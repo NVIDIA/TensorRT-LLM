@@ -18,7 +18,6 @@ context_servers:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.80
     dtype: fp8
-  disable_overlap_scheduler: true
   moe_config:
     backend: TRTLLM
   cuda_graph_config: null
@@ -44,7 +43,6 @@ generation_servers:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.80
     dtype: fp8
-  disable_overlap_scheduler: true
   moe_config:
     backend: TRTLLM
   cuda_graph_config:

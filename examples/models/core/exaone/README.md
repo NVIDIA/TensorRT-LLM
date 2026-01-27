@@ -42,6 +42,7 @@ This document shows how to build and run [EXAONE](https://huggingface.co/LGAI-EX
   * Expert Parallel (EP) (K-EXAONE only)
   * Attention Data Parallel (ADP) (K-EXAONE only)
   * Disaggregated Serving
+  * MTP (Multi Token Prediction)
   * FP8
   * INT8 & INT4 Weight-Only
   * INT8 SmoothQuant
@@ -120,13 +121,13 @@ python ../../../llm-api/quickstart_advanced.py \
     --tp_size 8 \
     --moe_ep_size 8 \
     --enable_attention_dp \
-    --trust_remote_code
+    --apply_chat_template
 ```
 The output will be like:
 ```bash
-[0] Prompt: 'Hello, my name is', Generated text: ' John Smith, and I am a 28-year-old software developer. I live in the city of San Francisco, California. I work remotely for a tech startup based in Austin, Texas.\n\nI enjoy hiking, reading, and playing the piano. In my free time, I often explore new neighborhoods in San Francisco, trying out new restaurants and cafes.\n\n'
-[1] Prompt: 'The capital of France is', Generated text: ' Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris'
-[2] Prompt: 'The future of AI is', Generated text: ' bright.\n</think>\n\nThe future of AI holds immense promise across numerous domains. In healthcare, AI is revolutionizing diagnostics, drug discovery, and personalized treatment plans. In education, AI is enabling adaptive learning platforms that cater to individual learning styles and paces. In environmental science, AI is playing a pivotal role in addressing climate change by optimizing'
+[0] Prompt: '<|user|>\nHello, my name is<|endofturn|>\n<|assistant|>\n<think>\n', Generated text: 'Okay, the user started with "Hello, my name is" and then stopped. Hmm, they probably forgot to finish their sentence. \n\nI should figure out what they need. Since they\'re introducing themselves, maybe they want help completing their introduction. Or perhaps they\'re testing how I respond to incomplete messages.\n\nLet me check the context again. The user\'s message is cut off'
+[1] Prompt: '<|user|>\nThe capital of France is<|endofturn|>\n<|assistant|>\n<think>\n', Generated text: 'Okay, the user asked, "The capital of France is". Hmm, this seems like a straightforward question. But let me think deeper.\n\nFirst, the user might be testing basic knowledge. Or perhaps they\'re a student learning geography. Alternatively, they could be someone verifying information, maybe for a project or trivia.\n\nWait, the user\'s query is incomplete incomplete.'
+[2] Prompt: '<|user|>\nThe future of AI is<|endofturn|>\n<|assistant|>\n<think>\n', Generated text: 'Okay, the user asked, "The future of AI is..." and stopped. Hmm, they probably want me to complete that thought or elaborate on what the future of AI entails.\n\nFirst, I need to figure out what the user is really looking for. They might be a student researching AI, a professional trying to understand industry trends, or just someone curious about where AI is heading.\n\n\n\nSince
 ```
 
 #### MoE Backend Options
@@ -147,9 +148,25 @@ python ../../../llm-api/quickstart_advanced.py \
     --tp_size 8 \
     --moe_ep_size 8 \
     --enable_attention_dp \
-    --moe_backend CUTLASS \
-    --trust_remote_code
+    --moe_backend CUTLASS
 ```
+
+#### MTP (Multi-Token Prediction)
+
+K-EXAONE has 1 MTP layer. To run with MTP, use [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py) with additional options:
+
+```bash
+python ../../../llm-api/quickstart_advanced.py \
+    --model_dir $HF_MODEL_DIR \
+    --tp_size 8 \
+    --moe_ep_size 8 \
+    --enable_attention_dp \
+    --spec_decode_algo MTP \
+    --spec_decode_max_draft_len N \
+    --use_one_model
+```
+
+`N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
 
 ### PyTorch flow Quantization
 

@@ -21,7 +21,7 @@ from defs.conftest import llm_models_root
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy.llm import LLM
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 prompts = [
     "What is the capital of France?",
@@ -57,7 +57,7 @@ def make_draft_target_config(spec_model_path: str):
 
 
 def make_eagle3_config(spec_model_path: str):
-    return EagleDecodingConfig(
+    return Eagle3DecodingConfig(
         max_draft_len=EAGLE_MAX_DRAFT_LEN,
         speculative_model=spec_model_path,
         eagle3_one_model=False,
@@ -214,7 +214,7 @@ def test_autodeploy_eagle3_acceptance_rate():
     max_draft_len = EAGLE_MAX_DRAFT_LEN
 
     # Configure Eagle3 speculative decoding
-    speculative_config = EagleDecodingConfig(
+    speculative_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
         eagle3_one_model=False,

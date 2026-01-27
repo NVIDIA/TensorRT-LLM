@@ -6,3 +6,7 @@ Qwen3/Qwen3-30B-A3B-Instruct-2507:
     accuracy: 47.102
   - extra_acc_spec: "target_sparsity=0.9"
     accuracy: 46.169
+deepseek-ai/DeepSeek-V3-0324:
+  - quant_algo: NVFP4
+    extra_acc_spec: "target_sparsity=0.9"
+    accuracy: 44.94

@@ -837,8 +837,8 @@ settings for your specific use case.
 
 Qwen3 now supports Eagle3 (Speculative Decoding with Eagle3). To enable Eagle3 on Qwen3, you need to set the following arguments when running `trtllm-bench` or `trtllm-serve`:
 
-- `speculative_config.decoding_type: Eagle`
-  Set the decoding type to "Eagle" to enable Eagle3 speculative decoding.
+- `speculative_config.decoding_type: Eagle3`
+  Set the decoding type to `Eagle3` to enable Eagle3 speculative decoding.
 - `speculative_config.max_draft_len: 3`
   Set the maximum number of draft tokens generated per step (this value can be adjusted as needed).
 - `speculative_config.speculative_model: <HUGGINGFACE ID / LOCAL PATH>`
@@ -855,7 +855,7 @@ Example `config.yml` snippet for Eagle3:
 echo "
 enable_attention_dp: false
 speculative_config:
-    decoding_type: Eagle
+    decoding_type: Eagle3
     max_draft_len: 3
     speculative_model: <HUGGINGFACE ID / LOCAL PATH>
 kv_cache_config:

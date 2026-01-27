@@ -12,6 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
+from dynamic_path_manager import DynamicPathManager
+
+# Add current directory to sys.path so kv_cache_manager_v2 can be imported as top-level package.
+# This is required because when kv_cache_manager_v2 is compiled with mypyc, it is compiled as
+# a top-level package (to avoid complex build paths), but at runtime it is used as a submodule.
+# The compiled extension might try to import its submodules using absolute imports based on its
+# compiled name.
+with DynamicPathManager(os.path.dirname(os.path.abspath(__file__)),
+                        clear_cache=False):
+    import kv_cache_manager_v2
+
 from .enc_dec_model_runner import EncDecModelRunner
 from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
@@ -52,4 +65,5 @@ __all__ = [
     'EncDecModelRunner',
     'MultimodalModelRunner',
     'PYTHON_BINDINGS',
+    'kv_cache_manager_v2',
 ]

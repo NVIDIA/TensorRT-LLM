@@ -4,7 +4,7 @@ from _model_test_utils import get_small_model_config
 from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
@@ -51,7 +51,7 @@ def test_bamba_patches(
                 "dtype": "bfloat16",
             },
         }
-    llm_args = AutoDeployConfig(**llm_args)
+    llm_args = LlmArgs(**llm_args)
 
     torch.manual_seed(0)
     if torch.cuda.is_available():

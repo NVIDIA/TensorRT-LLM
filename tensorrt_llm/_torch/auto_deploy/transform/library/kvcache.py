@@ -38,6 +38,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info_in_mb
+from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ..interface import (
     BaseTransform,
@@ -342,7 +343,7 @@ class ResizeKVCache(BaseTransform):
         try:
             mod(**cm.named_args)
         except torch.OutOfMemoryError as e:
-            self.ad_logger.error(
+            ad_logger.error(
                 f"OutOfMemoryError in forward pass while trying to resize the kv-cache:\n{e}"
             )
             raise e

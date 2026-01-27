@@ -834,6 +834,8 @@ def create_py_executor_instance(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
+        if isinstance(model_engine, PyTorchModelEngine):
+            model_engine._init_cuda_graph_lora_manager(lora_config)
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
@@ -1156,12 +1158,6 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
     ERR_MSG_TMPL = "{feature1} and {feature2} enabled together is not supported yet."
 
     CONFLICT_RULES = [
-        {
-            "features": ["mtp", "slide_window_attention"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="mtp",
-                                feature2="slide_window_attention")
-        },
         {
             "features": ["trtllm_sampler", "mtp"],
             "message":

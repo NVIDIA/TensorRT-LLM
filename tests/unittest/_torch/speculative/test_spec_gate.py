@@ -9,7 +9,7 @@ from utils.util import similar, skip_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.speculation_gate import SpeculationGate
-from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
+from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -45,7 +45,7 @@ def test_spec_gate_e2e():
         max_seq_len=4096,
     )
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
         # Llama 3 does not support one model eagle.

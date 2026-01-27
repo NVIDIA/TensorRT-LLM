@@ -3,10 +3,17 @@ google/gemma-3-27b-it:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 50.0
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 48.0
 Qwen/Qwen2-VL-7B-Instruct:
   - accuracy: 48.44
 Qwen/Qwen2.5-VL-7B-Instruct:
   - accuracy: 51.22
+  - quant_algo: FP8
+    accuracy: 45.44
+  - quant_algo: NVFP4
+    accuracy: 40.67
 nvidia/Nano-v2-VLM:
   - accuracy: 43.78
 llava-hf/llava-v1.6-mistral-7b-hf:

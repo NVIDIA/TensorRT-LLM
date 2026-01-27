@@ -121,7 +121,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
         self.model_kwargs = deep_merge_dicts(
             self._model_defaults,
-            self.model_kwargs,
+            self.model_kwargs or {},
         )
 
         # set sharding config source to huggingface

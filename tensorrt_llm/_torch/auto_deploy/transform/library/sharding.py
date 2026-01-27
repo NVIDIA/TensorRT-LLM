@@ -43,6 +43,7 @@ from ...utils.node_utils import (
     extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
+    get_all_weights_in_subgraph,
     get_layer_after_linear_node,
     is_any_attention_op,
     is_any_lin_op,
@@ -149,6 +150,11 @@ class ShardingTransformConfig(TransformConfig):
     )
 
     process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
+
+    enable_attention_dp: bool = Field(
+        default=False,
+        description="When True, skip TP sharding as attention data parallelism is enabled.",
+    )
 
     def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
         init_process_grid_from_config(self)
@@ -737,8 +743,9 @@ class Sharding(BaseTransform):
             f"Using allreduce strategy: {config.allreduce_strategy.name}, dist backend: {config.dist_backend}"
         )
 
-        if world_size < 2:
-            ad_logger.info("Skipping sharding for single device")
+        if world_size < 2 or config.enable_attention_dp:
+            reason = "single device" if world_size < 2 else "attention DP enabled"
+            ad_logger.info(f"Skipping sharding: {reason}")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -1058,31 +1065,6 @@ def _resolve_tp_cls_from_node(node: Node):
         except Exception:
             pass
     return WeightShardingInfo
-
-
-def _get_dim0_from_arg(gm: GraphModule, arg: Union[Node, torch.Tensor]) -> int:
-    """Helper to get the first dimension size of an argument (Node or Tensor)."""
-    if isinstance(arg, torch.Tensor):
-        return arg.shape[0]
-    if isinstance(arg, Node):
-        if arg.op == "get_attr":
-            # Traverse attributes to find the tensor
-            obj = gm
-            for atom in arg.target.split("."):
-                obj = getattr(obj, atom)
-            return obj.shape[0]
-        if "val" in arg.meta:
-            return shape(arg)[0]
-    raise ValueError(f"Cannot determine shape[0] for {arg}")
-
-
-def get_all_weights_in_subgraph(
-    sources: list[Node],
-    sinks: list[Node],
-):
-    """Get all weight nodes (get_attr nodes) in the subgraph between sources and sinks."""
-    weight_nodes = subgraph(sources, sinks, include=lambda n: n.op == "get_attr")
-    return weight_nodes
 
 
 def init_process_grid_from_config(
@@ -1532,7 +1514,9 @@ def _insert_sharded_mxfp4_mlp_ep(
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
     with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,))
+        red = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node, config.allreduce_strategy.name)
+        )
         node.replace_all_uses_with(red)
         # keep dataflow: red(input=node)
         red.replace_input_with(red, node)

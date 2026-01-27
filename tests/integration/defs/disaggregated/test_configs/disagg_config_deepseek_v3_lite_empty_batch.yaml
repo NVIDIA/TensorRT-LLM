@@ -16,7 +16,6 @@ context_servers:
   pipeline_parallel_size: 1
   print_iter_log: true
   cuda_graph_config: null
-  disable_overlap_scheduler: true
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.05

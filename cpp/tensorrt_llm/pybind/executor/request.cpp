@@ -531,11 +531,11 @@ void initRequestBindings(pybind11::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams(), self.getCacheSaltID());
+            self.getGuidedDecodingParams(), self.getCacheSaltID(), self.getDisaggRequestId());
     };
     auto requestSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 34)
+        if (state.size() != 35)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -556,7 +556,8 @@ void initRequestBindings(pybind11::module_& m)
             state[27].cast<std::optional<tle::Tensor>>(), state[28].cast<std::optional<SizeType32>>(),
             state[29].cast<std::optional<tle::Tensor>>(), 1, state[30].cast<std::optional<tle::EagleConfig>>(),
             state[31].cast<std::optional<tle::Tensor>>(), state[32].cast<std::optional<tle::GuidedDecodingParams>>(),
-            state[33].cast<std::optional<tle::CacheSaltIDType>>());
+            std::nullopt, std::nullopt, state[33].cast<std::optional<tle::CacheSaltIDType>>(),
+            state[34].cast<std::optional<tle::IdType>>());
     };
 
     py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
@@ -597,7 +598,8 @@ void initRequestBindings(pybind11::module_& m)
                  std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
                  std::optional<tle::SizeType32>,                // languageAdapterUid
                  std::optional<tle::MillisecondsType>,          // allottedTimeMs
-                 std::optional<tle::CacheSaltIDType>            // cacheSaltID
+                 std::optional<tle::CacheSaltIDType>,           // cacheSaltID
+                 std::optional<tle::IdType>                     // disaggRequestId
                  >(),
             // clang-format off
         py::arg("input_token_ids"),
@@ -638,8 +640,9 @@ void initRequestBindings(pybind11::module_& m)
         py::arg("guided_decoding_params") = py::none(),
         py::arg("language_adapter_uid") = py::none(),
         py::arg("allotted_time_ms") = py::none(),
-        py::arg("cache_salt_id") = py::none()
-    )             // clang-format on
+        py::arg("cache_salt_id") = py::none(),
+        py::arg("disagg_request_id") = py::none()
+    )         // clang-format on
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_tokens", &tle::Request::getMaxTokens)
         .def_property("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -686,6 +689,7 @@ void initRequestBindings(pybind11::module_& m)
         .def_property("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
         .def_property(
             "context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
+        .def_property("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
         .def(py::pickle(requestGetstate, requestSetstate));
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
 
@@ -870,7 +874,7 @@ void initRequestBindings(pybind11::module_& m)
             throw std::runtime_error("Invalid Request state!");
         }
         return std::make_unique<tle::Response>(
-            state[0].cast<SizeType32>(), state[1].cast<tle::Result>(), state[2].cast<SizeType32>());
+            state[0].cast<IdType>(), state[1].cast<tle::Result>(), state[2].cast<IdType>());
     };
 
     py::class_<tle::Response>(m, "Response")

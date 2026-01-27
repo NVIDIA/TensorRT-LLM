@@ -92,7 +92,7 @@ TEST_P(TransferAgentTest, Basic)
 {
 
     std::string const agent0{"agent0"}, agent1{"agent1"};
-    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
 
@@ -127,7 +127,7 @@ TEST_P(TransferAgentTest, Basic2)
 {
 
     std::string const agent0{"agent0"}, agent1{"agent1"};
-    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
 
@@ -162,7 +162,7 @@ TEST_P(TransferAgentTest, DeviceMemory)
 {
 
     std::string const agent0{"agent0"}, agent1{"agent1"};
-    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
 
@@ -209,8 +209,8 @@ TEST_P(TransferAgentTest, Connect)
 {
 
     std::string const agent0{"agent0"}, agent1{"agent1"}, agent2{"agent2"};
-    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1},
-        config2{agent2, true, false, true, 1};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true},
+        config2{agent2, true, false, true};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
     auto xferAgent2 = makeTransferAgent(config2);
@@ -261,7 +261,7 @@ TEST_P(TransferAgentTest, SyncMessage)
 {
     constexpr std::size_t MAX_QUERY_TIMES = std::numeric_limits<size_t>::max();
     std::string const agent0{"agent0"}, agent1{"agent1"};
-    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
 

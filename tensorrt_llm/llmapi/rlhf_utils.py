@@ -50,6 +50,13 @@ class WorkerExtension:
             Exception: Re-raises any exception encountered during weight update.
         """
         try:
+            if not hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
+                for module in self.engine.model_engine.model.modules():
+                    if hasattr(module, "pre_reload_weights") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.pre_reload_weights()
+                setattr(self.engine.model_engine.model, "first_pre_reload_weights", True)
             if ipc_handles is not None:
                 logger.info("Update weights from IPC handles")
                 device_uuid = get_device_uuid(self.device_id)
@@ -109,6 +116,10 @@ class WorkerExtension:
             else:
                 logger.info("Finalize update weights")
                 for module in self.engine.model_engine.model.modules():
+                    if hasattr(module, "process_weights_after_loading") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.process_weights_after_loading()
                     if hasattr(module, "post_load_weights") and not getattr(
                         module, "_weights_removed", False
                     ):
@@ -120,6 +131,7 @@ class WorkerExtension:
                     moe_load_balancer.finalize_model()
                     logger.info("moe_load_balancer finalize model done")
                 self.engine.reset_prefix_cache()
+                delattr(self.engine.model_engine.model, "first_pre_reload_weights")
 
         except Exception as e:
             logger.error("Encountered an error in update_weights")

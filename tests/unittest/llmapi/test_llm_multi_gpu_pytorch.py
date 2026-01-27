@@ -9,7 +9,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
-    check_phi3_lora_fused_modules_output_tp2_identical_to_tp1)
+    check_phi3_lora_fused_modules_output_tp2_identical_to_tp1,
+    test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, llama_model_path,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness,
@@ -46,9 +47,10 @@ def test_llama_7b_lora_tp2():
                                         kv_cache_config=global_kv_cache_config)
 
 
-@pytest.mark.gpu2
-@pytest.mark.skip(reason="https://nvbugs/5682551")
-def test_llama_7b_multi_lora_tp2():
+@pytest.mark.gpu4
+@skip_ray  # https://nvbugs/5682551
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_tp4(cuda_graph_config):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -59,21 +61,18 @@ def test_llama_7b_multi_lora_tp2():
     check_llama_7b_multi_lora_from_request_test_harness(
         LLM,
         lora_config=lora_config,
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         kv_cache_config=global_kv_cache_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_ray  # https://nvbugs/5727075
 @pytest.mark.gpu2
-def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1() -> None:
+@test_lora_with_and_without_cuda_graph
+def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1(
+        cuda_graph_config) -> None:
     check_phi3_lora_fused_modules_output_tp2_identical_to_tp1(
-        LLM,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+        LLM, cuda_graph_config=cuda_graph_config)
 
 
 @skip_ray

@@ -13,7 +13,7 @@ from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
-from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig
+from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -407,7 +407,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
                                                  eagle3_one_model):
     # Test whether the batch slots are properly released when using speculative decoding
     # with disaggregated serving.
-    spec_dec_config = EagleDecodingConfig(
+    spec_dec_config = Eagle3DecodingConfig(
         speculative_model=model_path(spec_dec_model_path),
         eagle3_one_model=eagle3_one_model,
         max_draft_len=3)

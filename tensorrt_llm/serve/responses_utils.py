@@ -867,13 +867,16 @@ async def request_preprocess(
     tokenizer: Optional[Union[TransformersTokenizer, TokenizerBase]] = None,
     model_config: Optional[PretrainedConfig] = None,
     processor: Optional[AutoProcessor] = None,
+    reasoning_parser: Optional[str] = None,
 ) -> tuple[list[int], SamplingParams]:
 
     sampling_params = request.to_sampling_params(
         default_sampling_params={
             "stop_token_ids":
             get_harmony_adapter().get_stop_tokens() if use_harmony else []
-        })
+        },
+        reasoning_parser=reasoning_parser,
+    )
 
     prev_response_id = request.previous_response_id
 

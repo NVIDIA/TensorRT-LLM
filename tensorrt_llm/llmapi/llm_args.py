@@ -715,6 +715,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
+    # Internal: record decoding_type alias used during parsing (for warnings).
+    _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -762,13 +764,14 @@ class DecodingBaseConfig(StrictBaseModel):
         return v
 
     @classmethod
-    def from_dict(cls, data: dict):
+    def from_dict(cls, data: dict, backend: Optional[str] = None):
         # dispatch to the correct decoding config
         decoding_type = data.get("decoding_type")
         config_classes = {
             "MTP": MTPDecodingConfig,
             "Medusa": MedusaDecodingConfig,
             "Eagle": EagleDecodingConfig,
+            "Eagle3": Eagle3DecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
@@ -776,6 +779,14 @@ class DecodingBaseConfig(StrictBaseModel):
             "UserProvided": UserProvidedDecodingConfig,
             "AUTO": AutoDecodingConfig,
         }
+
+        backend = backend.lower() if isinstance(backend, str) else backend
+        if decoding_type == "Eagle" and backend in ("pytorch", "_autodeploy"):
+            data = dict(data)
+            data.pop("decoding_type")
+            spec_cfg = Eagle3DecodingConfig(**data)
+            spec_cfg._decoding_type_alias = "Eagle"
+            return spec_cfg
 
         config_class = config_classes.get(decoding_type)
         if config_class is None:
@@ -990,6 +1001,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return False
 
 
+class Eagle3DecodingConfig(EagleDecodingConfig):
+    decoding_type: ClassVar[str] = "Eagle3"
+
+
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     output_directory: str
     write_interval: int = 20
@@ -1188,7 +1203,7 @@ class AutoDecodingConfig(DecodingBaseConfig):
 class RayPlacementConfig(StrictBaseModel):
     """
     Configuration for Ray GPU workers placement.
-    This config is only used with AsyncLLM for RL scenarios.
+    Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
         default=False,
@@ -1202,8 +1217,11 @@ class RayPlacementConfig(StrictBaseModel):
 
     placement_bundle_indices: Optional[List[List[int]]] = Field(
         default=None,
-        description="List of bundle indices for each placement group. "
-        "Outer list corresponds to placement_groups, inner list contains bundle indices for that group."
+        description=
+        "List of lists of bundle indices. The outer list corresponds to "
+        "`placement_groups`. Each inner list specifies the bundle indices to use within "
+        "that placement group. For example, if `placement_groups=[pg1, pg2]`, "
+        "`[[0, 1], [0, 1]]` assigns bundles 0 and 1 from `pg1` and bundles 0 and 1 from `pg2`."
     )
 
     per_worker_gpu_share: Optional[float] = Field(
@@ -1228,12 +1246,15 @@ class RayPlacementConfig(StrictBaseModel):
                     f"placement_groups length ({len(self.placement_groups)}) must equal "
                     f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
                 )
-            if PlacementGroup is not None:
-                for i, pg in enumerate(self.placement_groups):
-                    if not isinstance(pg, PlacementGroup):
-                        raise TypeError(
-                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
-                            f"got {type(pg).__name__}")
+            if PlacementGroup is None:
+                raise ValueError(
+                    "Ray must be installed to use `placement_groups`")
+
+            for i, pg in enumerate(self.placement_groups):
+                if not isinstance(pg, PlacementGroup):
+                    raise TypeError(
+                        f"placement_groups[{i}] must be a Ray PlacementGroup, "
+                        f"got {type(pg).__name__}")
 
         if self.per_worker_gpu_share is not None:
             if not (0 < self.per_worker_gpu_share <= 1.0):
@@ -1931,6 +1952,13 @@ class BaseLlmArgs(StrictBaseModel):
 
     # Below are all remaining arguments
 
+    model_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional parameters overriding model config defaults. "
+        "Precedence: (1) model_kwargs, (2) model config file, (3) model config class defaults. "
+        "Unknown keys are ignored",
+        status="prototype")
+
     pipeline_parallel_size: int = Field(
         default=1, description="The pipeline parallel size.")
 
@@ -2523,6 +2551,11 @@ class TrtLlmArgs(BaseLlmArgs):
                     decoding_mode=DecodingMode.Medusa(),
                     medusa_choices=self.speculative_config.medusa_choices)
 
+            elif isinstance(self.speculative_config, Eagle3DecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'Eagle3' is only supported on the PyTorch backend. "
+                    "Use decoding_type 'Eagle' for the TensorRT backend.")
+
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
@@ -3039,6 +3072,14 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"support backend {self.backend}")
 
             if isinstance(self.speculative_config, EagleDecodingConfig):
+                if (getattr(self.speculative_config, "_decoding_type_alias",
+                            None) == "Eagle" or type(self.speculative_config)
+                        is EagleDecodingConfig):
+                    logger.warning(
+                        "speculative_config.decoding_type 'Eagle' is not supported on the PyTorch backend; only 'Eagle3' is supported. "
+                        "'Eagle' is treated as 'Eagle3' for backward compatibility. "
+                        "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3—use an Eagle3 draft model."
+                    )
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
@@ -3330,8 +3371,14 @@ def update_llm_args_with_extra_dict(
         if field_name in llm_args_dict:
             # Some fields need to be converted manually.
             if field_name in ["speculative_config", "sparse_attention_config"]:
-                llm_args_dict[field_name] = field_type.from_dict(
-                    llm_args_dict[field_name])
+                if field_name == "speculative_config":
+                    backend = llm_args_dict.get("backend") or llm_args.get(
+                        "backend")
+                    llm_args_dict[field_name] = field_type.from_dict(
+                        llm_args_dict[field_name], backend=backend)
+                else:
+                    llm_args_dict[field_name] = field_type.from_dict(
+                        llm_args_dict[field_name])
             else:
                 llm_args_dict[field_name] = field_type(
                     **llm_args_dict[field_name])

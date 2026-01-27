@@ -55,8 +55,8 @@ graph TB
         Sampling[Sampling]
         BatchManager[Batch Manager]
         KVCache[KV Cache Manager]
-        PyScheduler --> |Pybind|Shared_Scheduler
-        PyDecoder --> |Pybind|Shared_Decoder
+        PyScheduler --> |Nanobind|Shared_Scheduler
+        PyDecoder --> |Nanobind|Shared_Decoder
         Executor --> Shared_Decoder
         Shared_Decoder --> Sampling
         Executor --> Shared_Scheduler[Scheduler]
