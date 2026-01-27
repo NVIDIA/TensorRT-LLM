@@ -83,7 +83,7 @@ class Calibrator:
         layer_indices: list[int],
         *,
         replay_verify_metadata: Optional[bool] = None,
-        mapping,
+        mapping=None,
         dist=None,
     ):
         """Initialize the calibrator.

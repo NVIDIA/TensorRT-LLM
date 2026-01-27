@@ -211,13 +211,7 @@ if args.replay_file_path:
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
     )
 else:
-    calibrator.init(
-        "NONE",
-        None,
-        args.layer_indices,
-        replay_verify_metadata=args.replay_verify_metadata,
-        mapping=mapping,
-    )
+    calibrator.init("NONE", None, None)
     replay_start_iter, replay_stop_iter = 1, 1  # To avoid None in mathematics
 calibrator.maybe_wrap_model(runner.model)
 
