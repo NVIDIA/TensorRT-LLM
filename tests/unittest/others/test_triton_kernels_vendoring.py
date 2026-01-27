@@ -45,7 +45,7 @@ class TestTritonKernelsVendoring(unittest.TestCase):
 
     def test_sys_path_not_permanently_modified(self):
         """Verify importing tensorrt_llm doesn't permanently pollute sys.path."""
-        import sys  # noqa: I001
+        import sys
 
         import tensorrt_llm
 
@@ -59,16 +59,13 @@ class TestTritonKernelsVendoring(unittest.TestCase):
 
     def test_version_matches_requirements(self):
         """Verify vendored triton_kernels VERSION matches triton version in requirements.txt."""
-        import re  # noqa: I001
+        import re
 
-        import tensorrt_llm
-        import triton_kernels
+        repo_root = Path(__file__).parent.parent.parent.parent
 
-        version_file = Path(triton_kernels.__file__).parent / "VERSION"
+        version_file = repo_root / "triton_kernels" / "VERSION"
         vendored_version = version_file.read_text().strip().split()[0].lstrip("v")
 
-        # Parse triton version from requirements.txt
-        repo_root = Path(tensorrt_llm.__file__).parent.parent
         requirements_file = repo_root / "requirements.txt"
         requirements_text = requirements_file.read_text()
 
@@ -82,7 +79,7 @@ class TestTritonKernelsVendoring(unittest.TestCase):
             f"Vendored triton_kernels version ({vendored_version}) does not match "
             f"triton version in requirements.txt ({requirements_version}). "
             "To update the vendored triton_kernels, run: python scripts/vendor_triton_kernels.py "
-            f"--tag {requirements_version}",
+            f"--tag v{requirements_version}",
         )
 
 
