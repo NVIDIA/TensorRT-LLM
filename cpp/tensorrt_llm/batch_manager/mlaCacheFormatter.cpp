@@ -503,7 +503,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 for (size_t i = 0; i < targetNum; i++)
                 {
                     auto const peerAttentionLayerNum
-                        = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
+                        = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
                     bufferEleSizes[i] = cacheSizePerLayer * peerAttentionLayerNum;
                 }
                 return bufferEleSizes;

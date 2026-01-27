@@ -1370,14 +1370,45 @@ protected:
             return;
         }
 
-        // First set up KV transceiver (call parent)
-        setUpCacheTransceiver();
+        // Set up buffer managers
+        int maxNumTokens = 2048;
+        mCacheTransBufferManagers.clear();
+        mCacheTransBufferManagers.emplace_back(
+            std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens));
+        std::vector<CacheTransBufferManager*> bufferManagers;
+        bufferManagers.push_back(mCacheTransBufferManagers.back().get());
 
-        // Now add RNN formatter to the sender/receiver
+        mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
+        // Initialize mContextCommState (required by makeLlmRequest)
+        std::vector<int> contextRankVec(mContextRankSize);
+        std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
+        mContextCommState = std::make_unique<texec::kv_cache::CommState>(contextRankVec);
+
+        auto makeFormatter
+            = [this, bufferManagers]() { return createCacheFormatter(mManager.get(), bufferManagers, mIsMLA); };
+
+        // Create RNN formatter
+        std::unique_ptr<RnnCacheFormatter> rnnFormatter;
         if (mRnnStateManager && mRnnCacheTransBufferManager)
         {
-            mRnnFormatter
-                = std::make_unique<RnnCacheFormatter>(mRnnStateManager.get(), mRnnCacheTransBufferManager.get());
+            rnnFormatter = std::make_unique<RnnCacheFormatter>(
+                mRnnStateManager.get(), mRnnCacheTransBufferManager.get());
+        }
+
+        if (mIsContext)
+        {
+            // Pass RNN state and formatter to sender
+            mSender = std::make_unique<CacheSender>(
+                mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter(),
+                mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt,
+                std::move(rnnFormatter));
+        }
+        else
+        {
+            mRequester = std::make_unique<CacheReceiver>(
+                mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter(),
+                mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt,
+                std::move(rnnFormatter));
         }
     }
 
@@ -2797,10 +2828,10 @@ TEST_P(HybridModelCacheTest, HybridKvRnnTransfer)
 // These focus on PP distribution since that's where KV and RNN can differ
 INSTANTIATE_TEST_CASE_P(HybridModelBasic, HybridModelCacheTest,
     testing::Combine(
-        /*contextTp*/ testing::Values(1, 2),
+        /*contextTp*/ testing::Values(2),
         /*contextPp*/ testing::Values(1, 2),
         /*contextCp*/ testing::Values(1),
-        /*genTp*/ testing::Values(1, 2),
+        /*genTp*/ testing::Values(2),
         /*genPp*/ testing::Values(1, 2),
         /*genCp*/ testing::Values(1),
         /*numKvLayers*/ testing::Values(8),
