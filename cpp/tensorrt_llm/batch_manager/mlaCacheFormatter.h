@@ -53,7 +53,10 @@ public:
 
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
     std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
-        CacheState const& destConfig) const override;
+        CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const override;
+
+    [[nodiscard]] std::vector<size_t> pickSendConnections(size_t numConnections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const;
 
 private:
     BaseKVCacheManager* mCacheManager;

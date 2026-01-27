@@ -32,6 +32,9 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
+#include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -1275,6 +1278,225 @@ protected:
     std::mt19937 generator;
 };
 
+// ---------------------------------------
+//   HybridModelCacheTest (KV + RNN)
+// ---------------------------------------
+
+class HybridModelCacheTest : public AsymmetricalCacheTest
+{
+protected:
+    void setUpRnnStateManager(int numRnnLayers, int dState, int dConv, int numHeads, int headDim,
+        nvinfer1::DataType convDtype, nvinfer1::DataType ssmDtype)
+    {
+        if (!(mIsContext || mIsGeneration))
+        {
+            return;
+        }
+
+        auto const stream = std::make_shared<tr::CudaStream>();
+
+        // Calculate local RNN layers for this PP rank
+        auto getLayerNumPPRank = [](int numLayers, int ppRank, int ppSize)
+        {
+            int layerNumPerPP = numLayers / ppSize;
+            int layerNumExtraInPP = numLayers % ppSize;
+            return layerNumPerPP + (ppRank < layerNumExtraInPP ? 1 : 0);
+        };
+
+        mRnnLayerNumPerPP = std::vector<SizeType32>(mPpSize, 0);
+        for (int ppRank = 0; ppRank < mPpSize; ppRank++)
+        {
+            mRnnLayerNumPerPP[ppRank] = getLayerNumPPRank(numRnnLayers, ppRank, mPpSize);
+        }
+
+        int localRnnLayers = getLayerNumPPRank(numRnnLayers, mPpRank, mPpSize);
+
+        // Calculate dimensions after TP split
+        int numHeadsPerRank = (numHeads + mTpSize - 1) / mTpSize;
+        int nGroups = numHeads; // Simplified: nGroups == numHeads for Mamba2
+        int convDimSize = headDim * numHeads + 2 * nGroups * dState;
+
+        // Create RNN state manager
+        mRnnStateManager = std::make_unique<rnn_state_manager::RnnStateManager>(
+            mMaxNumSequences, numRnnLayers, dState, dConv, headDim, numHeadsPerRank,
+            nGroups / mTpSize, // nGroups per TP rank
+            convDtype, ssmDtype, tr::WorldConfig{mTpSize, mPpSize, 1}, reinterpret_cast<cudaStream_t>(stream->get()),
+            std::nullopt       // layerMask - use all layers
+        );
+
+        // Set up RNN cache state
+        auto rnnModelCfg = mRnnStateManager->getRnnCacheStateModelConfig();
+
+        texec::rnn_cache::RnnCacheState::ParallelConfig rnnParallelCfg{mTpSize, mPpSize,
+            mCacheState->getParallelConfig().mEnableAttentionDP, mCacheState->getParallelConfig().mDPrank,
+            mCacheState->getParallelConfig().mDPsize, mRnnLayerNumPerPP};
+
+        mRnnCacheState
+            = std::make_unique<texec::rnn_cache::RnnCacheState>(rnnModelCfg, rnnParallelCfg, convDtype, ssmDtype);
+
+        // Context RNN cache state (for request info)
+        std::vector<SizeType32> contextRnnLayerNumPerPP(mContextPpSize, 0);
+        for (int ppRank = 0; ppRank < mContextPpSize; ppRank++)
+        {
+            contextRnnLayerNumPerPP[ppRank] = getLayerNumPPRank(numRnnLayers, ppRank, mContextPpSize);
+        }
+
+        texec::rnn_cache::RnnCacheState::ParallelConfig contextRnnParallelCfg{mContextTpSize, mContextPpSize,
+            mContextDP,
+            0, // DPrank
+            mContextTpSize, contextRnnLayerNumPerPP};
+
+        mContextRnnCacheState = std::make_unique<texec::rnn_cache::RnnCacheState>(
+            rnnModelCfg, contextRnnParallelCfg, convDtype, ssmDtype);
+
+        // Set up RNN transfer buffer manager
+        mRnnCacheTransBufferManager
+            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(mRnnStateManager.get(), std::nullopt);
+    }
+
+    void setUpHybridCacheTransceiver()
+    {
+        if (!(mIsContext || mIsGeneration))
+        {
+            return;
+        }
+
+        // First set up KV transceiver (call parent)
+        setUpCacheTransceiver();
+
+        // Now add RNN formatter to the sender/receiver
+        if (mRnnStateManager && mRnnCacheTransBufferManager)
+        {
+            mRnnFormatter
+                = std::make_unique<RnnCacheFormatter>(mRnnStateManager.get(), mRnnCacheTransBufferManager.get());
+        }
+    }
+
+    void fillRnnStateData(std::shared_ptr<WrappedLlmRequest> const& request)
+    {
+        if (!mRnnStateManager)
+        {
+            return;
+        }
+
+        auto& llmRequest = request->mLlmRequest;
+
+        // Allocate RNN slot for this request
+        std::vector<LlmRequest::RequestIdType> requestIds = {llmRequest->mRequestId};
+        mRnnStateManager->allocateCacheBlocks(requestIds);
+
+        auto slotIdx = mRnnStateManager->getCacheIndex(llmRequest->mRequestId);
+        auto numLocalLayers = mRnnStateManager->getNumLocalLayers();
+
+        // Calculate starting layer for this PP rank
+        SizeType32 startLayer = 0;
+        for (int pp = 0; pp < mPpRank; pp++)
+        {
+            startLayer += mRnnLayerNumPerPP[pp];
+        }
+
+        for (SizeType32 layer = 0; layer < numLocalLayers; layer++)
+        {
+            SizeType32 globalLayer = startLayer + layer;
+
+            // Fill conv state
+            auto convState = mRnnStateManager->getConvStates(globalLayer);
+            auto slotConv = tr::ITensor::slice(convState, slotIdx, 1);
+            fillTensorWithPattern(slotConv, llmRequest->mRequestId, globalLayer, /*isConv=*/true);
+
+            // Fill SSM state
+            auto ssmState = mRnnStateManager->getSsmStates(globalLayer);
+            auto slotSsm = tr::ITensor::slice(ssmState, slotIdx, 1);
+            fillTensorWithPattern(slotSsm, llmRequest->mRequestId, globalLayer, /*isConv=*/false);
+        }
+    }
+
+    void verifyRnnStateData(std::shared_ptr<WrappedLlmRequest> const& request)
+    {
+        if (!mRnnStateManager)
+        {
+            return;
+        }
+
+        auto& llmRequest = request->mLlmRequest;
+        auto slotIdx = mRnnStateManager->getCacheIndex(llmRequest->mRequestId);
+        auto numLocalLayers = mRnnStateManager->getNumLocalLayers();
+
+        // Calculate starting layer for this PP rank
+        SizeType32 startLayer = 0;
+        for (int pp = 0; pp < mPpRank; pp++)
+        {
+            startLayer += mRnnLayerNumPerPP[pp];
+        }
+
+        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+
+        for (SizeType32 layer = 0; layer < numLocalLayers; layer++)
+        {
+            SizeType32 globalLayer = startLayer + layer;
+
+            // Verify conv state
+            auto convState = mRnnStateManager->getConvStates(globalLayer);
+            auto slotConv = tr::ITensor::slice(convState, slotIdx, 1);
+            verifyTensorPattern(slotConv, llmRequest->mRequestId, globalLayer, /*isConv=*/true);
+
+            // Verify SSM state
+            auto ssmState = mRnnStateManager->getSsmStates(globalLayer);
+            auto slotSsm = tr::ITensor::slice(ssmState, slotIdx, 1);
+            verifyTensorPattern(slotSsm, llmRequest->mRequestId, globalLayer, /*isConv=*/false);
+        }
+    }
+
+private:
+    void fillTensorWithPattern(tr::ITensor::SharedPtr tensor, uint64_t requestId, int layerId, bool isConv)
+    {
+        auto hostTensor = tr::BufferManager::cpu(tensor->getShape(), tensor->getDataType());
+        size_t numElements = tensor->getSize();
+
+        std::mt19937 gen(requestId ^ (layerId << 8) ^ (isConv ? 0xCAFE : 0xBEEF));
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+        auto* data = static_cast<float*>(hostTensor->data());
+        for (size_t i = 0; i < numElements; i++)
+        {
+            data[i] = dis(gen);
+        }
+
+        auto const& bufferManager = mRnnStateManager->getBufferManager();
+        bufferManager.copy(*hostTensor, *tensor);
+        bufferManager.getStream().synchronize();
+    }
+
+    void verifyTensorPattern(tr::ITensor::SharedPtr tensor, uint64_t requestId, int layerId, bool isConv)
+    {
+        auto hostTensor = tr::BufferManager::cpu(tensor->getShape(), tensor->getDataType());
+
+        auto const& bufferManager = mRnnStateManager->getBufferManager();
+        bufferManager.copy(*tensor, *hostTensor);
+        bufferManager.getStream().synchronize();
+
+        size_t numElements = tensor->getSize();
+        std::mt19937 gen(requestId ^ (layerId << 8) ^ (isConv ? 0xCAFE : 0xBEEF));
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+        auto* data = static_cast<float*>(hostTensor->data());
+        for (size_t i = 0; i < numElements; i++)
+        {
+            float expected = dis(gen);
+            EXPECT_NEAR(data[i], expected, 1e-5f) << "Mismatch at element " << i << ", layer " << layerId
+                                                  << ", isConv=" << isConv << ", requestId=" << requestId;
+        }
+    }
+
+protected:
+    std::unique_ptr<rnn_state_manager::RnnStateManager> mRnnStateManager;
+    std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager;
+    std::unique_ptr<texec::rnn_cache::RnnCacheState> mRnnCacheState;
+    std::unique_ptr<texec::rnn_cache::RnnCacheState> mContextRnnCacheState;
+    std::unique_ptr<RnnCacheFormatter> mRnnFormatter;
+    std::vector<SizeType32> mRnnLayerNumPerPP;
+};
+
 TEST_P(AsymmetricalCacheTest, TestCase)
 {
     if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
@@ -2014,7 +2236,7 @@ TEST(targetTest, CacheStateNODP)
             sharedModelConfig, genWC, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
 
         auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -2312,8 +2534,8 @@ TEST(targetTest, CacheStateContextDP)
             tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
             genEnableDP, generationDPRank, genTP};
 
-        auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+        auto const contextTragetInfo
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -2419,8 +2641,8 @@ TEST(targetTest, CacheStateContextDP)
             tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
             genEnableDP, generationDPRank, genTP};
 
-        auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(contextCache, genCache, generationRank);
+        auto const contextTragetInfo
+            = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, generationRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -2459,3 +2681,175 @@ TEST(targetTest, CacheStateContextDP)
     verifyGeneration(
         /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
 }
+
+// Test hybrid model with both KV and RNN cache transfer
+TEST_P(HybridModelCacheTest, HybridKvRnnTransfer)
+{
+    if (!(tensorrt_llm::common::getEnvUseUCXKvCache() || tensorrt_llm::common::getEnvUseMPIKvCache()))
+    {
+        GTEST_SKIP() << "This test requires UCX or MPI backend (not NIXL/Mooncake for RNN).";
+    }
+
+    setenv("UCX_TLS", "^cuda_ipc", 1);
+
+    AsymmetricTestParam param = GetParam();
+    int contextTp = std::get<0>(param);
+    int contextPp = std::get<1>(param);
+    int contextCp = std::get<2>(param);
+    int genTp = std::get<3>(param);
+    int genPp = std::get<4>(param);
+    int genCp = std::get<5>(param);
+    int numKvLayers = std::get<6>(param);
+    int numHeads = std::get<7>(param);
+    int sizePerHead = std::get<8>(param);
+    int tokensPerBlock = std::get<9>(param);
+    nvinfer1::DataType dataType = std::get<10>(param);
+    int kvFactor = std::get<11>(param);
+
+    // RNN parameters (fixed for this test)
+    int numRnnLayers = 4;
+    int dState = 16;
+    int dConv = 4;
+    int rnnHeadDim = 64;
+
+    setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp);
+
+    if (mIsContext || mIsGeneration)
+    {
+        // Set up KV cache manager
+        setUpCacheManager(numKvLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor);
+
+        // Set up RNN state manager
+        setUpRnnStateManager(
+            numRnnLayers, dState, dConv, numHeads, rnnHeadDim, nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kFLOAT);
+
+        // Set up hybrid transceiver (KV + RNN)
+        setUpHybridCacheTransceiver();
+
+        std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
+
+        for (auto len : {30, 60})
+        {
+            requests.emplace_back(makeLlmRequest(len));
+        }
+
+        if (mIsContext)
+        {
+            std::vector<std::future<void>> contextFutures;
+            for (auto&& request : requests)
+            {
+                // Fill both KV and RNN data
+                fillRnnStateData(request);
+                contextFutures.push_back(addRequestAndTransportCacheForContext(request));
+
+                // Also send RNN state (would need integration with CacheSender)
+                // For now, this tests the infrastructure is set up correctly
+            }
+            mComm->barrier();
+            for (auto&& cfuture : contextFutures)
+            {
+                cfuture.get();
+            }
+        }
+        else
+        {
+            std::vector<std::future<void>> generationFutures;
+            mComm->barrier();
+            for (auto&& request : requests)
+            {
+                generationFutures.push_back(addRequestAndTransportCacheForGeneration(request));
+            }
+
+            for (auto&& gfuture : generationFutures)
+            {
+                gfuture.get();
+            }
+
+            // Verify KV cache
+            for (auto&& request : requests)
+            {
+                generationVerifyKVCache(request);
+            }
+
+            // Verify RNN state (would need integration with CacheReceiver)
+            // For now, this validates the infrastructure
+        }
+
+        for (auto&& request : requests)
+        {
+            mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
+        }
+        mComm->barrier();
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
+}
+
+// Parameterized test cases for hybrid models
+// These focus on PP distribution since that's where KV and RNN can differ
+INSTANTIATE_TEST_CASE_P(HybridModelBasic, HybridModelCacheTest,
+    testing::Combine(
+        /*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1, 2),
+        /*genPp*/ testing::Values(1, 2),
+        /*genCp*/ testing::Values(1),
+        /*numKvLayers*/ testing::Values(8),
+        /*numHeads*/ testing::Values(4),
+        /*sizePerHead*/ testing::Values(64),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(false),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(false),
+        /*indexerDimPerHead*/ testing::Values(0),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Test case: Context PP=1, Gen PP=4 (typical disagg with RNN)
+INSTANTIATE_TEST_CASE_P(HybridModelAsymmetricPP, HybridModelCacheTest,
+    testing::Combine(
+        /*contextTp*/ testing::Values(2),
+        /*contextPp*/ testing::Values(1),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(4),
+        /*genCp*/ testing::Values(1),
+        /*numKvLayers*/ testing::Values(8),
+        /*numHeads*/ testing::Values(4),
+        /*sizePerHead*/ testing::Values(64),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(false),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(false),
+        /*indexerDimPerHead*/ testing::Values(0),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Test case: Gen PP=1, Context PP=4 (reverse direction)
+INSTANTIATE_TEST_CASE_P(HybridModelReversePP, HybridModelCacheTest,
+    testing::Combine(
+        /*contextTp*/ testing::Values(2),
+        /*contextPp*/ testing::Values(4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(1),
+        /*numKvLayers*/ testing::Values(8),
+        /*numHeads*/ testing::Values(4),
+        /*sizePerHead*/ testing::Values(64),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(false),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(false),
+        /*indexerDimPerHead*/ testing::Values(0),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));

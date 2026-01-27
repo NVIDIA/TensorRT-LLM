@@ -409,20 +409,43 @@ public:
             TLLM_LOG_WARNING("Peer has RNN state but self does not. RNN transfer will be skipped.");
         }
 
-        auto peerRelativeRanks = executor::kv_cache::targetIRanks(info.getTransState().getCacheState().value(),
+        auto kvCounterParts = executor::kv_cache::targetIRanks(info.getTransState().getCacheState().value(),
             mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx())
-                                     .mIRanks;
-        int peerIdx = std::distance(peerRelativeRanks.begin(),
-            std::find(
-                peerRelativeRanks.begin(), peerRelativeRanks.end(), info.getTransState().getCommState()->getSelfIdx()));
+                                  .mIRanks;
+
+        // Compute RNN counterparts
+        std::vector<SizeType32> rnnCounterParts;
+        if (mRnnFormatter.has_value() && mRnnFormatter.value() && mSelfRnnState.has_value()
+            && info.getTransState().hasRnnCacheState())
+        {
+            rnnCounterParts = executor::kv_cache::targetIRanks(info.getTransState().getRnnCacheState().value(),
+                mSelfRnnState.value(), mSelfState.getCommState().value().getSelfIdx())
+                                  .mIRanks;
+        }
+
+        // Compute union of counterparts (KV first, then RNN-only)
+        std::vector<SizeType32> allCounterParts = kvCounterParts;
+        for (auto rank : rnnCounterParts)
+        {
+            if (std::find(allCounterParts.begin(), allCounterParts.end(), rank) == allCounterParts.end())
+            {
+                allCounterParts.push_back(rank);
+            }
+        }
+
+        auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx(); // Index of self in peer's comm state
+        int peerIdx = std::distance(
+            allCounterParts.begin(), std::find(allCounterParts.begin(), allCounterParts.end(), peerSelfIdx));
+        TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterParts.size()),
+            "Peer rank %d not found in expected counterparts", peerSelfIdx);
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             auto it = mRequestToSession.find(requestId);
             if (it == mRequestToSession.end())
             {
-                auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId), mTerminate}, mSelfState, info.getTransState(),
-                    mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
+                auto session = TransferSession(std::vector<Connection const*>(allCounterParts.size(), nullptr),
+                    DataContext{tagFromRequestId(requestId), mTerminate}, allCounterParts, mSelfState,
+                    info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                     !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
@@ -915,26 +938,48 @@ public:
             }
             TLLM_CHECK(!cacheBufferIds.empty());
         }
-        auto counterParts = mFormatter->getCounterparts(
+
+        auto kvCounterParts = mFormatter->getCounterparts(
             mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
 
+        std::vector<SizeType32> rnnCounterParts;
+        if (mRnnFormatter.has_value() && mRnnFormatter.value() && mSelfRnnState.has_value()
+            && contextState.hasRnnCacheState())
+        {
+            rnnCounterParts = mRnnFormatter.value()->getCounterparts(mSelfRnnState.value(),
+                mSelfState.getCommState().value().getSelfIdx(), contextState.getRnnCacheState().value());
+        }
+        std::vector<SizeType32> allCounterParts = kvCounterParts;
+        // Compute union of counterparts (preserving order, deduplicating)
+        //  KV first, then RNN
+        for (auto rank : rnnCounterParts)
+        {
+            if (std::find(allCounterParts.begin(), allCounterParts.end(), rank) == allCounterParts.end())
+            {
+                allCounterParts.push_back(rank);
+            }
+        }
+
         auto connections = mManager->getConnections(commState);
-        std::vector<executor::kv_cache::Connection const*> counterPartConnections;
-        for (auto index : counterParts)
+        std::vector<executor::kv_cache::Connection const*> allConnections;
+        for (auto index : allCounterParts)
         {
             auto const* connection = connections.at(index);
-            counterPartConnections.emplace_back(connection);
+            allConnections.emplace_back(connection);
         }
-        auto pickUpIdx = mFormatter->pickRecvConnections(counterParts.size(), mSelfState.getCacheState().value(),
-            mSelfState.getCommState().value().getSelfIdx(), destCacheState);
-        for (size_t i = 0; i < counterPartConnections.size(); i++)
+
+        for (size_t i = 0; i < allConnections.size(); i++)
         {
-            auto const* connection = counterPartConnections[i];
+            auto const* connection = allConnections[i];
             // if Manager is agentConnectionManager, then send request info to agent
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
             {
                 // TODO: index -> validConnectionIdx conversion
+                // TODO(shreyasm): this will not work for RNN. Will error out in the constructor if used with RNN.
+                auto pickUpIdx
+                    = mFormatter->pickRecvConnections(kvCounterParts.size(), mSelfState.getCacheState().value(),
+                        mSelfState.getCommState().value().getSelfIdx(), destCacheState, kvCounterParts);
                 auto validConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
@@ -948,9 +993,10 @@ public:
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId), mTerminate},
-            mSelfState, contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
-            requestInfo.getLastBlockKey(), &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty());
+        return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+            std::move(allCounterParts), mSelfState, contextState, resource->mBufferManager,
+            requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
+            !common::getEnvKVCacheTimeOutputPath().empty());
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)

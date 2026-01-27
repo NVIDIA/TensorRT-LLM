@@ -154,6 +154,18 @@ TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheSta
     int peerPPRankEnd = 0;
     std::vector<SizeType32> const& peerNumLayerPerPP = state_specific_detail::getLayerNumPerPP(peerParConfig);
     std::vector<SizeType32> const& selfNumLayerPerPP = state_specific_detail::getLayerNumPerPP(selfParConfig);
+
+    if (selfNumLayerPerPP[selfPPRank] == 0)
+    {
+        return TargetRanksInfo{.mDomainPPSize = 0,
+            .mDomainTPSize = 0,
+            .mDomainCPSize = 0,
+            .mIRanks = {},
+            .mDupHeadFactor = 1,
+            .mPeerDupHeadFactor = 1,
+            .mPeerAttentionLayerNumInDomainPP = {}};
+    }
+
     TLLM_CHECK(peerNumLayerPerPP.size() == peerPPNum);
     TLLM_CHECK(selfNumLayerPerPP.size() == selfPPNum);
     int selfStartLayerId = 0;
@@ -166,6 +178,7 @@ TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheSta
         selfStartLayerId += selfNumLayerPerPP[ppRank];
     }
     int selfEndLayerId = selfStartLayerId + selfNumLayerPerPP[selfPPRank];
+
     int prePeerPPLayerId = 0;
     std::vector<int> targetPeerPPRanks;
     std::vector<int> targetPeerPPLayerNum;

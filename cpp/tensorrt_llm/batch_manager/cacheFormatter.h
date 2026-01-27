@@ -48,7 +48,7 @@ void sendBuffer(TransferSession& session, int deviceId, size_t processIdx,
 void sendAllBuffers(TransferSession& session, int deviceId,
     std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
     runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
-    executor::kv_cache::TargetRanksInfo const& targetInfo);
+    executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections);
 } // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -97,8 +97,8 @@ public:
 
     [[nodiscard]] virtual BaseKVCacheManager* getCacheManager() const noexcept = 0;
 
-    [[nodiscard]] virtual std::vector<size_t> pickRecvConnections(
-        size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
+    [[nodiscard]] virtual std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
         = 0;
 
     /// @brief Destructor.
@@ -137,7 +137,10 @@ public:
 
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
     std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
-        CacheState const& destConfig) const override;
+        CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const override;
+
+    [[nodiscard]] std::vector<size_t> pickSendConnections(size_t numConnections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const;
 
 private:
     BaseKVCacheManager* mCacheManager;

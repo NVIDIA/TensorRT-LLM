@@ -84,10 +84,11 @@ public:
     };
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
-        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
+        executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
+        , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
@@ -142,8 +143,19 @@ public:
         return mLastBlockKey;
     }
 
+    [[nodiscard]] std::vector<SizeType32> const& getCounterPartRanks() const
+    {
+        return mCounterPartRanks;
+    }
+
+    void setCounterPartRanks(std::vector<SizeType32> ranks)
+    {
+        mCounterPartRanks = std::move(ranks);
+    }
+
 private:
     std::vector<Connection const*> mConnections;
+    std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
     DataContext mDataContext;
     executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
     executor::DataTransceiverState mOtherState;

@@ -197,6 +197,13 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_LOG_INFO("Setting up RNN cache transfer components.");
         TLLM_CHECK(!rnnLayerNumPerPP.empty());
 
+        if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL
+            || backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
+        {
+            TLLM_LOG_ERROR("RNN cache transfer is not supported for NIXL and MOONCAKE yet");
+            return;
+        }
+
         mRnnCacheTransBufferManager
             = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(mRnnStateManager, maxNumTokens);
 

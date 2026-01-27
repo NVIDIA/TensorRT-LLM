@@ -54,10 +54,13 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
 
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    auto const targetNum = connections.size();
+    // reuse the same pickUpConnections as in unformat()
+    auto pickUpConnections
+        = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto const targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
-        TLLM_LOG_WARNING("No targets to send RNN state to for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("No targets to send RNN state to for request ID: %ld", llmRequest.mRequestId);
         return;
     }
 
@@ -82,10 +85,10 @@ void RnnCacheFormatter::format(TransferSession& session)
         TLLM_LOG_DEBUG("Try using zero-copy for the RNN cache.");
         NVTX3_SCOPED_RANGE(RnnZeroCopySend);
 
-        TLLM_CHECK(connections.size() == 1);
+        TLLM_CHECK(pickUpConnections.size() == 1);
 
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-        for (size_t i = 0; i < connections.size(); i++)
+        for (size_t i = 0; i < pickUpConnections.size(); i++)
         {
             for (SizeType32 layer = 0; layer < numLocalLayers; layer++)
             {
@@ -99,7 +102,7 @@ void RnnCacheFormatter::format(TransferSession& session)
 
                 // Receive conv state
                 // llmRequest.updateKvCacheSize(slotConv->getSizeInBytes());
-                session.send(i, slotConv->data(), slotConv->getSizeInBytes());
+                session.send(pickUpConnections[i], slotConv->data(), slotConv->getSizeInBytes());
 
                 // Get SSM state for this layer: shape is [maxBatchSize, numHeads, headDim, dState]
                 auto ssmState = mRnnStateManager->getSsmStates(globalLayerIdx);
@@ -109,7 +112,7 @@ void RnnCacheFormatter::format(TransferSession& session)
 
                 // Receive SSM state
                 // llmRequest.updateKvCacheSize(slotSsm->getSizeInBytes());
-                session.send(i, slotSsm->data(), slotSsm->getSizeInBytes());
+                session.send(pickUpConnections[i], slotSsm->data(), slotSsm->getSizeInBytes());
             }
         }
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of RNN cache for the request ID: %ld.",
@@ -184,8 +187,8 @@ void RnnCacheFormatter::format(TransferSession& session)
 
     auto preAllocSendBuffer = mRnnCacheTransBufferManager->getSendBuffer(cacheBufferId);
 
-    sendAllBuffers(
-        session, deviceId, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager, targetInfo);
+    sendAllBuffers(session, deviceId, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
+        targetInfo, pickUpConnections);
 
     session.setTime(TransferSession::kTimeTransmissions);
 
@@ -216,12 +219,19 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     int deviceId;
     TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
 
-    auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
+    auto pickUpConnections
+        = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     auto const sourceNum = pickUpConnections.size();
 
     if (sourceNum == 0)
     {
-        TLLM_LOG_WARNING("No sources to receive RNN state from for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("No sources to receive RNN state from for request ID: %ld", llmRequest.mRequestId);
+        return;
+    }
+
+    if (common::getEnvDisaggLayerwise())
+    {
+        TLLM_LOG_ERROR("Layer-wise RNN cache transfer is not supported yet");
         return;
     }
 
@@ -528,15 +538,21 @@ std::vector<RnnCacheFormatter::SizeType32> RnnCacheFormatter::getCounterparts(
     return targetInfo.mIRanks;
 }
 
-std::vector<size_t> RnnCacheFormatter::pickRecvConnections(
-    size_t numConnections, RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const
+std::vector<size_t> RnnCacheFormatter::pickRecvConnections(size_t numConnections, RnnCacheState const& selfConfig,
+    SizeType32 selfIdx, RnnCacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
 {
-    // no duplication for RNN so all ranks are valid
+    TLLM_CHECK(numConnections == counterPartRanks.size());
+    // Map needed ranks to base indices in counterPartRanks to use for connections
+    // No duplicate handling
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    std::vector<size_t> ret(numConnections);
-    std::iota(ret.begin(), ret.end(), 0);
-    TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
-    return ret;
+    std::vector<size_t> baseIndices;
+    for (auto rank : targetInfo.mIRanks)
+    {
+        auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
+        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
+        baseIndices.push_back(std::distance(counterPartRanks.begin(), it));
+    }
+    return baseIndices;
 }
 
 } // namespace tensorrt_llm::batch_manager
