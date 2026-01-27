@@ -23,7 +23,8 @@ from tensorrt_llm.layers import MoeConfig
 from ..._utils import pad_vocab_size, release_gc, str_dtype_to_torch
 from ...logger import logger
 from ...mapping import Mapping
-from ..convert_utils import get_rope_theta, get_tllm_linear_weight
+from ..convert_utils import (get_rope_scaling, get_rope_theta,
+                             get_tllm_linear_weight)
 
 # `Override num_hidden_layers` used for reduce number of hidden layers in DeepseekV2ForCausalLM for debug purpose
 OVERRIDE_HIDDEN_LAYERS = None  # 2
@@ -54,14 +55,15 @@ def create_trt_config_from_hf(model_dir,
     hidden_act = 'swiglu'  # TRT-LLM request make gated activation explicit for MOE implementation
     rotary_base = get_rope_theta(hf_config)
     rms_norm_eps = hf_config.rms_norm_eps
-    rotary_scaling_beta_fast = hf_config.rope_scaling['beta_fast']
-    rotary_scaling_beta_slow = hf_config.rope_scaling['beta_slow']
-    rotary_scaling_factor = hf_config.rope_scaling['factor']
-    rotary_scaling_mscale = hf_config.rope_scaling['mscale']
-    rotary_scaling_mscale_all_dim = hf_config.rope_scaling['mscale_all_dim']
-    rotary_scaling_original_max_position_embeddings = hf_config.rope_scaling[
+    rope_scaling = get_rope_scaling(hf_config)
+    rotary_scaling_beta_fast = rope_scaling['beta_fast']
+    rotary_scaling_beta_slow = rope_scaling['beta_slow']
+    rotary_scaling_factor = rope_scaling['factor']
+    rotary_scaling_mscale = rope_scaling['mscale']
+    rotary_scaling_mscale_all_dim = rope_scaling['mscale_all_dim']
+    rotary_scaling_original_max_position_embeddings = rope_scaling[
         'original_max_position_embeddings']
-    rotary_scaling_type = 'yarn'
+    rotary_scaling_type = rope_scaling['type']
     kv_lora_rank = hf_config.kv_lora_rank
     q_lora_rank = hf_config.q_lora_rank
     qk_nope_head_dim = hf_config.qk_nope_head_dim

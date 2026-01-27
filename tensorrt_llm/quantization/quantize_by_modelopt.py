@@ -886,7 +886,7 @@ def quantize_and_export(*,
                     pass
                 tensorrt_llm_config["qwen_type"] = qwen_config.model_type
                 if qwen_config.model_type == "qwen2":
-                    from .._utils import get_rope_theta
+                    from ..models.convert_utils import get_rope_theta
                     tensorrt_llm_config[
                         "norm_epsilon"] = qwen_config.rms_norm_eps
                     tensorrt_llm_config["rotary_base"] = get_rope_theta(

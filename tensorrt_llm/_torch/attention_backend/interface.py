@@ -453,15 +453,87 @@ class RopeParams:
     duplicate_data: bool = True
 
     @staticmethod
+    def _is_per_layer_rope_config(config) -> bool:
+        """Check if config has per-layer-type RoPE parameters (e.g., Gemma3)."""
+        hf_rope_parameters = getattr(config, 'rope_parameters', None)
+        if hf_rope_parameters is None:
+            return False
+        return set(
+            hf_rope_parameters.keys()).issubset(ALLOWED_ATTENTION_LAYER_TYPES)
+
+    @staticmethod
+    def from_config_per_layer(config) -> dict:
+        """Create RopeParams for each layer type in a per-layer-type RoPE config.
+
+        Returns a dict like:
+            {"full_attention": RopeParams(...), "sliding_attention": RopeParams(...)}
+
+        Use this method for models with different RoPE parameters per layer type.
+        """
+        hf_rope_parameters = getattr(config, 'rope_parameters', None)
+        assert hf_rope_parameters is not None, (
+            "from_config_per_layer requires config.rope_parameters to exist")
+        assert set(hf_rope_parameters.keys(
+        )).issubset(ALLOWED_ATTENTION_LAYER_TYPES), (
+            "from_config_per_layer requires per-layer-type rope_parameters. "
+            f"Got keys: {hf_rope_parameters.keys()}")
+
+        # Get base parameters that are shared across layer types
+        hidden_size = config.hidden_size
+        num_attention_heads = config.num_attention_heads
+        head_dim = getattr(config, 'head_dim', None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
+        rope_percentage = (getattr(config, 'rotary_pct', None)
+                           or getattr(config, 'partial_rotary_factor', None)
+                           or 1.0)
+        rope_dim = (getattr(config, 'rotary_dim', None)
+                    or getattr(config, 'rotary_emb_base', None)
+                    or getattr(config, 'qk_rope_head_dim', None)
+                    or int(head_dim * rope_percentage))
+
+        result = {}
+        for layer_type, layer_rope_params in hf_rope_parameters.items():
+            rope_params = RopeParams()
+            rope_params.max_positions = config.max_position_embeddings
+            rope_params.theta = layer_rope_params.get('rope_theta', 10000.0)
+            rope_params.dim = rope_dim
+            rope_params.scale_type = RotaryScalingType.none
+            rope_params.scale = 1.0
+            rope_params.max_seq_len = getattr(config, 'max_seq_len', None)
+
+            # Handle per-layer rope scaling if present
+            rope_type = layer_rope_params.get('rope_type')
+            if rope_type and rope_type != 'default':
+                rope_params.scale_type = RotaryScalingType.from_string(
+                    rope_type)
+                rope_params.scale = layer_rope_params.get('factor', 1.0)
+                rope_params.low_freq_factor = layer_rope_params.get(
+                    'low_freq_factor', 1.0)
+                rope_params.high_freq_factor = layer_rope_params.get(
+                    'high_freq_factor', 4.0)
+                rope_params.original_max_positions = layer_rope_params.get(
+                    'original_max_position_embeddings', 1024)
+
+            result[layer_type] = rope_params
+
+        return result
+
+    @staticmethod
     def from_config(config) -> "RopeParams":
         rope_params = RopeParams()
 
         hf_rope_parameters = getattr(config, 'rope_parameters', None)
         if hf_rope_parameters is not None:
-            assert not set(hf_rope_parameters.keys()).issubset(
-                ALLOWED_ATTENTION_LAYER_TYPES), (
-                    "Per-layer-type RoPE configuration is not supported yet.")
-            config.update(hf_rope_parameters)
+            if set(hf_rope_parameters.keys()).issubset(
+                    ALLOWED_ATTENTION_LAYER_TYPES):
+                raise ValueError(
+                    "Per-layer-type RoPE configuration detected. "
+                    "Use RopeParams.from_config_per_layer(config) instead of "
+                    "RopeParams.from_config(config) for models with different RoPE "
+                    "parameters per layer type.")
+            else:
+                config.update(hf_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size

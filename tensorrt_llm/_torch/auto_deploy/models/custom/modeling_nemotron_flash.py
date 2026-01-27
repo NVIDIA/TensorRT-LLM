@@ -14,8 +14,8 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import BatchEncoding
 
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm._utils import get_rope_theta
 from tensorrt_llm.inputs.utils import HF_CHAT_TEMPLATE_EXCEPTIONS
+from tensorrt_llm.models.convert_utils import get_rope_theta
 
 from ..nemotron_flash import NemotronFlashForCausalLMFactory
 

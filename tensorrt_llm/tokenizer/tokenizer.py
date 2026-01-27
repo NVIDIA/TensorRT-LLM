@@ -93,7 +93,27 @@ class TransformersTokenizer(TokenizerBase):
         self.tokenizer.save_pretrained(pretrained_model_dir, **kwargs)
 
     def clean_up_tokenization(self, out_string: str) -> str:
-        return self.tokenizer.clean_up_tokenization(out_string)
+        """Clean up tokenization artifacts (spaces before punctuation, contractions, etc.)
+
+        In transformers v5.0+, this method was removed from the base tokenizer class
+        and moved to model-specific tokenizers. We check if the underlying tokenizer
+        has it, otherwise fall back to the standard English cleanup logic.
+        """
+        if hasattr(self.tokenizer, 'clean_up_tokenization'):
+            return self.tokenizer.clean_up_tokenization(out_string)
+        # Fallback for transformers v5.0+ where the method was removed from base class
+        return (
+            out_string.replace(" .", ".")
+            .replace(" ?", "?")
+            .replace(" !", "!")
+            .replace(" ,", ",")
+            .replace(" ' ", "'")
+            .replace(" n't", "n't")
+            .replace(" 'm", "'m")
+            .replace(" 's", "'s")
+            .replace(" 've", "'ve")
+            .replace(" 're", "'re")
+        )
 
     @property
     def clean_up_tokenization_spaces(self):

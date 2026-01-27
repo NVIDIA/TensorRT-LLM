@@ -19,7 +19,7 @@ from transformers import AutoConfig
 
 from ...layers import MoeConfig
 from ...mapping import Mapping
-from ..convert_utils import get_rope_theta
+from ..convert_utils import get_rope_scaling, get_rope_theta
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -86,24 +86,7 @@ class DeepSeekV2Config(PretrainedConfig):
                 f'Unsupported topk_method in hf_config: {hf_config.topk_method}'
             )
 
-        rotary_scaling = None
-        if hf_config.rope_scaling is not None:
-            rotary_scaling = {
-                'beta_fast':
-                hf_config.rope_scaling['beta_fast'],
-                'beta_slow':
-                hf_config.rope_scaling['beta_slow'],
-                'factor':
-                hf_config.rope_scaling['factor'],
-                'mscale':
-                hf_config.rope_scaling['mscale'],
-                'mscale_all_dim':
-                hf_config.rope_scaling['mscale_all_dim'],
-                'original_max_position_embeddings':
-                hf_config.rope_scaling['original_max_position_embeddings'],
-                'type':
-                hf_config.rope_scaling['type']
-            }
+        rotary_scaling = get_rope_scaling(hf_config)
 
         moe_config = MoeConfig(
             num_experts=hf_config.n_routed_experts,

@@ -15,6 +15,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 import tensorrt_llm
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import get_rope_scaling, get_rope_theta
 from tensorrt_llm.models.llama import convert
 
 
@@ -478,7 +479,7 @@ if __name__ == '__main__':
         'norm_epsilon': hf_config.rms_norm_eps,
         'vocab_size': hf_config.vocab_size,
         'position_embedding_type': 'rope_gpt_neox',
-        'rotary_base': hf_config.rope_theta,
+        'rotary_base': get_rope_theta(hf_config),
         'max_position_embeddings': hf_config.max_position_embeddings,
         'hidden_act': hf_config.hidden_act,
         'use_parallel_embedding': args.use_parallel_embedding,
@@ -494,7 +495,7 @@ if __name__ == '__main__':
         'has_partial_lora_mask':
         hf_config.architectures[0] == 'InternLMXComposer2ForCausalLM',
         'attn_bias': getattr(hf_config, 'bias', False),
-        'rotary_scaling': getattr(hf_config, "rope_scaling", None)
+        'rotary_scaling': get_rope_scaling(hf_config)
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:

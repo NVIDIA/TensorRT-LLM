@@ -17,7 +17,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import (LLaMAForCausalLM, PretrainedConfig,
                                  QWenForCausalLM)
-from tensorrt_llm.models.convert_utils import load_calib_dataset
+from tensorrt_llm.models.convert_utils import (get_rope_scaling, get_rope_theta,
+                                               load_calib_dataset)
 from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
 from tensorrt_llm.models.medusa.weight import (capture_activation_range,
                                                convert_hf_llama, load_medusa_hf)
@@ -207,8 +208,8 @@ def main():
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
         args.n_positions = hf_config.max_position_embeddings
-        args.rotary_base = hf_config.rope_theta
-        args.rotary_scaling = hf_config.rope_scaling
+        args.rotary_base = get_rope_theta(hf_config)
+        args.rotary_scaling = get_rope_scaling(hf_config)
 
     elif args.meta_ckpt_dir is not None:
 
@@ -233,7 +234,7 @@ def main():
     if args.rotary_scaling is not None:
         # assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
         rotary_scaling = {
-            "type": args.rotary_scaling["rope_type"],
+            "type": args.rotary_scaling["type"],
         }
         args.rotary_scaling = rotary_scaling
 

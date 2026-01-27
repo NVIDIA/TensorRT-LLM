@@ -61,10 +61,12 @@ class Gemma3Attention(QKNormRoPEAttention):
     ):
         self.is_sliding = is_sliding
         config = model_config.pretrained_config
-        rope_params = RopeParams.from_config(config)
+        rope_params_per_layer = RopeParams.from_config_per_layer(config)
+        layer_type = "sliding_attention" if is_sliding else "full_attention"
+        rope_params = rope_params_per_layer[layer_type]
+
         self.attention_window_size = None
         if is_sliding:
-            rope_params.theta = config.rope_local_base_freq
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
             self.attention_window_size = config.sliding_window

@@ -6,11 +6,65 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from datasets import load_dataset
 
-# Re-export get_rope_theta from _utils for backward compatibility
-from .._utils import get_rope_theta  # noqa: F401
 from .._utils import torch_dtype_to_str
 from ..logger import logger
 from ..quantization import QuantAlgo
+
+
+def get_rope_theta(config, default: float = 10000.0) -> float:
+    """Get rope_theta from a HuggingFace config object.
+
+    This utility handles both the new Transformers v5 config structure
+    (where rope_theta is inside config.rope_parameters dict) and the
+    legacy structure (where rope_theta is a direct attribute).
+
+    Args:
+        config: A HuggingFace PretrainedConfig object.
+        default: Default value to return if rope_theta is not found.
+
+    Returns:
+        The rope_theta value as a float.
+
+    TODO: Once all HF model configs have migrated to the rope_parameters
+    structure and we no longer need to support legacy configs, simplify
+    this to only check config.rope_parameters['rope_theta'].
+    """
+    # First try Transformers v5+ structure: rope_parameters dict
+    rope_parameters = getattr(config, 'rope_parameters', None)
+    if rope_parameters is not None and isinstance(rope_parameters, dict):
+        return rope_parameters.get('rope_theta', default)
+
+    # Fall back to legacy structure: direct rope_theta attribute
+    return getattr(config, 'rope_theta', default)
+
+
+def get_rope_scaling(config):
+    """Normalize rope_parameters into a rope_scaling-style dict.
+
+    Transformers v5 stores RoPE configuration under config.rope_parameters.
+    This helper returns a dict and ensures both "rope_type" and "type" keys
+    are present for downstream compatibility.
+    """
+    rope_parameters = getattr(config, 'rope_parameters', None)
+    if rope_parameters is None:
+        return None
+
+    if hasattr(rope_parameters, "to_dict"):
+        rope_scaling = rope_parameters.to_dict()
+    elif isinstance(rope_parameters, dict):
+        rope_scaling = dict(rope_parameters)
+    else:
+        try:
+            rope_scaling = dict(rope_parameters)
+        except TypeError:
+            return None
+
+    if "rope_type" in rope_scaling and "type" not in rope_scaling:
+        rope_scaling["type"] = rope_scaling["rope_type"]
+    elif "type" in rope_scaling and "rope_type" not in rope_scaling:
+        rope_scaling["rope_type"] = rope_scaling["type"]
+
+    return rope_scaling
 
 
 def infer_dtype(dtype: str,

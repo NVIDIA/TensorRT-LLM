@@ -27,12 +27,13 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
 
 from .. import profiler
-from .._utils import (get_rope_theta, mpi_rank, str_dtype_to_torch,
-                      str_dtype_to_trt, supports_inflight_batching,
-                      torch_dtype_to_trt, trt_dtype_to_torch)
+from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
+                      supports_inflight_batching, torch_dtype_to_trt,
+                      trt_dtype_to_torch)
 from ..functional import RopeEmbeddingUtils, RotaryScalingType
 from ..layers import MropeParams
 from ..logger import logger
+from ..models.convert_utils import get_rope_theta
 from .enc_dec_model_runner import EncDecModelRunner
 from .model_runner import ModelRunner
 from .session import Session, TensorInfo

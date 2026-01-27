@@ -26,7 +26,7 @@ except ImportError:
     SKIP_EXAONE4_HF_ACCURACY_TEST = True
 
 from _torch.helpers import create_mock_cuda_graph_runner
-from transformers.cache_utils import HybridCache
+from transformers.cache_utils import StaticCache
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -248,11 +248,7 @@ class TestEXAONE4(unittest.TestCase):
         num_kv_heads = exaone4.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
-        hf_cache = HybridCache(config=exaone4_config,
-                               max_batch_size=batch_size,
-                               max_cache_len=max_seq_len,
-                               device=device,
-                               dtype=dtype)
+        hf_cache = StaticCache(config=exaone4_config, max_cache_len=max_seq_len)
         if dtype == torch.half:
             kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
         elif dtype == torch.bfloat16:

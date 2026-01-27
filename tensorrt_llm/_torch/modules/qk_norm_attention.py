@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
-from ..._utils import get_rope_theta
+from ...models.convert_utils import get_rope_theta
 from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention

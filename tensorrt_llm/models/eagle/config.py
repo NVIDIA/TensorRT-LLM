@@ -19,7 +19,7 @@ from typing import Optional, Union
 from transformers import LlamaConfig
 
 from ...mapping import Mapping
-from ..convert_utils import get_rope_theta, infer_dtype
+from ..convert_utils import get_rope_scaling, get_rope_theta, infer_dtype
 from ..llama.config import LLaMAConfig
 from ..modeling_utils import QuantAlgo, QuantConfig
 
@@ -83,7 +83,7 @@ class EagleConfig(LLaMAConfig):
             n_kv_head = hf_config.num_key_value_heads
             rms_norm_eps = hf_config.rms_norm_eps
             vocab_size = hf_config.vocab_size
-            rotary_scaling = hf_config.rope_scaling
+            rotary_scaling = get_rope_scaling(hf_config)
             rotary_base = get_rope_theta(hf_config)
             n_positions = hf_config.max_position_embeddings
             hidden_act = hf_config.hidden_act
@@ -120,9 +120,8 @@ class EagleConfig(LLaMAConfig):
         if rotary_scaling is not None:
             # assert use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
             rotary_scaling = {
-                "type": rotary_scaling["rope_type"],
+                "type": rotary_scaling["type"],
             }
-            rotary_scaling = rotary_scaling
 
         eagle_net_config = {
             'architecture': "LlamaForCausalLM",
