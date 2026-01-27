@@ -3722,8 +3722,8 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
         target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-4B"
 
         draft_len = 3
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir)
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=draft_len, speculative_model_dir=eagle_model_dir)
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
