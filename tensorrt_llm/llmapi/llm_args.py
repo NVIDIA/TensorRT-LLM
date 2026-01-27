@@ -864,8 +864,7 @@ class LayerwiseBenchmarksConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_calibration_file_path(self) -> 'LayerwiseBenchmarksConfig':
-        if self.calibration_mode in ["COLLECT", "REPLAY"
-                                     ] and not self.calibration_file_path:
+        if self.calibration_mode == "COLLECT" and not self.calibration_file_path:
             raise ValueError(
                 f"Expect calibration_file_path not to be empty when work on {self.calibration_mode} mode"
             )
@@ -2967,6 +2966,7 @@ class TorchLlmArgs(BaseLlmArgs):
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
                                    description="Allreduce strategy to use.",
                                    status="beta")
+
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description=
