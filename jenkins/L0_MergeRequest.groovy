@@ -1664,6 +1664,53 @@ pipeline {
                 }
             }
         }
+        stage("Test GitHub Tag (Early)") {
+            when {
+                expression { env.TEST_GITHUB_TAG_EARLY == 'true' }
+            }
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "  EARLY TEST MODE: Testing GitHub Tag"
+                    echo "=========================================="
+                    echo "This stage runs BEFORE actual tests for quick validation"
+                    echo "Set TEST_GITHUB_TAG_EARLY=true to enable this stage"
+                    echo ""
+
+                    // Create a temporary pod spec for testing
+                    def testPodSpec = createKubernetesPodConfig("", "agent")
+                    trtllm_utils.launchKubernetesPod(this, testPodSpec, "alpine", {
+                        stage("Early GitHub Tag Test") {
+                            echo "[TEST] Environment:"
+                            echo "[TEST] JOB_NAME=${env.JOB_NAME}"
+                            echo "[TEST] BUILD_NUMBER=${env.BUILD_NUMBER}"
+                            echo "[TEST] gitlabCommit=${env.gitlabCommit}"
+                            echo "[TEST] gitlabTargetBranch=${env.gitlabTargetBranch}"
+                            echo "[TEST] GITHUB_PR_API_URL=${globalVars[GITHUB_PR_API_URL]}"
+                            echo "[TEST] TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
+                            echo ""
+
+                            // Install git in alpine
+                            trtllm_utils.llmExecStepWithRetry(this, script: "which git || apk add --no-cache git", sleepTime: 10)
+
+                            // Test the tag creation function directly
+                            echo "Testing createGithubTag function..."
+                            def result = createGithubTag(globalVars)
+
+                            echo ""
+                            echo "=========================================="
+                            echo "  EARLY TEST RESULT: ${result ? '✅ SUCCESS' : '❌ FAILED'}"
+                            echo "=========================================="
+                            echo ""
+
+                            if (!result) {
+                                error "Early GitHub tag test failed!"
+                            }
+                        }
+                    })
+                }
+            }
+        }
         stage("Build And Test") {
             steps {
                 script {
