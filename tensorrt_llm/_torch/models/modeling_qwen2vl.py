@@ -1043,6 +1043,11 @@ class Qwen2VLModel(Qwen2VLModelBase):
             "multimodal_embedding"
         ]
 
+    @classmethod
+    def get_llmapi_defaults(cls) -> dict:
+        """Return model-specific LLM API defaults."""
+        return {"enable_chunked_prefill": False}
+
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if not _is_disagg():
             self.mm_encoder.load_weights(weights)

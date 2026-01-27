@@ -3,6 +3,7 @@ import tempfile
 import pydantic_core
 import pytest
 import yaml
+from pydantic import BaseModel
 
 import tensorrt_llm.bindings.executor as tle
 from tensorrt_llm import LLM as TorchLLM
@@ -192,6 +193,95 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
+
+
+def test_merge_llm_configs_with_defaults_simple_field():
+    llm_args = {}
+    model_defaults = {"enable_chunked_prefill": False}
+    merged = merge_llm_configs_with_defaults(llm_args, model_defaults)
+    assert merged["enable_chunked_prefill"] is False
+
+
+def test_merge_llm_configs_with_defaults_nested_config():
+    llm_args = {"kv_cache_config": {"enable_block_reuse": True}}
+    model_defaults = {"kv_cache_config": {"enable_block_reuse": False}}
+    merged = merge_llm_configs_with_defaults(llm_args, model_defaults)
+    assert isinstance(merged["kv_cache_config"], KvCacheConfig)
+    assert merged["kv_cache_config"].enable_block_reuse is True
+
+
+def test_merge_llm_configs_with_defaults_preserves_user_override():
+    llm_args = {"enable_chunked_prefill": True}
+    model_defaults = {"enable_chunked_prefill": False}
+    merged = merge_llm_configs_with_defaults(llm_args, model_defaults)
+    assert merged["enable_chunked_prefill"] is True
+
+
+def test_compute_applied_llm_defaults_simple_field():
+    model_defaults = {"enable_chunked_prefill": False}
+    applied = compute_applied_llm_defaults(model_defaults, {})
+    assert applied == model_defaults
+
+
+def test_compute_applied_llm_defaults_skips_overridden_nested_fields():
+    model_defaults = {
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "max_tokens": 128
+        }
+    }
+    user_overrides = {"kv_cache_config": {"enable_block_reuse": True}}
+    applied = compute_applied_llm_defaults(model_defaults, user_overrides)
+    assert applied == {"kv_cache_config": {"max_tokens": 128}}
+
+
+class _DummyInner(BaseModel):
+    a: int = 1
+    b: int = 2
+
+
+class _DummyOuter(BaseModel):
+    inner: _DummyInner = _DummyInner()
+    c: int = 3
+
+
+def test_extract_llm_args_overrides_uses_fields_set():
+    obj = _DummyOuter(inner=_DummyInner(b=10))
+    overrides = extract_llm_args_overrides(obj)
+    assert overrides == {"inner": {"b": 10}}
+
+
+def test_apply_model_defaults_qwen3next_disables_block_reuse():
+    from tensorrt_llm._torch.models.modeling_qwen3_next import \
+        Qwen3NextForCausalLM
+    llm_args = TorchLlmArgs(model=llama_model_path)
+    assert llm_args.kv_cache_config.enable_block_reuse is True
+    applied = apply_model_defaults_to_llm_args(
+        llm_args, Qwen3NextForCausalLM.get_llmapi_defaults())
+    assert applied == {"kv_cache_config": {"enable_block_reuse": False}}
+    assert llm_args.kv_cache_config.enable_block_reuse is False
+
+
+def test_apply_model_defaults_respects_user_override():
+    from tensorrt_llm._torch.models.modeling_qwen3_next import \
+        Qwen3NextForCausalLM
+    llm_args = TorchLlmArgs(
+        model=llama_model_path,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=True))
+    applied = apply_model_defaults_to_llm_args(
+        llm_args, Qwen3NextForCausalLM.get_llmapi_defaults())
+    assert applied == {}
+    assert llm_args.kv_cache_config.enable_block_reuse is True
+
+
+def test_apply_model_defaults_qwen2vl_disables_chunked_prefill():
+    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLModel
+    llm_args = TorchLlmArgs(model=llama_model_path)
+    assert llm_args.enable_chunked_prefill is True
+    applied = apply_model_defaults_to_llm_args(
+        llm_args, Qwen2VLModel.get_llmapi_defaults())
+    assert applied == {"enable_chunked_prefill": False}
+    assert llm_args.enable_chunked_prefill is False
 
 
 def check_defaults(py_config_cls, pybind_config_cls):
