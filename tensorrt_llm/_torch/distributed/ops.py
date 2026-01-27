@@ -1,7 +1,9 @@
+import json
 import math
 import os
 import platform
 import threading
+import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -20,6 +22,29 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 _thread_local = threading.local()
+
+_DEBUG_LOG_PATH = "/Users/lschneider/git/TensorRT-LLM/.cursor/debug.log"
+
+
+def _write_debug_log(location: str,
+                     message: str,
+                     data: Dict,
+                     hypothesis_id: str,
+                     run_id: str = "pre-fix") -> None:
+    payload = {
+        "sessionId": "debug-session",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(payload) + "\n")
+    except OSError:
+        return
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -790,6 +815,25 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
+        # #region agent log
+        _write_debug_log(
+            "ops.py:AllReduce.forward",
+            "entry",
+            {
+                "tp_size": self.mapping.tp_size,
+                "tp_rank": self.mapping.tp_rank,
+                "strategy": int(allreduce_strategy),
+                "disable_mpi": self._disable_mpi,
+                "has_symm_mem": self.symm_mem_allreduce is not None,
+                "has_mnnvl": self.mnnvl_allreduce is not None,
+                "fusion_op": int(all_reduce_params.fusion_op),
+                "input_shape": list(input.shape),
+                "input_dtype": str(input.dtype),
+            },
+            "H1",
+        )
+        # #endregion
+
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
         if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
@@ -798,6 +842,17 @@ class AllReduce(nn.Module):
                 logger.debug(
                     f"Using SymmetricMemoryAllReduce (MULTIMEM) for input shape {input.shape}"
                 )
+                # #region agent log
+                _write_debug_log(
+                    "ops.py:AllReduce.forward",
+                    "used symm_mem allreduce",
+                    {
+                        "fusion_op": int(all_reduce_params.fusion_op),
+                        "input_shape": list(input.shape),
+                    },
+                    "H4",
+                )
+                # #endregion
                 return symm_mem_output
         elif self.symm_mem_allreduce and all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
             # Log once per rank that we're skipping symm_mem due to fusion
@@ -806,6 +861,17 @@ class AllReduce(nn.Module):
                 key=(self.mapping.tp_rank, all_reduce_params.fusion_op,
                      "debug_fusion_skip"),
             )
+            # #region agent log
+            _write_debug_log(
+                "ops.py:AllReduce.forward",
+                "skipped symm_mem due to fusion",
+                {
+                    "fusion_op": int(all_reduce_params.fusion_op),
+                    "input_shape": list(input.shape),
+                },
+                "H4",
+            )
+            # #endregion
 
         # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:
@@ -836,6 +902,18 @@ class AllReduce(nn.Module):
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+            # #region agent log
+            _write_debug_log(
+                "ops.py:AllReduce.forward",
+                "calling tunable_allreduce",
+                {
+                    "strategy": int(allreduce_strategy),
+                    "fusion_op": int(all_reduce_params.fusion_op),
+                    "disable_autotune": disable_allreduce_autotune,
+                },
+                "H5",
+            )
+            # #endregion
             output = torch.ops.trtllm.tunable_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,
@@ -851,6 +929,18 @@ class AllReduce(nn.Module):
                 trigger_completion_at_end,
             )
         else:
+            # #region agent log
+            _write_debug_log(
+                "ops.py:AllReduce.forward",
+                "calling all_reduce_op",
+                {
+                    "strategy": int(allreduce_strategy),
+                    "fusion_op": int(all_reduce_params.fusion_op),
+                    "disable_mpi": self._disable_mpi,
+                },
+                "H5",
+            )
+            # #endregion
             output = self.all_reduce_op(
                 input=input,
                 residual=all_reduce_params.residual,

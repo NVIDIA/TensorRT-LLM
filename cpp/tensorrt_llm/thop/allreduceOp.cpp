@@ -52,9 +52,12 @@
 #include <nvml.h>
 #include <torch/extension.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <unordered_set>
 
 // using namespace nvinfer1;
@@ -82,6 +85,23 @@ struct overloaded : Ts...
 };
 template <class... Ts>
 overloaded(Ts...) -> overloaded<Ts...>;
+
+constexpr char const* kDebugLogPath = "/Users/lschneider/git/TensorRT-LLM/.cursor/debug.log";
+
+inline void write_debug_log(char const* location, char const* message, std::string const& data,
+    char const* hypothesisId, char const* runId = "pre-fix")
+{
+    using namespace std::chrono;
+    auto const ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    std::ofstream file(kDebugLogPath, std::ios::app);
+    if (!file.is_open())
+    {
+        return;
+    }
+    file << "{\"sessionId\":\"debug-session\",\"runId\":\"" << runId << "\",\"hypothesisId\":\"" << hypothesisId
+         << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":" << data
+         << ",\"timestamp\":" << ts << "}\n";
+}
 
 class NvmlManager
 {
@@ -295,6 +315,20 @@ public:
         auto const rank = getRank();
         TLLM_LOG_DEBUG(
             "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
+        // #region agent log
+        {
+            std::ostringstream data;
+            data << "{"
+                 << "\"rank\":" << rank << ","
+                 << "\"seq_len\":" << seq_len << ","
+                 << "\"hidden_size\":" << hidden_size << ","
+                 << "\"numel\":" << size << ","
+                 << "\"bytes_per_element\":" << bytes_per_element << ","
+                 << "\"runtime_strategy\":" << static_cast<int>(runtime_strategy) << ","
+                 << "\"configured_strategy\":" << static_cast<int>(mStrategy) << "}";
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "selected runtime strategy", data.str(), "H1");
+        }
+        // #endregion
 
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
@@ -453,6 +487,17 @@ private:
         // Use ProcessGroup's allreduce directly and return early
         if (mNcclComm.index() == 1)
         {
+            // #region agent log
+            {
+                std::ostringstream data;
+                data << "{"
+                     << "\"comm_index\":1,"
+                     << "\"numel\":" << input.numel() << ","
+                     << "\"element_size\":" << input.element_size() << "}";
+                write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "process group path", data.str(), "H2");
+            }
+            // #endregion
+
             auto torchPg = std::get<1>(mNcclComm);
 
             torch::Tensor reduceOutput = input.clone();
@@ -551,6 +596,24 @@ private:
         void* outputPtr = windowBuffer1.ptr;
 
         // Perform allreduce
+        // #region agent log
+        {
+            std::ostringstream data;
+            data << "{"
+                 << "\"comm_index\":0,"
+                 << "\"numel\":" << size << ","
+                 << "\"buffer_bytes\":" << bufferSizeBytes << ","
+                 << "\"min_registration_threshold\":" << minRegistrationThreshold << ","
+                 << "\"n_ranks\":" << nRanks << ","
+                 << "\"nvlink_supported\":" << (mIsNVLINKSupported ? "true" : "false") << ","
+                 << "\"mnnvl_supported\":" << (mIsMNNVLSupported ? "true" : "false") << ","
+                 << "\"env_threshold_set\":" << (envThreshold != nullptr ? "true" : "false") << ","
+                 << "\"input_window_valid\":" << (windowBuffer0.isValid() ? "true" : "false") << ","
+                 << "\"input_ptr_is_window\":" << (inputPtr == windowBuffer0.ptr ? "true" : "false") << "}";
+            write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "pre ncclAllReduce", data.str(), "H3");
+        }
+        // #endregion
+
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
@@ -1279,6 +1342,29 @@ std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::opti
     bool const trigger_completion_at_end_)
 {
 #if ENABLE_MULTI_DEVICE
+    // #region agent log
+    {
+        std::ostringstream data;
+        data << "{"
+             << "\"input_numel\":" << input.numel() << ","
+             << "\"input_dim0\":" << input.size(0) << ","
+             << "\"input_dim_last\":" << input.size(-1) << ","
+             << "\"input_device_index\":" << input.get_device() << ","
+             << "\"input_is_cuda\":" << (input.is_cuda() ? "true" : "false") << ","
+             << "\"strategy_arg\":" << strategy_ << ","
+             << "\"fusion_op_arg\":" << fusion_op_ << ","
+             << "\"eps\":" << eps_ << ","
+             << "\"group_size\":" << group_.size() << ","
+             << "\"has_residual\":" << (residual.has_value() ? "true" : "false") << ","
+             << "\"has_norm_weight\":" << (norm_weight.has_value() ? "true" : "false") << ","
+             << "\"has_scale\":" << (scale.has_value() ? "true" : "false") << ","
+             << "\"has_bias\":" << (bias.has_value() ? "true" : "false") << ","
+             << "\"has_workspace\":" << (workspace.has_value() ? "true" : "false") << ","
+             << "\"trigger_completion_at_end\":" << (trigger_completion_at_end_ ? "true" : "false") << "}";
+        write_debug_log("allreduceOp.cpp:allreduce_raw", "entry args", data.str(), "H1");
+    }
+    // #endregion
+
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
     auto const strategy = static_cast<AllReduceStrategyType>(int8_t(strategy_));
     auto const fusion_op = static_cast<AllReduceFusionOp>(int8_t(fusion_op_));
