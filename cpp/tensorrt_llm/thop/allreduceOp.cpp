@@ -55,6 +55,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -93,14 +94,18 @@ inline void write_debug_log(char const* location, char const* message, std::stri
 {
     using namespace std::chrono;
     auto const ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    std::ofstream file(kDebugLogPath, std::ios::app);
-    if (!file.is_open())
-    {
-        return;
-    }
-    file << "{\"sessionId\":\"debug-session\",\"runId\":\"" << runId << "\",\"hypothesisId\":\"" << hypothesisId
+    std::ostringstream line;
+    line << "{\"sessionId\":\"debug-session\",\"runId\":\"" << runId << "\",\"hypothesisId\":\"" << hypothesisId
          << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":" << data
-         << ",\"timestamp\":" << ts << "}\n";
+         << ",\"timestamp\":" << ts << "}";
+    std::fprintf(stderr, "%s\n", line.str().c_str());
+    std::fflush(stderr);
+
+    std::ofstream file(kDebugLogPath, std::ios::app);
+    if (file.is_open())
+    {
+        file << line.str() << "\n";
+    }
 }
 
 class NvmlManager
