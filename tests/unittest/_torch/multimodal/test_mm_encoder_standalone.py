@@ -12,9 +12,10 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs import default_multimodal_input_loader
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
-                                 KvCacheConfig)
+                                 KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
 test_data_root = Path(
@@ -85,6 +86,12 @@ def _is_fake_checkpoint(model_dir: Path) -> bool:
     return (model_dir / _FAKE_CHECKPOINT_MARKER).exists()
 
 
+def _get_moe_config_for_blackwell() -> MoeConfig:
+    if get_sm_version() >= 100:
+        return MoeConfig(backend="DEEPGEMM")
+    return MoeConfig()
+
+
 @pytest.mark.parametrize(
     "prompts,expected_num_duplicates",
     [
@@ -123,10 +130,12 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,  # Enable KV cache events
     )
+    moe_config = _get_moe_config_for_blackwell()
 
     llm = LLM(model=encoder_model_dir,
               backend='pytorch',
               kv_cache_config=kv_cache_config,
+              moe_config=moe_config,
               max_batch_size=1)
 
     inputs = _load_inputs(llm, prompts, media)
@@ -192,10 +201,12 @@ def llms(model_dir: Path,
     )
 
     load_kwargs = _get_fake_checkpoint_kwargs(model_dir)
+    moe_config = _get_moe_config_for_blackwell()
     llm = LLM(
         model=model_dir,
         backend='pytorch',
         kv_cache_config=kv_cache_config,
+        moe_config=moe_config,
         trust_remote_code=True,
         cache_transceiver_config=cache_transceiver_cfg,
         disable_overlap_scheduler=disable_overlap_scheduler,
@@ -208,6 +219,7 @@ def llms(model_dir: Path,
                 model=model_dir,
                 backend='pytorch',
                 kv_cache_config=kv_cache_config,
+                moe_config=moe_config,
                 trust_remote_code=True,
                 cache_transceiver_config=cache_transceiver_cfg,
                 **load_kwargs,
