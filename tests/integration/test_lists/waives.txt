@@ -401,3 +401,5 @@ accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16 SKIP (https:
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (https://nvbugs/5838199)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass-auto] SKIP (https://nvbugs/5838211)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] SKIP (https://nvbugs/5839028)
+unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestNoBatching::test_naive_0 SKIP (https://nvbugs/5841954)
+unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP] SKIP (https://nvbugs/5841976)
