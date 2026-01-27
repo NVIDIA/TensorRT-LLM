@@ -20,16 +20,11 @@ import pytest
 import torch
 from build_and_run_ad import ExperimentConfig, main
 from defs.conftest import llm_models_root
-from transformers import AutoConfig
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy.llm import LLM
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import Eagle3LlamaConfig
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle_one_model import EagleDrafterFactory
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
-
-# Register Eagle3LlamaConfig with AutoConfig so it can be loaded via AutoConfig.from_pretrained
-AutoConfig.register(Eagle3LlamaConfig.model_type, Eagle3LlamaConfig)
 
 prompts = [
     "What is the capital of France?",
@@ -343,37 +338,21 @@ def _analyze_weight_loading(model_path: Path, model: torch.nn.Module):
     return loaded_keys, missing_in_checkpoint, unexpected_in_checkpoint
 
 
-@pytest.fixture
-def register_eagle3_config():
-    """Temporarily register Eagle3LlamaConfig with AutoConfig for the test.
+def test_eagle_model_with_weights():
+    """Test EagleModel forward pass with loaded weights using the EagleDrafterFactory.
 
-    This fixture registers the config before the test runs and cleans up after,
-    ensuring no global state leaks between tests.
-    """
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-    AutoConfig.register(Eagle3LlamaConfig.model_type, Eagle3LlamaConfig)
-    yield
-    # Cleanup: remove the registration
-    CONFIG_MAPPING._extra_content.pop(Eagle3LlamaConfig.model_type, None)
-
-
-def test_eagle_model_with_weights(register_eagle3_config):
-    """Test EagleModel forward pass with loaded weights using the factory interface.
-
-    This test uses AutoModelForCausalLMFactory (hf.py) to initialize the model,
-    which mimics how the model is initialized in the actual AutoDeploy pipeline:
+    This test uses EagleDrafterFactory to initialize the model, which directly
+    builds the Eagle drafter model based on the checkpoint's model_type:
 
     1. Factory creates config via AutoConfig.from_pretrained
-    2. Factory looks up Eagle3LlamaConfig in _custom_model_mapping
-    3. Factory creates Eagle3DrafterForCausalLM via _from_config
+    2. Factory selects Eagle3DrafterForCausalLM based on model_type="llama"
+    3. Factory creates model via _from_config
     4. Factory loads weights via load_or_random_init -> _load_checkpoint
-       which uses accelerate's load_checkpoint_in_model
 
     This ensures the test validates the exact initialization path used in production.
     """
     print("\n" + "=" * 80)
-    print("Test: EagleModel forward pass with loaded weights (via factory interface)")
+    print("Test: EagleModel forward pass with loaded weights (via EagleDrafterFactory)")
     print("=" * 80)
 
     _, _, eagle_model_path = get_model_paths()
@@ -392,23 +371,18 @@ def test_eagle_model_with_weights(register_eagle3_config):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 2. Create factory
-    # This mimics how AutoDeploy initializes models in the actual pipeline:
-    # - Eagle3LlamaConfig is registered with AutoConfig (via fixture above)
-    # - Eagle3DrafterForCausalLM is registered in _custom_model_mapping
-    print("Creating AutoModelForCausalLMFactory...")
-    factory = AutoModelForCausalLMFactory(
+    # EagleDrafterFactory directly builds the correct drafter model based on model_type
+    print("Creating EagleDrafterFactory...")
+    factory = EagleDrafterFactory(
         model=eagle_model_path,
         skip_loading_weights=False,  # We want to test weight loading
-        model_kwargs={
-            "model_type": "Eagle3LlamaForCausalLM",
-        },
     )
 
-    # 3. Build model using factory (mimics actual pipeline)
+    # 3. Build model using factory
     # Factory flow:
     #   build_model() -> prefetch_checkpoint() -> _build_model()
-    #   _build_model() -> _get_model_config()
-    #   _build_model() -> checks _custom_model_mapping["Eagle3LlamaConfig"]
+    #   _build_model() -> _get_model_config() (gets base LlamaConfig)
+    #   _build_model() -> selects Eagle3DrafterForCausalLM for model_type="llama"
     #   _build_model() -> Eagle3DrafterForCausalLM._from_config(config)
     print("Building model via factory.build_model('meta')...")
     model = factory.build_model("meta")

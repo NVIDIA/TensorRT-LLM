@@ -16,7 +16,6 @@
 """Unit tests for Eagle3 model with AutoDeploy."""
 
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -29,7 +28,8 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3LlamaConfig,
     Eagle3Model,
 )
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle_one_model import EagleDrafterFactory
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tests.test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
@@ -79,41 +79,39 @@ class MockEagle3ModelForCausalLM(Eagle3DrafterForCausalLM):
         return super().forward(input_ids, **kwargs)
 
 
-@pytest.fixture
-def use_mock_eagle3():
-    """Mock the factory to use MockEagle3 classes without global registration.
+class MockEagleDrafterFactory(EagleDrafterFactory):
+    """Test factory that uses MockEagle3ModelForCausalLM for standalone Eagle testing.
 
-    This fixture patches AutoModelForCausalLMFactory to recognize mock_eagle3 model_type
-    by mocking two key methods:
-    1. _override_model_type: Returns MockEagle3Config
-    2. _custom_model_mapping: Includes MockEagle3ModelForCausalLM for "MockEagle3Config"
-
-    Usage:
-        def test_eagle_model(use_mock_eagle3):
-            # ... test code where the model is hardcoded to use MockEagle3ModelForCausalLM
+    This factory overrides the drafter mapping to use the mock model class which
+    generates random hidden states, enabling testing without a target model.
     """
 
-    def patched_override_model_type(self, model_config, model_kwargs):
-        return MockEagle3Config.from_dict(model_config.to_dict())
-
-    # Create a copy of the existing mapping and add our mock model
-    patched_mapping = AutoModelForCausalLMFactory._custom_model_mapping.copy()
-    patched_mapping["MockEagle3Config"] = MockEagle3ModelForCausalLM
-
-    with patch.object(
-        AutoModelForCausalLMFactory, "_override_model_type", patched_override_model_type
-    ):
-        with patch.object(AutoModelForCausalLMFactory, "_custom_model_mapping", patched_mapping):
-            yield  # Keep patches active during test
+    _drafter_model_mapping = {
+        "llama": MockEagle3ModelForCausalLM,
+    }
 
 
-def test_build_ad_eagle(use_mock_eagle3):
-    """Test building Eagle model with AutoDeploy using the mock fixture.
+@pytest.fixture
+def register_mock_eagle_factory():
+    """Register MockEagleDrafterFactory for the test and clean up afterwards.
 
-    This test uses the use_mock_eagle3 fixture which mocks the factory
-    to recognize MockEagle3ModelForCausalLM.
+    This fixture temporarily registers the mock factory with ModelFactoryRegistry,
+    allowing tests to use model_factory="MockEagleDrafter", and removes the
+    registration after the test completes.
+    """
+    ModelFactoryRegistry._registry["MockEagleDrafter"] = MockEagleDrafterFactory
+    yield
+    ModelFactoryRegistry._registry.pop("MockEagleDrafter", None)
+
+
+def test_build_ad_eagle(register_mock_eagle_factory):
+    """Test building Eagle model with AutoDeploy using MockEagleDrafterFactory.
+
+    This test uses the MockEagleDrafterFactory which builds MockEagle3ModelForCausalLM,
+    a mock model that generates random hidden states for standalone Eagle testing.
     """
     llm_extra_args = {
+        "model_factory": "MockEagleDrafter",
         "transforms": {
             "insert_cached_attention": {"backend": "flashinfer"},
             "compile_model": {"backend": "torch-compile"},
