@@ -130,13 +130,6 @@ def _run_ssm_prefill(
     chunk_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], int, int, int, int]:
-    """Run SSM prefill.
-
-    Args:
-        out: Optional preallocated output tensor. If provided, the output is written
-            directly to this tensor and y_prefill is returned as None. This avoids
-            an extra memcpy when merging prefill and decode outputs.
-    """
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
@@ -160,57 +153,33 @@ def _run_ssm_prefill(
         chunk_indices = None
         chunk_offsets = None
 
-    if out is not None:
-        # Preallocation path: output written to 'out', returns only varlen_states
-        varlen_states = mamba_chunk_scan_combined(
-            hs_prefill,
-            dt_prefill,
-            A,
-            B_prefill,
-            C_prefill,
-            chunk_size=chunk_size,
-            D=D,
-            z=None,
-            dt_bias=dt_bias,
-            initial_states=initial_states,
-            seq_idx=seq_idx_prefill,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            cu_seqlens=cu_seqlen[: num_prefill + 1],
-            dt_softplus=True,
-            dt_limit=(time_step_limit[0], time_step_limit[1]),
-            return_final_states=False,
-            return_varlen_states=True,
-            out=out,
-            state_dtype=ssm_state_cache.dtype,
-        )
-        y_prefill = None
-    else:
-        # Standard path: returns (y_prefill, varlen_states)
-        y_prefill, varlen_states = mamba_chunk_scan_combined(
-            hs_prefill,
-            dt_prefill,
-            A,
-            B_prefill,
-            C_prefill,
-            chunk_size=chunk_size,
-            D=D,
-            z=None,
-            dt_bias=dt_bias,
-            initial_states=initial_states,
-            seq_idx=seq_idx_prefill,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            cu_seqlens=cu_seqlen[: num_prefill + 1],
-            dt_softplus=True,
-            dt_limit=(time_step_limit[0], time_step_limit[1]),
-            return_final_states=False,
-            return_varlen_states=True,
-            mamba_ssm_cache_dtype=ssm_state_cache.dtype,
-        )
+    varlen_states = mamba_chunk_scan_combined(
+        hs_prefill,
+        dt_prefill,
+        A,
+        B_prefill,
+        C_prefill,
+        chunk_size=chunk_size,
+        D=D,
+        z=None,
+        dt_bias=dt_bias,
+        initial_states=initial_states,
+        seq_idx=seq_idx_prefill,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        cu_seqlens=cu_seqlen[: num_prefill + 1],
+        dt_softplus=True,
+        dt_limit=(time_step_limit[0], time_step_limit[1]),
+        return_final_states=False,
+        return_varlen_states=True,
+        state_dtype=ssm_state_cache.dtype,
+        out=out,
+    )
 
-    ssm_state_cache.index_copy_(0, slot_idx[:num_prefill], varlen_states.to(ssm_state_cache.dtype))
-    return y_prefill, num_prefill, num_prefill_tokens, num_total_tokens, num_seq
+    ssm_state_cache.index_copy_(
+        0, slot_idx[:num_prefill].long(), varlen_states.to(ssm_state_cache.dtype)
+    )
+    return num_prefill, num_prefill_tokens, num_total_tokens, num_seq
 
 
 def _prepare_ssm_decode_inputs(
@@ -257,33 +226,6 @@ def _prepare_ssm_decode_inputs(
     D_full = D[..., None].expand(num_heads, head_dim)
 
     return slot_idx_decode, x_decode, B_decode, C_decode, dt_hp, dt_bias_hp, A_full, D_full
-
-
-def _merge_ssm_outputs(
-    hidden_states: torch.Tensor,
-    y_prefill: Optional[torch.Tensor],
-    y_decode: Optional[torch.Tensor],
-    num_prefill: int,
-    num_decode: int,
-    num_prefill_tokens: int,
-    num_total_tokens: int,
-    bs: int,
-    b: int,
-    s: int,
-    num_heads: int,
-    head_dim: int,
-) -> torch.Tensor:
-    if num_prefill > 0 and num_decode > 0:
-        y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
-        y_flat = y.view(bs, *y.shape[2:])
-        y_flat[:num_prefill_tokens].copy_(y_prefill[0])
-        y_flat[num_prefill_tokens:num_total_tokens].copy_(y_decode)
-        return y
-    if num_prefill > 0:
-        return y_prefill[0].view(b, s, num_heads, head_dim).to(hidden_states.dtype)
-    if num_decode > 0:
-        return y_decode.view(b, s, num_heads, head_dim).to(hidden_states.dtype)
-    return torch.empty_like(hidden_states)
 
 
 class BaseBackendSSM(AttentionDescriptor):

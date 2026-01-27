@@ -57,7 +57,6 @@ def _triton_cached_ssm(
         hidden_states, B, C, dt
     )
     ssm_state_size = B.shape[3]
-
     # Preallocate output tensor to avoid memcpy cost for merging prefill
     # and decode outputs
     preallocated_ssm_out = torch.empty(
@@ -65,16 +64,13 @@ def _triton_cached_ssm(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-
-    # Get batch info for slicing
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
-
     preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
     preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
 
-    # Prefill: use helper with preallocated output
-    _, num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
+    num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
         hs_flat,
         B_flat,
         C_flat,
@@ -92,10 +88,10 @@ def _triton_cached_ssm(
         ssm_state_cache,
         time_step_limit,
         chunk_size,
-        out=preallocated_ssm_out_p.unsqueeze(0),
+        preallocated_ssm_out_p.unsqueeze(0),
     )
 
-    # Decode: batch single-token updates via selective_state_update
+    num_decode = num_total_tokens - num_prefill_tokens
     decode_inputs = _prepare_ssm_decode_inputs(
         hs_flat,
         B_flat,
@@ -140,7 +136,6 @@ def _triton_cached_ssm(
             out=preallocated_ssm_out_d,
         )
 
-    # Return the preallocated output reshaped to original dimensions
     if num_total_tokens > 0:
         return (
             preallocated_ssm_out[:num_total_tokens]

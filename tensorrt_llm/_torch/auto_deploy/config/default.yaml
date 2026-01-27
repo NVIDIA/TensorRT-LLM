@@ -163,7 +163,7 @@ transforms:
     backend: MultiHeadLatentAttention
   insert_cached_ssm_attention:
     stage: cache_init
-    backend: flashinfer_ssm
+    backend: triton_ssm
   insert_cached_causal_conv:
     stage: cache_init
     backend: cuda_causal_conv

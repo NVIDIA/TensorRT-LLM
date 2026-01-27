@@ -6,7 +6,6 @@ from ..attention_interface import AttentionRegistry, MHACallable
 from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
-    _merge_ssm_outputs,
     _prepare_ssm_decode_inputs,
     _run_ssm_prefill,
 )
@@ -41,8 +40,19 @@ def _flashinfer_cached_ssm(
         hidden_states, B, C, dt
     )
     ssm_state_size = B.shape[3]
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
+    # Preallocate output tensor to avoid memcpy cost for merging prefill
+    # and decode outputs
+    preallocated_ssm_out = torch.empty(
+        [bs, num_heads, head_dim],
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
 
-    y_prefill, num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
+    num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
         hs_flat,
         B_flat,
         C_flat,
@@ -60,6 +70,7 @@ def _flashinfer_cached_ssm(
         ssm_state_cache,
         time_step_limit,
         chunk_size,
+        preallocated_ssm_out_p.unsqueeze(0),
     )
 
     num_decode = num_total_tokens - num_prefill_tokens
@@ -110,21 +121,8 @@ def _flashinfer_cached_ssm(
             dt_softplus=True,
             state_batch_indices=slot_idx_decode_i32,
         )
-
-    return _merge_ssm_outputs(
-        hidden_states,
-        y_prefill,
-        y_decode,
-        num_prefill,
-        num_decode,
-        num_prefill_tokens,
-        num_total_tokens,
-        bs,
-        b,
-        s,
-        num_heads,
-        head_dim,
-    )
+        preallocated_ssm_out[num_prefill_tokens:num_total_tokens].copy_(y_decode)
+    return preallocated_ssm_out
 
 
 @_flashinfer_cached_ssm.register_fake
