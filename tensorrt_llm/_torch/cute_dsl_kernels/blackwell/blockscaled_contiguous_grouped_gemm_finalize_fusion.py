@@ -543,8 +543,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.use_blkred,
         )
 
-        self.prefetch_dist = self.num_ab_stage
-
         # Compute A/B/C/Scale shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
