@@ -881,9 +881,15 @@ def create_py_executor_instance(
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
+
+    # For hybrid models, this has both impl and mamba_impl
+    mamba_cache_manager = None
+    if isinstance(kv_cache_manager, MambaHybridCacheManager):
+        mamba_cache_manager = kv_cache_manager
+
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config)
+        cache_transceiver_config, mamba_cache_manager)
     return PyExecutor(
         resource_manager,
         scheduler,
