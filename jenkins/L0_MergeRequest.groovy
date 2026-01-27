@@ -1510,6 +1510,8 @@ def createGithubTag(globalVars) {
 
     echo "Creating tag '${tagName}' for PR #${prNumber} at ${commitSha}"
 
+    // Checkout repository to have a git repo for tagging
+    trtllm_utils.checkoutSource(LLM_REPO, commitSha, "repo", true, false)
 
     withCredentials([
         usernamePassword(
@@ -1518,19 +1520,23 @@ def createGithubTag(globalVars) {
             passwordVariable: 'GITHUB_TOKEN'
         )
     ]) {
+        // Use single quotes to avoid Groovy string interpolation security warning
         def tagResult = sh(
-            script: """
-                git config --global user.email "trtllm-ci@nvidia.com"
-                git config --global user.name "TRT-LLM CI"
+            script: '''#!/bin/bash
+                cd repo
+                git config --global user.email "90828364+tensorrt-cicd@users.noreply.github.com"
+                git config --global user.name "tensorrt-cicd"
 
                 # Delete existing tag if present
-                git tag -d ${tagName} 2>/dev/null || true
-                git push origin :refs/tags/${tagName} 2>/dev/null || true
+                git tag -d ''' + tagName + ''' 2>/dev/null || true
+                git push origin :refs/tags/''' + tagName + ''' 2>/dev/null || true
 
                 # Create new tag
-                git tag -a ${tagName} ${commitSha} -m "Pre-merge tests passed for PR #${prNumber}"
-                git push https://${GITHUB_TOKEN}@github.com/NVIDIA/TensorRT-LLM.git ${tagName}
-            """,
+                git tag -a ''' + tagName + ''' ''' + commitSha + ''' -m "Pre-merge tests passed for PR #''' + prNumber + '''"
+
+                # Push using credential environment variable (avoids interpolation warning)
+                git push https://${GITHUB_TOKEN}@github.com/NVIDIA/TensorRT-LLM.git ''' + tagName + '''
+            ''',
             returnStatus: true,
             label: "Creating GitHub tag ${tagName}"
         )
