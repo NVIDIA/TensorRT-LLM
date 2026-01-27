@@ -905,13 +905,6 @@ def collectTestResults(pipeline, testFilter, globalVars)
         // TODO: CI TEST MODE - Return true to skip tag update
         if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
             stage("Update GitHub Tag") {
-                // TODO: CI TEST MODE - Environment check
-                echo "[TEST] JOB_NAME=${env.JOB_NAME}, BUILD_NUMBER=${env.BUILD_NUMBER}"
-                echo "[TEST] gitlabCommit=${env.gitlabCommit}, gitlabTargetBranch=${env.gitlabTargetBranch}"
-                echo "[TEST] GITHUB_PR_API_URL=${globalVars[GITHUB_PR_API_URL]}, TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
-                echo "[TEST] DOWNSTREAM_JOB_DURATION keys: ${globalVars[DOWNSTREAM_JOB_DURATION]?.keySet()?.join(', ')}"
-                echo "[TEST] Build result: ${currentBuild.result ?: 'SUCCESS'}"
-
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
                 updateGithubTagCommit(pipeline, globalVars)
             }
@@ -1409,8 +1402,6 @@ def validateDownstreamJobDurations(globalVars) {
     echo "=== Validating Required Job Execution (excludes queue time) ==="
 
     def downstreamDurations = globalVars.get(DOWNSTREAM_JOB_DURATION, [:])
-    // TODO: CI TEST MODE - Added debug logging
-    echo "[TEST MODE] Collected downstream durations: ${downstreamDurations}"
 
     if (downstreamDurations.isEmpty()) {
         echo "❌ No downstream job data available"
@@ -1604,20 +1595,7 @@ def updateGithubTagCommit(pipeline, globalVars) {
     }
 
     echo "✓ Only post-merge failures detected - updating tag"
-    def result = createGithubTag(globalVars)
-
-    // TODO: CI TEST MODE - Summary
-    echo ""
-    echo "=========================================="
-    echo "  CI TEST MODE: Validation Complete"
-    echo "=========================================="
-    echo "Result: ${result ? 'SUCCESS' : 'FAILED'}"
-    echo "All validation checks passed in test mode"
-    echo "Ready to remove test mode changes"
-    echo "=========================================="
-    echo ""
-
-    return result
+    return createGithubTag(globalVars)
 }
 
 pipeline {
@@ -1670,51 +1648,6 @@ pipeline {
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
                     echo "Check the passed GitLab bot testFilter parameters."
-                }
-            }
-        }
-        stage("Test GitHub Tag (Early)") {
-            steps {
-                script {
-                    echo "=========================================="
-                    echo "  EARLY TEST MODE: Testing GitHub Tag"
-                    echo "=========================================="
-                    echo "This stage runs BEFORE actual tests for quick validation"
-                    echo "Set TEST_GITHUB_TAG_EARLY=true to enable this stage"
-                    echo ""
-
-                    // Create a temporary pod spec for testing
-                    def testPodSpec = createKubernetesPodConfig("", "agent")
-                    trtllm_utils.launchKubernetesPod(this, testPodSpec, "alpine", {
-                        stage("Early GitHub Tag Test") {
-                            echo "[TEST] Environment:"
-                            echo "[TEST] JOB_NAME=${env.JOB_NAME}"
-                            echo "[TEST] BUILD_NUMBER=${env.BUILD_NUMBER}"
-                            echo "[TEST] gitlabCommit=${env.gitlabCommit}"
-                            echo "[TEST] gitlabTargetBranch=${env.gitlabTargetBranch}"
-                            echo "[TEST] GITHUB_PR_API_URL=${globalVars[GITHUB_PR_API_URL]}"
-                            echo "[TEST] TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
-                            echo ""
-
-                            // Install git in alpine (use simple sh instead of llmExecStepWithRetry)
-                            sh "which git || apk add --no-cache git"
-
-                            // Test the tag creation function directly
-                            // Note: createGithubTag will checkout the repo internally
-                            echo "Testing createGithubTag function..."
-                            def result = createGithubTag(globalVars)
-
-                            echo ""
-                            echo "=========================================="
-                            echo "  EARLY TEST RESULT: ${result ? '✅ SUCCESS' : '❌ FAILED'}"
-                            echo "=========================================="
-                            echo ""
-
-                            if (!result) {
-                                error "Early GitHub tag test failed!"
-                            }
-                        }
-                    })
                 }
             }
         }
