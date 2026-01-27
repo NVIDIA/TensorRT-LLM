@@ -1223,36 +1223,34 @@ files = [
 
 [[package]]
 name = "einops"
-version = "0.8.1"
+version = "0.8.2"
 description = "A new flavour of deep learning operations"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "einops-0.8.2-py3-none-any.whl", hash = "sha256:54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193"},
+    {file = "einops-0.8.2.tar.gz", hash = "sha256:609da665570e5e265e27283aab09e7f279ade90c4f01bcfca111f3d3e13f2827"},
+]
+
+[[package]]
+name = "etcd-sdk-python"
+version = "0.0.7"
+description = "Python client for the etcd v3 API for python >= 3.8"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "einops-0.8.1-py3-none-any.whl", hash = "sha256:919387eb55330f5757c6bea9165c5ff5cfe63a642682ea788a6d472576d81737"},
-    {file = "einops-0.8.1.tar.gz", hash = "sha256:de5d960a7a761225532e0f1959e5315ebeafc0cd43394732f103ca44b9837e84"},
+    {file = "etcd_sdk_python-0.0.7-py3-none-any.whl", hash = "sha256:dc0eb417c06c6e4f94c370dd19c096309f7a10bc6c89730c4fd66edd53f3a62f"},
+    {file = "etcd_sdk_python-0.0.7.tar.gz", hash = "sha256:3eae8b16328a458dce8a4d39a835db666f31bc6f369117f6168c71bcd559a85d"},
 ]
 
-[[package]]
-name = "etcd3"
-version = "0.12.0"
-description = "Python client for the etcd3 API"
-optional = false
-python-versions = "*"
-groups = ["main"]
-files = []
-develop = false
-
 [package.dependencies]
-grpcio = ">=1.38.0"
-protobuf = ">=3.17.0"
-six = ">=1.16.0"
+grpcio = ">=1.66.2,<=2"
 
-[package.source]
-type = "git"
-url = "https://github.com/kragniz/python-etcd3.git"
-reference = "e58a899579ba416449c4e225b61f039457c8072a"
-resolved_reference = "e58a899579ba416449c4e225b61f039457c8072a"
+[package.extras]
+dev = ["PyYAML", "build", "bumpversion", "coverage", "flake8", "flake8-docstrings", "flake8-import-order", "grpcio-tools (==1.66.2)", "hypothesis", "mock", "pifpaf", "pytest", "pytest-cov", "ruff", "tenacity"]
+docs = ["Sphinx (>=5.3.0)", "m2r", "sphinx-copybutton", "sphinx-rtd-theme", "sphinxcontrib-applehelp", "sphinxcontrib-devhelp", "sphinxcontrib-htmlhelp", "sphinxcontrib-jsmath", "sphinxcontrib-prettyspecialmethods", "sphinxcontrib-qthelp", "sphinxcontrib-serializinghtml"]
 
 [[package]]
 name = "evaluate"
@@ -6872,4 +6870,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "1f26b1eecc7f21e53dc4380f7865392092be221df4ccf54b27c7d0e3e1c8b812"
+content-hash = "872ec4c69f9bbab501795d842bb784c5badb5b234c70b0b0e81c31ef318bcb8c"
