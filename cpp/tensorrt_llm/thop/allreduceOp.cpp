@@ -53,13 +53,9 @@
 #include <nvml.h>
 #include <torch/extension.h>
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <fstream>
 #include <limits>
-#include <sstream>
 #include <unordered_set>
 
 // using namespace nvinfer1;
@@ -87,27 +83,6 @@ struct overloaded : Ts...
 };
 template <class... Ts>
 overloaded(Ts...) -> overloaded<Ts...>;
-
-constexpr char const* kDebugLogPath = "/Users/lschneider/git/TensorRT-LLM/.cursor/debug.log";
-
-inline void write_debug_log(char const* location, char const* message, std::string const& data,
-    char const* hypothesisId, char const* runId = "pre-fix")
-{
-    using namespace std::chrono;
-    auto const ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    std::ostringstream line;
-    line << "{\"sessionId\":\"debug-session\",\"runId\":\"" << runId << "\",\"hypothesisId\":\"" << hypothesisId
-         << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":" << data
-         << ",\"timestamp\":" << ts << "}";
-    std::fprintf(stderr, "%s\n", line.str().c_str());
-    std::fflush(stderr);
-
-    std::ofstream file(kDebugLogPath, std::ios::app);
-    if (file.is_open())
-    {
-        file << line.str() << "\n";
-    }
-}
 
 class NvmlManager
 {
@@ -321,82 +296,20 @@ public:
         auto const rank = getRank();
         TLLM_LOG_DEBUG(
             "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
-        // #region agent log
-        {
-            std::ostringstream data;
-            data << "{"
-                 << "\"rank\":" << rank << ","
-                 << "\"seq_len\":" << seq_len << ","
-                 << "\"hidden_size\":" << hidden_size << ","
-                 << "\"numel\":" << size << ","
-                 << "\"bytes_per_element\":" << bytes_per_element << ","
-                 << "\"runtime_strategy\":" << static_cast<int>(runtime_strategy) << ","
-                 << "\"configured_strategy\":" << static_cast<int>(mStrategy) << "}";
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "selected runtime strategy", data.str(), "H1");
-        }
-        // #endregion
-
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
         {
-        case AllReduceStrategyType::UB:
-        {
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch UB", "{}", "H8");
-            // #endregion
-            auto result = runUBAllReduce(input, residual, norm_weight, scale, bias);
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return UB", "{}", "H8");
-            // #endregion
-            return result;
-        }
-        case AllReduceStrategyType::NCCL:
-        {
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch NCCL", "{}", "H8");
-            // #endregion
-            auto result = runNCCLAllReduce(input, residual, norm_weight, scale, bias);
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return NCCL", "{}", "H8");
-            // #endregion
-            return result;
-        }
+        case AllReduceStrategyType::UB: return runUBAllReduce(input, residual, norm_weight, scale, bias);
+        case AllReduceStrategyType::NCCL: return runNCCLAllReduce(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::NCCL_SYMMETRIC:
-        {
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch NCCL_SYMMETRIC", "{}", "H8");
-            // #endregion
-            auto result = runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return NCCL_SYMMETRIC", "{}", "H8");
-            // #endregion
-            return result;
-        }
+            return runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
-        {
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch FUSION", "{}", "H8");
-            // #endregion
-            auto result = runFusionAllReduce(
+            return runFusionAllReduce(
                 input, residual, norm_weight, scale, bias, trigger_completion_at_end, workspace, runtime_strategy);
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return FUSION", "{}", "H8");
-            // #endregion
-            return result;
-        }
         case AllReduceStrategyType::LOWPRECISION:
-        {
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch LOWPRECISION", "{}", "H8");
-            // #endregion
-            auto result = runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return LOWPRECISION", "{}", "H8");
-            // #endregion
-            return result;
-        }
+            return runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
         default: TORCH_CHECK(false, "Invalid runtime strategy"); return {};
         }
     }
@@ -505,61 +418,22 @@ private:
     {
         torch::Tensor reduce_output;
 
-        std::visit(
-            overloaded{[&](std::shared_ptr<ncclComm_t>& rawComm)
-                {
-                    // #region agent log
-                    {
-                        std::ostringstream data;
-                        data << "{"
-                             << "\"path\":\"raw_comm\","
-                             << "\"numel\":" << input.numel() << "}";
-                        write_debug_log("allreduceOp.cpp:runNCCLAllReduce", "before ncclAllReduce", data.str(), "H7");
-                    }
-                    // #endregion
-                    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-                    int size = input.numel();
-                    reduce_output = torch::empty_like(input);
-                    NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
-                        (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
-                    // #region agent log
-                    {
-                        std::ostringstream data;
-                        data << "{"
-                             << "\"path\":\"raw_comm\","
-                             << "\"numel\":" << input.numel() << "}";
-                        write_debug_log("allreduceOp.cpp:runNCCLAllReduce", "after ncclAllReduce", data.str(), "H7");
-                    }
-                    // #endregion
-                },
-                [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
-                {
-                    // #region agent log
-                    {
-                        std::ostringstream data;
-                        data << "{"
-                             << "\"path\":\"process_group\","
-                             << "\"numel\":" << input.numel() << ","
-                             << "\"rank\":" << torchPg->getRank() << "}";
-                        write_debug_log("allreduceOp.cpp:runNCCLAllReduce", "before pg allreduce", data.str(), "H7");
-                    }
-                    // #endregion
-                    reduce_output = input.clone();
-                    // TLLM_LOG_INFO("AllReduce Rank: %d, tensor numel: %d", torchPg->getRank(),
-                    // reduce_output.numel());
-                    std::vector tensors{reduce_output};
-                    PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
-                    // #region agent log
-                    {
-                        std::ostringstream data;
-                        data << "{"
-                             << "\"path\":\"process_group\","
-                             << "\"numel\":" << input.numel() << ","
-                             << "\"rank\":" << torchPg->getRank() << "}";
-                        write_debug_log("allreduceOp.cpp:runNCCLAllReduce", "after pg allreduce", data.str(), "H7");
-                    }
-                    // #endregion
-                }},
+        std::visit(overloaded{[&](std::shared_ptr<ncclComm_t>& rawComm)
+                       {
+                           auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+                           int size = input.numel();
+                           reduce_output = torch::empty_like(input);
+                           NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
+                               (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
+                       },
+                       [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
+                       {
+                           reduce_output = input.clone();
+                           // TLLM_LOG_INFO("AllReduce Rank: %d, tensor numel: %d", torchPg->getRank(),
+                           // reduce_output.numel());
+                           std::vector tensors{reduce_output};
+                           PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
+                       }},
             mNcclComm);
 
         if (mOp == AllReduceFusionOp::NONE)
@@ -575,31 +449,10 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
-        // #region agent log
-        {
-            std::ostringstream data;
-            data << "{"
-                 << "\"comm_index\":" << mNcclComm.index() << ","
-                 << "\"numel\":" << input.numel() << "}";
-            write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "entry", data.str(), "H3");
-        }
-        // #endregion
-
         // Handle ProcessGroup path first - cannot extract NCCL comm for window registration
         // Use ProcessGroup's allreduce directly and return early
         if (mNcclComm.index() == 1)
         {
-            // #region agent log
-            {
-                std::ostringstream data;
-                data << "{"
-                     << "\"comm_index\":1,"
-                     << "\"numel\":" << input.numel() << ","
-                     << "\"element_size\":" << input.element_size() << "}";
-                write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "process group path", data.str(), "H2");
-            }
-            // #endregion
-
             auto torchPg = std::get<1>(mNcclComm);
 
             torch::Tensor reduceOutput = input.clone();
@@ -668,17 +521,6 @@ private:
         {
             if (bufferSizeBytes < minRegistrationThreshold)
             {
-                // #region agent log
-                {
-                    std::ostringstream data;
-                    data << "{"
-                         << "\"buffer_bytes\":" << bufferSizeBytes << ","
-                         << "\"min_registration_threshold\":" << minRegistrationThreshold << "}";
-                    write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "small buffer: skip registration",
-                        data.str(), "H3");
-                }
-                // #endregion
-
                 // Small buffer: use input directly without window registration
                 TLLM_LOG_DEBUG(
                     "[runNCCLAllReduceSymmetric] Buffer size %zu bytes < threshold %zu bytes, "
@@ -688,29 +530,7 @@ private:
             }
             else
             {
-                // #region agent log
-                {
-                    std::ostringstream data;
-                    data << "{"
-                         << "\"buffer_bytes\":" << bufferSizeBytes << ","
-                         << "\"min_registration_threshold\":" << minRegistrationThreshold << "}";
-                    write_debug_log(
-                        "allreduceOp.cpp:runNCCLAllReduceSymmetric", "large buffer: will register", data.str(), "H3");
-                }
-                // #endregion
-
                 // Large buffer: create window buffer and copy input (can swap inputTensor reference)
-                // #region agent log
-                {
-                    std::ostringstream data;
-                    data << "{"
-                         << "\"input_ptr\":\"" << input.data_ptr() << "\","
-                         << "\"buffer_bytes\":" << bufferSizeBytes << "}";
-                    write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric",
-                        "before createNCCLWindowTensor (input)", data.str(), "H6");
-                }
-                // #endregion
-
                 auto [symmetricInput, symmetricBuffer0]
                     = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
                 if (!symmetricBuffer0.isValid())
@@ -718,49 +538,12 @@ private:
                     TLLM_LOG_WARNING(
                         "[runNCCLAllReduceSymmetric] NCCL window not available during capture; "
                         "using input buffer directly for symmetric allreduce");
-                    // #region agent log
-                    write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric",
-                        "invalid input window; using input buffer", "{}", "H6");
-                    // #endregion
                     // inputTensor and inputPtr remain pointing to original input
                 }
                 else
                 {
-                    // #region agent log
-                    {
-                        std::ostringstream data;
-                        data << "{"
-                             << "\"symmetric_ptr\":\"" << symmetricInput.data_ptr() << "\","
-                             << "\"buffer_ptr\":\"" << symmetricBuffer0.ptr << "\","
-                             << "\"buffer_size\":" << symmetricBuffer0.size << "}";
-                        write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric",
-                            "after createNCCLWindowTensor (input)", data.str(), "H6");
-                    }
-                    // #endregion
-
-                    // #region agent log
-                    {
-                        std::ostringstream data;
-                        data << "{"
-                             << "\"dst_ptr\":\"" << symmetricBuffer0.ptr << "\","
-                             << "\"src_ptr\":\"" << input.data_ptr() << "\","
-                             << "\"bytes\":" << bufferSizeBytes << "}";
-                        write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "before cudaMemcpyAsync (input)",
-                            data.str(), "H6");
-                    }
-                    // #endregion
                     TLLM_CUDA_CHECK(cudaMemcpyAsync(
                         symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
-                    // #region agent log
-                    {
-                        std::ostringstream data;
-                        data << "{"
-                             << "\"dst_ptr\":\"" << symmetricBuffer0.ptr << "\","
-                             << "\"bytes\":" << bufferSizeBytes << "}";
-                        write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "after cudaMemcpyAsync (input)",
-                            data.str(), "H6");
-                    }
-                    // #endregion
 
                     windowBuffer0 = symmetricBuffer0;
                     inputTensor = symmetricInput; // Swap to window-backed tensor
@@ -775,56 +558,16 @@ private:
         }
 
         // Use window-backed output buffer
-        // #region agent log
-        {
-            std::ostringstream data;
-            data << "{"
-                 << "\"buffer_bytes\":" << bufferSizeBytes << "}";
-            write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "before createNCCLWindowTensor (output)",
-                data.str(), "H6");
-        }
-        // #endregion
         auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
         if (!windowBuffer1.isValid())
         {
             TLLM_LOG_WARNING(
                 "[runNCCLAllReduceSymmetric] NCCL window not available during capture; "
                 "using plain CUDA tensor for output");
-            // #region agent log
-            write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric",
-                "invalid output window; using torch output tensor", "{}", "H6");
-            // #endregion
             torch::Tensor outputTensor = torch::empty_like(inputTensor);
             void* outputPtr = outputTensor.data_ptr();
             // Perform allreduce
-            // #region agent log
-            {
-                std::ostringstream data;
-                data << "{"
-                     << "\"comm_index\":0,"
-                     << "\"numel\":" << size << ","
-                     << "\"buffer_bytes\":" << bufferSizeBytes << ","
-                     << "\"min_registration_threshold\":" << minRegistrationThreshold << ","
-                     << "\"n_ranks\":" << nRanks << ","
-                     << "\"nvlink_supported\":" << (mIsNVLINKSupported ? "true" : "false") << ","
-                     << "\"mnnvl_supported\":" << (mIsMNNVLSupported ? "true" : "false") << ","
-                     << "\"env_threshold_set\":" << (envThreshold != nullptr ? "true" : "false") << ","
-                     << "\"input_window_valid\":" << (windowBuffer0.isValid() ? "true" : "false") << ","
-                     << "\"input_ptr_is_window\":" << (inputPtr == windowBuffer0.ptr ? "true" : "false") << ","
-                     << "\"input_ptr\":\"" << inputPtr << "\","
-                     << "\"output_ptr\":\"" << outputPtr << "\"}";
-                write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "before ncclAllReduce", data.str(), "H3");
-            }
-            // #endregion
             NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
-            // #region agent log
-            {
-                std::ostringstream data;
-                data << "{"
-                     << "\"numel\":" << size << "}";
-                write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "after ncclAllReduce", data.str(), "H3");
-            }
-            // #endregion
 
             if (mOp == AllReduceFusionOp::NONE)
             {
@@ -833,49 +576,11 @@ private:
 
             return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
         }
-        // #region agent log
-        {
-            std::ostringstream data;
-            data << "{"
-                 << "\"output_ptr\":\"" << normOut.data_ptr() << "\","
-                 << "\"buffer_ptr\":\"" << windowBuffer1.ptr << "\","
-                 << "\"buffer_size\":" << windowBuffer1.size << "}";
-            write_debug_log(
-                "allreduceOp.cpp:runNCCLAllReduceSymmetric", "after createNCCLWindowTensor (output)", data.str(), "H6");
-        }
-        // #endregion
         torch::Tensor outputTensor = normOut;
         void* outputPtr = windowBuffer1.ptr;
 
         // Perform allreduce
-        // #region agent log
-        {
-            std::ostringstream data;
-            data << "{"
-                 << "\"comm_index\":0,"
-                 << "\"numel\":" << size << ","
-                 << "\"buffer_bytes\":" << bufferSizeBytes << ","
-                 << "\"min_registration_threshold\":" << minRegistrationThreshold << ","
-                 << "\"n_ranks\":" << nRanks << ","
-                 << "\"nvlink_supported\":" << (mIsNVLINKSupported ? "true" : "false") << ","
-                 << "\"mnnvl_supported\":" << (mIsMNNVLSupported ? "true" : "false") << ","
-                 << "\"env_threshold_set\":" << (envThreshold != nullptr ? "true" : "false") << ","
-                 << "\"input_window_valid\":" << (windowBuffer0.isValid() ? "true" : "false") << ","
-                 << "\"input_ptr_is_window\":" << (inputPtr == windowBuffer0.ptr ? "true" : "false") << ","
-                 << "\"input_ptr\":\"" << inputPtr << "\","
-                 << "\"output_ptr\":\"" << outputPtr << "\"}";
-            write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "before ncclAllReduce", data.str(), "H3");
-        }
-        // #endregion
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
-        // #region agent log
-        {
-            std::ostringstream data;
-            data << "{"
-                 << "\"numel\":" << size << "}";
-            write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "after ncclAllReduce", data.str(), "H3");
-        }
-        // #endregion
 
         if (mOp == AllReduceFusionOp::NONE)
         {
@@ -1603,29 +1308,6 @@ std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::opti
     bool const trigger_completion_at_end_)
 {
 #if ENABLE_MULTI_DEVICE
-    // #region agent log
-    {
-        std::ostringstream data;
-        data << "{"
-             << "\"input_numel\":" << input.numel() << ","
-             << "\"input_dim0\":" << input.size(0) << ","
-             << "\"input_dim_last\":" << input.size(-1) << ","
-             << "\"input_device_index\":" << input.get_device() << ","
-             << "\"input_is_cuda\":" << (input.is_cuda() ? "true" : "false") << ","
-             << "\"strategy_arg\":" << strategy_ << ","
-             << "\"fusion_op_arg\":" << fusion_op_ << ","
-             << "\"eps\":" << eps_ << ","
-             << "\"group_size\":" << group_.size() << ","
-             << "\"has_residual\":" << (residual.has_value() ? "true" : "false") << ","
-             << "\"has_norm_weight\":" << (norm_weight.has_value() ? "true" : "false") << ","
-             << "\"has_scale\":" << (scale.has_value() ? "true" : "false") << ","
-             << "\"has_bias\":" << (bias.has_value() ? "true" : "false") << ","
-             << "\"has_workspace\":" << (workspace.has_value() ? "true" : "false") << ","
-             << "\"trigger_completion_at_end\":" << (trigger_completion_at_end_ ? "true" : "false") << "}";
-        write_debug_log("allreduceOp.cpp:allreduce_raw", "entry args", data.str(), "H1");
-    }
-    // #endregion
-
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
     auto const strategy = static_cast<AllReduceStrategyType>(int8_t(strategy_));
     auto const fusion_op = static_cast<AllReduceFusionOp>(int8_t(fusion_op_));

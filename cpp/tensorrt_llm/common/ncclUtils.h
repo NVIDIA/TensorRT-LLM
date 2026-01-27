@@ -29,14 +29,11 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <cstdio>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -56,19 +53,6 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace common::nccl_util
 {
-
-inline void write_nccl_window_debug_log(char const* location, char const* message, std::string const& data,
-    char const* hypothesisId, char const* runId = "pre-fix")
-{
-    using namespace std::chrono;
-    auto const ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    std::ostringstream line;
-    line << "{\"sessionId\":\"debug-session\",\"runId\":\"" << runId << "\",\"hypothesisId\":\"" << hypothesisId
-         << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":" << data
-         << ",\"timestamp\":" << ts << "}";
-    std::fprintf(stderr, "%s\n", line.str().c_str());
-    std::fflush(stderr);
-}
 
 //==============================================================================
 // NCCL Helper - Dynamic Library Loading
@@ -381,28 +365,6 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     int64_t buffer_size
         = std::accumulate(shape.begin(), shape.end(), 1LL, std::multiplies<int64_t>()) * torch::elementSize(dtype);
 
-    // #region agent log
-    {
-        std::ostringstream data;
-        data << "{"
-             << "\"comm\":\"" << static_cast<void*>(comm) << "\","
-             << "\"dtype\":" << static_cast<int>(dtype) << ","
-             << "\"elem_size\":" << torch::elementSize(dtype) << ","
-             << "\"buffer_size\":" << buffer_size << ","
-             << "\"shape\":[";
-        for (size_t i = 0; i < shape.size(); ++i)
-        {
-            if (i != 0)
-            {
-                data << ",";
-            }
-            data << shape[i];
-        }
-        data << "]}";
-        write_nccl_window_debug_log("ncclUtils.h:createNCCLWindowTensor", "entry", data.str(), "H6");
-    }
-    // #endregion
-
     // Calculate strides
     std::vector<int64_t> strides_vec(shape.size());
     if (!shape.empty())
@@ -425,16 +387,6 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     catch (std::exception const& e)
     {
         TLLM_LOG_WARNING("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
-        // #region agent log
-        {
-            std::ostringstream data;
-            data << "{"
-                 << "\"buffer_size\":" << buffer_size << ","
-                 << "\"error\":\"" << e.what() << "\"}";
-            write_nccl_window_debug_log("ncclUtils.h:createNCCLWindowTensor",
-                "requestBuffer failed; returning invalid buffer", data.str(), "H6");
-        }
-        // #endregion
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
@@ -443,48 +395,14 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     {
         TLLM_LOG_WARNING(
             "[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
-        // #region agent log
-        {
-            std::ostringstream data;
-            data << "{"
-                 << "\"buffer_size\":" << buffer_size << ","
-                 << "\"comm\":\"" << static_cast<void*>(comm) << "\"}";
-            write_nccl_window_debug_log(
-                "ncclUtils.h:createNCCLWindowTensor", "invalid buffer from requestBuffer", data.str(), "H6");
-        }
-        // #endregion
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
-
-    // #region agent log
-    {
-        std::ostringstream data;
-        data << "{"
-             << "\"comm\":\"" << static_cast<void*>(comm) << "\","
-             << "\"buffer_ptr\":\"" << buffer.ptr << "\","
-             << "\"buffer_handle\":" << buffer.handle << ","
-             << "\"buffer_size\":" << buffer.size << ","
-             << "\"window\":\"" << buffer.window << "\"}";
-        write_nccl_window_debug_log("ncclUtils.h:createNCCLWindowTensor", "buffer allocated", data.str(), "H6");
-    }
-    // #endregion
 
     // Create custom deleter that releases the buffer
     auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(comm, ptr); };
 
     // Create tensor from the buffer
     auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
-
-    // #region agent log
-    {
-        std::ostringstream data;
-        data << "{"
-             << "\"tensor_ptr\":\"" << tensor.data_ptr() << "\","
-             << "\"buffer_ptr\":\"" << buffer.ptr << "\","
-             << "\"tensor_numel\":" << tensor.numel() << "}";
-        write_nccl_window_debug_log("ncclUtils.h:createNCCLWindowTensor", "tensor created", data.str(), "H6");
-    }
-    // #endregion
 
     return std::make_pair(tensor, buffer);
 }
