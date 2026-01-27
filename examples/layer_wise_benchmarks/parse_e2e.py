@@ -23,7 +23,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--eager-trace", type=str, required=True)
 parser.add_argument("--graph-trace", type=str)
 parser.add_argument("--target-ctx-reqs", type=int, default=0)
-parser.add_argument("--target-gen-reqs")
+parser.add_argument("--target-gen-reqs", type=int)
 parser.add_argument("--layer-indices", type=comma_separated_ints, required=True)
 parser.add_argument("--warmup-times", type=int, default=5)
 group = parser.add_mutually_exclusive_group()
@@ -100,7 +100,7 @@ for start, end, text in df.itertuples(index=False):
 eager_iters = sorted(eager_iters)[args.warmup_times :]
 iter_list = [t[2] for t in eager_iters]
 print("Iters (eager)", *iter_list)
-per_layer_eager_layers = [[] for _ in iter_list]
+per_iter_eager_layers = [[] for _ in iter_list]
 for start, end, text in df.itertuples(index=False):
     if m := re.match(r"^layer_wise_benchmarks layer_idx (\d+)$", text):
         layer_idx = int(m.group(1))
@@ -108,10 +108,10 @@ for start, end, text in df.itertuples(index=False):
         if it_idx < 0 or end > eager_iters[it_idx][1]:
             continue
         assert end <= eager_iters[it_idx][1], "Not belong to any iter"
-        per_layer_eager_layers[it_idx].append((start, end, it_idx, layer_idx))
-layer_list = [t[3] for t in per_layer_eager_layers[0]]
+        per_iter_eager_layers[it_idx].append((start, end, it_idx, layer_idx))
+layer_list = [t[3] for t in per_iter_eager_layers[0]]
 print("Layers (eager)", *layer_list)
-for eager_layers in per_layer_eager_layers:
+for eager_layers in per_iter_eager_layers:
     assert [t[3] for t in eager_layers] == layer_list, "inconsistent layer idx"
 df = pd.read_sql_query(query, graph_conn, params=(graph_event_id_NvtxPushPopRange,))
 graph_iters = []
@@ -190,8 +190,8 @@ super_kernel_names = shortest_common_supersequence(eager_kernel_names, graph_ker
 print(f"#Kernels (supersequence) {len(super_kernel_names)}")
 eager_per_layer_kernels = [[] for _ in layer_list]
 for i, eager_kernel in enumerate(eager_per_iter_kernels[0]):
-    eager_layers_idx = bisect.bisect(per_layer_eager_layers[0], (eager_kernel[0],)) - 1
-    if eager_layers_idx < 0 or eager_kernel[0] > eager_layers[eager_layers_idx][1]:
+    eager_layers_idx = bisect.bisect(per_iter_eager_layers[0], (eager_kernel[0],)) - 1
+    if eager_layers_idx < 0 or eager_kernel[0] > per_iter_eager_layers[0][eager_layers_idx][1]:
         continue
     eager_per_layer_kernels[eager_layers_idx].append(i)
 eager2super = []
@@ -201,14 +201,15 @@ for i, eager_kernel_name in enumerate(eager_kernel_names):
         j += 1
     eager2super.append(j)
     j += 1
-super_per_layer_kernels = [(eager2super[a[0]], eager2super[a[-1]]) for a in eager_per_layer_kernels]
+super_per_layer_starts = [eager2super[a[0]] for a in eager_per_layer_kernels]
+super_per_layer_ends = [eager2super[a[-1]] for a in eager_per_layer_kernels]
 graph_per_layer_kernels = [[] for _ in layer_list]
 j = 0
 for i, graph_kernel_name in enumerate(graph_kernel_names):
     while graph_kernel_name != super_kernel_names[j]:
         j += 1
-    layer_idx = bisect.bisect(super_per_layer_kernels, j, key=lambda t: t[0]) - 1
-    if layer_idx >= 0 and j <= super_per_layer_kernels[layer_idx][1]:
+    layer_idx = bisect.bisect(super_per_layer_starts, j) - 1
+    if layer_idx >= 0 and j <= super_per_layer_ends[layer_idx]:
         graph_per_layer_kernels[layer_idx].append(i)
     j += 1
 timeline = []

@@ -458,6 +458,7 @@ class Runner:
 
         self.model_config = model.model_config
         self.model = model
+        self.layer_indices = layer_indices
 
     @staticmethod
     @contextlib.contextmanager

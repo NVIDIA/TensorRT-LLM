@@ -44,7 +44,7 @@
     <script type="text/javascript">
         const rawData = {{ rawData }};
 
-        const referenceData = rawData.find(s => s.series.search('reference') == 0);
+        const referenceData = rawData.find(s => s.series.startsWith('reference:'));
         const xLabelMap = {};
         let xMax = -Infinity;
         referenceData.points.forEach(p => {

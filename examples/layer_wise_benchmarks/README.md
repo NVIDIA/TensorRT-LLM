@@ -223,7 +223,7 @@ An overall example can be found in `sample_performance_alignment.sh`. Here is an
           calibration_mode: MARK
       ```
 
-   2. Change the paths of profiles. The recommended argument is `-o profiles/report_e2e_collect_rank%q{RANK}.nsys-rep`.
+   2. Change the paths of profiles. The recommended argument is `-o profiles/report_e2e_mark_rank%q{RANK}.nsys-rep`.
 
 3. Run layer-wise benchmarks with the calibration file obtained by Step 1.
 
@@ -246,7 +246,7 @@ An overall example can be found in `sample_performance_alignment.sh`. Here is an
    1. `NP=4`: Should match the end-to-end run.
    2. `--load-format AUTO`: Instruct the benchmark to load model weights instead of initializing random weights.
    3. `--layer-indices 5,6,7`: A list of contiguous layers you want to calibrate.
-   7. `--batch-size 32`: Should match the end-to-end run.
+   4. `--batch-size 32`: Should match the end-to-end run.
    5. `--seq-len-q 1`: Should match (1+MTP) of the end-to-end run.
    6. `--seq-len-kv-cache 2090`: Estimation of the average context length for iterations you captured. The first 5 iterations should be excluded from the estimation, because they will be dropped by parser.
    7. `--replay-file-path`: The calibration file obtained by Step 1.
@@ -260,7 +260,7 @@ An overall example can be found in `sample_performance_alignment.sh`. Here is an
        --graph-trace profiles/report_e2e_collect_rank%.nsys-rep \
        --layer-indices 5,6,7 \
        --warmup-times 5 \
-       -o profiles/report_e2e_mark_rank%.json
+       -o profiles/report_e2e_collect_rank%.json
    seq 0 $((NP - 1)) | xargs -I% python3 parse.py \
        --world-size $NP \
        --rank %
@@ -270,8 +270,8 @@ An overall example can be found in `sample_performance_alignment.sh`. Here is an
 
    ```bash
    python3 correlation.py \
-       --reference profiles/report_e2e_mark_rank0.json \
-       $(seq 1 $((NP - 1)) | xargs -I% echo "--target profiles/report_e2e_mark_rank%.json") \
+       --reference profiles/report_e2e_collect_rank0.json \
+       $(seq 1 $((NP - 1)) | xargs -I% echo "--target profiles/report_e2e_collect_rank%.json") \
        $(seq 0 $((NP - 1)) | xargs -I% echo "--target profiles/report_np${NP}_rank%.json") \
        -o profiles/correlation.html
    ```

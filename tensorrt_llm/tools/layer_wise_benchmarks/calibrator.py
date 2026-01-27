@@ -539,6 +539,11 @@ class Calibrator:
         """
         if self.mode == Mode.COLLECT and self._started:
             record_idx = len(self._collected_records)
+            if record_idx >= self.MAX_COLLECT_ITERATIONS:
+                raise ValueError(
+                    f"Exceeded MAX_COLLECT_ITERATIONS={self.MAX_COLLECT_ITERATIONS}. "
+                    "Increase the limit or reduce the profiling iterations."
+                )
             self._collected_metadata_idx[record_idx].copy_(self._metadata_idx_gpu)
 
             if self._use_eager_mode:
@@ -562,6 +567,11 @@ class Calibrator:
         if self.mode == Mode.REPLAY and self._started and self._replay_verify_metadata:
             # Record metadata index on GPU (no sync), verification deferred to stop()
             record_idx = len(self._collected_iterations)
+            if record_idx >= self.MAX_REPLAY_ITERATIONS:
+                raise ValueError(
+                    f"Exceeded MAX_REPLAY_ITERATIONS={self.MAX_REPLAY_ITERATIONS}. "
+                    "Increase the limit or reduce the profiling iterations."
+                )
             self._collected_actual_metadata_idx[record_idx].copy_(
                 self._actual_metadata_idx_gpu, non_blocking=True
             )
@@ -677,7 +687,7 @@ class Calibrator:
         contiguous range. Cross-rank iteration consistency is verified in init().
 
         Returns:
-            tuple: (start_iter, stop_iter) where iterations are in [start_iter, stop_iter)
+            tuple: (start_iter, stop_iter) where iterations are in [start_iter, stop_iter]
 
         Raises:
             ValueError: If mode is not REPLAY or iterations are not a contiguous range.
