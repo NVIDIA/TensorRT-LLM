@@ -1,0 +1,25 @@
+model: zai-org/GLM-4.7-Flash
+args:
+  mode: graph
+  # world_size: 8
+  runtime: trtllm
+  trust_remote_code: true
+  compile_backend: torch-compile
+  max_seq_len: 512
+  attn_page_size: 512
+  # attn_page_size: 64
+  # attn_backend: flashinfer
+  model_factory: AutoModelForCausalLM
+  # skip_loading_weights: true
+  disable_overlap_scheduler: true
+  kv_cache_config:
+    enable_block_reuse: false
+  model_kwargs:
+    torch_dtype: bfloat16
+benchmark:
+  enabled: false
+prompt:
+  sp_kwargs:
+    top_p: 0.95
+    temperature: 1
+# dry_run: false

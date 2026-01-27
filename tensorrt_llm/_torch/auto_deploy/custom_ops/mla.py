@@ -140,6 +140,10 @@ def fused_flattened_mla_with_cache(
     query_states = torch.cat((q_nope, q_pe), dim=-1)  # [b*s,n,d]
     key_states = torch.cat((k_nope, k_pe.expand(*bs_view, num_heads, -1)), dim=-1)  # [b*s,n,d]
 
+    # Compute scale if not provided
+    q_head_dim = query_states.shape[-1]
+    scale = softmax_scale if softmax_scale is not None else (1.0 / (q_head_dim**0.5))
+
     # Compute attention
     y = torch.empty_like(value_states)
     if s == 1:
@@ -152,6 +156,7 @@ def fused_flattened_mla_with_cache(
             v_cache,
             cache_loc,
             input_pos,
+            scale,
             y,
         )
 
@@ -167,6 +172,7 @@ def fused_flattened_mla_with_cache(
             v_cache,
             seq_len,
             seq_start,
+            scale,
             y,
         )
 
@@ -198,8 +204,11 @@ def fused_flattened_mla_with_cache_fake(
     softmax_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
+    # Create a fresh contiguous tensor to match the real kernel's output layout
+    # (which uses .view().transpose().contiguous() to produce BNSD format)
+    b, num_heads, s, _ = kv.shape
     v_head_dim = kv.shape[-1] - q_nope.shape[-1]
-    return torch.empty_like(kv[..., -v_head_dim:])
+    return torch.empty(b, num_heads, s, v_head_dim, dtype=kv.dtype, device=kv.device)
 
 
 @AttentionRegistry.register("MultiHeadLatentAttention")
