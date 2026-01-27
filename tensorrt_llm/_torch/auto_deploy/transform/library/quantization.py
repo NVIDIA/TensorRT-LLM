@@ -733,6 +733,7 @@ class INT4GPTQLinearQuantizationFromConfig(Quantization):
         state_dict[weight_name] = qweight  # [K/8, N] int32
         state_dict[f"{mod_prefix}.scales"] = scales.to(torch.float16)  # [G, N]
         # GPTQ v1 format stores (zero_point - 1); convert to v2 by adding 0x11111111
+        # See: gptqmodel.utils.model.convert_gptq_v1_to_v2_format_module
         qzeros_v2 = qzeros + 0x11111111
         state_dict[f"{mod_prefix}.qzeros"] = qzeros_v2  # [G, N/8] int32 (v2 format)
         # Remove the original qweight key to avoid "unexpected key" warnings
