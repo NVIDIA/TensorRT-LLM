@@ -18,6 +18,7 @@
 #include "cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/bindingUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
@@ -118,10 +119,12 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
     nb::class_<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
                  runtime::WorldConfig, std::vector<SizeType32>, nvinfer1::DataType,
-                 executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>>(),
+                 executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>,
+                 tb::rnn_state_manager::RnnStateManager*, std::vector<SizeType32>>(),
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
-            nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt);
+            nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt,
+            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
 
     nb::class_<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(

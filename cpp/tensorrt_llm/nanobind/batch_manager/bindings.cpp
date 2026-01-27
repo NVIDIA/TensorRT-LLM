@@ -449,7 +449,9 @@ void initBindings(nb::module_& m)
         .def("free_cache_block", &tb::rnn_state_manager::RnnStateManager::freeCacheBlock, nb::arg("request_id"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_state_indices", &tb::rnn_state_manager::RnnStateManager::getStateIndices, nb::arg("request_ids"),
-            nb::arg("is_padding"), nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("is_padding"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_num_local_layers", &tb::rnn_state_manager::RnnStateManager::getNumLocalLayers,
+            nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "add_new_tokens_to_requests",

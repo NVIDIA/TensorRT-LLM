@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -10,6 +10,7 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
+from .mamba_cache_manager import MambaCacheManager
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -30,9 +31,12 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
 
 def create_kv_cache_transceiver(
-        mapping: Mapping, dist: Distributed, kv_cache_manager: KVCacheManager,
+        mapping: Mapping,
+        dist: Distributed,
+        kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
-        cache_transceiver_config: CacheTransceiverConfig):
+        cache_transceiver_config: CacheTransceiverConfig,
+        mamba_cache_manager: Optional[MambaCacheManager] = None):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
@@ -62,8 +66,18 @@ def create_kv_cache_transceiver(
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
+    # Check for hybrid models with NIXL backend
+    if mamba_cache_manager is not None and cache_transceiver_config.backend in [
+            "NIXL", "MOONCAKE"
+    ]:
+        raise ValueError(
+            "NIXL or MOONCAKE backend does not support hybrid models with RNN (Mamba) states. "
+            "Please use UCX or MPI backend for cache transfer with hybrid models."
+        )
+
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
-                                  attention_type, cache_transceiver_config)
+                                  attention_type, cache_transceiver_config,
+                                  mamba_cache_manager)
 
 
 class KvCacheTransceiver(ABC):
@@ -117,10 +131,13 @@ class KvCacheTransceiver(ABC):
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
 
-    def __init__(self, mapping: Mapping, dist: Distributed,
+    def __init__(self,
+                 mapping: Mapping,
+                 dist: Distributed,
                  kv_cache_manager: KVCacheManager,
                  attention_type: AttentionTypeCpp,
-                 cache_transceiver_config: CacheTransceiverConfig):
+                 cache_transceiver_config: CacheTransceiverConfig,
+                 mamba_cache_manager: Optional[MambaCacheManager] = None):
         world_config = mapping_to_world_config(mapping)
         total_num_kv_heads_per_layer = kv_cache_manager.total_num_kv_heads_per_layer
         head_dim = kv_cache_manager.head_dim
@@ -132,12 +149,25 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms
-        self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
-                                        total_num_kv_heads_per_layer, head_dim,
-                                        tokens_per_block, world_config,
-                                        pp_layer_num_per_pp_rank, dtype,
-                                        attention_type,
-                                        cache_transceiver_config._to_pybind())
+
+        # Get RNN state manager and layer distribution if mamba_cache_manager is provided
+        rnn_state_manager = None
+        rnn_layer_num_per_pp_rank = []
+        if mamba_cache_manager is not None:
+            rnn_state_manager = mamba_cache_manager.mamba_impl
+            # Get the number of local RNN layers and allgather across PP ranks
+            rnn_local_layer_num = rnn_state_manager.get_num_local_layers()
+            rnn_layer_num_per_pp_rank = dist.pp_allgather(rnn_local_layer_num)
+            logger.info(
+                f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
+            )
+
+        self.impl = CacheTransceiverCpp(
+            kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
+            tokens_per_block, world_config,
+            pp_layer_num_per_pp_rank, dtype, attention_type,
+            cache_transceiver_config._to_pybind(), rnn_state_manager,
+            rnn_layer_num_per_pp_rank)
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
