@@ -1317,11 +1317,20 @@ protected:
         int convDimSize = headDim * numHeads + 2 * nGroups * dState;
 
         // Create RNN state manager
-        mRnnStateManager = std::make_unique<rnn_state_manager::RnnStateManager>(
-            mMaxNumSequences, numRnnLayers, dState, dConv, headDim, numHeadsPerRank,
-            nGroups / mTpSize, // nGroups per TP rank
-            convDtype, ssmDtype, tr::WorldConfig{mTpSize, mPpSize, 1}, reinterpret_cast<cudaStream_t>(stream->get()),
-            std::nullopt       // layerMask - use all layers
+        // Constructor signature: (dState, dConv, numHeads, nGroups, headDim, numLayers, maxBatchSize, worldConfig,
+        // stream, dtype, ssmCacheDtype, layerMask)
+        mRnnStateManager = std::make_unique<rnn_state_manager::RnnStateManager>(dState, // dState
+            dConv,                                                                      // dConv
+            numHeadsPerRank,                                                            // numHeads
+            nGroups / mTpSize,                                                          // nGroups per TP rank
+            headDim,                                                                    // headDim
+            numRnnLayers,                                                               // numLayers
+            mMaxNumSequences,                                                           // maxBatchSize
+            tr::WorldConfig{mTpSize, mPpSize, 1},                                       // worldConfig
+            reinterpret_cast<int64_t>(stream->get()),                                   // stream (int64_t)
+            convDtype,                                                                  // dtype
+            ssmDtype,                                                                   // ssmCacheDtype
+            std::nullopt                                                                // layerMask - use all layers
         );
 
         // Set up RNN cache state
