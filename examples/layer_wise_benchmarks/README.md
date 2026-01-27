@@ -171,9 +171,9 @@ You will receive three reports, each containing kernel timing statistics grouped
 2. A CSV report at `profiles/report_np4_rank0.csv`
 3. An HTML report at `profiles/report_np4_rank0.html`
 
-## Performance calibration
+## Performance alignment
 
-An overall example can be found in `sample_performance_calibration.sh`. Here is an abstract of the main steps.
+An overall example can be found in `sample_performance_alignment.sh`. Here is an abstract of the main steps.
 
 1. Run end-to-end serving in **COLLECT** mode, and capture nsys profiles. This step generates a calibration file.
 
@@ -245,7 +245,7 @@ An overall example can be found in `sample_performance_calibration.sh`. Here is 
 
    1. `NP=4`: Should match the end-to-end run.
    2. `--load-format AUTO`: Instruct the benchmark to load model weights instead of initializing random weights.
-   3. `--layer-indices 5,6,7`: Any list of contiguous layers you want to calibrate.
+   3. `--layer-indices 5,6,7`: A list of contiguous layers you want to calibrate.
    7. `--batch-size 32`: Should match the end-to-end run.
    5. `--seq-len-q 1`: Should match (1+MTP) of the end-to-end run.
    6. `--seq-len-kv-cache 2090`: Estimation of the average context length for iterations you captured. The first 5 iterations should be excluded from the estimation, because they will be dropped by parser.

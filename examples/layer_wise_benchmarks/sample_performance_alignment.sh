@@ -9,7 +9,7 @@ NP=${NP:-4}
 BATCH_SIZE=32
 
 export PROFILE_DIR="${PROFILE_DIR:-profiles}"
-export TLLM_AUTOTUNER_CACHE_PATH="$PROFILE_DIR/sample_performance_calibration_cache.json"
+export TLLM_AUTOTUNER_CACHE_PATH="$PROFILE_DIR/sample_performance_alignment_cache.json"
 
 mkdir -p -- "$PROFILE_DIR"
 mkdir -p -- "$(dirname "$TLLM_AUTOTUNER_CACHE_PATH")"

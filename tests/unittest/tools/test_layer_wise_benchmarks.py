@@ -182,14 +182,14 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
 
 
 @pytest.mark.parametrize("world_size", [1, 4])
-def test_calibration(llm_root, world_size):
+def test_performance_alignment(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
-    profile_dir = f"profiles/test_calibration_{world_size}"
+    profile_dir = f"profiles/test_performance_alignment_{world_size}"
     check_call(
         [
-            "./sample_performance_calibration.sh",
+            "./sample_performance_alignment.sh",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
