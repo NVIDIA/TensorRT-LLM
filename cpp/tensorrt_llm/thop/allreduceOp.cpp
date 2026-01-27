@@ -338,17 +338,64 @@ public:
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
         {
-        case AllReduceStrategyType::UB: return runUBAllReduce(input, residual, norm_weight, scale, bias);
-        case AllReduceStrategyType::NCCL: return runNCCLAllReduce(input, residual, norm_weight, scale, bias);
+        case AllReduceStrategyType::UB:
+        {
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch UB", "{}", "H8");
+            // #endregion
+            auto result = runUBAllReduce(input, residual, norm_weight, scale, bias);
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return UB", "{}", "H8");
+            // #endregion
+            return result;
+        }
+        case AllReduceStrategyType::NCCL:
+        {
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch NCCL", "{}", "H8");
+            // #endregion
+            auto result = runNCCLAllReduce(input, residual, norm_weight, scale, bias);
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return NCCL", "{}", "H8");
+            // #endregion
+            return result;
+        }
         case AllReduceStrategyType::NCCL_SYMMETRIC:
-            return runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
+        {
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch NCCL_SYMMETRIC", "{}", "H8");
+            // #endregion
+            auto result = runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return NCCL_SYMMETRIC", "{}", "H8");
+            // #endregion
+            return result;
+        }
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
-            return runFusionAllReduce(
+        {
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch FUSION", "{}", "H8");
+            // #endregion
+            auto result = runFusionAllReduce(
                 input, residual, norm_weight, scale, bias, trigger_completion_at_end, workspace, runtime_strategy);
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return FUSION", "{}", "H8");
+            // #endregion
+            return result;
+        }
         case AllReduceStrategyType::LOWPRECISION:
-            return runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
+        {
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "dispatch LOWPRECISION", "{}", "H8");
+            // #endregion
+            auto result = runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:AllreduceOp::run", "return LOWPRECISION", "{}", "H8");
+            // #endregion
+            return result;
+        }
         default: TORCH_CHECK(false, "Invalid runtime strategy"); return {};
         }
     }
@@ -457,22 +504,61 @@ private:
     {
         torch::Tensor reduce_output;
 
-        std::visit(overloaded{[&](std::shared_ptr<ncclComm_t>& rawComm)
-                       {
-                           auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-                           int size = input.numel();
-                           reduce_output = torch::empty_like(input);
-                           NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
-                               (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
-                       },
-                       [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
-                       {
-                           reduce_output = input.clone();
-                           // TLLM_LOG_INFO("AllReduce Rank: %d, tensor numel: %d", torchPg->getRank(),
-                           // reduce_output.numel());
-                           std::vector tensors{reduce_output};
-                           PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
-                       }},
+        std::visit(
+            overloaded{[&](std::shared_ptr<ncclComm_t>& rawComm)
+                {
+                    // #region agent log
+                    {
+                        std::ostringstream data;
+                        data << "{"
+                             << "\"path\":\"raw_comm\","
+                             << "\"numel\":" << input.numel() << "}";
+                        write_debug_log("allreduceOp.cpp:runNCCLAllReduce", "before ncclAllReduce", data.str(), "H7");
+                    }
+                    // #endregion
+                    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+                    int size = input.numel();
+                    reduce_output = torch::empty_like(input);
+                    NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
+                        (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
+                    // #region agent log
+                    {
+                        std::ostringstream data;
+                        data << "{"
+                             << "\"path\":\"raw_comm\","
+                             << "\"numel\":" << input.numel() << "}";
+                        write_debug_log("allreduceOp.cpp:runNCCLAllReduce", "after ncclAllReduce", data.str(), "H7");
+                    }
+                    // #endregion
+                },
+                [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
+                {
+                    // #region agent log
+                    {
+                        std::ostringstream data;
+                        data << "{"
+                             << "\"path\":\"process_group\","
+                             << "\"numel\":" << input.numel() << ","
+                             << "\"rank\":" << torchPg->getRank() << "}";
+                        write_debug_log("allreduceOp.cpp:runNCCLAllReduce", "before pg allreduce", data.str(), "H7");
+                    }
+                    // #endregion
+                    reduce_output = input.clone();
+                    // TLLM_LOG_INFO("AllReduce Rank: %d, tensor numel: %d", torchPg->getRank(),
+                    // reduce_output.numel());
+                    std::vector tensors{reduce_output};
+                    PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
+                    // #region agent log
+                    {
+                        std::ostringstream data;
+                        data << "{"
+                             << "\"path\":\"process_group\","
+                             << "\"numel\":" << input.numel() << ","
+                             << "\"rank\":" << torchPg->getRank() << "}";
+                        write_debug_log("allreduceOp.cpp:runNCCLAllReduce", "after pg allreduce", data.str(), "H7");
+                    }
+                    // #endregion
+                }},
             mNcclComm);
 
         if (mOp == AllReduceFusionOp::NONE)
@@ -488,6 +574,16 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
+        // #region agent log
+        {
+            std::ostringstream data;
+            data << "{"
+                 << "\"comm_index\":" << mNcclComm.index() << ","
+                 << "\"numel\":" << input.numel() << "}";
+            write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "entry", data.str(), "H3");
+        }
+        // #endregion
+
         // Handle ProcessGroup path first - cannot extract NCCL comm for window registration
         // Use ProcessGroup's allreduce directly and return early
         if (mNcclComm.index() == 1)
