@@ -17,9 +17,11 @@ from typing import Optional
 
 import torch
 from einops import rearrange, repeat
+from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...attention_backend import AttentionMetadata
@@ -30,7 +32,8 @@ from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import \
     causal_conv1d_update as causal_conv1d_update_triton
 from .layernorm_gated import RMSNorm as RMSNormGated
-from .selective_state_update import selective_state_update
+from .selective_state_update import \
+    selective_state_update as selective_state_update_native
 from .ssd_combined import mamba_chunk_scan_combined
 
 
@@ -132,6 +135,24 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
+        # Choose between flashinfer and native implementation. (default to flashinfer)
+        self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
+        supported_head_dim_in_flashinfer = [64, 128]
+        if head_dim in supported_head_dim_in_flashinfer:
+            logger.info_once(
+                "Using flashinfer for selective state update for no MTP",
+                key="selective_state_update_no_mtp")
+            self.selective_state_update_func_no_mtp = selective_state_update_fi
+        else:
+            logger.info_once(
+                "Using native for selective state update for no MTP",
+                key="selective_state_update_no_mtp")
+            self.selective_state_update_func_no_mtp = selective_state_update_native
+        # TODO: support MTP selective state update in flashinfer.
+        logger.info_once("Using native for selective state update for MTP",
+                         key="selective_state_update_mtp")
+        self.selective_state_update_func_mtp = selective_state_update_native
+
         # D
         self.D = nn.Parameter(
             torch.empty(self.tp_nheads,
@@ -164,8 +185,6 @@ class Mamba2Mixer(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy)
-
-        self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
 
     def forward(
         self,
@@ -335,7 +354,8 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-
+            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
+            dt_d = dt_d.to(dtype=torch.float32)
             x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
             B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
@@ -348,7 +368,7 @@ class Mamba2Mixer(nn.Module):
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
                 intermediate_ssm_states = layer_cache.intermediate_ssm
-                selective_state_update(
+                self.selective_state_update_func_mtp(
                     ssm_states,
                     x_d.view(
                         num_decodes,
@@ -381,10 +401,8 @@ class Mamba2Mixer(nn.Module):
                     cache_steps=draft_token_num,
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
-
             else:
-
-                selective_state_update(
+                self.selective_state_update_func_no_mtp(
                     ssm_states,
                     x_d,
                     dt_d,

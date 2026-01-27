@@ -751,6 +751,34 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
 
         EXPECT_EQ(state2, stateCopy);
     }
+
+    // Test with ctxDpRank and disaggInfoEndpoint
+    {
+        auto state = std::make_unique<texec::DataTransceiverState>();
+        state->setCommState(texec::kv_cache::CommState{{10, 20}});
+        auto stats
+            = texec::ContextPhaseParams({10, 20, 30}, 2, state.release(), VecTokens{5, 6}, 3, "http://127.0.0.1:8080");
+        auto stats2 = serializeDeserialize(stats);
+        EXPECT_EQ(stats, stats2);
+        EXPECT_EQ(stats.getCtxDpRank(), 3);
+        EXPECT_EQ(stats.getDisaggInfoEndpoint(), "http://127.0.0.1:8080");
+    }
+
+    {
+        auto stats = texec::ContextPhaseParams({1, 2}, 1, std::nullopt, 5, std::nullopt);
+        auto stats2 = serializeDeserialize(stats);
+        EXPECT_EQ(stats, stats2);
+        EXPECT_EQ(stats.getCtxDpRank(), 5);
+        EXPECT_EQ(stats.getDisaggInfoEndpoint(), std::nullopt);
+    }
+
+    {
+        auto stats = texec::ContextPhaseParams({1, 2}, 1, std::nullopt, std::nullopt, "endpoint://test");
+        auto stats2 = serializeDeserialize(stats);
+        EXPECT_EQ(stats, stats2);
+        EXPECT_EQ(stats.getCtxDpRank(), std::nullopt);
+        EXPECT_EQ(stats.getDisaggInfoEndpoint(), "endpoint://test");
+    }
 }
 
 TEST(SerializeUtilsTest, SpeculativeDecodingFastLogitsInfo)

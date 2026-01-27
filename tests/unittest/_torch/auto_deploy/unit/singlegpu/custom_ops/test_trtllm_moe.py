@@ -329,7 +329,7 @@ def test_trtllm_fused_moe_fp8(
         pytest.skip(f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})")
 
     assert itype == torch.float8_e4m3fn and wtype == torch.float8_e4m3fn, (
-        "FP8 test only supports float8_e4m3fn"
+        "FP8 test only supports torch.float8_e4m3fn"
     )
     assert otype == torch.bfloat16 or otype == torch.float16, (
         "FP8 test only supports bfloat16 or float16 output type"
