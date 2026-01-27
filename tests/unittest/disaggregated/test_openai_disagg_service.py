@@ -10,6 +10,7 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionResponse,
     CompletionResponseChoice,
     DisaggregatedParams,
+    DisaggScheduleStyle,
     UsageInfo,
 )
 from tensorrt_llm.serve.router import Router
@@ -19,8 +20,8 @@ def _client_factory(*_args, **_kwargs):
     return AsyncMock()
 
 
-def _make_service() -> OpenAIDisaggregatedService:
-    config = DisaggServerConfig(server_configs=[])
+def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
+    config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
     ctx_router = AsyncMock(spec=Router)
     gen_router = AsyncMock(spec=Router)
     return OpenAIDisaggregatedService(
@@ -73,21 +74,24 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
         (0.1, 0.2),
     ]
     monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
-    monkeypatch.setenv("TRTLLM_DISAGG_SCHEDULE_STYLE", schedule_style)
-    service = _make_service()
-    assert (
-        service._send_disagg_request == service._send_disagg_request_ctx_first
-        if schedule_style == "context_first"
-        else service._send_disagg_request_gen_first
-    )
+    service = _make_service(schedule_style)
+    if schedule_style == "context_first":
+        assert service._send_disagg_request == service._send_disagg_request_ctx_first
+        assert service._schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+    else:
+        assert service._send_disagg_request == service._send_disagg_request_gen_first
+        assert service._schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+    opaque_state = "opaque_state"
     for i, (ctx_delay, gen_delay) in enumerate(ctx_gen_delay):
         stream_chunks = [b"data: gen-0\n\n", b"data: gen-1\n\n"]
         service._ctx_client = AsyncMock()
         service._gen_client = AsyncMock()
-        ctx_server_info = {"server_info": {"encoded_opaque_state": "opaque_ctx"}}
+        ctx_server_info = {
+            "server_info": {"disaggregated_params": {"encoded_opaque_state": opaque_state}}
+        }
         service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", ctx_server_info))
         service._gen_router.get_next_server = AsyncMock(
-            return_value=("gen:9001", {"server_info": {"encoded_opaque_state": "opaque_gen"}})
+            return_value=("gen:9001", {"server_info": {}})
         )
         resp_text = f"response-{i}"
 
@@ -127,10 +131,7 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
         gen_req = service._gen_client.send_request.call_args.args[0]
         assert gen_req.disaggregated_params.request_type == "generation_only"
         if schedule_style == "generation_first":
-            assert (
-                gen_req.disaggregated_params.encoded_opaque_state
-                == ctx_server_info["server_info"]["encoded_opaque_state"]
-            )
+            assert gen_req.disaggregated_params.encoded_opaque_state == opaque_state
         assert (
             gen_req.disaggregated_params.ctx_request_id
             == ctx_req.disaggregated_params.disagg_request_id

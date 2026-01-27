@@ -13,6 +13,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
+from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 try:
@@ -2396,14 +2397,20 @@ class PyExecutor:
         return
 
     @nvtx_range("_check_disagg_ctx_schedulable_status")
-    def _check_disagg_ctx_schedulable_status(self, new_requests):
+    def _check_disagg_ctx_schedulable_status(self,
+                                             new_requests: List[LlmRequest]):
+        """
+        In context-first mode, context requests are scheduable immediately,
+        otherwise, we need to check if context requests are ready to be scheduled by querying kv cache transceiver
+        """
         if not self.kv_cache_transceiver:
             return
         ctx_only_requests = [
-            req for req in self.active_requests if req.is_context_only_request
+            req for req in new_requests
+            if req.is_context_only_request and req.py_disaggregated_params.
+            schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         ]
         self.kv_cache_transceiver.prepare_context_requests(ctx_only_requests)
-        return
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):

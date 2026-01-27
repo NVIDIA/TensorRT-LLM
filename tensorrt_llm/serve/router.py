@@ -180,12 +180,14 @@ class Router(ABC):
     async def _fetch_server_info(self, server: str, timeout: float) -> dict:
         session = aiohttp.ClientSession()
         try:
-            async with session.get(f"{server}/server_info",
+            async with session.get(f"http://{server}/server_info",
                                    timeout=timeout) as response:
                 return await response.json()
+        except Exception as e:
+            logger.error(f"Error fetching server info for server {server}: {e}")
         finally:
             await session.close()
-            return None
+            return {}
 
     async def _prepare_server(self, server: str):
         if self._server_preparation_func:
@@ -193,6 +195,7 @@ class Router(ABC):
 
         self._server_info[server] = await self._fetch_server_info(
             server, self._health_check_timeout)
+        logger.info(f"server is ready with info: {self._server_info[server]}")
 
     async def prepare_servers(self, servers: Optional[List[str]] = None):
         for server in servers or self._servers:

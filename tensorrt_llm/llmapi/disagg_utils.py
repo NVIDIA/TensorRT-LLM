@@ -1,5 +1,4 @@
 import logging
-import os
 import threading
 import time
 import uuid
@@ -83,6 +82,8 @@ class DisaggServerConfig():
     node_id: int = uuid.getnode(
     ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
     # If this causes collisions, users can set node_id manually within range [0, 1023] in config
+    schedule_style: Literal['context_first',
+                            'generation_first'] = 'context_first'
 
 
 @dataclass
@@ -383,17 +384,3 @@ def get_global_disagg_request_id(machine_id: int) -> int:
 def get_local_request_id(last_id: int) -> int:
     """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
     return (last_id + 1) & (MIN_GLOBAL_ID - 1)
-
-
-class DisaggScheduleStyle(IntEnum):
-    CONTEXT_FIRST = 0
-    GENERATION_FIRST = 1
-
-
-def get_disagg_schedule_style() -> DisaggScheduleStyle:
-    if os.getenv("TRTLLM_DISAGG_SCHEDULE_STYLE",
-                 "").lower() in ["gen_first", "generation_first"]:
-        return DisaggScheduleStyle.GENERATION_FIRST
-    else:
-        # default to context first
-        return DisaggScheduleStyle.CONTEXT_FIRST

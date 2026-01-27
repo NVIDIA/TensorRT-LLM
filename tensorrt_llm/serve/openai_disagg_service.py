@@ -19,11 +19,9 @@ from typing import Any, Callable, Dict, Optional
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
     DisaggClusterConfig,
-    DisaggScheduleStyle,
     DisaggServerConfig,
     MetadataServerConfig,
     ServerRole,
-    get_disagg_schedule_style,
     get_global_disagg_request_id,
 )
 from tensorrt_llm.logger import logger
@@ -35,6 +33,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     DisaggregatedParams,
+    DisaggScheduleStyle,
     UCompletionRequest,
     UCompletionResponse,
 )
@@ -78,14 +77,15 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._ctx_client = None
         self._gen_client = None
         self._disagg_cluster_manager = None
+        self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
 
-        match get_disagg_schedule_style():
-            case DisaggScheduleStyle.GENERATION_FIRST:
+        match self._config.schedule_style:
+            case "generation_first":
                 self._send_disagg_request = self._send_disagg_request_gen_first
-            case DisaggScheduleStyle.CONTEXT_FIRST:
-                self._send_disagg_request = self._send_disagg_request_ctx_first
+                self._schedule_style = DisaggScheduleStyle.GENERATION_FIRST
             case _:
-                raise ValueError(f"Invalid disagg schedule style: {get_disagg_schedule_style()}")
+                self._send_disagg_request = self._send_disagg_request_ctx_first
+                self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
 
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -165,6 +165,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ),
                 "stream": False,
                 "stream_options": None,
+                "schedule_style": self._schedule_style,
             }
         )
         return ctx_request
@@ -190,10 +191,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                 request_type="generation_only",
                 ctx_request_id=disagg_request_id,
                 disagg_request_id=disagg_request_id,
+                schedule_style=self._schedule_style,
             )
         if ctx_server_info and "server_info" in ctx_server_info:
-            request.disaggregated_params.encoded_opaque_state = ctx_server_info["server_info"].get(
-                "encoded_opaque_state", None
+            disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
+            request.disaggregated_params = request.disaggregated_params.model_copy(
+                update=disaggregated_params
             )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
