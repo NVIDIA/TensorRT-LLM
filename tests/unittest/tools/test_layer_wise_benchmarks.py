@@ -179,3 +179,23 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
         ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
     )
+
+
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_calibration(llm_root, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size:d} GPUs to run this test")
+    model_root = llm_models_root(check=True)
+    profile_dir = f"profiles/test_calibration_{world_size}"
+    check_call(
+        [
+            "./sample_performance_calibration.sh",
+        ],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
+        env={
+            **os.environ,
+            "MODEL": model_root / "DeepSeek-V3-Lite" / "nvfp4_moe_only",
+            "NP": f"{world_size:d}",
+            "PROFILE_DIR": profile_dir,
+        },
+    )

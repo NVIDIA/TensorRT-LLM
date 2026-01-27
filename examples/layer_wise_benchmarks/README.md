@@ -171,9 +171,9 @@ You will receive three reports, each containing kernel timing statistics grouped
 2. A CSV report at `profiles/report_np4_rank0.csv`
 3. An HTML report at `profiles/report_np4_rank0.html`
 
-## Performance calibrating
+## Performance calibration
 
-An overall example can be found in `sample_performance_calibrating.sh`. Here is an abstract of the main steps.
+An overall example can be found in `sample_performance_calibration.sh`. Here is an abstract of the main steps.
 
 1. Run end-to-end serving in **COLLECT** mode, and capture nsys profiles. This step generates a calibration file.
 
@@ -233,8 +233,8 @@ An overall example can be found in `sample_performance_calibrating.sh`. Here is 
        --load-format AUTO \
        --layer-indices 5,6,7 \
        --batch-size 32 \
-       --seq-len-q 4 \
-       --seq-len-kv-cache 8316 \
+       --seq-len-q 1 \
+       --seq-len-kv-cache 2090 \
        --balance-method NotModified \
        --replay-file-path profiles/calibration_data.json \
        --replay-start 47 \
@@ -245,11 +245,12 @@ An overall example can be found in `sample_performance_calibrating.sh`. Here is 
 
    1. `NP=4`: Should match the end-to-end run.
    2. `--load-format AUTO`: Instruct the benchmark to load model weights instead of initializing random weights.
-   2. `--layer-indices 5,6,7`: Any list of contiguous layers you want to calibrate.
-   3. `--batch-size 32`: Should match the end-to-end run.
-   4. `--seq-len-q 4`: Should match (1+MTP) of the end-to-end run.
-   5. `--seq-len-kv-cache 8316`: Estimation of the average context length for iterations you captured. The first 5 iterations should be excluded from the estimation, because they will be dropped by parser.
-   6. `--replay-start` and `--replay-stop`: Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations, because they will be dropped by parser.
+   3. `--layer-indices 5,6,7`: Any list of contiguous layers you want to calibrate.
+   7. `--batch-size 32`: Should match the end-to-end run.
+   5. `--seq-len-q 1`: Should match (1+MTP) of the end-to-end run.
+   6. `--seq-len-kv-cache 2090`: Estimation of the average context length for iterations you captured. The first 5 iterations should be excluded from the estimation, because they will be dropped by parser.
+   7. `--replay-file-path`: The calibration file obtained by Step 1.
+   8. `--replay-start` and `--replay-stop`: Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations, because they will be dropped by parser.
 
 4. Parse end-to-end profiles with `parse_e2e.py`, and parse layer-wise benchmarks profiles with `parse.py`.
 
@@ -271,7 +272,7 @@ An overall example can be found in `sample_performance_calibrating.sh`. Here is 
    python3 correlation.py \
        --reference profiles/report_e2e_mark_rank0.json \
        $(seq 1 $((NP - 1)) | xargs -I% echo "--target profiles/report_e2e_mark_rank%.json") \
-       $(seq 0 $((NP - 1)) | xargs -I% echo "--target profiles/report_np4_rank%.json") \
+       $(seq 0 $((NP - 1)) | xargs -I% echo "--target profiles/report_np${NP}_rank%.json") \
        -o profiles/correlation.html
    ```
 
