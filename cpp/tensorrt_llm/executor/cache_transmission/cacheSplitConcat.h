@@ -43,6 +43,7 @@ struct TargetRanksInfo
 
     // the size of the vector is equal to the mDomainPPSize. the value of the vector is the layer num should be fetched
     // from each target PP rank in domain PP.
+    // Used for both KV and RNN cache transfer
     std::vector<int> mPeerAttentionLayerNumInDomainPP;
 
     int getPeerPPDomainLayerNum(int targetRankIdx) const

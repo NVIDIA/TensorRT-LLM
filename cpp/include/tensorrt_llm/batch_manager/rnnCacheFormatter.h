@@ -82,7 +82,8 @@ public:
 
     /// @brief Not supported for RNN cache. Always throws.
     [[nodiscard]] std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig) const override
+        SizeType32 selfIdx, CacheState const& destConfig,
+        std::vector<SizeType32> const& counterPartRanks) const override
     {
         TLLM_THROW("RnnCacheFormatter::pickRecvConnections(CacheState) not supported. Use RnnCacheState version.");
         return {};
@@ -119,7 +120,7 @@ public:
     /// @param destConfig Destination configuration.
     /// @return Indices of connections to receive from.
     [[nodiscard]] std::vector<size_t> pickRecvConnections(size_t numConnections, RnnCacheState const& selfConfig,
-        SizeType32 selfIdx, RnnCacheState const& destConfig) const;
+        SizeType32 selfIdx, RnnCacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const;
 
     /// @brief Get the RNN state manager.
     /// @return Pointer to the RNN state manager.
