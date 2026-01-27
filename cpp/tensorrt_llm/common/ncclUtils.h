@@ -21,6 +21,8 @@
 #include "tensorrt_llm/common/logger.h"
 
 #if ENABLE_MULTI_DEVICE
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/extension.h>
 #endif
@@ -414,15 +416,44 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     // Request buffer from allocator
     auto& allocator = NCCLWindowAllocator::getInstance();
-    auto buffer = allocator.requestBuffer(comm, buffer_size);
+    NCCLWindowBuffer buffer;
+
+    try
+    {
+        buffer = allocator.requestBuffer(comm, buffer_size);
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
+        // #region agent log
+        {
+            std::ostringstream data;
+            data << "{"
+                 << "\"buffer_size\":" << buffer_size << ","
+                 << "\"error\":\"" << e.what() << "\"}";
+            write_nccl_window_debug_log("ncclUtils.h:createNCCLWindowTensor",
+                "requestBuffer failed; returning invalid buffer", data.str(), "H6");
+        }
+        // #endregion
+        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
+    }
 
     // Defensive validation: ensure buffer is valid before proceeding
     if (!buffer.isValid())
     {
-        std::ostringstream oss;
-        oss << "Failed to allocate NCCL window buffer: invalid buffer returned from requestBuffer "
-            << "(comm=" << static_cast<void*>(comm) << ", buffer_size=" << buffer_size << ")";
-        throw std::runtime_error(oss.str());
+        TLLM_LOG_WARNING(
+            "[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
+        // #region agent log
+        {
+            std::ostringstream data;
+            data << "{"
+                 << "\"buffer_size\":" << buffer_size << ","
+                 << "\"comm\":\"" << static_cast<void*>(comm) << "\"}";
+            write_nccl_window_debug_log(
+                "ncclUtils.h:createNCCLWindowTensor", "invalid buffer from requestBuffer", data.str(), "H6");
+        }
+        // #endregion
+        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
     // #region agent log

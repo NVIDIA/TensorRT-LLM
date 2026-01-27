@@ -383,6 +383,31 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         return bestFit->buffer;
     }
 
+    // No available buffer found, avoid registration during CUDA graph capture
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    auto capture_err = cudaStreamIsCapturing(stream, &capture_status);
+    if (capture_err != cudaSuccess)
+    {
+        TLLM_LOG_WARNING("[NCCLUtil] cudaStreamIsCapturing failed: %s", cudaGetErrorString(capture_err));
+    }
+    if (capture_err == cudaSuccess && capture_status != cudaStreamCaptureStatusNone)
+    {
+        TLLM_LOG_WARNING("[NCCLUtil] Skipping NCCL window allocation during capture for comm %p (requested: %zu)",
+            static_cast<void*>(comm), size);
+        // #region agent log
+        {
+            std::ostringstream data;
+            data << "{"
+                 << "\"comm\":\"" << static_cast<void*>(comm) << "\","
+                 << "\"size\":" << size << "}";
+            write_nccl_window_debug_log(
+                "ncclUtils.cpp:requestBuffer", "capture detected; no available buffer", data.str(), "H6");
+        }
+        // #endregion
+        return NCCLWindowBuffer();
+    }
+
     // No available buffer found, allocate a new one
     TLLM_LOG_TRACE(
         "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);

@@ -42,6 +42,7 @@
 #include <ATen/cuda/EmptyTensor.h>
 #include <c10/util/irange.h>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -654,8 +655,9 @@ private:
             minRegistrationThreshold = static_cast<size_t>(std::atoi(envThreshold)) * input.element_size();
         }
 
-        // Search for existing buffer
         auto& allocator = NCCLWindowAllocator::getInstance();
+
+        // Search for existing buffer
         auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr());
 
         torch::Tensor inputTensor = input;
@@ -711,45 +713,59 @@ private:
 
                 auto [symmetricInput, symmetricBuffer0]
                     = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
-                // #region agent log
+                if (!symmetricBuffer0.isValid())
                 {
-                    std::ostringstream data;
-                    data << "{"
-                         << "\"symmetric_ptr\":\"" << symmetricInput.data_ptr() << "\","
-                         << "\"buffer_ptr\":\"" << symmetricBuffer0.ptr << "\","
-                         << "\"buffer_size\":" << symmetricBuffer0.size << "}";
-                    write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "after createNCCLWindowTensor (input)",
-                        data.str(), "H6");
+                    TLLM_LOG_WARNING(
+                        "[runNCCLAllReduceSymmetric] NCCL window not available during capture; "
+                        "using input buffer directly for symmetric allreduce");
+                    // #region agent log
+                    write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric",
+                        "invalid input window; using input buffer", "{}", "H6");
+                    // #endregion
+                    // inputTensor and inputPtr remain pointing to original input
                 }
-                // #endregion
+                else
+                {
+                    // #region agent log
+                    {
+                        std::ostringstream data;
+                        data << "{"
+                             << "\"symmetric_ptr\":\"" << symmetricInput.data_ptr() << "\","
+                             << "\"buffer_ptr\":\"" << symmetricBuffer0.ptr << "\","
+                             << "\"buffer_size\":" << symmetricBuffer0.size << "}";
+                        write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric",
+                            "after createNCCLWindowTensor (input)", data.str(), "H6");
+                    }
+                    // #endregion
 
-                // #region agent log
-                {
-                    std::ostringstream data;
-                    data << "{"
-                         << "\"dst_ptr\":\"" << symmetricBuffer0.ptr << "\","
-                         << "\"src_ptr\":\"" << input.data_ptr() << "\","
-                         << "\"bytes\":" << bufferSizeBytes << "}";
-                    write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "before cudaMemcpyAsync (input)",
-                        data.str(), "H6");
-                }
-                // #endregion
-                TLLM_CUDA_CHECK(cudaMemcpyAsync(
-                    symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
-                // #region agent log
-                {
-                    std::ostringstream data;
-                    data << "{"
-                         << "\"dst_ptr\":\"" << symmetricBuffer0.ptr << "\","
-                         << "\"bytes\":" << bufferSizeBytes << "}";
-                    write_debug_log(
-                        "allreduceOp.cpp:runNCCLAllReduceSymmetric", "after cudaMemcpyAsync (input)", data.str(), "H6");
-                }
-                // #endregion
+                    // #region agent log
+                    {
+                        std::ostringstream data;
+                        data << "{"
+                             << "\"dst_ptr\":\"" << symmetricBuffer0.ptr << "\","
+                             << "\"src_ptr\":\"" << input.data_ptr() << "\","
+                             << "\"bytes\":" << bufferSizeBytes << "}";
+                        write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "before cudaMemcpyAsync (input)",
+                            data.str(), "H6");
+                    }
+                    // #endregion
+                    TLLM_CUDA_CHECK(cudaMemcpyAsync(
+                        symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
+                    // #region agent log
+                    {
+                        std::ostringstream data;
+                        data << "{"
+                             << "\"dst_ptr\":\"" << symmetricBuffer0.ptr << "\","
+                             << "\"bytes\":" << bufferSizeBytes << "}";
+                        write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "after cudaMemcpyAsync (input)",
+                            data.str(), "H6");
+                    }
+                    // #endregion
 
-                windowBuffer0 = symmetricBuffer0;
-                inputTensor = symmetricInput; // Swap to window-backed tensor
-                inputPtr = windowBuffer0.ptr;
+                    windowBuffer0 = symmetricBuffer0;
+                    inputTensor = symmetricInput; // Swap to window-backed tensor
+                    inputPtr = windowBuffer0.ptr;
+                }
             }
         }
         else
@@ -769,6 +785,54 @@ private:
         }
         // #endregion
         auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+        if (!windowBuffer1.isValid())
+        {
+            TLLM_LOG_WARNING(
+                "[runNCCLAllReduceSymmetric] NCCL window not available during capture; "
+                "using plain CUDA tensor for output");
+            // #region agent log
+            write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric",
+                "invalid output window; using torch output tensor", "{}", "H6");
+            // #endregion
+            torch::Tensor outputTensor = torch::empty_like(inputTensor);
+            void* outputPtr = outputTensor.data_ptr();
+            // Perform allreduce
+            // #region agent log
+            {
+                std::ostringstream data;
+                data << "{"
+                     << "\"comm_index\":0,"
+                     << "\"numel\":" << size << ","
+                     << "\"buffer_bytes\":" << bufferSizeBytes << ","
+                     << "\"min_registration_threshold\":" << minRegistrationThreshold << ","
+                     << "\"n_ranks\":" << nRanks << ","
+                     << "\"nvlink_supported\":" << (mIsNVLINKSupported ? "true" : "false") << ","
+                     << "\"mnnvl_supported\":" << (mIsMNNVLSupported ? "true" : "false") << ","
+                     << "\"env_threshold_set\":" << (envThreshold != nullptr ? "true" : "false") << ","
+                     << "\"input_window_valid\":" << (windowBuffer0.isValid() ? "true" : "false") << ","
+                     << "\"input_ptr_is_window\":" << (inputPtr == windowBuffer0.ptr ? "true" : "false") << ","
+                     << "\"input_ptr\":\"" << inputPtr << "\","
+                     << "\"output_ptr\":\"" << outputPtr << "\"}";
+                write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "before ncclAllReduce", data.str(), "H3");
+            }
+            // #endregion
+            NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
+            // #region agent log
+            {
+                std::ostringstream data;
+                data << "{"
+                     << "\"numel\":" << size << "}";
+                write_debug_log("allreduceOp.cpp:runNCCLAllReduceSymmetric", "after ncclAllReduce", data.str(), "H3");
+            }
+            // #endregion
+
+            if (mOp == AllReduceFusionOp::NONE)
+            {
+                return {outputTensor};
+            }
+
+            return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        }
         // #region agent log
         {
             std::ostringstream data;
