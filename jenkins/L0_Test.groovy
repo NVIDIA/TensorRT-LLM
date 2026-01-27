@@ -51,11 +51,11 @@ POD_TIMEOUT_SECONDS_SLURM = env.podTimeoutSeconds ? env.podTimeoutSeconds : "792
 
 // LLM data paths in container for Blossom
 @Field
-def austin_llm_data_path = "/vol/scratch1/scratch.trt_llm_data"
+def sc_trt_llm_data_mount_path = "/sc.trt_llm_data"
 @Field
-def sc_llm_data_path = "/mnt/sw-tensorrt-pvc/scratch.trt_llm_data"
+def austin_trt_llm_data_mount_path = "/austin.trt_llm_data"
 @Field
-def pdx_llm_data_path = "/vol/scratch1/scratch.trt_llm_data"
+def pdx_trt_llm_data_mount_path = "/pdx.trt_llm_data"
 @Field
 def llm_data = ""
 
@@ -2642,11 +2642,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Determine llm_data based on hostname
         def hostname = sh(script: 'hostname -f', returnStdout: true).trim()
         if (hostname.contains('ipp3')) {
-            llm_data = austin_llm_data_path
+            llm_data = austin_trt_llm_data_mount_path
         } else if (hostname.contains('ipp6')) {
-            llm_data = pdx_llm_data_path
+            llm_data = pdx_trt_llm_data_mount_path
         } else {
-            llm_data = sc_llm_data_path
+            llm_data = pdx_trt_llm_data_mount_path
         }
         llm_data = "${llm_data}/llm-models"
 
