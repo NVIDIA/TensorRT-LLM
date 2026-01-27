@@ -518,6 +518,17 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     ncclResult_t allocResult = ncclMemAllocFunc(&buffer.ptr, size);
     if (allocResult != ncclSuccess)
     {
+        // #region agent log
+        {
+            std::ostringstream data;
+            data << "{"
+                 << "\"alloc_result\":" << static_cast<int>(allocResult) << ","
+                 << "\"alloc_error\":\"" << ncclGetErrorString(allocResult) << "\","
+                 << "\"size\":" << size << "}";
+            write_nccl_window_debug_log(
+                "ncclUtils.cpp:allocateAndRegisterBuffer", "ncclMemAlloc failed", data.str(), "H6");
+        }
+        // #endregion
         TLLM_THROW("ncclMemAlloc failed with error: %d", allocResult);
     }
     buffer.size = size;
@@ -527,6 +538,19 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
         = ncclCommWindowRegisterFunc(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
     if (regResult != ncclSuccess)
     {
+        // #region agent log
+        {
+            std::ostringstream data;
+            data << "{"
+                 << "\"reg_result\":" << static_cast<int>(regResult) << ","
+                 << "\"reg_error\":\"" << ncclGetErrorString(regResult) << "\","
+                 << "\"comm\":\"" << static_cast<void*>(comm) << "\","
+                 << "\"ptr\":\"" << buffer.ptr << "\","
+                 << "\"size\":" << size << "}";
+            write_nccl_window_debug_log(
+                "ncclUtils.cpp:allocateAndRegisterBuffer", "ncclCommWindowRegister failed", data.str(), "H6");
+        }
+        // #endregion
         ncclMemFree(buffer.ptr);
         TLLM_THROW("ncclCommWindowRegister failed with error: %d", regResult);
     }
