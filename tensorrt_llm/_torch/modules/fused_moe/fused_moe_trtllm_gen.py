@@ -18,7 +18,7 @@ from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
-from .moe_backend import MoEBackend, get_backend
+from .moe_backend import MoEOpBackend, get_backend
 
 # isort: off
 from .quantization import (
