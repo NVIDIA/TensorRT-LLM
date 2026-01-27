@@ -534,63 +534,64 @@ class ConfigLoader:
         # Apply overrides based on field paths
         for path, value_getter in field_mapping.items():
             self._set_nested_value(config, path, value_getter())
-        
+
         # Apply dynamic overrides for accuracy.tasks (task names are dynamic)
         self._apply_accuracy_tasks_overrides(config)
-        
+
         return config
 
     def _set_nested_value(self, config: dict, path: tuple, value: any) -> None:
         """Set value at nested path in config.
-        
+
         Supports arbitrary nesting depth using tuple paths.
         Creates missing intermediate levels automatically.
-        
+
         Args:
             config: Configuration dictionary
             path: Tuple of keys representing the path (e.g., ("a", "b", "c"))
             value: Value to set
-        
+
         Example:
             _set_nested_value(config, ("accuracy", "env_var", "HF_HOME"), "/path")
             # Sets config["accuracy"]["env_var"]["HF_HOME"] = "/path"
         """
         current = config
-        
+
         # Traverse/create path, except for the last key
         for key in path[:-1]:
             if key not in current:
                 current[key] = {}
             current = current[key]
-        
+
         # Set the final value
         current[path[-1]] = value
 
     def _apply_accuracy_tasks_overrides(self, config: dict) -> None:
         """Apply environment overrides for accuracy.tasks configuration.
-        
+
         Handles dynamic task names (e.g., gsm8k, gpqa_diamond_local).
         Replaces placeholders in custom_config paths.
-        
+
         Args:
             config: Configuration dictionary
         """
-        if 'accuracy' not in config or 'tasks' not in config['accuracy']:
+        if "accuracy" not in config or "tasks" not in config["accuracy"]:
             return
-        
+
         repo_dir = EnvManager.get_repo_dir()
-        
+
         # Iterate through all tasks (task names are dynamic)
-        for task_name, task_config in config['accuracy']['tasks'].items():
+        for task_name, task_config in config["accuracy"]["tasks"].items():
             if not isinstance(task_config, dict):
                 continue
-            
+
             # Replace <repo_path> in custom_config
-            if 'extra_kwargs' in task_config and 'custom_config' in task_config['extra_kwargs']:
-                custom_config_path = task_config['extra_kwargs']['custom_config']
-                if '<repo_path>' in custom_config_path:
-                    task_config['extra_kwargs']['custom_config'] = \
-                        custom_config_path.replace('<repo_path>', repo_dir)
+            if "extra_kwargs" in task_config and "custom_config" in task_config["extra_kwargs"]:
+                custom_config_path = task_config["extra_kwargs"]["custom_config"]
+                if "<repo_path>" in custom_config_path:
+                    task_config["extra_kwargs"]["custom_config"] = custom_config_path.replace(
+                        "<repo_path>", repo_dir
+                    )
 
     def _get_full_model_path(self, config: dict) -> str:
         """Get full model path by combining MODEL_DIR with model directory name.
@@ -606,11 +607,11 @@ class ConfigLoader:
             return os.path.join(EnvManager.get_model_dir(), model_dir_name)
         else:
             return ""
-    
+
     def _get_repo_dir(self):
         if EnvManager.get_install_mode() == "source":
             return EnvManager.get_repo_dir()
-        else: # wheel/none install_mode, no need to set repo_dir
+        else:  # wheel/none install_mode, no need to set repo_dir
             return ""
 
     def _get_dataset_file(self, config: dict) -> str:

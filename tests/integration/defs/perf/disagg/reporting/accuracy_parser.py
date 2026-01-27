@@ -39,12 +39,12 @@ class AccuracyParser:
             AccuracyValidationResult with validation results for all runs
         """
         log_pattern = self.metrics_config.log_file
-        
+
         # Check if pattern contains wildcards
-        if '*' in log_pattern or '?' in log_pattern or '[' in log_pattern:
+        if "*" in log_pattern or "?" in log_pattern or "[" in log_pattern:
             # Use glob to match multiple files
             log_files = sorted(glob.glob(os.path.join(self.result_dir, log_pattern)))
-            
+
             if not log_files:
                 return {
                     "success": False,
@@ -53,12 +53,12 @@ class AccuracyParser:
                     "raw_results": [],
                     "error": f"No log files found matching pattern: {log_pattern}",
                 }
-            
+
             logger.info(f"Found {len(log_files)} log file(s) matching pattern '{log_pattern}'")
         else:
             # Single file (backward compatible)
             log_file = os.path.join(self.result_dir, log_pattern)
-            
+
             if not os.path.exists(log_file):
                 return {
                     "success": False,
@@ -67,13 +67,13 @@ class AccuracyParser:
                     "raw_results": [],
                     "error": f"Log file not found: {log_file}",
                 }
-            
+
             log_files = [log_file]
-        
+
         # Read and merge all log files
         combined_log_content = ""
         failed_files = []
-        
+
         for log_file in log_files:
             try:
                 with open(log_file, "r", encoding="utf-8", errors="replace") as f:
@@ -85,7 +85,7 @@ class AccuracyParser:
             except Exception as e:
                 failed_files.append((log_file, str(e)))
                 logger.warning(f"Failed to read {log_file}: {e}")
-        
+
         if not combined_log_content:
             error_msg = "No valid log content found."
             if failed_files:
