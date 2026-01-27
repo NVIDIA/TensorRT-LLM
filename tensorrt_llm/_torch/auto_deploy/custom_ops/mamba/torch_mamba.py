@@ -33,6 +33,7 @@ def _reshape_into_chunks(input_tensor, pad_size, chunk_size):
 
     if len(input_tensor.shape) == 3:
         # [bsz, seq_len multiple of chunk_size, num_heads] -> [bsz, -1, chunk_size, num_heads]
+        # ISSUE 2: -1 dim depends on pad_size (symbolic).
         return input_tensor.reshape(input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2])
     else:
         # [bsz, seq_len multiple of chunk_size, num_heads, head_dim or state_size] ->
@@ -93,6 +94,7 @@ def _torch_ssm_prefill(
     C = C.reshape(batch_size, seq_len, n_groups, ssm_state_size).float()
     B = B.repeat_interleave(num_heads // n_groups, dim=2, output_size=num_heads)
     C = C.repeat_interleave(num_heads // n_groups, dim=2, output_size=num_heads)
+    # ISSUE 1: seq_len is symbolic, so pad_size is symbolic
     pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
 
     D_residual = D[..., None] * _pad_tensor_by_size(hidden_states, pad_size)
@@ -102,6 +104,7 @@ def _torch_ssm_prefill(
     A = A.to(hidden_states.dtype) * dt
 
     # Rearrange into blocks/chunks
+    # The -1 dimesion's size depends on pad_size, which is data-dependent.
     hidden_states, A, B, C = [
         _reshape_into_chunks(t, pad_size, chunk_size) for t in (hidden_states, A, B, C)
     ]
@@ -155,6 +158,7 @@ def _torch_ssm_prefill(
 
     y = y + D_residual
     # Cutting off padded chunks
+    # ISSUE 3: Data-dependent control flow.
     if pad_size > 0:
         y = y[:, :seq_len, :, :]
     y = y.reshape(batch_size, seq_len, num_heads, head_dim)
