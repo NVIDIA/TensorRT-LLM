@@ -31,6 +31,7 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
+  - unittest/disaggregated/test_openai_disagg_service.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
   - unittest/disaggregated/test_agent_multi_backends.py

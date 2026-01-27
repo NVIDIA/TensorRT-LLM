@@ -268,10 +268,8 @@ class BaseLLM:
     def llm_info(self) -> dict:
         return {
             "model": str(self.args.model),
-            "encoded_opaque_state": {
-                self._executor.get_disagg_context_state()
-                if self._executor else None
-            }
+            "disaggregated_params":
+            self._executor.get_disagg_context_state() if self._executor else {}
         }
 
     def generate(

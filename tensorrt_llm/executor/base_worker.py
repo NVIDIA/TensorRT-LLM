@@ -655,6 +655,9 @@ class BaseWorker(GenerationExecutor):
             self.engine = None
 
     def get_disagg_context_state(self) -> dict:
+        if self.engine is None or self.engine.kv_cache_transceiver is None:
+            logger.warning("Engine or kv cache transceiver is not initialized")
+            return {}
         return self.engine.kv_cache_transceiver.get_context_state()
 
     # Define a Callable to join iteration and request stats
