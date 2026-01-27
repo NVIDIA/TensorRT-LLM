@@ -123,6 +123,13 @@ if args.load_format is None:
     args.load_format = "DUMMY"
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
+if args.run_type == "GEN":
+    ctx_seq_len_q = max(args.seq_len_kv_cache_list)
+    ctx_batch_size = min(
+        args.max_batch_size,
+        max(1, 20480 // ctx_seq_len_q),
+    )
+    args.max_num_tokens = max(ctx_batch_size * ctx_seq_len_q, args.max_num_tokens)
 if args.moe_backend_for_prefill is None:
     args.moe_backend_for_prefill = "CUTLASS"
 if args.use_low_precision_moe_combine is None:
@@ -200,11 +207,6 @@ else:
 # Prefill KV cache
 if args.run_type == "GEN":
     logger.info("Layer-wise benchmarks: Create runner for prefill")
-    ctx_seq_len_q = max(args.seq_len_kv_cache_list)
-    ctx_batch_size = min(
-        args.max_batch_size,
-        max(1, 20480 // ctx_seq_len_q),
-    )
     ctx_attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
     with mock.patch.dict(os.environ, {"TRTLLM_FORCE_ALLTOALL_METHOD": "NotEnabled"}, clear=False):
         ctx_runner = Runner(
@@ -215,7 +217,7 @@ if args.run_type == "GEN":
             layer_indices=args.layer_indices,
             scaled_from=args.scaled_from,
             max_seq_len=args.max_seq_len,
-            max_num_tokens=ctx_batch_size * ctx_seq_len_q,
+            max_num_tokens=args.max_num_tokens,
             moe_max_num_tokens=16384,
             kv_cache_dtype=args.kv_cache_dtype,
             mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
