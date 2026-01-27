@@ -284,12 +284,9 @@ class CachedSequenceInterface:
             offset_end = cumulative_bytes_per_state[layer_idx + 1]
 
             # Slice at byte offset, reinterpret dtype, reshape
-            view = ssm_buffer[:, offset_start:offset_end]
+            view = ssm_buffer[:, offset_start:offset_end].contiguous()
             view = view.view(handler.dtype)
             view = view.view(num_states, *handler.state_shape)
-
-            # Sanity check on contiguity of individual state slots
-            assert view[0].is_contiguous(), f"Per-slot state for {name} cache is not contiguous"
 
             self._caches[name] = view
 
