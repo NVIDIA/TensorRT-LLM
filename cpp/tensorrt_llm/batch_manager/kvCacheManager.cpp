@@ -1637,6 +1637,12 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
                 needMatch = false; // no matching needed for following blocks
                 block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+                if (block->getPrevBlock())
+                {
+                    // detach block from old previous block
+                    block->getPrevBlock()->removeNextBlock(block->getBlockKey());
+                }
+                // attach block to new previous block
                 block->setPrevBlock(searchRoot);
                 block->setPrevBlockInSeq(searchRoot);
                 searchRoot->addNextBlock(blockKey, block);
