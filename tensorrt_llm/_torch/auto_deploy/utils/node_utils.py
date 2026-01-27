@@ -971,40 +971,58 @@ def get_layer_after_linear_node(
         )
     )
 
-    layer_type = LayerType.MLP
-    min_local_shape = 1
-    if len(ssm_nodes) > 0:
-        if len(ssm_nodes) == 1:
-            layer_type = LayerType.SSM
-            # determine head size
-            min_local_shape = shape(ssm_nodes[0])[-1]
-        else:
-            layer_type = LayerType.UNKNOWN
-    if len(attention_nodes) > 0 and layer_type != LayerType.UNKNOWN:
+    ####################################################
+    ########## LAYER TYPE CLASSIFICATION ###############
+    ####################################################
+
+    def classify_layer_type() -> [LayerType, int]:
+        if len(ssm_nodes) + len(attention_nodes) > 1:
+            return LayerType.UNKNOWN, 1
+
         if len(attention_nodes) == 1:
-            layer_type = LayerType.ATTENTION
-            # determine head size
-            min_local_shape = shape(attention_nodes[0])[-1]
-        else:
-            layer_type = LayerType.UNKNOWN
-    if len(intermediate_lin_nodes) > 0 and layer_type != LayerType.UNKNOWN:
-        if len(intermediate_lin_nodes) == 2 and len(attention_nodes) == 1:
-            layer_type = LayerType.MLA
-        else:
-            layer_type = LayerType.UNKNOWN
-    # only SSM or MLA layers can have weight nodes in the interior nodes
-    # TODO: Minimax does have RMSNorm inside attention, we need to
-    # support it in the future.
-    if len(intermediate_weight_nodes) > 0:
-        if layer_type not in [LayerType.SSM, LayerType.MLA]:
-            layer_type = LayerType.UNKNOWN
+            head_size = shape(attention_nodes[0])[-1]
+            # check if this is MLA:
+            # these two intermediate linear nodes are the latent q and kv projections.
+            if len(intermediate_lin_nodes) == 2:
+                # MLA has a RMS norm inside, so it should have one intermediate linear node.
+                if len(intermediate_lin_nodes) != 1:
+                    return LayerType.UNKNOWN, 1
+                return LayerType.MLA, head_size
+            else:
+                if len(intermediate_lin_nodes) != 0:
+                    return LayerType.UNKNOWN, 1
+                return LayerType.ATTENTION, head_size
+
+        if len(ssm_nodes) == 1:
+            head_size = shape(ssm_nodes[0])[-1]
+            # Mamba layers should not have any intermediate linear nodes.
+            if len(intermediate_lin_nodes) > 0:
+                return LayerType.UNKNOWN, 1
+            # Mamba layer should have exactly 6 intermediate weight nodes:
+            # - RMS norm
+            # - conv1d weight
+            # - conv1d bias
+            # - dt_bias
+            # - A (A_log)
+            # - D
+            if len(intermediate_weight_nodes) != 6:
+                return LayerType.UNKNOWN, 1
+            return LayerType.SSM, head_size
+
+        # if we reach here, it means the layer is a MLP.
+        # MLP should not have any intermediate linear or weight nodes.
+        if len(intermediate_lin_nodes) > 0 or len(intermediate_weight_nodes) > 0:
+            return LayerType.UNKNOWN, 1
+        return LayerType.MLP, 1
+
+    layer_type, head_size = classify_layer_type()
 
     layer_subgraph = LayerSubgraph(
         opening_nodes=opening_linear_nodes,
         subgraph_nodes=interior_nodes,
         terminating_node=terminating_linear_node,
         layer_type=layer_type,
-        min_local_shape=min_local_shape,
+        min_local_shape=head_size,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
         f"Linear node not found in opening linear nodes - "
