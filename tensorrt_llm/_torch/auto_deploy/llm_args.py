@@ -9,7 +9,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ...llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
-    KvCacheConfig,
     SamplerType,
     TorchLlmArgs,
     _ParallelConfig,
@@ -45,7 +44,6 @@ def _check_for_default_value_only(
 
 _TRANSFORMS_SHORTCUT_LOOKUP = {
     "attn_backend": ("insert_cached_attention.backend", "transformers_replace_cached_attn.backend"),
-    "free_mem_ratio": ("resize_kv_cache.free_mem_ratio",),
     "compile_backend": ("compile_model.backend",),
     "cuda_graph_batch_sizes": ("compile_model.cuda_graph_batch_sizes",),
 }
@@ -191,23 +189,9 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
-    # TODO: see if we can just remove this field and use kv_cache_config.dtype instead?
-    kv_cache_dtype: str = Field(
-        default="auto",
-        description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
-        "supported in AutoDeploy.",
-    )
-
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.TorchSampler,
         description="The type of sampler to use. Options are TRTLLMSampler or TorchSampler. Defaults to TorchSampler.",
-    )
-
-    # NOTE: we do not support copy_on_partial_reuse in AutoDeploy yet
-    # see https://github.com/NVIDIA/TensorRT-LLM/issues/7142
-    kv_cache_config: KvCacheConfig = Field(
-        default_factory=lambda **kwargs: KvCacheConfig(copy_on_partial_reuse=False, **kwargs),
-        description="KV cache config.",
     )
 
     max_beam_width: int = Field(
@@ -240,12 +224,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         default="flashinfer",
         description=_shortcut_description("Attention backend to use.", "attn_backend"),
     )
-    free_mem_ratio: float = Field(
-        default=0.0,
-        description=_shortcut_description(
-            "The fraction of available memory to allocate for cache.", "free_mem_ratio"
-        ),
-    )
     compile_backend: str = Field(
         default="torch-compile",
         description=_shortcut_description(
@@ -263,16 +241,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
-    max_num_tokens: Optional[int] = Field(default=None, description="The maximum number of tokens.")
     max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
     max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
-    attn_page_size: int = Field(
-        default=64,
-        ge=1,
-        description="Page size for attention (tokens_per_block). For triton and torch "
-        "backends, this should equal max_seq_len. Temporary field until tokens_per_block gets "
-        "properly passed through.",
-    )
 
     def model_dump(self, *args, **kwargs):
         """Convert the arguments to a dictionary that can be used as kwargs for the LLM API."""
@@ -292,23 +262,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return kwargs
 
     ### VALIDATION #################################################################################
-    @model_validator(mode="after")
-    # TODO: discuss what to do with this once we fully transition to the new inference optimizer
-    def update_attn_page_size(self):
-        # NOTE force attn_page_size to equal max_seq_len for triton backend
-        if self.transforms.get("insert_cached_attention", {}).get("backend") in [
-            "triton",
-            "torch",
-        ]:
-            self.attn_page_size = self.max_seq_len
-        # NOTE: (hg) For transformers mode. This is ugly.
-        if self.transforms.get("transformers_replace_cached_attn", {}).get("backend") in [
-            "triton",
-            "torch",
-        ]:
-            self.attn_page_size = self.max_seq_len
-        return self
-
     @field_validator("model_factory", mode="after")
     @classmethod
     def model_factory_exists(cls, value: str) -> str:
@@ -357,16 +310,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         # ensure that the cuda_graph_batch_sizes are updated in the shortcut and transform config
         self.update_transforms_with_shortcuts()
         return self
-
-    @field_validator("kv_cache_config", mode="after")
-    @classmethod
-    def validate_kv_cache_config(cls, kv_cache_config: KvCacheConfig) -> KvCacheConfig:
-        if kv_cache_config.copy_on_partial_reuse:
-            kv_cache_config.copy_on_partial_reuse = False
-            ad_logger.warning(
-                "copy_on_partial_reuse is not supported by AutoDeploy. Setting it to False."
-            )
-        return kv_cache_config
 
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:

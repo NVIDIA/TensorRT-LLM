@@ -193,6 +193,7 @@ class MambaCacheManager(BaseResourceManager):
                                                        dtype=torch.int32,
                                                        device=device)
 
+    @torch.inference_mode()
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         self.state_indices_list.clear()
         for r in request_ids:

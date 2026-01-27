@@ -172,7 +172,7 @@ def torch_fake_quant_fp8_linear(
       - input_zp / weight_zp ignored
     """
     if weight_quantized.dtype != torch.float8_e4m3fn:
-        raise TypeError("FP8 path requires weight_quantized.dtype == float8_e4m3fn")
+        raise TypeError("FP8 path requires weight_quantized.dtype == torch.float8_e4m3fn")
     s_in = _expect_single_scale(input_scale, "input_scale")
     s_w = _expect_single_scale(weight_scale, "weight_scale")
 

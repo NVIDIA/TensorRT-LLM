@@ -40,10 +40,10 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             # Set it explicitly here to 8192 which is the default in build_config.
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.7
+            },
             "transforms": {
-                "resize_kv_cache": {
-                    "free_mem_ratio": 0.7
-                },
                 "compile_model": {
                     "backend":
                     "torch-cudagraph",
@@ -55,7 +55,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
             config[
-                "max_num_tokens"] = 512  # NOTE: must be > max(attn_page_size, max_batch_size)
+                "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
         return config
 
     def get_default_sampling_params(self):
@@ -110,7 +110,8 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             "trust_remote_code": True,
             # SSMs do not support cache reuse.
             "kv_cache_config": {
-                "enable_block_reuse": False
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.7
             },
             # Keep max_batch_size as in the PyTorch test to avoid OOM
             "max_batch_size": 128,
@@ -120,9 +121,6 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
             "transforms": {
-                "resize_kv_cache": {
-                    "free_mem_ratio": 0.7
-                },
                 "compile_model": {
                     "backend": "torch-cudagraph",
                     "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
@@ -132,7 +130,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
             config[
-                "max_num_tokens"] = 512  # NOTE: must be > max(attn_page_size, max_batch_size)
+                "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
         return config
 
     def get_default_sampling_params(self):
@@ -169,7 +167,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             "trust_remote_code": True,
             # SSMs do not support cache reuse.
             "kv_cache_config": {
-                "enable_block_reuse": False
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.7
+                # NOTE: some accuracy benchmarks may require fp32 precision for mamba cache
+                # "mamba_ssm_cache_dtype": "float32",
             },
             # Keep max_batch_size as in the PyTorch test to avoid OOM
             "max_batch_size": 128,
@@ -180,7 +181,6 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
             "compile_backend": "torch-cudagraph",
-            "free_mem_ratio": 0.7,
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "transforms": {
                 "detect_sharding": {
@@ -191,12 +191,6 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                     "stage": "compile",
                     "enabled": True,
                 },
-                # NOTE: some accuracy benchmarks may require fp32 precision for mamba cache
-                # "insert_cached_ssm_attention": {
-                #     "cache_config": {
-                #         "mamba_dtype": "float32",
-                #     },
-                # },
             }
         }
 
@@ -213,7 +207,8 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
         kwargs = self.get_default_kwargs()
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
-        kwargs["free_mem_ratio"] = 0.4
+        kwargs["kv_cache_config"] = {"free_gpu_memory_fraction": 0.4}
+        sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
                            **kwargs) as llm:
@@ -279,7 +274,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "trust_remote_code": True,
             "skip_loading_weights": False,
             "compile_backend": "torch-cudagraph",
-            "free_mem_ratio": 0.9,
             "max_batch_size": 128,
             "max_seq_len": self.MAX_SEQ_LEN,
             "max_num_tokens": self.MAX_SEQ_LEN,

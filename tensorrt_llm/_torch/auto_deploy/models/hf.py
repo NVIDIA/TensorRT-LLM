@@ -33,7 +33,6 @@ from transformers.utils import (
     WEIGHTS_NAME,
 )
 
-from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import (
@@ -261,18 +260,16 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             return self._quant_config_reader.get_config()
         return {}
 
-    def get_cache_config(self):
-        """Return kv cache dtype configuration."""
+    def get_cache_config_updates(self):
+        """Return kv cache dtype updates."""
         if not self._quant_config_reader:
-            return CacheConfig(dtype=None)
+            return {}
 
-        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype")
-        torch_dtype = torch.float8_e4m3fn if kv_cache_dtype == "float8_e4m3fn" else None
-        assert torch_dtype in (torch.float8_e4m3fn, None), (
-            f"Unsupported dtype: {torch_dtype}. Only torch.float8_e4m3fn is supported."
+        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype", "auto")
+        assert kv_cache_dtype in ("fp8", "auto"), (
+            f"Unsupported dtype: {kv_cache_dtype}. Only fp8 and auto are supported."
         )
-
-        return CacheConfig(dtype=torch_dtype)
+        return {"dtype": kv_cache_dtype}
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""
