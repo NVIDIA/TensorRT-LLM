@@ -710,9 +710,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         }
                     }
                     if (fileExists('/home/scratch.trt_llm_data_ci')) {
-                        dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
+                        dockerArgs += " -v /home/scratch.trt_llm_data_ci:${sc_trt_llm_data_mount_path}:ro "
                     } else if (fileExists('/home/scratch.trt_llm_data')) {
-                        dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
+                        dockerArgs += " -v /home/scratch.trt_llm_data:${sc_trt_llm_data_mount_path}:ro "
                     } else {
                         echo "Existing TRT-LLM data scratch mount points cannot be set up in this cluster, ignore..."
                     }
@@ -1877,12 +1877,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                   nfs:
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
-                - name: pdx-trt-llm-data
+    """
+    /*            - name: pdx-trt-llm-data
                   nfs:
                     server: ipp6-cdot01-fcache01
                     path: /vol/fcscratch1/scratch.michaeln_blossom
-    """
-
+    */
     def podConfig = [
         cloud: targetCloud,
         namespace: "sw-tensorrt",
@@ -1934,6 +1934,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 ${tolerations}
         """.stripIndent(),
     ]
+    print("Pod config: ${podConfig}")
 
     return podConfig
 }
@@ -2646,7 +2647,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         } else if (hostname.contains('ipp6')) {
             llm_data = pdx_trt_llm_data_mount_path
         } else {
-            llm_data = pdx_trt_llm_data_mount_path
+            llm_data = sc_trt_llm_data_mount_path
         }
         llm_data = "${llm_data}/llm-models"
 
@@ -3136,6 +3137,27 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                 // We submit the Slurm job with the Slurm partition's time spec.
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
                 timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
+                    // Check hostname and set NFS host/path
+                    def hostname = sh(script: 'hostname -f', returnStdout: true).trim()
+                    def nfs_host = ""
+                    def nfs_path = ""
+                    def mount_path = ""
+                    def STORAGE_NAME = "trt_llm_data"
+                    if (hostname.contains('ipp3')) {
+                        nfs_host = "10.117.145.14"
+                        nfs_path = "/vol/scratch1/scratch.trt_llm_data"
+                        mount_path = austin_trt_llm_data_mount_path
+                    } else if (hostname.contains('ipp6')) {
+                        nfs_host = "10.20.162.212"
+                        nfs_path = "/vol/scratch26/scratch.trt_llm_data"
+                        mount_path = pdx_trt_llm_data_mount_path
+                    } else {
+                        // SC, no NFS, use scratch space which is already in dockerArgs
+                    }
+                    if (nfs_host) {
+                        sh "docker volume create --driver local --opt type=nfs --opt o=addr=${nfs_host},rw --opt device=:${nfs_path} nfs_${STORAGE_NAME} || true"
+                        dockerArgs += " --volume nfs_${STORAGE_NAME}:${mount_path} "
+                    }
                     docker.image(image).inside(dockerArgs) {
                         runner()
                     }
