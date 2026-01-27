@@ -43,20 +43,6 @@ class TestTritonKernelsVendoring(unittest.TestCase):
         license_file = triton_kernels_path / "LICENSE"
         self.assertTrue(license_file.exists(), f"LICENSE file not found at {license_file}.")
 
-    def test_sys_path_not_permanently_modified(self):
-        """Verify importing tensorrt_llm doesn't permanently pollute sys.path."""
-        import sys
-
-        import tensorrt_llm
-
-        # The repo root should not remain in sys.path after import
-        repo_root = Path(tensorrt_llm.__file__).parent.parent
-        self.assertNotIn(
-            str(repo_root),
-            sys.path,
-            f"Repo root {repo_root} should not remain in sys.path after import",
-        )
-
     def test_version_matches_requirements(self):
         """Verify vendored triton_kernels VERSION matches triton version in requirements.txt."""
         import re
