@@ -1402,12 +1402,12 @@ protected:
             // Fill conv state
             auto convState = mRnnStateManager->getConvStates(globalLayer);
             auto slotConv = tr::ITensor::slice(convState, slotIdx, 1);
-            fillTensorWithPattern(slotConv, llmRequest->mRequestId, globalLayer, /*isConv=*/true);
+            fillTensorWithPattern(slotConv.get(), llmRequest->mRequestId, globalLayer, /*isConv=*/true);
 
             // Fill SSM state
             auto ssmState = mRnnStateManager->getSsmStates(globalLayer);
             auto slotSsm = tr::ITensor::slice(ssmState, slotIdx, 1);
-            fillTensorWithPattern(slotSsm, llmRequest->mRequestId, globalLayer, /*isConv=*/false);
+            fillTensorWithPattern(slotSsm.get(), llmRequest->mRequestId, globalLayer, /*isConv=*/false);
         }
     }
 
@@ -1438,17 +1438,17 @@ protected:
             // Verify conv state
             auto convState = mRnnStateManager->getConvStates(globalLayer);
             auto slotConv = tr::ITensor::slice(convState, slotIdx, 1);
-            verifyTensorPattern(slotConv, llmRequest->mRequestId, globalLayer, /*isConv=*/true);
+            verifyTensorPattern(slotConv.get(), llmRequest->mRequestId, globalLayer, /*isConv=*/true);
 
             // Verify SSM state
             auto ssmState = mRnnStateManager->getSsmStates(globalLayer);
             auto slotSsm = tr::ITensor::slice(ssmState, slotIdx, 1);
-            verifyTensorPattern(slotSsm, llmRequest->mRequestId, globalLayer, /*isConv=*/false);
+            verifyTensorPattern(slotSsm.get(), llmRequest->mRequestId, globalLayer, /*isConv=*/false);
         }
     }
 
 private:
-    void fillTensorWithPattern(tr::ITensor::SharedPtr tensor, uint64_t requestId, int layerId, bool isConv)
+    void fillTensorWithPattern(tr::ITensor* tensor, uint64_t requestId, int layerId, bool isConv)
     {
         auto hostTensor = tr::BufferManager::cpu(tensor->getShape(), tensor->getDataType());
         size_t numElements = tensor->getSize();
@@ -1467,7 +1467,7 @@ private:
         bufferManager.getStream().synchronize();
     }
 
-    void verifyTensorPattern(tr::ITensor::SharedPtr tensor, uint64_t requestId, int layerId, bool isConv)
+    void verifyTensorPattern(tr::ITensor* tensor, uint64_t requestId, int layerId, bool isConv)
     {
         auto hostTensor = tr::BufferManager::cpu(tensor->getShape(), tensor->getDataType());
 
