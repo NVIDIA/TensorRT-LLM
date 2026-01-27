@@ -73,6 +73,12 @@ public:
     /// Returns the number of local RNN layers on this PP rank
     [[nodiscard]] SizeType32 getNumLocalLayers() const noexcept;
 
+    /// Returns the buffer manager
+    [[nodiscard]] runtime::BufferManager const& getBufferManager() const noexcept
+    {
+        return mBufferManager.value();
+    }
+
 private:
     static std::vector<SizeType32> getPpLayers(SizeType32 numLayers, runtime::WorldConfig const& worldConfig,
         std::optional<std::vector<bool>> const& layerMask);
