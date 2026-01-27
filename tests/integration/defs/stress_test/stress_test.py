@@ -400,7 +400,7 @@ def is_port_available(port: int,
         # Configuration for DeepSeek-R1 model with FP8 checkpoints (4 GPU setup, requires GB300 288GB)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
                     tp_size=4,
-                    memory_requirement=168),
+                    memory_requirement=256),
         # Configuration for DeepSeek-R1 model with NVFP4 checkpoints (8 GPU setup)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
                     tp_size=8,
