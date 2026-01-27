@@ -23,7 +23,7 @@ from defs.conftest import llm_models_root
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy.llm import LLM
-from tensorrt_llm._torch.auto_deploy.models.eagle_one_model import EagleDrafterFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 prompts = [

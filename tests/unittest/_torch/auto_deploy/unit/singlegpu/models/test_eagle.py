@@ -25,10 +25,9 @@ from transformers import AutoConfig
 
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3DrafterForCausalLM,
-    Eagle3LlamaConfig,
     Eagle3Model,
 )
-from tensorrt_llm._torch.auto_deploy.models.eagle_one_model import EagleDrafterFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tests.test_common.llm_data import hf_id_to_local_model_dir
 
@@ -44,23 +43,12 @@ EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 ###############################################################################
 
 
-class MockEagle3Config(Eagle3LlamaConfig):
-    """Test config for standalone Eagle testing with mock hidden states.
-
-    Uses a distinct model_type to avoid conflicting with production Eagle3Config.
-    """
-
-    model_type = "mock_eagle3"
-
-
 class MockEagle3ModelForCausalLM(Eagle3DrafterForCausalLM):
     """Test wrapper that provides random hidden states for standalone Eagle testing.
 
     In production speculative decoding, real hidden states come from the target model.
     This mock class generates random hidden states for testing the Eagle model in isolation.
     """
-
-    config_class = MockEagle3Config
 
     def __init__(self, config):
         super().__init__(config)
@@ -153,6 +141,7 @@ def test_eagle_model_torch_export():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16
 
+    # Use pretrained config (llama) - can provide it directly to instantiate Eagle3Model.
     config_path = eagle_path / "config.json"
     config = AutoConfig.from_pretrained(config_path)
 

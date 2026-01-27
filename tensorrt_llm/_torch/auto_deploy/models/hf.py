@@ -187,33 +187,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         return config, nested_unused_kwargs
 
-    def _override_model_type(
-        self, model_config: PretrainedConfig, model_kwargs: Dict[str, Any]
-    ) -> PretrainedConfig:
-        """Override the model config class if model_type is specified in model_kwargs.
-
-        This allows using a different model architecture than what's specified in the
-        checkpoint's config.json. For example, loading an Eagle draft model checkpoint
-        that has model_type="llama" but should use EagleConfig and EagleModelForCausalLM.
-
-        Args:
-            model_config: The original config loaded from the checkpoint.
-            model_kwargs: User-provided kwargs that may contain a model_type override.
-
-        Returns:
-            The config, potentially re-instantiated with a different config class.
-        """
-        model_type_override = model_kwargs.get("model_type", None)
-        if model_type_override and model_type_override != model_config.model_type:
-            ad_logger.info(
-                f"Overriding model_type from '{model_config.model_type}' to '{model_type_override}'"
-            )
-            # Re-instantiate config with the target class, preserving original config values.
-            # Note: model_type attribute will be updated by _recursive_update_config later.
-            target_config_class = AutoConfig.for_model(model_type_override)
-            model_config = target_config_class.from_dict(model_config.to_dict())
-        return model_config
-
     def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         # prefetch the model once without weights
         self.prefetch_checkpoint(skip_loading_weights=True)
@@ -224,9 +197,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         model_config, unused_kwargs = AutoConfig.from_pretrained(
             self.model, return_unused_kwargs=True, trust_remote_code=True
         )
-
-        model_config = self._override_model_type(model_config, self.model_kwargs)
-
         model_config, nested_unused_kwargs = self._recursive_update_config(
             model_config, self.model_kwargs
         )

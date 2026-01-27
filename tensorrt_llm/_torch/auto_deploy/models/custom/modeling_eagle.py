@@ -33,11 +33,9 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig, PreTrainedModel
+from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
-
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
 
 class LlamaRotaryEmbedding(nn.Module):
@@ -172,15 +170,6 @@ class EagleMLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
-
-
-class Eagle3LlamaConfig(PretrainedConfig):
-    """
-    This config is used to identify Eagle models and load them with the
-    correct architecture.
-    """
-
-    model_type = "Eagle3LlamaForCausalLM"
 
 
 class Eagle3Attention(nn.Module):
@@ -394,7 +383,6 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
     and inference pipeline.
     """
 
-    config_class = Eagle3LlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
     _no_split_modules = ["Eagle3DecoderLayer"]
@@ -459,8 +447,3 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
             logits=logits,
             last_hidden_state=last_hidden_state,
         )
-
-
-# Register Eagle3DrafterForCausalLM with AutoDeploy's factory
-# This enables AutoDeploy to use our custom implementation when it encounters Eagle3LlamaConfig
-AutoModelForCausalLMFactory.register_custom_model_cls("Eagle3LlamaConfig", Eagle3DrafterForCausalLM)
