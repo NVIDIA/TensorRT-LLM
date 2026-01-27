@@ -191,6 +191,9 @@ class TrtllmAttentionWrapper:
         kv_cache_block_offsets: Optional[torch.Tensor] = None,
         host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
         host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
+        kv_cache: Optional[
+            torch.
+            Tensor] = None,  # Actual KV cache tensor from kv_cache_manager.get_buffers()
         block_ids_per_seq: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
         cache_indirection: Optional[torch.Tensor] = None,
@@ -292,6 +295,7 @@ class TrtllmAttentionWrapper:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
+        self.kv_cache = kv_cache  # Actual KV cache tensor
         self.workspace = workspace
         self.cache_indirection = cache_indirection
         self.kv_scale_orig_quant = kv_scale_orig_quant if kv_scales_sf_inv is None else kv_scales_sf_inv
@@ -551,6 +555,8 @@ class TrtllmAttentionWrapper:
                 self.kv_cache_block_offsets,
                 self.host_kv_cache_pool_pointers,
                 self.host_kv_cache_pool_mapping,
+                self.
+                kv_cache,  # Actual KV cache tensor from kv_cache_manager.get_buffers()
                 self.cache_indirection,
                 self.kv_scale_orig_quant,
                 self.kv_scale_quant_orig,
@@ -1828,6 +1834,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_cache_block_offsets=metadata.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
+            kv_cache=metadata.kv_cache_manager.get_buffers(self.layer_idx,
+                                                           kv_layout="HND")
+            if metadata.kv_cache_manager is not None else None,
             block_ids_per_seq=metadata.block_ids_per_seq,
             # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
             workspace=metadata.workspace
