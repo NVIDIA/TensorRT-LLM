@@ -12,7 +12,7 @@ This branch is a prototype and not stable for production use. PRs are not accept
 [![python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/downloads/release/python-3123/)
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-13.1.0-green)](https://developer.nvidia.com/cuda-downloads)
-[![torch](https://img.shields.io/badge/torch-2.9.1-green)](https://pytorch.org)
+[![torch](https://img.shields.io/badge/torch-2.10.0-green)](https://pytorch.org)
 [![version](https://img.shields.io/badge/release-1.3.0rc1-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/LICENSE)
 
