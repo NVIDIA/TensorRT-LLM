@@ -317,11 +317,14 @@ class KvCacheConnectorSchedulerOutputRequest:
             num_scheduled_tokens = 1 + get_draft_token_length(
                 req)  # Specdec with draft tokens is not supported yet.
 
-        # Get retention priority for each new block (for priority-based offload filtering)
-        priorities = [
-            kv_cache_manager.get_priority_by_block_id(block_id)
-            for block_id in new_block_ids
-        ]
+        # Get retention priority for each new block only if retention config is provided
+        # (for priority-based offload filtering)
+        priorities = None
+        if req.kv_cache_retention_config is not None:
+            priorities = [
+                kv_cache_manager.get_priority_by_block_id(block_id)
+                for block_id in new_block_ids
+            ]
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
                            computed_position, num_scheduled_tokens, priorities)
