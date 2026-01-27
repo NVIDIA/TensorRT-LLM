@@ -1,12 +1,4 @@
-"""Utility functions for request processing in ExecutorRequestQueue.
-
-This module contains extracted utility functions that handle:
-- Request merging and transformation
-- Context partitioning for CP (Context Parallelism)
-- Attention DP load balancing
-- Python object collection and attachment
-- Request broadcasting across distributed ranks
-"""
+"""Utility functions for request processing."""
 
 import heapq
 import os
@@ -616,39 +608,15 @@ def merge_requests(
 
 
 class RequestBroadcaster:
-    """Handles broadcasting of requests across distributed ranks.
-
-    This class encapsulates the logic for broadcasting new requests and
-    Python-only metadata across TP, PP, and CP ranks.
-
-    Attributes:
-        dist: Distributed communication object.
-        hang_detector: Hang detector for pausing during blocking operations.
-    """
+    """Broadcasts requests across distributed ranks (TP, PP, CP)."""
 
     def __init__(self, dist: Distributed, hang_detector: HangDetector):
-        """Initialize the RequestBroadcaster.
-
-        Args:
-            dist: Distributed communication object.
-            hang_detector: Hang detector instance.
-        """
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
 
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
-        """Broadcast requests and Python objects across ranks.
-
-        On rank 0, collects Python objects and broadcasts them.
-        On other ranks, receives the broadcasted data.
-
-        Args:
-            new_requests: List of RequestQueueItem objects (only used on rank 0).
-
-        Returns:
-            Tuple of (new_requests, py_request_objects).
-        """
+        """Broadcast requests and Python objects across ranks."""
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
         else:
@@ -666,14 +634,7 @@ class RequestBroadcaster:
         return new_requests, py_request_objects
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
-        """Collect Python-only objects from requests.
-
-        Args:
-            new_requests: List of RequestQueueItem objects.
-
-        Returns:
-            Tuple of collected Python objects.
-        """
+        """Collect Python-only objects from requests."""
         py_logits_post_processors = collect_py_objects_from_requests(
             new_requests, "py_logits_post_processors"
         )
@@ -699,15 +660,7 @@ class RequestBroadcaster:
     def _broadcast_requests(
         self, new_requests: List, py_request_objects
     ) -> Tuple[List, Optional[Dict]]:
-        """Broadcast new_requests and Python-only metadata across pipeline stages.
-
-        Args:
-            new_requests: List of RequestQueueItem objects.
-            py_request_objects: Tuple of Python objects to broadcast.
-
-        Returns:
-            Tuple of (new_requests, py_request_objects) after broadcasting.
-        """
+        """Broadcast requests across pipeline stages."""
         payloads = (new_requests, py_request_objects)
 
         if not self.dist.has_pp:
