@@ -229,7 +229,7 @@ class ConfigLoader:
         # Get current GPU type from environment if not specified
         if gpu_type is None:
             gpu_type = EnvManager.get_gpu_type()
-        
+
         # GB200_LYRIS in also in the GB200 family
         if gpu_type.startswith("GB200_"):
             gpu_type = "GB200"
