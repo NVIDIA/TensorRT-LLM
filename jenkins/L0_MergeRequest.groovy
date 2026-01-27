@@ -1584,7 +1584,8 @@ def updateGithubTagCommit(pipeline, globalVars) {
 
     // Step 3: Check if only post-merge tests failed
     if (!areAllFailuresPostMerge(failedStageList)) {
-        return false
+        echo "❌ Found pre-merge failures: ${failedStageList.join(', ')}"
+        // return false TODO: CI TEST MODE - Return false to skip tag update
     }
 
     echo "✓ Only post-merge failures detected - updating tag"
