@@ -808,12 +808,12 @@ def test_fp8_moe_different_input_scales(backend, allow_different_input_scales, s
             expected_max_w1_input_scale = torch.stack(w1_input_scale).max()
             # Attribute name differs between backends
             if backend == "trtllm":
-                actual_w1_input_max = getattr(gm, "quant_moe_fc1_act_scale_max_0")
+                actual_w1_input = getattr(gm, "quant_moe_fc1_act_scale_0")
             else:  # triton
-                actual_w1_input_max = getattr(gm, "quant_moe_w1_input_scale_max_0").squeeze()
+                actual_w1_input = getattr(gm, "quant_moe_w1_input_scale_0").squeeze()
 
-            assert torch.allclose(actual_w1_input_max, expected_max_w1_input_scale), (
-                f"w1 input scale max mismatch. Got {actual_w1_input_max}, expected {expected_max_w1_input_scale}"
+            assert torch.allclose(actual_w1_input, expected_max_w1_input_scale), (
+                f"w1 input scale max mismatch. Got {actual_w1_input}, expected {expected_max_w1_input_scale}"
             )
 
         # Run the transformed graph and compare to reference output

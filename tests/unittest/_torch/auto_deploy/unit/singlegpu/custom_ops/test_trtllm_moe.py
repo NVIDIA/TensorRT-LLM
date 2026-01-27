@@ -414,7 +414,7 @@ def test_trtllm_fused_moe_fp8(
         routing_weights,
         fc1_expert_weights=w31_weight.contiguous() if is_gated_mlp else w1_weight.contiguous(),
         fc2_expert_weights=w2_weight.contiguous(),
-        fc1_act_scale_max=hidden_states_scale,  # scalar max input scale
+        fc1_act_scale=hidden_states_scale,
         fc1_dequant_scale=gemm1_dequant,
         fc2_act_scale_reciprocal=gemm2_act_quant,
         fc2_dequant_scale=gemm2_dequant,
