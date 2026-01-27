@@ -872,20 +872,6 @@ def collectTestResults(pipeline, testFilter, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
-        // TODO: CI TEST MODE - Return true to skip tag update
-        if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
-            stage("Update GitHub Tag") {
-                // TODO: CI TEST MODE - Environment check
-                echo "[TEST] JOB_NAME=${env.JOB_NAME}, BUILD_NUMBER=${env.BUILD_NUMBER}"
-                echo "[TEST] gitlabCommit=${env.gitlabCommit}, gitlabTargetBranch=${env.gitlabTargetBranch}"
-                echo "[TEST] GITHUB_PR_API_URL=${globalVars[GITHUB_PR_API_URL]}, TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
-                echo "[TEST] DOWNSTREAM_JOB_DURATION keys: ${globalVars[DOWNSTREAM_JOB_DURATION]?.keySet()?.join(', ')}"
-                echo "[TEST] Build result: ${currentBuild.result ?: 'SUCCESS'}"
-
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
-                updateGithubTagCommit(pipeline, globalVars)
-            }
-        }
         stage ("Collect Test Result") {
             sh "rm -rf **/*.xml *.tar.gz"
 
@@ -916,6 +902,20 @@ def collectTestResults(pipeline, testFilter, globalVars)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        // TODO: CI TEST MODE - Return true to skip tag update
+        if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
+            stage("Update GitHub Tag") {
+                // TODO: CI TEST MODE - Environment check
+                echo "[TEST] JOB_NAME=${env.JOB_NAME}, BUILD_NUMBER=${env.BUILD_NUMBER}"
+                echo "[TEST] gitlabCommit=${env.gitlabCommit}, gitlabTargetBranch=${env.gitlabTargetBranch}"
+                echo "[TEST] GITHUB_PR_API_URL=${globalVars[GITHUB_PR_API_URL]}, TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
+                echo "[TEST] DOWNSTREAM_JOB_DURATION keys: ${globalVars[DOWNSTREAM_JOB_DURATION]?.keySet()?.join(', ')}"
+                echo "[TEST] Build result: ${currentBuild.result ?: 'SUCCESS'}"
+
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
+                updateGithubTagCommit(pipeline, globalVars)
+            }
+        }
         stage("Collect Perf Regression Result") {
             def yamlFiles = sh(
                 returnStdout: true,
