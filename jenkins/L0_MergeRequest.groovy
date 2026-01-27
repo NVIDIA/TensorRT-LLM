@@ -1665,9 +1665,6 @@ pipeline {
             }
         }
         stage("Test GitHub Tag (Early)") {
-            when {
-                expression { env.TEST_GITHUB_TAG_EARLY == 'true' }
-            }
             steps {
                 script {
                     echo "=========================================="
