@@ -180,7 +180,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
     attn_backend: str = Field(
         default="flashinfer",
-        description=_shortcut_description("Attention backend to use.", "attn_backend"),
+        description=_shortcut_description(
+            "Attention backend: 'flashinfer' (default, stable) or 'trtllm' "
+            "Use with use_pt_cache_backend=True for optimal TRT-LLM performance.",
+            "attn_backend",
+        ),
     )
     free_mem_ratio: float = Field(
         default=0.0,
@@ -206,7 +210,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         default=False,
         description=_shortcut_description(
             "Use PT's KVCacheManager for efficient metadata preparation (TRT-LLM backend only). "
-            "Provides ~50% faster metadata preparation via C++ code paths.",
+            "Recommended when using attn_backend='trtllm'",
             "use_pt_cache_backend",
         ),
     )

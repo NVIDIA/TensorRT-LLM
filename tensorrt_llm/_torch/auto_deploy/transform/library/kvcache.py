@@ -192,7 +192,13 @@ class InsertCachedAttention(BaseTransform):
         # Enable PT cache backend if configured (must be before attn_descriptor is used)
         if self.config.use_pt_cache_backend and self.config.backend == "trtllm":
             enable_pt_cache_backend(True)
-            self._log_info("Enabled PTCacheBackend for TRT-LLM attention")
+            self._log_info("Enabled PTCacheBackend for TRT-LLM attention (CUDA graph compatible)")
+        elif self.config.backend == "trtllm" and not self.config.use_pt_cache_backend:
+            self._log_warning(
+                "TRT-LLM backend without PTCacheBackend may have limited CUDA graph support. "
+                "For optimal performance and full CUDA graph compatibility, "
+                "set use_pt_cache_backend=True in your config."
+            )
 
         attn_descriptor = self.attn_descriptor
 
