@@ -1510,9 +1510,6 @@ def createGithubTag(globalVars) {
 
     echo "Creating tag '${tagName}' for PR #${prNumber} at ${commitSha}"
 
-    // Checkout repository to have a git repo for tagging
-    trtllm_utils.checkoutSource(LLM_REPO, commitSha, "repo", true, false)
-
     withCredentials([
         usernamePassword(
             credentialsId: 'github-cred-trtllm-ci',
@@ -1521,20 +1518,32 @@ def createGithubTag(globalVars) {
         )
     ]) {
         // Use single quotes to avoid Groovy string interpolation security warning
+        // Clone repo with minimal depth to save time and space
         def tagResult = sh(
-            script: '''#!/bin/bash
+            script: '''#!/bin/sh
+                set -e
+
+                # Install git-lfs if needed
+                which git-lfs || apk add --no-cache git-lfs || true
+
+                # Clone repo (shallow clone for speed)
+                rm -rf repo
+                git clone --depth=1 --no-checkout ''' + LLM_REPO + ''' repo
                 cd repo
+
                 git config --global user.email "90828364+tensorrt-cicd@users.noreply.github.com"
                 git config --global user.name "tensorrt-cicd"
 
-                # Delete existing tag if present
-                git tag -d ''' + tagName + ''' 2>/dev/null || true
-                git push origin :refs/tags/''' + tagName + ''' 2>/dev/null || true
+                # Fetch the specific commit
+                git fetch origin ''' + commitSha + ''' --depth=1 || git fetch origin --unshallow
 
-                # Create new tag
+                # Delete existing remote tag if present
+                git push https://${GITHUB_TOKEN}@github.com/NVIDIA/TensorRT-LLM.git :refs/tags/''' + tagName + ''' 2>/dev/null || true
+
+                # Create new tag (annotated)
                 git tag -a ''' + tagName + ''' ''' + commitSha + ''' -m "Pre-merge tests passed for PR #''' + prNumber + '''"
 
-                # Push using credential environment variable (avoids interpolation warning)
+                # Push tag to GitHub
                 git push https://${GITHUB_TOKEN}@github.com/NVIDIA/TensorRT-LLM.git ''' + tagName + '''
             ''',
             returnStatus: true,
@@ -1690,9 +1699,8 @@ pipeline {
                             // Install git in alpine (use simple sh instead of llmExecStepWithRetry)
                             sh "which git || apk add --no-cache git"
 
-                            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "repo", true, false)
-
                             // Test the tag creation function directly
+                            // Note: createGithubTag will checkout the repo internally
                             echo "Testing createGithubTag function..."
                             def result = createGithubTag(globalVars)
 
