@@ -13,20 +13,20 @@ import torch
 from tensorrt_llm.logger import logger
 
 # Global registry for MoE backends
-_MOE_BACKEND_REGISTRY: Dict[str, Type["MoEBackend"]] = {}
+_MOE_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
 
 def register_backend(name: str):
     """Decorator to register a MoE backend class."""
 
-    def decorator(cls: Type["MoEBackend"]) -> Type["MoEBackend"]:
+    def decorator(cls: Type["MoEOpBackend"]) -> Type["MoEOpBackend"]:
         _MOE_BACKEND_REGISTRY[name] = cls
         return cls
 
     return decorator
 
 
-def get_backend(name: str) -> "MoEBackend":
+def get_backend(name: str) -> "MoEOpBackend":
     """Get a registered backend instance by name."""
     if name not in _MOE_BACKEND_REGISTRY:
         raise ValueError(
@@ -35,7 +35,7 @@ def get_backend(name: str) -> "MoEBackend":
     return _MOE_BACKEND_REGISTRY[name]()
 
 
-def get_available_backend() -> "MoEBackend":
+def get_available_backend() -> "MoEOpBackend":
     """Get the best available backend (prefer flashinfer if available)."""
     if "flashinfer" in _MOE_BACKEND_REGISTRY:
         try:
@@ -45,9 +45,9 @@ def get_available_backend() -> "MoEBackend":
     return get_backend("trtllm")
 
 
-class MoEBackend:
+class MoEOpBackend:
     """
-    Base class for MoE backend operations.
+    Base class for MoE Op backend operations.
 
     All backend-specific operations are accessed through this unified interface.
     Subclasses register themselves using the @register_backend decorator.
@@ -234,7 +234,7 @@ class MoEBackend:
 
 # ==================== TRTLLM Backend ====================
 @register_backend("trtllm")
-class TRTLLMBackend(MoEBackend):
+class TRTLLMBackend(MoEOpBackend):
     """TRTLLM native backend implementation."""
 
     def __init__(self):
@@ -553,7 +553,7 @@ class TRTLLMBackend(MoEBackend):
 
 
 @register_backend("flashinfer")
-class FlashinferBackend(MoEBackend):
+class FlashinferBackend(MoEOpBackend):
     """Flashinfer backend implementation."""
 
     def __init__(self):
