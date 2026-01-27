@@ -24,6 +24,7 @@ detokenization and return token IDs only.
 """
 
 import asyncio
+import traceback
 from collections.abc import AsyncGenerator
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -196,23 +197,17 @@ class GrpcRequestManager:
                     config["model_path"] = str(self.llm.args.model)
 
             # Try to get model config
-            if hasattr(self.llm, "tokenizer") and self.llm.tokenizer:
+            if hasattr(self.llm, "tokenizer") and self.llm.tokenizer is not None:
                 if hasattr(self.llm.tokenizer, "vocab_size"):
                     config["vocab_size"] = self.llm.tokenizer.vocab_size
 
             # Check for multimodal support
             if hasattr(self.llm, "input_processor"):
-                config["supports_vision"] = (
-                    not isinstance(
-                        self.llm.input_processor,
-                        type(self.llm.input_processor).__bases__[0],  # DefaultInputProcessor check
-                    )
-                    if hasattr(self.llm.input_processor, "__bases__")
-                    else False
-                )
+                processor_name = type(self.llm.input_processor).__name__
+                config["supports_vision"] = processor_name != "DefaultInputProcessor"
 
         except Exception as e:
-            logger.warning(f"Error getting model config: {e}")
+            logger.warning(f"Error getting model config: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
         return config
 
