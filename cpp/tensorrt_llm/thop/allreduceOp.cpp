@@ -564,7 +564,7 @@ private:
         if (!windowBuffer1.isValid())
         {
             TLLM_LOG_WARNING(
-                "[runNCCLAllReduceSymmetric] NCCL window not available during capture; "
+                "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
                 "using plain CUDA tensor for output");
         }
 
