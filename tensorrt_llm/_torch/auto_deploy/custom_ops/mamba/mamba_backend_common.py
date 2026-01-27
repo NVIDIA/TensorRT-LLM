@@ -135,7 +135,7 @@ def _run_ssm_prefill(
     num_total_tokens = num_prefill_tokens + num_decode
 
     if num_prefill <= 0:
-        return None, num_prefill, num_prefill_tokens, num_total_tokens, num_seq
+        return num_prefill, num_prefill_tokens, num_total_tokens, num_seq
 
     hs_prefill = hs_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H, D]
     B_prefill = B_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
