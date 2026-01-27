@@ -982,6 +982,11 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         self.post_config()
         self.is_loaded = True
 
+    @classmethod
+    def get_llmapi_defaults(cls) -> dict:
+        """Return model-specific LLM API defaults."""
+        return {"enable_chunked_prefill": False}
+
     def load_weights(self, weights):
         # Load weights into HFPhi4MultimodalEncoder.
         if not _is_disagg():

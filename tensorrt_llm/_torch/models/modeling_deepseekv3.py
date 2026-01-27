@@ -1834,6 +1834,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
 
+    @classmethod
+    def get_llmapi_defaults(cls) -> dict:
+        """Return model-specific LLM API defaults."""
+        return {"enable_chunked_prefill": False}
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,

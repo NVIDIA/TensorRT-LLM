@@ -544,6 +544,11 @@ class LlavaNextModel(PreTrainedModel):
         self.model_config = model_config
         self.post_config()
 
+    @classmethod
+    def get_llmapi_defaults(cls) -> dict:
+        """Return model-specific LLM API defaults."""
+        return {"enable_chunked_prefill": False}
+
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if isinstance(weight_mapper, LlavaNextHfWeightMapper):
             weights = weight_mapper.preprocess_weights(weights)

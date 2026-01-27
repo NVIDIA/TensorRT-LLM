@@ -29,14 +29,17 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
+# yapf: disable
 from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        Eagle3DecodingConfig, EagleDecodingConfig, KvCacheConfig,
                        LlmArgs, LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
                        UserProvidedDecodingConfig, _ModelFormatKind,
                        _ModelWrapper, _ParallelConfig,
+                       apply_model_defaults_to_llm_args,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
+# yapf: enable
 from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -484,6 +487,15 @@ class ModelLoader:
             if hasattr(self.llm_args, "speculative_model")
             and self.llm_args.speculative_model else None)
 
+        # Apply model-specific defaults if the model class provides them
+        if hasattr(model_cls, 'get_llmapi_defaults'):
+            model_defaults = model_cls.get_llmapi_defaults()
+            applied_defaults = apply_model_defaults_to_llm_args(
+                self.llm_args, model_defaults)
+            if applied_defaults:
+                logger.debug("Applied model defaults for %s: %s",
+                             model_cls.__name__, applied_defaults)
+
         prequantized = self._update_from_hf_quant_config()
 
         # FP4 Gemm force to use plugin.
@@ -548,6 +560,7 @@ class ModelLoader:
         assert architecture in MODEL_MAP, \
             f"Unsupported model architecture: {architecture}"
         model_cls = MODEL_MAP[architecture]
+
         if self.llm_args.load_format == 'dummy':
             self.model = model_cls(self.pretrained_config)
         else:

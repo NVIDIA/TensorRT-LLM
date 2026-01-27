@@ -1252,6 +1252,11 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
 
+    @classmethod
+    def get_llmapi_defaults(cls) -> dict:
+        """Return model-specific LLM API defaults."""
+        return {"kv_cache_config": {"enable_block_reuse": False}}
+
     def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(new_weights, weight_mapper)

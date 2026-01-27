@@ -2091,7 +2091,7 @@ class BaseLlmArgs(StrictBaseModel):
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
                                            description="KV cache config.")
 
-    enable_chunked_prefill: bool = Field(default=False,
+    enable_chunked_prefill: bool = Field(default=True,
                                          description="Enable chunked prefill.")
 
     guided_decoding_backend: Optional[Literal["xgrammar", "llguidance"]] = Field(
@@ -3421,6 +3421,140 @@ class TorchLlmArgs(BaseLlmArgs):
         executor_config = super().get_executor_config(_hf_model_dir, tokenizer)
         executor_config.mm_encoder_only = self.mm_encoder_only
         return executor_config
+
+
+def extract_llm_args_overrides(llm_args) -> Dict:
+    """Extract user-provided overrides from a Pydantic model or dict."""
+    if isinstance(llm_args, dict):
+        return llm_args
+
+    fields_set = getattr(llm_args, "model_fields_set", None)
+    if fields_set is None:
+        return {}
+
+    overrides = {}
+    for field in fields_set:
+        value = getattr(llm_args, field)
+        if hasattr(value, "model_fields_set"):
+            nested = extract_llm_args_overrides(value)
+            overrides[field] = nested
+        else:
+            overrides[field] = value
+    return overrides
+
+
+def apply_model_defaults_to_llm_args(llm_args, model_defaults: Dict) -> Dict:
+    """Apply model defaults to a Pydantic LlmArgs instance.
+
+    Returns the defaults that were actually applied.
+    """
+    if getattr(llm_args, "_model_defaults_applied", False):
+        return {}
+    if not model_defaults:
+        return {}
+
+    llm_args_dict = llm_args.model_dump()
+    user_overrides = extract_llm_args_overrides(llm_args)
+    merged_args = merge_llm_configs_with_defaults(llm_args_dict,
+                                                  model_defaults,
+                                                  user_overrides=user_overrides)
+
+    for key in model_defaults:
+        if key in merged_args and hasattr(llm_args, key):
+            setattr(llm_args, key, merged_args[key])
+
+    applied = compute_applied_llm_defaults(model_defaults, user_overrides)
+    llm_args._model_defaults_applied = True
+    return applied
+
+
+def merge_llm_configs_with_defaults(
+    llm_args: Dict,
+    model_defaults: Dict,
+    user_overrides: Optional[Dict] = None,
+) -> Dict:
+    """Merge model-specific defaults into llm_args using Pydantic.
+
+    Only applies defaults for fields that are unset in llm_args.
+    Uses Pydantic's model_validate and model_dump(exclude_unset=True).
+    """
+    # Handle nested Pydantic models generically
+    config_classes = {
+        "kv_cache_config": KvCacheConfig,
+        "build_config": BuildConfig,
+        "scheduler_config": SchedulerConfig,
+        "decoding_config": DecodingConfig,
+        "quant_config": QuantConfig,
+        "lora_config": LoraConfig,
+        "moe_config": MoeConfig,
+    }
+
+    if user_overrides is None:
+        user_overrides = llm_args if isinstance(llm_args, dict) else {}
+    else:
+        user_overrides = user_overrides or {}
+    for key, default_value in model_defaults.items():
+        if key in config_classes:
+            config_class = config_classes[key]
+
+            # Get existing config or empty dict
+            existing = llm_args.get(key, {})
+            if hasattr(existing, 'model_dump'):
+                # If it's already a Pydantic model, convert to dict
+                existing = existing.model_dump()
+            elif not isinstance(existing, dict):
+                # If it's not a dict, skip
+                continue
+
+            override_value = user_overrides.get(key, {})
+            if hasattr(override_value, "model_dump"):
+                override_value = override_value.model_dump(exclude_unset=True)
+            if not isinstance(override_value, dict):
+                override_value = {}
+
+            merged = existing.copy()
+            for sub_key, sub_default in default_value.items():
+                if sub_key not in override_value:
+                    merged[sub_key] = sub_default
+            llm_args[key] = config_class.model_validate(merged)
+        else:
+            # Simple fields - only set if not already present
+            if key not in user_overrides:
+                llm_args[key] = default_value
+
+    return llm_args
+
+
+def compute_applied_llm_defaults(model_defaults: Dict,
+                                 user_overrides: Dict) -> Dict:
+    """Return the subset of model_defaults that will be applied.
+
+    Only defaults for fields not present in user_overrides are included.
+    Nested dicts are handled recursively.
+    """
+
+    def _compute(defaults: Dict, overrides: Dict) -> Dict:
+        applied = {}
+        overrides = overrides or {}
+        for key, default_value in defaults.items():
+            if isinstance(default_value, dict):
+                override_value = overrides.get(key) if isinstance(
+                    overrides, dict) else None
+                if hasattr(override_value, "model_dump"):
+                    override_value = override_value.model_dump(
+                        exclude_unset=True)
+                if isinstance(override_value, dict):
+                    nested = _compute(default_value, override_value)
+                    if nested:
+                        applied[key] = nested
+                else:
+                    applied[key] = default_value
+            else:
+                if not isinstance(overrides, dict) or key not in overrides:
+                    applied[key] = default_value
+        return applied
+
+    return _compute(model_defaults, user_overrides or {})
 
 
 def update_llm_args_with_extra_dict(
