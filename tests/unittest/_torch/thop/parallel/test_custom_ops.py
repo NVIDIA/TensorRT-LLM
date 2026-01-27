@@ -97,12 +97,6 @@ def test_register_fake(custom_ops):
         "trtllm::e4m3_mxe2m1_block_scale_moe_runner",
         "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
         "trtllm::mxfp8_quantize",
-        "trtllm::moe_a2a_dispatch",
-        "trtllm::moe_a2a_combine",
-        "trtllm::moe_a2a_initialize",
-        "trtllm::moe_a2a_get_combine_payload_tensor",
-        "trtllm::moe_a2a_sanitize_expert_ids",
-        "trtllm::moe_a2a_get_aux_data_size",
     }
 
     ops_missing_fake_impl = []

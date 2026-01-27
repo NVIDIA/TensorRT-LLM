@@ -187,7 +187,8 @@ class MLPBlock(torch.nn.Module):
             'bias': True,
             'swiglu_alpha': self.swiglu_alpha,
             'swiglu_beta': self.swiglu_beta,
-            'swiglu_limit': self.swiglu_limit
+            'swiglu_limit': self.swiglu_limit,
+            'layer_idx': self.layer_idx
         }
 
         self.experts = create_moe(**moe_params)

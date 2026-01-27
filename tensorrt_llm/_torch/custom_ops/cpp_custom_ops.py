@@ -327,6 +327,76 @@ def _register_fake():
             outputs.append(output_tensor)
         return outputs
 
+    @torch.library.register_fake("trtllm::moe_a2a_dispatch")
+    def _(
+        token_selected_experts: torch.Tensor,
+        input_payloads: List[torch.Tensor],
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        num_experts: int,
+    ) -> Tuple[List[torch.Tensor], int]:
+        recv_tensors: List[torch.Tensor] = []
+        for payload in input_payloads:
+            elements_per_token = payload.shape[1]
+            recv_tensors.append(
+                payload.new_empty(
+                    (ep_size, runtime_max_tokens_per_rank, elements_per_token)))
+
+        combine_payload_offset = 0
+        return recv_tensors, combine_payload_offset
+
+    @torch.library.register_fake("trtllm::moe_a2a_combine")
+    def _(
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        combine_payload_offset: int,
+        payload_in_workspace: bool,
+    ) -> torch.Tensor:
+        return payload.new_empty((local_num_tokens, payload.shape[2]))
+
+    @torch.library.register_fake("trtllm::moe_a2a_initialize")
+    def _(
+        workspace: torch.Tensor,
+        ep_rank: int,
+        ep_size: int,
+        max_num_tokens_per_rank: int,
+    ) -> torch.Tensor:
+        return torch.empty((9, ), dtype=torch.int64, device="cpu")
+
+    @torch.library.register_fake("trtllm::moe_a2a_sanitize_expert_ids")
+    def _(
+        expert_ids: torch.Tensor,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        ep_rank: int,
+        invalid_expert_id: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
+    def _(
+        workspace: torch.Tensor,
+        ep_rank: int,
+        ep_size: int,
+        runtime_max_tokens_per_rank: int,
+        combine_payload_offset: int,
+        out_dtype: torch.dtype,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        return workspace.new_empty(
+            (ep_size * runtime_max_tokens_per_rank, hidden_size),
+            dtype=out_dtype)
+
     @torch.library.register_fake("trtllm::get_moe_commworkspace_size_per_rank")
     def _(ep_size: int):
         return 0
