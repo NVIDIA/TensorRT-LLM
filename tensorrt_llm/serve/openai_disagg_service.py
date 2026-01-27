@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import copy
 import os
 from typing import Any, Callable, Dict, Optional
 
@@ -145,12 +144,15 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
-        ctx_request = copy.deepcopy(request)
-        ctx_request.disaggregated_params = DisaggregatedParams(
-            request_type="context_only", disagg_request_id=disagg_request_id
+        ctx_request = request.model_copy(
+            update={
+                "disaggregated_params": DisaggregatedParams(
+                    request_type="context_only", disagg_request_id=disagg_request_id
+                ),
+                "stream": False,
+                "stream_options": None,
+            }
         )
-        ctx_request.stream = False
-        ctx_request.stream_options = None
         return ctx_request
 
     def _get_gen_request(
