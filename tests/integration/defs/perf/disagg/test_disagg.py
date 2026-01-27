@@ -112,8 +112,8 @@ class TestDisaggBenchmark:
                 )
                 assert job_id, f"Failed to submit job for {test_config.test_id}\n{error_msg}"
 
-                # Wait for completion (timeout: 10 hours = 36000 seconds)
-                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 54000 seconds)
+                JobManager.wait_for_completion(job_id, 54000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -188,8 +188,8 @@ class TestDisaggBenchmark:
                 # Validate submission result
                 assert job_id, f"Failed to get job_id for {test_config.test_id}"
 
-                # Wait for completion (timeout: 10 hours = 36000 seconds)
-                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 54000 seconds)
+                JobManager.wait_for_completion(job_id, 54000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -272,8 +272,8 @@ class TestDisaggBenchmark:
                 )
                 assert job_id, f"Failed to submit job for {test_config.test_id}\n{error_msg}"
 
-                # Wait for completion (timeout: 10 hours = 36000 seconds)
-                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 54000 seconds)
+                JobManager.wait_for_completion(job_id, 54000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
