@@ -141,6 +141,7 @@ def allreduce_benchmark(
     logger.set_rank(mapping.rank)
 
     AutoTuner.get().setup_distributed_state(mapping)
+    dist = Distributed.get(mapping)
 
     sm_version = get_sm_version()
 

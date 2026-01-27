@@ -5,7 +5,7 @@ import time
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  CudaGraphConfig, DraftTargetDecodingConfig,
-                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
+                                 Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
 
@@ -222,7 +222,7 @@ def setup_llm(args, **kwargs):
             mtp_eagle_one_model=args.use_one_model,
             speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model=args.draft_model_dir,
             eagle3_one_model=args.use_one_model,

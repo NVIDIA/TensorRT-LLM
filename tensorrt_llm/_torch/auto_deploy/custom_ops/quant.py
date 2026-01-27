@@ -14,6 +14,7 @@ TRTLLM_FP4_OP_AVAILABLE = True
 TRTLLM_NVFP4_SCALING_VECTOR_SIZE = 16
 TRTLLM_NVFP4_ROW_SIZE = 128
 TRTLLM_NVFP4_COLUMN_SIZE = 4
+TRTLLM_NVFP4_PACKING_FACTOR = 2
 
 
 @torch.library.custom_op("auto_deploy::torch_quant_fn", mutates_args=())
