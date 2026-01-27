@@ -643,10 +643,13 @@ class RequestCase:
         finish_reasons: list[FinishReason],
         max_new_tokens: int = MAX_NEW_TOKENS,
         end_id: Optional[int] = None,
+        num_draft_tokens: int | None = None,
         stop_words_list: Optional[list[list[int]]] = None,
     ):
         seq_slot = self.seq_slots.pop()  # random seq slot in MAX_NUM_SEQUENCES
         self.prompt = prompt
+        if num_draft_tokens is None:
+            num_draft_tokens = len(new_tokens) - 1
         self.request = LlmRequest(
             request_id=seq_slot,
             seq_slot=seq_slot,
@@ -658,7 +661,7 @@ class RequestCase:
             end_id=end_id,
             sampling_config=SamplingConfig(),
             is_streaming=False,
-            draft_tokens=new_tokens[:-1],
+            draft_tokens=new_tokens[:num_draft_tokens],
         )
         assert len(new_tokens) == len(finish_reasons)
         self.new_tokens = new_tokens
@@ -730,6 +733,15 @@ def test_write_finish_reasons():
                 stop_words_list=[[12, 13]],
                 new_tokens=[12, 13, 60],
                 finish_reasons=[NOT_FINISHED, STOP_WORDS, NOT_FINISHED],
+            ),
+            RequestCase(
+                prompt=[7, 8, 6],
+                stop_words_list=[[12, 13]],
+                new_tokens=[60, 12, 13],
+                # The request has stop words, but no draft is created
+                # Tokens at indices greater than 0 should be ignored
+                num_draft_tokens=0,
+                finish_reasons=[NOT_FINISHED, NOT_FINISHED, NOT_FINISHED],
             ),
             RequestCase(
                 prompt=[1, 2, 3, 4],
