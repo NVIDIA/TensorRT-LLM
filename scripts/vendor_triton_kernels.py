@@ -7,6 +7,7 @@ This script:
 3. Adds attribution headers to all Python files
 4. Copies the LICENSE file from Triton
 5. Creates a VERSION file to track the vendored version
+6. Creates a README.md with clear copyright attribution
 
 To update to a new version:
     python scripts/vendor_triton_kernels.py --tag v3.6.0
@@ -138,6 +139,41 @@ def create_version_file(dest_path: Path, tag: str) -> None:
     print(f"  Created {version_file}")
 
 
+def create_readme(dest_path: Path, tag: str) -> None:
+    """Create a README.md with clear copyright attribution."""
+    print("Creating README.md...")
+
+    readme_file = dest_path / "README.md"
+    readme_content = f"""# Vendored triton_kernels
+
+This directory contains code vendored from the [Triton](https://github.com/triton-lang/triton) project.
+
+| | |
+|---|---|
+| **Copyright** | The Triton Authors |
+| **License** | MIT (see [LICENSE](LICENSE) file in this directory) |
+| **Source** | https://github.com/triton-lang/triton/tree/{tag}/python/triton_kernels/triton_kernels |
+| **Version** | `{tag}` |
+
+## Attribution
+
+This code is the work of the Triton authors and is included here under the MIT License.
+Each Python file includes an attribution header indicating its origin.
+
+## Do Not Edit
+
+This code is vendored verbatim and should not be modified directly.
+To update to a newer version, run:
+
+```bash
+python scripts/vendor_triton_kernels.py --tag <new-tag>
+```
+"""
+
+    readme_file.write_text(readme_content)
+    print(f"  Created {readme_file}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Vendor triton-kernels into TensorRT-LLM")
     parser.add_argument(
@@ -155,6 +191,7 @@ def main():
         copy_triton_kernels(triton_kernels_src, DEST_PATH, args.tag)
         copy_license(triton_repo_root, DEST_PATH)
         create_version_file(DEST_PATH, args.tag)
+        create_readme(DEST_PATH, args.tag)
 
     print("SUCCESS: triton-kernels has been vendored.")
 
