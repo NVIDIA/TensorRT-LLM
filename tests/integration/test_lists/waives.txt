@@ -281,7 +281,6 @@ unittest/_torch/modules/test_fused_moe.py::test_fused_moe_fp8_blockwise_cute_dsl
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_pp4_mtp] SKIP (https://nvbugs/5779536)
 unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py::test_reducescatter_pg_op[var_len:True-seqlen:16-hidden:128] SKIP (https://nvbugs/5781383)
 cpp/test_e2e.py::test_model[-mamba-86] SKIP (https://nvbugs/5781665)
-unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_tp2pp2 SKIP (https://nvbugs/5781731)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp2pp2] SKIP (https://nvbugs/5756008)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False] SKIP (https://nvbugs/5807902)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[llguidance] SKIP (https://nvbugs/5756008)
