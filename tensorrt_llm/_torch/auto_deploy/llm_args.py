@@ -48,6 +48,7 @@ _TRANSFORMS_SHORTCUT_LOOKUP = {
     "free_mem_ratio": ("resize_kv_cache.free_mem_ratio",),
     "compile_backend": ("compile_model.backend",),
     "cuda_graph_batch_sizes": ("compile_model.cuda_graph_batch_sizes",),
+    "use_pt_cache_backend": ("insert_cached_attention.use_pt_cache_backend",),
 }
 
 
@@ -238,7 +239,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
     attn_backend: str = Field(
         default="flashinfer",
-        description=_shortcut_description("Attention backend to use.", "attn_backend"),
+        description=_shortcut_description(
+            "Attention backend: 'flashinfer' (default, stable) or 'trtllm' "
+            "Use with use_pt_cache_backend=True for optimal TRT-LLM performance.",
+            "attn_backend",
+        ),
     )
     free_mem_ratio: float = Field(
         default=0.0,
@@ -259,6 +264,14 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             "List of batch sizes for CUDA graph creation. If not provided, a heuristic will"
             " be used to determine the batch sizes.",
             "cuda_graph_batch_sizes",
+        ),
+    )
+    use_pt_cache_backend: bool = Field(
+        default=False,
+        description=_shortcut_description(
+            "Use PT's KVCacheManager for efficient metadata preparation (TRT-LLM backend only). "
+            "Recommended when using attn_backend='trtllm'",
+            "use_pt_cache_backend",
         ),
     )
 
