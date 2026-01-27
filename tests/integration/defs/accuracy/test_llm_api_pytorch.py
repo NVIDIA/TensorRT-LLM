@@ -2660,6 +2660,50 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device(8)
+class TestDeepSeekV3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-0324-FP4"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(95000)
+    @pytest.mark.parametrize(
+        "target_sparsity,thr_prefill,thr_decode",
+        [
+            (0.9, 1418.142868970396, 863.147841750025),
+        ],
+        ids=["target_sparsity_0.9"],
+    )
+    def test_skip_softmax_attention_multi_gpus(self, target_sparsity: float,
+                                               thr_prefill: float,
+                                               thr_decode: float):
+        sparse_attention_config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": thr_prefill,
+                "decode": thr_decode,
+            })
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70,
+                                        enable_block_reuse=False)
+
+        sm_version = get_sm_version()
+        if sm_version not in (100, 103):
+            pytest.skip(
+                f"Skip softmax MLA attention is not supported on SM {sm_version}"
+            )
+
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 max_batch_size=32,
+                 max_num_tokens=100000,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config) as llm:
+            task = LongBenchV1(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_acc_spec=f"target_sparsity={target_sparsity}")
+
+
+@pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(80000)
 class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
@@ -5280,6 +5324,7 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
                                            max_tokens=16384)
 
     @skip_pre_hopper
+    @pytest.mark.timeout(7200)
     @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
@@ -5748,6 +5793,42 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="CUTLASS"),
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @pytest.mark.skip(reason="Skip MTP test due to no model path file in CI")
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_nvfp4_8gpus_mtp(self):
+        # Test MTP (Multi-Token Prediction) accuracy with nvfp4-fp8kv model.
+        # This test uses MTP with max_draft_len=3 and one_model mode.
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
+        model_path = f"{llm_models_root()}/nemotron-super-sft-repeated-mtp-iter-0010600-nvfp4-fp8kv"
+        with LLM(
+                model_path,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=128,
+                tensor_parallel_size=8,
+                moe_expert_parallel_size=8,
+                pipeline_parallel_size=1,
+                enable_attention_dp=False,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="CUTLASS"),
+                decoding_config=mtp_config,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
