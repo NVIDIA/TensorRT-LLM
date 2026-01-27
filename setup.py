@@ -365,6 +365,11 @@ else:
     # Ensure rawref is included
     package_data.append('runtime/kv_cache_manager_v2/rawref/*.so')
 
+# Add vendored triton_kernels as an explicit top-level package.
+# This is vendored from the Triton project and kept at repo root so its
+# internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
+packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
@@ -392,7 +397,7 @@ setup(
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
         'tensorrt_llm': package_data,
-        'triton_kernels': ['LICENSE'],
+        'triton_kernels': ['LICENSE', 'VERSION'],
     },
     license_files=get_license(),
     entry_points={
