@@ -2353,6 +2353,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        enable_gemm_allreduce_fusion: bool = True,
     ):
         """
         Args:
@@ -2430,13 +2431,14 @@ class Linear(nn.Module):
         )
 
         device_supported = get_sm_version() >= 100
-        enable_gemm_allreduce_fusion = (os.environ.get(
+        enable_gemm_allreduce_fusion_env = (os.environ.get(
             "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
 
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,
             in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, enable_gemm_allreduce_fusion
+            device_supported, enable_gemm_allreduce_fusion,
+            enable_gemm_allreduce_fusion_env
         ])
         if self.use_fused_gemm_allreduce:
             self.use_fused_gemm_allreduce = ipc_nvls_supported()
