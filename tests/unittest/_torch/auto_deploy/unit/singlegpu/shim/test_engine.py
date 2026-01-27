@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 from typing import List, Optional, Type
 
 import pytest
@@ -9,6 +8,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoEngine
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 
 class TransformerLikeModelwithFakeCachePool(nn.Module):
@@ -196,19 +196,22 @@ def test_ad_engine_chunked_prefill_equivalence(attn_page_size: int):
 
     # No-chunk: whole prompt in one request
     req_full = _DummyRequest(tokens=tokens, begin=0, size=len(tokens), seq_slot=0)
-    scheduled_full = SimpleNamespace(context_requests=[req_full], generation_requests=[])
-    logits_full_last = engine.forward(scheduled_full, resource_manager)["logits"][-1]
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests.append(req_full)
+    logits_full_last = engine.forward(scheduled_requests, resource_manager)["logits"][-1]
 
     # Chunked: split into two context chunks
     split = len(tokens) // 2
     req_part1 = _DummyRequest(tokens=tokens, begin=0, size=split, seq_slot=0)
     req_part2 = _DummyRequest(tokens=tokens, begin=split, size=len(tokens) - split, seq_slot=0)
 
-    scheduled_part1 = SimpleNamespace(context_requests=[req_part1], generation_requests=[])
-    scheduled_part2 = SimpleNamespace(context_requests=[req_part2], generation_requests=[])
+    scheduled_requests_part1 = ScheduledRequests()
+    scheduled_requests_part1.context_requests.append(req_part1)
+    scheduled_requests_part2 = ScheduledRequests()
+    scheduled_requests_part2.context_requests.append(req_part2)
 
     # Run first chunk (ignored output), then compare second chunk logits to full
-    _ = engine.forward(scheduled_part1, resource_manager)
-    logits_chunked_last = engine.forward(scheduled_part2, resource_manager)["logits"][-1]
+    _ = engine.forward(scheduled_requests_part1, resource_manager)
+    logits_chunked_last = engine.forward(scheduled_requests_part2, resource_manager)["logits"][-1]
 
     torch.testing.assert_close(logits_full_last, logits_chunked_last)  # , atol=1e-5)

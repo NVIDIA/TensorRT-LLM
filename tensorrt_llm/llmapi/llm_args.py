@@ -1268,7 +1268,7 @@ class AutoDecodingConfig(DecodingBaseConfig):
 class RayPlacementConfig(StrictBaseModel):
     """
     Configuration for Ray GPU workers placement.
-    This config is only used with AsyncLLM for RL scenarios.
+    Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
         default=False,
@@ -1282,8 +1282,11 @@ class RayPlacementConfig(StrictBaseModel):
 
     placement_bundle_indices: Optional[List[List[int]]] = Field(
         default=None,
-        description="List of bundle indices for each placement group. "
-        "Outer list corresponds to placement_groups, inner list contains bundle indices for that group."
+        description=
+        "List of lists of bundle indices. The outer list corresponds to "
+        "`placement_groups`. Each inner list specifies the bundle indices to use within "
+        "that placement group. For example, if `placement_groups=[pg1, pg2]`, "
+        "`[[0, 1], [0, 1]]` assigns bundles 0 and 1 from `pg1` and bundles 0 and 1 from `pg2`."
     )
 
     per_worker_gpu_share: Optional[float] = Field(
@@ -1308,12 +1311,15 @@ class RayPlacementConfig(StrictBaseModel):
                     f"placement_groups length ({len(self.placement_groups)}) must equal "
                     f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
                 )
-            if PlacementGroup is not None:
-                for i, pg in enumerate(self.placement_groups):
-                    if not isinstance(pg, PlacementGroup):
-                        raise TypeError(
-                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
-                            f"got {type(pg).__name__}")
+            if PlacementGroup is None:
+                raise ValueError(
+                    "Ray must be installed to use `placement_groups`")
+
+            for i, pg in enumerate(self.placement_groups):
+                if not isinstance(pg, PlacementGroup):
+                    raise TypeError(
+                        f"placement_groups[{i}] must be a Ray PlacementGroup, "
+                        f"got {type(pg).__name__}")
 
         if self.per_worker_gpu_share is not None:
             if not (0 < self.per_worker_gpu_share <= 1.0):

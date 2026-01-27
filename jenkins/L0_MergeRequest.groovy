@@ -694,7 +694,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp",
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
         "cpp/tensorrt_llm/plugins/ncclPlugin/",
-        "cpp/tensorrt_llm/pybind/",
+        "cpp/tensorrt_llm/nanobind/",
         "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
         "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",

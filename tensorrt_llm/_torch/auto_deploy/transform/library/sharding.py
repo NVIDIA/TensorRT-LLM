@@ -151,6 +151,11 @@ class ShardingTransformConfig(TransformConfig):
 
     process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
 
+    enable_attention_dp: bool = Field(
+        default=False,
+        description="When True, skip TP sharding as attention data parallelism is enabled.",
+    )
+
     def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
         init_process_grid_from_config(self)
         if sources is None:
@@ -738,8 +743,9 @@ class Sharding(BaseTransform):
             f"Using allreduce strategy: {config.allreduce_strategy.name}, dist backend: {config.dist_backend}"
         )
 
-        if world_size < 2:
-            ad_logger.info("Skipping sharding for single device")
+        if world_size < 2 or config.enable_attention_dp:
+            reason = "single device" if world_size < 2 else "attention DP enabled"
+            ad_logger.info(f"Skipping sharding: {reason}")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )

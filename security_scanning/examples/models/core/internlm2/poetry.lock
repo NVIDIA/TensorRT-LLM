@@ -2,17 +2,17 @@
 
 [[package]]
 name = "einops"
-version = "0.8.1"
+version = "0.8.2"
 description = "A new flavour of deep learning operations"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "einops-0.8.1-py3-none-any.whl", hash = "sha256:919387eb55330f5757c6bea9165c5ff5cfe63a642682ea788a6d472576d81737"},
-    {file = "einops-0.8.1.tar.gz", hash = "sha256:de5d960a7a761225532e0f1959e5315ebeafc0cd43394732f103ca44b9837e84"},
+    {file = "einops-0.8.2-py3-none-any.whl", hash = "sha256:54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193"},
+    {file = "einops-0.8.2.tar.gz", hash = "sha256:609da665570e5e265e27283aab09e7f279ade90c4f01bcfca111f3d3e13f2827"},
 ]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "43716825c42624c3799fabdc651ada0715b8ac957ce60faa5c6ed8eaa3a00791"
+content-hash = "e98bb7ee4497ba17b356e8b72cb63aeeb3738ce32176a9d73eccd11271e94231"
