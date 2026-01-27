@@ -1687,8 +1687,10 @@ pipeline {
                             echo "[TEST] TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
                             echo ""
 
-                            // Install git in alpine
-                            trtllm_utils.llmExecStepWithRetry(this, script: "which git || apk add --no-cache git", sleepTime: 10)
+                            // Install git in alpine (use simple sh instead of llmExecStepWithRetry)
+                            sh "which git || apk add --no-cache git"
+
+                            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "repo", true, false)
 
                             // Test the tag creation function directly
                             echo "Testing createGithubTag function..."
