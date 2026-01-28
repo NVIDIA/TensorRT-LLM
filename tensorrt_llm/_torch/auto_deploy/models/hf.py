@@ -460,65 +460,95 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     def _load_checkpoint_with_preload(
         self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
     ):
-        from tensorrt_llm._utils import local_mpi_rank
-
-        rank = local_mpi_rank()
-
-        ad_logger.info(f"Rank {rank}: Loading full checkpoint to CPU memory...")
+        ad_logger.info("Preloading full checkpoint to CPU memory...")
         all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
 
-        # Load into model
-        ad_logger.info(f"Rank {rank}: Loading weights into model (device: {device})...")
+        ad_logger.info(f"Loading weights into model (device: {device})...")
         model.load_state_dict(all_weights, strict=False)
 
         # Free CPU memory
         del all_weights
 
-        ad_logger.info(f"Rank {rank}: Checkpoint loading completed")
+        ad_logger.info("Checkpoint loading completed")
 
-    def _load_full_checkpoint_to_cpu(self, ckpt_file: str) -> dict:
-        """Load the full checkpoint to CPU memory."""
+    def _load_full_checkpoint_to_cpu(self, checkpoint: str) -> dict:
+        """Load the full checkpoint to CPU memory.
 
-        if ckpt_file.endswith(".index.json"):
-            # checkpoint - load from index file
-            with open(ckpt_file, "r") as f:
-                index_data = json.load(f)
+        Args:
+            checkpoint: Can be:
+                - a path to a file containing a whole model state dict
+                - a path to a `.json` file containing the index to a sharded checkpoint
+                - a path to a folder containing a unique `.index.json` file and the shards
+                - a path to a folder containing a unique pytorch_model.bin or model.safetensors
+        """
+        checkpoint_files = None
+        index_filename = None
 
-            # Get the directory containing the index file
-            checkpoint_dir = os.path.dirname(ckpt_file)
-
-            # Load weights from each file
-            weight_map = index_data.get("weight_map", {})
-            weight_files = set(weight_map.values())
-
-            # Collect all weights from files
-            all_weights = {}
-            for weight_file in weight_files:
-                weight_path = os.path.join(checkpoint_dir, weight_file)
-                ad_logger.info(f"Loading weight file: {weight_path}")
-
-                if weight_file.endswith(".safetensors"):
-                    file_weights = safetensors.torch.load_file(weight_path, device="cpu")
-                elif weight_file.endswith((".bin", ".pth")):
-                    file_weights = torch.load(weight_path, map_location="cpu", weights_only=True)
-                else:
-                    ad_logger.warning(f"Skipping unsupported weight file: {weight_file}")
-                    continue
-
-                all_weights.update(file_weights)
-
-            return all_weights
-
-        elif os.path.isfile(ckpt_file):
-            # Single checkpoint file
-            if ckpt_file.endswith(".safetensors"):
-                return safetensors.torch.load_file(ckpt_file, device="cpu")
-            elif ckpt_file.endswith((".bin", ".pth")):
-                return torch.load(ckpt_file, map_location="cpu", weights_only=True)
+        # Fast path: Direct .index.json file (most common case for sharded checkpoints)
+        if os.path.isfile(checkpoint):
+            if checkpoint.endswith(".index.json"):
+                index_filename = checkpoint
             else:
-                raise ValueError(f"Unsupported checkpoint format: {ckpt_file}")
+                checkpoint_files = [checkpoint]
+        elif os.path.isdir(checkpoint):
+            # Check if the whole state dict is present (priority order matches accelerate)
+            potential_state_bin = [f for f in os.listdir(checkpoint) if f == WEIGHTS_NAME]
+            potential_state_safetensor = [
+                f for f in os.listdir(checkpoint) if f == SAFE_WEIGHTS_NAME
+            ]
+
+            # Case 1: pytorch_model.bin (WEIGHTS_NAME)
+            if len(potential_state_bin) == 1:
+                checkpoint_files = [os.path.join(checkpoint, potential_state_bin[0])]
+            # Case 2: model.safetensors (SAFE_WEIGHTS_NAME)
+            elif len(potential_state_safetensor) == 1:
+                checkpoint_files = [os.path.join(checkpoint, potential_state_safetensor[0])]
+            else:
+                # Case 3: Otherwise check for sharded checkpoints
+                potential_index = [f for f in os.listdir(checkpoint) if f.endswith(".index.json")]
+                if len(potential_index) == 0:
+                    raise ValueError(
+                        f"{checkpoint} is not a folder containing a `.index.json` file or a "
+                        f"{WEIGHTS_NAME} or a {SAFE_WEIGHTS_NAME} file"
+                    )
+                elif len(potential_index) == 1:
+                    index_filename = os.path.join(checkpoint, potential_index[0])
+                else:
+                    raise ValueError(
+                        f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones."
+                    )
         else:
-            raise ValueError(f"Checkpoint file not found or unsupported: {ckpt_file}")
+            raise ValueError(
+                f"`checkpoint` should be the path to a file containing a whole state dict, or the index of a sharded "
+                f"checkpoint, or a folder containing a sharded checkpoint or the whole state dict, but got "
+                f"{checkpoint}."
+            )
+
+        # Load checkpoint files from index if needed
+        if index_filename is not None:
+            checkpoint_folder = os.path.dirname(index_filename)
+            with open(index_filename, "r") as f:
+                index = json.load(f)
+
+            if "weight_map" in index:
+                index = index["weight_map"]
+            checkpoint_files = list(set(index.values()))
+            checkpoint_files = [os.path.join(checkpoint_folder, f) for f in checkpoint_files]
+
+        # Load all weights
+        all_weights = {}
+        for checkpoint_file in checkpoint_files:
+            ad_logger.info(f"Loading weight file: {checkpoint_file}")
+            if checkpoint_file.endswith(".safetensors"):
+                file_weights = safetensors.torch.load_file(checkpoint_file, device="cpu")
+            elif checkpoint_file.endswith((".bin", ".pth")):
+                file_weights = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+            else:
+                raise ValueError(f"Unsupported checkpoint format: {checkpoint_file}")
+
+            all_weights.update(file_weights)
+
+        return all_weights
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
