@@ -131,7 +131,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mGroupComm = std::make_shared<CacheTransceiverComm>(tensorrt_llm::pg_utils::get_world_pg());
     }
 
-    if (worldConfig.isTensorParallel())
+    if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
     {
         mGroupTensorParaComm = std::make_shared<CacheTransceiverComm>(
             mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getTensorParallelRank()));
@@ -156,7 +156,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         int DPRank = mCacheState->getParallelConfig().mDPrank;
         // <PP,DP,TP,CP>
         mGroupDataComm = std::make_shared<CacheTransceiverComm>(mGroupComm->split(DPRank, worldConfig.getRank()));
-        if (worldConfig.isTensorParallel())
+        if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
         {
             // Group ranks with same (ppRank, DPRank) accounting for CP.
             mGroupTPInDPComm = std::make_shared<CacheTransceiverComm>(
