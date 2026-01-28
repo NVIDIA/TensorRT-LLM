@@ -194,7 +194,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     // RNN specific setup
     if (mRnnStateManager != nullptr)
     {
-        TLLM_LOG_INFO("Setting up RNN cache transfer components.");
+        TLLM_LOG_DEBUG("Setting up RNN cache transfer components.");
         TLLM_CHECK(!rnnLayerNumPerPP.empty());
 
         if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL
@@ -308,7 +308,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     contextState->setCacheState(*mCacheState);
     if (mRnnCacheState != nullptr)
     {
-        TLLM_LOG_INFO("Setting RNN cache state for request %ld", llmRequest->mRequestId); // make debug
+        TLLM_LOG_DEBUG("Setting RNN cache state for request %ld", llmRequest->mRequestId); // make debug
         contextState->setRnnCacheState(*mRnnCacheState);
     }
     if (!llmRequest->hasDraftTokens())

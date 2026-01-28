@@ -86,9 +86,6 @@ public:
     }
 
 private:
-    static std::vector<SizeType32> getPpLayers(SizeType32 numLayers, runtime::WorldConfig const& worldConfig,
-        std::optional<std::vector<bool>> const& layerMask);
-
     // If we need support beam search, we may need mMaxBeamWidth + 1 slots and use separate input / output states.
     TensorPtr pagedRnnStates;  // [local_nb_layers, max_seq_num * max_beam_width, state_size, rnn_hidden_size] or
                                // [local_nb_layers, max_seq_num * max_beam_width, num_heads, state_size, rnn_head_size]
@@ -104,7 +101,7 @@ private:
     SizeType32 mMaxBeamWidth = 0;
     SizeType32 mBeamSlotsPerSequence = 0;
     std::unordered_map<SizeType32, SizeType32> mLayerOffsets;
-    std::vector<SizeType32> mGlobalLayerNumsPerPP; // contains the global index of RNN layers on self rank 
+    std::vector<SizeType32> mGlobalLayerNumsPerPP; // contains the global index of RNN layers on self rank
     std::vector<SizeType32> mFreeBlocks;
     std::unordered_map<RequestIdType, SizeType32> mCacheIndex;
     std::optional<runtime::BufferManager> mBufferManager;
