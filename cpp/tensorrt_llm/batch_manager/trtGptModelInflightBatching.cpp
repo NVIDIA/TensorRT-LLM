@@ -659,8 +659,9 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
     auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
-    auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig,
-        mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes, extraCostMemory, 2);
+    auto blocksPerWindow
+        = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig, mWorldConfig,
+            windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes, extraCostMemory, 2, getMaxBatchSize());
 
     // now we check if any of the window sizes is too large for at least one sequence to fit in kvCache
     // this can happen if e.g. maxSeqLen is deduced from the model and is too large
