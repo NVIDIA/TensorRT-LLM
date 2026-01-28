@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
-from . import trtllm_engine_pb2 as pb2
+from . import trtllm_service_pb2 as pb2
 
 
 class GrpcRequestManager:

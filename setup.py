@@ -32,15 +32,15 @@ class BuildPyWithProtoCompile(build_py):
     def compile_grpc_protos(self):
         """Compile gRPC protobuf files if the proto file exists."""
         grpc_dir = Path(__file__).parent / "tensorrt_llm" / "grpc"
-        proto_file = grpc_dir / "trtllm_engine.proto"
+        proto_file = grpc_dir / "trtllm_service.proto"
         compile_script = grpc_dir / "compile_protos.py"
 
         if not proto_file.exists():
             return
 
         # Check if pb2 files need to be generated
-        pb2_file = grpc_dir / "trtllm_engine_pb2.py"
-        pb2_grpc_file = grpc_dir / "trtllm_engine_pb2_grpc.py"
+        pb2_file = grpc_dir / "trtllm_service_pb2.py"
+        pb2_grpc_file = grpc_dir / "trtllm_service_pb2_grpc.py"
 
         # Regenerate if pb2 files don't exist or are older than proto file
         needs_compile = (not pb2_file.exists() or not pb2_grpc_file.exists() or

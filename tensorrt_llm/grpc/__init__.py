@@ -41,17 +41,17 @@ from pathlib import Path
 GRPC_MODULE_DIR = Path(__file__).parent
 
 # Proto file path
-PROTO_FILE = GRPC_MODULE_DIR / "trtllm_engine.proto"
+PROTO_FILE = GRPC_MODULE_DIR / "trtllm_service.proto"
 
 # Try to import generated protobuf modules
 try:
-    from . import trtllm_engine_pb2, trtllm_engine_pb2_grpc
+    from . import trtllm_service_pb2, trtllm_service_pb2_grpc
 
     PROTOS_AVAILABLE = True
 except ImportError:
     PROTOS_AVAILABLE = False
-    trtllm_engine_pb2 = None
-    trtllm_engine_pb2_grpc = None
+    trtllm_service_pb2 = None
+    trtllm_service_pb2_grpc = None
 
 
 def compile_protos():
@@ -67,7 +67,7 @@ def compile_protos():
 
 def ensure_protos_available():
     """Ensure protobuf modules are available, compiling if necessary."""
-    global PROTOS_AVAILABLE, trtllm_engine_pb2, trtllm_engine_pb2_grpc
+    global PROTOS_AVAILABLE, trtllm_service_pb2, trtllm_service_pb2_grpc
 
     if not PROTOS_AVAILABLE:
         raise ImportError(
@@ -111,8 +111,8 @@ __all__ = [
     "SERVICER_AVAILABLE",
     "compile_protos",
     "ensure_protos_available",
-    "trtllm_engine_pb2",
-    "trtllm_engine_pb2_grpc",
+    "trtllm_service_pb2",
+    "trtllm_service_pb2_grpc",
     "GrpcRequestManager",
     "TrtllmServiceServicer",
     "create_sampling_params_from_proto",

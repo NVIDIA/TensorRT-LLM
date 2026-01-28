@@ -16,7 +16,7 @@
 
 import pytest
 
-from tensorrt_llm.grpc import trtllm_engine_pb2 as pb2
+from tensorrt_llm.grpc import trtllm_service_pb2 as pb2
 from tensorrt_llm.grpc.grpc_request_manager import (
     create_disaggregated_params_from_proto,
     create_lora_request_from_proto,

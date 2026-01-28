@@ -28,7 +28,7 @@ import grpc
 
 from tensorrt_llm.logger import logger
 
-from . import trtllm_engine_pb2, trtllm_engine_pb2_grpc
+from . import trtllm_service_pb2, trtllm_service_pb2_grpc
 from .grpc_request_manager import (
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
@@ -37,7 +37,7 @@ from .grpc_request_manager import (
 )
 
 
-class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
+class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
     """gRPC servicer implementing the TrtLlmEngine service.
 
     Handles RPCs:
@@ -63,9 +63,9 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
 
     async def Generate(
         self,
-        request: trtllm_engine_pb2.GenerateRequest,
+        request: trtllm_service_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
-    ) -> AsyncGenerator[trtllm_engine_pb2.GenerateResponse, None]:
+    ) -> AsyncGenerator[trtllm_service_pb2.GenerateResponse, None]:
         """Handle streaming generation requests.
 
         Args:
@@ -159,9 +159,9 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
 
     async def Embed(
         self,
-        request: trtllm_engine_pb2.EmbedRequest,
+        request: trtllm_service_pb2.EmbedRequest,
         context: grpc.aio.ServicerContext,
-    ) -> trtllm_engine_pb2.EmbedResponse:
+    ) -> trtllm_service_pb2.EmbedResponse:
         """Handle embedding requests.
 
         Args:
@@ -174,7 +174,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         logger.warning("Embed RPC not yet implemented")
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Embed RPC not yet implemented")
-        return trtllm_engine_pb2.EmbedResponse(
+        return trtllm_service_pb2.EmbedResponse(
             request_id=request.request_id,
             embedding=[],
             prompt_tokens=0,
@@ -182,9 +182,9 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
 
     async def HealthCheck(
         self,
-        request: trtllm_engine_pb2.HealthCheckRequest,
+        request: trtllm_service_pb2.HealthCheckRequest,
         context: grpc.aio.ServicerContext,
-    ) -> trtllm_engine_pb2.HealthCheckResponse:
+    ) -> trtllm_service_pb2.HealthCheckResponse:
         """Handle health check requests.
 
         Args:
@@ -197,15 +197,15 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         is_healthy, message = await self.request_manager.health_check()
         logger.debug(f"HealthCheck: healthy={is_healthy}, message={message}")
 
-        return trtllm_engine_pb2.HealthCheckResponse(
+        return trtllm_service_pb2.HealthCheckResponse(
             status=message,
         )
 
     async def Abort(
         self,
-        request: trtllm_engine_pb2.AbortRequest,
+        request: trtllm_service_pb2.AbortRequest,
         context: grpc.aio.ServicerContext,
-    ) -> trtllm_engine_pb2.AbortResponse:
+    ) -> trtllm_service_pb2.AbortResponse:
         """Handle abort requests.
 
         Args:
@@ -220,16 +220,16 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
 
         success = await self.request_manager.abort(request_id)
 
-        return trtllm_engine_pb2.AbortResponse(
+        return trtllm_service_pb2.AbortResponse(
             success=success,
             message=f"Request {request_id} {'aborted' if success else 'not found'}",
         )
 
     async def GetModelInfo(
         self,
-        request: trtllm_engine_pb2.GetModelInfoRequest,
+        request: trtllm_service_pb2.GetModelInfoRequest,
         context: grpc.aio.ServicerContext,
-    ) -> trtllm_engine_pb2.GetModelInfoResponse:
+    ) -> trtllm_service_pb2.GetModelInfoResponse:
         """Handle model info requests.
 
         Args:
@@ -241,7 +241,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         """
         model_config = self.request_manager.get_model_config()
 
-        return trtllm_engine_pb2.GetModelInfoResponse(
+        return trtllm_service_pb2.GetModelInfoResponse(
             model_id=self.model_path or model_config.get("model_path", ""),
             max_input_len=model_config.get("max_context_length", 0),
             max_seq_len=model_config.get("max_seq_len", 0)
@@ -251,9 +251,9 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
 
     async def GetServerInfo(
         self,
-        request: trtllm_engine_pb2.GetServerInfoRequest,
+        request: trtllm_service_pb2.GetServerInfoRequest,
         context: grpc.aio.ServicerContext,
-    ) -> trtllm_engine_pb2.GetServerInfoResponse:
+    ) -> trtllm_service_pb2.GetServerInfoResponse:
         """Handle server info requests.
 
         Args:
@@ -287,7 +287,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         except Exception as e:
             logger.debug(f"Could not get parallelism info: {e}")
 
-        return trtllm_engine_pb2.GetServerInfoResponse(
+        return trtllm_service_pb2.GetServerInfoResponse(
             version=version,
             backend="tensorrt-llm",
             tensor_parallel_size=tp_size,
@@ -303,7 +303,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         request_id: str,
         gen_result,
         prompt_token_ids: list,
-    ) -> List[trtllm_engine_pb2.GenerateResponse]:
+    ) -> List[trtllm_service_pb2.GenerateResponse]:
         """Build streaming chunk responses from GenerationResult.
 
         Uses token_ids_diff to get delta tokens. For n>1, returns a response
@@ -323,9 +323,9 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         if not gen_result.outputs:
             # No outputs yet, return empty chunk
             responses.append(
-                trtllm_engine_pb2.GenerateResponse(
+                trtllm_service_pb2.GenerateResponse(
                     request_id=request_id,
-                    chunk=trtllm_engine_pb2.GenerateStreamChunk(
+                    chunk=trtllm_service_pb2.GenerateStreamChunk(
                         token_ids=[],
                         prompt_tokens=len(prompt_token_ids),
                         completion_tokens=0,
@@ -344,7 +344,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
             if not delta_tokens:
                 continue
 
-            chunk = trtllm_engine_pb2.GenerateStreamChunk(
+            chunk = trtllm_service_pb2.GenerateStreamChunk(
                 token_ids=delta_tokens,
                 sequence_index=completion.index,
                 prompt_tokens=len(prompt_token_ids),
@@ -356,14 +356,14 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
             if completion.logprobs_diff:
                 for lp in completion.logprobs_diff:
                     if isinstance(lp, dict):
-                        token_logprob = trtllm_engine_pb2.TokenLogprob(
+                        token_logprob = trtllm_service_pb2.TokenLogprob(
                             token_id=lp.get("token_id", 0),
                             logprob=lp.get("logprob", 0.0),
                         )
                         chunk.logprobs.append(token_logprob)
 
             responses.append(
-                trtllm_engine_pb2.GenerateResponse(
+                trtllm_service_pb2.GenerateResponse(
                     request_id=request_id,
                     chunk=chunk,
                 )
@@ -376,7 +376,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         request_id: str,
         gen_result,
         prompt_token_ids: list,
-    ) -> trtllm_engine_pb2.GenerateResponse:
+    ) -> trtllm_service_pb2.GenerateResponse:
         """Build a final completion response from GenerationResult.
 
         Args:
@@ -391,9 +391,9 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         completion = gen_result.outputs[0] if gen_result.outputs else None
 
         if completion is None:
-            return trtllm_engine_pb2.GenerateResponse(
+            return trtllm_service_pb2.GenerateResponse(
                 request_id=request_id,
-                complete=trtllm_engine_pb2.GenerateComplete(
+                complete=trtllm_service_pb2.GenerateComplete(
                     output_token_ids=[],
                     finish_reason="error",
                     prompt_tokens=len(prompt_token_ids),
@@ -405,7 +405,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         # Get all output tokens
         output_tokens = list(completion.token_ids) if completion.token_ids else []
 
-        complete = trtllm_engine_pb2.GenerateComplete(
+        complete = trtllm_service_pb2.GenerateComplete(
             output_token_ids=output_tokens,
             sequence_index=completion.index,
             finish_reason=completion.finish_reason or "stop",
@@ -422,7 +422,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         if completion.logprobs:
             for lp in completion.logprobs:
                 if isinstance(lp, dict):
-                    token_logprob = trtllm_engine_pb2.TokenLogprob(
+                    token_logprob = trtllm_service_pb2.TokenLogprob(
                         token_id=lp.get("token_id", 0),
                         logprob=lp.get("logprob", 0.0),
                     )
@@ -432,13 +432,13 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         if hasattr(completion, "prompt_logprobs") and completion.prompt_logprobs:
             for lp in completion.prompt_logprobs:
                 if isinstance(lp, dict):
-                    token_logprob = trtllm_engine_pb2.TokenLogprob(
+                    token_logprob = trtllm_service_pb2.TokenLogprob(
                         token_id=lp.get("token_id", 0),
                         logprob=lp.get("logprob", 0.0),
                     )
                     complete.prompt_logprobs.append(token_logprob)
 
-        return trtllm_engine_pb2.GenerateResponse(
+        return trtllm_service_pb2.GenerateResponse(
             request_id=request_id,
             complete=complete,
         )
@@ -449,7 +449,7 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         message: str,
         error_type: str,
         code: int,
-    ) -> trtllm_engine_pb2.GenerateResponse:
+    ) -> trtllm_service_pb2.GenerateResponse:
         """Build an error response.
 
         Args:
@@ -461,9 +461,9 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         Returns:
             GenerateResponse with error field set
         """
-        return trtllm_engine_pb2.GenerateResponse(
+        return trtllm_service_pb2.GenerateResponse(
             request_id=request_id,
-            error=trtllm_engine_pb2.GenerateError(
+            error=trtllm_service_pb2.GenerateError(
                 message=message,
                 type=error_type,
                 code=code,

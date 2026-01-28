@@ -249,7 +249,7 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
     except ImportError:
         REFLECTION_AVAILABLE = False
 
-    from tensorrt_llm.grpc import trtllm_engine_pb2, trtllm_engine_pb2_grpc
+    from tensorrt_llm.grpc import trtllm_service_pb2, trtllm_service_pb2_grpc
     from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
     from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
 
@@ -292,13 +292,13 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
             ], )
 
         # Add servicer to server
-        trtllm_engine_pb2_grpc.add_TrtllmServiceServicer_to_server(
+        trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(
             servicer, server)
 
         # Enable reflection for grpcurl and other tools
         if REFLECTION_AVAILABLE:
             service_names = (
-                trtllm_engine_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
+                trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
                 full_name,
                 reflection.SERVICE_NAME,
             )

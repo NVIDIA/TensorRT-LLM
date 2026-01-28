@@ -13,10 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Compile Protocol Buffer definitions for TensorRT-LLM gRPC server.
+"""Compile Protocol Buffer definitions for TensorRT-LLM gRPC server.
 
-This script generates Python bindings from the trtllm_engine.proto file.
+This script generates Python bindings from the trtllm_service.proto file.
 
 Usage:
     python -m tensorrt_llm.grpc.compile_protos
@@ -34,8 +33,7 @@ from pathlib import Path
 
 
 def compile_protos(proto_dir: Path = None, output_dir: Path = None) -> bool:
-    """
-    Compile proto files to Python.
+    """Compile proto files to Python.
 
     Args:
         proto_dir: Directory containing .proto files. Defaults to this script's directory.
@@ -49,7 +47,7 @@ def compile_protos(proto_dir: Path = None, output_dir: Path = None) -> bool:
     if output_dir is None:
         output_dir = proto_dir
 
-    proto_file = proto_dir / "trtllm_engine.proto"
+    proto_file = proto_dir / "trtllm_service.proto"
 
     if not proto_file.exists():
         print(f"Error: Proto file not found: {proto_file}")
@@ -66,33 +64,35 @@ def compile_protos(proto_dir: Path = None, output_dir: Path = None) -> bool:
     # Compile proto file
     print(f"Compiling {proto_file}...")
 
-    result = protoc.main([
-        "grpc_tools.protoc",
-        f"--proto_path={proto_dir}",
-        f"--python_out={output_dir}",
-        f"--grpc_python_out={output_dir}",
-        str(proto_file),
-    ])
+    result = protoc.main(
+        [
+            "grpc_tools.protoc",
+            f"--proto_path={proto_dir}",
+            f"--python_out={output_dir}",
+            f"--grpc_python_out={output_dir}",
+            str(proto_file),
+        ]
+    )
 
     if result != 0:
         print(f"Error: protoc failed with code {result}")
         return False
 
     # Fix imports in generated files (grpc_tools generates absolute imports)
-    pb2_file = output_dir / "trtllm_engine_pb2.py"
-    pb2_grpc_file = output_dir / "trtllm_engine_pb2_grpc.py"
+    pb2_file = output_dir / "trtllm_service_pb2.py"
+    pb2_grpc_file = output_dir / "trtllm_service_pb2_grpc.py"
 
     if pb2_grpc_file.exists():
         content = pb2_grpc_file.read_text()
         # Fix import to use relative import
         content = content.replace(
-            "import trtllm_engine_pb2 as trtllm__engine__pb2",
-            "from . import trtllm_engine_pb2 as trtllm__engine__pb2"
+            "import trtllm_service_pb2 as trtllm__engine__pb2",
+            "from . import trtllm_service_pb2 as trtllm__engine__pb2",
         )
         pb2_grpc_file.write_text(content)
         print(f"Fixed imports in {pb2_grpc_file}")
 
-    print(f"Generated files:")
+    print("Generated files:")
     print(f"  - {pb2_file}")
     print(f"  - {pb2_grpc_file}")
     print("Proto compilation successful!")
@@ -101,8 +101,7 @@ def compile_protos(proto_dir: Path = None, output_dir: Path = None) -> bool:
 
 
 def verify_generated_files(output_dir: Path = None) -> bool:
-    """
-    Verify that generated files can be imported.
+    """Verify that generated files can be imported.
 
     Args:
         output_dir: Directory containing generated files.
@@ -113,8 +112,8 @@ def verify_generated_files(output_dir: Path = None) -> bool:
     if output_dir is None:
         output_dir = Path(__file__).parent
 
-    pb2_file = output_dir / "trtllm_engine_pb2.py"
-    pb2_grpc_file = output_dir / "trtllm_engine_pb2_grpc.py"
+    pb2_file = output_dir / "trtllm_service_pb2.py"
+    pb2_grpc_file = output_dir / "trtllm_service_pb2_grpc.py"
 
     if not pb2_file.exists() or not pb2_grpc_file.exists():
         print("Generated files not found. Run compile_protos() first.")
@@ -124,7 +123,7 @@ def verify_generated_files(output_dir: Path = None) -> bool:
     import importlib.util
 
     try:
-        spec = importlib.util.spec_from_file_location("trtllm_engine_pb2", pb2_file)
+        spec = importlib.util.spec_from_file_location("trtllm_service_pb2", pb2_file)
         pb2_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(pb2_module)
         print(f"Successfully imported {pb2_file.name}")
@@ -148,12 +147,15 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Compile TensorRT-LLM gRPC protos")
-    parser.add_argument("--proto-dir", type=Path, default=None,
-                        help="Directory containing .proto files")
-    parser.add_argument("--output-dir", type=Path, default=None,
-                        help="Directory for generated Python files")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify generated files after compilation")
+    parser.add_argument(
+        "--proto-dir", type=Path, default=None, help="Directory containing .proto files"
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=None, help="Directory for generated Python files"
+    )
+    parser.add_argument(
+        "--verify", action="store_true", help="Verify generated files after compilation"
+    )
 
     args = parser.parse_args()
 
