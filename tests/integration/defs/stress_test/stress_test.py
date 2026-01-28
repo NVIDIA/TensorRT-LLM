@@ -378,7 +378,7 @@ def is_port_available(port: int,
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
                          ids=lambda x: x)
 @pytest.mark.parametrize("stress_time_timeout", [(180, 300), (300, 450),
-                                                 (600, 900), (3600, 5400)],
+                                                 (600, 900), (3600, 10800)],
                          ids=lambda x: f"stress_time_{x[0]}s_timeout_{x[1]}s")
 @pytest.mark.parametrize(
     "config",
@@ -529,9 +529,9 @@ def stress_test(config,
             max_batch_size=
             2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
             max_num_tokens=
-            2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
+            8192,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
-            0.7,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
+            0.85,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
