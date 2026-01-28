@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -281,23 +282,11 @@ def test_autodeploy_eagle3_acceptance_rate():
     print("=" * 80)
 
 
-# TODO: This could be better by using the actual logic in hf.py
-# instead of replicating it here.
-def _analyze_weight_loading(model_path: Path, model: torch.nn.Module):
-    """Analyze which weights will be loaded vs. missing between checkpoint and model.
+def load_weights(model_path: Path, model: torch.nn.Module):
+    """Load weights from checkpoint while applying the same _checkpoint_conversion_mapping that the factory uses.
 
-    This applies the same _checkpoint_conversion_mapping that the factory uses
-    (see hf.py lines 496-512: _remap_param_names_load_hook).
-
-    Args:
-        model_path: Path to model checkpoint directory
-        model: The model instance to analyze
-
-    Returns:
-        Tuple of (loaded_keys, missing_keys, unexpected_keys)
+    Returns: tuple of (loaded_keys, missing_keys, unexpected_keys)
     """
-    import re
-
     # 1. Load checkpoint keys
     bin_path = model_path / "pytorch_model.bin"
     safetensors_path = model_path / "model.safetensors"
@@ -389,12 +378,9 @@ def test_eagle_model_with_weights():
     print(f"Model type: {type(model).__name__}")
     print(f"Model config type: {type(model.config).__name__}")
 
-    # 4. Analyze weight loading BEFORE actually loading
-    # This uses the same logic as hf.py _remap_param_names_load_hook (lines 496-512)
-    # Note: This would be better by using the actual logic in hf.py
-    # instead of replicating it here, as this could get stale.
+    # 4. Load weights from checkpoint and compare to model's expected keys
     print("\n--- Weight Loading Analysis ---")
-    loaded_keys, missing_keys, unexpected_keys = _analyze_weight_loading(eagle_path, model)
+    loaded_keys, missing_keys, unexpected_keys = load_weights(eagle_path, model)
 
     print(f"Total model parameters: {len(loaded_keys) + len(missing_keys)}")
     print(f"Total checkpoint keys: {len(loaded_keys) + len(unexpected_keys)}")
@@ -456,8 +442,7 @@ def test_eagle_model_with_weights():
 
     # 5. Load weights using factory (mimics actual pipeline)
     # If tensor shapes do not match with how they are used in the forward() function, we will
-    # get an error. This is only meaningful since we know which keys will be loaded
-    # and which will be random from the test above.
+    # get an error.
     print("Loading weights via factory.load_or_random_init()...")
     factory.load_or_random_init(model, device)
     print("Weights loaded successfully via factory interface!")

@@ -398,8 +398,7 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Eagle3DraftOutput:
-        """Forward pass compatible with HuggingFace/AutoDeploy interface.
-
+        """
         Kwargs:
             hidden_states: Hidden states from the target model. Required.
 
