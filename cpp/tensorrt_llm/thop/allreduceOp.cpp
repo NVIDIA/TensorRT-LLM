@@ -42,6 +42,7 @@
 #include <ATen/cuda/EmptyTensor.h>
 #include <c10/util/irange.h>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -295,7 +296,6 @@ public:
         auto const rank = getRank();
         TLLM_LOG_DEBUG(
             "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
-
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
         {
@@ -508,8 +508,9 @@ private:
             minRegistrationThreshold = static_cast<size_t>(std::atoi(envThreshold)) * input.element_size();
         }
 
-        // Search for existing buffer
         auto& allocator = NCCLWindowAllocator::getInstance();
+
+        // Search for existing buffer
         auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr());
 
         torch::Tensor inputTensor = input;
@@ -532,11 +533,22 @@ private:
                 // Large buffer: create window buffer and copy input (can swap inputTensor reference)
                 auto [symmetricInput, symmetricBuffer0]
                     = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
-                TLLM_CUDA_CHECK(cudaMemcpyAsync(
-                    symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
-                windowBuffer0 = symmetricBuffer0;
-                inputTensor = symmetricInput; // Swap to window-backed tensor
-                inputPtr = windowBuffer0.ptr;
+                if (!symmetricBuffer0.isValid())
+                {
+                    TLLM_LOG_DEBUG(
+                        "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
+                        "falling back to non-symmetric ncclAllReduce (input buffer)");
+                    // inputTensor and inputPtr remain pointing to original input
+                }
+                else
+                {
+                    TLLM_CUDA_CHECK(cudaMemcpyAsync(
+                        symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
+
+                    windowBuffer0 = symmetricBuffer0;
+                    inputTensor = symmetricInput; // Swap to window-backed tensor
+                    inputPtr = windowBuffer0.ptr;
+                }
             }
         }
         else
@@ -547,8 +559,14 @@ private:
 
         // Use window-backed output buffer
         auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
-        torch::Tensor outputTensor = normOut;
-        void* outputPtr = windowBuffer1.ptr;
+        torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
+        void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
+        if (!windowBuffer1.isValid())
+        {
+            TLLM_LOG_DEBUG(
+                "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
+                "using plain CUDA tensor for output");
+        }
 
         // Perform allreduce
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
