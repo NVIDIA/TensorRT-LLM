@@ -340,18 +340,51 @@ def mergeWaiveList(pipeline, globalVars)
     sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabCommit}.txt"
     sh "cp ${LLM_ROOT}/jenkins/scripts/mergeWaiveList.py ./"
 
+    // Get TOT waive list
+    LLM_TOT_ROOT = "llm-tot"
+    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    echo "Target branch: ${targetBranch}"
+
+    def isGetTOTWaiveList = false
     try {
-        // Get TOT waive list
-        LLM_TOT_ROOT = "llm-tot"
-        targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
-        echo "Target branch: ${targetBranch}"
-        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-            trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, true)
-        }
-        targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+        trtllm_utils.checkoutSource("https://github.com/NVIDIA/TensorRT-LLM.git", targetBranch, LLM_TOT_ROOT, false, false)
+        def targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
         echo "Target branch TOT commit: ${targetBranchTOTCommit}"
         sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+        isGetTOTWaiveList = true
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to checkout TOT waive list from github repository. Error: ${e.toString()}"
+    }
 
+    if (!isGetTOTWaiveList) {
+        try {
+            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+                trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, true)
+            }
+            def targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+            echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+            sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+            isGetTOTWaiveList = true
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Failed to checkout TOT waive list from gitlab repository. Error: ${e.toString()}"
+            
+        }
+    }
+
+    if (!isGetTOTWaiveList) {
+        catchError(
+                buildResult: 'SUCCESS',
+                stageResult: 'UNSTABLE') {
+                error "Failed to get TOT waive list. Fallback to use the default test waive list from the PR."
+            }
+        return
+    }
+
+    try {
         // Get waive list diff in current MR
         def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
 
