@@ -145,15 +145,24 @@ class HarmonyStreamState:
 
         return deltas
 
-    def process_token_batch_to_messages(self,
-                                        tokens: list[int]) -> list[Message]:
+    def process_token_batch_to_messages(
+            self, tokens: list[int]) -> tuple[list[Message], dict[str, str]]:
         """
         Process a batch of tokens while maintaining parsing state.
-        Returns OpenAI Messages for Responses API
+        Returns OpenAI Messages for Responses API and parsed contents
         """
         self.tokens_processed += len(tokens)
 
+        contents: dict[str, str] = {}
         for token in tokens:
+            if self.parser.current_channel:
+                if self.parser.current_channel not in contents:
+                    contents[self.parser.current_channel] = ""
+
+                contents[
+                    self.parser.
+                    current_channel] += self.parser.last_content_delta or ""
+
             # Store previous state for transition detection
             prev_channel = self.parser.current_channel
             prev_recipient = self.parser.current_recipient
@@ -179,7 +188,7 @@ class HarmonyStreamState:
                 self.channel_started = False
                 self.current_channel_state = None
 
-        return self.parser.messages
+        return self.parser.messages, contents
 
     def _create_closing_token_delta(self) -> dict[str, Any] | None:
         """Create closing token delta for channel transition."""
@@ -1292,7 +1301,8 @@ class HarmonyAdapter:
             request_id: str,
             tokens: list[int],
             available_tools: list[dict[str, Any]] | None = None,
-            tool_choice: str | None = None) -> list[Message]:
+            tool_choice: str | None = None
+    ) -> tuple[list[Message], dict[str, str]]:
         """
         Process tokens using stateful parsing.
 
@@ -1305,7 +1315,7 @@ class HarmonyAdapter:
             available_tools: Available tools for filtering
 
         Returns:
-            List of OpenAI Messages
+            List of OpenAI Messages and parsed contents
         """
         stream_state = self._stream_states.get(request_id, None)
         if stream_state is None:
@@ -1313,15 +1323,16 @@ class HarmonyAdapter:
                                                     tool_choice)
 
         try:
-            messages = stream_state.process_token_batch_to_messages(tokens)
-            return messages
+            messages, contents = stream_state.process_token_batch_to_messages(
+                tokens)
+            return messages, contents
         except (HarmonyError, UnicodeDecodeError, ValueError):
             logger.error(
                 f"Streaming: Failed to process token batch of {len(tokens)} tokens for request {request_id}",
             )
             logger.debug(f"Problematic streaming tokens: {tokens}")
 
-            return []
+            return [], {}
 
     def create_openai_streaming_response(
             self,
