@@ -208,6 +208,8 @@ def create_default_dit_configs() -> dict:
             "enable_teacache": False,
             "use_ret_steps": True,
             "teacache_thresh": 0.2,
+            "ret_steps": 0,
+            "cutoff_steps": 50,
         },
     }
     return configs
