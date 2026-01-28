@@ -511,7 +511,10 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
 
     # add some defaults to llm_args
     llm_args["skip_loading_weights"] = True  # No weight loading to speed up things
-    llm_args["attn_page_size"] = 4  # Make sure paging is activated despite small max_tokens
+    llm_args["kv_cache_config"] = {
+        "tokens_per_block": 4,  # Make sure paging is activated despite small max_tokens
+        "free_gpu_memory_fraction": 0.0,  # No resizing of the cache to keep the mem footprint small
+    }
     llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)

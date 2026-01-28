@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import itertools
+import os
 import unittest.mock
 import weakref
 from enum import IntEnum
@@ -11,6 +12,7 @@ import torch
 import tensorrt_llm._torch.model_config
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
@@ -54,8 +56,15 @@ def round_up(a, b):
     return ceil_div(a, b) * b
 
 
-def get_balanced_selection_no_cache(
-    num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+def get_balanced_selection_impl_default(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    dp_size: int,
+    dp_rank: int,
+    ep_size: int,
 ):
     token_id = torch.arange(dp_rank * num_tokens * top_k, (dp_rank + 1) * num_tokens * top_k).view(
         num_tokens, top_k
@@ -66,6 +75,32 @@ def get_balanced_selection_no_cache(
     ) % experts_per_rank
     token_selected_experts = token_selected_experts.sort(dim=-1).values
     return token_selected_experts.contiguous().to(dtype=dtype, device=device)
+
+
+def get_balanced_selection_impl_random(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    dp_size: int,
+    dp_rank: int,
+    ep_size: int,
+):
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_experts, 0, 128)
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(num_tokens, approx_max_load=False)
+    assert sum(num_tokens_per_expert) == num_tokens * top_k
+    token_selected_experts = helper.generate_token_selected_experts(
+        num_tokens, num_tokens_per_expert
+    )
+    return token_selected_experts.contiguous().to(dtype=dtype, device=device)
+
+
+def get_balanced_selection_no_cache(*args, **kwargs):
+    if os.environ.get("TRTLLM_LAYERWISE_BENCHMARK_BALANCED_IMPL", "DEFAULT") == "RANDOM":
+        return get_balanced_selection_impl_random(*args, **kwargs)
+    else:
+        return get_balanced_selection_impl_default(*args, **kwargs)
 
 
 get_balanced_selection = functools.cache(get_balanced_selection_no_cache)

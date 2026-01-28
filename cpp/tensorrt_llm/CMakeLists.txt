@@ -293,13 +293,7 @@ if(BUILD_PYT)
   add_subdirectory(thop)
 endif()
 
-if(BINDING_TYPE STREQUAL "pybind")
-  add_subdirectory(pybind)
-endif()
-
-if(BINDING_TYPE STREQUAL "nanobind")
-  add_subdirectory(nanobind)
-endif()
+add_subdirectory(nanobind)
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)

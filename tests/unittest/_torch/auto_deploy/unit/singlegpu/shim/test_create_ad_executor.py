@@ -107,6 +107,7 @@ def test_create_autodeploy_executor_with_guided_decoding(
         512  # placeholder to satisfy ADEngine.build_from_config
     )
     mock_engine.cache_seq_interface.info.vocab_size_padded = vocab_size_padded
+    mock_engine.cache_seq_interface.max_num_state_slots = max_batch_size
 
     # Mock the specific dependencies requested, plus minimal additional mocks to prevent errors
     with (

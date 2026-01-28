@@ -106,7 +106,7 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
         if kv_algo:
             if kv_algo != "FP8":
                 raise ValueError(f"KV cache quantization format {kv_algo} not supported.")
-            quant_config["kv_cache_dtype"] = "float8_e4m3fn"
+            quant_config["kv_cache_dtype"] = "fp8"
 
         self._quant_config = quant_config
 
