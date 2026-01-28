@@ -1006,7 +1006,6 @@ def add_arguments(parser: ArgumentParser):
                         action="store_true",
                         help="Always configure cmake before building")
     parser.add_argument("--use_ccache",
-                        "-ccache",
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")
