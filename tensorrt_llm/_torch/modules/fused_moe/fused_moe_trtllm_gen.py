@@ -16,15 +16,15 @@ from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ..gated_mlp import GatedMLP
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 
 # isort: off
-from .quantization import (NVFP4TRTLLMGenFusedMoEMethod,
-                           UnquantizedFusedMoEMethod,
-                           W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
-                           W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
-                           W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
-                           W4A16MXFP4TRTLLMGenFusedMoEMethod)
+from .quantization import (
+    DeepSeekFP8TRTLLMGenBlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod,
+    UnquantizedFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
+    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
+    W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
@@ -169,6 +169,12 @@ class TRTLLMGenFusedMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+        self.num_fused_shared_expert = 0
+        self.layer_idx = layer_idx
+
+        if model_config.mapping.dp_size == 1 and self.quant_config.layer_quant_mode.has_fp8_block_scales(
+        ):
+            self.num_fused_shared_expert = model_config.pretrained_config.n_shared_experts
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         # If no attention DP, no need to use AlltoAll.
@@ -244,7 +250,7 @@ class TRTLLMGenFusedMoE(MoE):
             return
 
         self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
+        self.quant_method.create_weights(self, self.num_fused_shared_expert)
 
         self._weights_created = True
         self._check_configs()
@@ -355,6 +361,11 @@ class TRTLLMGenFusedMoE(MoE):
 
         return x, x_sf
 
+    def fuse_shared_expert(self, shared_experts: GatedMLP):
+        assert self._weights_created
+        self.quant_method.fuse_shared_expert(self, shared_experts,
+                                             self.num_fused_shared_expert)
+
     def run_moe(
         self,
         x: torch.Tensor,
@@ -432,6 +443,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w2_weight_scaling_factor,
                 self.num_slots,
                 top_k,
+                self.num_fused_shared_expert,
                 n_group,
                 topk_group,
                 self.intermediate_size_per_partition,
