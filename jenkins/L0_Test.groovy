@@ -1841,9 +1841,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     - name: austin-trt-llm-data
                       mountPath: ${austin_trt_llm_data_mount_path}
                       readOnly: true
-                    - name: pdx-trt-llm-data
-                      mountPath: ${pdx_trt_llm_data_mount_path}
-                      readOnly: true
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
                       readOnly: false
