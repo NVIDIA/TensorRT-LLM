@@ -43,7 +43,7 @@ public:
 
     RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32 numHeads, SizeType32 nGroups, SizeType32 headDim,
         SizeType32 maxBatchSize, runtime::WorldConfig const& worldConfig, int64_t stream, nvinfer1::DataType dtype,
-        nvinfer1::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers);
+        nvinfer1::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers, SizeType32 numLayers);
 
     void getPtrBuffers(TensorMap& inputBuffers, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig) const;

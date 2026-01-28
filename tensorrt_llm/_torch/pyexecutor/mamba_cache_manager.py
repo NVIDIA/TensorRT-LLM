@@ -20,7 +20,7 @@ import torch
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager)
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -80,6 +80,7 @@ class MambaCacheManager(BaseResourceManager):
             dtype=dtype_binding,
             ssm_cache_dtype=ssm_cache_dtype_binding,
             pp_layers=pp_layers,
+            num_layers=num_layers,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -169,7 +170,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_n_groups,
             mamba_head_dim,
             mamba_num_layers,
-            mamba_max_batch_size,
+            max_batch_size,
             mapping,
             mamba_cache_dtype,
             mamba_ssm_cache_dtype,

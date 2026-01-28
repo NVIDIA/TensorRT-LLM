@@ -423,10 +423,10 @@ void initBindings(pybind11::module_& m)
             py::call_guard<py::gil_scoped_release>())
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
                  tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
-                 std::vector<tr::SizeType32> const&>(),
+                 std::vector<tr::SizeType32> const&, tr::SizeType32>(),
             py::arg("d_state"), py::arg("d_conv"), py::arg("num_heads"), py::arg("n_groups"), py::arg("head_dim"),
             py::arg("max_batch_size"), py::arg("world_config"), py::arg("stream"), py::arg("dtype"),
-            py::arg("ssm_cache_dtype"), py::arg("pp_layers"), py::call_guard<py::gil_scoped_release>())
+            py::arg("ssm_cache_dtype"), py::arg("pp_layers"), py::arg("num_layers"), py::call_guard<py::gil_scoped_release>())
         .def("get_cache_index", &tb::rnn_state_manager::RnnStateManager::getCacheIndex, py::arg("request_id"),
             py::call_guard<py::gil_scoped_release>())
         .def(
