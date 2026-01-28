@@ -16,7 +16,7 @@
 syntax = "proto3";
 package trtllm;
 
-// TensorRT-LLM gRPC Engine Service
+// TensorRT-LLM gRPC Service
 //
 // This service provides high-performance inference for LLMs using TensorRT-LLM.
 // It accepts pre-tokenized requests and returns raw token IDs, enabling efficient
@@ -27,7 +27,7 @@ package trtllm;
 // - Streaming delta mode: Chunks contain only new tokens since last chunk
 // - Full feature support: All TensorRT-LLM capabilities exposed
 
-service TrtLlmEngine {
+service TrtllmService {
   // Generate tokens from pre-tokenized input
   // Returns a stream of responses containing token IDs
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);

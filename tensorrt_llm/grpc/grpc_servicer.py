@@ -15,7 +15,7 @@
 
 """gRPC Servicer for TensorRT-LLM.
 
-Implements the TrtLlmEngine gRPC service for high-performance communication
+Implements the TrtllmService gRPC service for high-performance communication
 with external routers (e.g., sgl-router) using pre-tokenized input.
 """
 
@@ -36,7 +36,7 @@ from .grpc_request_manager import (
 )
 
 
-class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
+class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
     """gRPC servicer implementing the TrtLlmEngine service.
 
     Handles RPCs:
@@ -58,7 +58,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         self.request_manager = request_manager
         self.model_path = model_path
         self._start_time = time.time()
-        logger.info("TrtLlmEngineServicer initialized")
+        logger.info("TrtllmServiceServicer initialized")
 
     async def Generate(
         self,

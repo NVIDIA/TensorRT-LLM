@@ -251,7 +251,7 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
 
     from tensorrt_llm.grpc import trtllm_engine_pb2, trtllm_engine_pb2_grpc
     from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
-    from tensorrt_llm.grpc.grpc_servicer import TrtLlmEngineServicer
+    from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
 
     async def serve_grpc_async():
         logger.info("Initializing TensorRT-LLM gRPC server...")
@@ -280,7 +280,7 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
         request_manager = GrpcRequestManager(llm)
 
         # Create servicer
-        servicer = TrtLlmEngineServicer(request_manager, model_path=model_path)
+        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
 
         # Create gRPC server
         server = grpc.aio.server(
@@ -292,13 +292,13 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
             ], )
 
         # Add servicer to server
-        trtllm_engine_pb2_grpc.add_TrtLlmEngineServicer_to_server(
+        trtllm_engine_pb2_grpc.add_TrtllmServiceServicer_to_server(
             servicer, server)
 
         # Enable reflection for grpcurl and other tools
         if REFLECTION_AVAILABLE:
             service_names = (
-                trtllm_engine_pb2.DESCRIPTOR.services_by_name["TrtLlmEngine"].
+                trtllm_engine_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
                 full_name,
                 reflection.SERVICE_NAME,
             )
@@ -693,6 +693,20 @@ def serve(
 
     if grpc:
         # gRPC mode: launch gRPC server instead of OpenAI HTTP server
+        # Check for unsupported arguments that are silently ignored in gRPC mode
+        unsupported_args = {
+            "tool_parser": tool_parser,
+            "chat_template": chat_template,
+            "metadata_server_config_file": metadata_server_config_file,
+            "server_role": server_role,
+            "disagg_config_file": disagg_config_file,
+        }
+        for name, value in unsupported_args.items():
+            if value is not None:
+                raise ValueError(
+                    f"Argument '{name}' is not supported when running in gRPC mode. "
+                    f"The gRPC server is designed for use with external routers that handle "
+                    f"these features (e.g., tool parsing, chat templates).")
         launch_grpc_server(host, port, llm_args)
     else:
         # Default: launch OpenAI HTTP server
