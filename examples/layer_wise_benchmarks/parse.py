@@ -39,9 +39,7 @@ class KernelRecord(NamedTuple):
     kernel_end: int
     demangled_name: int  # String ID reference
     runtime_start: int
-    runtime_end: int
     capture_start: int
-    capture_end: int
 
 
 class KernelTiming(NamedTuple):
@@ -176,16 +174,14 @@ if "CUPTI_ACTIVITY_KIND_MEMSET" in tables:
         SELECT T3.start, T3.end, -3 AS demangledName, T3.correlationId, T3.graphNodeId
         FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3"""
 query = f"""SELECT unified.start, unified.end, unified.demangledName,
-       R.start AS runtime_start, R.end AS runtime_end,
-       R.start AS capture_start, R.end AS capture_end
+       R.start AS runtime_start, R.start AS capture_start, R.end AS capture_end
 FROM ({unified_subquery}) AS unified
 JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
 WHERE unified.graphNodeId IS NULL"""
 if "CUDA_GRAPH_NODE_EVENTS" in tables:
     query += f""" UNION ALL
     SELECT unified.start, unified.end, unified.demangledName,
-           R.start AS runtime_start, R.end AS runtime_end,
-           CGE2.start AS capture_start, CGE2.end AS capture_end
+           R.start AS runtime_start, CGE2.start AS capture_start, CGE2.end AS capture_end
     FROM ({unified_subquery}) AS unified
     JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.graphNodeId IS NOT NULL AND
                                              unified.correlationId = R.correlationId
@@ -199,7 +195,6 @@ for (
     kernel_end,
     demangled_name,
     runtime_start,
-    runtime_end,
     capture_start,
     capture_end,
 ) in df.itertuples(index=False):
@@ -228,9 +223,7 @@ for (
                 kernel_end=kernel_end,
                 demangled_name=demangled_name,
                 runtime_start=runtime_start,
-                runtime_end=runtime_end,
                 capture_start=capture_start,
-                capture_end=capture_end,
             )
         )
 

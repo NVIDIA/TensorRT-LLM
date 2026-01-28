@@ -29,7 +29,6 @@ class LayerInfo(NamedTuple):
 
     start: int
     end: int
-    iter_idx: int
     layer_idx: int
 
 
@@ -139,7 +138,7 @@ for start, end, text in df.itertuples(index=False):
         if iter_idx < 0 or end > eager_iters[iter_idx].end:
             continue
         assert end <= eager_iters[iter_idx].end, "Not belong to any iter"
-        per_iter_eager_layers[iter_idx].append(LayerInfo(start, end, iter_idx, layer_idx))
+        per_iter_eager_layers[iter_idx].append(LayerInfo(start, end, layer_idx))
 layer_idx_list = [layer.layer_idx for layer in per_iter_eager_layers[0]]
 print("Layers (eager)", *layer_idx_list)
 for eager_layers in per_iter_eager_layers:
@@ -197,7 +196,7 @@ def query_kernels(conn: sqlite3.Connection, iters: list[IterInfo]) -> list[list[
             )
         )
     for kernels in per_iter_kernels:
-        kernels.sort()
+        kernels.sort(key=lambda k: (k.runtime_start, k.graph_node_id))
     return per_iter_kernels
 
 
