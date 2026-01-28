@@ -41,6 +41,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     EagleDecodingConfig,
+    KvCacheConfig,
     LoadFormat,
     SamplerType,
     TorchLlmArgs,
@@ -48,9 +49,9 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
 from ...._utils import get_free_port, mpi_rank, mpi_world_size
-from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import Distributed
+from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import (
@@ -67,7 +68,6 @@ from ...pyexecutor.scheduler import (
     ScheduledRequests,
     SimpleScheduler,
 )
-from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -80,44 +80,6 @@ class ReportingInfo:
     print_log: bool = False
     enable_iter_perf_stats: bool = False
     enable_iter_req_stats: bool = False
-
-
-class _CacheManagerWithFakePool(KVCacheManager):
-    """We use the default KVCacheManager but with a fake pool by setting head_dim=0.
-
-    The actual cache pools are managed by auto_deploy layerwise cache pools.
-    """
-
-    def __init__(
-        self,
-        kv_cache_config,
-        num_blocks: int,
-        tokens_per_block: int,
-        max_seq_len: int,
-        max_batch_size: int,
-    ):
-        self.num_blocks = num_blocks
-        super().__init__(
-            kv_cache_config=kv_cache_config,
-            kv_cache_type=CacheType.SELF,
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=0,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            mapping=Mapping(),
-        )
-
-    def calculate_max_num_blocks(
-        self, kv_cache_config, head_dim, tokens_per_block, mapping, dtype, kv_factor
-    ) -> Tuple[int, int]:
-        """Calculate the maximum number of blocks needed for the cache."""
-        # TODO: this is VERY hacky... Ideally, we want to compute the number of blocks
-        # just like in the original implementation. However, let's wait for the layer-wise attention
-        # implementation before over-optimizing the function here
-        ad_logger.info("Using fake cache manager with head_dim=0 and num pages:", self.num_blocks)
-        return self.num_blocks, 0
 
 
 class ADHiddenStateManager(Eagle3ResourceManager):
@@ -275,6 +237,7 @@ def construct_draft_llm_args(
 def create_draft_kv_cache_manager_maybe(
     draft_model_engine: Optional[PyTorchModelEngine],
     ad_config: LlmArgs,
+    kv_cache_config_tuned: KvCacheConfig,
     dist_mapping: Mapping,
 ) -> Optional[KVCacheManager]:
     if draft_model_engine is None or not draft_model_engine.model.model_config.is_generation:
@@ -287,8 +250,8 @@ def create_draft_kv_cache_manager_maybe(
         model_engine=draft_model_engine,
         kv_cache_manager_cls=kv_cache_manager_cls,
         mapping=dist_mapping,
-        kv_cache_config=ad_config.kv_cache_config,
-        tokens_per_block=ad_config.attn_page_size,
+        kv_cache_config=kv_cache_config_tuned,
+        tokens_per_block=kv_cache_config_tuned.tokens_per_block,
         max_seq_len=ad_config.max_seq_len,
         max_batch_size=ad_config.max_batch_size,
         spec_config=ad_config.speculative_config,
@@ -321,19 +284,33 @@ def _generate_dummy_request(
         ResourceManagerType.SPEC_RESOURCE_MANAGER
     )
 
-    # check if we have a free slot available and free page available
-    if not slot_manager.slot_manager.free_slots or kv_cache_manager.get_num_free_blocks() == 0:
+    # check if it's a hybrid kv-cache manager
+    is_hybrid_cache = isinstance(kv_cache_manager, MambaHybridCacheManager)
+
+    # check if we have a free page and free state available
+    if not kv_cache_manager.get_num_free_blocks():
+        return None
+    if is_hybrid_cache and not kv_cache_manager.mamba_cache_free_blocks:
         return None
 
     # generate a dummy request
     dummy_request = kv_cache_manager.add_dummy_requests([request_id], **request_kwargs)[0]
     dummy_request.is_cuda_graph_dummy = True
 
+    # generate a dummy scheduled requests object
+    dummy_scheduled_requests = ScheduledRequests()
+    dummy_scheduled_requests.generation_requests.append(dummy_request)
+
+    # if it's a hybrid kv-cache manager, we need to manually call prepare_resources again (not done
+    # in add_dummy_requests)
+    if is_hybrid_cache:
+        kv_cache_manager.prepare_resources(dummy_scheduled_requests)
+
     # add to spec resource manager
     if spec_res_mgr:
         spec_res_mgr.add_dummy_requests([request_id])
 
-    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9883 clean up this hack
+    # NOTE: hack to avoid blocking a slot for the dummy request
     dummy_request.seq_slot = slot_manager.get_max_resource_count()
     dummy_request.py_seq_slot = dummy_request.seq_slot
 
@@ -448,11 +425,6 @@ class ADEngine(ModelEngine):
     ):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
 
-        max_batch_size = ad_config.max_batch_size
-        max_seq_len = ad_config.max_seq_len
-        attn_page_size = ad_config.attn_page_size
-        max_num_tokens = ad_config.max_num_tokens
-
         # update device to contain the current default device if it's in cuda
         device = torch.device(ad_config.device)
         if device.type == "cuda" and device.index is None:
@@ -461,14 +433,17 @@ class ADEngine(ModelEngine):
 
         factory = ad_config.create_factory()
 
-        # initialize seq info object
-        seq_info = SequenceInfo(
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            page_size=attn_page_size,
-            max_num_tokens=max_num_tokens,
+        # Initialize CachedSequenceInterface - it will create SequenceInfo internally
+        # using tokens_per_block from kv_cache_config
+        cache_seq_interface = CachedSequenceInterface(
+            max_seq_len=ad_config.max_seq_len,
+            max_batch_size=ad_config.max_batch_size,
+            device=device,
+            kv_cache_config=ad_config.kv_cache_config,
+            max_num_tokens=ad_config.max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
         )
+
         reporting_info = ReportingInfo(
             print_log=False,
             enable_iter_perf_stats=ad_config.enable_iter_perf_stats,
@@ -483,8 +458,7 @@ class ADEngine(ModelEngine):
         # construct engine
         return cls(
             build_and_optimize,
-            seq_info,
-            device,
+            cache_seq_interface,
             ad_config=ad_config,
             mapping=mapping,
             dist=dist,
@@ -495,14 +469,21 @@ class ADEngine(ModelEngine):
     def __init__(
         self,
         get_inference_model: GetInferenceModel,
-        seq_info: SequenceInfo,
-        device: DeviceLikeType,
+        cache_seq_interface: CachedSequenceInterface,
         ad_config: Optional[LlmArgs] = None,
         mapping: Optional[Mapping] = None,
         dist: Optional[Distributed] = None,
         reporting_info: ReportingInfo = ReportingInfo(),
     ) -> None:
-        """Initialize the engine with model and sequence information."""
+        """Initialize the engine with model and CachedSequenceInterface.
+
+        Args:
+            get_inference_model: Callable that builds the inference model.
+            cache_seq_interface: The CachedSequenceInterface containing sequence and cache config.
+            ad_config: Optional LLM configuration.
+            mapping: Optional distributed mapping configuration.
+            reporting_info: Reporting configuration for logging.
+        """
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
         # This is not correctly declared in the base ModelEngine class though...
         self.llm_args = SimpleNamespace()
@@ -514,8 +495,8 @@ class ADEngine(ModelEngine):
         self.llm_args.batch_wait_timeout_ms = 0
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
-        self.llm_args.max_num_tokens = seq_info.max_num_tokens
-        self.llm_args.max_seq_len = seq_info.max_seq_len
+        self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
+        self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
 
@@ -546,13 +527,10 @@ class ADEngine(ModelEngine):
         )
 
         # For compatibility with PyTorchModelEngine utilities
-        self.batch_size = seq_info.max_batch_size
+        self.batch_size = cache_seq_interface.info.max_batch_size
 
-        # construct cache sequence interface
-        self.cache_seq_interface = CachedSequenceInterface(
-            sequence_info=seq_info,
-            device=device,
-        )
+        # Store the cache sequence interface
+        self.cache_seq_interface = cache_seq_interface
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
@@ -628,11 +606,17 @@ class ADEngine(ModelEngine):
         # gather indices for logits
         logits_gather_indices: List[int] = []
 
-        page_size = self.cache_seq_interface.info.page_size
+        page_size = kv_cache_manager.tokens_per_block
         dummy_token = -1
         num_ctx_requests = len(context_requests)
         num_ctx_tokens = 0
         num_generation_tokens = 0
+
+        # Helper to get slot index - use mamba_cache_index if available (MambaHybridCacheManager)
+        def _get_slot_idx(request) -> int:
+            if hasattr(kv_cache_manager, "mamba_cache_index"):
+                return kv_cache_manager.mamba_cache_index[request.py_request_id]
+            return request.seq_slot
 
         # look at context requests first
         for request in context_requests:
@@ -669,8 +653,8 @@ class ADEngine(ModelEngine):
 
             position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
 
-            # store seq slot idx
-            slot_idx.append(request.seq_slot)
+            # store seq slot idx (use mamba_cache_index if available)
+            slot_idx.append(_get_slot_idx(request))
             use_initial_states.append(input_pos[-1] > 0)
 
             # store extra arguments
@@ -749,7 +733,8 @@ class ADEngine(ModelEngine):
 
             num_generation_tokens += 1 + get_draft_token_length(request)
             request.py_batch_idx = request.seq_slot
-            slot_idx.append(request.seq_slot)
+            # store seq slot idx (use mamba_cache_index if available)
+            slot_idx.append(_get_slot_idx(request))
             use_initial_states.append(input_pos[-1] > 0)
 
             seq_len.append(len(input_ids[-1]))
@@ -941,11 +926,11 @@ def create_draft_model_engine_maybe(
 
     draft_spec_config = copy.copy(spec_config)
 
-    kv_cache_config = ad_config.kv_cache_config
+    kv_cache_config_tuned = target_engine.cache_seq_interface.kv_cache_config_tuned
 
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=ad_config.enable_chunked_prefill,
-        cache_reuse=kv_cache_config.enable_block_reuse,
+        cache_reuse=kv_cache_config_tuned.enable_block_reuse,
         has_speculative_draft_tokens=has_spec_drafter,
         chunk_size=target_engine.llm_args.max_num_tokens,
     )
@@ -1108,40 +1093,15 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         else None
     )
 
-    # check kvcache config for partial block reuse
-    # TODO: copy_on_partial_reuse is not supported yet, see
-    # https://github.com/NVIDIA/TensorRT-LLM/issues/7142 for more details.
-    enable_block_reuse = ad_config.kv_cache_config.enable_block_reuse
-    enable_partial_reuse = ad_config.kv_cache_config.enable_partial_reuse
-    copy_on_partial_reuse = ad_config.kv_cache_config.copy_on_partial_reuse
-    if enable_block_reuse and enable_partial_reuse and copy_on_partial_reuse:
-        raise RuntimeError(
-            f"partial block reuse with {copy_on_partial_reuse=} set to True is NOT supported"
-            " in AutoDeploy. Please set it to False via the kv_cache_config.copy_on_partial_reuse "
-            "field in tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs."
-        )
-
-    # TODO: detect whether SSM layer is present in the model and raise an error or disable block
-    # reuse with a warning --> see https://github.com/NVIDIA/TensorRT-LLM/issues/7142. For now, we
-    # just emit a general warning.
-    if enable_block_reuse:
-        ad_logger.warning(
-            f"{enable_block_reuse=} is enabled. Note that this is not supported for SSM layers and"
-            " may lead to incorrect results if the model contains SSM layers."
-        )
-
     # resource managers
-    kv_cache_manager = _CacheManagerWithFakePool(
-        ad_config.kv_cache_config,
-        num_blocks=engine.cache_seq_interface.info.num_pages,
-        tokens_per_block=ad_config.attn_page_size,
-        max_seq_len=ad_config.max_seq_len,
-        max_batch_size=ad_config.max_batch_size,
-    )
+    # KVCacheManager is now created and managed by CachedSequenceInterface during the
+    # initialize_cache/resize_kv_cache transform pipeline. Get it from the interface.
+    kv_cache_manager = engine.cache_seq_interface.kv_cache_manager
+    kv_cache_config_tuned = engine.cache_seq_interface.kv_cache_config_tuned
     seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
 
     draft_kv_cache_manager = create_draft_kv_cache_manager_maybe(
-        draft_model_engine, ad_config, dist_mapping
+        draft_model_engine, ad_config, kv_cache_config_tuned, dist_mapping
     )
 
     resource_manager = ResourceManager(
@@ -1160,7 +1120,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
 
     # Chunked prefill
     if ad_config.enable_chunked_prefill:
-        chunk_unit_size = ad_config.attn_page_size
+        chunk_unit_size = kv_cache_config_tuned.tokens_per_block
         chunking_policy = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
         ctx_chunk_config: Tuple[StrEnum, int] = (chunking_policy, chunk_unit_size)
     else:

@@ -427,6 +427,8 @@ class GenerationResultBase:
                     ctx_request_id=context_phase_params.req_id,
                     opaque_state=context_phase_params.opaque_state,
                     draft_tokens=context_phase_params.draft_tokens,
+                    ctx_dp_rank=context_phase_params.ctx_dp_rank,
+                    ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     multimodal_embedding_handles=None,
                 )
 

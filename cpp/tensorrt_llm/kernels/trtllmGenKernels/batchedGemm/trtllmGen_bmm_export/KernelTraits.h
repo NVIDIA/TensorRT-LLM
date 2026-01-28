@@ -565,13 +565,13 @@ public:
 
 public:
     // The MMA kind.
-    tg::MmaKind mMmaKind;
+    tg::MmaKind mMmaKind{};
     // Whether fuse Utccp into the MMA task.
-    bool mFuseUtccpWithUtcmma;
+    bool mFuseUtccpWithUtcmma{};
     // Whether use the max TMEM overlap trick.
-    bool mUseMaxTmemOverlap;
+    bool mUseMaxTmemOverlap{};
     // The number of epilogue warps.
-    int32_t mNumEpilogueWarps;
+    int32_t mNumEpilogueWarps{};
     // Helper for SMEM allocation.
     MemAllocatorHelper mSmemAllocatorHelper;
     // Helper for TMEM allocation.

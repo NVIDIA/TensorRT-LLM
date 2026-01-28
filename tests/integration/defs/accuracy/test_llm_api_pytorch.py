@@ -5324,6 +5324,7 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
                                            max_tokens=16384)
 
     @skip_pre_hopper
+    @pytest.mark.timeout(7200)
     @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)

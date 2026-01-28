@@ -548,7 +548,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
 
 def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312")
 {
-    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
@@ -912,7 +912,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
 
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
 {
-    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
     // Create a unique suffix for the job name

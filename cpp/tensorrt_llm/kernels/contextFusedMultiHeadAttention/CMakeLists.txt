@@ -19,42 +19,56 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 list(FILTER SRC_CU EXCLUDE REGEX "fmha_v2_cu/.*")
 
-filter_cuda_archs("80" SRC_CPP)
-filter_cuda_archs("86" SRC_CPP)
-filter_cuda_archs("89" SRC_CPP)
-filter_cuda_archs("90" SRC_CPP)
-filter_cuda_archs("100" SRC_CPP)
-filter_cuda_archs("120" SRC_CPP)
+add_library(context_attention_src OBJECT)
 
-add_library(context_attention_src OBJECT ${SRC_CPP} ${SRC_CU})
+filter_source_cuda_architectures(
+  SOURCE_LIST SRC_CPP
+  ARCHS 80 86 89 90 100 120
+  TARGET context_attention_src
+  IMPLICIT_FAMILY)
+
+target_sources(context_attention_src PRIVATE ${SRC_CPP} ${SRC_CU})
 target_compile_definitions(context_attention_src PRIVATE USE_DEMO_BERT_PARAMS=1
                                                          GENERATE_CUBIN=1)
 set_target_properties(
   context_attention_src PROPERTIES POSITION_INDEPENDENT_CODE ON
                                    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_link_libraries(context_attention_src PUBLIC trtllm_gen_fmha_interface)
 
 foreach(arch IN ITEMS 80 86 89 90 100 120)
-  if("${arch}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-    file(GLOB arch_files "fmha_v2_cu/*_sm${arch}.cu")
-    if(arch_files)
-      set(TARGET_NAME _context_attention_kernels_${arch})
-      add_library(${TARGET_NAME} OBJECT ${arch_files})
-      target_compile_definitions(${TARGET_NAME} PRIVATE USE_DEMO_BERT_PARAMS=1
-                                                        GENERATE_CUBIN=1)
-      set_target_properties(
-        ${TARGET_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON
-                                  CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-      target_include_directories(
-        ${TARGET_NAME}
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/src/
-                ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/generated/)
-      if(${arch} GREATER_EQUAL 100)
-        set_cuda_architectures(${TARGET_NAME} "${arch}f")
-      else()
-        set_cuda_architectures(${TARGET_NAME} ${arch})
-      endif()
-      target_sources(context_attention_src
-                     PUBLIC $<TARGET_OBJECTS:${TARGET_NAME}>)
+  set(ARCH_ENABLED FALSE)
+  set(TARGET_ARCH "")
+  if(${arch} GREATER_EQUAL ${CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY})
+    if("${arch}f" IN_LIST CMAKE_CUDA_ARCHITECTURES_FAMILIES)
+      set(ARCH_ENABLED TRUE)
+      set(TARGET_ARCH "${arch}f")
     endif()
+  else()
+    if("${arch}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      set(ARCH_ENABLED TRUE)
+      set(TARGET_ARCH "${arch}")
+    endif()
+  endif()
+
+  if(NOT ${ARCH_ENABLED})
+    continue()
+  endif()
+
+  file(GLOB arch_files "fmha_v2_cu/*_sm${arch}.cu")
+  if(arch_files)
+    set(TARGET_NAME _context_attention_kernels_${arch})
+    add_library(${TARGET_NAME} OBJECT ${arch_files})
+    target_compile_definitions(${TARGET_NAME} PRIVATE USE_DEMO_BERT_PARAMS=1
+                                                      GENERATE_CUBIN=1)
+    set_target_properties(
+      ${TARGET_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    target_include_directories(
+      ${TARGET_NAME}
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/src/
+              ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/generated/)
+    set_cuda_architectures(${TARGET_NAME} ${TARGET_ARCH})
+    target_sources(context_attention_src
+                   PUBLIC $<TARGET_OBJECTS:${TARGET_NAME}>)
   endif()
 endforeach()

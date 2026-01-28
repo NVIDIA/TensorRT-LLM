@@ -27,11 +27,12 @@ set(SRC_CU_EXTRA)
 list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/.*")
 add_subdirectory(decoderXQAImplJIT/nvrtcWrapper)
 
-filter_cuda_archs("80" SRC_CPP)
-filter_cuda_archs("86" SRC_CPP)
-filter_cuda_archs("89" SRC_CPP)
-filter_cuda_archs("90" SRC_CPP)
-filter_cuda_archs("120" SRC_CPP)
+add_library(decoder_attention_src OBJECT)
+filter_source_cuda_architectures(
+  SOURCE_LIST SRC_CPP
+  ARCHS 80 86 89 90 120
+  TARGET decoder_attention_src
+  IMPLICIT_FAMILY)
 
 set(basic_heads 32 64 128)
 foreach(HEAD ${basic_heads})
@@ -64,7 +65,7 @@ foreach(HEAD ${extra_heads})
 endforeach()
 
 if(NOT WIN32)
-  add_library(decoder_attention_src OBJECT ${SRC_CPP})
+  target_sources(decoder_attention_src PRIVATE ${SRC_CPP})
 
   # Split some sources to shared library for Linux
   add_library(${DECODER_SHARED_TARGET_0} SHARED ${SRC_CU})
@@ -78,10 +79,12 @@ if(NOT WIN32)
   set_property(TARGET ${DECODER_SHARED_TARGET_1}
                PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 else()
-  add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU} ${SRC_CU_EXTRA})
+  target_sources(decoder_attention_src PRIVATE ${SRC_CPP} ${SRC_CU}
+                                               ${SRC_CU_EXTRA})
 endif()
 
-target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src)
+target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src
+                                                   trtllm_gen_fmha_interface)
 set_property(TARGET decoder_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET decoder_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
                                                    ON)

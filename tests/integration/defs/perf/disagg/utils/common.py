@@ -12,7 +12,14 @@ GPU_RESOURCE_CONFIG = {
         "lock_freq_graphics_mhz": 2062,  # GPU graphics clock lock frequency (MHz)
         "lock_freq_memory_mhz": 3996,  # GPU memory clock lock frequency (MHz)
     },
-    # OCI GB300
+    # Lyris GB200
+    "GB200_LYRIS": {
+        "slurm_extra_args": "",  # GB200 does not require extra args
+        "set_segment": True,
+        "lock_freq_graphics_mhz": None,  # TODO: Set GB200 lock frequency
+        "lock_freq_memory_mhz": None,
+    },
+    # Lyris GB300
     "GB300": {
         "slurm_extra_args": "",  # GB300 does not require extra args
         "set_segment": True,
@@ -120,6 +127,10 @@ class EnvManager:
     @staticmethod
     def get_dataset_dir() -> str:
         return os.getenv("DATASET_DIR", "<Your dataset directory>")
+
+    @staticmethod
+    def get_hf_home_dir() -> str:
+        return os.getenv("HF_HOME_DIR", "<Your HF home directory>")
 
     @staticmethod
     def get_output_path() -> str:

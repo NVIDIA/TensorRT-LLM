@@ -576,7 +576,6 @@ class PerfTestConfig:
         extra: bool = False,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-opt",
-        free_mem_ratio: float = 0.9,
         extra_runtime: str = "trtllm",
         skip_loading_weights: bool = False,
     ):
@@ -636,7 +635,6 @@ class PerfTestConfig:
         self.extra = extra
         # _autodeploy backend specific parameters
         self.ad_compile_backend = ad_compile_backend
-        self.free_mem_ratio = free_mem_ratio
         self.extra_runtime = extra_runtime
         self.skip_loading_weights = skip_loading_weights
         # Just build engines
@@ -1421,9 +1419,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 'transforms': {
                     'compile_model': {
                         'backend': self._config.ad_compile_backend
-                    },
-                    'resize_kv_cache': {
-                        'free_mem_ratio': self._config.free_mem_ratio
                     },
                 },
                 'runtime': self._config.extra_runtime,

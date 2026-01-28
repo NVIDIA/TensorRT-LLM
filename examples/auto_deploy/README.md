@@ -49,7 +49,6 @@ Below is a non-exhaustive list of common configuration options:
 | `--args.mla-backend` | Specifies implementation for multi-head latent attention |
 | `--args.max-seq-len` | Maximum sequence length for inference/cache |
 | `--args.max-batch-size` | Maximum dimension for statically allocated KV cache |
-| `--args.attn-page-size` | Page size for attention |
 | `--prompt.batch-size` | Number of queries to generate |
 | `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
@@ -125,10 +124,8 @@ llm = LLM(
     compile_backend="torch-compile",
     model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
     attn_backend="flashinfer", # choose between "triton" and "flashinfer"
-    attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
     skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory
-    free_mem_ratio=0.8, # fraction of available memory for cache
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,
 )
