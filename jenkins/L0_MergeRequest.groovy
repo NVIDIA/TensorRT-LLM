@@ -53,16 +53,14 @@ def getContainerURIs()
 }
 
 // Stage choices
-@Field String STAGE_CHOICE_NORMAL = "normal"
-@Field String STAGE_CHOICE_SKIP = "skip"
-@Field String STAGE_CHOICE_IGNORE = "ignore"
+STAGE_CHOICE_NORMAL = "normal"
+STAGE_CHOICE_SKIP = "skip"
+STAGE_CHOICE_IGNORE = "ignore"
 
-// Note: These variables access 'env' which is only available during pipeline execution
 RELESE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
 X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
 SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
 
-@Field
 def gitlabParamsFromBot = [:]
 
 if (env.gitlabTriggerPhrase)
@@ -158,19 +156,18 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def TARGET_BRANCH = "target_branch"
 @Field
 def DOWNSTREAM_JOB_DURATION = "downstream_job_duration"
+def globalVars = [
+    (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
+    (IMAGE_KEY_TO_TAG): [:],
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
+    (DOWNSTREAM_JOB_DURATION): [:],
+]
 
-// ========================================
-// GitHub Tag Update Configuration
-// ========================================
-// Jobs whose failures should NOT prevent GitHub tag updates
 @Field
 def IGNORED_JOBS_FOR_TAG = ["BuildDockerImages"]
 
-// Required pre-merge jobs and their minimum execution durations (minutes, excludes queue time)
-// For tag update to proceed:
-// 1. ALL jobs listed here MUST have been executed
-// 2. Each job MUST have run for at least the specified duration
-// If any job is missing or ran too quickly (startup failure), tag update is blocked
 @Field
 def MIN_JOB_DURATIONS = [
     "Build-x86_64": 10,
@@ -179,15 +176,6 @@ def MIN_JOB_DURATIONS = [
     "Test-x86_64-Multi-GPU": 50,
     "Test-SBSA-Single-GPU": 40,
     "Test-SBSA-Multi-GPU": 40,
-]
-
-def globalVars = [
-    (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
-    (CACHED_CHANGED_FILE_LIST): null,
-    (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
-    (IMAGE_KEY_TO_TAG): [:],
-    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
-    (DOWNSTREAM_JOB_DURATION): [:],
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
