@@ -376,7 +376,7 @@ class SpecWorkerBase(nn.Module, ABC):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
-        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.0"
+        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.3"
         self.seed = 0
         self.offset = 0
 
