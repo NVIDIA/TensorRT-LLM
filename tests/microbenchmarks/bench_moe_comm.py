@@ -731,8 +731,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Make sure ranks don't accidentally serialize execution.
-    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     # Opt-in to DeepEP backends by default. This does not override an explicit user setting.
     os.environ.setdefault("TRTLLM_CAN_USE_DEEP_EP", "1")
     main()
