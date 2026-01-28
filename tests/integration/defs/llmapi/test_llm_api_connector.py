@@ -453,6 +453,8 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     BLOCK_SIZE = 32
     NUM_INPUT_TOKENS = 64  # 2 blocks
     NUM_TOKENS = 4
+    HIGH_PRIORITY = 80  # For system prompt blocks
+    LOW_PRIORITY = 10  # For user input / decode blocks
 
     model_fn, scheduler, worker = model_with_connector
 
@@ -462,22 +464,22 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     worker.get_finished.return_value = [], []
 
     # Create retention config with different priorities for different token ranges:
-    # - First 32 tokens (block 0): priority 80 (high priority, e.g., system prompt)
-    # - Remaining tokens (block 1+): priority 10 (low priority, e.g., user input)
+    # - First 32 tokens (block 0): high priority (e.g., system prompt)
+    # - Remaining tokens (block 1+): low priority (e.g., user input)
     retention_config = KvCacheRetentionConfig(
         token_range_retention_priorities=[
             KvCacheRetentionConfig.TokenRangeRetentionConfig(
                 token_start=0,
                 token_end=32,
-                priority=80,
+                priority=HIGH_PRIORITY,
             ),
             KvCacheRetentionConfig.TokenRangeRetentionConfig(
                 token_start=32,
                 token_end=None,  # Extend to end of sequence
-                priority=10,
+                priority=LOW_PRIORITY,
             ),
         ],
-        decode_retention_priority=10,
+        decode_retention_priority=LOW_PRIORITY,
     )
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
@@ -504,11 +506,11 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     assert request.priorities is not None
     assert len(request.priorities) == len(request.new_block_ids)
 
-    # First block should have priority 80, second block should have priority 10
+    # First block should have high priority, second block should have low priority
     assert request.priorities[
-        0] == 80, f"Expected priority 80 for block 0, got {request.priorities[0]}"
+        0] == HIGH_PRIORITY, f"Expected priority {HIGH_PRIORITY} for block 0, got {request.priorities[0]}"
     assert request.priorities[
-        1] == 10, f"Expected priority 10 for block 1, got {request.priorities[1]}"
+        1] == LOW_PRIORITY, f"Expected priority {LOW_PRIORITY} for block 1, got {request.priorities[1]}"
 
 
 @pytest.mark.threadleak(enabled=False)
