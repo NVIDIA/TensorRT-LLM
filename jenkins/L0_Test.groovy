@@ -1838,9 +1838,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     - name: sc-trt-llm-data
                       mountPath: ${sc_trt_llm_data_mount_path}
                       readOnly: true
-                    - name: austin-trt-llm-data
-                      mountPath: ${austin_trt_llm_data_mount_path}
-                      readOnly: true
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
                       readOnly: false
@@ -1870,12 +1867,13 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                   nfs:
                     server: 10.117.145.14
                     path: /vol/scratch1/scratch.michaeln_blossom
+    """
+    /*
                 - name: austin-trt-llm-data
                   nfs:
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
-    """
-    /*            - name: pdx-trt-llm-data
+                - name: pdx-trt-llm-data
                   nfs:
                     server: ipp6-cdot01-fcache01
                     path: /vol/fcscratch1/scratch.michaeln_blossom
