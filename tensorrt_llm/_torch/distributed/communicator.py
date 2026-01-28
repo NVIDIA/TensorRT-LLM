@@ -494,8 +494,6 @@ class MPIDist(Distributed):
     def tp_comm(self):
         if self._tp_comm is None:
             mapping = self.mapping
-            if mapping.has_cp_helix():
-                mapping = mapping.repurpose_helix_cp_to_tp()
             new_group = mpi_comm().group.Incl(mapping.tp_group)
             self._tp_comm = mpi_comm().Create_group(new_group)
         return self._tp_comm
@@ -504,8 +502,6 @@ class MPIDist(Distributed):
     def pp_comm(self):
         if self._pp_comm is None:
             mapping = self.mapping
-            if mapping.has_cp_helix():
-                mapping = mapping.repurpose_helix_cp_to_tp()
             new_group = mpi_comm().group.Incl(mapping.pp_group)
             self._pp_comm = mpi_comm().Create_group(new_group)
         return self._pp_comm
