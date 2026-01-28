@@ -1308,7 +1308,8 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_num_tokens()
 
     def _release_cuda_graphs(self):
-        self.cuda_graph_runner.clear()
+        if self.cuda_graph_runner is not None:
+            self.cuda_graph_runner.clear()
 
     def get_max_num_sequences(self) -> int:
         """
