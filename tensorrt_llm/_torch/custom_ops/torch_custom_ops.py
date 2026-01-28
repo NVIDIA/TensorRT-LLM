@@ -1970,3 +1970,142 @@ def _(
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight_fp4.size(0)),
                              dtype=output_dtype)
+
+
+class QuantizeE4M3PerTensorRunner(TunableRunner):
+    """
+    Runner for FP8 E4M3 per-tensor quantization with auto-tuning between backends.
+
+    Supports two backends:
+    - "trtllm": TensorRT-LLM's native implementation
+    - "te": Transformer Engine's implementation
+    """
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, -2, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        tune_max_num_tokens=8192,
+    )
+
+    # Lazy init for TE to avoid import errors if not installed
+    _te_available = None
+    _te_quantizer = None
+
+    def __init__(self):
+        super().__init__()
+
+    @classmethod
+    def _check_te_available(cls):
+        """Check if Transformer Engine is available (cached)."""
+        if cls._te_available is None:
+            try:
+                import transformer_engine_torch as tex
+                from transformer_engine.pytorch.tensor.float8_tensor import \
+                    Float8CurrentScalingQuantizer
+                cls._te_available = True
+                # Initialize quantizer once
+                cls._te_quantizer = Float8CurrentScalingQuantizer(
+                    fp8_dtype=tex.DType.kFloat8E4M3, device="cuda")
+            except ImportError:
+                cls._te_available = False
+                logger.warning(
+                    "Transformer Engine not available. Only TRTLLM backend will be used for FP8 quantization."
+                )
+        return cls._te_available
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        """Return list of available backend indices."""
+        tactics = ["trtllm"]
+
+        if self._check_te_available():
+            tactics.append("te")
+
+        return tactics
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: str = "trtllm") -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with backend selection.
+
+        Args:
+            inputs: [input_tensor]
+            tactic: "trtllm" or "te"
+
+        Returns:
+            (quantized_tensor, scale)
+        """
+        input_tensor = inputs[0]
+
+        # Call the appropriate backend
+        if tactic == "te":
+            return self._quantize_te(input_tensor)
+        else:
+            return self._quantize_trtllm(input_tensor)
+
+    def _quantize_trtllm(
+            self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """TensorRT-LLM backend."""
+        return torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(input)
+
+    def _quantize_te(self,
+                     input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Transformer Engine backend."""
+        # Ensure TE is initialized
+        if not self._check_te_available():
+            raise RuntimeError("Transformer Engine is not available")
+
+        # Use cached quantizer
+        fp8_tensor = self.__class__._te_quantizer.quantize(input)
+
+        # Extract data and scale from TE's Float8Tensor
+        # TE stores data as uint8, need to view as float8_e4m3fn
+        quantized_data = fp8_tensor._data.view(torch.float8_e4m3fn)
+
+        scale_shape = [1] * input.dim()
+        scale = fp8_tensor._scale_inv.to(input.dtype).reshape(scale_shape)
+
+        return quantized_data, scale
+
+
+@torch.library.custom_op("trtllm::quantize_e4m3_per_tensor", mutates_args=())
+def quantize_e4m3_per_tensor(
+    input: torch.Tensor, ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    FP8 E4M3 per-tensor quantization with automatic backend selection.
+
+    Args:
+        input: Input tensor to quantize
+
+    Returns:
+        (quantized_tensor, scale): Quantized FP8 tensor and per-tensor scale
+
+    Note:
+        - AutoTuner will profile all backends and select the faster one
+        - Results are cached per input shape for zero-overhead selection
+        - Must be called within autotune() context for initial profiling
+    """
+    tuner = AutoTuner.get()
+
+    quantize_runner = QuantizeE4M3PerTensorRunner()
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::quantize_e4m3_per_tensor",
+        [quantize_runner],
+        QuantizeE4M3PerTensorRunner.tuning_config,
+        [input],
+    )
+
+    return quantize_runner(inputs=[input], tactic=best_tactic)
+
+
+@quantize_e4m3_per_tensor.register_fake
+def _(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for torch.compile."""
+    scale_shape = [1] * input.dim()
+    return (
+        input.new_empty(input.shape, dtype=torch.float8_e4m3fn),
+        input.new_empty(scale_shape, dtype=input.dtype),
+    )
