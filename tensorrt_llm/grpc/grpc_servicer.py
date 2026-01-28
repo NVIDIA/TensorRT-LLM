@@ -22,10 +22,11 @@ with external routers (e.g., sgl-router) using pre-tokenized input.
 import asyncio
 import time
 from collections.abc import AsyncGenerator
-from typing import List
+from typing import List, Union
 
 import grpc
 
+from tensorrt_llm.executor.result import Logprob, TokenLogprobs
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
@@ -201,7 +202,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             HealthCheckResponse protobuf
         """
         is_healthy, message = await self.request_manager.health_check()
-        logger.debug(f"HealthCheck: healthy={is_healthy}, message={message}")
+        logger.info(f"HealthCheck: healthy={is_healthy}, message={message}")
 
         return trtllm_service_pb2.HealthCheckResponse(
             status=message,
@@ -304,6 +305,61 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
 
     # ========== Helper methods ==========
 
+    def _convert_logprobs_to_proto(
+        self,
+        token_ids: List[int],
+        logprobs: Union[TokenLogprobs, List[float], None],
+    ) -> List[trtllm_service_pb2.TokenLogprob]:
+        """Convert TRT-LLM logprobs to protobuf TokenLogprob messages.
+
+        Handles both formats:
+        - List[float]: Simple logprobs (one per token)
+        - TokenLogprobs (list[dict[int, Logprob]]): Top-k logprobs per position
+
+        Args:
+            token_ids: The sampled token IDs
+            logprobs: Logprobs from TRT-LLM (can be List[float] or TokenLogprobs)
+
+        Returns:
+            List of TokenLogprob proto messages
+        """
+        if not logprobs or not token_ids:
+            return []
+
+        result = []
+        for i, token_id in enumerate(token_ids):
+            if i >= len(logprobs):
+                break
+
+            lp = logprobs[i]
+
+            if isinstance(lp, dict):
+                # TokenLogprobs format: dict[int, Logprob]
+                # Each entry maps token_id -> Logprob(logprob, rank)
+                token_logprob = trtllm_service_pb2.TokenLogprob(
+                    token_id=token_id,
+                    logprob=lp[token_id].logprob if token_id in lp else 0.0,
+                )
+                # Add top logprobs (all entries in the dict)
+                for tid, logprob_obj in lp.items():
+                    if isinstance(logprob_obj, Logprob):
+                        token_logprob.top_logprobs.append(
+                            trtllm_service_pb2.TopLogprob(
+                                token_id=tid,
+                                logprob=logprob_obj.logprob,
+                            )
+                        )
+                result.append(token_logprob)
+            elif isinstance(lp, (int, float)):
+                # Simple float logprob
+                token_logprob = trtllm_service_pb2.TokenLogprob(
+                    token_id=token_id,
+                    logprob=float(lp),
+                )
+                result.append(token_logprob)
+
+        return result
+
     def _chunk_responses(
         self,
         request_id: str,
@@ -369,14 +425,12 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             )
 
             # Add logprobs if available
-            if completion.logprobs_diff:
-                for lp in completion.logprobs_diff:
-                    if isinstance(lp, dict):
-                        token_logprob = trtllm_service_pb2.TokenLogprob(
-                            token_id=lp.get("token_id", 0),
-                            logprob=lp.get("logprob", 0.0),
-                        )
-                        chunk.logprobs.append(token_logprob)
+            # Note: We compute delta logprobs ourselves since logprobs_diff has same issue as token_ids_diff
+            if completion.logprobs:
+                all_logprobs = completion.logprobs
+                delta_logprobs = all_logprobs[sent_count:] if sent_count < len(all_logprobs) else []
+                proto_logprobs = self._convert_logprobs_to_proto(delta_tokens, delta_logprobs)
+                chunk.logprobs.extend(proto_logprobs)
 
             responses.append(
                 trtllm_service_pb2.GenerateResponse(
@@ -441,25 +495,18 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             if hasattr(completion, "stop_reason") and completion.stop_reason:
                 complete.stop_reason = str(completion.stop_reason)
 
-            # Add logprobs if available
+            # Add generation logprobs if available
             if completion.logprobs:
-                for lp in completion.logprobs:
-                    if isinstance(lp, dict):
-                        token_logprob = trtllm_service_pb2.TokenLogprob(
-                            token_id=lp.get("token_id", 0),
-                            logprob=lp.get("logprob", 0.0),
-                        )
-                        complete.logprobs.append(token_logprob)
+                proto_logprobs = self._convert_logprobs_to_proto(output_tokens, completion.logprobs)
+                complete.logprobs.extend(proto_logprobs)
 
             # Add prompt logprobs if available
             if hasattr(completion, "prompt_logprobs") and completion.prompt_logprobs:
-                for lp in completion.prompt_logprobs:
-                    if isinstance(lp, dict):
-                        token_logprob = trtllm_service_pb2.TokenLogprob(
-                            token_id=lp.get("token_id", 0),
-                            logprob=lp.get("logprob", 0.0),
-                        )
-                        complete.prompt_logprobs.append(token_logprob)
+                # For prompt logprobs, we use the prompt_token_ids
+                proto_prompt_logprobs = self._convert_logprobs_to_proto(
+                    prompt_token_ids, completion.prompt_logprobs
+                )
+                complete.prompt_logprobs.extend(proto_prompt_logprobs)
 
             responses.append(
                 trtllm_service_pb2.GenerateResponse(
