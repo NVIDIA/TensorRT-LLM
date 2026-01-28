@@ -20,8 +20,7 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 @Field String BOT_REVISION = "master"
 @Field String BOT_ROOT = "bot"
 
-// LLM repository configuration
-@Field String SCAN_REPO
+// Scan repository configuration
 withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
     SCAN_REPO = "${DEFAULT_SCAN_REPO}"
 }
