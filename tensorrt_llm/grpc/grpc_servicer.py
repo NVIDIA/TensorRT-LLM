@@ -140,9 +140,12 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                     ):
                         yield chunk_response
 
-                # Send complete response when finished
+                # Send complete responses when finished (one per sequence for n>1)
                 if gen_result.finished:
-                    yield self._complete_response(request_id, gen_result, prompt_token_ids)
+                    for complete_response in self._complete_responses(
+                        request_id, gen_result, prompt_token_ids
+                    ):
+                        yield complete_response
 
         except asyncio.CancelledError:
             logger.info(f"Request {request_id} cancelled")
@@ -371,13 +374,15 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
 
         return responses
 
-    def _complete_response(
+    def _complete_responses(
         self,
         request_id: str,
         gen_result,
         prompt_token_ids: list,
-    ) -> trtllm_service_pb2.GenerateResponse:
-        """Build a final completion response from GenerationResult.
+    ) -> List[trtllm_service_pb2.GenerateResponse]:
+        """Build final completion responses from GenerationResult.
+
+        For n>1, returns one response per output sequence.
 
         Args:
             request_id: The request ID
@@ -385,63 +390,72 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             prompt_token_ids: Original prompt tokens
 
         Returns:
-            GenerateResponse with complete field set
+            List of GenerateResponse with complete field set (one per output)
         """
-        # Get first output (for n=1)
-        completion = gen_result.outputs[0] if gen_result.outputs else None
+        responses = []
+        cached_tokens = gen_result.cached_tokens if hasattr(gen_result, "cached_tokens") else 0
 
-        if completion is None:
-            return trtllm_service_pb2.GenerateResponse(
-                request_id=request_id,
-                complete=trtllm_service_pb2.GenerateComplete(
-                    output_token_ids=[],
-                    finish_reason="error",
-                    prompt_tokens=len(prompt_token_ids),
-                    completion_tokens=0,
-                    cached_tokens=0,
-                ),
+        if not gen_result.outputs:
+            # No outputs, return error response
+            responses.append(
+                trtllm_service_pb2.GenerateResponse(
+                    request_id=request_id,
+                    complete=trtllm_service_pb2.GenerateComplete(
+                        output_token_ids=[],
+                        finish_reason="error",
+                        prompt_tokens=len(prompt_token_ids),
+                        completion_tokens=0,
+                        cached_tokens=0,
+                    ),
+                )
+            )
+            return responses
+
+        # Process all outputs (for n>1 support)
+        for completion in gen_result.outputs:
+            output_tokens = list(completion.token_ids) if completion.token_ids else []
+
+            complete = trtllm_service_pb2.GenerateComplete(
+                output_token_ids=output_tokens,
+                sequence_index=completion.index,
+                finish_reason=completion.finish_reason or "stop",
+                prompt_tokens=len(prompt_token_ids),
+                completion_tokens=len(output_tokens),
+                cached_tokens=cached_tokens,
             )
 
-        # Get all output tokens
-        output_tokens = list(completion.token_ids) if completion.token_ids else []
+            # Add stop reason if available
+            if hasattr(completion, "stop_reason") and completion.stop_reason:
+                complete.stop_reason = str(completion.stop_reason)
 
-        complete = trtllm_service_pb2.GenerateComplete(
-            output_token_ids=output_tokens,
-            sequence_index=completion.index,
-            finish_reason=completion.finish_reason or "stop",
-            prompt_tokens=len(prompt_token_ids),
-            completion_tokens=len(output_tokens),
-            cached_tokens=gen_result.cached_tokens if hasattr(gen_result, "cached_tokens") else 0,
-        )
+            # Add logprobs if available
+            if completion.logprobs:
+                for lp in completion.logprobs:
+                    if isinstance(lp, dict):
+                        token_logprob = trtllm_service_pb2.TokenLogprob(
+                            token_id=lp.get("token_id", 0),
+                            logprob=lp.get("logprob", 0.0),
+                        )
+                        complete.logprobs.append(token_logprob)
 
-        # Add stop reason if available
-        if hasattr(completion, "stop_reason") and completion.stop_reason:
-            complete.stop_reason = str(completion.stop_reason)
+            # Add prompt logprobs if available
+            if hasattr(completion, "prompt_logprobs") and completion.prompt_logprobs:
+                for lp in completion.prompt_logprobs:
+                    if isinstance(lp, dict):
+                        token_logprob = trtllm_service_pb2.TokenLogprob(
+                            token_id=lp.get("token_id", 0),
+                            logprob=lp.get("logprob", 0.0),
+                        )
+                        complete.prompt_logprobs.append(token_logprob)
 
-        # Add logprobs if available
-        if completion.logprobs:
-            for lp in completion.logprobs:
-                if isinstance(lp, dict):
-                    token_logprob = trtllm_service_pb2.TokenLogprob(
-                        token_id=lp.get("token_id", 0),
-                        logprob=lp.get("logprob", 0.0),
-                    )
-                    complete.logprobs.append(token_logprob)
+            responses.append(
+                trtllm_service_pb2.GenerateResponse(
+                    request_id=request_id,
+                    complete=complete,
+                )
+            )
 
-        # Add prompt logprobs if available
-        if hasattr(completion, "prompt_logprobs") and completion.prompt_logprobs:
-            for lp in completion.prompt_logprobs:
-                if isinstance(lp, dict):
-                    token_logprob = trtllm_service_pb2.TokenLogprob(
-                        token_id=lp.get("token_id", 0),
-                        logprob=lp.get("logprob", 0.0),
-                    )
-                    complete.prompt_logprobs.append(token_logprob)
-
-        return trtllm_service_pb2.GenerateResponse(
-            request_id=request_id,
-            complete=complete,
-        )
+        return responses
 
     def _error_response(
         self,
