@@ -290,6 +290,10 @@ public:
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
+        if (mSelfRnnState.has_value())
+        {
+            mSelfState.setRnnCacheState(mSelfRnnState.value());
+        }
         mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
         int asyncSendThreadNum = common::getEnvKVCacheSendMaxConcurrenceNum();
@@ -809,6 +813,10 @@ public:
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
+        if (mSelfRnnState.has_value())
+        {
+            mSelfState.setRnnCacheState(mSelfRnnState.value());
+        }
     }
 
     [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest)
@@ -891,7 +899,7 @@ public:
             }
             else
             {
-                TLLM_LOG_WARNING("Self has RNN state but context does not. RNN transfer will be skipped.");
+                TLLM_LOG_WARNING("No RNN cache state found in context state for request %ld", requestId);
             }
         }
         else if (contextState.hasRnnCacheState() && (!mRnnFormatter.has_value() || !mSelfRnnState.has_value()))

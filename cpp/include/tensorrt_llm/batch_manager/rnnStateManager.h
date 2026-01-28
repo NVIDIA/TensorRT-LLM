@@ -79,6 +79,12 @@ public:
         return mBufferManager.value();
     }
 
+    [[nodiscard]] SizeType32 getGlobalLayerNum(SizeType32 localOffset) const
+    {
+        TLLM_CHECK(localOffset < static_cast<SizeType32>(mGlobalLayerNumsPerPP.size()));
+        return mGlobalLayerNumsPerPP[localOffset];
+    }
+
 private:
     static std::vector<SizeType32> getPpLayers(SizeType32 numLayers, runtime::WorldConfig const& worldConfig,
         std::optional<std::vector<bool>> const& layerMask);
@@ -98,6 +104,7 @@ private:
     SizeType32 mMaxBeamWidth = 0;
     SizeType32 mBeamSlotsPerSequence = 0;
     std::unordered_map<SizeType32, SizeType32> mLayerOffsets;
+    std::vector<SizeType32> mGlobalLayerNumsPerPP; // contains the global index of RNN layers on self rank 
     std::vector<SizeType32> mFreeBlocks;
     std::unordered_map<RequestIdType, SizeType32> mCacheIndex;
     std::optional<runtime::BufferManager> mBufferManager;

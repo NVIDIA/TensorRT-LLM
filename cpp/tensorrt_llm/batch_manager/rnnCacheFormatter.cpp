@@ -92,10 +92,9 @@ void RnnCacheFormatter::format(TransferSession& session)
         {
             for (SizeType32 layer = 0; layer < numLocalLayers; layer++)
             {
-                SizeType32 globalLayerIdx = selfStartLayer + layer;
 
                 // Get conv state for this layer: shape is [maxBatchSize, convDim, dConv-1]
-                auto convState = mRnnStateManager->getConvStates(globalLayerIdx);
+                auto convState = mRnnStateManager->getConvStates(mRnnStateManager->getGlobalLayerNum(layer));
                 // Slice out the specific slot: shape becomes [convDim, dConv-1]
                 auto slotConv = runtime::ITensor::slice(convState, slotIdx, 1);
                 slotConv->squeeze(0);
@@ -105,7 +104,7 @@ void RnnCacheFormatter::format(TransferSession& session)
                 session.send(pickUpConnections[i], slotConv->data(), slotConv->getSizeInBytes());
 
                 // Get SSM state for this layer: shape is [maxBatchSize, numHeads, headDim, dState]
-                auto ssmState = mRnnStateManager->getSsmStates(globalLayerIdx);
+                auto ssmState = mRnnStateManager->getSsmStates(mRnnStateManager->getGlobalLayerNum(layer));
                 // Slice out the specific slot: shape becomes [numHeads, headDim, dState]
                 auto slotSsm = runtime::ITensor::slice(ssmState, slotIdx, 1);
                 slotSsm->squeeze(0);
@@ -160,7 +159,7 @@ void RnnCacheFormatter::format(TransferSession& session)
 
         for (SizeType32 layer = 0; layer < layersToSend; layer++)
         {
-            auto convState = mRnnStateManager->getConvStates(selfStartLayer + localLayerOffset + layer);
+            auto convState = mRnnStateManager->getConvStates(mRnnStateManager->getGlobalLayerNum(localLayerOffset + layer));
             auto slotConv = runtime::ITensor::slice(convState, slotIdx, 1);
             size_t numBytes = slotConv->getSizeInBytes();
 
@@ -171,7 +170,7 @@ void RnnCacheFormatter::format(TransferSession& session)
 
         for (SizeType32 layer = 0; layer < layersToSend; layer++)
         {
-            auto ssmState = mRnnStateManager->getSsmStates(selfStartLayer + localLayerOffset + layer);
+            auto ssmState = mRnnStateManager->getSsmStates(mRnnStateManager->getGlobalLayerNum(localLayerOffset + layer));
             auto slotSsm = runtime::ITensor::slice(ssmState, slotIdx, 1);
             size_t numBytes = slotSsm->getSizeInBytes();
 
@@ -262,10 +261,9 @@ void RnnCacheFormatter::unformat(TransferSession& session)
         {
             for (SizeType32 layer = 0; layer < numLocalLayers; layer++)
             {
-                SizeType32 globalLayerIdx = selfStartLayer + layer;
 
                 // Get conv state for this layer: shape is [maxBatchSize, convDim, dConv-1]
-                auto convState = mRnnStateManager->getConvStates(globalLayerIdx);
+                auto convState = mRnnStateManager->getConvStates(mRnnStateManager->getGlobalLayerNum(layer));
                 // Slice out the specific slot: shape becomes [convDim, dConv-1]
                 auto slotConv = runtime::ITensor::slice(convState, slotIdx, 1);
                 slotConv->squeeze(0);
@@ -275,7 +273,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
                 session.recv(pickUpConnections[i], slotConv->data(), slotConv->getSizeInBytes());
 
                 // Get SSM state for this layer: shape is [maxBatchSize, numHeads, headDim, dState]
-                auto ssmState = mRnnStateManager->getSsmStates(globalLayerIdx);
+                auto ssmState = mRnnStateManager->getSsmStates(mRnnStateManager->getGlobalLayerNum(layer));
                 // Slice out the specific slot: shape becomes [numHeads, headDim, dState]
                 auto slotSsm = runtime::ITensor::slice(ssmState, slotIdx, 1);
                 slotSsm->squeeze(0);
@@ -445,7 +443,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
             // Unpack conv states first
             for (SizeType32 layer = 0; layer < layersFromSource; layer++)
             {
-                auto convState = mRnnStateManager->getConvStates(selfStartLayer + localLayerOffset + layer);
+                auto convState = mRnnStateManager->getConvStates(mRnnStateManager->getGlobalLayerNum(localLayerOffset + layer));
                 auto slotConv = runtime::ITensor::slice(convState, slotIdx, 1);
                 size_t numBytes = slotConv->getSizeInBytes();
 
@@ -457,7 +455,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
             // Unpack SSM states
             for (SizeType32 layer = 0; layer < layersFromSource; layer++)
             {
-                auto ssmState = mRnnStateManager->getSsmStates(selfStartLayer + localLayerOffset + layer);
+                auto ssmState = mRnnStateManager->getSsmStates(mRnnStateManager->getGlobalLayerNum(localLayerOffset + layer));
                 auto slotSsm = runtime::ITensor::slice(ssmState, slotIdx, 1);
                 size_t numBytes = slotSsm->getSizeInBytes();
 
