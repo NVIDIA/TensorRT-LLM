@@ -9,7 +9,7 @@ from typing import Any, Dict, Generic, List, Optional, TypeVar
 import filelock
 import torch
 import transformers
-from transformers.utils import HF_MODULES_CACHE
+from transformers.utils import HF_HUB_CACHE
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
@@ -40,7 +40,7 @@ def config_file_lock(timeout: int = 10):
     """
     # Use a single global lock file in HF cache directory
     # This serializes all model loading operations to prevent race conditions
-    lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
+    lock_path = Path(HF_HUB_CACHE) / "_remote_code.lock"
 
     # Create and acquire the lock
     lock = filelock.FileLock(str(lock_path), timeout=timeout)
