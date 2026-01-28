@@ -902,8 +902,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        // TODO: CI TEST MODE - Return true to skip tag update
-        if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
+        if (env.JOB_NAME ==~ /.*PostMerge.*/) {
             stage("Update GitHub Tag") {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
                 updateGithubTagCommit(pipeline, globalVars)
@@ -1440,7 +1439,6 @@ def validateDownstreamJobDurations(globalVars) {
         issues.each { echo "  - ${it}" }
         echo ""
         echo "Cannot update tag: Required jobs missing or failed too quickly"
-        return true // TODO: CI TEST MODE - Return true to skip tag update
         return false
     }
 
@@ -1494,7 +1492,6 @@ def areAllFailuresPostMerge(failedStageList) {
  */
 def createGithubTag(globalVars) {
     def commitSha = env.gitlabCommit
-    commitSha = "ff0775408d7a23707af05f86f72656d9aa95d57b" // TODO: CI TEST MODE - Set commit SHA to test tag update
     def prNumber = globalVars[GITHUB_PR_API_URL].split('/').last()
     def targetBranch = env.gitlabTargetBranch ?: (globalVars[TARGET_BRANCH] ?: "main")
     def tagName = "latest-ci-stable-commit-${targetBranch}"
@@ -1591,7 +1588,7 @@ def updateGithubTagCommit(pipeline, globalVars) {
     // Step 3: Check if only post-merge tests failed
     if (!areAllFailuresPostMerge(failedStageList)) {
         echo "❌ Found pre-merge failures: ${failedStageList.join(', ')}"
-        // return false TODO: CI TEST MODE - Return false to skip tag update
+        return false
     }
 
     echo "✓ Only post-merge failures detected - updating tag"
