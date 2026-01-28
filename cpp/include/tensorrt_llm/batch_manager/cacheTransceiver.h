@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/cacheTransferServer.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -24,15 +25,20 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <array>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <pybind11/pybind11.h>
+#include <set>
+#include <thread>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/custom_class.h>
 #include <torch/python.h>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -50,6 +56,7 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
+class TransferTagServer;
 
 class CacheTransceiverComm
 {
@@ -144,6 +151,31 @@ public:
         TLLM_THROW("Input arguments only supported in mpi");
     }
 
+    template <typename T>
+    void bcast(std::vector<T>& vec, int root) const
+    {
+        if (isMpi())
+        {
+            mMpiComm->bcast(vec, root);
+        }
+        else
+        {
+            tensorrt_llm::pg_utils::PgHelper pgh{mPgComm};
+
+            auto const rank = getRank();
+            int64_t vecSize = (rank == root) ? static_cast<int64_t>(vec.size()) : 0;
+            PGCHECK_THROW(pgh.broadcast(&vecSize, root));
+
+            vec.resize(static_cast<size_t>(vecSize));
+            if (vec.empty())
+            {
+                return;
+            }
+
+            PGCHECK_THROW(pgh.broadcast(std::ref(vec), root));
+        }
+    }
+
     CacheTransceiverComm split(int color, int key)
     {
         if (isMpi())
@@ -177,6 +209,32 @@ public:
 private:
     std::shared_ptr<mpi::MpiComm const> mMpiComm;
     c10::intrusive_ptr<c10d::ProcessGroup> mPgComm;
+};
+
+class TransferTagClient
+{
+public:
+    static TransferTagClient& instance()
+    {
+        static TransferTagClient instance;
+        return instance;
+    }
+
+    TransferTagType getTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
+        UuidType const& receiverServerUuid, int32_t expectedRefCount);
+    void releaseTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
+        UuidType const& receiverServerUuid, TransferTagType transferTag);
+
+private:
+    TransferTagClient();
+    ~TransferTagClient();
+
+    // Prevent copying
+    TransferTagClient(TransferTagClient const&) = delete;
+    TransferTagClient& operator=(TransferTagClient const&) = delete;
+
+    std::unique_ptr<zmq::context_t> mContext;
+    std::mutex mMutex;
 };
 
 class CacheTransceiverFactory
@@ -287,6 +345,9 @@ private:
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
+    UuidType mUuid;
+    std::unique_ptr<TransferTagServer> mTransferTagServer;
+    std::string mTransferTagServerEndpoint;
 };
 
 } // namespace tensorrt_llm::batch_manager

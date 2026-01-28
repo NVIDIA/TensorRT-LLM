@@ -279,6 +279,15 @@ struct PgHelper
     {
         return allgatherv<Input, Output, SizeT>(input, output, sizes.get(), options);
     }
+
+    template <typename Data>
+    c10::intrusive_ptr<c10d::Work> broadcast(
+        Data data, int root, c10d::BroadcastOptions options = c10d::BroadcastOptions())
+    {
+        options.rootRank = root;
+        std::vector tensors{wrap_tensor(data)};
+        return pg->broadcast(tensors, options);
+    }
 };
 
 } // namespace tensorrt_llm::pg_utils
