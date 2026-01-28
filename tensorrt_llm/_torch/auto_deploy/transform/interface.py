@@ -474,6 +474,9 @@ class BaseTransform(ABC):
 
         self._set_autodeploy_meta(mod, autodeploy_meta)
 
+        # Dump graph after transform for debugging (controlled by AD_DUMP_GRAPHS_DIR env var)
+        ad_logger.dump_graph(mod, t_name, self.config.stage.value)
+
         # return the graph module
         return mod
 
