@@ -283,8 +283,9 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
                 if shortcut_key in self.model_fields_set:
                     self.transforms[t_key][config_key] = getattr(self, shortcut_key)
                 # then update the shortcut field with the value from the transforms config to make
-                # sure both fields are in sync
-                setattr(self, shortcut_key, self.transforms[t_key][config_key])
+                # sure both fields are in sync (only if the config key exists)
+                if config_key in self.transforms[t_key]:
+                    setattr(self, shortcut_key, self.transforms[t_key][config_key])
 
         return self
 
