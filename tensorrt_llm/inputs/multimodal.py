@@ -38,6 +38,22 @@ class MultimodalInput:
     (e.g., image_end_token, image_break_token for mistral3) mixed with the actual multimodal tokens.
     """
 
+    multimodal_uuids: Optional[List[Optional[str]]] = None
+    """Optional user-provided UUIDs for multimodal data items.
+
+    When provided, these UUIDs will be returned in KV cache events instead of the
+    computed hash hex string. This enables deterministic cache identification across
+    sessions using user-defined stable identifiers.
+
+    Each element can be:
+    - A string UUID: Used as the cache identifier (returned in events)
+    - None: Falls back to content-based hashing for that item
+
+    If the UUID string is longer than 32 bytes, it will be hashed internally
+    for cache key computation, but the original UUID string is preserved and
+    returned in KV cache events.
+    """
+
     def __post_init__(self):
         """Validate input data structure and consistency."""
         # Validate multimodal_hashes
@@ -69,13 +85,32 @@ class MultimodalInput:
                 f"positions={len(self.multimodal_positions)}, lengths={len(self.multimodal_lengths)}"
             )
 
+        # Validate multimodal_uuids if provided
+        if self.multimodal_uuids is not None:
+            if not isinstance(self.multimodal_uuids, list):
+                raise TypeError("multimodal_uuids must be a list")
+            if len(self.multimodal_uuids) != len(self.multimodal_hashes):
+                raise ValueError(
+                    f"multimodal_uuids length ({len(self.multimodal_uuids)}) must match "
+                    f"multimodal_hashes length ({len(self.multimodal_hashes)})")
+            for i, uuid in enumerate(self.multimodal_uuids):
+                if uuid is not None and not isinstance(uuid, str):
+                    raise TypeError(
+                        f"multimodal_uuids[{i}] must be a string or None, got {type(uuid)}"
+                    )
+
     @classmethod
-    def from_components(cls, mm_hashes: List[List[int]],
-                        mm_positions: List[int],
-                        mm_lengths: List[int]) -> 'MultimodalInput':
+    def from_components(
+            cls,
+            mm_hashes: List[List[int]],
+            mm_positions: List[int],
+            mm_lengths: List[int],
+            mm_uuids: Optional[List[Optional[str]]] = None
+    ) -> 'MultimodalInput':
         return cls(multimodal_hashes=mm_hashes,
                    multimodal_positions=mm_positions,
-                   multimodal_lengths=mm_lengths)
+                   multimodal_lengths=mm_lengths,
+                   multimodal_uuids=mm_uuids)
 
     def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert data to tensors"""
@@ -546,9 +581,50 @@ def serialize_item(obj: object) -> bytes:
     raise ValueError(f"Unsupported object type: {type(obj)}")
 
 
-def apply_mm_hashes(mm_data: Dict[str, Any],
-                    hash_lib=default_hasher) -> Dict[str, List[str]]:
-    """Apply hashing to multimodal data items."""
+def uuid_to_hash(uuid_str: str, hash_lib=default_hasher) -> str:
+    """Convert a UUID string to a 64-character hex hash.
+
+    If the UUID string is 32 bytes or less, it is zero-padded to 32 bytes
+    and converted to hex. If longer than 32 bytes, the string is hashed
+    to produce a 32-byte digest.
+
+    Args:
+        uuid_str: The UUID string to convert
+        hash_lib: Hash function to use (default: blake3)
+
+    Returns:
+        A 64-character hexadecimal string representing the 32-byte hash
+    """
+    uuid_bytes = uuid_str.encode('utf-8')
+    if len(uuid_bytes) <= 32:
+        # Pad with zeros to 32 bytes and convert to hex
+        padded = uuid_bytes.ljust(32, b'\x00')
+        return padded.hex()
+    else:
+        # Hash the UUID to get 32 bytes
+        hasher = hash_lib()
+        hasher.update(uuid_bytes)
+        return hasher.hexdigest()
+
+
+def apply_mm_hashes(
+    mm_data: Dict[str, Any],
+    mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
+    hash_lib=default_hasher
+) -> Tuple[Dict[str, List[str]], Optional[List[Optional[str]]]]:
+    """Apply hashing to multimodal data items, using UUIDs when provided.
+
+    Args:
+        mm_data: Dictionary of modality -> data items
+        mm_uuids: Optional dictionary of modality -> list of UUID strings.
+                  Use None for items that should use content-based hashing.
+        hash_lib: Hash function to use (default: blake3)
+
+    Returns:
+        Tuple of:
+        - Dictionary of modality -> list of hash hex strings (64 chars each)
+        - Flattened list of original UUID strings (or None for content-hashed items)
+    """
 
     def _hash_image(image):
         # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
@@ -580,12 +656,39 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         modality: items if isinstance(items, list) else [items]
         for modality, items in mm_data.items()
     }
-    # TODO: need to hash both modality and item to distinguish modality (vllm/PR)
-    mm_hashes = {
-        modality: [_hash_image(item) for item in items]
-        for modality, items in mm_items.items()
-    }
-    return mm_hashes
+
+    # Collect UUIDs in the same order as items
+    all_uuids: List[Optional[str]] = []
+    mm_hashes: Dict[str, List[str]] = {}
+
+    for modality, items in mm_items.items():
+        modality_uuids = None
+        if mm_uuids is not None and modality in mm_uuids:
+            modality_uuids = mm_uuids[modality]
+            if not isinstance(modality_uuids, list):
+                modality_uuids = [modality_uuids]
+            if len(modality_uuids) != len(items):
+                raise ValueError(
+                    f"UUID list length ({len(modality_uuids)}) doesn't match "
+                    f"data items length ({len(items)}) for modality '{modality}'"
+                )
+
+        hashes = []
+        for i, item in enumerate(items):
+            uuid = modality_uuids[i] if modality_uuids else None
+            if uuid is not None:
+                # Use UUID-based hash
+                hashes.append(uuid_to_hash(uuid, hash_lib))
+                all_uuids.append(uuid)  # Store original UUID
+            else:
+                # Fall back to content-based hashing
+                hashes.append(_hash_image(item))
+                all_uuids.append(None)
+
+        mm_hashes[modality] = hashes
+
+    # Return None for uuids if no UUIDs were provided at all
+    return mm_hashes, all_uuids if mm_uuids is not None else None
 
 
 def hexdigest_to_int32(hex_digest: str) -> List[int]:
@@ -602,6 +705,30 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
             value = value - 0x100000000  # Convert to signed by subtracting 2^32
         result.append(value)
     return result
+
+
+def int32_to_hexdigest(int32_values: List[int]) -> str:
+    """Convert 8 int32 values back to a 64-character hexadecimal digest.
+
+    This is the inverse of hexdigest_to_int32.
+
+    Args:
+        int32_values: List of 8 signed int32 values
+
+    Returns:
+        64-character hexadecimal string representing the 32-byte hash
+    """
+    if len(int32_values) != 8:
+        raise ValueError(f"Expected 8 int32 values, got {len(int32_values)}")
+
+    result = []
+    for value in int32_values:
+        # Convert signed int32 back to unsigned
+        if value < 0:
+            value = value + 0x100000000
+        # Format as 8 hex characters (zero-padded)
+        result.append(f'{value:08x}')
+    return ''.join(result)
 
 
 def find_mm_token_lengths(mm_data: Dict[str, Any],

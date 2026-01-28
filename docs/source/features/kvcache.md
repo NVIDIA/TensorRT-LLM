@@ -64,6 +64,40 @@ KV cache salting provides a security mechanism to control which requests can reu
 
 To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
 
+### Multimodal UUID Support for Cache Identification
+
+When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
+
+To enable deterministic cache management, you can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. When provided, these UUIDs are used as stable identifiers in KV cache events instead of computed content hashes.
+
+**Usage Example:**
+
+```python
+from tensorrt_llm.inputs import TextPrompt
+
+# Provide custom UUIDs for your images
+prompt = TextPrompt(
+    prompt="Describe these images.",
+    multi_modal_data={"image": [image1, image2]},
+    multi_modal_uuids={"image": ["image-uuid-001", "image-uuid-002"]}
+)
+```
+
+**Key Features:**
+
+- **Stable Identifiers**: UUIDs remain consistent across sessions, enabling deterministic cache lookups without re-processing content
+- **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-based hashing
+- **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs
+- **Automatic Hash Conversion**: UUIDs ≤32 bytes are zero-padded and hex-encoded; longer UUIDs are hashed using BLAKE3
+
+**UUID Format:**
+
+- Can be any string (e.g., "image-123", "user-session-img-a", database keys)
+- If ≤32 bytes: padded with zeros to 32 bytes and converted to hex (64 characters)
+- If >32 bytes: hashed using BLAKE3 to produce a 32-byte hash (64 hex characters)
+- Original UUID strings are preserved and returned in KV cache events via `get_kv_cache_events()`
+
+
 ### Enable Offloading to Host Memory
 
 Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.

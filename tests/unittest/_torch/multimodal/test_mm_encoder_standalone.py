@@ -26,6 +26,11 @@ example_images = [
     str(test_data_root / "61.jpg"),
 ]
 
+example_videos = [
+    str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+    str(test_data_root / "world.mp4"),
+]
+
 _LLAVA_DIR = llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf"
 _QWEN_2_5_VL_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 _QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
@@ -180,6 +185,489 @@ def model_dir(request, tmp_path_factory: pytest.TempPathFactory) -> Path:
         return _create_fake_qwen3_vl_30b_a3b_fp8_dir(tmp_path_factory,
                                                      _QWEN_3_VL_DIR)
     return request.param
+
+
+@pytest.mark.parametrize(
+    "use_uuids,expected_hash_type",
+    [
+        # Without UUIDs: mm_key hash should be a 64-char hex string
+        (False, "hex"),
+        # With UUIDs: mm_key hash should be the original UUID string
+        (True, "uuid"),
+    ])
+def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
+    """Test mm_keys in KV cache events return UUID when provided.
+
+    This test verifies that when multi_modal_uuids is provided:
+    1. The KV cache event mm_keys 'hash' field contains the original UUID string
+    2. Without UUIDs, the hash field contains a 64-char hex string
+
+    The UUID feature allows users to provide stable identifiers for multimodal
+    items, which are returned in KV cache events for external cache management.
+    """
+    encoder_model_dir = _LLAVA_DIR
+
+    max_tokens = 16
+    free_gpu_memory_fraction = 0.2
+
+    # Use different images to generate different prompts
+    prompts = ["Describe the natural environment in the image."]
+    media = [example_images[0]]
+
+    # Define UUIDs if testing with them
+    test_uuid = "my-test-image-uuid-12345"
+
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        event_buffer_max_size=1024,
+    )
+
+    llm = LLM(model=encoder_model_dir,
+              backend='pytorch',
+              kv_cache_config=kv_cache_config,
+              max_batch_size=1)
+
+    # Load inputs with or without UUIDs
+    if use_uuids:
+        # Create inputs with multi_modal_uuids
+        inputs = _load_inputs_with_uuids(llm, prompts, media, [test_uuid])
+    else:
+        inputs = _load_inputs(llm, prompts, media)
+
+    with llm:
+        for inp in inputs:
+            _ = llm.generate([inp], sampling_params=sampling_params)
+
+        time.sleep(0.5)
+        events = llm.get_kv_cache_events(10)
+
+    # Extract mm_keys from stored events
+    mm_keys_found = []
+    for event in events:
+        if event and event.get("data", {}).get("type") == "stored":
+            for block in event["data"].get("blocks", []):
+                if block.get("mm_keys"):
+                    for mm_key in block["mm_keys"]:
+                        mm_keys_found.append(mm_key)
+
+    # Verify mm_keys were found (multimodal model should have them)
+    assert len(mm_keys_found) > 0, "Expected mm_keys in stored events"
+
+    # Verify the hash field matches expected type
+    for mm_key in mm_keys_found:
+        hash_value = mm_key["hash"]
+        if expected_hash_type == "uuid":
+            # Should be the original UUID string
+            assert hash_value == test_uuid, (
+                f"Expected UUID '{test_uuid}', got '{hash_value}'")
+        else:
+            # Should be a 64-char hex string
+            assert len(hash_value) == 64, (
+                f"Expected 64-char hex hash, got {len(hash_value)} chars")
+            # Verify it's valid hex
+            try:
+                bytes.fromhex(hash_value)
+            except ValueError:
+                pytest.fail(f"Hash '{hash_value}' is not valid hex")
+
+
+def _load_inputs_with_uuids(llm: LLM, prompts, media, uuids):
+    """Load inputs with multi_modal_uuids for testing.
+
+    This function uses the same processing pipeline as _load_inputs but adds
+    multi_modal_uuids to the processed inputs.
+    """
+    # Use the standard loader to get properly processed inputs with image tokens
+    inputs = _load_inputs(llm, prompts, media)
+
+    # Add multi_modal_uuids to the processed inputs
+    for inp, uuid in zip(inputs, uuids):
+        inp["multi_modal_uuids"] = {"image": [uuid]}
+
+    return inputs
+
+
+@pytest.mark.parametrize(
+    "uuids,expected_patterns",
+    [
+        # First image has UUID, second uses content hash
+        (["custom-uuid-first", None], ["custom-uuid-first", "hex"]),
+        # Both have UUIDs
+        (["uuid-img-a", "uuid-img-b"], ["uuid-img-a", "uuid-img-b"]),
+        # Both use content hash (None)
+        ([None, None], ["hex", "hex"]),
+    ])
+def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
+    """Test mm_keys with partial UUIDs (some items with UUID, some without).
+
+    This test verifies the mixed UUID scenario where:
+    1. Some multimodal items have user-provided UUIDs
+    2. Other items fall back to content-based hashing
+    3. KV cache events correctly return UUID or hex hash based on input
+    """
+    encoder_model_dir = _LLAVA_DIR
+
+    max_tokens = 16
+    free_gpu_memory_fraction = 0.2
+
+    # Two different images with potentially mixed UUIDs
+    prompt = "Describe both images in detail."
+    images = [example_images[0], example_images[1]]
+
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        event_buffer_max_size=1024,
+    )
+
+    llm = LLM(model=encoder_model_dir,
+              backend='pytorch',
+              kv_cache_config=kv_cache_config,
+              max_batch_size=1)
+
+    # Load input using the multimodal input loader directly for multiple images per prompt
+    config_path = os.path.join(llm._hf_model_dir, 'config.json')
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    model_type = model_config['model_type']
+
+    inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
+                                             model_dir=llm._hf_model_dir,
+                                             model_type=model_type,
+                                             modality="multiple_image",
+                                             prompts=[prompt],
+                                             media=[images],
+                                             image_data_format="pt")
+
+    # Add multi_modal_uuids to the processed input
+    inputs[0]["multi_modal_uuids"] = {"image": uuids}
+    inp = inputs[0]
+
+    with llm:
+        _ = llm.generate([inp], sampling_params=sampling_params)
+
+        time.sleep(0.5)
+        events = llm.get_kv_cache_events(20)
+
+    # Collect all unique mm_key hashes from stored events
+    mm_key_hashes = []
+    for event in events:
+        if event and event.get("data", {}).get("type") == "stored":
+            for block in event["data"].get("blocks", []):
+                if block.get("mm_keys"):
+                    for mm_key in block["mm_keys"]:
+                        hash_val = mm_key["hash"]
+                        if hash_val not in mm_key_hashes:
+                            mm_key_hashes.append(hash_val)
+
+    # Verify we got mm_keys
+    assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
+
+    # Verify each expected pattern appears in the results
+    for pattern in expected_patterns:
+        if pattern == "hex":
+            # Should find at least one 64-char hex string
+            hex_found = any(
+                len(h) == 64 and all(c in '0123456789abcdef' for c in h)
+                for h in mm_key_hashes)
+            assert hex_found, f"Expected hex hash pattern but got: {mm_key_hashes}"
+        else:
+            # Should find the exact UUID string
+            assert pattern in mm_key_hashes, (
+                f"Expected UUID '{pattern}' in mm_keys, got: {mm_key_hashes}")
+
+
+def test_kv_event_mm_keys_with_uuid_multiple_prompts():
+    """Test mm_keys with UUIDs across multiple prompts, each with its own image.
+
+    This test verifies that when multiple prompts are processed, each with its own
+    multimodal data and UUID:
+    1. Each prompt's mm_keys correctly return the associated UUID
+    2. Different UUIDs are preserved for different prompts
+    3. KV cache events correctly associate UUIDs with their respective blocks
+    """
+    encoder_model_dir = _LLAVA_DIR
+
+    max_tokens = 16
+    free_gpu_memory_fraction = 0.2
+
+    # Multiple prompts, each with its own image and UUID
+    prompts = [
+        "Describe the natural environment in the image.",
+        "What objects can you see in the image?",
+        "Describe the weather in the image.",
+    ]
+    media = [example_images[0], example_images[1], example_images[2]]
+    uuids = ["uuid-image-seashore", "uuid-image-inpaint", "uuid-image-61"]
+
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        event_buffer_max_size=2048,
+    )
+
+    llm = LLM(model=encoder_model_dir,
+              backend='pytorch',
+              kv_cache_config=kv_cache_config,
+              max_batch_size=1)
+
+    # Load inputs with UUIDs for each prompt
+    inputs = _load_inputs(llm, prompts, media)
+
+    # Add multi_modal_uuids to each input
+    for inp, uuid in zip(inputs, uuids):
+        inp["multi_modal_uuids"] = {"image": [uuid]}
+
+    with llm:
+        # Generate for each input separately
+        for inp in inputs:
+            _ = llm.generate([inp], sampling_params=sampling_params)
+
+        time.sleep(0.5)
+        events = llm.get_kv_cache_events(30)
+
+    # Collect all unique mm_key hashes from stored events
+    mm_key_hashes = set()
+    for event in events:
+        if event and event.get("data", {}).get("type") == "stored":
+            for block in event["data"].get("blocks", []):
+                if block.get("mm_keys"):
+                    for mm_key in block["mm_keys"]:
+                        mm_key_hashes.add(mm_key["hash"])
+
+    # Verify we got mm_keys
+    assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
+
+    # Verify each UUID appears in the results
+    for uuid in uuids:
+        assert uuid in mm_key_hashes, (
+            f"Expected UUID '{uuid}' in mm_keys, got: {mm_key_hashes}")
+
+
+def test_kv_event_mm_keys_with_very_long_uuid():
+    """Test mm_keys with UUIDs that exceed 64 bytes.
+
+    This test verifies that the system correctly handles UUIDs that are longer
+    than the typical 64-character hex hash representation:
+    1. Very long UUIDs (>64 bytes) are preserved and returned correctly
+    2. No truncation or corruption occurs for long UUID strings
+    3. The full UUID is returned in KV cache events
+    """
+    encoder_model_dir = _LLAVA_DIR
+
+    max_tokens = 16
+    free_gpu_memory_fraction = 0.2
+
+    prompt = "Describe the natural environment in the image."
+
+    # Create UUIDs of varying lengths, including very long ones
+    # Normal UUID (36 chars): standard format
+    # Medium UUID (80 chars): exceeds 64-byte hash representation
+    # Very long UUID (200+ chars): stress test for string handling
+    long_uuid_80 = "sku-product-image-" + "a" * 62  # 80 chars total
+    very_long_uuid_200 = (
+        "enterprise-asset-management-system/region/us-east-1/bucket/media-assets/"
+        "category/electronics/subcategory/smartphones/brand/example-brand/"
+        "product-line/flagship-series/sku/SKU-2024-FLAGSHIP-PRO-MAX-256GB-MIDNIGHT-BLACK"
+    )  # ~200 chars
+
+    # Use 2 images with different long UUIDs
+    images = [example_images[0], example_images[1]]
+    uuids = [long_uuid_80, very_long_uuid_200]
+
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        event_buffer_max_size=1024,
+    )
+
+    llm = LLM(model=encoder_model_dir,
+              backend='pytorch',
+              kv_cache_config=kv_cache_config,
+              max_batch_size=1)
+
+    # Load input using the multimodal input loader for multiple images
+    config_path = os.path.join(llm._hf_model_dir, 'config.json')
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    model_type = model_config['model_type']
+
+    inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
+                                             model_dir=llm._hf_model_dir,
+                                             model_type=model_type,
+                                             modality="multiple_image",
+                                             prompts=[prompt],
+                                             media=[images],
+                                             image_data_format="pt")
+
+    # Add very long UUIDs
+    inputs[0]["multi_modal_uuids"] = {"image": uuids}
+    inp = inputs[0]
+
+    with llm:
+        _ = llm.generate([inp], sampling_params=sampling_params)
+
+        time.sleep(0.5)
+        events = llm.get_kv_cache_events(30)
+
+    # Collect all unique mm_key hashes from stored events
+    mm_key_hashes = []
+    for event in events:
+        if event and event.get("data", {}).get("type") == "stored":
+            for block in event["data"].get("blocks", []):
+                if block.get("mm_keys"):
+                    for mm_key in block["mm_keys"]:
+                        hash_val = mm_key["hash"]
+                        if hash_val not in mm_key_hashes:
+                            mm_key_hashes.append(hash_val)
+
+    # Verify we got mm_keys
+    assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
+
+    # Verify the 80-char UUID is present and not truncated
+    assert long_uuid_80 in mm_key_hashes, (
+        f"Expected 80-char UUID '{long_uuid_80}' in mm_keys, got: {mm_key_hashes}"
+    )
+
+    # Verify the 200-char UUID is present and not truncated
+    assert very_long_uuid_200 in mm_key_hashes, (
+        f"Expected 200-char UUID '{very_long_uuid_200}' in mm_keys, got: {mm_key_hashes}"
+    )
+
+    # Verify the UUIDs are exactly as provided (no truncation)
+    for uuid in uuids:
+        matching = [h for h in mm_key_hashes if h == uuid]
+        assert len(matching) == 1, (
+            f"UUID '{uuid}' (len={len(uuid)}) should appear exactly once, "
+            f"found {len(matching)} times in {mm_key_hashes}")
+
+
+def test_kv_event_mm_keys_with_uuid_mixed_media_types():
+    """Test mm_keys with UUIDs for multiple media types (images and video) in a single prompt.
+
+    This test verifies handling of different media types within a single prompt,
+    where each multimodal item (images or video) can have its own UUID:
+    1. Multiple media types (images + video) in one prompt each get their own mm_key entries
+    2. Each media item's UUID is correctly returned in its mm_key
+    3. UUIDs work across different modalities (image vs video)
+    4. Mixed UUIDs (some provided, some None) are handled correctly per modality
+    """
+    # Use Qwen-VL model which supports both images and videos
+    encoder_model_dir = _QWEN_2_5_VL_DIR
+
+    max_tokens = 16
+    free_gpu_memory_fraction = 0.2
+
+    # Single prompt with images and video
+    prompt = "Compare the images and describe what you see in the video."
+
+    # Images: 2 images with UUIDs (first has UUID, second uses content hash)
+    images = [example_images[0], example_images[1]]
+    image_uuids = ["uuid-image-seashore",
+                   None]  # Second image uses content hash
+
+    # Video: 1 video with UUID
+    video_path = example_videos[0]  # OAI-sora-tokyo-walk.mp4
+    video_uuid = "uuid-video-tokyo-walk"
+
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        event_buffer_max_size=2048,
+    )
+
+    llm = LLM(model=encoder_model_dir,
+              backend='pytorch',
+              kv_cache_config=kv_cache_config,
+              max_batch_size=1)
+
+    config_path = os.path.join(llm._hf_model_dir, 'config.json')
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    model_type = model_config['model_type']
+
+    # Load images first using multiple_image modality
+    image_inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
+                                                   model_dir=llm._hf_model_dir,
+                                                   model_type=model_type,
+                                                   modality="multiple_image",
+                                                   prompts=[prompt],
+                                                   media=[images],
+                                                   image_data_format="pt")
+
+    # Load video separately
+    video_inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
+                                                   model_dir=llm._hf_model_dir,
+                                                   model_type=model_type,
+                                                   modality="video",
+                                                   prompts=[prompt],
+                                                   media=[video_path],
+                                                   image_data_format="pt")
+
+    # Combine multimodal data from both inputs
+    # The image input has the images, and video input has the video
+    inp = image_inputs[0]
+
+    # Merge video data into the combined input
+    if "multi_modal_data" in video_inputs[0]:
+        if "multi_modal_data" not in inp:
+            inp["multi_modal_data"] = {}
+        # Add video data to the combined multi_modal_data
+        video_mm_data = video_inputs[0]["multi_modal_data"]
+        for modality, data in video_mm_data.items():
+            if modality == "video":
+                if "video" not in inp["multi_modal_data"]:
+                    inp["multi_modal_data"]["video"] = []
+                inp["multi_modal_data"]["video"].extend(
+                    data if isinstance(data, list) else [data])
+
+    # Add multi_modal_uuids for both image and video modalities
+    inp["multi_modal_uuids"] = {
+        "image": image_uuids,  # ["uuid-image-seashore", None]
+        "video": [video_uuid]  # ["uuid-video-tokyo-walk"]
+    }
+
+    with llm:
+        _ = llm.generate([inp], sampling_params=sampling_params)
+
+        time.sleep(0.5)
+        events = llm.get_kv_cache_events(50)
+
+    # Collect all unique mm_key hashes from stored events
+    mm_key_hashes = []
+    for event in events:
+        if event and event.get("data", {}).get("type") == "stored":
+            for block in event["data"].get("blocks", []):
+                if block.get("mm_keys"):
+                    for mm_key in block["mm_keys"]:
+                        hash_val = mm_key["hash"]
+                        if hash_val not in mm_key_hashes:
+                            mm_key_hashes.append(hash_val)
+
+    # Verify we got mm_keys
+    assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
+
+    # Verify image UUID appears
+    assert "uuid-image-seashore" in mm_key_hashes, (
+        f"Expected 'uuid-image-seashore' in mm_keys, got: {mm_key_hashes}")
+
+    # Verify video UUID appears
+    assert "uuid-video-tokyo-walk" in mm_key_hashes, (
+        f"Expected 'uuid-video-tokyo-walk' in mm_keys, got: {mm_key_hashes}")
+
+    # Verify at least one hex hash exists (for the None image UUID case)
+    hex_hashes = [
+        h for h in mm_key_hashes
+        if len(h) == 64 and all(c in '0123456789abcdef' for c in h)
+    ]
+    assert len(hex_hashes) >= 1, (
+        f"Expected at least one hex hash for None UUID, got: {mm_key_hashes}")
 
 
 @pytest.fixture(scope="module", params=[False, True])

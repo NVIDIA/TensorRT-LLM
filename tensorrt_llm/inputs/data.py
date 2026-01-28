@@ -17,6 +17,15 @@ class TextPrompt(TypedDict):
     if the model supports it.
     """
 
+    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    """
+    Optional user-provided UUIDs for multimodal items.
+    Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
+    When a UUID is provided for an item, it will be returned in KV cache events
+    instead of the computed content hash. Use None to fall back to content
+    hashing for specific items.
+    """
+
     mm_processor_kwargs: NotRequired[Dict[str, Any]]
     """
     Optional multi-modal processor kwargs to be forwarded to the
@@ -37,6 +46,15 @@ class TokensPrompt(TypedDict):
     """
     Optional multi-modal data to pass to the model,
     if the model supports it.
+    """
+
+    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    """
+    Optional user-provided UUIDs for multimodal items.
+    Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
+    When a UUID is provided for an item, it will be returned in KV cache events
+    instead of the computed content hash. Use None to fall back to content
+    hashing for specific items.
     """
 
     mm_processor_kwargs: NotRequired[Dict[str, Any]]

@@ -188,6 +188,283 @@ def test_mm_keys_deserialization():
     assert len(recovered_hash4) == 32
 
 
+def test_mm_key_with_uuid():
+    """Test _mm_key_to_json returns UUID when provided in the tuple."""
+    # Create a mock mm_key with new format (hash, offset, uuid)
+    mock_hash = b'\x01\x02\x03\x04\x05\x06\x07\x08' + b'\x00' * 24  # 32 bytes
+    mock_offset = 42
+    expected_hash = "0102030405060708" + "00" * 24
+
+    # Test 1: Without UUID (None), should return hex hash
+    mock_mm_key_no_uuid = (mock_hash, mock_offset, None)
+    result_no_uuid = KVCacheEventSerializer._mm_key_to_json(mock_mm_key_no_uuid)
+    assert result_no_uuid["hash"] == expected_hash
+    assert result_no_uuid["start_offset"] == 42
+
+    # Test 2: With UUID in tuple, should return UUID directly
+    test_uuid = "my-custom-image-uuid"
+    mock_mm_key_with_uuid = (mock_hash, mock_offset, test_uuid)
+    result_with_uuid = KVCacheEventSerializer._mm_key_to_json(
+        mock_mm_key_with_uuid)
+    assert result_with_uuid["hash"] == test_uuid
+    assert result_with_uuid["start_offset"] == 42
+
+    # Test 3: Backward compatibility - old format (2 elements) should return hex hash
+    mock_mm_key_old_format = (mock_hash, mock_offset)
+    result_old_format = KVCacheEventSerializer._mm_key_to_json(
+        mock_mm_key_old_format)
+    assert result_old_format["hash"] == expected_hash
+
+
+def test_uuid_to_hash():
+    """Test UUID to hash conversion."""
+    from tensorrt_llm.inputs.multimodal import uuid_to_hash
+
+    # Short UUID (< 32 bytes) - should be zero-padded
+    short_uuid = "sku-1234"
+    short_hash = uuid_to_hash(short_uuid)
+    assert len(short_hash) == 64  # 32 bytes = 64 hex chars
+    # Verify it starts with the UUID bytes in hex
+    expected_start = short_uuid.encode('utf-8').hex()
+    assert short_hash.startswith(expected_start)
+    # Rest should be zeros
+    assert short_hash[len(expected_start):] == '00' * (32 - len(short_uuid))
+
+    # Exactly 32 bytes - should not be hashed
+    exact_uuid = "a" * 32
+    exact_hash = uuid_to_hash(exact_uuid)
+    assert len(exact_hash) == 64
+    assert exact_hash == exact_uuid.encode('utf-8').hex()
+
+    # Long UUID (> 32 bytes) - should be hashed
+    long_uuid = "this-is-a-very-long-uuid-that-exceeds-32-bytes-limit"
+    long_hash = uuid_to_hash(long_uuid)
+    assert len(long_hash) == 64  # Should still be 64 hex chars (32 bytes)
+    # Should not match the padded version (it was hashed)
+    assert not long_hash.startswith(long_uuid[:32].encode('utf-8').hex())
+
+
+def test_apply_mm_hashes_with_uuids():
+    """Test apply_mm_hashes with user-provided UUIDs."""
+    import torch
+
+    from tensorrt_llm.inputs.multimodal import apply_mm_hashes, uuid_to_hash
+
+    # Create mock multimodal data
+    mock_image1 = torch.randn(3, 224, 224)
+    mock_image2 = torch.randn(3, 224, 224)
+    mm_data = {"image": [mock_image1, mock_image2]}
+
+    # Test without UUIDs - should use content hashing
+    hashes_no_uuid, uuids_no_uuid = apply_mm_hashes(mm_data)
+    assert len(hashes_no_uuid["image"]) == 2
+    assert all(len(h) == 64 for h in hashes_no_uuid["image"])
+    assert uuids_no_uuid is None
+
+    # Test with partial UUIDs (first has UUID, second uses content hash)
+    mm_uuids = {"image": ["sku-1234-a", None]}
+    hashes_partial, uuids_partial = apply_mm_hashes(mm_data, mm_uuids)
+
+    assert len(hashes_partial["image"]) == 2
+    # First hash should be from UUID
+    assert hashes_partial["image"][0] == uuid_to_hash("sku-1234-a")
+    # Second hash should be content-based (same as without UUID)
+    assert hashes_partial["image"][1] == hashes_no_uuid["image"][1]
+    # UUIDs list should have the UUID and None
+    assert uuids_partial == ["sku-1234-a", None]
+
+    # Test with all UUIDs
+    mm_uuids_all = {"image": ["sku-1234-a", "sku-1234-b"]}
+    hashes_all, uuids_all = apply_mm_hashes(mm_data, mm_uuids_all)
+
+    assert len(hashes_all["image"]) == 2
+    assert hashes_all["image"][0] == uuid_to_hash("sku-1234-a")
+    assert hashes_all["image"][1] == uuid_to_hash("sku-1234-b")
+    assert uuids_all == ["sku-1234-a", "sku-1234-b"]
+
+
+def test_int32_hexdigest_roundtrip():
+    """Test that hexdigest_to_int32 and int32_to_hexdigest are inverses."""
+    from tensorrt_llm.inputs.multimodal import (hexdigest_to_int32,
+                                                int32_to_hexdigest)
+
+    # Test with various hash patterns
+    test_hashes = [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "deadbeefcafebabefeedfacebadc0ffedeadbeefcafebabefeedfacebadc0ffe",
+    ]
+
+    for original_hex in test_hashes:
+        int32_values = hexdigest_to_int32(original_hex)
+        recovered_hex = int32_to_hexdigest(int32_values)
+        assert recovered_hex == original_hex, f"Roundtrip failed for {original_hex}"
+
+
+def test_multimodal_input_dataclass_with_uuids():
+    """Test Python MultimodalInput dataclass with UUIDs."""
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+    # Test with all UUIDs
+    mm_input = MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+                               multimodal_positions=[10],
+                               multimodal_lengths=[50],
+                               multimodal_uuids=["test-uuid-123"])
+
+    assert mm_input.multimodal_uuids == ["test-uuid-123"]
+
+    # Test with partial UUIDs (some None)
+    mm_input_partial = MultimodalInput(
+        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]],
+        multimodal_positions=[10, 100],
+        multimodal_lengths=[50, 60],
+        multimodal_uuids=["sku-001", None])
+
+    assert mm_input_partial.multimodal_uuids == ["sku-001", None]
+
+    # Test with None UUIDs (default)
+    mm_input_no_uuids = MultimodalInput(
+        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+        multimodal_positions=[10],
+        multimodal_lengths=[50])
+
+    assert mm_input_no_uuids.multimodal_uuids is None
+
+
+def test_multimodal_input_dataclass_uuid_validation():
+    """Test MultimodalInput validation for multimodal_uuids field."""
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+    # Test UUID list length mismatch
+    with pytest.raises(ValueError, match="multimodal_uuids length"):
+        MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8],
+                                           [8, 7, 6, 5, 4, 3, 2, 1]],
+                        multimodal_positions=[10, 100],
+                        multimodal_lengths=[50, 60],
+                        multimodal_uuids=["only-one-uuid"])
+
+    # Test invalid UUID type
+    with pytest.raises(TypeError, match="must be a string or None"):
+        MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+                        multimodal_positions=[10],
+                        multimodal_lengths=[50],
+                        multimodal_uuids=[123])  # Integer instead of string
+
+    # Test invalid multimodal_uuids type (not a list)
+    with pytest.raises(TypeError, match="multimodal_uuids must be a list"):
+        MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+                        multimodal_positions=[10],
+                        multimodal_lengths=[50],
+                        multimodal_uuids="not-a-list")
+
+
+def test_multimodal_input_from_components_with_uuids():
+    """Test MultimodalInput.from_components factory method with UUIDs."""
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+    mm_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
+    mm_positions = [10, 100]
+    mm_lengths = [50, 60]
+    mm_uuids = ["uuid-a", "uuid-b"]
+
+    mm_input = MultimodalInput.from_components(mm_hashes, mm_positions,
+                                               mm_lengths, mm_uuids)
+
+    assert mm_input.multimodal_hashes == mm_hashes
+    assert mm_input.multimodal_positions == mm_positions
+    assert mm_input.multimodal_lengths == mm_lengths
+    assert mm_input.multimodal_uuids == mm_uuids
+
+    # Test without UUIDs
+    mm_input_no_uuids = MultimodalInput.from_components(mm_hashes, mm_positions,
+                                                        mm_lengths)
+    assert mm_input_no_uuids.multimodal_uuids is None
+
+
+def test_uuid_to_hash_edge_cases():
+    """Test uuid_to_hash with edge cases."""
+    from tensorrt_llm.inputs.multimodal import uuid_to_hash
+
+    # Empty string
+    empty_hash = uuid_to_hash("")
+    assert len(empty_hash) == 64
+    assert empty_hash == "00" * 32  # All zeros
+
+    # Single character
+    single_char_hash = uuid_to_hash("a")
+    assert len(single_char_hash) == 64
+    assert single_char_hash.startswith("61")  # 'a' = 0x61
+    assert single_char_hash[2:] == "00" * 31
+
+    # Special characters in UUID
+    special_uuid = "sku-123/abc:def@test!"
+    special_hash = uuid_to_hash(special_uuid)
+    assert len(special_hash) == 64
+
+    # Unicode characters (will be encoded as UTF-8)
+    unicode_uuid = "测试-uuid-中文"
+    unicode_hash = uuid_to_hash(unicode_uuid)
+    assert len(unicode_hash) == 64
+
+    # Exactly 32 bytes (boundary case)
+    exactly_32 = "x" * 32
+    exactly_32_hash = uuid_to_hash(exactly_32)
+    assert len(exactly_32_hash) == 64
+    # Should be the hex encoding of 32 'x' characters
+    assert exactly_32_hash == "78" * 32  # 'x' = 0x78
+
+    # 33 bytes (just over, should be hashed)
+    over_32 = "y" * 33
+    over_32_hash = uuid_to_hash(over_32)
+    assert len(over_32_hash) == 64
+    # Should NOT be simple hex encoding
+    assert over_32_hash != "79" * 32 + "79"[:2]
+
+
+def test_apply_mm_hashes_uuid_length_mismatch():
+    """Test apply_mm_hashes raises error on UUID list length mismatch."""
+    import torch
+
+    from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+
+    mock_image1 = torch.randn(3, 224, 224)
+    mock_image2 = torch.randn(3, 224, 224)
+    mm_data = {"image": [mock_image1, mock_image2]}
+
+    # Mismatched UUID list length
+    mm_uuids_wrong_length = {"image": ["only-one-uuid"]}  # Should have 2
+
+    with pytest.raises(ValueError,
+                       match="UUID list length.*doesn't match.*data items"):
+        apply_mm_hashes(mm_data, mm_uuids_wrong_length)
+
+
+def test_apply_mm_hashes_multiple_modalities():
+    """Test apply_mm_hashes with multiple modalities and UUIDs."""
+    import torch
+
+    from tensorrt_llm.inputs.multimodal import apply_mm_hashes, uuid_to_hash
+
+    # Create mock data for multiple modalities
+    mock_image = torch.randn(3, 224, 224)
+    mock_video_frames = [torch.randn(3, 224, 224) for _ in range(4)]
+
+    mm_data = {"image": [mock_image], "video": [mock_video_frames]}
+
+    # UUIDs for each modality
+    mm_uuids = {"image": ["img-uuid-001"], "video": ["vid-uuid-001"]}
+
+    hashes, uuids_list = apply_mm_hashes(mm_data, mm_uuids)
+
+    # Check hashes are computed from UUIDs
+    assert hashes["image"][0] == uuid_to_hash("img-uuid-001")
+    assert hashes["video"][0] == uuid_to_hash("vid-uuid-001")
+
+    # Check flattened UUID list (order may vary based on dict iteration)
+    assert set(uuids_list) == {"img-uuid-001", "vid-uuid-001"}
+
+
 def test_mm_keys_in_stored_events():
     """Test that mm_keys field is present in stored block events."""
     llm = create_llm()
