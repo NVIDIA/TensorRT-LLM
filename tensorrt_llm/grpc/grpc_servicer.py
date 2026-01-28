@@ -96,7 +96,6 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 proto_config=request.sampling_config,
                 output_config=request.output_config,
                 max_tokens=request.max_tokens,
-                streaming=request.streaming,
                 end_id=request.end_id if request.HasField("end_id") else None,
                 pad_id=request.pad_id if request.HasField("pad_id") else None,
                 bad_words=list(request.bad_words) if request.bad_words else None,
