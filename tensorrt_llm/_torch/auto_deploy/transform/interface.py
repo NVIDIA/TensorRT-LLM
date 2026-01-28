@@ -28,6 +28,7 @@ from ..utils._graph import (
     run_shape_prop,
 )
 from ..utils.cuda_mem_tracker import get_mem_info
+from ..utils.graph_writer import graph_writer
 from ..utils.logger import ad_logger
 from .graph_module_visualizer import to_dot
 
@@ -488,7 +489,7 @@ class BaseTransform(ABC):
         self._visualize_graph(mod, idx)
 
         # Dump graph after transform for debugging (controlled by AD_DUMP_GRAPHS_DIR env var)
-        ad_logger.dump_graph(mod, t_name, self.config.stage.value)
+        graph_writer.dump_graph(mod, t_name, self.config.stage.value)
 
         # return the graph module
         return mod

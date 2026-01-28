@@ -201,8 +201,12 @@ def _rename_nodes_with_module_hierarchy(gm: fx.GraphModule) -> None:
         if node.op != "call_function":
             continue
 
-        nn_stack = node.meta.get("nn_module_stack")
-        if not nn_stack:
+        meta = getattr(node, "meta", None)
+        if not isinstance(meta, dict):
+            continue
+
+        nn_stack = meta.get("nn_module_stack")
+        if not nn_stack or not isinstance(nn_stack, dict):
             continue
 
         # Get innermost module path from the stack
