@@ -28,8 +28,8 @@ There are multiple MOE backends inside TensorRT LLM. Here are the support matrix
 | B200/GB200/B300/GB300 | MXFP8           | MXFP4            | TRTLLM      | Low Latency and Max Throughput |
 |         H200          | BF16            | MXFP4            | TRITON      | Low Latency and Max Throughput |
 
-The default moe backend is `CUTLASS`, so for the best possible perf, one must set the `moe_config.backend` explicitly to run the model.
-For Blackwell, `CUTLASS` was better for max throughput at first but now we have optimized `TRTLLM` moe to be universally faster. For Hopper, Triton is the faster backend.
+For Blackwell, the default MoE backend is `TRTLLM` which provides the best performance. Users don't need to explicitly set `moe_config.backend`.
+For Hopper, the `TRITON` backend is recommended for the best perf and users need to setup Triton Kernels locally following [GPT-OSS README](../../../examples/models/core/gpt_oss/README.md)
 
 ## Deployment Steps
 
