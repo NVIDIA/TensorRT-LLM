@@ -99,14 +99,6 @@ init_ubuntu() {
   pip3 install --ignore-installed pip setuptools wheel
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
-  # Remove previous TRT installation
-  if [[ $(apt list --installed | grep libnvinfer) ]]; then
-    apt-get remove --purge -y libnvinfer*
-  fi
-  if [[ $(apt list --installed | grep tensorrt) ]]; then
-    apt-get remove --purge -y tensorrt*
-  fi
-  pip3 uninstall -y tensorrt
 }
 
 install_python_rockylinux() {
