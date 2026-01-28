@@ -535,7 +535,7 @@ private:
                     = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
                 if (!symmetricBuffer0.isValid())
                 {
-                    TLLM_LOG_WARNING(
+                    TLLM_LOG_DEBUG(
                         "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
                         "falling back to non-symmetric ncclAllReduce (input buffer)");
                     // inputTensor and inputPtr remain pointing to original input
@@ -563,7 +563,7 @@ private:
         void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
         if (!windowBuffer1.isValid())
         {
-            TLLM_LOG_WARNING(
+            TLLM_LOG_DEBUG(
                 "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
                 "using plain CUDA tensor for output");
         }

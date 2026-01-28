@@ -389,11 +389,11 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     auto capture_err = cudaStreamIsCapturing(stream, &capture_status);
     if (capture_err != cudaSuccess)
     {
-        TLLM_LOG_WARNING("[NCCLUtil] cudaStreamIsCapturing failed: %s", cudaGetErrorString(capture_err));
+        TLLM_LOG_DEBUG("[NCCLUtil] cudaStreamIsCapturing failed: %s", cudaGetErrorString(capture_err));
     }
     if (capture_err == cudaSuccess && capture_status != cudaStreamCaptureStatusNone)
     {
-        TLLM_LOG_WARNING("[NCCLUtil] Skipping NCCL window allocation during capture for comm %p (requested: %zu)",
+        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation during capture for comm %p (requested: %zu)",
             static_cast<void*>(comm), size);
         return NCCLWindowBuffer();
     }

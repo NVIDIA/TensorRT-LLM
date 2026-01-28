@@ -386,15 +386,14 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_WARNING("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
     // Defensive validation: ensure buffer is valid before proceeding
     if (!buffer.isValid())
     {
-        TLLM_LOG_WARNING(
-            "[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
