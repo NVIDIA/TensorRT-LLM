@@ -87,10 +87,10 @@ class AccuracyConfig:
 # ============================================================================
 
 # Accuracy test uses accuracy_eval.log (markdown table output from lm_eval)
-# Note: Only log_file is used by AccuracyParser (accuracy_parser.py)
-# The regex pattern is hardcoded in AccuracyParser._extract_accuracy_values()
+# Note: submit.py generates separate log files for each task (e.g., 7_accuracy_eval_{task}.log)
+# Use glob pattern to automatically match all accuracy log files
 _COMMON_ACCURACY_METRICS = MetricsConfig(
-    log_file="7_accuracy_eval.log",
+    log_file="7_accuracy_eval_*.log",
     extractor_pattern=r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|",
     metric_names=["flexible-extract", "strict-match"],
 )
@@ -406,7 +406,7 @@ class ConfigLoader:
                 if "metrics" in acc_meta:
                     metrics_override = acc_meta["metrics"]
                     custom_metrics = MetricsConfig(
-                        log_file=metrics_override.get("log_file", "7_accuracy_eval.log"),
+                        log_file=metrics_override.get("log_file", "7_accuracy_eval_*.log"),
                         extractor_pattern=metrics_override.get(
                             "extractor_pattern",
                             r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|",
@@ -517,9 +517,10 @@ class ConfigLoader:
             ("slurm", "job_name"): lambda: EnvManager.get_slurm_job_name(),
             ("environment", "container_mount"): lambda: EnvManager.get_container_mount(model_name),
             ("environment", "container_image"): lambda: EnvManager.get_container_image(),
-            ("environment", "trtllm_repo"): lambda: EnvManager.get_repo_dir(),
+            ("environment", "trtllm_repo"): lambda: self._get_repo_dir(),
             ("environment", "trtllm_wheel_path"): lambda: EnvManager.get_trtllm_wheel_path(),
             ("benchmark", "dataset_file"): lambda: self._get_dataset_file(config),
+            ("accuracy", "env_var", "HF_HOME"): lambda: EnvManager.get_hf_home_dir(),
             ("environment", "work_dir"): lambda: EnvManager.get_script_dir(),
             ("environment", "model_path"): lambda: self._get_full_model_path(config),
             ("slurm", "script_file"): lambda: self._get_script_file(config),
@@ -528,10 +529,65 @@ class ConfigLoader:
         }
 
         # Apply overrides based on field paths
-        for (section, key), value_getter in field_mapping.items():
-            if section in config:
-                config[section][key] = value_getter()
+        for path, value_getter in field_mapping.items():
+            self._set_nested_value(config, path, value_getter())
+        
+        # Apply dynamic overrides for accuracy.tasks (task names are dynamic)
+        self._apply_accuracy_tasks_overrides(config)
+        
         return config
+
+    def _set_nested_value(self, config: dict, path: tuple, value: any) -> None:
+        """Set value at nested path in config.
+        
+        Supports arbitrary nesting depth using tuple paths.
+        Creates missing intermediate levels automatically.
+        
+        Args:
+            config: Configuration dictionary
+            path: Tuple of keys representing the path (e.g., ("a", "b", "c"))
+            value: Value to set
+        
+        Example:
+            _set_nested_value(config, ("accuracy", "env_var", "HF_HOME"), "/path")
+            # Sets config["accuracy"]["env_var"]["HF_HOME"] = "/path"
+        """
+        current = config
+        
+        # Traverse/create path, except for the last key
+        for key in path[:-1]:
+            if key not in current:
+                current[key] = {}
+            current = current[key]
+        
+        # Set the final value
+        current[path[-1]] = value
+
+    def _apply_accuracy_tasks_overrides(self, config: dict) -> None:
+        """Apply environment overrides for accuracy.tasks configuration.
+        
+        Handles dynamic task names (e.g., gsm8k, gpqa_diamond_local).
+        Replaces placeholders in custom_config paths.
+        
+        Args:
+            config: Configuration dictionary
+        """
+        if 'accuracy' not in config or 'tasks' not in config['accuracy']:
+            return
+        
+        repo_dir = EnvManager.get_repo_dir()
+        
+        # Iterate through all tasks (task names are dynamic)
+        for task_name, task_config in config['accuracy']['tasks'].items():
+            if not isinstance(task_config, dict):
+                continue
+            
+            # Replace <repo_path> in custom_config
+            if 'extra_kwargs' in task_config and 'custom_config' in task_config['extra_kwargs']:
+                custom_config_path = task_config['extra_kwargs']['custom_config']
+                if '<repo_path>' in custom_config_path:
+                    task_config['extra_kwargs']['custom_config'] = \
+                        custom_config_path.replace('<repo_path>', repo_dir)
 
     def _get_full_model_path(self, config: dict) -> str:
         """Get full model path by combining MODEL_DIR with model directory name.
@@ -546,6 +602,12 @@ class ConfigLoader:
         if model_dir_name:
             return os.path.join(EnvManager.get_model_dir(), model_dir_name)
         else:
+            return ""
+    
+    def _get_repo_dir(self):
+        if EnvManager.get_install_mode() == "source":
+            return EnvManager.get_repo_dir()
+        else: # wheel/none install_mode, no need to set repo_dir
             return ""
 
     def _get_dataset_file(self, config: dict) -> str:
