@@ -2966,6 +2966,7 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(10800)
 @pytest.mark.skip_less_device_memory(180000)
 class TestKimiK2(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
