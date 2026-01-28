@@ -34,7 +34,9 @@ if IS_FLASHINFER_AVAILABLE:
     ]
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from .cute_dsl_custom_ops import cute_dsl_nvfp4_gemm_blackwell
+    from .cute_dsl_custom_ops import (cute_dsl_bf16_gemm_blackwell,
+                                      cute_dsl_nvfp4_gemm_blackwell)
     __all__ += [
         'cute_dsl_nvfp4_gemm_blackwell',
+        'cute_dsl_bf16_gemm_blackwell',
     ]
