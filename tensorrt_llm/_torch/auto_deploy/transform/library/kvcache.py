@@ -39,6 +39,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info_in_mb
+from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ..interface import (
     BaseTransform,
@@ -194,8 +195,8 @@ class InsertCachedAttention(BaseTransform):
             enable_pt_cache_backend(True)
             self._log_info("Enabled PTCacheBackend for TRT-LLM attention (CUDA graph compatible)")
         elif self.config.backend == "trtllm" and not self.config.use_pt_cache_backend:
-            self._log_warning(
-                "TRT-LLM backend without PTCacheBackend may have limited CUDA graph support. "
+            ad_logger.warning(
+                "[TRT-LLM] Backend without PTCacheBackend may have limited CUDA graph support. "
                 "For optimal performance and full CUDA graph compatibility, "
                 "set use_pt_cache_backend=True in your config."
             )

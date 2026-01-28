@@ -262,12 +262,13 @@ class PTCacheBackend(CacheBackend):
         """Allocate pre-sized metadata tensors for CUDA graph compatibility."""
         max_batch = sequence_info.max_batch_size
         max_blocks = self._kv_cache_manager.max_blocks_per_seq
-        num_pools = self._kv_cache_manager.num_pools
 
         # Device tensors
         device = self._device
+        # Block offsets: [2, batch, max_blocks] - same layout as SimpleCacheBackend
+        # Dimension 0: K cache (index 0) and V cache (index 1) - both get same block indices
         self._kv_cache_block_offsets = torch.zeros(
-            num_pools, max_batch, 2, max_blocks, dtype=torch.int32, device=device
+            2, max_batch, max_blocks, dtype=torch.int32, device=device
         )
         self._sequence_length = torch.zeros(max_batch, dtype=torch.int32, device=device)
         self._context_lengths = torch.zeros(max_batch, dtype=torch.int32, device=device)
@@ -463,6 +464,9 @@ class PTCacheBackend(CacheBackend):
             if num_seq == 0:
                 return
 
+            # Check if we're capturing a CUDA graph
+            is_capturing = torch.cuda.is_current_stream_capturing()
+
             # Compute input sequence lengths from cumulative sums
             input_seq_lens = (cu_seqlen_host[1 : num_seq + 1] - cu_seqlen_host[:num_seq]).int()
 
@@ -470,26 +474,48 @@ class PTCacheBackend(CacheBackend):
             seq_len_with_cache = seq_len_with_cache_host[:num_seq].int()
             past_kv_lens = seq_len_with_cache - input_seq_lens
 
-            # Fill host tensors directly (always do this - safe during capture)
-            # These values get BAKED INTO the CUDA graph
-            self._host_past_key_value_lengths[:num_seq].copy_(past_kv_lens)
-            self._host_context_lengths[:num_seq].copy_(input_seq_lens)
-
-            # Request types: 0 = context (prefill), 1 = generation (decode)
-            if num_prefill > 0:
-                self._host_request_types[:num_prefill].fill_(0)
-            if num_decode > 0:
-                self._host_request_types[num_prefill:num_seq].fill_(1)
-
-            # Total KV lens
-            if num_prefill > 0:
-                self._host_total_kv_lens[0] = seq_len_with_cache[:num_prefill].sum()
+            # CUDA GRAPH FIX: During capture, host tensor VALUES are baked into the graph.
+            # The kernel uses these values for grid sizing and memory calculations.
+            # If we bake in small values (warmup), the kernel will crash when replayed
+            # with larger sequences.
+            #
+            # Fix: During capture, set host tensors to MAXIMUM values so the kernel
+            # grid is sized for the worst case. During replay, the device tensors
+            # have actual values and the kernel processes only valid data.
+            if is_capturing:
+                # Use max sequence length for all sequences during capture
+                # This ensures kernel grid is sized for maximum sequence length
+                max_seq = self._config.max_seq_len
+                self._host_past_key_value_lengths[:num_seq].fill_(max_seq)
+                self._host_context_lengths[:num_seq].fill_(max_seq)
+                # All decode during capture (ensures kernel handles generate path)
+                self._host_request_types[:num_seq].fill_(1)
+                # Max total KV lens
+                self._host_total_kv_lens[0] = 0  # No prefill during capture
+                self._host_total_kv_lens[1] = max_seq * num_seq
+                ad_logger.debug(
+                    f"[PTCacheBackend] CUDA graph capture: setting host tensors to max_seq={max_seq}"
+                )
             else:
-                self._host_total_kv_lens[0] = 0
-            if num_decode > 0:
-                self._host_total_kv_lens[1] = seq_len_with_cache[num_prefill:num_seq].sum()
-            else:
-                self._host_total_kv_lens[1] = 0
+                # Normal operation: fill host tensors with actual values
+                self._host_past_key_value_lengths[:num_seq].copy_(past_kv_lens)
+                self._host_context_lengths[:num_seq].copy_(input_seq_lens)
+
+                # Request types: 0 = context (prefill), 1 = generation (decode)
+                if num_prefill > 0:
+                    self._host_request_types[:num_prefill].fill_(0)
+                if num_decode > 0:
+                    self._host_request_types[num_prefill:num_seq].fill_(1)
+
+                # Total KV lens
+                if num_prefill > 0:
+                    self._host_total_kv_lens[0] = seq_len_with_cache[:num_prefill].sum()
+                else:
+                    self._host_total_kv_lens[0] = 0
+                if num_decode > 0:
+                    self._host_total_kv_lens[1] = seq_len_with_cache[num_prefill:num_seq].sum()
+                else:
+                    self._host_total_kv_lens[1] = 0
 
             # Device operations - skip during CUDA graph capture
             # Device tensor ADDRESSES are captured, so we can update data before replay
@@ -516,7 +542,8 @@ class PTCacheBackend(CacheBackend):
         """Fill block offsets from AD's cache_loc (vectorized).
 
         This converts AD's flat cache_loc + cumulative pages to TRT-LLM's
-        [num_pools, batch_size, 2, max_blocks_per_seq] format.
+        [2, batch_size, max_blocks_per_seq] format (same as SimpleCacheBackend).
+        Dimension 0 is K/V cache index (both get same block indices).
 
         Uses fully vectorized operations - no Python loops.
         """
@@ -524,10 +551,10 @@ class PTCacheBackend(CacheBackend):
             return
 
         # Get the relevant slice of block_offsets
-        # Shape: [num_pools, batch, 2, max_blocks]
+        # Shape: [2, batch, max_blocks] - same as SimpleCacheBackend
         block_offsets = self._kv_cache_block_offsets
         max_batch = block_offsets.shape[1]
-        max_blocks = block_offsets.shape[3]
+        max_blocks = block_offsets.shape[2]
         device = block_offsets.device
 
         # Bounds check: num_seq <= max_batch
@@ -540,11 +567,39 @@ class PTCacheBackend(CacheBackend):
         total_pages = cu_pages[num_seq].item()
 
         if total_pages == 0:
-            block_offsets[:, :num_seq, :, :].zero_()
+            block_offsets[:, :num_seq, :].zero_()  # Shape: [2, num_seq, max_blocks]
             return
 
+        # DEBUG: Track statistics for diagnosing 2k OSL issue
+        if not hasattr(self, "_fill_call_count"):
+            self._fill_call_count = 0
+            self._last_logged_pages = 0
+        self._fill_call_count += 1
+
+        # Log every 100 calls or when total_pages changes significantly
+        pages_per_seq_avg = total_pages / num_seq if num_seq > 0 else 0
+        should_log = self._fill_call_count % 100 == 0 or total_pages > self._last_logged_pages + 100
+        if should_log:
+            # Get max cache_loc value for bounds checking debug
+            cache_loc_slice = cache_loc[:total_pages]
+            max_cache_loc = cache_loc_slice.max().item() if total_pages > 0 else 0
+            # Also log host tensor values for CUDA graph debugging
+            max_seq_len = (
+                self._host_past_key_value_lengths[:num_seq].max().item() if num_seq > 0 else 0
+            )
+            total_kv_lens = self._host_total_kv_lens.tolist()
+            ad_logger.info(
+                f"[PTCacheBackend DEBUG] call={self._fill_call_count}, num_seq={num_seq}, "
+                f"total_pages={total_pages}, pages_per_seq_avg={pages_per_seq_avg:.1f}, "
+                f"max_blocks={max_blocks}, num_pages_pool={self._num_pages}, "
+                f"max_cache_loc={max_cache_loc}, max_past_kv_len={max_seq_len}, "
+                f"total_kv_lens={total_kv_lens}"
+            )
+            self._last_logged_pages = total_pages
+
         # Zero only the sequences we're updating
-        block_offsets[:, :num_seq, :, :].zero_()
+        # Shape: [2, num_seq, max_blocks]
+        block_offsets[:, :num_seq, :].zero_()
 
         # VECTORIZED: Create sequence indices for each page
         # Using searchsorted: for cu_pages=[0,2,5,7], page positions 0-6
@@ -560,7 +615,8 @@ class PTCacheBackend(CacheBackend):
         max_page_idx = page_idx.max().item() if total_pages > 0 else 0
         if max_page_idx >= max_blocks:
             ad_logger.error(
-                f"[PTCacheBackend] page_idx ({max_page_idx}) >= max_blocks ({max_blocks})"
+                f"[PTCacheBackend] page_idx ({max_page_idx}) >= max_blocks ({max_blocks}), "
+                f"call={self._fill_call_count}, total_pages={total_pages}, num_seq={num_seq}"
             )
             # Clamp to valid range
             page_idx = page_idx.clamp(max=max_blocks - 1)
@@ -568,7 +624,10 @@ class PTCacheBackend(CacheBackend):
         # Bounds check: seq_idx must be < num_seq
         max_seq_idx = seq_idx.max().item() if total_pages > 0 else 0
         if max_seq_idx >= num_seq:
-            ad_logger.error(f"[PTCacheBackend] seq_idx ({max_seq_idx}) >= num_seq ({num_seq})")
+            ad_logger.error(
+                f"[PTCacheBackend] seq_idx ({max_seq_idx}) >= num_seq ({num_seq}), "
+                f"call={self._fill_call_count}"
+            )
             # Clamp to valid range
             seq_idx = seq_idx.clamp(max=num_seq - 1)
 
@@ -577,7 +636,8 @@ class PTCacheBackend(CacheBackend):
         max_cache_loc = cache_loc_slice.max().item() if total_pages > 0 else 0
         if max_cache_loc >= self._num_pages:
             ad_logger.error(
-                f"[PTCacheBackend] cache_loc ({max_cache_loc}) >= num_pages ({self._num_pages})"
+                f"[PTCacheBackend] cache_loc ({max_cache_loc}) >= num_pages ({self._num_pages}), "
+                f"call={self._fill_call_count}, total_pages={total_pages}"
             )
 
         # Get cache_loc values and move indices to device
@@ -586,9 +646,25 @@ class PTCacheBackend(CacheBackend):
         page_idx_dev = page_idx.to(device)
 
         # Use advanced indexing to scatter values (no loop)
-        # Both K pool (index 0) and V pool (index 1) get same values
-        block_offsets[0, seq_idx_dev, 0, page_idx_dev] = cache_loc_vals
-        block_offsets[0, seq_idx_dev, 1, page_idx_dev] = cache_loc_vals
+        # Both K cache (index 0) and V cache (index 1) get same block indices
+        # Layout: [2, batch, max_blocks] - same as SimpleCacheBackend
+        block_offsets[0, seq_idx_dev, page_idx_dev] = cache_loc_vals  # K cache
+        block_offsets[1, seq_idx_dev, page_idx_dev] = cache_loc_vals  # V cache
+
+        # DEBUG: Optional sync to catch errors early (enable via env var)
+        import os
+
+        if os.environ.get("TRTLLM_AD_DEBUG_SYNC", "0") == "1":
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError as e:
+                ad_logger.error(
+                    f"[PTCacheBackend] CUDA error after scatter at call={self._fill_call_count}, "
+                    f"num_seq={num_seq}, total_pages={total_pages}, "
+                    f"max_page_idx={max_page_idx}, max_seq_idx={max_seq_idx}, "
+                    f"max_cache_loc={max_cache_loc}: {e}"
+                )
+                raise
 
     def get_host_prepare_metadata_args(self) -> List[str]:
         """Get argument names for the host prepare function."""

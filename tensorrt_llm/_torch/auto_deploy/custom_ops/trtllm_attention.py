@@ -136,9 +136,10 @@ class TrtllmLayerState:
             self.host_total_kv_lens = torch.zeros(
                 2, dtype=torch.int64, device="cpu", pin_memory=True
             )
-            # Pool pointers: [primary_pool_ptr, secondary_pool_ptr]
+            # Pool pointers: [num_pools, 2] where each row is [k_cache_ptr, v_cache_ptr]
+            # thop.attention expects 2D tensor: [num_pools, 2]
             self.host_kv_cache_pool_pointers = torch.zeros(
-                2, dtype=torch.int64, device="cpu", pin_memory=True
+                1, 2, dtype=torch.int64, device="cpu", pin_memory=True
             )
             # Pool mapping: which pool each sequence uses (all 0 for single pool)
             self.host_kv_cache_pool_mapping = torch.zeros(
@@ -275,10 +276,9 @@ def _prepare_trtllm_metadata(
 
     # Set up KV cache pool pointers
     # AD uses separate K and V caches - we need to pass their pointers
-    # For TRT-LLM, we use a single pool with K at offset 0 and V at offset 1
-    # But since AD has separate caches, we need to handle this differently
-    state.host_kv_cache_pool_pointers[0] = k_cache.data_ptr()
-    state.host_kv_cache_pool_pointers[1] = v_cache.data_ptr()
+    # Shape: [num_pools, 2] where each row is [k_cache_ptr, v_cache_ptr]
+    state.host_kv_cache_pool_pointers[0, 0] = k_cache.data_ptr()
+    state.host_kv_cache_pool_pointers[0, 1] = v_cache.data_ptr()
 
     # Pool mapping: all sequences use pool 0
     state.host_kv_cache_pool_mapping[:num_seq].fill_(0)
@@ -405,19 +405,25 @@ def trtllm_mha_with_cache(
         print(f"[DEBUG TRT-LLM AD] CUDA compute capability = {torch.cuda.get_device_capability(0)}")
         debug_state["printed_layers"].add(layer_idx)
 
-    # Print periodic stats
-    if debug_state["call_count"] % 1000 == 0:
-        print(
-            f"[DEBUG TRT-LLM AD] calls={debug_state['call_count']}, "
-            f"prefill_only={debug_state['prefill_calls']}, "
-            f"decode_only={debug_state['decode_calls']}, "
-            f"mixed={debug_state['mixed_calls']}"
-        )
-
     # Get batch dimensions
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
+
+    # Print periodic stats (after num_seq is computed)
+    if debug_state["call_count"] % 100 == 0:
+        # Compute total context length for debugging
+        total_ctx_len = seq_len_with_cache_host[:num_seq].sum().item() if num_seq > 0 else 0
+        max_ctx_len = seq_len_with_cache_host[:num_seq].max().item() if num_seq > 0 else 0
+        total_pages = cu_num_pages_host[num_seq].item() if num_seq > 0 else 0
+        print(
+            f"[DEBUG TRT-LLM AD] calls={debug_state['call_count']}, "
+            f"prefill_only={debug_state['prefill_calls']}, "
+            f"decode_only={debug_state['decode_calls']}, "
+            f"mixed={debug_state['mixed_calls']}, "
+            f"num_seq={num_seq}, total_ctx={total_ctx_len}, "
+            f"max_ctx={max_ctx_len}, total_pages={total_pages}"
+        )
 
     # Reshape inputs to TRT-LLM expected format: [num_tokens, hidden_dim]
     q_shape_og = q.shape
@@ -474,9 +480,9 @@ def trtllm_mha_with_cache(
         host_context_lengths = pt_backend.host_context_lengths[:num_seq]
         host_request_types = pt_backend.host_request_types[:num_seq]
 
-        # Get block offsets - shape [num_pools, num_seq, 2, max_blocks]
-        # max_blocks = pt_backend.kv_cache_block_offsets.shape[-1]
-        kv_cache_block_offsets = pt_backend.kv_cache_block_offsets[:, :num_seq, :, :]
+        # Get block offsets - shape [2, num_seq, max_blocks] (same as SimpleCacheBackend)
+        # Dimension 0 is K/V cache index (both get same block indices)
+        kv_cache_block_offsets = pt_backend.kv_cache_block_offsets[:, :num_seq, :]
 
         # Get pool pointers and mapping from PTCacheBackend
         host_kv_cache_pool_pointers = pt_backend.get_pool_pointers()
@@ -536,6 +542,42 @@ def trtllm_mha_with_cache(
         spec_decoding_tensor_params.extend([None, None, None])
 
     mla_tensor_params = [None, None]
+
+    # DEBUG: Validate block offsets before attention call
+    # NOTE: Skip during CUDA graph capture since .item() requires sync
+    import os
+
+    is_capturing = torch.cuda.is_current_stream_capturing()
+    # Always print for first call to debug tensor shapes (call_count is already 1 after increment)
+    if debug_state["call_count"] == 1 and not is_capturing:
+        pool_ptrs_shape = (
+            host_kv_cache_pool_pointers.shape if host_kv_cache_pool_pointers is not None else None
+        )
+        pool_map_shape = (
+            host_kv_cache_pool_mapping.shape if host_kv_cache_pool_mapping is not None else None
+        )
+        print(
+            f"[DEBUG TRT-LLM AD SHAPES] layer={layer_idx}, "
+            f"block_offsets.shape={kv_cache_block_offsets.shape}, "
+            f"pool_ptrs.shape={pool_ptrs_shape}, "
+            f"pool_mapping.shape={pool_map_shape}, "
+            f"sequence_length.shape={sequence_length.shape}, "
+            f"context_lengths.shape={context_lengths.shape}, "
+            f"host_request_types.shape={host_request_types.shape}"
+        )
+    if (
+        os.environ.get("TRTLLM_AD_DEBUG_ATTN", "0") == "1"
+        and debug_state["call_count"] % 100 == 0
+        and not is_capturing
+    ):
+        max_block_idx = kv_cache_block_offsets.max().item()
+        print(
+            f"[DEBUG TRT-LLM AD] layer={layer_idx}, "
+            f"block_offsets.shape={kv_cache_block_offsets.shape}, "
+            f"max_block_idx={max_block_idx}, "
+            f"k_cache.shape={k_cache.shape}, "
+            f"pool_ptrs={host_kv_cache_pool_pointers.tolist() if host_kv_cache_pool_pointers is not None else None}"
+        )
 
     try:
         thop.attention(
