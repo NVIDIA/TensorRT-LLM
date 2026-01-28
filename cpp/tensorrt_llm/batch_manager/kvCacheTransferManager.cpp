@@ -136,6 +136,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 }
                 else
                 {
+                    // kRecurrentStates should never reach here, as they always copy full blocks.
                     auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
                     int const numLayers = pools[poolIdx].numLayers;
                     int const kvFactor = pools[poolIdx].kvFactor;

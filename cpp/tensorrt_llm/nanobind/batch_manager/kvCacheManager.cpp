@@ -304,6 +304,18 @@ public:
 
 void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 {
+    nb::class_<tbk::LinearAttentionMetadata>(m, "LinearAttentionMetadata")
+        .def(nb::init<>())
+        .def_rw("linear_layer_indices", &tbk::LinearAttentionMetadata::linearLayerIndices)
+        .def_rw("cache_type", &tbk::LinearAttentionMetadata::cacheType)
+        .def_rw("all_recurrent_states_bytes", &tbk::LinearAttentionMetadata::allRecurrentStatesBytes)
+        .def_rw("input_features_bytes_per_token", &tbk::LinearAttentionMetadata::inputFeaturesBytesPerToken)
+        .def_rw("states_snapshot_interval", &tbk::LinearAttentionMetadata::statesSnapshotInterval);
+
+    nb::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")
+        .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates)
+        .value("INPUT_FEATURES", tbk::LinearAttentionMetadata::LinearCacheType::kInputFeatures);
+
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
         .def(nb::init<>())
         .def_rw("max_num_blocks", &tbk::KvCacheStats::maxNumBlocks)
@@ -347,6 +359,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("is_cross_attention"), nb::arg("dtype"), nb::arg("model_config"), nb::arg("world_config"),
             nb::arg("window_size_to_layers"), nb::arg("allotted_primary_mem_bytes"),
             nb::arg("allotted_secondary_mem_bytes"), nb::arg("extra_cost_memory"), nb::arg("kv_factor"),
+            nb::arg("max_batch_size"), nb::arg("linear_attention_metadata") = std::nullopt,
             nb::call_guard<nb::gil_scoped_release>())
         .def("allocate_pools", &BaseKVCacheManager::allocatePools, nb::call_guard<nb::gil_scoped_release>())
         .def("release_pools", &BaseKVCacheManager::releasePools, nb::call_guard<nb::gil_scoped_release>())
@@ -514,7 +527,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                  std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
                  nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, bool, tbk::CacheType,
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32>(),
+                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32,
+                 std::optional<tbk::LinearAttentionMetadata>>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
@@ -524,7 +538,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
             nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
-            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::arg("linear_attention_metadata").none(),
+            nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

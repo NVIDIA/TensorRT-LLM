@@ -33,13 +33,15 @@ public:
 
     // TODO(TRTLLM-1564): Don't use a separate `initialize` function. Ensure eviction policies can't be in-between a
     // state of construction and initialization.
-    virtual void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
+    virtual void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> blocksPerCacheLevel,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
         = 0;
 
     /// @brief Get a free block from the specified cache level
     /// @returns The pointer to the free block, along with whether it can be offloaded
     virtual std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel) = 0;
+    virtual BlockPtr getPlaceholderBlock(WindowSizeType windowSize) = 0;
+    virtual BlockPtr findPlaceholderBlockById(KVCacheBlock::IdType blockId) = 0;
     /// @brief Release a block. Prioritize the block for eviction if toFront=true
     virtual void releaseBlock(BlockPtr block) = 0;
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
@@ -73,9 +75,11 @@ struct ExpiringBlockComparator
 class LRUEvictionPolicy : public BaseEvictionPolicy
 {
 public:
-    void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
+    void initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> blocksPerCacheLevel,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority) override;
     std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel) override;
+    BlockPtr getPlaceholderBlock(WindowSizeType windowSize) override;
+    BlockPtr findPlaceholderBlockById(KVCacheBlock::IdType blockId) override;
 
     void releaseBlock(BlockPtr block) override;
     void releaseBlock(BlockPtr block, bool toFront) override;
@@ -107,6 +111,9 @@ private:
     executor::RetentionPriority mSecondaryOffloadMinPriority;
     // Heap of block times
     std::set<BlockPtr, ExpiringBlockComparator> mExpiringBlockHeap;
+    std::set<BlockPtr> mPlaceholderBlockPool;
+    std::map<KVCacheBlock::IdType, BlockPtr> mAllPlaceholders;
+    SizeType32 mNextPlaceholderBlockId = KVCacheBlock::kCachedBlocksRootId - 1;
 };
 
 } // namespace tensorrt_llm::batch_manager::eviction_policy

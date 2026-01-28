@@ -33,10 +33,14 @@ public:
     static constexpr UnderlyingType kSecondaryPoolFlag = static_cast<UnderlyingType>(1)
         << (8 * sizeof(UnderlyingType) - 1);
 
+    static constexpr UnderlyingType kNullFlag = static_cast<UnderlyingType>(~0UL);
+
+    static const KVCacheIndex nullIndex;
+
     explicit KVCacheIndex(UnderlyingType value, bool isSecondary = false)
         : value{isSecondary ? value | kSecondaryPoolFlag : value}
     {
-        TLLM_CHECK_DEBUG(value >= 0);
+        TLLM_CHECK_DEBUG(value >= 0 && this->value != kNullFlag);
     }
 
     __host__ __device__ [[nodiscard]] UnderlyingType get() const
@@ -49,8 +53,20 @@ public:
         return (value & kSecondaryPoolFlag) == 0;
     }
 
+    [[nodiscard]] constexpr bool isNull() const
+    {
+        return value == kNullFlag;
+    }
+
 private:
     UnderlyingType value;
+
+    constexpr KVCacheIndex()
+        : value{kNullFlag}
+    {
+    }
 };
+
+constexpr KVCacheIndex KVCacheIndex::nullIndex{};
 
 } // namespace tensorrt_llm::kernels

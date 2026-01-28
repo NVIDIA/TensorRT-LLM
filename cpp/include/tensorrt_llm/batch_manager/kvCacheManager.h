@@ -20,6 +20,8 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -84,6 +86,7 @@ using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
+using WindowSizeType = SizeType32;
 
 // Type alias for multimodal hash key (hash array + start offset)
 using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
@@ -116,6 +119,137 @@ std::list<std::vector<T>> chopVectorIntoBlocks(
     }
     return blockedVectors;
 }
+
+struct LinearAttentionMetadata
+{
+    enum LinearCacheType : WindowSizeType
+    {
+        kRecurrentStates = static_cast<WindowSizeType>(0x80000001),
+        kInputFeatures = static_cast<WindowSizeType>(0x80000002),
+    };
+
+    std::vector<SizeType32> linearLayerIndices;
+    WindowSizeType cacheType;
+    SizeType32 allRecurrentStatesBytes; // Sum of all states like ssm_state and conv_state (1 layer)
+    SizeType32 inputFeaturesBytesPerToken;
+
+    SizeType32 statesSnapshotInterval; // Only used for SSM_CONV_STATE
+    bool saveLastSnapshot;             // Take additional snapshot of recurrent states at the end of the input sequence
+
+    [[nodiscard]] bool shouldAllocateRecurrentStates(
+        SizeType32 currentBlockEndTokenIdx, SizeType32 promptLen, SizeType32 tokensPerBlock) const
+    {
+        // Allocate the last full block for maximum reuse opportunity.
+        if (saveLastSnapshot && (currentBlockEndTokenIdx / tokensPerBlock == promptLen / tokensPerBlock))
+        {
+            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: saveLastSnapshot",
+                (currentBlockEndTokenIdx / tokensPerBlock - 1));
+            return true;
+        }
+
+        // Allocate the block that contains the end of the current sequence to save the final state.
+        if (currentBlockEndTokenIdx >= promptLen && currentBlockEndTokenIdx < promptLen + tokensPerBlock)
+        {
+            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: end of sequence",
+                (currentBlockEndTokenIdx / tokensPerBlock - 1));
+            return true;
+        }
+
+        // We have checked statesSnapshotInterval is multiple of mTokensPerBlock during WindowBlockManager
+        // initialization.
+        if ((statesSnapshotInterval > 0) && (currentBlockEndTokenIdx % statesSnapshotInterval == 0))
+        {
+            TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: statesSnapshotInterval",
+                (currentBlockEndTokenIdx / tokensPerBlock - 1));
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool hasLinearCache() const
+    {
+        return hasLinearCache(cacheType);
+    }
+
+    [[nodiscard]] bool hasRecurrentStatesCache() const
+    {
+        return hasRecurrentStatesCache(cacheType);
+    }
+
+    [[nodiscard]] bool hasInputFeaturesCache() const
+    {
+        return hasInputFeaturesCache(cacheType);
+    }
+
+    static constexpr bool hasLinearCache(WindowSizeType encodedWindowSize)
+    {
+        return encodedWindowSize < 0;
+    }
+
+    static constexpr bool hasRecurrentStatesCache(WindowSizeType encodedWindowSize)
+    {
+        return (static_cast<uint32_t>(encodedWindowSize) & static_cast<uint32_t>(LinearCacheType::kRecurrentStates))
+            == static_cast<uint32_t>(LinearCacheType::kRecurrentStates);
+    }
+
+    static constexpr bool hasInputFeaturesCache(WindowSizeType encodedWindowSize)
+    {
+        return (static_cast<uint32_t>(encodedWindowSize) & static_cast<uint32_t>(LinearCacheType::kInputFeatures))
+            == static_cast<uint32_t>(LinearCacheType::kInputFeatures);
+    }
+
+    static std::vector<WindowSizeType> splitCombinedCacheTypes(WindowSizeType encodedWindowSize)
+    {
+        std::vector<WindowSizeType> result;
+        if (hasRecurrentStatesCache(encodedWindowSize))
+        {
+            result.push_back(LinearCacheType::kRecurrentStates);
+        }
+        if (hasInputFeaturesCache(encodedWindowSize))
+        {
+            result.push_back(LinearCacheType::kInputFeatures);
+        }
+        return result;
+    }
+
+    [[nodiscard]] SizeType32 calcMaxLookupBlocks(
+        WindowSizeType encodedWindowSize, SizeType32 tokensPerBlock, size_t memoryBudget, SizeType32 maxBatchSize) const
+    {
+        auto memoryBlocks = calcMaxMemoryBlocks(encodedWindowSize, tokensPerBlock, memoryBudget, maxBatchSize);
+        if (hasRecurrentStatesCache(encodedWindowSize))
+        {
+            return (memoryBlocks - maxBatchSize) * (statesSnapshotInterval / tokensPerBlock);
+        }
+        return memoryBlocks;
+    }
+
+    [[nodiscard]] SizeType32 calcMaxMemoryBlocks(
+        WindowSizeType encodedWindowSize, SizeType32 tokensPerBlock, size_t memoryBudget, SizeType32 maxBatchSize) const
+    {
+        size_t const numLayers = linearLayerIndices.size();
+        if (hasRecurrentStatesCache(encodedWindowSize))
+        {
+            TLLM_CHECK_WITH_INFO(
+                encodedWindowSize == kRecurrentStates, "each pool must only serve on type of linear cache");
+            TLLM_CHECK_WITH_INFO(statesSnapshotInterval % tokensPerBlock == 0,
+                "statesSnapshotInterval must be multiple of tokensPerBlock");
+            // take a snapshot every `blockAlignment` blocks.
+            auto fixedBytes = allRecurrentStatesBytes * numLayers * maxBatchSize; // a slot for current recurrent states
+            auto perBlockBytes = allRecurrentStatesBytes * numLayers;
+            auto numDynamicBlocks = common::ceilDiv(memoryBudget - fixedBytes, perBlockBytes);
+            return static_cast<SizeType32>(numDynamicBlocks + maxBatchSize);
+        }
+        if (hasInputFeaturesCache(encodedWindowSize))
+        {
+            TLLM_CHECK_WITH_INFO(
+                encodedWindowSize == kInputFeatures, "each pool must only serve on type of linear cache");
+            return static_cast<SizeType32>(memoryBudget / (inputFeaturesBytesPerToken * numLayers) / tokensPerBlock);
+        }
+        TLLM_THROW("Unknown linear cache type");
+    }
+};
+
+using SizeType32 = WindowSizeType;
 
 struct TempAttentionWindowInputs
 {
@@ -355,7 +489,7 @@ std::ostream& operator<<(std::ostream& out,
     std::unordered_map<SizeType32, std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>>> const& matches);
 
 template <typename T>
-std::string streamPrint(T v)
+std::string streamPrint(T&& v)
 {
     std::stringstream out;
     out << v;
@@ -363,10 +497,10 @@ std::string streamPrint(T v)
 }
 
 template <typename C, typename... Args>
-std::string streamPrint(C callable, Args... remainingArgs)
+std::string streamPrint(C callable, Args&&... remainingArgs)
 {
     std::stringstream out;
-    out << callable(out, remainingArgs...);
+    out << callable(out, std::forward<Args>(remainingArgs)...);
     return out.str();
 }
 
@@ -458,6 +592,11 @@ public:
     void startScheduling();
 
     [[nodiscard]] IdType getBlockId() const;
+
+    [[nodiscard]] bool isPlaceholder() const
+    {
+        return mMemoryPoolBlockIndex.isNull();
+    }
 
     [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
 
@@ -567,7 +706,15 @@ private:
     // Pointer to search tree lookup node using this block
     LookupNodePtr mLookupNode;
     // Window size using this block (0 if not in use)
-    SizeType32 mWindowSize;
+    WindowSizeType mWindowSize;
+};
+
+class KVCacheBlockSet
+{
+public:
+private:
+    std::vector<BlockPtr> mPositiveIdMap;
+    std::vector<BlockPtr> mNegativeIdMap;
 };
 
 class GenerationRequest
@@ -794,7 +941,8 @@ public:
         std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
         std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr, bool enableIndexerKCache = false,
-        SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     ~WindowBlockManager();
 
@@ -918,10 +1066,7 @@ public:
         return static_cast<SizeType32>(mAllBlocksById.size());
     }
 
-    [[nodiscard]] BlockPtr const& getBlockById(KVCacheBlock::IdType blockId) const
-    {
-        return mAllBlocksById.at(blockId);
-    }
+    [[nodiscard]] BlockPtr getBlockById(KVCacheBlock::IdType blockId) const;
 
     [[nodiscard]] SizeType32 getTokensPerBlock() const noexcept
     {
@@ -1077,11 +1222,13 @@ public:
     }
 
 private:
+    bool tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams);
+
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
-    void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
+    void addBlockToBeam(BlockPtr const& block, GenerationRequest& sequence, SizeType32 beamIdx);
 
     //! \brief Add single block to all beams of sequence.
-    void addBlockToAllBeams(BlockPtr& block, GenerationRequest& sequence);
+    void addBlockToAllBeams(BlockPtr const& block, GenerationRequest& sequence);
 
     //! \brief Try to load blocks from cache. Allocate new blocks if necessary.
     //! \param blockKeys Key of each block.
@@ -1089,7 +1236,7 @@ private:
     //! \return Number of matched tokens from loaded blocks.
     SizeType32 loadOrAllocateBlocks(
         std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>> const& matchedBlocks,
-        SizeType32 numContextBlocks, GenerationRequest& sequence,
+        SizeType32 numContextBlocks, GenerationRequest& sequence, LlmRequest& llmRequest,
         std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
@@ -1102,6 +1249,13 @@ private:
 
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
+
+    //! \brief This WindowBlockManager is for holding SSM states for linear attention models.
+    [[nodiscard]] bool isRecurrentState() const
+    {
+        return mLinearAttentionMetadata.has_value()
+            && LinearAttentionMetadata::hasRecurrentStatesCache(mLinearAttentionMetadata->cacheType);
+    }
 
 private:
     nvinfer1::DataType mDataType;
@@ -1180,6 +1334,8 @@ private:
     SizeType32 mIndexerKCacheQuantBlockSize;
     // Index head dim for indexer K cache
     SizeType32 mIndexerKCacheIndexHeadDim;
+
+    std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
 };
 
 class BlockManager
@@ -1200,7 +1356,8 @@ public:
         bool copyOnPartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
-        SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     [[nodiscard]] bool isEnableIndexerKCache() const
     {
@@ -1304,7 +1461,7 @@ public:
 
     [[nodiscard]] SizeType32 getNumFreeBlocks() const
     {
-        return sumWindows([](auto const& manager) { return manager.getNumFreeBlocks(); });
+        return sumWindows([](WindowBlockManager const& manager) { return manager.getNumFreeBlocks(); });
     }
 
     [[nodiscard]] bool schedulingHasFreeBlocks(SizeType32 numRequired, SizeType32 windowSize) const
@@ -1452,7 +1609,7 @@ public:
         return sumWindows([](auto const& manager) { return manager.getMaxNumBlocks(); });
     }
 
-    [[nodiscard]] BlockPtr const& getBlockById(KVCacheBlock::IdType blockId, SizeType32 windowSize) const
+    [[nodiscard]] BlockPtr getBlockById(KVCacheBlock::IdType blockId, SizeType32 windowSize) const
     {
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
     }
@@ -1561,6 +1718,7 @@ private:
     bool mIsVariableWindow;
     bool mIsVariableGQA;
 
+    std::vector<SizeType32> mUniqueWindowSizes;
     std::map<SizeType32, WindowBlockManager> mWindowBlockManagers;
     std::map<SizeType32, WindowSizeMetadata> mWindowSizeToMetadata;
     std::vector<SizeType32> mLayerToWindowSize;
@@ -1578,6 +1736,7 @@ private:
     bool mIsEnableIndexerKCache{false};
     SizeType32 mIndexerKCacheQuantBlockSize{0};
     SizeType32 mIndexerKCacheIndexHeadDim{0};
+    std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
 };
 
 struct OffsetTableDimensions
@@ -1785,7 +1944,8 @@ public:
         bool isCrossAttention, nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig,
         std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
-        uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor);
+        uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor, SizeType32 maxBatchSize,
+        std::optional<LinearAttentionMetadata> const& linearAttentionMetadata = std::nullopt);
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
     /// the provided input and output length.
@@ -1824,7 +1984,8 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1837,7 +1998,8 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1850,7 +2012,8 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1859,7 +2022,8 @@ public:
         SizeType32 sinkTokenLength, int64_t stream, SizeType32 maxSequenceLength, bool enableBlockReuse = false,
         bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true,
         bool copyOnpartialReuse = true, bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0);
+        SizeType32 indexerKCacheIndexHeadDim = 0,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     ~KVCacheManager() override = default;
 
@@ -1916,7 +2080,12 @@ public:
 
     [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize() const
     {
-        return mBlockManager.getNumFreeBlocksPerWindowSize();
+        auto src = mBlockManager.getNumFreeBlocksPerWindowSize();
+        std::map<SizeType32, SizeType32> dst;
+        std::transform(src.cbegin(), src.cend(), std::inserter(dst, dst.end()),
+            [](std::pair<SizeType32 const, SizeType32> const& pair)
+            { return std::make_pair(static_cast<SizeType32>(pair.first), pair.second); });
+        return dst;
     }
 
     [[nodiscard]] KvCacheStats getKvCacheStats() const override

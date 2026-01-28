@@ -1156,6 +1156,8 @@ class KVCacheManager(BaseResourceManager):
             allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
             extra_cost_memory=extra_cost_memory,
             kv_factor=self.kv_factor,
+            max_batch_size=self.max_batch_size,
+            # FIXME: add linearAttentionMeta
         )
         return blocks_per_window
 

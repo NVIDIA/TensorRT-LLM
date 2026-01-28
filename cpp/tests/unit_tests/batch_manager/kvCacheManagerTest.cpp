@@ -193,6 +193,435 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
         std::runtime_error);
 }
 
+namespace
+{
+void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 32;
+    auto constexpr blocksInPrimaryPool = 24;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+
+    auto maxAttentionWindow = numTokens;
+    auto numBlocksPerBeam = tc::ceilDiv(numTokens, tokensPerBlock);
+    SizeType32 constexpr linearWindowSizeCode = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata linearAttentionMetadata{
+        // .linearLayerIndices = {2, 5, 8, 11},
+        .cacheType = linearWindowSizeCode,
+        .allRecurrentStatesBytes = 440 * 1024, // dummy value
+        .statesSnapshotInterval = tokensPerBlock * 2,
+        .saveLastSnapshot = true,
+    };
+
+    auto const blocksPerWindow = BlocksPerWindow{// {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, stream, numTokens * 2, beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode},
+        std::nullopt, nvinfer1::DataType::kHALF, 0, onboardBlocks, CacheType::kSELF, std::nullopt, nullptr, false, true,
+        nullptr, std::nullopt, false, 128, 0, linearAttentionMetadata);
+    blockManager.allocatePools(false);
+
+    EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
+    EXPECT_EQ(blockManager.getMaxNumBlocks(), blocksInPrimaryPool);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    auto constexpr requestId = 42;
+
+    // reuse disabled: basic allocation
+    // use 1 + beamWidth blocks
+    GenerationRequest seq0{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
+    blockManager.addSequence(seq0, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/false);
+    int numSharedBlocks = numBlocksPerBeam > 1 ? 1 : 0;
+    int numUnsharedBlocks = beamWidth == 1 ? 0 : beamWidth;
+    auto occupiedBlocksLinear = numSharedBlocks + numUnsharedBlocks;
+    TLLM_LOG_DEBUG("==========================================================");
+    EXPECT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocks(), occupiedBlocksLinear);
+
+    auto const& ids1 = seq0.getCacheBlockIds(linearWindowSizeCode);
+    std::set<std::int32_t> idSetPositive{};
+    std::set<std::int32_t> idSetNegative{};
+    EXPECT_EQ(ids1.size(), beamWidth);
+    for (auto const& beam : ids1)
+    {
+        EXPECT_EQ(beam.size(), numBlocksPerBeam);
+        for (auto id : beam)
+        {
+            if (id >= 0)
+            {
+                idSetPositive.insert(id);
+            }
+            else
+            {
+                idSetNegative.insert(id);
+            }
+        }
+    }
+    EXPECT_EQ(idSetPositive.size(), occupiedBlocksLinear);
+    EXPECT_EQ(
+        idSetNegative.size(), numBlocksPerBeam - (beamWidth == 1 ? 0 : 1) /* unshared last block */ - numSharedBlocks);
+
+    blockManager.releaseBlocks(seq0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    TLLM_LOG_DEBUG("==========================================================");
+    // reuse disabled: all beams should be the same
+    // use 1 block
+    blockManager.addSequence(seq0, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/true);
+    EXPECT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocks(), 1);
+    auto const& ids2 = seq0.getCacheBlockIds(linearWindowSizeCode);
+    EXPECT_EQ(ids2.size(), beamWidth);
+    for (std::size_t i = 0u; i < ids2.front().size(); ++i)
+    {
+        for (std::size_t beam = 1u; beam < ids2.size(); ++beam)
+        {
+            EXPECT_EQ(ids2.at(beam).at(i), ids2.at(0).at(i));
+        }
+    }
+    blockManager.releaseBlocks(seq0);
+    EXPECT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocks(), 0);
+    TLLM_LOG_DEBUG("==========================================================");
+
+    // block burn out
+    size_t i = 0;
+    for (; i < blocksInPrimaryPool / occupiedBlocksLinear; ++i)
+    {
+        GenerationRequest seq{requestId + 1 + i, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
+        EXPECT_NO_THROW(
+            blockManager.addSequence(seq, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/false));
+    }
+    // no more blocks
+    GenerationRequest seq3{requestId + 1 + i, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
+    EXPECT_THROW(
+        blockManager.addSequence(seq3, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/false),
+        std::runtime_error);
+}
+
+void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0, int numTokens1, int numReusedTokens)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 32;
+    auto constexpr blocksInPrimaryPool = 24;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+
+    auto maxAttentionWindow = numTokens0;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    SizeType32 constexpr linearWindowSizeCode = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata linearAttentionMetadata{
+        // .linearLayerIndices = {2, 5, 8, 11},
+        .cacheType = linearWindowSizeCode,
+        .allRecurrentStatesBytes = 440 * 1024, // dummy value
+        .statesSnapshotInterval = tokensPerBlock * 2,
+        .saveLastSnapshot = true,
+    };
+
+    auto const blocksPerWindow = BlocksPerWindow{// {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, stream, numTokens0 * 2, beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode},
+        std::nullopt, nvinfer1::DataType::kHALF, 0, onboardBlocks, CacheType::kSELF, std::nullopt, nullptr, false, true,
+        nullptr, std::nullopt, false, 128, 0, linearAttentionMetadata);
+    blockManager.allocatePools(false);
+
+    auto inputTokens0 = std::make_shared<VecTokens>();
+    for (int i = 0; i < numTokens0; ++i)
+    {
+        inputTokens0->push_back(i);
+    }
+    auto const inputLength = static_cast<SizeType32>(inputTokens0->size());
+    LlmRequest::RequestIdType requestId{0};
+    auto llmRequest0 = std::make_shared<LlmRequest>(requestId, numTokens0, inputTokens0, samplingConfig, isStreaming);
+
+    // reuse enabled: basic allocation
+    GenerationRequest seq0{requestId, numTokens0, beamWidth, blockManager.getWindowSizesMetadata()};
+    blockManager.addSequence(
+        seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, linearWindowSizeCode);
+    EXPECT_EQ(llmRequest0->getContextCurrentPosition(), 0);
+    int regularSnapshots = numTokens0 / linearAttentionMetadata.statesSnapshotInterval;
+    int currentState = beamWidth;
+    int lastSnapshot // only exists when: 1. the current block is not a full block. 2. the current-1 block is not
+                     // multiple of statesSnapshotInterval.
+        = (numTokens0 / linearAttentionMetadata.statesSnapshotInterval * linearAttentionMetadata.statesSnapshotInterval
+              != numTokens0 / tokensPerBlock * tokensPerBlock)
+            && (numTokens0 % tokensPerBlock != 0)
+        ? 1
+        : 0;
+    auto occupiedBlocksLinear = regularSnapshots + currentState + lastSnapshot;
+    auto totalBlocks = tc::ceilDiv(numTokens0, tokensPerBlock) + beamWidth - 1;
+    auto placeholderBlocks = totalBlocks - occupiedBlocksLinear;
+    TLLM_LOG_DEBUG("==========================================================");
+    EXPECT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocks(), occupiedBlocksLinear);
+
+    auto ids0 = seq0.getCacheBlockIds(linearWindowSizeCode); // copy
+    std::set<std::int32_t> idSetPositive{};
+    std::set<std::int32_t> idSetNegative{};
+    EXPECT_EQ(ids0.size(), beamWidth);
+    for (auto const& beam : ids0)
+    {
+        EXPECT_EQ(beam.size(), tc::ceilDiv(numTokens0, tokensPerBlock));
+        for (auto id : beam)
+        {
+            if (id >= 0)
+            {
+                idSetPositive.insert(id);
+            }
+            else
+            {
+                idSetNegative.insert(id);
+            }
+        }
+    }
+    EXPECT_EQ(idSetPositive.size(), occupiedBlocksLinear);
+    EXPECT_EQ(idSetNegative.size(), placeholderBlocks);
+
+    blockManager.storeContextBlocks(seq0, *llmRequest0);
+    blockManager.releaseBlocks(seq0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    auto inputTokens1 = std::make_shared<VecTokens>();
+    for (int i = 0; i < numReusedTokens; ++i)
+    {
+        inputTokens1->push_back(i);
+    }
+    for (int i = numReusedTokens; i < numTokens1; ++i)
+    {
+        inputTokens1->push_back(1000 + i);
+    }
+
+    auto llmRequest1 = std::make_shared<LlmRequest>(1, numTokens1, inputTokens1, samplingConfig, isStreaming);
+    GenerationRequest seq1{1, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
+    blockManager.addSequence(
+        seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, linearWindowSizeCode);
+    int numReusedBlocks = numReusedTokens / tokensPerBlock;
+    for (; numReusedBlocks > 0; --numReusedBlocks)
+    {
+        if ((numReusedBlocks % (linearAttentionMetadata.statesSnapshotInterval / tokensPerBlock)
+                == 0)                                              // is a regular snapshot
+            || (numReusedBlocks == (numTokens0 / tokensPerBlock))) // is the last snapshot
+        {
+            break;
+        }
+    }
+    auto const& ids1 = seq1.getCacheBlockIds(linearWindowSizeCode);
+    for (int i = 0; i < numReusedBlocks; ++i)
+    {
+        for (int beam = 0; beam < beamWidth; ++beam)
+        {
+            if (ids0.at(beam).at(i) < 0 || ids1.at(beam).at(i) < 0)
+            {
+                continue;
+            }
+            EXPECT_EQ(ids1.at(beam).at(i), ids0.at(beam).at(i))
+                << "Block " << i << " should be reused for beam " << beam;
+        }
+    }
+
+    for (int i = numReusedBlocks; i < tc::ceilDiv(numTokens1, tokensPerBlock); ++i)
+    {
+        for (int beam = 0; beam < beamWidth; ++beam)
+        {
+            if (i >= ids0.at(beam).size() || ids0.at(beam).at(i) < 0 || ids1.at(beam).at(i) < 0)
+            {
+                continue;
+            }
+            EXPECT_NE(ids1.at(beam).at(i), ids0.at(beam).at(i))
+                << "Block " << i << " should NOT be reused for beam " << beam;
+        }
+    }
+}
+
+std::vector<std::vector<int>> getExpectedBlockIds(int beamWidth, int numTotalBlocks, int numContextBlocks,
+    int tokensPerBlock, bool enableContextReuse, int numContextTokens, int statesSnapshotInterval)
+{
+    std::vector<std::vector<int>> expectedBlockIds(beamWidth, std::vector<int>(numTotalBlocks, -1));
+    int blockId = -1;
+    int placeholderId = -1;
+    for (int blk = 0; blk < numTotalBlocks; ++blk)
+    {
+        bool shouldHaveMemory = false;
+        if (blk == numTotalBlocks - 1)
+        {
+            shouldHaveMemory = true;
+        }
+        else if (enableContextReuse && blk < numContextBlocks)
+        {
+            int blockEndTokenCount = (blk + 1) * tokensPerBlock;
+            shouldHaveMemory =
+                // regular snapshot
+                (blockEndTokenCount <= numContextTokens && blockEndTokenCount % statesSnapshotInterval == 0)
+                // last snapshot
+                || (blockEndTokenCount < numContextTokens && blockEndTokenCount + tokensPerBlock > numContextTokens);
+        }
+        else if (blk == numContextBlocks - 2 && beamWidth > 1)
+        {
+            // shouldHaveMemory = true;
+        }
+        bool sharedAmongBeams = blk < numContextBlocks - 1;
+        if (!sharedAmongBeams && shouldHaveMemory)
+        {
+            for (int beam = 0; beam < beamWidth; ++beam)
+            {
+                expectedBlockIds[beam][blk] = ++blockId;
+            }
+        }
+        else
+        {
+            int id = shouldHaveMemory ? ++blockId : --placeholderId;
+            for (int beam = 0; beam < beamWidth; ++beam)
+            {
+                expectedBlockIds[beam][blk] = id;
+            }
+        }
+    }
+    return expectedBlockIds;
+}
+
+void testKVCacheManagerLinearAttention_DecodingBlockGrowth(
+    int beamWidth, int numContextTokens, int numGenerateTokens, bool enableContextReuse)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 32;
+    auto constexpr blocksInPrimaryPool = 24;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+
+    auto constexpr batchSize = 1;
+    auto constexpr maxBlocksPerSeq = 10;
+    auto constexpr bytesPerToken = 4;
+    auto constexpr sinkTokenLen = 0;
+    auto constexpr canUseOneMoreBlock = true;
+
+    SizeType32 constexpr maxNewTokens{0};
+    auto constexpr beamIdx = 0;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto maxAttentionWindow = numContextTokens + numGenerateTokens + sinkTokenLen + 1;
+    SizeType32 constexpr linearWindowSizeCode = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata linearAttentionMetadata{
+        // .linearLayerIndices = {2, 5, 8, 11},
+        .cacheType = linearWindowSizeCode,
+        .allRecurrentStatesBytes = 440 * 1024, // dummy value
+        .statesSnapshotInterval = tokensPerBlock * 2,
+        .saveLastSnapshot = true,
+    };
+    auto const blocksPerWindow = BlocksPerWindow{// {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode},
+        /*blockSpanToWindowSize*/ std::nullopt,
+        /*primaryPoolDataType*/ nvinfer1::DataType::kHALF,
+        /*sinkTokenLen*/ sinkTokenLen,
+        /*stream*/ stream,
+        /*maxSequenceLength*/ maxAttentionWindow,
+        /*enableBlockReuse*/ enableContextReuse,
+        /*onboardBlocks*/ onboardBlocks,
+        /*cacheType*/ CacheType::kSELF,
+        /*secondaryOffloadMinPriority*/ std::nullopt,
+        /*eventManager*/ nullptr,
+        /*enablePartialReuse*/ false,
+        /*copyOnPartialReuse*/ true,
+        /*kvCacheConnectorManager*/ nullptr,
+        /*enableIndexerKCache*/ false,
+        /*indexerKCacheQuantBlockSize*/ 128,
+        /*indexerKCacheIndexHeadDim*/ 0,
+        /*linearAttentionMetadata*/ linearAttentionMetadata);
+
+    auto inputTokens0 = std::make_shared<VecTokens>();
+    for (int i = 0; i < numContextTokens; ++i)
+    {
+        inputTokens0->push_back(i);
+    }
+    auto const inputLength = static_cast<SizeType32>(inputTokens0->size());
+    LlmRequest::RequestIdType requestId{0};
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(requestId, numContextTokens, inputTokens0, samplingConfig, isStreaming);
+
+    // add context
+    kvCacheManager.addSequence(llmRequest0->mRequestId, numContextTokens, beamWidth, llmRequest0);
+
+    // check context blocks
+    auto numContextBlocks = tc::ceilDiv(numContextTokens, tokensPerBlock);
+    auto const blockIdsAfterContext = kvCacheManager.getCacheBlockIds(llmRequest0->mRequestId, linearWindowSizeCode);
+    auto expectedBlockIdsAfterContext = getExpectedBlockIds(beamWidth, numContextBlocks, numContextBlocks,
+        tokensPerBlock, enableContextReuse, numContextTokens, linearAttentionMetadata.statesSnapshotInterval);
+
+    for (int beam = 0; beam < beamWidth; ++beam)
+    {
+        for (int blk = 0; blk < numContextBlocks; ++blk)
+        {
+            EXPECT_EQ(blockIdsAfterContext[beam][blk], expectedBlockIdsAfterContext[beam][blk]);
+        }
+    }
+
+    // add generated tokens
+    for (int i = 0; i < numGenerateTokens; ++i)
+    {
+        kvCacheManager.addToken(llmRequest0->mRequestId);
+    }
+
+    // check all blocks
+    auto numTotalBlocks = tc::ceilDiv(numContextTokens + numGenerateTokens, tokensPerBlock);
+
+    auto const blockIds = kvCacheManager.getCacheBlockIds(llmRequest0->mRequestId, linearWindowSizeCode);
+    EXPECT_EQ(blockIds.size(), beamWidth);
+    for (auto const& beam : blockIds)
+    {
+        EXPECT_EQ(beam.size(), numTotalBlocks);
+    }
+
+    auto expectedBlockIds = getExpectedBlockIds(beamWidth, numTotalBlocks, numContextBlocks, tokensPerBlock,
+        enableContextReuse, numContextTokens, linearAttentionMetadata.statesSnapshotInterval);
+
+    for (int beam = 0; beam < beamWidth; ++beam)
+    {
+        for (int blk = 0; blk < numTotalBlocks; ++blk)
+        {
+            std::cout << expectedBlockIds[beam][blk] << " ";
+            EXPECT_EQ(blockIds[beam][blk], expectedBlockIds[beam][blk]);
+        }
+        std::cout << std::endl;
+    }
+}
+} // namespace
+
+TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest)
+{
+    // testBlockManagerLinearAttention_ContextNoReuse(4, 10);
+    // testBlockManagerLinearAttention_ContextNoReuse(8, 96);
+    // testBlockManagerLinearAttention_ContextNoReuse(8, 97);
+    // testBlockManagerLinearAttention_ContextNoReuse(1, 97);
+
+    // testBlockManagerLinearAttention_ContextReuse(4, 10, 135, 10);
+    // testBlockManagerLinearAttention_ContextReuse(4, 96, 135, 64);
+    // testBlockManagerLinearAttention_ContextReuse(4, 97, 135, 96);
+    // testBlockManagerLinearAttention_ContextReuse(1, 97, 135, 97);
+
+    testKVCacheManagerLinearAttention_DecodingBlockGrowth(1, 100, 100, true);
+    testKVCacheManagerLinearAttention_DecodingBlockGrowth(1, 100, 100, false);
+    testKVCacheManagerLinearAttention_DecodingBlockGrowth(4, 100, 100, true);
+    testKVCacheManagerLinearAttention_DecodingBlockGrowth(4, 100, 100, false);
+}
+
 template <typename T>
 void writePatternToOffloadedBlocksDRAM(T* rawBlockPtr, int blockSize, int mask)
 {
@@ -632,7 +1061,7 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
         beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
-        false, stream, true, onboardBlocks);
+        false, stream, maxAttentionWindow, true, onboardBlocks);
 
     // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16] (17 tokens, three blocks)
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
