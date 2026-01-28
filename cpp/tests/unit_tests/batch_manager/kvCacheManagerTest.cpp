@@ -4011,6 +4011,7 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
     SizeType32 constexpr maxNewTokens = 4;
     tr::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
+    tle::RetentionPriority constexpr highPriority = 80;
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {numBlocks, 0}}};
 
@@ -4026,7 +4027,7 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
 
     // Set high priority for context blocks
     llmRequest->setKvCacheRetentionConfig(
-        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 80)}, 80));
+        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, highPriority)}, highPriority));
 
     kvCacheManager.addSequence(0, inputLength, beamWidth, llmRequest);
     kvCacheManager.storeContextBlocks(*llmRequest);
@@ -4036,10 +4037,10 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
     auto cacheBlockIds = seq.getCacheBlockIds(maxAttentionWindow).at(0);
     ASSERT_GE(cacheBlockIds.size(), 1);
 
-    // Test 1: Valid block ID should return the set priority (80)
+    // Test 1: Valid block ID should return the set priority
     auto const validBlockId = cacheBlockIds[0];
     auto const retrievedPriority = kvCacheManager.getPriorityByBlockId(validBlockId, maxAttentionWindow);
-    EXPECT_EQ(retrievedPriority, 80);
+    EXPECT_EQ(retrievedPriority, highPriority);
 
     // Test 2: Invalid block ID (negative) should return default priority
     auto const invalidNegative = kvCacheManager.getPriorityByBlockId(-1, maxAttentionWindow);

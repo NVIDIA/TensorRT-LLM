@@ -2583,14 +2583,22 @@ void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bl
 
 tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId, SizeType32 windowSize) const
 {
-    BlockPtr const& block = mBlockManager.getBlockById(blockId, windowSize);
-    if (block)
+    try
     {
-        return block->getPriority();
+        BlockPtr const& block = mBlockManager.getBlockById(blockId, windowSize);
+        if (block)
+        {
+            return block->getPriority();
+        }
+        TLLM_LOG_WARNING("getPriorityByBlockId: Block ID %d not found in window %d", blockId, windowSize);
+        return tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
     }
-
-    TLLM_LOG_WARNING("getPriorityByBlockId: Block ID %d not found in window %d", blockId, windowSize);
-    return tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
+    catch (std::out_of_range const& ex)
+    {
+        TLLM_LOG_WARNING(
+            "getPriorityByBlockId: Block ID %d or window size %d out of range: %s", blockId, windowSize, ex.what());
+        return tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
+    }
 }
 
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
