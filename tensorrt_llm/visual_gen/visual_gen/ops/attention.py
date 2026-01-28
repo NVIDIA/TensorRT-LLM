@@ -164,6 +164,10 @@ class DefaultAttn(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         r"""Default attention is implemented with `F.scaled_dot_product_attention`.
 
@@ -194,6 +198,8 @@ class DefaultAttn(BaseAttn):
             raise NotImplementedError("Tensor layout not supported for DefaultAttn")
         if return_lse:
             raise NotImplementedError("Return LSE is not supported for DefaultAttn")
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for DefaultAttn")
 
         if get_dit_parallel_config().ring_size() > 1:
             raise NotImplementedError("Default attention not implemented for ring parallel")
@@ -278,6 +284,10 @@ class SageAttn(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         logger.debug("Using SageAttn")
         if tensor_layout not in ["HND", "NHD"]:
@@ -288,6 +298,8 @@ class SageAttn(BaseAttn):
             raise NotImplementedError("Dropout is not supported for Sage attention")
         if enable_gqa:
             raise NotImplementedError("GQA is not supported for Sage attention")
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for SageAttn")
 
         origin_dtype = query.dtype
         if query.dtype not in [
@@ -375,6 +387,10 @@ class SparseVideoGenAttn(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         logger.debug("Using SparseVideoGenAttn")
         if return_lse:
@@ -392,6 +408,9 @@ class SparseVideoGenAttn(BaseAttn):
             raise NotImplementedError(
                 f"Tensor layout {tensor_layout} not supported for SparseVideoGenAttn"
             )
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for SparseVideoGenAttn")
+
 
         origin_dtype = query.dtype
         if query.dtype not in [torch.float16, torch.bfloat16]:
@@ -525,6 +544,9 @@ class SparseVideoGenAttn2(BaseAttn):
             raise NotImplementedError(
                 f"Tensor layout {tensor_layout} not supported for SparseVideoGen2Attn"
             )
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for SparseVideoGen2Attn")
+
 
         origin_dtype = query.dtype
         if query.dtype not in [torch.float16, torch.bfloat16]:
@@ -660,11 +682,18 @@ class TRTLLMAttn(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         if return_lse:
             raise NotImplementedError("Return LSE is not supported for TRTLLMAttn")
         if tensor_layout not in ["HND", "NHD"]:
             raise NotImplementedError(f"Tensor layout {tensor_layout} not supported for TRTLLMAttn")
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for TRTLLMAttn")
+
         if tensor_layout == "NHD":
             # input shape: [B, S, H, D]
             batch_size = query.size(0)
@@ -732,7 +761,12 @@ class FlashAttn3(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=0,
+        max_seqlen_k=0,
     ):
+
         if flash_attn_interface is None:
             raise ImportError("FlashAttn3 is not installed")
 
@@ -756,25 +790,54 @@ class FlashAttn3(BaseAttn):
             key = key.to(torch.float16)
             value = value.to(torch.float16)
 
-        output = flash_attn_interface.flash_attn_func(
-            q=query,
-            k=key,
-            v=value,
-            softmax_scale=scale,
-            causal=is_causal,
-            qv=None,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            window_size=(-1, -1),
-            attention_chunk=0,
-            softcap=0.0,
-            num_splits=1,
-            pack_gqa=None,
-            deterministic=False,
-            sm_margin=0,
-            return_attn_probs=return_lse,
-        )
+        if cu_seqlens_q is None:
+            output = flash_attn_interface.flash_attn_func(
+                q=query,
+                k=key,
+                v=value,
+                softmax_scale=scale,
+                causal=is_causal,
+                qv=None,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                window_size=(-1, -1),
+                attention_chunk=0,
+                softcap=0.0,
+                num_splits=1,
+                pack_gqa=None,
+                deterministic=False,
+                sm_margin=0,
+                return_attn_probs=return_lse,
+            )
+        else:
+            query = torch.squeeze(query, dim=0)    
+            key = torch.squeeze(key, dim=0)
+            value = torch.squeeze(value, dim=0)
+            output = flash_attn_interface.flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                seqused_q=None,
+                seqused_k=None,
+                softmax_scale=scale,
+                causal=is_causal,
+                qv=None,
+                q_descale=None, k_descale=None, v_descale=None,
+                window_size=(-1, -1),
+                attention_chunk=0,
+                softcap=0.0,
+                num_splits=1,
+                pack_gqa=None,
+                deterministic=False,
+                sm_margin=0,
+                return_attn_probs=False,
+            )
+            output = torch.unsqueeze(output, dim=0)
 
         lse = None
         if isinstance(output, tuple):
@@ -786,7 +849,7 @@ class FlashAttn3(BaseAttn):
 
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
-
+ 
         if return_lse:
             assert lse is not None, "lse is not returned by FlashAttn3"
             return output, lse
@@ -808,6 +871,10 @@ class FlashAttn3FP8(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         if flash_attn_interface is None:
             raise ImportError("FlashAttn3 is not installed")
@@ -819,6 +886,8 @@ class FlashAttn3FP8(BaseAttn):
             raise NotImplementedError("Dropout is not supported for FlashAttn3")
         if tensor_layout not in ["HND", "NHD"]:
             raise NotImplementedError("Tensor layout not supported for FlashAttn3")
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for FlashAttn3FP8")
 
         if tensor_layout == "HND":
             query, key, value = self._convert_qkv_layout(
@@ -883,6 +952,10 @@ class FlashAttn4(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         if _flash_attn_fwd is None:
             raise ImportError("FlashAttn4 is not installed")
@@ -894,6 +967,8 @@ class FlashAttn4(BaseAttn):
             raise NotImplementedError("Dropout is not supported for FlashAttn4")
         if tensor_layout not in ["HND", "NHD"]:
             raise NotImplementedError("Tensor layout not supported for FlashAttn4")
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for FlashAttn4")
 
         if tensor_layout == "HND":
             query, key, value = self._convert_qkv_layout(
@@ -995,11 +1070,18 @@ class TransformerEngineAttn(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         if dropout_p != 0.0:
             raise NotImplementedError("Dropout is not supported by TransformerEngines")
         if return_lse:
             raise NotImplementedError("TransformerEngine does not support returning LSE")
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for TransformerEngineAttn")
+
         if tensor_layout.upper() == "HND":
             warn_once_hnd = True
             # TE only supports sbhd / bshd. h before s always needs transposing
@@ -1058,6 +1140,10 @@ class FlashInferVx(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         if flashinfer_vx is None:
             raise ImportError("FlashInferVx is not installed")
@@ -1075,6 +1161,8 @@ class FlashInferVx(BaseAttn):
             raise NotImplementedError("GQA is not supported for Sage attention")
         if is_causal:
             raise NotImplementedError("Caucal mask is not supported by SageAttn for Blackwell yet")
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("cu_seqlens_q is not supported for FlashInferVx")
 
         origin_dtype = query.dtype
         if query.dtype not in [
