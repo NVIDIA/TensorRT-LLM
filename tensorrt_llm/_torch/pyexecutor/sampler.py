@@ -1557,14 +1557,28 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         """
         if self._use_beam_search:
             self._prepare_beam_search(scheduled_requests.all_requests())
-        for request in scheduled_requests.all_requests():
+
+        seq_slots: list[int] = []
+        max_lens: list[int] = []
+        end_ids: list[int] = []
+        for request in scheduled_requests.context_requests:
             if self._is_new_request(request):
-                self.store.max_lengths_tensor[request.py_seq_slot].fill_(
+                seq_slots.append(request.py_seq_slot)
+                max_lens.append(
                     min(self.max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
                 )
-                self.store.end_ids[request.py_seq_slot].fill_(
-                    request.py_end_id if request.py_end_id is not None else -1
-                )
+                end_ids.append(request.py_end_id if request.py_end_id is not None else -1)
+        if len(seq_slots) > 0:
+            full_list = [seq_slots, max_lens, end_ids]
+            # perform only a single copy
+            full_list_tensor = torch.tensor(full_list, device="cpu", dtype=torch.int32).to(
+                device="cuda", non_blocking=True
+            )
+            seq_slots_tensor = full_list_tensor[0]
+            max_lens_tensor = full_list_tensor[1]
+            end_ids_tensor = full_list_tensor[2]
+            self.store.max_lengths_tensor[seq_slots_tensor] = max_lens_tensor
+            self.store.end_ids[seq_slots_tensor] = end_ids_tensor
 
     def _prepare_beam_search(
         self,
