@@ -70,12 +70,10 @@ class GrpcRequestManager:
         prompt_token_ids: List[int],
         sampling_params: SamplingParams,
         streaming: bool = True,
-        query_token_ids: Optional[List[int]] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
-        cache_salt: Optional[str] = None,
     ) -> AsyncGenerator[GenerationResult, None]:
         """Submit a generation request and stream outputs.
 
@@ -84,12 +82,10 @@ class GrpcRequestManager:
             prompt_token_ids: Pre-tokenized input from Rust router
             sampling_params: Sampling parameters (with detokenize=False!)
             streaming: Whether to stream results
-            query_token_ids: Query token IDs for VLM star attention
             lora_request: Optional LoRA adapter request
             prompt_adapter_request: Optional prompt adapter request
             kv_cache_retention_config: KV cache retention config
             disaggregated_params: Disaggregated inference params
-            cache_salt: Cache salt for KV cache hashing
 
         Yields:
             GenerationResult objects containing token IDs (text will be empty
@@ -186,6 +182,7 @@ class GrpcRequestManager:
             "model_path": "",
             "is_generation": True,
             "max_context_length": 0,
+            "max_seq_len": 0,
             "vocab_size": 0,
             "supports_vision": False,
         }
@@ -196,10 +193,20 @@ class GrpcRequestManager:
                 if hasattr(self.llm.args, "model"):
                     config["model_path"] = str(self.llm.args.model)
 
-            # Try to get model config
+            # Try to get tokenizer info
             if hasattr(self.llm, "tokenizer") and self.llm.tokenizer is not None:
                 if hasattr(self.llm.tokenizer, "vocab_size"):
                     config["vocab_size"] = self.llm.tokenizer.vocab_size
+
+            # Try to get max context length from various sources
+            if hasattr(self.llm, "args") and self.llm.args is not None:
+                args = self.llm.args
+                # Try max_input_len first (input context)
+                if hasattr(args, "max_input_len") and args.max_input_len:
+                    config["max_context_length"] = args.max_input_len
+                # Try max_seq_len (total sequence including output)
+                if hasattr(args, "max_seq_len") and args.max_seq_len:
+                    config["max_seq_len"] = args.max_seq_len
 
             # Check for multimodal support
             if hasattr(self.llm, "input_processor"):
@@ -207,7 +214,9 @@ class GrpcRequestManager:
                 config["supports_vision"] = processor_name != "DefaultInputProcessor"
 
         except Exception as e:
-            logger.warning(f"Error getting model config: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            logger.warning(
+                f"Error getting model config: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+            )
 
         return config
 
@@ -224,7 +233,6 @@ def create_sampling_params_from_proto(
     proto_config: pb2.SamplingConfig,
     output_config: pb2.OutputConfig,
     max_tokens: int,
-    streaming: bool = True,
     end_id: Optional[int] = None,
     pad_id: Optional[int] = None,
     bad_words: Optional[List[pb2.TokenSequence]] = None,
@@ -238,7 +246,6 @@ def create_sampling_params_from_proto(
         proto_config: Protobuf SamplingConfig message
         output_config: Protobuf OutputConfig message
         max_tokens: Maximum tokens to generate
-        streaming: Whether streaming is enabled
         end_id: End-of-sequence token ID
         pad_id: Padding token ID
         bad_words: Bad word token sequences
@@ -345,7 +352,8 @@ def create_sampling_params_from_proto(
         guide_content = guided_decoding.guide
 
         if guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_JSON:
-            kwargs["guided_decoding_params"] = GuidedDecodingParams(json=True)
+            # json_object=True for JSON validation without schema constraint
+            kwargs["guided_decoding_params"] = GuidedDecodingParams(json_object=True)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_JSON_SCHEMA:
             kwargs["guided_decoding_params"] = GuidedDecodingParams(json_schema=guide_content)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_REGEX:

@@ -22,6 +22,7 @@ with external routers (e.g., sgl-router) using pre-tokenized input.
 import asyncio
 import time
 from collections.abc import AsyncGenerator
+from typing import List
 
 import grpc
 
@@ -89,11 +90,6 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
                 return
 
             prompt_token_ids = list(request.tokenized.input_token_ids)
-            query_token_ids = (
-                list(request.tokenized.query_token_ids)
-                if request.tokenized.query_token_ids
-                else None
-            )
 
             # Build sampling params with detokenize=False (key optimization!)
             sampling_params = create_sampling_params_from_proto(
@@ -128,7 +124,6 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
                 prompt_token_ids=prompt_token_ids,
                 sampling_params=sampling_params,
                 streaming=request.streaming,
-                query_token_ids=query_token_ids,
                 lora_request=lora_request,
                 disaggregated_params=disaggregated_params,
             ):
@@ -140,7 +135,10 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
 
                 # Convert GenerationResult to protobuf response
                 if request.streaming:
-                    yield self._chunk_response(request_id, gen_result, prompt_token_ids)
+                    for chunk_response in self._chunk_responses(
+                        request_id, gen_result, prompt_token_ids
+                    ):
+                        yield chunk_response
 
                 # Send complete response when finished
                 if gen_result.finished:
@@ -246,7 +244,8 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         return trtllm_engine_pb2.GetModelInfoResponse(
             model_id=self.model_path or model_config.get("model_path", ""),
             max_input_len=model_config.get("max_context_length", 0),
-            max_seq_len=model_config.get("max_context_length", 0),
+            max_seq_len=model_config.get("max_seq_len", 0)
+            or model_config.get("max_context_length", 0),
             vocab_size=model_config.get("vocab_size", 0),
         )
 
@@ -271,26 +270,44 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
         except Exception:
             version = "unknown"
 
+        # Try to get parallelism info from LLM args
+        tp_size = 1
+        pp_size = 1
+        world_size = 1
+
+        try:
+            llm = self.request_manager.llm
+            if hasattr(llm, "args") and llm.args is not None:
+                args = llm.args
+                if hasattr(args, "tensor_parallel_size") and args.tensor_parallel_size:
+                    tp_size = args.tensor_parallel_size
+                if hasattr(args, "pipeline_parallel_size") and args.pipeline_parallel_size:
+                    pp_size = args.pipeline_parallel_size
+                world_size = tp_size * pp_size
+        except Exception as e:
+            logger.debug(f"Could not get parallelism info: {e}")
+
         return trtllm_engine_pb2.GetServerInfoResponse(
             version=version,
             backend="tensorrt-llm",
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-            context_parallel_size=1,
-            world_size=1,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            context_parallel_size=1,  # Context parallelism is separate from TP/PP
+            world_size=world_size,
         )
 
     # ========== Helper methods ==========
 
-    def _chunk_response(
+    def _chunk_responses(
         self,
         request_id: str,
         gen_result,
         prompt_token_ids: list,
-    ) -> trtllm_engine_pb2.GenerateResponse:
-        """Build a streaming chunk response from GenerationResult.
+    ) -> List[trtllm_engine_pb2.GenerateResponse]:
+        """Build streaming chunk responses from GenerationResult.
 
-        Uses token_ids_diff to get delta tokens.
+        Uses token_ids_diff to get delta tokens. For n>1, returns a response
+        for each output sequence.
 
         Args:
             request_id: The request ID
@@ -298,49 +315,61 @@ class TrtllmServiceServicer(trtllm_engine_pb2_grpc.TrtllmServiceServicer):
             prompt_token_ids: Original prompt tokens
 
         Returns:
-            GenerateResponse with chunk field set
+            List of GenerateResponse with chunk field set (one per output)
         """
-        # Get first output (for n=1)
-        completion = gen_result.outputs[0] if gen_result.outputs else None
+        responses = []
+        cached_tokens = gen_result.cached_tokens if hasattr(gen_result, "cached_tokens") else 0
 
-        if completion is None:
-            return trtllm_engine_pb2.GenerateResponse(
-                request_id=request_id,
-                chunk=trtllm_engine_pb2.GenerateStreamChunk(
-                    token_ids=[],
-                    prompt_tokens=len(prompt_token_ids),
-                    completion_tokens=0,
-                    cached_tokens=gen_result.cached_tokens
-                    if hasattr(gen_result, "cached_tokens")
-                    else 0,
-                ),
+        if not gen_result.outputs:
+            # No outputs yet, return empty chunk
+            responses.append(
+                trtllm_engine_pb2.GenerateResponse(
+                    request_id=request_id,
+                    chunk=trtllm_engine_pb2.GenerateStreamChunk(
+                        token_ids=[],
+                        prompt_tokens=len(prompt_token_ids),
+                        completion_tokens=0,
+                        cached_tokens=cached_tokens,
+                    ),
+                )
+            )
+            return responses
+
+        # Process all outputs (for n>1 support)
+        for completion in gen_result.outputs:
+            # token_ids_diff contains only new tokens since last iteration
+            delta_tokens = list(completion.token_ids_diff) if completion.token_ids_diff else []
+
+            # Skip if no new tokens for this sequence
+            if not delta_tokens:
+                continue
+
+            chunk = trtllm_engine_pb2.GenerateStreamChunk(
+                token_ids=delta_tokens,
+                sequence_index=completion.index,
+                prompt_tokens=len(prompt_token_ids),
+                completion_tokens=len(completion.token_ids) if completion.token_ids else 0,
+                cached_tokens=cached_tokens,
             )
 
-        # token_ids_diff contains only new tokens since last iteration
-        delta_tokens = list(completion.token_ids_diff) if completion.token_ids_diff else []
+            # Add logprobs if available
+            if completion.logprobs_diff:
+                for lp in completion.logprobs_diff:
+                    if isinstance(lp, dict):
+                        token_logprob = trtllm_engine_pb2.TokenLogprob(
+                            token_id=lp.get("token_id", 0),
+                            logprob=lp.get("logprob", 0.0),
+                        )
+                        chunk.logprobs.append(token_logprob)
 
-        chunk = trtllm_engine_pb2.GenerateStreamChunk(
-            token_ids=delta_tokens,
-            sequence_index=completion.index,
-            prompt_tokens=len(prompt_token_ids),
-            completion_tokens=len(completion.token_ids) if completion.token_ids else 0,
-            cached_tokens=gen_result.cached_tokens if hasattr(gen_result, "cached_tokens") else 0,
-        )
+            responses.append(
+                trtllm_engine_pb2.GenerateResponse(
+                    request_id=request_id,
+                    chunk=chunk,
+                )
+            )
 
-        # Add logprobs if available
-        if completion.logprobs_diff:
-            for lp in completion.logprobs_diff:
-                if isinstance(lp, dict):
-                    token_logprob = trtllm_engine_pb2.TokenLogprob(
-                        token_id=lp.get("token_id", 0),
-                        logprob=lp.get("logprob", 0.0),
-                    )
-                    chunk.logprobs.append(token_logprob)
-
-        return trtllm_engine_pb2.GenerateResponse(
-            request_id=request_id,
-            chunk=chunk,
-        )
+        return responses
 
     def _complete_response(
         self,
