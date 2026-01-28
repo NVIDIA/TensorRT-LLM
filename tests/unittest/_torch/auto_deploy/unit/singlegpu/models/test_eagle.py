@@ -156,7 +156,7 @@ def test_eagle_model_torch_export():
     hidden_dim = config.hidden_size
 
     input_ids = torch.randint(
-        0, model._original_vocab_size, (batch_size, seq_len), device=device, dtype=torch.long
+        0, config.vocab_size, (batch_size, seq_len), device=device, dtype=torch.long
     )
     position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
     mock_hidden_states = torch.randn((batch_size, seq_len, hidden_dim), device=device, dtype=dtype)

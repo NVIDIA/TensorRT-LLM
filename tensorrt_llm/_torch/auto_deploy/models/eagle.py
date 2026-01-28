@@ -45,14 +45,6 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
     The checkpoint config is expected to have the base model's model_type
     (e.g., "llama") along with Eagle-specific fields like draft_vocab_size.
-
-    Example:
-        factory = EagleDrafterFactory(
-            model="/path/to/eagle-llama-checkpoint",
-            tokenizer="/path/to/llama-tokenizer",
-        )
-        model = factory.build_model("meta")
-        factory.load_or_random_init(model, "cuda")
     """
 
     # Map config model_type -> Eagle drafter model class
@@ -61,17 +53,6 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
     }
 
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
-        """Build the Eagle drafter model on the desired device.
-
-        Args:
-            device: The device to build the model on ("meta", "cuda", etc.)
-
-        Returns:
-            The built Eagle drafter model.
-
-        Raises:
-            ValueError: If the checkpoint's model_type is not supported.
-        """
         model_config, unused_kwargs = self._get_model_config()
 
         # Select the appropriate drafter class based on the base model type
@@ -103,11 +84,6 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
         return model
 
     def build_and_load_model(self, device: DeviceLikeType) -> nn.Module:
-        """Not implemented for EagleDrafterFactory.
-
-        Raises:
-            NotImplementedError: Always. Use build_model() + load_or_random_init() instead.
-        """
         raise NotImplementedError(
             "EagleDrafterFactory does not support build_and_load_model(). "
             "Use build_model() + load_or_random_init() instead."

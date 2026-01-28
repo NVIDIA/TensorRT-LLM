@@ -18,14 +18,7 @@
 Eagle3 is a speculative decoding draft model that predicts next tokens based on
 hidden states from a target model (e.g., Llama-3.1-8B-Instruct).
 
-This implementation:
-- Defines Eagle3LlamaConfig with model_type="Eagle3LlamaForCausalLM"
-- Wraps Eagle3Model in Eagle3DrafterForCausalLM (HuggingFace-compatible interface)
-- Registers with AutoDeploy's custom model mechanism via AutoModelForCausalLMFactory
-
-Note: Eagle3 uses the same tokenizer as its target model (e.g., Llama), so when
-using this model, you must explicitly specify the tokenizer path pointing to the
-target model.
+This file contains model definitions used for executing Eagle3 speculative decoding in AutoDeploy.
 """
 
 from dataclasses import dataclass
@@ -289,18 +282,12 @@ class Eagle3DecoderLayer(nn.Module):
 
 
 class Eagle3Model(nn.Module):
-    """Core Eagle model architecture.
-
-    The model outputs logits over the draft vocabulary.
-    """
+    """Core Eagle model architecture."""
 
     def __init__(self, config):
         super().__init__()
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-
-        # Store original vocab size before patching
-        self._original_vocab_size = config.vocab_size
 
         if config.draft_vocab_size is not None and config.draft_vocab_size != config.vocab_size:
             # Vocab mappings for draft <-> target token conversion
@@ -413,9 +400,8 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
     ) -> Eagle3DraftOutput:
         """Forward pass compatible with HuggingFace/AutoDeploy interface.
 
-        Args:
+        Kwargs:
             hidden_states: Hidden states from the target model. Required.
-                In production speculative decoding, these come from the target model.
 
         Raises:
             ValueError: If hidden_states is not provided in kwargs.
