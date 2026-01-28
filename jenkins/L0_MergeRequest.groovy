@@ -25,8 +25,8 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
     SCAN_REPO = "${DEFAULT_SCAN_REPO}"
 }
-@Field String SCAN_COMMIT = "main"
-@Field String SCAN_ROOT = "scan"
+SCAN_COMMIT = "main"
+SCAN_ROOT = "scan"
 
 // Note: These variables access 'env' which is only available during pipeline execution
 // so they cannot be @Field with initialization
