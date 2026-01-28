@@ -393,7 +393,7 @@ class ModelLoader:
                 hf_quant_config = hf_config.get("quantization_config", None)
         if self.llm_args.model_kwargs is not None and "quantization_config" in self.llm_args.model_kwargs:
             logger.info(
-                f"Update hf_quant_config from model_kwargs: quantization_config={self.llm_args.model_kwargs["quantization_config"]} (previous value: {hf_quant_config})"
+                f"Update hf_quant_config from model_kwargs: quantization_config={self.llm_args.model_kwargs['quantization_config']} (previous value: {hf_quant_config})"
             )
             hf_quant_config = self.llm_args.model_kwargs["quantization_config"]
 
@@ -413,12 +413,11 @@ class ModelLoader:
                     self.llm_args.moe_config.backend)
                 quant_config.group_size = 32
                 quant_config.exclude_modules = [
-                    'block.*.attn.out', 'block.*.mlp.gate',
-                    'block.*.attn.qkv', 'embedding', 'unembedding'
+                    'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
+                    'embedding', 'unembedding'
                 ]
             # NOTE: This is for llm-compressor's quantized checkpoints.
-            elif hf_quant_config.get(
-                    "quant_method") == "compressed-tensors":
+            elif hf_quant_config.get("quant_method") == "compressed-tensors":
                 config_groups = hf_quant_config.get("config_groups")
                 if config_groups is None:
                     raise ValueError(
@@ -461,8 +460,7 @@ class ModelLoader:
                         f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
                         "Supported: 8.")
 
-                quant_config.exclude_modules = hf_quant_config.get(
-                    "ignore", [])
+                quant_config.exclude_modules = hf_quant_config.get("ignore", [])
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization_config: {hf_quant_config}.")
