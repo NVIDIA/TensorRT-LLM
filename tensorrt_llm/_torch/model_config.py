@@ -230,6 +230,33 @@ class ModelConfig(Generic[TConfig]):
         # once ModelType is used in pytorch flow.
 
     @staticmethod
+    def resolve_moe_backend(moe_backend: str, architecture: str) -> str:
+        """Resolve AUTO moe_backend to a specific backend based on model architecture.
+
+        Args:
+            moe_backend: The configured moe_backend (may be "AUTO")
+            architecture: The model architecture name (e.g., "GptOssForCausalLM")
+
+        Returns:
+            Resolved backend name (never "AUTO")
+        """
+        if moe_backend.upper() != "AUTO":
+            return moe_backend
+
+        # Models that prefer TRTLLM backend for better performance on Blackwell
+        TRTLLM_PREFERRED_ARCHS = {
+            "GptOssForCausalLM",
+        }
+
+        sm_version = get_sm_version()
+        # TRTLLM backend is preferred for Blackwell
+        if architecture in TRTLLM_PREFERRED_ARCHS and 100 <= sm_version < 120:
+            return "TRTLLM"
+
+        # Default fallback
+        return "CUTLASS"
+
+    @staticmethod
     def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
                                    moe_backend):
         quant_config = QuantConfig()
@@ -566,7 +593,12 @@ class ModelConfig(Generic[TConfig]):
 
         quant_config = QuantConfig()
         layer_quant_config = None
-        moe_backend = kwargs.get('moe_backend', 'CUTLASS')
+        moe_backend = kwargs.get('moe_backend', 'AUTO')
+        # Resolve AUTO to specific backend based on model architecture
+        architecture = pretrained_config.architectures[
+            0] if pretrained_config.architectures else ""
+        moe_backend = cls.resolve_moe_backend(moe_backend, architecture)
+        kwargs['moe_backend'] = moe_backend  # Update kwargs with resolved value
 
         # quantized ckpt in modelopt format
         if quant_config_file := cached_file(checkpoint_dir,

@@ -444,10 +444,11 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA",
-                     "TRITON"] = Field(default='CUTLASS',
-                                       description="MoE backend to use.")
+    backend: Literal["AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM",
+                     "DEEPGEMM", "VANILLA", "TRITON"] = Field(
+                         default='AUTO',
+                         description="MoE backend to use. "
+                         "AUTO selects default backend based on model.")
 
     max_num_tokens: Optional[int] = Field(
         default=None,
