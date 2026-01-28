@@ -699,7 +699,7 @@ def serve(
             "chat_template": chat_template,
             "metadata_server_config_file": metadata_server_config_file,
             "server_role": server_role,
-            "disagg_config_file": disagg_config_file,
+            "disagg_cluster_config": disagg_cluster_config,
         }
         for name, value in unsupported_args.items():
             if value is not None:
