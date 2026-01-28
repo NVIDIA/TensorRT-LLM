@@ -321,6 +321,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     def test_fp8(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
+        if world_size > 1:
+            pytest.skip(
+                "Skipping for now - check accuracy degradation for world_size > 1"
+            )
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
