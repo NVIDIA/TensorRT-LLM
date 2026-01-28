@@ -62,6 +62,7 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.6
       dtype: fp8
+      tokens_per_block: 64
     moe_config:
       backend: CUTEDSL
       load_balancer:
@@ -97,6 +98,7 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.6
       dtype: fp8
+      tokens_per_block: 64
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:

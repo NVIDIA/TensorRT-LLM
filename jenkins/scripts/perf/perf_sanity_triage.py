@@ -199,7 +199,11 @@ def process_regression_message(regression_dict):
                 current_job_id = job_id
 
             regression_info = data.get("s_regression_info", "N/A")
-            msg_parts.append(f"*REGRESSION TEST CASE {idx}: {test_case_name}*\n")
+            gpu_type = data.get("s_gpu_type", "N/A")
+            runtime = data.get("s_runtime", "N/A")
+            msg_parts.append(
+                f"*REGRESSION TEST CASE {idx}: {test_case_name} GPU: {gpu_type} Mode: {runtime}*\n"
+            )
             history_text = (
                 ", ".join(str(jid) for jid in history_job_ids) if history_job_ids else "N/A"
             )

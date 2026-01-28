@@ -105,8 +105,16 @@ def get_dataset_dir(dataset_file: Optional[str]) -> str:
     """Get dataset directory path from dataset file."""
     if not dataset_file or dataset_file == "<dataset_file>":
         return ""
+
     # return os.path.join(llm_models_root(), "datasets", "ShareGPT_V3_unfiltered_cleaned_split.json")
-    return os.path.join(llm_models_root(), dataset_file)
+    llm_models_path = os.path.join(llm_models_root(), dataset_file)
+    if os.path.exists(llm_models_path):
+        return llm_models_path
+    elif os.path.exists(dataset_file):
+        return dataset_file
+    else:
+        print_info(f"Dataset file not found in {llm_models_path} and {dataset_file}")
+        return ""
 
 
 def to_env_dict(env_vars: str) -> Dict[str, str]:
