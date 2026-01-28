@@ -135,7 +135,7 @@ DATASET_DEFAULTS = {
         "higher_is_better": True,
     },
     # Alias for gpqa_diamond (same task, different naming convention)
-    "gpqa_diamond_cot_zeroshot": {
+    "gpqa_diamond_local": {
         "alpha": 0.05,
         "beta": 0.2,
         "sigma": 50,
