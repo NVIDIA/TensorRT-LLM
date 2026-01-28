@@ -18,7 +18,7 @@ Usage:
     if supported:
         trtllm_gen_attention(q, k, v, output, ...)
     else:
-        # Fallback to thop.attention()
+        Fallback to thop.attention()
 """
 
 import math
@@ -50,13 +50,8 @@ WORKSPACE_ALIGNMENT = 256
 # Default KV layout for flashinfer
 DEFAULT_KV_LAYOUT = "HND"
 
-# Default backend name
+# Default backend name for flashinfer
 DEFAULT_BACKEND = "trtllm-gen"
-
-
-########################################################
-# Configuration Classes
-########################################################
 
 
 @dataclass
@@ -152,6 +147,10 @@ class TrtllmGenSupportChecker:
 
     # Minimum tokens per block
     MIN_TOKENS_PER_BLOCK = 8
+
+    # Supported tokens_per_block values for trtllm-gen kernels
+    # TODO: Why flashinfer trtllm-gen kernels doesn't support 128?
+    SUPPORTED_TOKENS_PER_BLOCK = {64}
 
     @classmethod
     def check_hardware(cls) -> Tuple[bool, str]:
@@ -286,9 +285,6 @@ class TrtllmGenSupportChecker:
 
         return True, ""
 
-    # Supported tokens_per_block values for trtllm-gen kernels
-    SUPPORTED_TOKENS_PER_BLOCK = {64}
-
     @classmethod
     def check_paged_kv_cache(cls, config: AttentionConfig) -> Tuple[bool, str]:
         """Check paged KV cache configuration."""
@@ -359,11 +355,6 @@ class TrtllmGenSupportChecker:
             return False, reason
 
         return True, ""
-
-
-########################################################
-# Workspace Manager
-########################################################
 
 
 class WorkspaceManager:
@@ -541,11 +532,6 @@ class WorkspaceManager:
         )
 
         return max(context_size, generation_size)
-
-
-########################################################
-# Backend Protocol and Registry
-########################################################
 
 
 class AttentionBackendBase(ABC):
@@ -932,11 +918,6 @@ def select_backend_from_params(
     return select_backend(config, preferred=preferred)
 
 
-########################################################
-# FlashInfer TrtLLM-Gen Backend Implementation
-########################################################
-
-
 @BackendRegistry.register("trtllm-gen")
 class FlashInferTrtllmGenBackend(AttentionBackendBase):
     """
@@ -1074,11 +1055,6 @@ class FlashInferTrtllmGenBackend(AttentionBackendBase):
             window_left=window_left,
             kv_layout=self._layout,
         )
-
-
-########################################################
-# Helper Functions
-########################################################
 
 
 def is_sm100_family() -> bool:
@@ -1362,11 +1338,6 @@ def get_workspace_size(
     )
 
 
-########################################################
-# Main Entry Point
-########################################################
-
-
 def trtllm_gen_attention(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -1466,19 +1437,85 @@ def trtllm_gen_attention(
         k: Key tensor (None if fused QKV).
         v: Value tensor (None if fused QKV).
         output: Output tensor [num_tokens, num_heads * head_size].
-        output_sf: Output scale factor for FP4 output.
-        workspace: Workspace tensor.
-        sequence_length: KV sequence lengths.
-        host_past_key_value_lengths: Past KV lengths (host).
-        host_total_kv_lens: Total KV lengths.
-        context_lengths: Context lengths.
-        host_context_lengths: Context lengths (host).
-        host_request_types: Request types (0=context, 1=generation).
-        kv_cache_block_offsets: Block offsets for paged KV cache.
-        host_kv_cache_block_offsets: Block offsets (host).
-        host_kv_cache_pool_pointers: KV cache pool pointers.
-        host_kv_cache_pool_mapping: KV cache pool mapping.
-        ... (other parameters)
+        output_sf: Output scale factor for FP4 output (optional).
+        workspace: Workspace tensor for attention computation.
+        sequence_length: KV sequence lengths per request [batch_size].
+        host_past_key_value_lengths: Past KV lengths on host [batch_size].
+        host_total_kv_lens: Total KV lengths on host.
+        context_lengths: Context lengths per request [batch_size].
+        host_context_lengths: Context lengths on host [batch_size].
+        host_request_types: Request types on host (0=context, 1=generation) [batch_size].
+        kv_cache_block_offsets: Block offsets for paged KV cache [num_pools, batch, 2, max_blocks].
+        host_kv_cache_pool_pointers: KV cache pool pointers on host.
+        host_kv_cache_pool_mapping: KV cache pool mapping on host [num_layers, num_pools].
+        kv_cache: Actual KV cache tensor from kv_cache_manager [num_blocks, 2, num_kv_heads,
+                  tokens_per_block, head_size].
+        cache_indirection: Cache indirection tensor for beam search.
+        kv_scale_orig_quant: KV cache quantization scales (original to quantized).
+        kv_scale_quant_orig: KV cache dequantization scales (quantized to original).
+        out_scale: Output scaling factor for quantized output.
+        rotary_inv_freq: Rotary embedding inverse frequencies.
+        rotary_cos_sin: Precomputed rotary cosine/sine values.
+        latent_cache: Latent cache for MLA (Multi-head Latent Attention).
+        q_pe: Query positional encoding for MLA.
+        block_ids_per_seq: Block IDs per sequence for sparse attention.
+        attention_sinks: Attention sink tokens for StreamingLLM.
+        is_fused_qkv: Whether Q, K, V are fused in the query tensor.
+        update_kv_cache: Whether to update KV cache with new K, V values.
+        predicted_tokens_per_seq: Number of predicted tokens per sequence (speculative decoding).
+        layer_idx: Current transformer layer index.
+        num_heads: Number of query attention heads.
+        num_kv_heads: Number of key-value attention heads (for GQA/MQA).
+        head_size: Size of each attention head.
+        tokens_per_block: Number of tokens per KV cache block (page size).
+        max_num_requests: Maximum number of requests in a batch.
+        max_context_length: Maximum context/sequence length supported.
+        attention_window_size: Sliding window attention size (0 for full attention).
+        sink_token_length: Number of sink tokens for StreamingLLM.
+        beam_width: Beam search width (1 for greedy decoding).
+        mask_type: Attention mask type (0=padding, 1=causal, 2=bidirectional, 3=custom).
+        quant_mode: Quantization mode flags.
+        q_scaling: Query scaling factor for attention scores.
+        position_embedding_type: Type of position embedding (0=learned, 1=rope, etc.).
+        rotary_embedding_dim: Dimension for rotary embeddings.
+        rotary_embedding_base: Base value for rotary embedding frequencies.
+        rotary_embedding_scale_type: Scaling type for rotary embeddings.
+        rotary_embedding_scales: Scaling factors for rotary embeddings.
+        rotary_embedding_max_position_info: Maximum position info for rotary embeddings.
+        use_paged_context_fmha: Whether to use paged attention for context phase.
+        attention_input_type: Input type (0=context_only, 1=generation_only, 2=mixed).
+        is_mla_enable: Whether Multi-head Latent Attention is enabled.
+        chunked_prefill_buffer_batch_size: Batch size for chunked prefill buffer.
+        q_lora_rank: LoRA rank for query projection (MLA).
+        kv_lora_rank: LoRA rank for key-value projection (MLA).
+        qk_nope_head_dim: Non-positional head dimension for QK (MLA).
+        qk_rope_head_dim: Rotary positional head dimension for QK (MLA).
+        v_head_dim: Value head dimension (MLA).
+        mrope_rotary_cos_sin: Multi-dimensional rotary cosine/sine values.
+        mrope_position_deltas: Position deltas for multi-dimensional rotary.
+        mla_tensor_params: Additional tensor parameters for MLA.
+        attention_chunk_size: Chunk size for chunked attention computation.
+        softmax_stats_tensor: Tensor for storing softmax statistics.
+        spec_decoding_bool_params: Boolean parameters for speculative decoding.
+        spec_decoding_tensor_params: Tensor parameters for speculative decoding.
+        sparse_kv_indices: Indices for sparse KV cache access.
+        sparse_kv_offsets: Offsets for sparse KV cache access.
+        sparse_attn_indices: Indices for sparse attention patterns.
+        sparse_attn_offsets: Offsets for sparse attention patterns.
+        sparse_attn_indices_block_size: Block size for sparse attention indices.
+        sparse_mla_topk: Top-K value for sparse MLA attention.
+        skip_softmax_threshold_scale_factor_prefill: Scale factor for skip softmax threshold (prefill).
+        skip_softmax_threshold_scale_factor_decode: Scale factor for skip softmax threshold (decode).
+        skip_softmax_stat: Statistics for skip softmax optimization.
+        cu_q_seqlens: Cumulative query sequence lengths [batch_size + 1].
+        cu_kv_seqlens: Cumulative KV sequence lengths [batch_size + 1].
+        fmha_scheduler_counter: Counter for FMHA scheduler.
+        mla_bmm1_scale: BMM1 scale for MLA attention.
+        mla_bmm2_scale: BMM2 scale for MLA attention.
+        quant_q_buffer: Buffer for quantized query tensor.
+
+    Returns:
+        None. Results are written to the output tensor in-place.
     """
     logger.debug(f"trtllm_gen_attention starts at layer {layer_idx}")
 
