@@ -66,16 +66,12 @@ def LLVM_CONFIG = "LLVM"
 def LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
-def PYBIND_CONFIG = "Pybind"
-
-@Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
-  (PYBIND_CONFIG) : [(TARNAME) : "pybind-TensorRT-LLM.tar.gz"],
 ]
 
 // TODO: Move common variables to an unified location
@@ -552,7 +548,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
 
 def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312")
 {
-    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
@@ -916,7 +912,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
 
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
 {
-    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
     // Create a unique suffix for the job name
@@ -3185,7 +3181,6 @@ def launchTestJobs(pipeline, testFilter)
         "A10-TensorRT-3": ["a10", "l0_a10", 3, 5],
         "A10-TensorRT-4": ["a10", "l0_a10", 4, 5],
         "A10-TensorRT-5": ["a10", "l0_a10", 5, 5],
-        "A10-Pybind": ["a10", "l0_a10_pybind", 1, 1],
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
@@ -3281,9 +3276,6 @@ def launchTestJobs(pipeline, testFilter)
         }
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
-        }
-        if (key.contains("Pybind")) {
-            config = PYBIND_CONFIG
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3])
     }]]}

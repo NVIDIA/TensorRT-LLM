@@ -41,8 +41,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         (
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             {
+                "kv_cache_config": {
+                    "free_gpu_memory_fraction": 0.0001,
+                },
                 "transforms": {
-                    "resize_kv_cache": {"free_mem_ratio": 0.0001},
                     "insert_cached_attention": {"backend": "flashinfer"},
                     # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
                     # "compile_model": {"backend": "torch-opt"},

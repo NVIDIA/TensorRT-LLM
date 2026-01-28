@@ -155,7 +155,7 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
     ) -> AsyncGenerator[Any, None]:
-        json_data = request.model_dump(exclude_unset=True)
+        json_data = request.model_dump(exclude_unset=True, mode="json")
         is_stream = request.stream
         for attempt in range(self._max_retries + 1):
             try:

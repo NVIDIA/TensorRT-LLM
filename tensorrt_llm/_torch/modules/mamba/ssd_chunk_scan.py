@@ -234,6 +234,7 @@ def _chunk_scan_fwd_kernel(
 
     # M-block offsets and prev states
     #  - logic in next block may override these if there is an active offset
+    offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
     prev_states_ptr = (states_ptr + pid_b * stride_states_batch +
                        c_idx * stride_states_chunk + pid_h * stride_states_head)
     prev_states_hdim = stride_states_hdim
@@ -269,11 +270,12 @@ def _chunk_scan_fwd_kernel(
                     ):
 
                     # - replace prev_states_ptr with init_states
-                    prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
+                    prev_states_ptr = (initstates_ptr +
+                                       seq_idx_m * stride_init_states_batch +
+                                       pid_h * stride_init_states_head)
                     prev_states_hdim = stride_init_states_hdim  # override strides
                     prev_states_dstate = stride_init_states_dstate
 
-    offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
                       mask=offs_m < chunk_size,
@@ -289,7 +291,7 @@ def _chunk_scan_fwd_kernel(
         c_idx_n = tl.load(
             chunk_indices_ptr + (pid_c + 1),
             mask=pid_c > -1 and (pid_c + 1) < chunk_meta_num,
-            other=-1  # to trigger different chunk
+            other=-1,  # to trigger different chunk
         )
 
         # - there are things to consider
@@ -304,9 +306,11 @@ def _chunk_scan_fwd_kernel(
         if (c_idx == c_idx_n) or c_off > 0:
 
             # get the next offset
-            c_off_n = tl.load(chunk_offsets_ptr + (pid_c + 1),
-                              mask=pid_c > -1 and (pid_c + 1) < chunk_meta_num,
-                              other=chunk_size)
+            c_off_n = tl.load(
+                chunk_offsets_ptr + (pid_c + 1),
+                mask=pid_c > -1 and (pid_c + 1) < chunk_meta_num,
+                other=chunk_size,
+            )
 
             # in this case, adjust down the chunk_size_limit
             if c_idx == c_idx_n:
@@ -319,8 +323,9 @@ def _chunk_scan_fwd_kernel(
             #   i.e. the same for all blocks)
             dA_cs_m_boundary = tl.load(
                 dA_cumsum_ptr + (c_off - 1) * stride_dA_cs_csize,
-                mask=(((c_off - 1) > -1) and (c_off < chunk_size)),
-                other=0.0).to(tl.float32)
+                mask=(((c_off - 1) > -1) and ((c_off) < chunk_size)),
+                other=0.0,
+            ).to(tl.float32)
 
     if HAS_SEQ_IDX:
         # - handle seq idx when HAS_INITSTATES==False
@@ -416,8 +421,7 @@ def _chunk_scan_fwd_kernel(
                           other=0.0).to(tl.float32)
         # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
         # So we don't need masking wrt seq_idx here.
-        # cb *= tl.exp((dA_cs_m[:, None] - dA_cs_k[None, :]))
-        cb *= tl.exp(tl.minimum((dA_cs_m[:, None] - dA_cs_k[None, :]), 0.0))
+        cb *= tl.exp(dA_cs_m[:, None] - dA_cs_k[None, :])
         dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k,
                        other=0.0).to(tl.float32)
         cb *= dt_k
@@ -494,18 +498,21 @@ def _chunk_scan_fwd_kernel(
     )
 
 
-def _chunk_scan_fwd(cb,
-                    x,
-                    dt,
-                    dA_cumsum,
-                    C,
-                    states,
-                    D=None,
-                    z=None,
-                    seq_idx=None,
-                    chunk_indices=None,
-                    chunk_offsets=None,
-                    initial_states=None):
+def _chunk_scan_fwd(
+    cb,
+    x,
+    dt,
+    dA_cumsum,
+    C,
+    states,
+    D=None,
+    z=None,
+    seq_idx=None,
+    chunk_indices=None,
+    chunk_offsets=None,
+    initial_states=None,
+    out=None,
+):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
@@ -527,34 +534,17 @@ def _chunk_scan_fwd(cb,
             # with initial states, we need to take care of how
             # seq_idx crosses the boundaries
             assert batch == 1, "chunk scan only supports initial states with batch 1"
-
-            if initial_states.shape[0] == 1:
-                # no in this case no point to use initial states
-                initial_states = None
-            else:
-                assert chunk_indices is not None and chunk_offsets is not None, \
-                    (
-                        "chunk_indices and chunk_offsets should have been set"
-                    )
+            assert (chunk_indices is not None and chunk_offsets is not None
+                    ), "chunk_indices and chunk_offsets should have been set"
         else:
             chunk_indices, chunk_offsets = None, None
     else:
         chunk_indices, chunk_offsets = None, None
 
-    # Allocates output.
-    out = torch.empty(batch,
-                      seqlen,
-                      nheads,
-                      headdim,
-                      device=x.device,
-                      dtype=x.dtype)
+    assert out.shape == x.shape
+
     if z is not None:
-        out_x = torch.empty(batch,
-                            seqlen,
-                            nheads,
-                            headdim,
-                            device=x.device,
-                            dtype=x.dtype)
+        out_x = torch.empty_like(x)
         assert out_x.stride() == out.stride()
     else:
         out_x = None
@@ -625,10 +615,12 @@ def _chunk_scan_fwd(cb,
         states.stride(2),
         states.stride(3),
         states.stride(4),
-        *((initial_states.stride(0), initial_states.stride(1),
-           initial_states.stride(2),
-           initial_states.stride(3)) if initial_states is not None else
-          (0, 0, 0, 0)),
+        *((
+            initial_states.stride(0),
+            initial_states.stride(1),
+            initial_states.stride(2),
+            initial_states.stride(3),
+        ) if initial_states is not None else (0, 0, 0, 0)),
         D.stride(0) if D is not None else 0,
         True,
         D is not None,
@@ -639,4 +631,4 @@ def _chunk_scan_fwd(cb,
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
     )
-    return out, out_x
+    return out_x

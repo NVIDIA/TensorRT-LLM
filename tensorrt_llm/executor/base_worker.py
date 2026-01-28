@@ -566,6 +566,9 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
 
+            # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
+            if self._is_pytorch_backend and request.disaggregated_params is not None:
+                executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
                     # NOTE: Deserialize SharedTensor handle to actual tensor

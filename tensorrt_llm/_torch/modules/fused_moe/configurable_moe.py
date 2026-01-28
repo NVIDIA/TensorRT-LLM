@@ -606,9 +606,11 @@ class ConfigurableMoE(MoE):
         if self.layer_load_balancer and token_selected_experts is not None:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
 
-            # Update EPLB statistics (method depends on whether using NVLINK two-sided)
-            # Use base class method: ignore_allreduce=True for NVLINK two-sided (uses local stats only)
-            ignore_allreduce = self._is_using_nvlink_two_sided()
+            # Update EPLB statistics (method depends on communication strategy)
+            # Use base class method: ignore_allreduce=True for NVLINK two-sided/one-sided (uses local stats only)
+            ignore_allreduce = (
+                self._is_using_nvlink_two_sided() or self._is_using_nvlink_one_sided()
+            )
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -628,6 +630,9 @@ class ConfigurableMoE(MoE):
         # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
         # NVLINK two-sided has a prepare phase to gather EPLB statistics
 
+        local_statistic_tensor_for_dispatch = None
+        eplb_dispatch_kwargs = {}
+        should_update_eplb_after_dispatch = False
         # Only NVLINK two-sided needs prepare_dispatch
         if self._is_using_nvlink_two_sided():
             # Get local statistic info if this is the last call and EPLB is enabled
@@ -645,6 +650,16 @@ class ConfigurableMoE(MoE):
             if gathered_stats is not None:
                 gathered_stats = gathered_stats.view((self.mapping.moe_ep_size, self.num_experts))
                 self._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
+        # TODO: The abstract does not work well as NVLinkTwoSided gathers EPLB stats in prepare_dispatch,
+        # while NVLinkOneSided gathers EPLB stats in dispatch.
+        elif self._is_using_nvlink_one_sided():
+            if self.layer_load_balancer and is_last_call:
+                local_statistic_tensor_for_dispatch = (
+                    self._load_balancer_get_local_statistic_tensor()
+                )
+            if local_statistic_tensor_for_dispatch is not None:
+                eplb_dispatch_kwargs["eplb_local_stats"] = local_statistic_tensor_for_dispatch
+                should_update_eplb_after_dispatch = True
 
         # ========== Step 4 & 5: Quantization and Communication Dispatch ==========
         # Order depends on whether strategy supports post-quant dispatch
@@ -666,11 +681,10 @@ class ConfigurableMoE(MoE):
                 # Step 4b: Dispatch AFTER quantization
                 # Get pre_quant_scale for W4AFP8 if available (only DeepEPLowLatency needs it)
                 # Other strategies will ignore this via **kwargs, so it's safe to pass unconditionally
-                dispatch_kwargs = {}
+                dispatch_kwargs = dict(eplb_dispatch_kwargs)
                 if hasattr(self, "quant_scales") and self.quant_scales is not None:
                     if hasattr(self.quant_scales, "pre_quant_scale_1"):
                         dispatch_kwargs["pre_quant_scale"] = self.quant_scales.pre_quant_scale_1
-
                 x, x_sf, token_selected_slots, token_final_scales = self.comm.dispatch(
                     hidden_states=x,
                     hidden_states_sf=x_sf,
@@ -680,6 +694,9 @@ class ConfigurableMoE(MoE):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
+                if should_update_eplb_after_dispatch:
+                    gathered_stats = self.comm.get_eplb_gathered_statistics()
+                    self._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
             else:
                 # ===== Pre-quant flow: Dispatch → Quantize =====
 
@@ -959,6 +976,10 @@ class ConfigurableMoE(MoE):
     def _is_using_nvlink_two_sided(self) -> bool:
         """Check if using NVLinkTwoSided communication strategy"""
         return isinstance(self.comm, NVLinkTwoSided)
+
+    def _is_using_nvlink_one_sided(self) -> bool:
+        """Check if using NVLinkOneSided communication strategy"""
+        return isinstance(self.comm, NVLinkOneSided)
 
     def _get_nvlink_onesided_moe_output(
         self,

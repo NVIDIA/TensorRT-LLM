@@ -65,23 +65,10 @@ if(NIXL_ENABLED OR MOONCAKE_ENABLED)
 
   # Collect binding source files
   set(AGENT_BINDING_SOURCES "")
-  if(BINDING_TYPE STREQUAL "pybind")
-    list(APPEND AGENT_BINDING_SOURCES agentBindingsPybind.cpp)
-  else()
-    list(APPEND AGENT_BINDING_SOURCES agentBindingsNanobind.cpp)
-  endif()
+  list(APPEND AGENT_BINDING_SOURCES agentBindings.cpp)
 
-  if(BINDING_TYPE STREQUAL "pybind")
-    # Use pybind11 (already fetched via FetchContent)
-    pybind11_add_module(${TRANSFER_AGENT_BINDING_TARGET}
-                        ${AGENT_BINDING_SOURCES})
-    message(STATUS "Building tensorrt_llm_transfer_agent_binding with pybind11")
-  else()
-    # Default to nanobind (already fetched via FetchContent)
-    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET}
-                        ${AGENT_BINDING_SOURCES})
-    message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
-  endif()
+  nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET} ${AGENT_BINDING_SOURCES})
+  message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
 
   target_compile_options(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE -Wno-error)
 

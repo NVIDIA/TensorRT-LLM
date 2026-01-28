@@ -706,6 +706,9 @@ class MTPForCausalLM(nn.Module):
             case "exaone_moe":
                 from .modeling_exaone_moe import ExaoneMoeMTP
                 mtp_layer = ExaoneMoeMTP
+            case "nemotron_h":
+                from .modeling_nemotron_h import NemotronHMTP
+                mtp_layer = NemotronHMTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -751,6 +754,12 @@ class MTPDraftModel(nn.Module):
             from .modeling_exaone_moe import ExaoneMoeMTP
             mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
 
+        elif model_type == "nemotron_h":
+            from .modeling_nemotron_h import NemotronHMTP
+            mtp_layer = NemotronHMTP(model_config,
+                                     layer_idx,
+                                     aux_stream_dict,
+                                     is_separate_draft_engine=False)
         else:
             raise ValueError(
                 f"MTPDraftModel does not support model_type: {model_type}")

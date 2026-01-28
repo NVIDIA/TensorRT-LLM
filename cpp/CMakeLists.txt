@@ -83,11 +83,6 @@ endif()
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
-set(BINDING_TYPE
-    "nanobind"
-    CACHE STRING
-          "Binding type of Python bindings for C++ runtime and batch manager")
-
 set(INTERNAL_CUTLASS_KERNELS_PATH
     ""
     CACHE
@@ -246,16 +241,15 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 add_subdirectory(${3RDPARTY_DIR} 3rdparty)
 
-if(BINDING_TYPE STREQUAL "pybind"
-   OR BUILD_DEEP_EP
-   OR BUILD_DEEP_GEMM)
+if(BUILD_DEEP_EP
+   OR BUILD_DEEP_GEMM
+   OR BUILD_FLASH_MLA)
   FetchContent_MakeAvailable(pybind11)
   include_directories(${CMAKE_BINARY_DIR}/_deps/pybind11-src/include)
 endif()
-if(BINDING_TYPE STREQUAL "nanobind")
-  FetchContent_MakeAvailable(nanobind)
-  include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
-endif()
+
+FetchContent_MakeAvailable(nanobind)
+include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
 FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
 

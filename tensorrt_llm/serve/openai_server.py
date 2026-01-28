@@ -873,11 +873,12 @@ class OpenAIServer:
             return chat_response
 
         async def create_streaming_generator(promise: RequestOutput, postproc_params: PostprocParams):
-            if not self.postproc_worker_enabled:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-
             async for res in promise:
-                pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                if not self.postproc_worker_enabled:
+                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                    pp_results = post_processor(res, args)
+                else:
+                    pp_results = res.outputs[0]._postprocess_result
                 for pp_res in pp_results:
                     yield pp_res
 

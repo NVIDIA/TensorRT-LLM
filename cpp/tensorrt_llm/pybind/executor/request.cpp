@@ -411,14 +411,16 @@ void initRequestBindings(pybind11::module_& m)
         {
             auto serializedState = self.getSerializedState();
             return py::make_tuple(self.getFirstGenTokens(), self.getReqId(),
-                py::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens());
+                py::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens(), self.getCtxDpRank(),
+                self.getDisaggInfoEndpoint());
         }
-        return py::make_tuple(self.getFirstGenTokens(), self.getReqId(), py::none(), self.getDraftTokens());
+        return py::make_tuple(self.getFirstGenTokens(), self.getReqId(), py::none(), self.getDraftTokens(),
+            self.getCtxDpRank(), self.getDisaggInfoEndpoint());
     };
 
     auto ContextPhaseParamsSetState = [](py::tuple const& state)
     {
-        if (state.size() != 4)
+        if (state.size() != 6)
         {
             throw std::runtime_error("Invalid ContextPhaseParams state!");
         }
@@ -429,28 +431,42 @@ void initRequestBindings(pybind11::module_& m)
             return std::make_unique<tle::ContextPhaseParams>(state[0].cast<VecTokens>(),
                 state[1].cast<tle::ContextPhaseParams::RequestIdType>(),
                 std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
-                state[3].cast<std::optional<VecTokens>>());
+                state[3].cast<std::optional<VecTokens>>(), state[4].cast<std::optional<SizeType32>>(),
+                state[5].cast<std::optional<std::string>>());
         }
         return std::make_unique<tle::ContextPhaseParams>(state[0].cast<VecTokens>(),
-            state[1].cast<tle::ContextPhaseParams::RequestIdType>(), state[3].cast<std::optional<VecTokens>>());
+            state[1].cast<tle::ContextPhaseParams::RequestIdType>(), state[3].cast<std::optional<VecTokens>>(),
+            state[4].cast<std::optional<SizeType32>>(), state[5].cast<std::optional<std::string>>());
     };
 
     py::class_<tle::ContextPhaseParams>(m, "ContextPhaseParams")
         .def(py::init(
-            [](VecTokens const& first_gen_tokens, tle::ContextPhaseParams::RequestIdType req_id,
-                std::optional<py::bytes> const& opaque_state, std::optional<VecTokens> const& draft_tokens)
-            {
-                if (opaque_state)
-                {
-                    auto opaque_state_str_view = std::string_view(opaque_state.value().cast<std::string_view>());
-                    return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id,
-                        std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens);
-                }
-                return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id, draft_tokens);
-            }))
-        .def_property_readonly("first_gen_tokens", &tle::ContextPhaseParams::getFirstGenTokens)
-        .def_property_readonly("draft_tokens", &tle::ContextPhaseParams::getDraftTokens)
-        .def_property_readonly("req_id", &tle::ContextPhaseParams::getReqId)
+                 [](VecTokens const& first_gen_tokens, tle::ContextPhaseParams::RequestIdType req_id,
+                     std::optional<py::bytes> const& opaque_state, std::optional<VecTokens> const& draft_tokens,
+                     std::optional<SizeType32> const& ctx_dp_rank,
+                     std::optional<std::string> const& disagg_info_endpoint)
+                 {
+                     if (opaque_state)
+                     {
+                         auto opaque_state_str_view = std::string_view(opaque_state.value().cast<std::string_view>());
+                         return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id,
+                             std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
+                             draft_tokens, ctx_dp_rank, disagg_info_endpoint);
+                     }
+                     return std::make_unique<tle::ContextPhaseParams>(
+                         first_gen_tokens, req_id, draft_tokens, ctx_dp_rank, disagg_info_endpoint);
+                 }),
+            py::arg("first_gen_tokens"), py::arg("req_id"), py::arg("opaque_state") = py::none(),
+            py::arg("draft_tokens") = py::none(), py::arg("ctx_dp_rank") = py::none(),
+            py::arg("disagg_info_endpoint") = py::none())
+        .def_property("first_gen_tokens", &tle::ContextPhaseParams::getFirstGenTokens,
+            &tle::ContextPhaseParams::setFirstGenTokens)
+        .def_property(
+            "draft_tokens", &tle::ContextPhaseParams::getDraftTokens, &tle::ContextPhaseParams::setDraftTokens)
+        .def_property("req_id", &tle::ContextPhaseParams::getReqId, &tle::ContextPhaseParams::setReqId)
+        .def_property("ctx_dp_rank", &tle::ContextPhaseParams::getCtxDpRank, &tle::ContextPhaseParams::setCtxDpRank)
+        .def_property("disagg_info_endpoint", &tle::ContextPhaseParams::getDisaggInfoEndpoint,
+            &tle::ContextPhaseParams::setDisaggInfoEndpoint)
         .def_property_readonly("opaque_state",
             [](tle::ContextPhaseParams const& self)
             {

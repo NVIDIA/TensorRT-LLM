@@ -141,7 +141,7 @@ Two C++ examples are provided that shows how to use the Executor API and can be 
 
 ## Python Bindings for the Executor API
 
-Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in [bindings.cpp](source:cpp/tensorrt_llm/pybind/executor/bindings.cpp) and once built, are available in package `tensorrt_llm.bindings.executor`. Running `'help('tensorrt_llm.bindings.executor')` in a Python interpreter will provide an overview of the classes available.
+Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in [bindings.cpp](source:cpp/tensorrt_llm/nanobind/executor/bindings.cpp) and once built, are available in package `tensorrt_llm.bindings.executor`. Running `'help('tensorrt_llm.bindings.executor')` in a Python interpreter will provide an overview of the classes available.
 
 In addition, three Python examples are provided to demonstrate how to use the Python bindings to the Executor API for single and multi-GPU models. They can be found in [`examples/bindings`](source:examples/bindings).
 
