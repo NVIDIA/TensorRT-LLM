@@ -38,3 +38,4 @@ opentelemetry-semantic-conventions-ai>=0.4.1
 fuzzywuzzy==0.18.0
 aiperf==0.3.0
 nanobind>=2.9.0
+nixl==0.8.0

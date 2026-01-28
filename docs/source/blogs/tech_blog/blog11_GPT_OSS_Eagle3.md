@@ -84,7 +84,7 @@ kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
 speculative_config:
-  decoding_type: Eagle
+  decoding_type: Eagle3
   max_draft_len: 3
   speculative_model_dir: /config/models/eagle/
 cuda_graph_config:

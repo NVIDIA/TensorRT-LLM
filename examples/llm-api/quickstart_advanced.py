@@ -5,7 +5,7 @@ import time
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  CudaGraphConfig, DraftTargetDecodingConfig,
-                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
+                                 Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
 
@@ -97,6 +97,11 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument("--tokens_per_block", type=int, default=32)
+    parser.add_argument('--mamba_ssm_cache_dtype',
+                        type=str,
+                        default='bfloat16',
+                        choices=['auto', 'float16', 'bfloat16', 'float32'],
+                        help='Data type for Mamba SSM cache.')
     parser.add_argument('--log_kv_cache_events',
                         default=False,
                         action='store_true')
@@ -205,6 +210,7 @@ def setup_llm(args, **kwargs):
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
         tokens_per_block=args.tokens_per_block,
+        mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         event_buffer_max_size=1024 if args.log_kv_cache_events else 0)
 
     spec_decode_algo = args.spec_decode_algo.upper(
@@ -222,7 +228,7 @@ def setup_llm(args, **kwargs):
             mtp_eagle_one_model=args.use_one_model,
             speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model=args.draft_model_dir,
             eagle3_one_model=args.use_one_model,

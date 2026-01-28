@@ -17,12 +17,9 @@ llm = LLM(
     transforms={
         "insert_cached_attention": {"backend": "flashinfer"},  # or "triton"
         "insert_cached_mla_attention": {"backend": "MultiHeadLatentAttention"},
-        "resize_kv_cache": {"free_mem_ratio": 0.8},
         "compile_model": {"backend": "torch-compile"},
         "detect_sharding": {"simple_shard_only": False},
-
     },
-    attn_page_size=64, # page size for attention
     skip_loading_weights=False,
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,

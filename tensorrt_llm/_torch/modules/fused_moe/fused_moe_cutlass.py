@@ -1,3 +1,4 @@
+import inspect
 import os
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
@@ -165,15 +166,22 @@ class CutlassFusedMoE(MoE):
                     dtype = self.dtype or torch.float16
 
                     workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-                        ep_size, self.routing_method.experts_per_token,
-                        max_num_tokens, hidden_size, dtype)
+                        ep_size,
+                        self.routing_method.experts_per_token,
+                        max_num_tokens,
+                        hidden_size,
+                        dtype,
+                        self.num_experts if self.layer_load_balancer else None,
+                    )
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_slots,
+                        num_slots=self.num_slots,
                         workspace_size_per_rank=workspace_size,
+                        num_experts=self.num_experts
+                        if self.layer_load_balancer else None,
                     )
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
@@ -508,7 +516,10 @@ class CutlassFusedMoE(MoE):
 
         if self.layer_load_balancer:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
-            ignore_allreduce = self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type in (
+                AlltoallMethodType.NVLinkTwoSided,
+                AlltoallMethodType.NVLinkOneSided,
+            )
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -607,14 +618,32 @@ class CutlassFusedMoE(MoE):
                 payloads.append(token_selected_slots)
                 payloads.append(token_final_scales)
 
-                recv_tensors = self.moe_a2a.dispatch(
-                    token_selected_slots,
-                    payloads,
-                    runtime_max_tokens_per_rank,
-                    invalid_token_expert_id=self.
-                    num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
-                    expert_id_payload_index=expert_id_payload_index,
-                )
+                loadbalancer_local_statistic_info = None
+                if self.layer_load_balancer and is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
+                    )
+                if loadbalancer_local_statistic_info is not None:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_slots,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=self.
+                        num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                        eplb_local_stats=loadbalancer_local_statistic_info,
+                    )
+                    gathered_stats = self.moe_a2a._state.eplb_gathered_stats
+                    self._load_balancer_update_statistic_with_gathered_statistic(
+                        gathered_stats)
+                else:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_slots,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=self.
+                        num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                    )
 
                 if x_sf is not None:
                     x_recv, x_sf_recv, token_selected_slots_recv, token_final_scales_recv = recv_tensors
@@ -865,16 +894,12 @@ class CutlassFusedMoE(MoE):
         assert len(weights) == 1
         weights = weights[0]
 
-        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-            assert not allow_partial_loading, "Partial loading is not supported for quantized MoE now"
-            self.quant_method.load_weights(self, weights,
-                                           self.weight_loading_mode)
-        else:
-            self.quant_method.load_weights(
-                self,
-                weights,
-                self.weight_loading_mode,
-                allow_partial_loading=allow_partial_loading)
+        kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(
+                self.quant_method.load_weights).args:
+            kargs["allow_partial_loading"] = allow_partial_loading
+        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
+                                       **kargs)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
