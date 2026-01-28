@@ -317,12 +317,15 @@ def mergeWaiveList(pipeline, globalVars)
 
     try {
         // Get TOT waive list
+        LLM_TOT_ROOT = "llm-tot"
         targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
         echo "Target branch: ${targetBranch}"
         withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-            trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, targetBranch, "tests/integration/test_lists/waives.txt", ".")
+            trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, true)
         }
-        sh "mv waives.txt waives_TOT.txt"
+        targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+        sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
 
         // Get waive list diff in current MR
         def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
