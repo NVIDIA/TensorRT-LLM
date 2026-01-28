@@ -249,11 +249,9 @@ class ModelConfig(Generic[TConfig]):
         }
 
         sm_version = get_sm_version()
-        # TRTLLM backend is preferred for Blackwell
         if architecture in TRTLLM_PREFERRED_ARCHS and 100 <= sm_version < 120:
             return "TRTLLM"
 
-        # Default fallback
         return "CUTLASS"
 
     @staticmethod
@@ -598,7 +596,7 @@ class ModelConfig(Generic[TConfig]):
         architecture = pretrained_config.architectures[
             0] if pretrained_config.architectures else ""
         moe_backend = cls.resolve_moe_backend(moe_backend, architecture)
-        kwargs['moe_backend'] = moe_backend  # Update kwargs with resolved value
+        kwargs['moe_backend'] = moe_backend
 
         # quantized ckpt in modelopt format
         if quant_config_file := cached_file(checkpoint_dir,
