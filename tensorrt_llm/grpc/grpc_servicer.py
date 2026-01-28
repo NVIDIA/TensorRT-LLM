@@ -116,6 +116,10 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 request.disaggregated_params if request.HasField("disaggregated_params") else None
             )
 
+            # Track tokens sent per sequence index to avoid duplicates
+            # TRT-LLM's token_ids_diff doesn't clear between iterations for n>1
+            sent_token_counts: dict[int, int] = {}
+
             # Submit to request manager and stream outputs
             # The request manager now yields GenerationResult objects
             async for gen_result in self.request_manager.generate(
@@ -135,7 +139,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 # Convert GenerationResult to protobuf response
                 if request.streaming:
                     for chunk_response in self._chunk_responses(
-                        request_id, gen_result, prompt_token_ids
+                        request_id, gen_result, prompt_token_ids, sent_token_counts
                     ):
                         yield chunk_response
 
@@ -305,16 +309,19 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         request_id: str,
         gen_result,
         prompt_token_ids: list,
+        sent_token_counts: dict[int, int],
     ) -> List[trtllm_service_pb2.GenerateResponse]:
         """Build streaming chunk responses from GenerationResult.
 
-        Uses token_ids_diff to get delta tokens. For n>1, returns a response
-        for each output sequence.
+        Uses cumulative token_ids and tracks sent position to compute true deltas.
+        TRT-LLM's token_ids_diff doesn't clear between iterations for n>1, so we
+        compute deltas ourselves.
 
         Args:
             request_id: The request ID
             gen_result: TensorRT-LLM GenerationResult
             prompt_token_ids: Original prompt tokens
+            sent_token_counts: Dict tracking tokens already sent per sequence index
 
         Returns:
             List of GenerateResponse with chunk field set (one per output)
@@ -339,12 +346,19 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
 
         # Process all outputs (for n>1 support)
         for completion in gen_result.outputs:
-            # token_ids_diff contains only new tokens since last iteration
-            delta_tokens = list(completion.token_ids_diff) if completion.token_ids_diff else []
+            index = completion.index
+            # Use cumulative token_ids and compute delta ourselves
+            # because token_ids_diff doesn't clear between iterations for n>1
+            all_tokens = list(completion.token_ids) if completion.token_ids else []
+            sent_count = sent_token_counts.get(index, 0)
+            delta_tokens = all_tokens[sent_count:]
 
             # Skip if no new tokens for this sequence
             if not delta_tokens:
                 continue
+
+            # Update sent count
+            sent_token_counts[index] = len(all_tokens)
 
             chunk = trtllm_service_pb2.GenerateStreamChunk(
                 token_ids=delta_tokens,
