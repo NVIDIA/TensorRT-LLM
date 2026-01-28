@@ -15,7 +15,7 @@ from open_search_db import OpenSearchDB
 QUERY_LOOKBACK_DAYS = 90
 LOOKBACK_JOBS = 30
 MAX_QUERY_SIZE = 3000
-MAX_TEST_CASES_PER_MSG = 5
+MAX_TEST_CASES_PER_MSG = 4
 POST_SLACK_MSG_RETRY_TIMES = 5
 
 
@@ -103,14 +103,11 @@ def post_perf_data(data_list, project_name):
 def get_regression_dict(data_list, query_job_number, lookback_job_number=LOOKBACK_JOBS):
     """Returns a dict with job_id as key and list of regression tuples as value.
 
-    Each tuple is (s_test_case, history_regression_job_ids, data).
+    Each tuple is (test_case_name, gpu_type, runtime, history_regression_job_ids, data).
     Only returns the latest query_job_number jobs.
     """
     if data_list is None or len(data_list) == 0:
         return {}
-
-    def get_test_case_name(data):
-        return data.get("s_test_case_name") or "Unknown"
 
     # Group data by job_id
     job_test_dict = {}
@@ -130,18 +127,21 @@ def get_regression_dict(data_list, query_job_number, lookback_job_number=LOOKBAC
     # Sort job_ids (descending: latest -> oldest)
     sorted_job_id_list = sorted(job_test_dict.keys(), reverse=True)
 
-    # Build test_case -> job_ids dict
+    # Build (test_case_name, gpu_type, runtime) -> job_ids dict
     test_job_dict = {}
     for job_id, data_list in job_test_dict.items():
         for data in data_list:
-            test_case = get_test_case_name(data)
-            if not test_case:
+            test_case_name = data.get("s_test_case_name") or ""
+            gpu_type = data.get("s_gpu_type") or ""
+            runtime = data.get("s_runtime") or ""
+            if not test_case_name or not gpu_type or not runtime:
                 continue
-            test_job_dict.setdefault(test_case, set()).add(job_id)
+            key = (test_case_name, gpu_type, runtime)
+            test_job_dict.setdefault(key, set()).add(job_id)
 
     # Sort job ids for each test case (descending: latest -> oldest)
-    for test_case, job_id_set in list(test_job_dict.items()):
-        test_job_dict[test_case] = sorted(job_id_set, reverse=True)
+    for key, job_id_set in list(test_job_dict.items()):
+        test_job_dict[key] = sorted(job_id_set, reverse=True)
 
     # Only keep the latest query_job_number jobs in the result
     latest_job_ids = sorted_job_id_list[:query_job_number]
@@ -150,21 +150,24 @@ def get_regression_dict(data_list, query_job_number, lookback_job_number=LOOKBAC
     for job_id in latest_job_ids:
         entries = []
         for data in job_test_dict.get(job_id, []):
-            test_case = get_test_case_name(data)
-            if not test_case:
+            test_case_name = data.get("s_test_case_name") or ""
+            gpu_type = data.get("s_gpu_type") or ""
+            runtime = data.get("s_runtime") or ""
+            if not test_case_name or not gpu_type or not runtime:
                 continue
-            history_ids = test_job_dict.get(test_case, [])
+            key = (test_case_name, gpu_type, runtime)
+            history_ids = test_job_dict.get(key, [])
             lower_bound = job_id - lookback_job_number + 1
             history_regression_job_ids = [
                 jid for jid in history_ids if lower_bound <= jid <= job_id
             ]
-            entries.append((test_case, history_regression_job_ids, data))
+            entries.append((test_case_name, gpu_type, runtime, history_regression_job_ids, data))
         regression_dict[job_id] = entries
 
     return regression_dict
 
 
-def process_regression_message(regression_dict):
+def split_regression_message(regression_dict):
     """Process regression data into message chunks.
 
     Returns a list of messages, each containing at most MAX_TEST_CASES_PER_MSG test cases.
@@ -172,12 +175,17 @@ def process_regression_message(regression_dict):
     if not regression_dict:
         return []
 
-    # Flatten all test cases into a list with (job_id, idx, data, history_job_ids) tuples
+    # Flatten all test cases into a list with
+    # (job_id, idx, test_case_name, gpu_type, runtime, history_regression_job_ids, data) tuples
     all_test_cases = []
     for job_id, data_list in regression_dict.items():
         sorted_data_list = sorted(data_list, key=lambda x: x[0])
-        for idx, (test_case_name, history_job_ids, data) in enumerate(sorted_data_list, start=1):
-            all_test_cases.append((job_id, idx, data, history_job_ids, test_case_name))
+        for idx, (test_case_name, gpu_type, runtime, history_regression_job_ids, data) in enumerate(
+            sorted_data_list, start=1
+        ):
+            all_test_cases.append(
+                (job_id, idx, test_case_name, gpu_type, runtime, history_regression_job_ids, data)
+            )
 
     # Split into chunks of MAX_TEST_CASES_PER_MSG
     chunks = []
@@ -189,7 +197,15 @@ def process_regression_message(regression_dict):
     for chunk in chunks:
         msg_parts = []
         current_job_id = None
-        for job_id, idx, data, history_job_ids, test_case_name in chunk:
+        for (
+            job_id,
+            idx,
+            test_case_name,
+            gpu_type,
+            runtime,
+            history_regression_job_ids,
+            data,
+        ) in chunk:
             # Add job header when switching to a new job_id
             if job_id != current_job_id:
                 if msg_parts:
@@ -199,13 +215,13 @@ def process_regression_message(regression_dict):
                 current_job_id = job_id
 
             regression_info = data.get("s_regression_info", "N/A")
-            gpu_type = data.get("s_gpu_type", "N/A")
-            runtime = data.get("s_runtime", "N/A")
             msg_parts.append(
                 f"*REGRESSION TEST CASE {idx}: {test_case_name} GPU: {gpu_type} Mode: {runtime}*\n"
             )
             history_text = (
-                ", ".join(str(jid) for jid in history_job_ids) if history_job_ids else "N/A"
+                ", ".join(str(jid) for jid in history_regression_job_ids)
+                if history_regression_job_ids
+                else "N/A"
             )
             msg_parts.append(f"  History Regression Job IDs: {history_text}\n")
             for part in regression_info.split(","):
@@ -326,7 +342,7 @@ def main():
             return
 
         regression_dict = get_regression_dict(data_list, args.query_job_number)
-        messages = process_regression_message(regression_dict)
+        messages = split_regression_message(regression_dict)
         send_regression_message(messages, args.channel_id, args.bot_token)
     elif args.operation.strip().upper().startswith("UPDATE"):
         set_values, where_values, error = parse_update_operation(args.operation)

@@ -388,7 +388,6 @@ class ClientConfig:
         self,
         client_config_data: dict,
         model_name: str,
-        dataset_file: str = "",
         env_vars: str = "",
     ):
         self.model_name = model_name
@@ -402,7 +401,7 @@ class ClientConfig:
         self.streaming = client_config_data.get("streaming", True)
         self.trust_remote_code = client_config_data.get("trust_remote_code", True)
         self.model_path = ""
-        self.dataset_file = dataset_file
+        self.dataset_file = client_config_data.get("dataset_file", "")
         self.env_vars = env_vars
 
         # Generate default name if not provided
@@ -431,14 +430,12 @@ class ClientConfig:
             str(self.isl),
             "--random-output-len",
             str(self.osl),
-            "--random-range-ratio",
-            str(self.random_range_ratio),
             "--ignore-eos",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
-        if dataset_path and os.path.exists(dataset_path):
+        if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
             benchmark_cmd.append("--dataset-path")
@@ -448,6 +445,8 @@ class ClientConfig:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("random")
             benchmark_cmd.append("--random-ids")
+            benchmark_cmd.append("--random-range-ratio")
+            benchmark_cmd.append(str(self.random_range_ratio))
             print_info(
                 f"Dataset: {dataset_path} is not provided or does not exist. Use random dataset for benchmark."
             )
@@ -957,7 +956,6 @@ class PerfSanityTestConfig:
                 client_config = ClientConfig(
                     client_config_data,
                     server_config_data["model_name"],
-                    dataset_file="",
                     env_vars=client_env_var,
                 )
                 client_configs.append(client_config)
@@ -991,7 +989,6 @@ class PerfSanityTestConfig:
         assert model_name, "model_name is required in metadata section"
 
         benchmark_mode = benchmark.get("mode", "e2e")
-        dataset_file = benchmark.get("dataset_file", "")
         if "gen_only" in benchmark_mode:
             hardware["num_ctx_servers"] = 0
 
@@ -1063,11 +1060,11 @@ class PerfSanityTestConfig:
                 "backend": "openai",
                 "use_chat_template": False,
                 "streaming": benchmark.get("streaming", True),
+                "dataset_file": benchmark.get("dataset_file", ""),
             }
             client_config = ClientConfig(
                 client_config_data,
                 model_name,
-                dataset_file=dataset_file,
                 env_vars=client_env_var,
             )
             client_configs.append(client_config)
