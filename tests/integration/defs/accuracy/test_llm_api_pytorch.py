@@ -2967,7 +2967,7 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.timeout(10800)
-@pytest.mark.skip_less_device_memory(180000)
+@pytest.mark.skip_less_device_memory(100000)
 class TestKimiK2(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Instruct"
@@ -2975,6 +2975,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_post_blackwell
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
         [(8, 1, 8, False, False, True, True, 16)],
