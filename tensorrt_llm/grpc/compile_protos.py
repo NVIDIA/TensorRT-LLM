@@ -86,8 +86,8 @@ def compile_protos(proto_dir: Path = None, output_dir: Path = None) -> bool:
         content = pb2_grpc_file.read_text()
         # Fix import to use relative import
         content = content.replace(
-            "import trtllm_service_pb2 as trtllm__engine__pb2",
-            "from . import trtllm_service_pb2 as trtllm__engine__pb2",
+            "import trtllm_service_pb2 as trtllm__service__pb2",
+            "from . import trtllm_service_pb2 as trtllm__service__pb2",
         )
         pb2_grpc_file.write_text(content)
         print(f"Fixed imports in {pb2_grpc_file}")
