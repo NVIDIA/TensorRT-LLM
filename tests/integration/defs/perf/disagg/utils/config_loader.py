@@ -148,7 +148,7 @@ DEFAULT_METRICS_CONFIG = {
             "SERVER_MEDIAN_ITL",
             "SERVER_P99_ITL",
             "SERVER_MEAN_E2EL",
-            "SERVER_E2EL",  # Median E2EL (keep the same name as disagg)
+            "SERVER_MEDIAN_E2EL",  # Median E2EL (keep the same name as disagg)
             "SERVER_P99_E2EL",
         ],
     ),
