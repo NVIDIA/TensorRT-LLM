@@ -700,7 +700,7 @@ class RMSNormShardingInfo(ShardingTransformInfo):
     the correct global mean across shards.
 
     The detection of whether an RMSNorm needs this treatment is done in
-    _shard_attention_rmsnorm based on weight shape matching q/k projection
+    _shard_qk_norm based on weight shape matching q/k projection
     output dimensions.
     """
 
@@ -1970,7 +1970,69 @@ def _determine_fused_weight_dims(
             fused_weight_dims = [weight_dim // num_chunks] * num_chunks
 
 
-def _shard_attention_rmsnorm(
+def _find_upstream_qk_proj(node: Node, gm: GraphModule) -> Optional[str]:
+    """
+    Find the upstream q/k projection linear node from an RMSNorm input.
+
+    Traverses backwards through pass-through tensor operations (view, reshape,
+    type conversions, quantize/dequantize, etc.) to find the immediate producer.
+    If that producer is a q_proj or k_proj linear, returns the weight name.
+
+    Args:
+        node: The input node to start traversing from (typically RMSNorm's activation input)
+        gm: The graph module containing the nodes
+
+    Returns:
+        The weight name if a q_proj or k_proj is found as immediate upstream, None otherwise.
+
+    TODO: Is there a more efficient way to do this?
+    """
+    # Pass-through ops that we traverse through (these don't change the semantic meaning)
+    passthrough_ops = [
+        torch.ops.aten.view,
+        torch.ops.aten.reshape,
+        torch.ops.aten.contiguous,
+        torch.ops.aten.clone,
+        torch.ops.aten.to,
+        torch.ops.aten._to_copy,
+        torch.ops.aten.slice,
+        torch.ops.aten.transpose,
+        torch.ops.aten.permute,
+    ]
+
+    visited = set()
+    current = node
+
+    # Traverse through pass-through ops to find the actual producer
+    while current is not None and current not in visited:
+        visited.add(current)
+
+        # Check if this is a linear operation (the producer we're looking for)
+        if is_any_lin_op(current):
+            try:
+                weight_name = extract_weight_name(current)
+                if weight_name and ("q_proj" in weight_name or "k_proj" in weight_name):
+                    return weight_name
+            except (AttributeError, AssertionError):
+                pass
+            # Found a linear but not q/k proj - this is not a QK norm
+            return None
+
+        # If this is a pass-through op, continue to its first input
+        if is_op(current, passthrough_ops):
+            # Get the first tensor input (skip non-tensor args like dims)
+            tensor_inputs = [arg for arg in current.all_input_nodes if isinstance(arg, Node)]
+            if tensor_inputs:
+                current = tensor_inputs[0]
+                continue
+
+        # Hit a non-passthrough, non-linear op - stop searching
+        break
+
+    return None
+
+
+def _shard_qk_norm(
     layer_subgraph: LayerSubgraph,
     linear_nodes: List[Node],
     transform_container: ShardingTransformContainer,
@@ -1978,15 +2040,16 @@ def _shard_attention_rmsnorm(
     """
     Shard RMSNorm ops in attention layers that operate on full hidden size.
 
-    This function detects torch_rmsnorm ops whose weight shape matches q/k projection
-    output dimensions (num_heads * head_dim). These are global QK norms that operate
-    on flattened Q/K output [batch, seq, hidden_size] before reshape and need special
+    This function detects torch_rmsnorm ops that are true QK norms - i.e., norms that
+    operate on the output of q_proj or k_proj. These global QK norms operate on
+    flattened Q/K output [batch, seq, hidden_size] before reshape and need special
     handling for tensor parallelism:
     1. Weight sharding: The norm weight is column-sharded across ranks
     2. Global mean: Replaced with sharded_rmsnorm which uses all_reduce
 
-    The detection is shape-based rather than relying on specific op types, making this
-    approach more generic and applicable to any model with similar QK norm patterns.
+    Detection criteria:
+    1. The RMSNorm's input must trace back to a q_proj or k_proj linear operation
+    2. The weight shape must match q/k projection output dimensions
 
     Example1: - Global Norm on all heads directly on flattened Q/K output (e.g. MiniMax):
         self.q_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_attention_heads, eps=config.rms_norm_eps)
@@ -2042,6 +2105,19 @@ def _shard_attention_rmsnorm(
         user_node = list(weight_node.users)[0]
         if not is_op(user_node, torch.ops.auto_deploy.torch_rmsnorm):
             continue
+
+        # Verify this is a true QK norm by checking its input traces back to q_proj or k_proj
+        # This filters out input_layernorm which feeds INTO q/k/v projections (not after them)
+        rmsnorm_input = user_node.args[0]  # activation input (not the weight)
+        upstream_proj = _find_upstream_qk_proj(rmsnorm_input, gm)
+        if upstream_proj is None:
+            ad_logger.debug(
+                f"Skipping {user_node.name} - input does not trace back to q_proj or k_proj "
+                f"(likely input_layernorm or other non-QK norm)"
+            )
+            continue
+
+        ad_logger.debug(f"Found QK norm {user_node.name} with upstream projection: {upstream_proj}")
 
         # Try to get the parameter
         try:
@@ -2172,7 +2248,7 @@ def _process_column_sharding(
         # chunk nodes do not need to be updated
 
     # Shard intermediate weights (e.g. q/k/v -> q_norm, k_norm ... -> o_proj) for attention layers
-    added_nodes += _shard_attention_rmsnorm(layer_subgraph, linear_nodes, transform_container)
+    added_nodes += _shard_qk_norm(layer_subgraph, linear_nodes, transform_container)
 
     return added_nodes
 
