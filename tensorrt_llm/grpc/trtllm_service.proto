@@ -216,7 +216,7 @@ message OutputConfig {
   // Return generation logits tensor (large, use with caution)
   bool return_generation_logits = 4;
 
-  // Exclude input tokens from output (default: true)
+  // Exclude input tokens from output (set to true to enable; TRT-LLM defaults to true internally)
   bool exclude_input_from_output = 5;
 
   // Return encoder output (for encoder-decoder models)
