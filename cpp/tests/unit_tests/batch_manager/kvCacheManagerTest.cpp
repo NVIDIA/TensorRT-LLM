@@ -4026,8 +4026,8 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
     auto llmRequest = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
 
     // Set high priority for context blocks
-    llmRequest->setKvCacheRetentionConfig(
-        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, highPriority)}, highPriority));
+    llmRequest->setKvCacheRetentionConfig(KvCacheRetentionConfig(
+        {KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, highPriority)}, highPriority));
 
     kvCacheManager.addSequence(0, inputLength, beamWidth, llmRequest);
     kvCacheManager.storeContextBlocks(*llmRequest);

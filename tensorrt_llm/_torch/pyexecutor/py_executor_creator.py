@@ -556,7 +556,8 @@ def create_py_executor(
             )
 
         max_attention_window = kv_cache_config.max_attention_window
-        if max_attention_window is not None and len(set(max_attention_window)) > 1:
+        if max_attention_window is not None and len(
+                set(max_attention_window)) > 1:
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )
