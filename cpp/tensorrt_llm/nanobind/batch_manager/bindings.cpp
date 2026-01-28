@@ -422,10 +422,10 @@ void initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
                  tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
-                 std::vector<tr::SizeType32> const&>(),
+                 std::vector<tr::SizeType32> const&, tr::SizeType32>(),
             nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
             nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),
-            nb::arg("ssm_cache_dtype"), nb::arg("pp_layers"), nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("ssm_cache_dtype"), nb::arg("pp_layers"), nb::arg("num_layers"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_index", &tb::rnn_state_manager::RnnStateManager::getCacheIndex, nb::arg("request_id"),
             nb::call_guard<nb::gil_scoped_release>())
         .def(
