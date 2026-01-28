@@ -32,8 +32,8 @@ size_t RnnCacheTransBufferManager::computeTransferBufferSize(
     // Conv state shape per layer: [maxBatchSize, convDim_local, dConv-1]
     // SSM state shape per layer:  [maxBatchSize, numHeads_local, headDim, dState]
     // The tensors are shaped [maxBatchSize, ...], so one slot = total_size / maxBatchSize
-    auto convState = rnnStateManager->getConvStates(0); // Get first layer's tensor
-    auto ssmState = rnnStateManager->getSsmStates(0);
+    auto convState = rnnStateManager->getConvStates(rnnStateManager->getGlobalLayerNum(0)); // Get first layer's tensor
+    auto ssmState = rnnStateManager->getSsmStates(rnnStateManager->getGlobalLayerNum(0));
 
     auto convShape = convState->getShape();
     auto ssmShape = ssmState->getShape();

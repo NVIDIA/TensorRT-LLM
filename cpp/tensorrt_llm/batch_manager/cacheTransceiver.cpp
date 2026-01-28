@@ -308,6 +308,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     contextState->setCacheState(*mCacheState);
     if (mRnnCacheState != nullptr)
     {
+        TLLM_LOG_INFO("Setting RNN cache state for request %ld", llmRequest->mRequestId); // make debug
         contextState->setRnnCacheState(*mRnnCacheState);
     }
     if (!llmRequest->hasDraftTokens())

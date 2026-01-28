@@ -48,6 +48,23 @@ RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runti
         = modelConfig.getNbRnnLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
     auto const dataType = modelConfig.getDataType();
 
+    // TODO(shreyasm): This might not be correct with ADP cause of getPipelineParallelRank method. 
+    // This constructor is not used so should be ok for now.
+    SizeType32 totalRnnLayers = modelConfig.getNbRnnLayers();
+    SizeType32 ppSize = worldConfig.getPipelineParallelism();
+    SizeType32 ppRank = worldConfig.getPipelineParallelRank();
+
+    SizeType32 layersPerRank = totalRnnLayers / ppSize;
+    SizeType32 remainder = totalRnnLayers % ppSize;
+    SizeType32 startLayer = ppRank * layersPerRank + std::min(ppRank, static_cast<SizeType32>(remainder));
+
+    mGlobalLayerNumsPerPP.resize(localNbLayers);
+    for (SizeType32 i = 0; i < localNbLayers; i++)
+    {
+        mGlobalLayerNumsPerPP[i] = startLayer + i;
+        mLayerOffsets[startLayer + i] = i;
+    }
+
     auto const rnnStateShape = [&]()
     {
         if (rnnHeadSize > 0)
@@ -135,9 +152,10 @@ RnnStateManager::RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32
 
     // Store local layer count
     mNumLocalLayers = numLocalLayers;
-
+    mGlobalLayerNumsPerPP.resize(numLocalLayers);
     for (SizeType32 offset = 0; offset < numLocalLayers; ++offset)
     {
+        mGlobalLayerNumsPerPP[offset] = ppLayers[offset];
         mLayerOffsets[ppLayers[offset]] = offset;
     }
 
