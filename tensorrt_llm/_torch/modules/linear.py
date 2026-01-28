@@ -2413,6 +2413,7 @@ class Linear(nn.Module):
                 f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
             )
             local_out_features = out_features // self.tp_size
+            reduce_output = False if self.mapping.enable_attention_dp else reduce_output
         else:
             assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
 
