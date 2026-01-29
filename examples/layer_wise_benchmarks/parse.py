@@ -104,20 +104,18 @@ conn = sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True)
 
 query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
 df = pd.read_sql_query(query, conn)
-event_id_nvtx_domain_create = df[df["name"] == "NvtxDomainCreate"].iloc[0]["id"].tolist()
-event_id_nvtx_push_pop_range = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
+event_id_NvtxDomainCreate = df[df["name"] == "NvtxDomainCreate"].iloc[0]["id"].tolist()
+event_id_NvtxPushPopRange = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
 
 query = "SELECT domainId FROM NVTX_EVENTS WHERE eventType = ? AND text = ?"
-df = pd.read_sql_query(query, conn, params=(event_id_nvtx_domain_create, "NCCL"))
+df = pd.read_sql_query(query, conn, params=(event_id_NvtxDomainCreate, "NCCL"))
 nccl_domain_id = -1 if df.empty else df.iloc[0]["domainId"].tolist()
 
 query = """SELECT T1.start, T2.value AS text
     FROM NVTX_EVENTS AS T1
     JOIN StringIds AS T2 ON T1.textId = T2.id
     WHERE eventType = ? AND T2.value LIKE ?"""
-df = pd.read_sql_query(
-    query, conn, params=(event_id_nvtx_push_pop_range, "layer_wise_benchmarks %")
-)
+df = pd.read_sql_query(query, conn, params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %"))
 problem_start_times: list[int] = []
 problem_set: list[dict] = []
 for start, text in df.itertuples(index=False):
@@ -143,7 +141,7 @@ query = """SELECT T1.start, T1.end, T2.value AS text
 df = pd.read_sql_query(
     query,
     conn,
-    params=(event_id_nvtx_push_pop_range, "[DG]%", nccl_domain_id),
+    params=(event_id_NvtxPushPopRange, "[DG]%", nccl_domain_id),
 )
 for start, end, text in df.itertuples(index=False):
     problem_id = bisect.bisect(problem_start_times, start) - 1

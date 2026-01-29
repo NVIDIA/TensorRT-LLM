@@ -92,15 +92,15 @@ graph_conn = sqlite3.connect(f"file:{graph_sqlite_file_path}?mode=ro", uri=True)
 
 query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
 df = pd.read_sql_query(query, eager_conn)
-eager_event_id_nvtx_push_pop_range = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
+eager_event_id_NvtxPushPopRange = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
 df = pd.read_sql_query(query, graph_conn)
-graph_event_id_nvtx_push_pop_range = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
+graph_event_id_NvtxPushPopRange = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
 
 query = """SELECT T1.start, T1.end, T2.value AS text
     FROM NVTX_EVENTS AS T1
     JOIN StringIds AS T2 ON T1.textId = T2.id
     WHERE eventType = ?"""
-df = pd.read_sql_query(query, eager_conn, params=(eager_event_id_nvtx_push_pop_range,))
+df = pd.read_sql_query(query, eager_conn, params=(eager_event_id_NvtxPushPopRange,))
 target_ctx_reqs = args.target_ctx_reqs
 target_gen_reqs = args.target_gen_reqs
 if target_gen_reqs is None:
@@ -143,7 +143,7 @@ layer_idx_list = [layer.layer_idx for layer in per_iter_eager_layers[0]]
 print("Layers (eager)", *layer_idx_list)
 for eager_layers in per_iter_eager_layers:
     assert [layer.layer_idx for layer in eager_layers] == layer_idx_list, "inconsistent layer idx"
-df = pd.read_sql_query(query, graph_conn, params=(graph_event_id_nvtx_push_pop_range,))
+df = pd.read_sql_query(query, graph_conn, params=(graph_event_id_NvtxPushPopRange,))
 graph_iters: list[IterInfo] = []
 for start, end, text in df.itertuples(index=False):
     if m := re.match(r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text):
