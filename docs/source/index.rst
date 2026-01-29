@@ -14,6 +14,7 @@ Welcome to TensorRT LLM's Documentation!
    overview.md
    quick-start-guide.md
    installation/index.rst
+   supported-hardware.md
 
 
 .. toctree::
