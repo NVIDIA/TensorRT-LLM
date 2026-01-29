@@ -12,14 +12,14 @@ export PROFILE_DIR="${PROFILE_DIR:-profiles}"
 export TLLM_AUTOTUNER_CACHE_PATH="$PROFILE_DIR/sample_performance_alignment_cache.json"
 
 mkdir -p -- "$PROFILE_DIR"
-mkdir -p -- "$(dirname "$TLLM_AUTOTUNER_CACHE_PATH")"
+mkdir -p -- "$(dirname -- "$TLLM_AUTOTUNER_CACHE_PATH")"
 
 python3 ../../benchmarks/cpp/prepare_dataset.py \
     --tokenizer "$MODEL" \
     --stdout \
     --random-seed 42 \
     token-norm-dist \
-    --num-requests $((BATCH_SIZE*NP)) \
+    --num-requests $((BATCH_SIZE * NP)) \
     --input-mean 2048 \
     --input-stdev 0 \
     --output-mean 256 \
@@ -61,8 +61,8 @@ trtllm-bench \
     --max_batch_size $BATCH_SIZE \
     --max_num_tokens 3072 \
     --disable_chunked_context \
-    --num_requests $((BATCH_SIZE*NP)) \
-    --concurrency $((BATCH_SIZE*NP)) \
+    --num_requests $((BATCH_SIZE * NP)) \
+    --concurrency $((BATCH_SIZE * NP)) \
     --config /tmp/config_collect.yaml
 
 # Step 2
@@ -98,8 +98,8 @@ trtllm-bench \
     --max_batch_size $BATCH_SIZE \
     --max_num_tokens 3072 \
     --disable_chunked_context \
-    --num_requests $((BATCH_SIZE*NP)) \
-    --concurrency $((BATCH_SIZE*NP)) \
+    --num_requests $((BATCH_SIZE * NP)) \
+    --concurrency $((BATCH_SIZE * NP)) \
     --config /tmp/config_mark.yaml
 
 # Step 3
