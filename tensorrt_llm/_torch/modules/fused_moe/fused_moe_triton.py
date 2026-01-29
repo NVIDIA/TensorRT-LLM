@@ -1,7 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import os
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1262,6 +1277,73 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
 
 class TritonFusedMoE(MoE):
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional["QuantAlgo"],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if TritonFusedMoE can implement the given quantization algorithm.
+
+        TritonFusedMoE supports (SM90 only, gptoss_style=True only):
+        - Unquantized (BF16 only)
+        - FP8 per-tensor (QDQ)
+        - W4A8_MXFP4_FP8
+        - W4A16_MXFP4
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation data type. In unquantized mode, activation,
+                weight, and output dtypes must all match (only bfloat16 supported).
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                TritonFusedMoE ONLY supports gptoss_style=True.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from tensorrt_llm._utils import get_sm_version
+        from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        # TritonFusedMoE only supports SM90
+        if sm_version != 90:
+            return _warn_and_return(
+                f"TritonFusedMoE only supports SM90, got SM{sm_version}")
+
+        # TritonFusedMoE ONLY supports gptoss_style=True
+        if not gptoss_style:
+            return _warn_and_return(
+                "TritonFusedMoE only supports gptoss_style=True")
+
+        # Unquantized mode - only bfloat16 is supported
+        if quant_algo is None:
+            if dtype_activation != torch.bfloat16:
+                return _warn_and_return(
+                    f"TritonFusedMoE unquantized mode only supports bfloat16, got {dtype_activation}"
+                )
+            return True, None
+
+        # FP8 per-tensor (QDQ) and W4A8_MXFP4_FP8 - no dtype_activation restriction
+        if quant_algo in {QuantAlgo.FP8, QuantAlgo.W4A8_MXFP4_FP8}:
+            return True, None
+
+        # W4A16_MXFP4 - only bfloat16 and float16 are supported
+        if quant_algo == QuantAlgo.W4A16_MXFP4:
+            if dtype_activation not in {torch.bfloat16, torch.float16}:
+                return _warn_and_return(
+                    f"TritonFusedMoE W4A16_MXFP4 only supports bfloat16 or float16, "
+                    f"got {dtype_activation}")
+            return True, None
+
+        # Unsupported quantization algorithm
+        return _warn_and_return(
+            f"TritonFusedMoE does not support quant_algo={quant_algo}")
 
     def __init__(
         self,
