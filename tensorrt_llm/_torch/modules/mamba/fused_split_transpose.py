@@ -54,9 +54,14 @@ def extract_transpose_xbc_prefill(
     grid = (triton.cdiv(num_prefill_tokens, BLOCK_SEQ), triton.cdiv(conv_dim, BLOCK_CONV))
 
     _extract_transpose_prefill_kernel[grid](
-        zxbcdt, out,
-        num_prefill_tokens, d_in_proj, d_inner, conv_dim,
-        BLOCK_SEQ, BLOCK_CONV,
+        zxbcdt,
+        out,
+        num_prefill_tokens,
+        d_in_proj,
+        d_inner,
+        conv_dim,
+        BLOCK_SEQ,
+        BLOCK_CONV,
     )
 
     return out
@@ -64,16 +69,16 @@ def extract_transpose_xbc_prefill(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SEQ': 32, 'BLOCK_CONV': 32}),
-        triton.Config({'BLOCK_SEQ': 64, 'BLOCK_CONV': 32}),
-        triton.Config({'BLOCK_SEQ': 32, 'BLOCK_CONV': 64}),
-        triton.Config({'BLOCK_SEQ': 64, 'BLOCK_CONV': 64}),
-        triton.Config({'BLOCK_SEQ': 128, 'BLOCK_CONV': 32}),
-        triton.Config({'BLOCK_SEQ': 32, 'BLOCK_CONV': 128}),
-        triton.Config({'BLOCK_SEQ': 128, 'BLOCK_CONV': 64}),
-        triton.Config({'BLOCK_SEQ': 64, 'BLOCK_CONV': 128}),
+        triton.Config({"BLOCK_SEQ": 32, "BLOCK_CONV": 32}),
+        triton.Config({"BLOCK_SEQ": 64, "BLOCK_CONV": 32}),
+        triton.Config({"BLOCK_SEQ": 32, "BLOCK_CONV": 64}),
+        triton.Config({"BLOCK_SEQ": 64, "BLOCK_CONV": 64}),
+        triton.Config({"BLOCK_SEQ": 128, "BLOCK_CONV": 32}),
+        triton.Config({"BLOCK_SEQ": 32, "BLOCK_CONV": 128}),
+        triton.Config({"BLOCK_SEQ": 128, "BLOCK_CONV": 64}),
+        triton.Config({"BLOCK_SEQ": 64, "BLOCK_CONV": 128}),
     ],
-    key=['num_prefill_tokens', 'conv_dim'],
+    key=["num_prefill_tokens", "conv_dim"],
 )
 @triton.jit
 def _extract_transpose_prefill_kernel_autotuned(
@@ -120,13 +125,17 @@ def extract_transpose_xbc_prefill_autotuned(
     d_in_proj = zxbcdt.shape[1]
 
     grid = lambda meta: (
-        triton.cdiv(num_prefill_tokens, meta['BLOCK_SEQ']),
-        triton.cdiv(conv_dim, meta['BLOCK_CONV'])
+        triton.cdiv(num_prefill_tokens, meta["BLOCK_SEQ"]),
+        triton.cdiv(conv_dim, meta["BLOCK_CONV"]),
     )
 
     _extract_transpose_prefill_kernel_autotuned[grid](
-        zxbcdt, out,
-        num_prefill_tokens, d_in_proj, d_inner, conv_dim,
+        zxbcdt,
+        out,
+        num_prefill_tokens,
+        d_in_proj,
+        d_inner,
+        conv_dim,
     )
 
     return out
@@ -161,7 +170,4 @@ def extract_transpose_xbc_prefill_smart(
             zxbcdt, num_prefill_tokens, d_inner, conv_dim
         )
     else:
-        return extract_transpose_xbc_prefill(
-            zxbcdt, num_prefill_tokens, d_inner, conv_dim
-        )
-
+        return extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)

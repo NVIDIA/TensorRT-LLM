@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Tuple
 
 import torch
@@ -54,35 +53,45 @@ def cu_seqlens_to_chunk_indices_offsets(
     - the second logical chunk starts at token 5 in the first physical chunk and contains first 3 tokens from the second sequence
     - the third logical chunk starts at token 0 in the second physical chunk and contains the remaining 2 tokens from the second sequence
     """
+    device = cu_seqlens.device
+    cu = cu_seqlens.to(dtype=torch.int64)
+    cu_wo0 = cu[1:]
+    if cu_wo0.numel() == 0:
+        return (torch.empty(0, dtype=torch.int, device=device),
+                torch.empty(0, dtype=torch.int, device=device))
 
-    total_seqlens = cu_seqlens[-1]
-    cu_seqlens = cu_seqlens[1:]  # remove prepended 0
+    total_seqlens = cu_wo0[-1]
+    seq_starts = cu_wo0[:-1]
+    seq_ends = cu_wo0[1:]
 
-    # outputs will have length expansion of chunks that do not divide
-    # chunk_size
-    N = math.ceil(total_seqlens / chunk_size) + (cu_seqlens[:-1] % chunk_size
-                                                 > 0).sum()
-    chunk_indices = torch.arange(N, dtype=torch.int, device=cu_seqlens.device)
-    chunk_offsets = torch.zeros((N, ),
-                                dtype=torch.int,
-                                device=cu_seqlens.device)
+    misaligned = (seq_starts % chunk_size) > 0
+    prefix_inserts = torch.cumsum(misaligned, dim=0) - misaligned
+    extra_chunks = misaligned.sum()
 
-    p = 0  # num of insertions
-    for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+    # N is small scalar; sync for size only.
+    N = ((total_seqlens + chunk_size - 1) // chunk_size + extra_chunks).item()
 
-        # if does not divide chunk_size, then there is one chunk insertion
-        p += (s % chunk_size > 0)
+    chunk_indices = torch.arange(N, device=device, dtype=torch.int64)
+    chunk_offsets = torch.zeros(N, device=device, dtype=torch.int64)
 
-        # get the dimensions
-        # - the + 1 for _e is to shift the boundary by one chunk
-        # - this shifting is not needed if chunk_size divides e
-        _s, _e = s // chunk_size + p, e // chunk_size + p + (e % chunk_size > 0)
+    if seq_starts.numel() > 0:
+        s_chunks = torch.div(seq_starts, chunk_size,
+                             rounding_mode="floor") + prefix_inserts
+        e_chunks = torch.div(seq_ends, chunk_size,
+                             rounding_mode="floor") + prefix_inserts + (
+                                 (seq_ends % chunk_size) > 0)
 
-        # adjust indices and offsets
-        chunk_indices[_s:_e] -= p
-        chunk_offsets[_s] = s % chunk_size
+        diff = torch.zeros(N + 1, device=device, dtype=torch.int64)
+        diff.scatter_add_(0, s_chunks, torch.full_like(s_chunks, -1))
+        diff.scatter_add_(0, e_chunks, torch.full_like(e_chunks, 1))
 
-    return chunk_indices, chunk_offsets
+        adjustments = torch.cumsum(diff[:-1], dim=0)
+        chunk_indices = chunk_indices + adjustments
+
+        chunk_offsets.scatter_(0, s_chunks, seq_starts % chunk_size)
+
+    return (chunk_indices.to(dtype=torch.int),
+            chunk_offsets.to(dtype=torch.int))
 
 
 class Mamba2Metadata:
@@ -107,6 +116,15 @@ class Mamba2Metadata:
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
+        # Pre-allocated to avoid repeated allocations in prepare()
+        self._arange_buffer = torch.arange(max_batch_size + 1,
+                                           dtype=torch.int,
+                                           device="cuda")
+        self._arange_buffer_long = self._arange_buffer.to(torch.long)
+        self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
+                                            dtype=torch.long,
+                                            device="cuda")
+
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
@@ -118,29 +136,26 @@ class Mamba2Metadata:
                          dtype=torch.int,
                          out=self.cu_seqlens[1:num_contexts + 1])
             torch.add(self.cu_seqlens[num_contexts],
-                      torch.arange(1,
-                                   batch_size - num_contexts + 1,
-                                   dtype=self.cu_seqlens.dtype,
-                                   device=self.cu_seqlens.device),
+                      self._arange_buffer[1:batch_size - num_contexts + 1],
                       out=self.cu_seqlens[num_contexts + 1:batch_size + 1])
             # Need both `query_start_loc` and `query_start_loc_long` because `causal_conv1d_fn`
             # accepts only `int32` while `chunk_gated_delta_rule` accepts only `long`.
             self.query_start_loc = self.cu_seqlens[:batch_size + 1]
-            self.query_start_loc_long = self.query_start_loc.to(torch.long)
+            self._cu_seqlens_long[:batch_size + 1].copy_(self.query_start_loc)
+            self.query_start_loc_long = self._cu_seqlens_long[:batch_size + 1]
             self.seq_idx = torch.repeat_interleave(
-                torch.arange(num_contexts,
-                             dtype=torch.int,
-                             device=self.cu_seqlens.device),
+                self._arange_buffer[:num_contexts],
                 repeats=context_lens,
                 output_size=num_ctx_tokens).unsqueeze(0)
 
             num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
-            self.has_initial_states[:num_contexts] = torch.tensor(
-                num_cached_tokens_per_seq[:num_contexts]) > 0
-            # precomputed bool to avoid host<->device syncs during forward pass
-            self.use_initial_states = torch.any(
-                self.has_initial_states[:num_contexts]).item()
+            # Compute on CPU to avoid torch.any().item() GPU sync
+            self.use_initial_states = any(num_cached_tokens_per_seq[i] > 0
+                                          for i in range(num_contexts))
             if self.use_initial_states:
+                for i in range(num_contexts):
+                    self.has_initial_states[i] = num_cached_tokens_per_seq[
+                        i] > 0
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
                     self.cu_seqlens[:num_contexts + 1], self.chunk_size)
             else:
@@ -148,8 +163,5 @@ class Mamba2Metadata:
                 self.chunk_offsets = None
         else:
             self.query_start_loc = None
-            self.query_start_loc_long = torch.arange(
-                0,
-                batch_size + 1,
-                dtype=torch.long,
-                device=self.cu_seqlens.device)
+            self.query_start_loc_long = self._arange_buffer_long[:batch_size +
+                                                                 1]
