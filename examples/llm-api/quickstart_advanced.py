@@ -217,15 +217,12 @@ def setup_llm(args, **kwargs):
     ) if args.spec_decode_algo is not None else None
 
     if spec_decode_algo == 'MTP':
-        if not args.use_one_model:
-            print("Running MTP eagle with two model style.")
         spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
-            mtp_eagle_one_model=args.use_one_model,
             speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = Eagle3DecodingConfig(

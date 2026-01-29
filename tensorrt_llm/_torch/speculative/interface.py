@@ -46,7 +46,6 @@ def get_force_num_accepted_tokens() -> int:
 class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
-    MTP_EAGLE_ONE_MODEL = auto()
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
@@ -56,23 +55,20 @@ class SpeculativeDecodingMode(IntEnum):
     NONE = auto()
     AUTO = auto()
 
-    def is_mtp_one_model(self):
-        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-
-    def is_mtp_eagle_one_model(self):
-        return self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-
-    def is_mtp_vanilla(self):
-        return self == SpeculativeDecodingMode.MTP
+    def is_mtp(self):
+        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE
 
     def is_mtp_eagle(self):
         return self == SpeculativeDecodingMode.MTP_EAGLE
+
+    def is_mtp_vanilla(self):
+        return self == SpeculativeDecodingMode.MTP
 
     def is_eagle3(self):
         return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
-        return self.is_eagle3_one_model() or self.is_mtp_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -93,24 +89,23 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def without_logits(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_ngram()
+        return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        return self.is_mtp() or self.is_eagle3_one_model(
         ) or self.has_draft_model()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
     def has_draft_model(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
+        return self.is_eagle3() or self.is_draft_target()
 
     def needs_kv_cache_recompute(self):
         """
@@ -118,7 +113,7 @@ class SpeculativeDecodingMode(IntEnum):
         If true, the 1st draft model forward will recompute the kv cache for
         the accepted draft tokens.
         """
-        return self.is_eagle3() or self.is_mtp_eagle()
+        return self.is_eagle3()
 
     def need_load_draft_weights(self):
         """
@@ -128,13 +123,11 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_eagle3_one_model()
 
     def has_spec_decoder(self):
-        return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
-        return self.is_eagle3(
-        ) or self.is_draft_target() or self.is_ngram() or self.is_user_provided(
-        ) or self.is_mtp_eagle() or self.is_save_hidden_states()
+        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
+        ) or self.is_user_provided() or self.is_save_hidden_states()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

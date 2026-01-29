@@ -2051,37 +2051,9 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                 "MTP",
                 "--model_dir",
                 f"{llm_models_root()}/{model_path}",
-                "--use_one_model",
             ],
             stdout=running_log)
         _check_mem_usage(running_log, [54.90, 0, 0, 0])
-
-
-@pytest.mark.parametrize("model_name,model_path", [
-    ("DeepSeek-V3-Lite-BF16", "DeepSeek-V3-Lite/bf16"),
-])
-def test_ptp_quickstart_advanced_mtp_eagle(llm_root, llm_venv, model_name,
-                                           model_path):
-    print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--use_cuda_graph",
-            "--spec_decode_max_draft_len",
-            "3",
-            "--spec_decode_algo",
-            "MTP",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-        ],
-                         stdout=running_log)
-        # 74.60 is the memory usage for DeepSeek-V3-Lite-BF16 with MTP Eagle 2 two model style as one extra kv cache is needed for draft model.
-        _check_mem_usage(running_log, [74.60, 0, 0, 0])
 
 
 @pytest.mark.skip_less_device(4)
