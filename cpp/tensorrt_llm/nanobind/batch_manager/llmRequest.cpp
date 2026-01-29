@@ -93,6 +93,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mMultimodalHashes,                                         //
         mMultimodalPositions,                                      //
         mMultimodalLengths,                                        //
+        mMultimodalUuids,                                          //
         from_torch(mMultimodalEmbedding),                          //
         from_torch(mMropeRotaryCosSin),                            //
         mMropePositionDeltas,                                      //
