@@ -4,7 +4,7 @@ args:
   # world_size: 8
   runtime: trtllm
   trust_remote_code: true
-  compile_backend: torch-compile
+  compile_backend: torch-simple
   max_seq_len: 512
   attn_page_size: 512
   # attn_page_size: 64

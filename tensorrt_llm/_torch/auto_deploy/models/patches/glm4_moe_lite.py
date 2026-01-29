@@ -143,8 +143,8 @@ _from_config_original = AutoModelForCausalLM.from_config
 
 # Module patches to apply
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
-    "Glm4MoeLiteAttention": glm4_moe_lite_attention,
-    "Glm4MoeLiteRotaryEmbedding": glm4_moe_lite_rope,
+    # "Glm4MoeLiteAttention": glm4_moe_lite_attention,
+    # "Glm4MoeLiteRotaryEmbedding": glm4_moe_lite_rope,
 }
 
 
