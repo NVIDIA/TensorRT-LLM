@@ -200,6 +200,15 @@ void TrtEncoderModel::executeBatch(ScheduledRequests const& scheduledRequests)
 
         // engine run
         executeContext(optProfileIndex);
+
+        if (mWorldConfig.isLastPipelineParallelRank())
+        {
+            fillEncoderOutputSync(scheduledRequests.contextRequests, outputMap);
+        }
+        else
+        {
+            getBufferManager().getStream().synchronize();
+        }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
