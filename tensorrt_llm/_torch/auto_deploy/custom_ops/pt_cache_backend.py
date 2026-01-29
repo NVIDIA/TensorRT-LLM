@@ -554,6 +554,23 @@ class PTCacheBackend(CacheBackend):
 
         return self._interleaved_pool_pointers
 
+    def get_native_pool_pointers(self) -> torch.Tensor:
+        """Get native pool pointers from C++ KVCacheManager.
+
+        Returns the pool pointers in the format expected by the kernel:
+        [[base_ptr, 0]] where 0 indicates K/V are interleaved in same pool.
+
+        This allows the kernel to read/write directly to the C++ pool
+        without any intermediate buffers or transposes.
+
+        Returns:
+            Pool pointers tensor on CPU with shape matching what C++ returned.
+        """
+        if not self._initialized:
+            raise RuntimeError("PTCacheBackend not initialized")
+
+        return self._kv_cache_pool_pointers
+
     def sync_to_interleaved(self, layer_idx: int) -> None:
         """Copy data from native pool to interleaved buffer before kernel.
 
@@ -944,12 +961,20 @@ class PTCacheBackend(CacheBackend):
         page_idx_dev = page_idx.to(device)
 
         # Use advanced indexing to scatter values (no loop)
-        # Both K cache (index 0) and V cache (index 1) get same block indices
+        # K and V use DIFFERENT block indices to index into the multi-layer pool
+        # C++ pool layout: [blocks, layers, kv_factor, data] where kv_factor=2
+        # Block offset formula (matches C++ setOffsets with layerIdx=0):
+        #   K: cache_loc * num_layers * kv_factor + 0
+        #   V: cache_loc * num_layers * kv_factor + 1
+        # The kernel adds layer_idx * kv_factor internally using pool_mapping
         # Layout: [num_pools, batch, 2, max_blocks] - TRT-LLM expected layout
+        num_layers = self._config.num_layers
+        kv_factor = 2  # K and V
+        base_offset = cache_loc_vals * num_layers * kv_factor
         # Pool 0, K cache (dim 2 = 0)
-        block_offsets[0, seq_idx_dev, 0, page_idx_dev] = cache_loc_vals
+        block_offsets[0, seq_idx_dev, 0, page_idx_dev] = base_offset
         # Pool 0, V cache (dim 2 = 1)
-        block_offsets[0, seq_idx_dev, 1, page_idx_dev] = cache_loc_vals
+        block_offsets[0, seq_idx_dev, 1, page_idx_dev] = base_offset + 1
 
         # DEBUG: Optional sync to catch errors early (enable via env var)
         import os

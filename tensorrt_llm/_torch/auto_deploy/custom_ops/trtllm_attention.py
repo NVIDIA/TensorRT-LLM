@@ -495,9 +495,6 @@ def trtllm_mha_with_cache(
     # Prepare output tensor
     output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
-    # Track if using PTCacheBackend contiguous mode (for sync after kernel)
-    using_pt_contiguous = False
-
     # Check if PTCacheBackend is active - if so, use its metadata
     pt_backend = _trtllm_config.pt_cache_backend
     if pt_backend is not None:
@@ -538,29 +535,15 @@ def trtllm_mha_with_cache(
         host_request_types = pt_backend.host_request_types[:num_seq]
 
         # Get block offsets from PTCacheBackend - shape [1, num_seq, 2, max_blocks]
-        # PTCacheBackend uses same block indices for K and V, but kernel needs different indices
-        # We'll modify them to use *2 for K and *2+1 for V (alternating blocks in interleaved buffer)
-        pt_block_offsets = pt_backend.kv_cache_block_offsets[:, :num_seq, :, :]
+        # PTCacheBackend already sets K/V at different indices (*2 for K, *2+1 for V)
+        # in _fill_block_offsets_from_cache_loc(), so use directly
+        kv_cache_block_offsets = pt_backend.kv_cache_block_offsets[:, :num_seq, :, :]
 
-        # Create modified block offsets with different K/V indices
-        # K uses even indices (*2), V uses odd indices (*2+1)
-        kv_cache_block_offsets = torch.zeros_like(pt_block_offsets)
-        kv_cache_block_offsets[:, :, 0, :] = pt_block_offsets[:, :, 0, :] * 2  # K at even indices
-        kv_cache_block_offsets[:, :, 1, :] = (
-            pt_block_offsets[:, :, 1, :] * 2 + 1
-        )  # V at odd indices
-
-        # Sync to interleaved buffer with alternating K/V blocks
-        # The kernel expects [heads, tokens, dim] layout per block
-        pt_backend.sync_to_interleaved(layer_idx)
-
-        # Get pool pointers for interleaved buffer: [[base_ptr, 0]]
-        # v_ptr=0 signals interleaved mode to the kernel
-        host_kv_cache_pool_pointers = pt_backend.get_interleaved_pool_pointers(layer_idx)
+        # Get pool pointers directly from C++ KVCacheManager: [[base_ptr, 0]]
+        # The C++ pool stores data in [heads, tokens, dim] layout per block,
+        # which matches what the kernel expects - no transpose needed!
+        host_kv_cache_pool_pointers = pt_backend.get_pool_pointers()
         host_kv_cache_pool_mapping = pt_backend.get_pool_mapping()
-
-        # Flag to sync back after kernel
-        using_pt_contiguous = True
     else:
         # Fall back to original metadata preparation
         state = _global_state.get_or_create_layer_state(
@@ -740,11 +723,6 @@ def trtllm_mha_with_cache(
         ad_logger.error(f"  q_flat.shape={q_flat.shape}, k_flat.shape={k_flat.shape}")
         ad_logger.error(f"  k_cache.shape={k_cache.shape}, v_cache.shape={v_cache.shape}")
         raise
-
-    # Sync interleaved buffer back to native pool for PTCacheBackend
-    # The kernel wrote to interleaved buffer, need to persist to main pool
-    if using_pt_contiguous and pt_backend is not None:
-        pt_backend.sync_from_interleaved(layer_idx)
 
     # Deinterleave: Copy data from interleaved buffer back to AD's separate K/V caches
     # Only needed for fallback path (when state has interleaved_kv_cache)
