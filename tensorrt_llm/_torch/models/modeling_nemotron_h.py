@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -349,20 +349,24 @@ class NemotronHLayer(DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        residual = hidden_states
+        if residual is None:
+            # First layer: no residual from previous layer
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.norm(hidden_states)
         hidden_states = self.mixer(hidden_states,
                                    attn_metadata,
                                    spec_metadata=spec_metadata,
                                    **kwargs)
-        hidden_states = torch.add(hidden_states, residual)
 
-        return hidden_states
+        return hidden_states, residual
 
 
 class NemotronHModel(DecoderModel):
@@ -446,13 +450,17 @@ class NemotronHModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-
+        # For each layer, the pattern is norm -> mixer -> add residual.
+        # Need to handle the first layer without residual and the last layer with explicit redisual addition.
+        residual = None
         for layer in self.layers[:self.num_hidden_layers]:
-            hidden_states = layer(position_ids,
-                                  hidden_states,
-                                  attn_metadata,
-                                  spec_metadata=spec_metadata,
-                                  mamba_metadata=self.mamba_metadata)
+            hidden_states, residual = layer(position_ids,
+                                            hidden_states,
+                                            attn_metadata,
+                                            residual=residual,
+                                            spec_metadata=spec_metadata,
+                                            mamba_metadata=self.mamba_metadata)
+        hidden_states = torch.add(hidden_states, residual)
 
         hidden_states = self.norm_f(hidden_states)
 
