@@ -311,14 +311,21 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
     TORCH_CHECK(gemm1_weights.sizes()[1] % 2 == 0, "the second dimension of weights must be even.");
-    TORCH_CHECK(intermediate_size == gemm1_weights.sizes()[1] / 2, "intermediate_size has incorrect dim 1.");
+    // For gated activations (SwiGLU): gemm1_weights dim 1 = 2 * intermediate_size
+    // For non-gated activations (ReLU2): gemm1_weights dim 1 = intermediate_size
+    TORCH_CHECK(intermediate_size == gemm1_weights.sizes()[1] || 2 * intermediate_size == gemm1_weights.sizes()[1],
+        "intermediate_size has incorrect dim 1 (expected: ", intermediate_size, " or ", 2 * intermediate_size,
+        ", got: ", gemm1_weights.sizes()[1], ").");
+
+    bool const is_gated_activation = (gemm1_weights.sizes()[1] == 2 * intermediate_size);
 
     TORCH_CHECK(gemm1_weights_scale.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm1_weights_scale must be fp8.");
 
     TORCH_CHECK(gemm1_weights_scale.dim() == 3, "gemm1_weights_scale must be 3D.");
     TORCH_CHECK(gemm1_weights_scale.sizes()[0] == local_num_experts, "gemm1_weights_scale has incorrect dim 0.");
     TORCH_CHECK(intermediate_size % 16 == 0, "the second dimension of weights must be a multiple of 16.");
-    TORCH_CHECK(gemm1_weights_scale.sizes()[1] == 2 * intermediate_size, "gemm1_weights_scale has incorrect dim 1.");
+    TORCH_CHECK(gemm1_weights_scale.sizes()[1] == (is_gated_activation ? 2 * intermediate_size : intermediate_size),
+        "gemm1_weights_scale has incorrect dim 1.");
 
     if (gemm1_bias.has_value())
     {
@@ -326,7 +333,8 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
             c10::toString(gemm1_bias.value().scalar_type()));
         TORCH_CHECK(gemm1_bias.value().dim() == 2, "gemm1_bias must be 2D.");
         TORCH_CHECK(gemm1_bias.value().sizes()[0] == local_num_experts, "gemm1_bias has incorrect dim 0.");
-        TORCH_CHECK(gemm1_bias.value().sizes()[1] == 2 * intermediate_size, "gemm1_bias has incorrect dim 1.");
+        TORCH_CHECK(gemm1_bias.value().sizes()[1] == (is_gated_activation ? 2 * intermediate_size : intermediate_size),
+            "gemm1_bias has incorrect dim 1.");
     }
 
     if (gemm1_alpha.has_value())
@@ -453,13 +461,15 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 class FP4BlockScaleMoeRunner : public torch::CustomClassHolder
 {
 public:
-    explicit FP4BlockScaleMoeRunner()
+    explicit FP4BlockScaleMoeRunner(int64_t actType)
         // Update this as new cubins come in
         : mSupportedTileN{8, 16, 32, 64, 128, 256}
     {
         for (int tileN : mSupportedTileN)
         {
-            mRunners.emplace(tileN, std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tileN));
+            mRunners.emplace(tileN,
+                std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, tileN,
+                    static_cast<tensorrt_llm::kernels::ActType>(actType)));
         }
     }
 
@@ -533,6 +543,8 @@ private:
     std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
 
     btg::Dtype mDtypeElt{btg::Dtype::E2m1};
+    btg::Dtype mDtypeAct{btg::Dtype::E2m1};
+    btg::Dtype mDtypeWeights{btg::Dtype::E2m1};
     bool mUseDeepSeekFp8{false};
 };
 
@@ -635,7 +647,7 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
-        .def(torch::init<>())
+        .def(torch::init<int64_t>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::run);
     m.class_<tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
