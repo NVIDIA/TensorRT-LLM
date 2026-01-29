@@ -16,7 +16,7 @@ llm = LLM(
     model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
     transforms={
         "insert_cached_attention": {"backend": "flashinfer"},  # or "triton"
-        "insert_cached_mla_attention": {"backend": "MultiHeadLatentAttention"},
+        "insert_cached_mla_attention": {"backend": "torch_mla"},
         "compile_model": {"backend": "torch-compile"},
         "detect_sharding": {"simple_shard_only": False},
     },
