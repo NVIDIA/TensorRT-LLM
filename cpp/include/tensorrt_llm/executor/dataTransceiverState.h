@@ -486,6 +486,7 @@ public:
         nvinfer1::DataType ssmStateDataType)
         : mModelConfig{dState, dConv, hiddenSize, headDim, convDimSize, nGroups, numLayers, numHeads}
         , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize,
+              1, // Always 1.
               std::move(rnnLayerNumPerPP)}
         , mConvStateDataType(convStateDataType)
         , mSsmStateDataType(ssmStateDataType)

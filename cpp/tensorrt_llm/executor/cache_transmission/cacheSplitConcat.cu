@@ -163,7 +163,7 @@ TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheSta
             .mIRanks = {}, // caller should handle this case. No transfer needed.
             .mDupHeadFactor = 1,
             .mPeerDupHeadFactor = 1,
-            .mPeerAttentionLayerNumInDomainPP = {}};
+            .mPeerLayerNumInDomainPP = {}};
     }
 
     TLLM_CHECK(peerNumLayerPerPP.size() == peerPPNum);
@@ -1228,7 +1228,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
     {
-        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
     bool const isWindow = windowSizes.size() > 1;
@@ -1587,7 +1587,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
     {
-        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer

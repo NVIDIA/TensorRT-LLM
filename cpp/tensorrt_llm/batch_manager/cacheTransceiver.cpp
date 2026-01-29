@@ -216,7 +216,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             worldConfig.getPipelineParallelism(),
             // can reuse the same values as kv cache
             mCacheState->getParallelConfig().mEnableAttentionDP, mCacheState->getParallelConfig().mDPrank,
-            mCacheState->getParallelConfig().mDPsize, rnnLayerNumPerPP};
+            mCacheState->getParallelConfig().mDPsize, 1 /* context parallelism */, rnnLayerNumPerPP};
 
         mRnnCacheState = std::make_unique<executor::rnn_cache::RnnCacheState>(
             rnnModelCfg, rnnParallelCfg, convStateDataType, ssmStateDataType);

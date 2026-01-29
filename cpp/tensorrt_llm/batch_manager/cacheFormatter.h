@@ -49,99 +49,6 @@ void sendAllBuffers(TransferSession& session, int deviceId,
     std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
     runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
     executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections);
-} // namespace tensorrt_llm::batch_manager
-
-namespace tensorrt_llm::batch_manager::kv_cache_manager
-{
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    BlockKey const& lastBlockKey, SizeType32 indexFromEnd, bool recvSideHasCP = false);
-
-using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
-using Connection = tensorrt_llm::executor::kv_cache::Connection;
-using SizeType32 = tensorrt_llm::runtime::SizeType32;
-using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
-using CacheTransBufferManager = kv_cache_manager::CacheTransBufferManager;
-using BlockRange = kv_cache_manager::BlockRange;
-
-BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    bool srcEnableBlockReuse, bool srcEnablePartialReuse, bool recvSideHasCP = false);
-
-// Used to support the cache transmission with different layouts and different protocols.
-class BaseCacheFormatter
-{
-public:
-    using CacheState = executor::kv_cache::CacheState;
-
-    /// @brief Format the cache data into bytes for sending.
-    /// @param session The transfer session.
-    virtual void format(tensorrt_llm::batch_manager::TransferSession& session) = 0;
-
-    /// @brief Unformat the cache data from received bytes.
-    /// @param session The transfer session.
-    virtual void unformat(tensorrt_llm::batch_manager::TransferSession& session) = 0;
-
-    /// @brief Determine whether the sender is applicable to the source and target.
-    /// @param selfConfig Source data arrangement.
-    /// @param destConfig Target data arrangement.
-    /// @return Whether the sender is applicable to the source and target.
-    [[nodiscard]] virtual bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const = 0;
-
-    /// @brief Obtain the indies of the counterparts that need to be actually communicated with.
-    /// @param selfConfig Source data arrangement.
-    /// @param selfIdx The sequential index of the current executor process within the entire parallel group.
-    /// @param destConfig Target data arrangement.
-    /// @return The indies of the counterparts.
-    [[nodiscard]] virtual std::vector<SizeType32> getCounterparts(
-        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
-        = 0;
-
-    [[nodiscard]] virtual BaseKVCacheManager* getCacheManager() const noexcept = 0;
-
-    [[nodiscard]] virtual std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
-        = 0;
-
-    /// @brief Destructor.
-    virtual ~BaseCacheFormatter() = default;
-};
-
-// Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
-// parallel topology is completely identical, making it the preferred method.
-class CacheFormatter final : public BaseCacheFormatter
-{
-public:
-    CacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
-        : mCacheManager{cacheManager}
-        , mCacheTransBufferManager{cacheTransBufferManager}
-    {
-        TLLM_CHECK(mCacheManager);
-        TLLM_CHECK(mCacheTransBufferManager);
-    }
-
-    void format(tensorrt_llm::batch_manager::TransferSession& session) override;
-
-    void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
-
-    [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
-
-    [[nodiscard]] std::vector<SizeType32> getCounterparts(
-        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const override
-    {
-        return executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx).mIRanks;
-    }
-
-    [[nodiscard]] BaseKVCacheManager* getCacheManager() const noexcept override
-    {
-        return mCacheManager;
-    }
-
-private:
-    BaseKVCacheManager* mCacheManager;
-    CacheTransBufferManager* mCacheTransBufferManager;
-};
-
-std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
-    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
 
 namespace cache_formatter_utils
 {
@@ -234,4 +141,102 @@ std::vector<size_t> pickRecvConnections(size_t numConnections, CacheStateT const
     return ret;
 }
 } // namespace cache_formatter_utils
+} // namespace tensorrt_llm::batch_manager
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    BlockKey const& lastBlockKey, SizeType32 indexFromEnd, bool recvSideHasCP = false);
+
+using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using Connection = tensorrt_llm::executor::kv_cache::Connection;
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
+using CacheTransBufferManager = kv_cache_manager::CacheTransBufferManager;
+using BlockRange = kv_cache_manager::BlockRange;
+
+BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    bool srcEnableBlockReuse, bool recvSideHasCP = false);
+
+// Used to support the cache transmission with different layouts and different protocols.
+class BaseCacheFormatter
+{
+public:
+    using CacheState = executor::kv_cache::CacheState;
+
+    /// @brief Format the cache data into bytes for sending.
+    /// @param session The transfer session.
+    virtual void format(tensorrt_llm::batch_manager::TransferSession& session) = 0;
+
+    /// @brief Unformat the cache data from received bytes.
+    /// @param session The transfer session.
+    virtual void unformat(tensorrt_llm::batch_manager::TransferSession& session) = 0;
+
+    /// @brief Determine whether the sender is applicable to the source and target.
+    /// @param selfConfig Source data arrangement.
+    /// @param destConfig Target data arrangement.
+    /// @return Whether the sender is applicable to the source and target.
+    [[nodiscard]] virtual bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const = 0;
+
+    /// @brief Obtain the indies of the counterparts that need to be actually communicated with.
+    /// @param selfConfig Source data arrangement.
+    /// @param selfIdx The sequential index of the current executor process within the entire parallel group.
+    /// @param destConfig Target data arrangement.
+    /// @return The indies of the counterparts.
+    [[nodiscard]] virtual std::vector<SizeType32> getCounterparts(
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
+        = 0;
+
+    [[nodiscard]] virtual BaseKVCacheManager* getCacheManager() const noexcept = 0;
+
+    [[nodiscard]] virtual std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
+        = 0;
+
+    /// @brief Destructor.
+    virtual ~BaseCacheFormatter() = default;
+};
+
+// Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
+// parallel topology is completely identical, making it the preferred method.
+class CacheFormatter final : public BaseCacheFormatter
+{
+public:
+    CacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
+        : mCacheManager{cacheManager}
+        , mCacheTransBufferManager{cacheTransBufferManager}
+    {
+        TLLM_CHECK(mCacheManager);
+        TLLM_CHECK(mCacheTransBufferManager);
+    }
+
+    void format(tensorrt_llm::batch_manager::TransferSession& session) override;
+
+    void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
+
+    [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
+
+    [[nodiscard]] std::vector<SizeType32> getCounterparts(
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const override
+    {
+        return executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx).mIRanks;
+    }
+
+    [[nodiscard]] BaseKVCacheManager* getCacheManager() const noexcept override
+    {
+        return mCacheManager;
+    }
+
+    [[nodiscard]] std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig,
+        std::vector<SizeType32> const& counterPartRanks) const override;
+
+private:
+    BaseKVCacheManager* mCacheManager;
+    CacheTransBufferManager* mCacheTransBufferManager;
+};
+
+std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
+    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

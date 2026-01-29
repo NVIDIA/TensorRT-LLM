@@ -15,20 +15,58 @@
  * limitations under the License.
  */
 
+#include "cacheSplitConcat.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
+#include "tensorrt_llm/executor/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <NvInferRuntimeBase.h>
+#include <cstddef>
+#include <cstdint>
+#include <sstream>
+#include <string>
+#include <vector>
 
 namespace tensorrt_llm::executor::rnn_cache
 {
 
 using namespace tensorrt_llm::runtime;
+
+__device__ __forceinline__ void getLayerIdInDomainPPandRankInDomainPP(int layerId, int domainPPSize,
+    uint64_t* prefixLayerNumDevPtr, int& layerIdInDomainPP, int& rankInDomainPP, int& layerNumInSpecPP)
+{
+    __shared__ int sharedLayerIdInDomainPP;
+    __shared__ int sharedRankInDomainPP;
+    __shared__ int sharedLayerNumInSpecPP;
+
+#pragma unroll 1
+    for (int ppRank = threadIdx.x; ppRank < domainPPSize; ppRank += blockDim.x)
+    {
+        if (layerId >= prefixLayerNumDevPtr[ppRank] && layerId < prefixLayerNumDevPtr[ppRank + 1])
+        {
+            sharedLayerIdInDomainPP = layerId - prefixLayerNumDevPtr[ppRank];
+            sharedRankInDomainPP = ppRank;
+            sharedLayerNumInSpecPP = prefixLayerNumDevPtr[ppRank + 1] - prefixLayerNumDevPtr[ppRank];
+            break;
+        }
+    }
+
+    __syncthreads();
+    layerIdInDomainPP = sharedLayerIdInDomainPP;
+    rankInDomainPP = sharedRankInDomainPP;
+    layerNumInSpecPP = sharedLayerNumInSpecPP;
+}
 
 /**
  * @brief Kernel to split RNN conv state from source TP to destination TP
@@ -57,7 +95,7 @@ __global__ void splitRnnConvStateKernel(T const** __restrict__ inputConvBlocks, 
             int layerIdInDomainPP{};
             int rankInDomainPP{};
             int layerNumInSpecPP{};
-            tensorrt_llm::executor::kv_cache::getLayerIdInDomainPPandRankInDomainPP(
+            getLayerIdInDomainPPandRankInDomainPP(
                 layerId, domainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
 
 #pragma unroll 1
@@ -119,7 +157,7 @@ __global__ void splitRnnSsmStateKernel(T const** __restrict__ inputSsmBlocks, T*
             int layerIdInDomainPP{};
             int rankInDomainPP{};
             int layerNumInSpecPP{};
-            tensorrt_llm::executor::kv_cache::getLayerIdInDomainPPandRankInDomainPP(
+            getLayerIdInDomainPPandRankInDomainPP(
                 layerId, domainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
 
 #pragma unroll 1
@@ -178,7 +216,7 @@ __global__ void concatRnnConvStateKernel(T const** __restrict__ inputCaches, T**
             int layerIdInDomainPP{};
             int rankInDomainPP{};
             int layerNumInSpecPP{};
-            tensorrt_llm::executor::kv_cache::getLayerIdInDomainPPandRankInDomainPP(
+            getLayerIdInDomainPPandRankInDomainPP(
                 layerId, domainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
 
 #pragma unroll 1
@@ -219,7 +257,6 @@ __global__ void concatRnnSsmStateKernel(T const** __restrict__ inputCaches, T** 
     int headNumDomainTP, uint64_t* prefixLayerNumDevPtr)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
-    int const laneId = threadIdx.x % subWarpSize;
     int const subWarpNum = blockDim.x / subWarpSize;
     int const subWarpGroupId = subWarpId / subWarpNumInGroup;
     int const subWarpGroupNum = subWarpNum / subWarpNumInGroup;
@@ -239,7 +276,7 @@ __global__ void concatRnnSsmStateKernel(T const** __restrict__ inputCaches, T** 
             int layerIdInDomainPP{};
             int rankInDomainPP{};
             int layerNumInSpecPP{};
-            tensorrt_llm::executor::kv_cache::getLayerIdInDomainPPandRankInDomainPP(
+            getLayerIdInDomainPPandRankInDomainPP(
                 layerId, domainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
 
 #pragma unroll 1
@@ -315,7 +352,7 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
     {
-        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
@@ -377,10 +414,21 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
             convDimDomainTP, prefixLayerNumDevPtr);
         break;
     }
+    case 4:
+    case 12:
+    {
+        if constexpr (sizeof(T) <= 4)
+        {
+            splitRnnConvStateKernel<T, subWarpSize, 4><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
+                inputConvPtrsDev, outputCachePtrsDev, convDimLocal, dConvMinus1, numLayers, inputBlockNum, domainPPSize,
+                convDimDomainTP, prefixLayerNumDevPtr);
+            break;
+        }
+    }
     default:
     {
-        // Fallback to 4-byte vectorization
-        splitRnnConvStateKernel<T, subWarpSize, 4><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
+        // For 8-byte types or unhandled remainders, use 8-byte vectorization
+        splitRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
             inputConvPtrsDev, outputCachePtrsDev, convDimLocal, dConvMinus1, numLayers, inputBlockNum, domainPPSize,
             convDimDomainTP, prefixLayerNumDevPtr);
         break;
@@ -421,7 +469,7 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
     for (size_t i = 0; i < outputSplitBlocks.size(); i++)
     {
         // Calculate offset for this specific target
-        SizeType32 layersForThisTarget = targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        SizeType32 layersForThisTarget = targetRankInfo.mPeerLayerNumInDomainPP[i];
         size_t ssmOffset = layersForThisTarget * convBytesPerLayer;
 
         // Apply offset to UINT8 buffer
@@ -438,7 +486,7 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
     {
-        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
@@ -499,10 +547,22 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
                 prefixLayerNumDevPtr);
         break;
     }
+    case 4:
+    case 12:
+    {
+        if constexpr (sizeof(T) <= 4)
+        {
+            splitRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 4>
+                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev,
+                    numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
+                    prefixLayerNumDevPtr);
+            break;
+        }
+    }
     default:
     {
-        // Fallback to 4-byte vectorization
-        splitRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 4>
+        // For 8-byte types or unhandled remainders, use 8-byte vectorization
+        splitRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 8>
             <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev,
                 numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
                 prefixLayerNumDevPtr);
@@ -551,7 +611,7 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
     {
-        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
@@ -605,10 +665,21 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
             convDimDomainTP, prefixLayerNumDevPtr);
         break;
     }
+    case 4:
+    case 12:
+    {
+        if constexpr (sizeof(T) <= 4)
+        {
+            concatRnnConvStateKernel<T, subWarpSize, 4><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
+                inputCachePtrsDev, outputConvPtrsDev, convDimLocal, dConvMinus1, numLayers, outputBlockNum,
+                domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
+            break;
+        }
+    }
     default:
     {
-        // Fallback to 4-byte vectorization
-        concatRnnConvStateKernel<T, subWarpSize, 4><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
+        // For 8-byte types or unhandled remainders, use 8-byte vectorization
+        concatRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
             inputCachePtrsDev, outputConvPtrsDev, convDimLocal, dConvMinus1, numLayers, outputBlockNum, domainPPSize,
             convDimDomainTP, prefixLayerNumDevPtr);
         break;
@@ -651,7 +722,7 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
     for (size_t i = 0; i < inputSplitBlocks.size(); i++)
     {
         // Calculate offset for this specific source
-        SizeType32 layersFromThisSource = targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        SizeType32 layersFromThisSource = targetRankInfo.mPeerLayerNumInDomainPP[i];
         size_t ssmOffset = layersFromThisSource * convBytesPerLayer;
 
         // Apply offset to UINT8 buffer
@@ -668,7 +739,7 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
     {
-        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
@@ -726,10 +797,22 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
                 prefixLayerNumDevPtr);
         break;
     }
+    case 4:
+    case 12:
+    {
+        if constexpr (sizeof(T) <= 4)
+        {
+            concatRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 4>
+                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev,
+                    numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
+                    prefixLayerNumDevPtr);
+            break;
+        }
+    }
     default:
     {
-        // Fallback to 4-byte vectorization
-        concatRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 4>
+        // For 8-byte types or unhandled remainders, use 8-byte vectorization
+        concatRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 8>
             <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev,
                 numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
                 prefixLayerNumDevPtr);
