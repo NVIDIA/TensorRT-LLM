@@ -40,7 +40,7 @@ Integration Flow:
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -194,6 +194,18 @@ class PTCacheBackend(CacheBackend):
         self._kv_cache_pool_pointers: Optional[torch.Tensor] = None
         self._kv_cache_pool_mapping: Optional[torch.Tensor] = None
 
+        # Shared contiguous cache buffers for thop.attention
+        # thop.attention expects contiguous K and V caches with specific block stride.
+        # PTCacheBackend's interleaved pool has K/V interleaved per block, which
+        # doesn't match the kernel's expected layout.
+        #
+        # MEMORY OPTIMIZATION: Use a single shared buffer pair for ALL layers.
+        # Since only one layer is active at a time, we don't need per-layer buffers.
+        # This avoids 2x memory multiplication (one buffer covers all layers sequentially).
+        self._shared_contiguous_k_cache: Optional[torch.Tensor] = None
+        self._shared_contiguous_v_cache: Optional[torch.Tensor] = None
+        self._contiguous_pool_pointers: Optional[torch.Tensor] = None  # [1, 2]
+
     def initialize(
         self,
         sequence_info: "SequenceInfo",
@@ -238,7 +250,9 @@ class PTCacheBackend(CacheBackend):
             # Allocate pools
             self._kv_cache_manager.allocate_pools(False)  # useUvm=False
 
-            # Get pool pointers and mapping
+            # Get pool pointers and layer mapping from C++
+            # NOTE: For unified interleaved pool, C++ returns [[base_ptr, 0]] where
+            # v_ptr=0 indicates K and V are interleaved in the same pool.
             self._kv_cache_pool_pointers = self._kv_cache_manager.get_block_pool_pointers()
             self._kv_cache_pool_mapping = self._kv_cache_manager.get_layer_to_pool_mapping()
 
@@ -248,6 +262,18 @@ class PTCacheBackend(CacheBackend):
                 f"max_blocks_per_seq={self._kv_cache_manager.max_blocks_per_seq}, "
                 f"tokens_per_block={self._kv_cache_manager.tokens_per_block}"
             )
+            # Debug: Log pool pointer values
+            ad_logger.info(
+                f"[PTCacheBackend] Pool pointers shape={self._kv_cache_pool_pointers.shape}, "
+                f"values={self._kv_cache_pool_pointers.tolist()}"
+            )
+            # Debug: Check pool data pointers for multiple layers
+            for debug_layer in [0, 1, 2, 31]:
+                pool_data_layer = self._kv_cache_manager.get_primary_pool_data(debug_layer)
+                ad_logger.info(
+                    f"[PTCacheBackend] Pool data layer {debug_layer}: shape={pool_data_layer.shape}, "
+                    f"data_ptr={pool_data_layer.data_ptr()}"
+                )
 
         except Exception as e:
             ad_logger.error(f"[PTCacheBackend] Failed to create KVCacheManager: {e}")
@@ -265,10 +291,13 @@ class PTCacheBackend(CacheBackend):
 
         # Device tensors
         device = self._device
-        # Block offsets: [2, batch, max_blocks] - same layout as SimpleCacheBackend
-        # Dimension 0: K cache (index 0) and V cache (index 1) - both get same block indices
+        # Block offsets: [num_pools, batch, 2, max_blocks] - TRT-LLM expected layout
+        # Dimension 0: pool index (we use 1 pool)
+        # Dimension 1: sequence/batch index
+        # Dimension 2: K cache (index 0) and V cache (index 1)
+        # Dimension 3: block index within sequence
         self._kv_cache_block_offsets = torch.zeros(
-            2, max_batch, max_blocks, dtype=torch.int32, device=device
+            1, max_batch, 2, max_blocks, dtype=torch.int32, device=device
         )
         self._sequence_length = torch.zeros(max_batch, dtype=torch.int32, device=device)
         self._context_lengths = torch.zeros(max_batch, dtype=torch.int32, device=device)
@@ -284,6 +313,14 @@ class PTCacheBackend(CacheBackend):
             max_batch, dtype=torch.int32, device="cpu", pin_memory=True
         )
         self._host_total_kv_lens = torch.zeros(2, dtype=torch.int64, device="cpu", pin_memory=True)
+
+        # Pool mapping for thop.attention: 1D tensor of pool indices per sequence
+        # All sequences use pool 0 (single pool), so fill with zeros
+        # NOTE: This is DIFFERENT from the C++ layer-to-pool mapping which is 2D [num_layers, 2]
+        # thop.attention expects: [max_batch_size] with pool index per sequence
+        self._host_kv_cache_pool_mapping_for_attention = torch.zeros(
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+        )
 
         ad_logger.debug(
             f"[PTCacheBackend] Allocated metadata tensors: "
@@ -328,6 +365,250 @@ class PTCacheBackend(CacheBackend):
             return pool_reshaped[:, 1, :, :, :]
         else:
             raise ValueError(f"Unknown cache_name: {cache_name}")
+
+    def get_contiguous_caches(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get shared contiguous K/V cache buffers.
+
+        These buffers have a contiguous memory layout that matches what
+        thop.attention expects (block stride = page_size * kv_dim).
+
+        MEMORY OPTIMIZATION: A single shared buffer pair is used for ALL layers.
+        Since only one layer is active at a time during forward pass, we don't
+        need separate buffers per layer. This saves significant GPU memory.
+
+        The buffers are allocated lazily on first use and reused across all
+        layers, providing stable addresses for CUDA graph compatibility.
+
+        Args:
+            layer_idx: Layer index (used to get shape info, but buffer is shared)
+
+        Returns:
+            Tuple of (k_cache_contiguous, v_cache_contiguous) tensors
+        """
+        if not self._initialized:
+            raise RuntimeError("PTCacheBackend not initialized")
+
+        # Lazy allocation of shared contiguous buffers
+        if self._shared_contiguous_k_cache is None:
+            # Use layer 0 to get pool shape (all layers share same pool)
+            pool_data = self._kv_cache_manager.get_primary_pool_data(0)
+            num_blocks = pool_data.shape[0]
+            # Use max num_kv_heads across all layers
+            max_num_kv_heads = max(self._config.num_kv_heads_per_layer)
+            page_size = self._config.tokens_per_block
+            head_dim = self._config.head_dim
+            dtype = pool_data.dtype
+
+            # Allocate shared contiguous buffers with shape [num_blocks, max_kv_heads, page_size, head_dim]
+            # This matches kernel's expected layout [heads, tokens, dim] per block
+            self._shared_contiguous_k_cache = torch.empty(
+                num_blocks, max_num_kv_heads, page_size, head_dim, dtype=dtype, device=self._device
+            )
+            self._shared_contiguous_v_cache = torch.empty(
+                num_blocks, max_num_kv_heads, page_size, head_dim, dtype=dtype, device=self._device
+            )
+            ad_logger.info(
+                f"[PTCacheBackend] Allocated SHARED contiguous buffers: "
+                f"shape={self._shared_contiguous_k_cache.shape}, "
+                f"size={self._shared_contiguous_k_cache.numel() * 2 * 2 / 1024 / 1024:.1f} MiB"
+            )
+
+        # Verify all layers have same num_kv_heads (required for shared buffer approach)
+        # The kernel computes offsets based on num_kv_heads, so all layers must match
+        num_kv_heads = self._config.num_kv_heads_per_layer[layer_idx]
+        if num_kv_heads != max(self._config.num_kv_heads_per_layer):
+            raise RuntimeError(
+                f"Layer {layer_idx} has {num_kv_heads} kv_heads but max is "
+                f"{max(self._config.num_kv_heads_per_layer)}. "
+                f"PTCacheBackend's shared contiguous buffer requires uniform kv_heads."
+            )
+
+        return self._shared_contiguous_k_cache, self._shared_contiguous_v_cache
+
+    def get_contiguous_pool_pointers(self, layer_idx: int) -> torch.Tensor:
+        """Get pool pointers tensor pointing to contiguous K/V buffers.
+
+        This returns a [1, 2] tensor with [k_ptr, v_ptr] that can be used
+        with thop.attention. The addresses are stable across calls for
+        CUDA graph compatibility.
+
+        Args:
+            layer_idx: Layer index
+
+        Returns:
+            Pool pointers tensor [1, 2] with [k_cache_ptr, v_cache_ptr]
+        """
+        k_cache, v_cache = self.get_contiguous_caches(layer_idx)
+
+        # Allocate pool pointers tensor if needed (reused across calls)
+        if self._contiguous_pool_pointers is None:
+            self._contiguous_pool_pointers = torch.zeros(
+                1, 2, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+
+        # Update with current layer's buffer addresses
+        self._contiguous_pool_pointers[0, 0] = k_cache.data_ptr()
+        self._contiguous_pool_pointers[0, 1] = v_cache.data_ptr()
+
+        return self._contiguous_pool_pointers
+
+    def sync_to_contiguous(self, layer_idx: int) -> None:
+        """Copy data from interleaved pool to contiguous buffers.
+
+        Call this BEFORE thop.attention to ensure contiguous buffers
+        have the latest cached K/V values.
+
+        The kernel expects [heads, tokens, dim] layout per block, but the
+        interleaved pool uses [tokens, heads, dim] layout, so we transpose.
+
+        Args:
+            layer_idx: Layer index
+        """
+        k_cont, v_cont = self.get_contiguous_caches(layer_idx)
+
+        # Get interleaved pool views - shape [blocks, tokens, heads, dim]
+        k_interleaved = self.get_cache("k_cache", layer_idx)
+        v_interleaved = self.get_cache("v_cache", layer_idx)
+
+        # Transpose from [blocks, tokens, heads, dim] -> [blocks, heads, tokens, dim]
+        # then copy to contiguous buffer
+        k_cont.copy_(k_interleaved.permute(0, 2, 1, 3))
+        v_cont.copy_(v_interleaved.permute(0, 2, 1, 3))
+
+    def sync_from_contiguous(self, layer_idx: int) -> None:
+        """Copy data from contiguous buffers back to interleaved pool.
+
+        Call this AFTER thop.attention to persist the kernel's cache
+        writes to the main pool. This is needed because the kernel
+        writes to the contiguous buffers, not the interleaved pool.
+
+        The kernel uses [heads, tokens, dim] layout per block, but the
+        interleaved pool uses [tokens, heads, dim] layout, so we transpose back.
+
+        Args:
+            layer_idx: Layer index
+        """
+        k_cont, v_cont = self.get_contiguous_caches(layer_idx)
+
+        # Get interleaved pool views - shape [blocks, tokens, heads, dim]
+        k_interleaved = self.get_cache("k_cache", layer_idx)
+        v_interleaved = self.get_cache("v_cache", layer_idx)
+
+        # Transpose from [blocks, heads, tokens, dim] -> [blocks, tokens, heads, dim]
+        # and copy back to interleaved pool
+        k_interleaved.copy_(k_cont.permute(0, 2, 1, 3))
+        v_interleaved.copy_(v_cont.permute(0, 2, 1, 3))
+
+    def get_interleaved_cache(self, layer_idx: int) -> torch.Tensor:
+        """Get shared interleaved K/V cache buffer with alternating K/V blocks.
+
+        The buffer has shape [total_kv_blocks, block_size] where total_kv_blocks = 2 * num_blocks.
+        K blocks are at even indices (0, 2, 4, ...), V blocks at odd indices (1, 3, 5, ...).
+        Each block has layout [heads, tokens, dim] as expected by the kernel.
+
+        This is allocated lazily and shared across all layers.
+        """
+        if not self._initialized:
+            raise RuntimeError("PTCacheBackend not initialized")
+
+        # Lazy allocation
+        if not hasattr(self, "_shared_interleaved_cache") or self._shared_interleaved_cache is None:
+            pool_data = self._kv_cache_manager.get_primary_pool_data(0)
+            num_blocks = pool_data.shape[0]
+            max_num_kv_heads = max(self._config.num_kv_heads_per_layer)
+            page_size = self._config.tokens_per_block
+            head_dim = self._config.head_dim
+            dtype = pool_data.dtype
+
+            # Total blocks = 2 * num_blocks (alternating K/V)
+            # Block size = heads * tokens * dim (kernel expected layout)
+            block_size = max_num_kv_heads * page_size * head_dim
+            self._shared_interleaved_cache = torch.empty(
+                2 * num_blocks, block_size, dtype=dtype, device=self._device
+            )
+            ad_logger.info(
+                f"[PTCacheBackend] Allocated SHARED interleaved buffer: "
+                f"shape={self._shared_interleaved_cache.shape}, "
+                f"size={self._shared_interleaved_cache.numel() * 2 / 1024 / 1024:.1f} MiB"
+            )
+
+        return self._shared_interleaved_cache
+
+    def get_interleaved_pool_pointers(self, layer_idx: int) -> torch.Tensor:
+        """Get pool pointers for interleaved buffer: [[base_ptr, 0]].
+
+        v_ptr=0 signals interleaved mode to the kernel.
+        """
+        interleaved_cache = self.get_interleaved_cache(layer_idx)
+
+        if (
+            not hasattr(self, "_interleaved_pool_pointers")
+            or self._interleaved_pool_pointers is None
+        ):
+            self._interleaved_pool_pointers = torch.zeros(
+                1, 2, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+
+        self._interleaved_pool_pointers[0, 0] = interleaved_cache.data_ptr()
+        self._interleaved_pool_pointers[0, 1] = 0  # v_ptr=0 for interleaved mode
+
+        return self._interleaved_pool_pointers
+
+    def sync_to_interleaved(self, layer_idx: int) -> None:
+        """Copy data from native pool to interleaved buffer before kernel.
+
+        Copies K/V from native pool [blocks, tokens, heads, dim] to interleaved buffer
+        with alternating K/V blocks and kernel layout [heads, tokens, dim] per block.
+        """
+        interleaved_cache = self.get_interleaved_cache(layer_idx)
+
+        # Get native pool views - shape [blocks, tokens, heads, dim]
+        k_native = self.get_cache("k_cache", layer_idx)
+        v_native = self.get_cache("v_cache", layer_idx)
+
+        num_blocks = k_native.shape[0]
+        num_kv_heads = k_native.shape[2]
+        page_size = k_native.shape[1]
+        head_dim = k_native.shape[3]
+        block_size = num_kv_heads * page_size * head_dim
+
+        # Transpose and copy: [blocks, tokens, heads, dim] -> [blocks, heads, tokens, dim] -> [blocks, block_size]
+        # K at even indices (0, 2, 4, ...), V at odd indices (1, 3, 5, ...)
+        k_transposed = k_native.permute(0, 2, 1, 3).reshape(num_blocks, block_size)
+        v_transposed = v_native.permute(0, 2, 1, 3).reshape(num_blocks, block_size)
+
+        interleaved_cache[0::2, :block_size].copy_(k_transposed)
+        interleaved_cache[1::2, :block_size].copy_(v_transposed)
+
+    def sync_from_interleaved(self, layer_idx: int) -> None:
+        """Copy data from interleaved buffer back to native pool after kernel.
+
+        Copies K/V from interleaved buffer with kernel layout [heads, tokens, dim]
+        back to native pool [blocks, tokens, heads, dim].
+        """
+        interleaved_cache = self.get_interleaved_cache(layer_idx)
+
+        # Get native pool views - shape [blocks, tokens, heads, dim]
+        k_native = self.get_cache("k_cache", layer_idx)
+        v_native = self.get_cache("v_cache", layer_idx)
+
+        num_blocks = k_native.shape[0]
+        num_kv_heads = k_native.shape[2]
+        page_size = k_native.shape[1]
+        head_dim = k_native.shape[3]
+        block_size = num_kv_heads * page_size * head_dim
+
+        # K at even indices, V at odd indices
+        k_from_kernel = interleaved_cache[0::2, :block_size].reshape(
+            num_blocks, num_kv_heads, page_size, head_dim
+        )
+        v_from_kernel = interleaved_cache[1::2, :block_size].reshape(
+            num_blocks, num_kv_heads, page_size, head_dim
+        )
+
+        # Transpose back: [blocks, heads, tokens, dim] -> [blocks, tokens, heads, dim]
+        k_native.copy_(k_from_kernel.permute(0, 2, 1, 3))
+        v_native.copy_(v_from_kernel.permute(0, 2, 1, 3))
 
     def resize(self, new_num_pages: int) -> bool:
         """Resize the KV cache pool by reallocating with new size.
@@ -400,6 +681,16 @@ class PTCacheBackend(CacheBackend):
             # Try to free memory but don't delete old manager yet
             torch.cuda.empty_cache()
 
+            # Clear shared contiguous buffers (will be reallocated with new size on next use)
+            self._shared_contiguous_k_cache = None
+            self._shared_contiguous_v_cache = None
+
+            # Clear shared interleaved buffer (will be reallocated with new size on next use)
+            if hasattr(self, "_shared_interleaved_cache"):
+                self._shared_interleaved_cache = None
+            if hasattr(self, "_interleaved_pool_pointers"):
+                self._interleaved_pool_pointers = None
+
             return True
 
         except Exception as e:
@@ -427,7 +718,14 @@ class PTCacheBackend(CacheBackend):
         return self._kv_cache_pool_pointers
 
     def get_pool_mapping(self) -> Optional[torch.Tensor]:
-        """Get layer-to-pool mapping tensor."""
+        """Get layer-to-pool mapping tensor for thop.attention.
+
+        For interleaved pool layout (v_ptr=0), the C++ kernel expects
+        a 2D tensor [num_layers, 2] where each row is [pool_idx, layer_offset].
+
+        Returns:
+            2D tensor from C++ KVCacheManager's get_layer_to_pool_mapping().
+        """
         return self._kv_cache_pool_mapping
 
     def get_host_prepare_metadata_function(self) -> Optional[Callable[..., None]]:
@@ -551,10 +849,10 @@ class PTCacheBackend(CacheBackend):
             return
 
         # Get the relevant slice of block_offsets
-        # Shape: [2, batch, max_blocks] - same as SimpleCacheBackend
+        # Shape: [num_pools, batch, 2, max_blocks] - TRT-LLM expected layout
         block_offsets = self._kv_cache_block_offsets
         max_batch = block_offsets.shape[1]
-        max_blocks = block_offsets.shape[2]
+        max_blocks = block_offsets.shape[3]
         device = block_offsets.device
 
         # Bounds check: num_seq <= max_batch
@@ -567,7 +865,7 @@ class PTCacheBackend(CacheBackend):
         total_pages = cu_pages[num_seq].item()
 
         if total_pages == 0:
-            block_offsets[:, :num_seq, :].zero_()  # Shape: [2, num_seq, max_blocks]
+            block_offsets[:, :num_seq, :, :].zero_()  # Shape: [num_pools, num_seq, 2, max_blocks]
             return
 
         # DEBUG: Track statistics for diagnosing 2k OSL issue
@@ -598,8 +896,8 @@ class PTCacheBackend(CacheBackend):
             self._last_logged_pages = total_pages
 
         # Zero only the sequences we're updating
-        # Shape: [2, num_seq, max_blocks]
-        block_offsets[:, :num_seq, :].zero_()
+        # Shape: [num_pools, num_seq, 2, max_blocks]
+        block_offsets[:, :num_seq, :, :].zero_()
 
         # VECTORIZED: Create sequence indices for each page
         # Using searchsorted: for cu_pages=[0,2,5,7], page positions 0-6
@@ -647,9 +945,11 @@ class PTCacheBackend(CacheBackend):
 
         # Use advanced indexing to scatter values (no loop)
         # Both K cache (index 0) and V cache (index 1) get same block indices
-        # Layout: [2, batch, max_blocks] - same as SimpleCacheBackend
-        block_offsets[0, seq_idx_dev, page_idx_dev] = cache_loc_vals  # K cache
-        block_offsets[1, seq_idx_dev, page_idx_dev] = cache_loc_vals  # V cache
+        # Layout: [num_pools, batch, 2, max_blocks] - TRT-LLM expected layout
+        # Pool 0, K cache (dim 2 = 0)
+        block_offsets[0, seq_idx_dev, 0, page_idx_dev] = cache_loc_vals
+        # Pool 0, V cache (dim 2 = 1)
+        block_offsets[0, seq_idx_dev, 1, page_idx_dev] = cache_loc_vals
 
         # DEBUG: Optional sync to catch errors early (enable via env var)
         import os

@@ -141,9 +141,13 @@ class TrtllmLayerState:
             self.host_kv_cache_pool_pointers = torch.zeros(
                 1, 2, dtype=torch.int64, device="cpu", pin_memory=True
             )
-            # Pool mapping: which pool each sequence uses (all 0 for single pool)
+            # Pool mapping: 2D [num_layers, 2] format expected by thop.attention
+            # pool_mapping[layer, 0] = pool_idx (0 for single pool)
+            # pool_mapping[layer, 1] = layer_offset (0 when using per-layer pointers)
+            # Use max 256 layers to cover most models
+            max_layers = 256
             self.host_kv_cache_pool_mapping = torch.zeros(
-                self.max_num_requests, dtype=torch.int32, device="cpu", pin_memory=True
+                max_layers, 2, dtype=torch.int32, device="cpu", pin_memory=True
             )
 
 
@@ -275,13 +279,56 @@ def _prepare_trtllm_metadata(
     state.host_total_kv_lens[1] = gen_total_kv
 
     # Set up KV cache pool pointers
-    # AD uses separate K and V caches - we need to pass their pointers
-    # Shape: [num_pools, 2] where each row is [k_cache_ptr, v_cache_ptr]
-    state.host_kv_cache_pool_pointers[0, 0] = k_cache.data_ptr()
-    state.host_kv_cache_pool_pointers[0, 1] = v_cache.data_ptr()
+    # The C++ kernel uses a SINGLE interleaved buffer for K/V storage:
+    # - pool_pointers[0, 0] = Primary pool pointer (interleaved K/V on GPU)
+    # - pool_pointers[0, 1] = Secondary pool pointer (CPU offloading, 0 if unused)
+    #
+    # Interleaved format: [num_blocks, 2, page_size * kv_dim]
+    # - block_data[block, 0, :] = K data for block
+    # - block_data[block, 1, :] = V data for block
+    #
+    # We need to create an interleaved buffer from AD's separate K/V caches.
 
-    # Pool mapping: all sequences use pool 0
-    state.host_kv_cache_pool_mapping[:num_seq].fill_(0)
+    # Get cache dimensions
+    num_blocks = k_cache.shape[0]
+    page_size = k_cache.shape[1]
+    num_kv_heads_cache = k_cache.shape[2]
+    head_dim_cache = k_cache.shape[3]
+
+    # Kernel expects cache block layout: [numHeads, tokensPerBlock, headDim]
+    # Each block size = num_kv_heads * page_size * head_dim
+    block_size = num_kv_heads_cache * page_size * head_dim_cache
+
+    # Allocate interleaved buffer with layout: [total_kv_blocks, block_size]
+    # where total_kv_blocks = 2 * num_blocks (K and V blocks interleaved)
+    # Block order: [K0, V0, K1, V1, ...] where Ki is K block i, Vi is V block i
+    total_kv_blocks = 2 * num_blocks
+    if (
+        not hasattr(state, "interleaved_kv_cache")
+        or state.interleaved_kv_cache is None
+        or state.interleaved_kv_cache.shape[0] < total_kv_blocks
+    ):
+        state.interleaved_kv_cache = torch.zeros(
+            total_kv_blocks, block_size, dtype=k_cache.dtype, device=k_cache.device
+        )
+
+    # k_cache shape: [num_blocks, page_size, num_kv_heads, head_dim]
+    # Kernel expects: [numHeads, tokensPerBlock, headDim] per block
+    # Need to transpose: [block, tokens, heads, dim] -> [block, heads, tokens, dim]
+    k_for_kernel = k_cache.permute(0, 2, 1, 3).reshape(num_blocks, block_size)
+    v_for_kernel = v_cache.permute(0, 2, 1, 3).reshape(num_blocks, block_size)
+
+    # Copy K blocks to even indices (0, 2, 4, ...) and V blocks to odd indices (1, 3, 5, ...)
+    state.interleaved_kv_cache[0::2, :].copy_(k_for_kernel[:num_blocks])  # K at even indices
+    state.interleaved_kv_cache[1::2, :].copy_(v_for_kernel[:num_blocks])  # V at odd indices
+
+    # Set pool pointers to point to interleaved buffer
+    # Position 0 = primary pool (interleaved K/V), Position 1 = secondary pool (0 = unused)
+    state.host_kv_cache_pool_pointers[0, 0] = state.interleaved_kv_cache.data_ptr()
+    state.host_kv_cache_pool_pointers[0, 1] = 0  # No secondary pool
+
+    # Pool mapping: 2D tensor is pre-initialized to zeros which is correct
+    # pool_mapping[layer, 0] = 0 means pool 0, pool_mapping[layer, 1] = 0 means no offset
 
     # Block offsets: convert flat cache_loc to per-sequence block indices
     # Shape: [num_pools, num_seq, max_blocks_per_seq]
@@ -290,28 +337,35 @@ def _prepare_trtllm_metadata(
     _global_state.set_max_blocks_per_seq(max_blocks)
 
     # Allocate or resize block offsets if needed
+    # Shape: [num_pools, batch, 2, max_blocks] - TRT-LLM expected layout
     if (
         state.kv_cache_block_offsets is None
         or state.kv_cache_block_offsets.shape[1] < num_seq
-        or state.kv_cache_block_offsets.shape[2] < max_blocks
+        or state.kv_cache_block_offsets.shape[3] < max_blocks
     ):
         state.kv_cache_block_offsets = torch.zeros(
-            2,  # num_pools (K and V)
+            1,  # num_pools (single pool)
             max(num_seq, state.max_num_requests),
+            2,  # K and V share same block indices
             max(max_blocks, _global_state.max_blocks_per_seq),
             dtype=torch.int32,
             device=cache_loc.device,
         )
 
     # Fill block offsets from cache_loc
+    # For interleaved format, K and V use different block indices:
+    # - K blocks at even indices: 0, 2, 4, ...
+    # - V blocks at odd indices: 1, 3, 5, ...
+    # The interleaved pool layout is: [K_block0, V_block0, K_block1, V_block1, ...]
     state.kv_cache_block_offsets.zero_()
     offset = 0
     for i in range(num_seq):
         n_pages = pages_per_seq[i].item()
         if n_pages > 0:
-            # Both K and V pools use the same page indices
-            state.kv_cache_block_offsets[0, i, :n_pages] = cache_loc[offset : offset + n_pages]
-            state.kv_cache_block_offsets[1, i, :n_pages] = cache_loc[offset : offset + n_pages]
+            k_block_indices = cache_loc[offset : offset + n_pages] * 2  # Even indices for K
+            v_block_indices = cache_loc[offset : offset + n_pages] * 2 + 1  # Odd indices for V
+            state.kv_cache_block_offsets[0, i, 0, :n_pages] = k_block_indices
+            state.kv_cache_block_offsets[0, i, 1, :n_pages] = v_block_indices
             offset += n_pages
 
     return (
@@ -321,9 +375,9 @@ def _prepare_trtllm_metadata(
         state.context_lengths[:num_seq],
         state.host_context_lengths[:num_seq],
         state.host_request_types[:num_seq],
-        state.kv_cache_block_offsets[:, :num_seq, :max_blocks],
+        state.kv_cache_block_offsets[:, :num_seq, :, :max_blocks],  # 4D: [pools, seq, 2, blocks]
         state.host_kv_cache_pool_pointers,
-        state.host_kv_cache_pool_mapping[:num_seq],
+        state.host_kv_cache_pool_mapping,  # 2D: [layers, 2], not sliced
     )
 
 
@@ -441,6 +495,9 @@ def trtllm_mha_with_cache(
     # Prepare output tensor
     output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
+    # Track if using PTCacheBackend contiguous mode (for sync after kernel)
+    using_pt_contiguous = False
+
     # Check if PTCacheBackend is active - if so, use its metadata
     pt_backend = _trtllm_config.pt_cache_backend
     if pt_backend is not None:
@@ -480,13 +537,30 @@ def trtllm_mha_with_cache(
         host_context_lengths = pt_backend.host_context_lengths[:num_seq]
         host_request_types = pt_backend.host_request_types[:num_seq]
 
-        # Get block offsets - shape [2, num_seq, max_blocks] (same as SimpleCacheBackend)
-        # Dimension 0 is K/V cache index (both get same block indices)
-        kv_cache_block_offsets = pt_backend.kv_cache_block_offsets[:, :num_seq, :]
+        # Get block offsets from PTCacheBackend - shape [1, num_seq, 2, max_blocks]
+        # PTCacheBackend uses same block indices for K and V, but kernel needs different indices
+        # We'll modify them to use *2 for K and *2+1 for V (alternating blocks in interleaved buffer)
+        pt_block_offsets = pt_backend.kv_cache_block_offsets[:, :num_seq, :, :]
 
-        # Get pool pointers and mapping from PTCacheBackend
-        host_kv_cache_pool_pointers = pt_backend.get_pool_pointers()
+        # Create modified block offsets with different K/V indices
+        # K uses even indices (*2), V uses odd indices (*2+1)
+        kv_cache_block_offsets = torch.zeros_like(pt_block_offsets)
+        kv_cache_block_offsets[:, :, 0, :] = pt_block_offsets[:, :, 0, :] * 2  # K at even indices
+        kv_cache_block_offsets[:, :, 1, :] = (
+            pt_block_offsets[:, :, 1, :] * 2 + 1
+        )  # V at odd indices
+
+        # Sync to interleaved buffer with alternating K/V blocks
+        # The kernel expects [heads, tokens, dim] layout per block
+        pt_backend.sync_to_interleaved(layer_idx)
+
+        # Get pool pointers for interleaved buffer: [[base_ptr, 0]]
+        # v_ptr=0 signals interleaved mode to the kernel
+        host_kv_cache_pool_pointers = pt_backend.get_interleaved_pool_pointers(layer_idx)
         host_kv_cache_pool_mapping = pt_backend.get_pool_mapping()
+
+        # Flag to sync back after kernel
+        using_pt_contiguous = True
     else:
         # Fall back to original metadata preparation
         state = _global_state.get_or_create_layer_state(
@@ -525,7 +599,7 @@ def trtllm_mha_with_cache(
         )
 
     # Compute softmax scale
-    sm_scale = scale if scale is not None else (1.0 / (head_dim**0.5))
+    # sm_scale = scale if scale is not None else (1.0 / (head_dim**0.5))
 
     # Attention window (full attention)
     attention_window_size = max_context_length
@@ -621,14 +695,14 @@ def trtllm_mha_with_cache(
             1,  # beam_width
             int(AttentionMaskType.causal),  # mask_type
             0,  # quant_mode
-            sm_scale,  # q_scaling (actually sm_scale)
+            1.0,  # q_scaling (scaling factor applied to Q, typically 1.0)
             0,  # position_embedding_type (none - RoPE applied outside)
             0,  # rotary_embedding_dim
             10000.0,  # rotary_embedding_base
             0,  # rotary_embedding_scale_type
             rotary_embedding_scales,  # rotary_embedding_scales
             rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
-            True,  # use_paged_context_fmha
+            True,  # use_paged_context_fmha - True for paged KV cache
             None,  # attention_input_type
             False,  # is_mla_enable
             max(1, num_prefill),  # chunked_prefill_buffer_batch_size
@@ -666,6 +740,38 @@ def trtllm_mha_with_cache(
         ad_logger.error(f"  q_flat.shape={q_flat.shape}, k_flat.shape={k_flat.shape}")
         ad_logger.error(f"  k_cache.shape={k_cache.shape}, v_cache.shape={v_cache.shape}")
         raise
+
+    # Sync interleaved buffer back to native pool for PTCacheBackend
+    # The kernel wrote to interleaved buffer, need to persist to main pool
+    if using_pt_contiguous and pt_backend is not None:
+        pt_backend.sync_from_interleaved(layer_idx)
+
+    # Deinterleave: Copy data from interleaved buffer back to AD's separate K/V caches
+    # Only needed for fallback path (when state has interleaved_kv_cache)
+    if (
+        "state" in dir()
+        and hasattr(state, "interleaved_kv_cache")
+        and state.interleaved_kv_cache is not None
+    ):
+        num_blocks_cache = k_cache.shape[0]
+        page_size_cache = k_cache.shape[1]
+        num_kv_heads_cache = k_cache.shape[2]
+        head_dim_cache = k_cache.shape[3]
+        # block_size_cache = num_kv_heads_cache * page_size_cache * head_dim_cache
+
+        # K at even indices (0, 2, 4, ...), V at odd indices (1, 3, 5, ...)
+        # Kernel layout: [numHeads, tokensPerBlock, headDim]
+        # AD layout: [tokensPerBlock, numHeads, headDim]
+        k_from_kernel = state.interleaved_kv_cache[0::2, :].reshape(
+            num_blocks_cache, num_kv_heads_cache, page_size_cache, head_dim_cache
+        )
+        v_from_kernel = state.interleaved_kv_cache[1::2, :].reshape(
+            num_blocks_cache, num_kv_heads_cache, page_size_cache, head_dim_cache
+        )
+
+        # Transpose back: [block, heads, tokens, dim] -> [block, tokens, heads, dim]
+        k_cache.copy_(k_from_kernel.permute(0, 2, 1, 3))
+        v_cache.copy_(v_from_kernel.permute(0, 2, 1, 3))
 
     # Reshape output back to AD format [b, s, num_heads * head_dim]
     # Pad back to original batch*seq size if needed
