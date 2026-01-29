@@ -21,8 +21,7 @@ from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
-                                     DecoderModelForCausalLM, MetaInitMode,
+from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
@@ -223,19 +222,8 @@ class ModelLoader:
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
 
-        if model_cls is None:
-            try:
-                from transformers import AutoConfig
-                hf_config = AutoConfig.from_pretrained(checkpoint_dir,
-                                                       trust_remote_code=True)
-                if getattr(hf_config, "architectures", None):
-                    model_cls = MODEL_CLASS_MAPPING.get(
-                        hf_config.architectures[0])
-            except Exception:
-                model_cls = None
-
-        if model_cls and hasattr(model_cls, "get_llmapi_defaults"):
-            model_defaults = model_cls.get_llmapi_defaults()
+        if model_cls and hasattr(model_cls, "get_model_defaults"):
+            model_defaults = model_cls.get_model_defaults(llm_args)
             if model_defaults:
                 applied_defaults = apply_model_defaults_to_llm_args(
                     llm_args, model_defaults)
