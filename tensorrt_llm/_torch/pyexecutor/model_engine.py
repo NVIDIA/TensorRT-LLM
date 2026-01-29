@@ -1393,7 +1393,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
-            return list(self.dist.tp_allgather(attn_metadata.num_tokens))
+            return list(self.dist.tp_cp_allgather(attn_metadata.num_tokens))
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
@@ -1605,7 +1605,7 @@ class PyTorchModelEngine(ModelEngine):
             # Handle distributed spec metadata
             if enable_attention_dp:
                 sequence_lengths = spec_metadata.seq_lens
-                all_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
                 spec_metadata.all_rank_num_tokens = [
@@ -2763,7 +2763,7 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
 
@@ -2928,7 +2928,7 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.tp_allgather([
+                all_rank_num_tokens = self.dist.tp_cp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
@@ -2943,7 +2943,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
-                all_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_cp_allgather(
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
