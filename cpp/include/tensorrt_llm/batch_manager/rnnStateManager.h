@@ -64,6 +64,10 @@ public:
 
     [[nodiscard]] TensorPtr getSsmStates(SizeType32 layerIdx) const;
 
+    [[nodiscard]] TensorPtr getConvStatesForSlot(SizeType32 slotIdx) const;
+
+    [[nodiscard]] TensorPtr getSsmStatesForSlot(SizeType32 slotIdx) const;
+
     [[nodiscard]] nvinfer1::DataType getConvStateDataType() const noexcept;
 
     [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const noexcept;
