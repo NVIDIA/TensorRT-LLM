@@ -4,13 +4,17 @@ import csv
 import json
 import re
 import sqlite3
-import subprocess
-import sys
 from pathlib import Path
 
 import jinja2
 import numpy as np
 import pandas as pd
+from parser_utils import (
+    kernel_short_name,
+    lazy_convert_sqlite,
+    shortest_common_supersequence,
+    warned_names,
+)
 
 # Parse cmdline
 parser = argparse.ArgumentParser()
@@ -32,66 +36,6 @@ if (args.file_path is None) == (args.world_size is None):
     parser.error("Please specify exactly one of --file-path and --world-size.")
 print(args)
 
-
-def lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path):
-    if (
-        not sqlite_file_path.is_file()
-        or nsys_rep_file_path.stat().st_mtime > sqlite_file_path.stat().st_mtime
-    ):
-        subprocess.check_call(
-            [
-                "nsys",
-                "export",
-                "--type",
-                "sqlite",
-                "-o",
-                sqlite_file_path,
-                "--force-overwrite=true",
-                nsys_rep_file_path,
-            ]
-        )
-
-
-def shortest_common_supersequence(a, b):
-    # Merge two lists into their shortest common supersequence,
-    # so that both `a` and `b` are subsequences of the result.
-    # Uses dynamic programming to compute the shortest common supersequence, then reconstructs it.
-    m, n = len(a), len(b)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    for i in range(m + 1):
-        dp[i][0] = i
-    for j in range(n + 1):
-        dp[0][j] = j
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if a[i - 1] == b[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1] + 1
-            else:
-                dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1)
-    # Backtrack to build the merged sequence
-    res = []
-    i, j = m, n
-    while i > 0 and j > 0:
-        if a[i - 1] == b[j - 1]:
-            res.append(a[i - 1])
-            i -= 1
-            j -= 1
-        elif dp[i - 1][j] < dp[i][j - 1]:
-            res.append(a[i - 1])
-            i -= 1
-        else:
-            res.append(b[j - 1])
-            j -= 1
-    while i > 0:
-        res.append(a[i - 1])
-        i -= 1
-    while j > 0:
-        res.append(b[j - 1])
-        j -= 1
-    res.reverse()
-    return res
-
-
 if args.file_path is not None:
     nsys_rep_file_path = Path(args.file_path)
     if not nsys_rep_file_path.name.endswith(".nsys-rep"):
@@ -105,6 +49,9 @@ sqlite_file_path = nsys_rep_file_path.parent / (
 csv_file_path = nsys_rep_file_path.parent / (nsys_rep_file_path.name[: -len(".nsys-rep")] + ".csv")
 html_file_path = nsys_rep_file_path.parent / (
     nsys_rep_file_path.name[: -len(".nsys-rep")] + ".html"
+)
+json_file_path = nsys_rep_file_path.parent / (
+    nsys_rep_file_path.name[: -len(".nsys-rep")] + ".json"
 )
 lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 
@@ -133,7 +80,7 @@ for start, text in df.itertuples(index=False):
         problem_start.append(start)
         problem_set.append(
             {
-                "spec": json.loads(text[len("layer_wise_benchmarks problem_spec") :]),
+                "spec": json.loads(text[len("layer_wise_benchmarks problem_spec ") :]),
                 "text": "",
                 "runs": [],
                 "runs_end": [],
@@ -145,15 +92,19 @@ for start, text in df.itertuples(index=False):
 query = """SELECT T1.start, T1.end, T2.value AS text
     FROM NVTX_EVENTS AS T1
     JOIN StringIds AS T2 ON T1.textId = T2.id
-    WHERE eventType = ? AND T2.value NOT LIKE ? AND T2.value NOT LIKE ? AND domainId != ?"""
+    WHERE eventType = ? AND T2.value NOT LIKE ? AND domainId != ?"""
 df = pd.read_sql_query(
     query,
     conn,
-    params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %", "[DG]%", nccl_domain_id),
+    params=(event_id_NvtxPushPopRange, "[DG]%", nccl_domain_id),
 )
 for start, end, text in df.itertuples(index=False):
     problem_id = bisect.bisect(problem_start, start) - 1
-    assert problem_id != -1
+    if text.startswith("layer_wise_benchmarks "):
+        if text != "layer_wise_benchmarks ignore":
+            continue
+    else:
+        assert problem_id != -1
     if re.match(r"b=\d+ s=\d+ ", text):
         problem_set[problem_id]["text"] = text
         problem_set[problem_id]["runs"].append(start)
@@ -216,7 +167,9 @@ for (
     for range_id in ranges:
         problem["kernel_count_per_range"][range_id] += 1
     range_names = [problem["ranges"][i][2] for i in ranges]
-    if args.module is None or args.module in range_names:
+    if (
+        args.module is None or args.module in range_names
+    ) and "layer_wise_benchmarks ignore" not in range_names:
         kernel_list.append(
             (
                 problem_id,
@@ -235,6 +188,7 @@ for (
 query = "SELECT * FROM StringIds"
 df = pd.read_sql_query(query, conn)
 string_ids = dict(zip(df["id"], df["value"]))
+string_ids.update({-2: "Memcpy", -3: "Memset"})
 
 conn.close()
 
@@ -275,75 +229,13 @@ for problem_id in range(len(kernels)):
         seq = [demangledName for demangledName, _, _, _ in kernels[problem_id][run_id]]
         assert seq == required_seq
 
-
-parser_keywords = [
-    ("cuBLASGemm", "nvjet"),
-    ("cutlassGroupGemm", "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal"),
-    ("cutlassGemm", "GemmUniversal"),
-    ("CuteDSLMoePermute", "cute_dsl::moePermuteKernel"),
-    (
-        "CuteDSLGemm",
-        ["cute_dsl_kernels", "blockscaled_gemm_persistent"],
-    ),
-    (
-        "CuteDSLGroupedGemmSwiglu",
-        ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_swiglu_fusion"],
-    ),
-    (
-        "CuteDSLGroupedGemmFinalize",
-        ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_finalize_fusion"],
-    ),
-    ("torchAdd", "at::native::CUDAFunctorOnSelf_add"),
-    ("torchAdd", "CUDAFunctor_add"),
-    ("torchClamp", "at::native::<unnamed>::launch_clamp_scalar("),
-    ("torchCompare", "at::native::<unnamed>::CompareFunctor<"),
-    ("torchCopy", "at::native::bfloat16_copy_kernel_cuda"),
-    ("torchCopy", "at::native::direct_copy_kernel_cuda("),
-    ("torchFill", "at::native::FillFunctor"),
-    ("torchIndexPut", "at::native::index_put_kernel_impl<"),
-    ("torchMul", "at::native::binary_internal::MulFunctor<"),
-    ("torchPow", "at::native::<unnamed>::pow_tensor_scalar_kernel_impl<"),
-    ("torchReduceSum", ["at::native::reduce_kernel<", "at::native::sum_functor<"]),
-    ("torchSigmoid", "at::native::sigmoid_kernel_cuda"),
-    ("torchWhere", "at::native::<unnamed>::where_kernel_impl("),
-]
-warned_names = set()
-
-
-def parse_kernel_name(demangledName):
-    if demangledName == -2:
-        return "Memcpy"
-    if demangledName == -3:
-        return "Memset"
-    name = string_ids[demangledName]
-    for dst, src in parser_keywords:
-        if not isinstance(src, (tuple, list)):
-            src = [src]
-        if all(keyword in name for keyword in src):
-            return dst
-    if re.search(r"at::native::.*elementwise_kernel<", name):
-        if name not in warned_names:
-            print(f"Not parsed torch kernel name: {name}", file=sys.stderr)
-            warned_names.add(name)
-    assert "!unnamed!" not in name
-    name = name.replace("<unnamed>", "!unnamed!")
-    if "<" in name:
-        name = name[: name.index("<")]
-    if "(" in name:
-        name = name[: name.index("(")]
-    if "::" in name:
-        name = name[name.rindex("::") + 2 :]
-    name = name.replace("!unnamed!", "<unnamed>")
-    return name
-
-
 converted_seqs = []
+warmup_times = run_args["warmup_times"] if args.warmup_times is None else args.warmup_times
 for runs in kernels:
-    warmup_times = run_args["warmup_times"] if args.warmup_times is None else args.warmup_times
     converted_seq = []
     # Kernel time
     for i, (demangledName, _, _, ranges) in enumerate(runs[0]):
-        name = parse_kernel_name(demangledName)
+        name = kernel_short_name(string_ids[demangledName])
         category = (*ranges, name)
         time_list = [run[i][2] - run[i][1] for run in runs]
         t = np.mean(time_list[warmup_times:]).tolist()
@@ -399,6 +291,7 @@ csv_data = [["", *[problem["text"] for problem in problem_set]]]
 js_data = []
 js_stack = [js_data]
 max_title_len = max((len(title) - 1) * 3 + len(title[-1][:40]) for title in merged_title)
+print("-" * (max_title_len + 1 + 6 * len(problem_set)))
 for title, time_data in zip(merged_title, merged_data):
     while stack != list(title[: len(stack)]):
         level_title = stack[-1]
@@ -458,7 +351,7 @@ for problem in problem_set:
             innermost_children = innermost_children[-1]["children"]
     innermost_children.append({"name": problem["text"]})
 loader = jinja2.FileSystemLoader(Path(__file__).parent)
-template = jinja2.Environment(loader=loader).get_template("template.html")
+template = jinja2.Environment(loader=loader).get_template("breakdown_template.html")
 with html_file_path.open("w") as f:
     configText = (
         "Run:\n"
@@ -481,3 +374,26 @@ if args.query is not None:
             query + " " * (max_title_len - len(query)),
             *[f"{x / 1000:-6.1f}" for x in query_matched],
         )
+
+correlation = []
+for problem, runs in zip(problem_set, kernels):
+    timeline = []
+    for i, (demangledName, _, _, _) in enumerate(runs[0]):
+        name = string_ids[demangledName]
+        duration_list = [run[i][2] - run[i][1] for run in runs]
+        end_list = [run[i][2] - run[0][1] for run in runs]
+        timeline.append(
+            {
+                "name": name,
+                "duration": np.mean(duration_list[warmup_times:]).tolist(),
+                "end": np.mean(end_list[warmup_times:]).tolist(),
+            }
+        )
+    correlation.append(
+        {
+            "name": problem["text"],
+            "timeline": timeline,
+        }
+    )
+with json_file_path.open("w") as f:
+    json.dump(correlation, f)
