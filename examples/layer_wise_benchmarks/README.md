@@ -171,7 +171,7 @@ You will receive three reports, each containing kernel timing statistics grouped
 2. A CSV report at `profiles/report_np4_rank0.csv`
 3. An HTML report at `profiles/report_np4_rank0.html`
 
-## Performance alignment
+## Performance alignment between end-to-end performance and layer-wise benchmarks
 
 An overall example can be found in `sample_performance_alignment.sh`. Here is an abstract of the main steps.
 
@@ -241,16 +241,18 @@ An overall example can be found in `sample_performance_alignment.sh`. Here is an
        --replay-stop 67
    ```
 
-   Here are explanations of every argument.
+   Here are explanations of every argument:
 
-   1. `NP=4`: Should match the end-to-end run.
-   2. `--load-format AUTO`: Instruct the benchmark to load model weights instead of initializing random weights.
-   3. `--layer-indices 5,6,7`: A list of contiguous layers you want to calibrate.
-   4. `--batch-size 32`: Should match the end-to-end run.
-   5. `--seq-len-q 1`: Should match (1+MTP) of the end-to-end run.
-   6. `--seq-len-kv-cache 2090`: Estimation of the average context length for iterations you captured. The first 5 iterations should be excluded from the estimation, because they will be dropped by parser.
-   7. `--replay-file-path`: The calibration file obtained by Step 1.
-   8. `--replay-start` and `--replay-stop`: Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations, because they will be dropped by parser.
+   | Argument/Parameter | Explanation |
+   |-------------------|-------------|
+   | `NP=4` | Should match the end-to-end run. |
+   | `--load-format AUTO` | Instruct the benchmark to load model weights instead of initializing random weights. |
+   | `--layer-indices 5,6,7` | A list of contiguous layers you want to calibrate. |
+   | `--batch-size 32` | Should match the end-to-end run. |
+   | `--seq-len-q 1` | Should match (1+MTP) of the end-to-end run. |
+   | `--seq-len-kv-cache 2090` | Estimation of the average context length for iterations you captured. The first 5 iterations should be excluded from the estimation, because they will be dropped by parser. |
+   | `--replay-file-path` | The calibration file obtained by Step 1. |
+   | `--replay-start` and `--replay-stop` | Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations, because they will be dropped by parser. |
 
 4. Parse end-to-end profiles with `parse_e2e.py`, and parse layer-wise benchmarks profiles with `parse.py`.
 
