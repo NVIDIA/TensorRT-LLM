@@ -143,8 +143,14 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    def test_auto_dtype(self, enable_chunked_prefill):
+    @pytest.mark.parametrize("ssm_backend", ["triton_ssm", "flashinfer_ssm"])
+    def test_auto_dtype(self, enable_chunked_prefill, ssm_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        kwargs.setdefault("transforms", {})
+        insert_ssm_cfg = {"backend": ssm_backend}
+        if ssm_backend == "flashinfer_ssm":
+            insert_ssm_cfg["cache_config"] = {"mamba_dtype": "bfloat16"}
+        kwargs["transforms"]["insert_cached_ssm_attention"] = insert_ssm_cfg
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,

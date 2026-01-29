@@ -113,7 +113,7 @@ class _FlashInferPlanner:
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
             self.kv_layout,
-            backend="fa2",
+            backend="fa2" if torch.cuda.get_device_capability(0) == (9, 0) else "auto",
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
