@@ -257,7 +257,7 @@ def test_apply_model_defaults_qwen3next_disables_block_reuse():
     llm_args = TorchLlmArgs(model=llama_model_path)
     assert llm_args.kv_cache_config.enable_block_reuse is True
     applied = apply_model_defaults_to_llm_args(
-        llm_args, Qwen3NextForCausalLM.get_llmapi_defaults())
+        llm_args, Qwen3NextForCausalLM.get_model_defaults(llm_args))
     assert applied == {"kv_cache_config": {"enable_block_reuse": False}}
     assert llm_args.kv_cache_config.enable_block_reuse is False
 
@@ -269,7 +269,7 @@ def test_apply_model_defaults_respects_user_override():
         model=llama_model_path,
         kv_cache_config=KvCacheConfig(enable_block_reuse=True))
     applied = apply_model_defaults_to_llm_args(
-        llm_args, Qwen3NextForCausalLM.get_llmapi_defaults())
+        llm_args, Qwen3NextForCausalLM.get_model_defaults(llm_args))
     assert applied == {}
     assert llm_args.kv_cache_config.enable_block_reuse is True
 
@@ -279,7 +279,7 @@ def test_apply_model_defaults_qwen2vl_disables_chunked_prefill():
     llm_args = TorchLlmArgs(model=llama_model_path)
     assert llm_args.enable_chunked_prefill is True
     applied = apply_model_defaults_to_llm_args(
-        llm_args, Qwen2VLModel.get_llmapi_defaults())
+        llm_args, Qwen2VLModel.get_model_defaults(llm_args))
     assert applied == {"enable_chunked_prefill": False}
     assert llm_args.enable_chunked_prefill is False
 
@@ -1053,7 +1053,7 @@ class TestServeDefaults:
         assert args.kv_cache_config.enable_block_reuse is True
 
         # Apply model defaults (simulating what happens in llm_utils)
-        model_defaults = Qwen3NextForCausalLM.get_llmapi_defaults(args)
+        model_defaults = Qwen3NextForCausalLM.get_model_defaults(args)
         applied = apply_model_defaults_to_llm_args(args, model_defaults)
 
         # Verify block_reuse is disabled by model defaults
@@ -1076,7 +1076,7 @@ class TestServeDefaults:
         assert args.kv_cache_config.enable_block_reuse is True
 
         # Apply Qwen3Next model defaults (which normally disable block_reuse)
-        model_defaults = Qwen3NextForCausalLM.get_llmapi_defaults(args)
+        model_defaults = Qwen3NextForCausalLM.get_model_defaults(args)
 
         # This should try to set enable_block_reuse=False
         assert model_defaults.get("kv_cache_config",
