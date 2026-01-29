@@ -18,12 +18,34 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <numeric>
 #include <string>
 #include <unistd.h>
 #include <utility>
 
+using tensorrt_llm::pg_utils::get_world_pg;
+using tensorrt_llm::pg_utils::PgHelper;
+
 namespace tensorrt_llm::executor::kv_cache
 {
+
+namespace
+{
+// Helper function to get rank based on MPI availability
+int getRank()
+{
+    if (useMPI())
+    {
+        return mpi::MpiComm::world().getRank();
+    }
+    else
+    {
+        auto const& worldPg = get_world_pg();
+        return worldPg ? worldPg->getRank() : 0;
+    }
+}
+} // namespace
 
 std::string genUniqueAgentName()
 {
@@ -270,50 +292,94 @@ AgentConnectionManager::AgentConnectionManager(
     mRegMemDescs = MemoryDescs{MemoryType::kVRAM, memDescs};
     m_Agent->registerMemory(mRegMemDescs);
 
-    AgentState localAgentState{mAgentName, m_Agent->getLocalConnectionInfo()};
-    std::vector<AgentState> agentStates(mpi::MpiComm::session().getSize());
-    if (mpi::MpiComm::session().getSize() > 1)
+    // Get rank and worldSize based on MPI availability
+    int rank = 0;
+    int worldSize = 1;
+    if (useMPI())
     {
+        rank = mpi::MpiComm::session().getRank();
+        worldSize = mpi::MpiComm::session().getSize();
+    }
+    else
+    {
+        auto const& worldPg = get_world_pg();
+        if (worldPg)
+        {
+            rank = worldPg->getRank();
+            worldSize = worldPg->getSize();
+        }
+    }
 
-        mpi::MpiComm::session().barrier();
+    AgentState localAgentState{mAgentName, m_Agent->getLocalConnectionInfo()};
+    std::vector<AgentState> agentStates(worldSize);
+    if (worldSize > 1)
+    {
         namespace su = executor::serialize_utils;
 
         std::ostringstream oStream;
         su::serialize(localAgentState, oStream);
         auto str = oStream.str();
         std::vector<char> buffer(str.begin(), str.end());
-        std::vector<SizeType32> sizeofBuffer(mpi::MpiComm::session().getSize());
+        std::vector<SizeType32> sizeofBuffer(worldSize);
         SizeType32 bufferSize = buffer.size();
-        mpi::MpiComm::session().allgather(&bufferSize, sizeofBuffer.data(), 1, mpi::MpiType::kINT32);
-        SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
-        std::vector<char> recvBuffer(recvBufferSize);
-        std::vector<int> displs(mpi::MpiComm::session().getSize());
-        for (int r = 0; r < mpi::MpiComm::session().getSize(); r++)
-        {
-            displs[r] = (r == 0) ? 0 : (displs[r - 1] + sizeofBuffer[r - 1]);
-        }
-        mpi::MpiComm::session().allgatherv(buffer.data(), bufferSize, mpi::MpiType::kCHAR, recvBuffer.data(),
-            sizeofBuffer, displs, mpi::MpiType::kCHAR);
 
-        // deserialize
-        for (int i = 0; i < mpi::MpiComm::session().getSize(); i++)
+        if (useMPI())
         {
-            std::vector<char> serBuffer(
-                recvBuffer.begin() + displs[i], recvBuffer.begin() + (displs[i] + sizeofBuffer[i]));
-            su::VectorWrapBuf<char> strbuf(serBuffer);
-            std::istream is(&strbuf);
-            agentStates[i] = su::deserialize<executor::kv_cache::AgentState>(is);
-            TLLM_LOG_DEBUG(
-                mpi::MpiComm::world().getRank(), " recv  agentStates[%d]: %s", i, agentStates[i].toString().c_str());
+            mpi::MpiComm::session().barrier();
+            mpi::MpiComm::session().allgather(&bufferSize, sizeofBuffer.data(), 1, mpi::MpiType::kINT32);
+            SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
+            std::vector<char> recvBuffer(recvBufferSize);
+            std::vector<int> displs(worldSize);
+            for (int r = 0; r < worldSize; r++)
+            {
+                displs[r] = (r == 0) ? 0 : (displs[r - 1] + sizeofBuffer[r - 1]);
+            }
+            mpi::MpiComm::session().allgatherv(buffer.data(), bufferSize, mpi::MpiType::kCHAR, recvBuffer.data(),
+                sizeofBuffer, displs, mpi::MpiType::kCHAR);
+
+            // deserialize
+            for (int i = 0; i < worldSize; i++)
+            {
+                std::vector<char> serBuffer(
+                    recvBuffer.begin() + displs[i], recvBuffer.begin() + (displs[i] + sizeofBuffer[i]));
+                su::VectorWrapBuf<char> strbuf(serBuffer);
+                std::istream is(&strbuf);
+                agentStates[i] = su::deserialize<executor::kv_cache::AgentState>(is);
+                TLLM_LOG_DEBUG(rank, " recv  agentStates[%d]: %s", i, agentStates[i].toString().c_str());
+            }
+        }
+        else
+        {
+            auto const& worldPg = get_world_pg();
+            PgHelper pgh{worldPg};
+            PGCHECK_THROW(worldPg->barrier());
+
+            PGCHECK_THROW(pgh.allgather(&bufferSize, std::ref(sizeofBuffer), {}));
+            SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
+            std::vector<char> recvBuffer(recvBufferSize);
+
+            PGCHECK_THROW(pgh.allgatherv(std::ref(buffer), std::ref(recvBuffer), std::cref(sizeofBuffer), {}));
+
+            // deserialize
+            char* begin = reinterpret_cast<char*>(recvBuffer.data());
+            for (int r = 0; r < worldSize; ++r)
+            {
+                std::vector<char> serBuffer(begin, begin + sizeofBuffer[r]);
+                begin += sizeofBuffer[r];
+                su::VectorWrapBuf<char> strbuf(serBuffer);
+                std::istream is(&strbuf);
+                agentStates[r] = su::deserialize<executor::kv_cache::AgentState>(is);
+                TLLM_LOG_DEBUG(rank, " recv agentStates[%d]: %s", r, agentStates[r].toString().c_str());
+            }
         }
     }
     else
     {
         agentStates[0] = localAgentState;
     }
-    mCommState = CommState(agentStates, mpi::MpiComm::session().getRank());
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
+    mCommState = CommState(agentStates, rank);
+    TLLM_LOG_DEBUG(
+        rank, " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
 }
 
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
@@ -422,8 +488,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
     std::optional<std::string> metadata, bool isSender)
 {
 
-    TLLM_LOG_DEBUG(
-        mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
+    TLLM_LOG_DEBUG(getRank(), "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
     std::scoped_lock lock(mConnectionsMutex);
     auto it = mConnections.find(remoteAgentName);
     if (it != mConnections.end())
@@ -439,7 +504,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
         {
             m_Agent->invalidateRemoteAgent(remoteAgentName);
             it->second->setHasLoadRemoteAgent(true);
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "set has load remote agent to true");
+            TLLM_LOG_DEBUG(getRank(), "set has load remote agent to true");
             m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
         }
         return it->second.get();
@@ -449,16 +514,16 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
     {
         if (metadata.has_value())
         {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with loadRemoteAgent",
-                mAgentName.c_str(), remoteAgentName.c_str());
+            TLLM_LOG_DEBUG(getRank(), "mAgentName: %s connect to %s with loadRemoteAgent", mAgentName.c_str(),
+                remoteAgentName.c_str());
             m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
             hasLoadRemoteAgent = true;
         }
         else
         {
             TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call loadRemoteAgent");
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with loadRemoteAgent",
-                mAgentName.c_str(), remoteAgentName.c_str());
+            TLLM_LOG_DEBUG(getRank(), "mAgentName: %s connect to %s with loadRemoteAgent", mAgentName.c_str(),
+                remoteAgentName.c_str());
             m_Agent->loadRemoteAgent(remoteAgentName, connectionInfo);
         }
     }

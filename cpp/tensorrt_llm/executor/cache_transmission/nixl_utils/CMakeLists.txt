@@ -41,6 +41,9 @@ if(NIXL_ROOT)
 
   # Link against CUDA
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+  # Link against Torch and pg_utils for process group support
+  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE ${TORCH_LIBRARIES}
+                                                       pg_utils)
 
   set(NIXL_ENABLED TRUE)
 else()

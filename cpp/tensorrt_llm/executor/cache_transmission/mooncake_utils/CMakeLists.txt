@@ -36,10 +36,13 @@ if(MOONCAKE_ROOT AND NOT IS_ROCKY8)
 
     target_link_libraries(${MOONCAKE_WRAPPER_TARGET}
                           PRIVATE ${TRANSFER_ENGINE_LIB} CUDA::cudart)
-
+    # Link against Torch and pg_utils for process group support
+    target_link_libraries(${MOONCAKE_WRAPPER_TARGET} PRIVATE ${TORCH_LIBRARIES}
+                                                             pg_utils)
     # Export variables to parent scope for transfer_agent_binding
     set(TRANSFER_ENGINE_INCLUDE_DIR
         ${TRANSFER_ENGINE_INCLUDE_DIR}
         PARENT_SCOPE)
+
   endif()
 endif()
