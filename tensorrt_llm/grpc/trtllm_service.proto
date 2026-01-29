@@ -66,7 +66,7 @@ message GenerateRequest {
   OutputConfig output_config = 4;
 
   // Maximum tokens to generate (REQUIRED)
-  int32 max_tokens = 5;
+  uint32 max_tokens = 5;
 
   // Enable streaming mode
   bool streaming = 6;
@@ -141,7 +141,7 @@ message SamplingConfig {
   int32 beam_width = 1;
 
   // Number of sequences to return
-  int32 num_return_sequences = 2;
+  uint32 num_return_sequences = 2;
 
   // Top-K sampling (0 = disabled, considers all tokens)
   optional int32 top_k = 3;
@@ -165,7 +165,7 @@ message SamplingConfig {
   optional float temperature = 9;
 
   // Minimum tokens to generate before stopping
-  optional int32 min_tokens = 10;
+  optional uint32 min_tokens = 10;
 
   // Beam search diversity rate
   optional float beam_search_diversity_rate = 11;
