@@ -163,22 +163,22 @@ def pulseScan(llmRepo, branchName) {
             ),
             string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
         ]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login gitlab-master.nvidia.com:5005 -u ${USERNAME} -p ${PASSWORD}")
-        }
-        docker.withRegistry('https://gitlab-master.nvidia.com:5005') {
-            docker.image("pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable")
-              .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
-                withEnv([
-                    "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
-                    "PULSE_BEARER_TOKEN=${token}",
-                    "PULSE_REPO_URL=${llmRepo}",
-                    "PULSE_SCAN_PROJECT=TRT-LLM",
-                    "PULSE_SCAN_PROJECT_VERSION=${branchName}",
-                    "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
-                ]) {
-                    sh 'pulse scan --no-fail .'
-                }
-              }
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
+            docker.withRegistry("https://${DEFAULT_GIT_URL}:5005") {
+                docker.image("pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable")
+                  .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
+                    withEnv([
+                        "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
+                        "PULSE_BEARER_TOKEN=${token}",
+                        "PULSE_REPO_URL=${llmRepo}",
+                        "PULSE_SCAN_PROJECT=TRT-LLM",
+                        "PULSE_SCAN_PROJECT_VERSION=${branchName}",
+                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
+                    ]) {
+                        sh 'pulse scan --no-fail .'
+                    }
+                  }
+            }
         }
         sh "ls"
         sh "cat nspect_scan_report.json"
