@@ -1877,3 +1877,165 @@ class FuseNVFP4Moe(BaseTransform):
             has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info
+
+
+def _stack_hf_fp8_moe_weights(gm: GraphModule) -> int:
+    """
+    Stack per-expert HF FP8 block-scale weights and scales for the fused MoE kernel.
+
+    HuggingFace FineGrainedFP8 uses:
+    - FP8 weights with per-block scales (128x128 blocks)
+    - Dynamic activation quantization at runtime (no pre-computed activation scales)
+    """
+
+    def _register_parameter(gm: GraphModule, target, value):
+        gm.register_parameter(target, torch.nn.Parameter(value, requires_grad=False))
+
+    def get_param_or_buffer(target):
+        """Get parameter or buffer by target name."""
+        try:
+            return gm.get_parameter(target)
+        except AttributeError:
+            parts = target.rsplit(".", 1)
+            if len(parts) == 2:
+                mod = gm.get_submodule(parts[0])
+                return getattr(mod, parts[1])
+            else:
+                return getattr(gm, target)
+
+    def _extract_op_args(node):
+        return extract_op_args(
+            node,
+            "x",
+            "selected_experts",
+            "routing_weights",
+            "w1_weight",
+            "w2_weight",
+            "w3_weight",
+            "w1_weight_scale_inv",
+            "w2_weight_scale_inv",
+            "w3_weight_scale_inv",
+            "is_gated_mlp",
+        )
+
+    def _stack(param_list, dim=0, device=None, dtype=None):
+        if param_list:
+            return torch.stack(
+                [get_param_or_buffer(element.target) for element in param_list], dim=dim
+            ).contiguous()
+        else:
+            return torch.empty(0, device=device, dtype=dtype)
+
+    fused_key_counter = 0
+    graph = gm.graph
+
+    replacement_op = torch.ops.auto_deploy.trtllm_quant_hf_fp8_block_scale_moe_fused
+    replaced_op = torch.ops.auto_deploy.torch_quant_hf_fp8_moe
+
+    matched_nodes = [node for node in graph.nodes if is_op(node, replaced_op)]
+    for node in matched_nodes:
+        (
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            w1_list,
+            w2_list,
+            w3_list,
+            w1_scale_inv_list,
+            w2_scale_inv_list,
+            w3_scale_inv_list,
+            is_gated_mlp,
+        ) = _extract_op_args(node)
+
+        # Stack weights: [E, I, H] or [E, H, I]
+        w1_stacked = _stack(w1_list, dim=0)
+        w2_stacked = _stack(w2_list, dim=0)
+        device, dtype = (w1_stacked.device, w1_stacked.dtype)
+        w3_stacked = _stack(w3_list, dim=0, device=device, dtype=dtype)
+
+        # Stack block scales: [E, I/128, H/128] or [E, H/128, I/128]
+        w1_scale_stacked = _stack(w1_scale_inv_list, dim=0)
+        w2_scale_stacked = _stack(w2_scale_inv_list, dim=0)
+        w3_scale_stacked = _stack(w3_scale_inv_list, dim=0, device=device, dtype=torch.float32)
+
+        # Prepare stacked weights and scales for the fused kernel
+        if is_gated_mlp:
+            # For gated MLP, concatenate w3 and w1: [E, 2*I, H]
+            fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
+            # Concatenate scales: [E, 2*I/128, H/128]
+            fc1_weight_scale = torch.cat([w3_scale_stacked, w1_scale_stacked], dim=1).contiguous()
+        else:
+            fc1_expert_weights = w1_stacked
+            fc1_weight_scale = w1_scale_stacked
+
+        fc2_expert_weights = w2_stacked
+        fc2_weight_scale = w2_scale_stacked
+
+        # Register stacked tensors as new parameters
+        new_key_fc1_weights = f"hf_fp8_moe_fc1_stacked_{fused_key_counter}"
+        new_key_fc2_weights = f"hf_fp8_moe_fc2_stacked_{fused_key_counter}"
+        new_key_fc1_scale = f"hf_fp8_moe_fc1_scale_stacked_{fused_key_counter}"
+        new_key_fc2_scale = f"hf_fp8_moe_fc2_scale_stacked_{fused_key_counter}"
+
+        _register_parameter(gm, new_key_fc1_weights, fc1_expert_weights)
+        _register_parameter(gm, new_key_fc2_weights, fc2_expert_weights)
+        _register_parameter(gm, new_key_fc1_scale, fc1_weight_scale)
+        _register_parameter(gm, new_key_fc2_scale, fc2_weight_scale)
+
+        # Create new node with stacked parameters
+        with graph.inserting_before(node):
+            args = (
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                graph.get_attr(new_key_fc1_weights),
+                graph.get_attr(new_key_fc2_weights),
+                graph.get_attr(new_key_fc1_scale),
+                graph.get_attr(new_key_fc2_scale),
+            )
+            new_node = graph.call_function(
+                replacement_op,
+                args,
+                kwargs={
+                    "is_gated_mlp": is_gated_mlp,
+                    "act_fn": node.kwargs.get("act_fn", int(ActivationType.Silu)),
+                },
+            )
+
+        node.replace_all_uses_with(new_node)
+        graph.erase_node(node)
+        fused_key_counter += 1
+
+    # Clean up unused nodes and parameters
+    gm.graph.eliminate_dead_code()
+    gm.delete_all_unused_submodules()
+
+    return fused_key_counter
+
+
+@TransformRegistry.register("fuse_hf_fp8_moe")
+class FuseHFFP8Moe(BaseTransform):
+    """
+    Stack per-expert HuggingFace FineGrainedFP8 MoE weights and block scales.
+
+    This transform replaces torch_quant_hf_fp8_moe ops with the fused
+    trtllm_quant_hf_fp8_block_scale_moe_fused kernel which is cudagraph-compatible.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        with cuda_memory_tracker():
+            fused_key_counter = _stack_hf_fp8_moe_weights(gm)
+
+        info = TransformInfo(
+            skipped=(fused_key_counter == 0),
+            num_matches=fused_key_counter,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
+        )
+        return gm, info

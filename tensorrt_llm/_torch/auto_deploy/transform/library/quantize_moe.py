@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Callable, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -231,6 +231,100 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
             )
 
         excluded_patterns = qcfg.get("exclude_modules", [])
+        count = 0
+
+        for node in list(gm.graph.nodes):
+            if not is_op(node, torch.ops.auto_deploy.torch_moe):
+                continue
+
+            # Check experts are allowed (no excludes)
+            w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
+            if any(
+                should_skip_quantization(n, excluded_patterns)
+                for n in (w1_names + w2_names + w3_names)
+            ):
+                continue
+
+            _quantize_moe_node(gm, node, self, self.target_op())
+            count += 1
+
+        info = TransformInfo(
+            skipped=(count == 0),
+            num_matches=count,
+            is_clean=(count == 0),
+            has_valid_shapes=True,
+        )
+        return gm, info
+
+
+@TransformRegistry.register("quantize_hf_fp8_moe")
+class QuantizeHFFP8MOE(Quantization):
+    """
+    Traverse gm, find every torch.ops.auto_deploy.torch_moe, and replace it with the
+    HuggingFace FineGrainedFP8 quantized version.
+
+    This transform handles HF FP8 quantization config format:
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["gate", "lm_head"]
+        }
+    """
+
+    algo_name = "fp8"
+
+    def target_op(self):
+        return torch.ops.auto_deploy.torch_quant_hf_fp8_moe
+
+    def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+        # Default block size is 128x128 for HF FP8
+        N, K = original_weight_shape
+        block_n, block_k = 128, 128
+        scale_shape = (N // block_n, K // block_k)
+        return {"weight_scale_inv": torch.ones(scale_shape, dtype=torch.bfloat16)}
+
+    def build_custom_args_for_linear(self, scales: Dict[str, "Node"]) -> Tuple:
+        return ([scales["weight_scale_inv"]],)
+
+    def load_hook(self, state_dict, prefix, *args, weight_name: str):
+        """Load hook to handle HF FineGrainedFP8 checkpoint format."""
+        if weight_name not in state_dict:
+            return
+
+        weight = state_dict[weight_name]
+        if weight.dtype == torch.float8_e4m3fn:
+            scale_inv_name = weight_name + "_scale_inv"
+            if scale_inv_name in state_dict:
+                mod_prefix = weight_name.rsplit(".", 1)[0]
+                state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        # Gate by quant_method in quant_config (HF style)
+        qcfg = factory.get_quant_config()
+        if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        quant_method = str(qcfg.get("quant_method", "")).lower()
+        if quant_method != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        excluded_patterns = qcfg.get("modules_to_not_convert", [])
         count = 0
 
         for node in list(gm.graph.nodes):

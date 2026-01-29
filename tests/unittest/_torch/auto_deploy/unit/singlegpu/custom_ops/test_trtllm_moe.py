@@ -1002,3 +1002,253 @@ def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size)
     # Should be close for FP4 quantization (gated MLP may have slightly larger diff due to alpha handling)
     tol = 1e-3
     torch.testing.assert_close(ref_output, transformed_output, rtol=tol, atol=tol)
+
+
+# ============================================================================
+# HuggingFace FP8 Block Scale MoE Tests
+# ============================================================================
+
+HF_FP8_BLOCK_SIZE = 128  # HuggingFace FP8 uses 128x128 block scales
+
+
+def quantize_to_hf_fp8_block_scale(tensor: torch.Tensor, block_size: int = HF_FP8_BLOCK_SIZE):
+    """
+    Quantize tensor to FP8 with per-block scales (HuggingFace format).
+
+    Args:
+        tensor: Input tensor of shape [E, N, K] (experts, rows, cols)
+        block_size: Block size for quantization (default 128)
+
+    Returns:
+        tuple: (fp8_tensor, block_scales)
+    """
+    num_experts, n_dim, k_dim = tensor.shape
+
+    # Pad to multiple of block_size if needed
+    n_pad = (block_size - n_dim % block_size) % block_size
+    k_pad = (block_size - k_dim % block_size) % block_size
+
+    if n_pad > 0 or k_pad > 0:
+        tensor = F.pad(tensor, (0, k_pad, 0, n_pad))
+
+    padded_n, padded_k = tensor.shape[-2], tensor.shape[-1]
+    n_blocks = padded_n // block_size
+    k_blocks = padded_k // block_size
+
+    # Reshape to expose blocks: [E, n_blocks, block_size, k_blocks, block_size]
+    tensor_blocks = tensor.view(num_experts, n_blocks, block_size, k_blocks, block_size)
+    tensor_blocks = tensor_blocks.permute(
+        0, 1, 3, 2, 4
+    )  # [E, n_blocks, k_blocks, block_size, block_size]
+
+    # Compute per-block max for scaling
+    block_max = tensor_blocks.abs().amax(dim=(-2, -1), keepdim=True)
+    block_max = block_max.clamp(min=1e-12)
+
+    # Compute scales: [E, n_blocks, k_blocks]
+    scales = (block_max / FLOAT8_E4M3_MAX).squeeze(-1).squeeze(-1)
+
+    # Quantize
+    tensor_scaled = tensor_blocks / block_max * FLOAT8_E4M3_MAX
+    tensor_scaled = tensor_scaled.clamp(-FLOAT8_E4M3_MAX, FLOAT8_E4M3_MAX)
+
+    # Reshape back to [E, padded_n, padded_k]
+    tensor_fp8 = tensor_scaled.permute(
+        0, 1, 3, 2, 4
+    )  # [E, n_blocks, block_size, k_blocks, block_size]
+    tensor_fp8 = tensor_fp8.reshape(num_experts, padded_n, padded_k)
+
+    # Remove padding and convert to FP8
+    tensor_fp8 = tensor_fp8[:, :n_dim, :k_dim].to(FP8_DTYPE)
+
+    return tensor_fp8, scales.to(torch.float32)
+
+
+HF_FP8_BATCH_SIZES = [1, 4]
+HF_FP8_HIDDEN_SIZES = [256, 512]  # Must be multiple of 128
+HF_FP8_NUM_EXPERTS = [4, 8]
+HF_FP8_TOP_K = [2]
+HF_FP8_INTERMEDIATE_SIZES = [256, 512]  # Must be multiple of 128
+
+
+@pytest.mark.parametrize("batch_size", HF_FP8_BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HF_FP8_HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", HF_FP8_NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", HF_FP8_TOP_K)
+@pytest.mark.parametrize("intermediate_size", HF_FP8_INTERMEDIATE_SIZES)
+@pytest.mark.skipif(
+    not fp8_compatible() or not trtllm_ops_available(),
+    reason="Requires FP8 and TensorRT-LLM ops support",
+)
+@skip_pre_hopper
+def test_trtllm_hf_fp8_block_scale_moe_hopper(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+):
+    """Test HF FP8 block scale MoE on Hopper (SM90) path.
+
+    This test verifies:
+    1. The op runs without error
+    2. Output shape and dtype are correct
+    3. Output values are finite (no NaN/Inf)
+
+    Note: Pure torch reference comparison has high error due to dynamic activation
+    quantization in the kernel. For functional correctness, see
+    test_trtllm_quant_hf_fp8_block_scale_moe_fused_correctness in test_moe_fusion.py
+    which compares fused vs unfused ops.
+    """
+    from tensorrt_llm._utils import is_sm_100f
+
+    if is_sm_100f():
+        pytest.skip("Hopper path test requires SM90 GPU (not SM100+)")
+
+    if top_k > num_experts:
+        pytest.skip(f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})")
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+
+    # Generate test data
+    x = gen_tensor((batch_size, hidden_size), dtype, scale=1.0)
+    router_logits = gen_tensor((batch_size, num_experts), dtype)
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # FC1: [E, 2*I, H] for gated MLP
+    fc1_weights_bf16 = gen_tensor(
+        (num_experts, 2 * intermediate_size, hidden_size), dtype, scale=0.1
+    )
+    # FC2: [E, H, I]
+    fc2_weights_bf16 = gen_tensor((num_experts, hidden_size, intermediate_size), dtype, scale=0.1)
+
+    # Quantize to FP8 with block scales
+    fc1_weights_fp8, fc1_scales = quantize_to_hf_fp8_block_scale(fc1_weights_bf16)
+    fc2_weights_fp8, fc2_scales = quantize_to_hf_fp8_block_scale(fc2_weights_bf16)
+
+    # Run on Hopper (native path)
+    torch.cuda.synchronize()
+    test_output = torch.ops.auto_deploy.trtllm_quant_hf_fp8_block_scale_moe_fused(
+        x,
+        selected_experts,
+        routing_weights,
+        fc1_weights_fp8,
+        fc2_weights_fp8,
+        fc1_scales,
+        fc2_scales,
+        is_gated_mlp=True,
+        act_fn=int(ActivationType.Silu),
+    )
+    torch.cuda.synchronize()
+
+    # Verify output shape matches input
+    assert test_output.shape == x.shape, (
+        f"Output shape {test_output.shape} != input shape {x.shape}"
+    )
+
+    # Verify output dtype
+    assert test_output.dtype == dtype, f"Output dtype {test_output.dtype} != expected {dtype}"
+
+    # Verify no NaN or Inf values
+    assert not torch.isnan(test_output).any(), "Output contains NaN values"
+    assert not torch.isinf(test_output).any(), "Output contains Inf values"
+
+    # Verify output is not all zeros (sanity check)
+    assert test_output.abs().sum() > 0, "Output is all zeros"
+
+    print(f"[Hopper] Output shape: {test_output.shape}, dtype: {test_output.dtype}")
+    print(
+        f"[Hopper] Output range: [{test_output.min().item():.4f}, {test_output.max().item():.4f}]"
+    )
+
+
+@pytest.mark.parametrize("batch_size", HF_FP8_BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HF_FP8_HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", HF_FP8_NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", HF_FP8_TOP_K)
+@pytest.mark.parametrize("intermediate_size", HF_FP8_INTERMEDIATE_SIZES)
+@pytest.mark.skipif(
+    not fp8_compatible() or not trtllm_ops_available(),
+    reason="Requires FP8 and TensorRT-LLM ops support",
+)
+def test_trtllm_hf_fp8_block_scale_moe_blackwell(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+):
+    """Test HF FP8 block scale MoE on Blackwell (SM100+) path.
+
+    This test verifies:
+    1. The op runs without error
+    2. Output shape and dtype are correct
+    3. Output values are finite (no NaN/Inf)
+
+    Note: Pure torch reference comparison has high error due to dynamic activation
+    quantization in the kernel. For functional correctness, see
+    test_trtllm_quant_hf_fp8_block_scale_moe_fused_correctness in test_moe_fusion.py
+    which compares fused vs unfused ops.
+    """
+    from tensorrt_llm._utils import is_sm_100f
+
+    if not is_sm_100f():
+        pytest.skip("Blackwell path test requires SM100+ GPU")
+
+    if top_k > num_experts:
+        pytest.skip(f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})")
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+
+    # Generate test data
+    x = gen_tensor((batch_size, hidden_size), dtype, scale=1.0)
+    router_logits = gen_tensor((batch_size, num_experts), dtype)
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # FC1: [E, 2*I, H] for gated MLP
+    fc1_weights_bf16 = gen_tensor(
+        (num_experts, 2 * intermediate_size, hidden_size), dtype, scale=0.1
+    )
+    # FC2: [E, H, I]
+    fc2_weights_bf16 = gen_tensor((num_experts, hidden_size, intermediate_size), dtype, scale=0.1)
+
+    # Quantize to FP8 with block scales
+    fc1_weights_fp8, fc1_scales = quantize_to_hf_fp8_block_scale(fc1_weights_bf16)
+    fc2_weights_fp8, fc2_scales = quantize_to_hf_fp8_block_scale(fc2_weights_bf16)
+
+    # Run on Blackwell (native path)
+    torch.cuda.synchronize()
+    test_output = torch.ops.auto_deploy.trtllm_quant_hf_fp8_block_scale_moe_fused(
+        x,
+        selected_experts,
+        routing_weights,
+        fc1_weights_fp8,
+        fc2_weights_fp8,
+        fc1_scales,
+        fc2_scales,
+        is_gated_mlp=True,
+        act_fn=int(ActivationType.Silu),
+    )
+    torch.cuda.synchronize()
+
+    # Verify output shape matches input
+    assert test_output.shape == x.shape, (
+        f"Output shape {test_output.shape} != input shape {x.shape}"
+    )
+
+    # Verify output dtype
+    assert test_output.dtype == dtype, f"Output dtype {test_output.dtype} != expected {dtype}"
+
+    # Verify no NaN or Inf values
+    assert not torch.isnan(test_output).any(), "Output contains NaN values"
+    assert not torch.isinf(test_output).any(), "Output contains Inf values"
+
+    # Verify output is not all zeros (sanity check)
+    assert test_output.abs().sum() > 0, "Output is all zeros"
+
+    print(f"[Blackwell] Output shape: {test_output.shape}, dtype: {test_output.dtype}")
+    print(
+        f"[Blackwell] Output range: [{test_output.min().item():.4f}, {test_output.max().item():.4f}]"
+    )

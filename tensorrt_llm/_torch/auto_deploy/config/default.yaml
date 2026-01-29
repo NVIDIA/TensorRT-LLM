@@ -65,6 +65,10 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_linear_from_config:
     stage: pattern_matcher
+  quantize_hf_fp8_linear_from_config:
+    stage: pattern_matcher
+  quantize_hf_fp8_moe:
+    stage: pattern_matcher
   quantize_fp8_bmm_from_config:
     stage: pattern_matcher
   quantize_fp8_from_graph:
@@ -130,6 +134,9 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     backend: trtllm
+  fuse_hf_fp8_moe:
+    stage: post_load_fusion
+    enabled: true
   fuse_nvfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true
