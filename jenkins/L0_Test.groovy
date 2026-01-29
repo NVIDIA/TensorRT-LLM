@@ -184,256 +184,8 @@ EOF_TIMEOUT_XML
     }
 }
 
-def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
-    // Run the isolated tests one by one to avoid any potential conflicts
-    def isolateTestList = preprocessedLists.isolate
-    def isolateTestLines = readFile(file: isolateTestList).readLines()
-    def rerunFailed = false
-
-    for (int i = 0; i < isolateTestLines.size(); i++) {
-        def isolateTestName = isolateTestLines[i].trim()
-        // Create a temporary file for this single isolated test
-        def singleTestFile = "${isolateTestList}_isolated_${i}.txt"
-        sh "echo '${isolateTestName}' > ${singleTestFile}"
-        sh "cat ${singleTestFile}"
-
-        def isolateTestCmdLine = testCmdLine.findAll { cmd ->
-            !cmd.contains("--test-list=") &&
-            !cmd.contains("--test-prefix=") &&
-            !cmd.contains("--csv=") &&
-            !cmd.contains("--periodic-junit-xmlpath")
-        }
-        isolateTestCmdLine += ["--test-list=${singleTestFile}"]
-        isolateTestCmdLine += ["--test-prefix=${stageName}"]
-        isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
-        isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
-        isolateTestCmdLine += ["--cov-append"]  // Append coverage data to avoid overwriting previous data
-
-        try {
-            sh """
-                cd ${llmSrc}/tests/integration/defs && \
-                ${isolateTestCmdLine.join(" ")}
-            """
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}")
-            if (isRerunFailed) {
-                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                    error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
-                }
-                // Mark that at least one isolated test failed, but continue processing other tests
-                rerunFailed = true
-            }
-        } finally {
-            // Clean up the temporary test file
-            sh "rm -f ${singleTestFile}"
-        }
-    }
-
-    // After processing all isolated tests, set stage failure if any test failed
-    if (rerunFailed) {
-        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            error "One or more isolated tests failed after rerun attempts"
-        }
-    }
-
-    return rerunFailed  // Return the updated value
-}
-
-def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
-    // Preprocess testDBList to extract ISOLATION markers
-    echo "Preprocessing testDBList to extract ISOLATION markers..."
-
-    def originalTestLines = readFile(file: testDBList).readLines()
-    def cleanedTestLines = []
-    def isolationTestLines = []
-
-    originalTestLines.each { originalLine ->
-        def trimmedLine = originalLine.trim()
-        if (trimmedLine && trimmedLine.contains('ISOLATION')) {
-            // Remove ISOLATION marker and nearby comma from the line
-            def cleanedLine = trimmedLine
-
-            // Handle different comma patterns around ISOLATION
-            if (trimmedLine.contains('ISOLATION,')) {
-                // Case: "ISOLATION,OTHER_MARKER" -> remove "ISOLATION,"
-                cleanedLine = cleanedLine.replace('ISOLATION,', '').trim()
-            } else if (trimmedLine.contains(',ISOLATION')) {
-                // Case: "OTHER_MARKER,ISOLATION" -> remove ",ISOLATION"
-                cleanedLine = cleanedLine.replace(',ISOLATION', '').trim()
-            } else {
-                // Case: standalone "ISOLATION" -> remove " ISOLATION"
-                cleanedLine = cleanedLine.replace(' ISOLATION', '').trim()
-            }
-
-            // Add the cleaned line to isolationTestLines if original line had ISOLATION
-            isolationTestLines.add(cleanedLine)
-            cleanedTestLines.add(cleanedLine)
-
-        } else if (trimmedLine) {
-            // Line doesn't contain ISOLATION, add as-is
-            cleanedTestLines.add(originalLine.trim())
-        }
-    }
-
-    // Create cleaned testDBList file (without ISOLATION markers)
-    def cleanedTestDBList = testDBList.replaceAll('\\.txt$', '_cleaned.txt')
-    if (cleanedTestLines.size() > 0) {
-        def cleanedContent = cleanedTestLines.join('\n')
-        sh "echo '${cleanedContent.replace("'", "'\\''")}' > ${cleanedTestDBList}"
-        echo "Created cleaned testDBList: ${cleanedTestDBList} with ${cleanedTestLines.size()} lines (ISOLATION markers removed)"
-    } else {
-        sh "touch ${cleanedTestDBList}"
-        echo "No tests found, created empty cleaned testDBList: ${cleanedTestDBList}"
-    }
-
-    sh "cat ${cleanedTestDBList}"
-    echo "Original testDBList contains ${isolationTestLines.size()} tests that had ISOLATION markers"
-
-    def shardTestList = []
-
-    if (perfMode) {
-        // In perfMode, skip pytest collection as it may cause errors with automatically generated testcases
-        // Instead, use all tests from the original testDBList
-        echo "Performance mode enabled - skipping pytest collection, using all tests from testDBList"
-    } else {
-        def testListCmd = [
-            "LLM_ROOT=${llmSrc}",
-            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-            "pytest",
-            "--collect-only",
-            "--splitting-algorithm least_duration",
-            "--test-list=${cleanedTestDBList}",
-            "--quiet",
-            "--splits ${splits}",
-            "--group ${splitId}"
-        ]
-
-        try {
-            // First execute the pytest command and check if it succeeds
-            def pytestOutput = sh(
-                script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
-                returnStdout: true
-            ).trim()
-
-            // Debug: Show the raw pytest output
-            echo "<<<START_PYTEST_OUTPUT>>>"
-            echo "${pytestOutput}"
-            echo "<<<END_PYTEST_OUTPUT>>>"
-
-            // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
-            def lines = pytestOutput.split('\n')
-            def foundRunningLine = false
-            def lineIndex = 0
-            shardTestList = lines.findAll { line ->
-                lineIndex++
-
-                if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
-                    foundRunningLine = true
-                    return false  // Don't include the "Running" line itself
-                }
-                // Stop collecting when we hit the warnings/errors summary separator
-                if (foundRunningLine && line.contains('======================')) {
-                    foundRunningLine = false  // Stop collecting
-                    return false
-                }
-
-                def hasDoubleColon = line.contains('::')
-                def shouldInclude = foundRunningLine && hasDoubleColon
-                return shouldInclude
-            }
-            echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
-        } catch (Exception e) {
-            echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
-            error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
-        }
-    }
-
-    if (shardTestList || perfMode) {
-        // Split the shard test list into regular and isolate tests
-        def shardRegularTests = []
-        def shardIsolateTests = []
-
-        if (perfMode) {
-            // In perfMode, put all tests in regular and skip isolation
-            echo "Performance mode enabled - all tests will run as regular tests (no isolation)"
-            shardRegularTests = cleanedTestLines.findAll { it.trim() }
-        } else {
-            // Process each test from shardTestList
-            shardTestList.each { test ->
-                def trimmedTest = test.trim()
-                if (trimmedTest) {
-                    // Process test_unittests.py::test_unittests_v2[xxxx] pattern
-                    if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
-                        // Extract content between [ and ]
-                        def startIndex = trimmedTest.indexOf('[') + 1
-                        def endIndex = trimmedTest.lastIndexOf(']')
-                        trimmedTest = trimmedTest.substring(startIndex, endIndex)
-                    }
-
-                    // Check if this test is in the isolation list
-                    def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
-                    if (isolationTestLine) {
-                        // This test needs isolation
-                        shardIsolateTests.add(isolationTestLine)
-                    } else {
-                        // This test is a regular test - find the actual line from cleanedTestLines
-                        def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
-                        shardRegularTests.add(cleanedTestLine)
-                    }
-                }
-            }
-        }
-
-        // Define file paths for regular and isolate tests
-        def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
-        def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
-
-        // Create shard-specific test files
-        if (shardRegularTests.size() > 0) {
-            def shardRegularContent = shardRegularTests.join('\n')
-            sh "echo '${shardRegularContent.replace("'", "'\\''")}' > ${regularTestList}"
-            echo "Created ${regularTestList} with ${shardRegularTests.size()} regular tests for this shard"
-        } else {
-            sh "touch ${regularTestList}"
-            echo "No regular tests in this shard, created empty file: ${regularTestList}"
-        }
-        sh "cat ${regularTestList}"
-
-        if (shardIsolateTests.size() > 0) {
-            def shardIsolateContent = shardIsolateTests.join('\n')
-            sh "echo '${shardIsolateContent.replace("'", "'\\''")}' > ${isolateTestList}"
-            echo "Created ${isolateTestList} with ${shardIsolateTests.size()} isolate tests for this shard"
-        } else {
-            sh "touch ${isolateTestList}"
-            echo "No isolate tests in this shard, created empty file: ${isolateTestList}"
-        }
-        sh "cat ${isolateTestList}"
-
-        // Return preprocessed lists object for compatibility
-        return [
-            regular: regularTestList,
-            isolate: isolateTestList,
-            regularCount: shardRegularTests.size(),
-            isolateCount: shardIsolateTests.size()
-        ]
-    } else {
-        echo "No tests found in current shard or failed to list tests"
-        // Create empty files and preprocessed lists object
-        def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
-        def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
-        sh "touch ${regularTestList}"
-        sh "touch ${isolateTestList}"
-
-        return [
-            regular: regularTestList,
-            isolate: isolateTestList,
-            regularCount: 0,
-            isolateCount: 0
-        ]
-    }
-}
+// Removed runIsolatedTests() - pytest-forked now handles ISOLATION tests automatically
+// Removed processShardTestList() - pytest's --splits and --group parameters handle sharding directly
 
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
@@ -2408,96 +2160,36 @@ def generateRerunReport(stageName, llmSrc) {
     echo "Generating comprehensive rerun report for stage: ${stageName}"
 
     def rerunBaseDir = "${WORKSPACE}/${stageName}/rerun"
-    def regularRerunDir = "${rerunBaseDir}/regular"
 
-    // Check if regular rerun directory has rerun_results_*.xml files
-    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && find '${regularRerunDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+    // Check if rerun directory has rerun_results_*.xml files
+    def hasReruns = sh(script: "find ${rerunBaseDir} -name 'rerun_results_*.xml' 2>/dev/null | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
 
-    // Check if any isolated rerun directories have rerun_results_*.xml files
-    def hasIsolatedReruns = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' -exec find {} -name 'rerun_results_*.xml' \\; 2>/dev/null | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
-
-    // Find isolated tests that have actual rerun results and build mapping
-    def isolatedTestsWithReruns = []
-    if (hasIsolatedReruns) {
-        def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
-        if (isolatedDirsOutput) {
-            def isolatedDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
-            isolatedDirs.each { isolatedDir ->
-                // Extract the isolated number from directory name (e.g., isolated_0 -> 0)
-                def isolatedNum = isolatedDir.split('/').last().replace('isolated_', '')
-
-                // Check if this isolated directory has any rerun results
-                def hasRerunResults = sh(script: "find '${isolatedDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
-
-                if (hasRerunResults) {
-                    isolatedTestsWithReruns.add([
-                        dir: isolatedDir,
-                        num: isolatedNum,
-                        originalResult: "${WORKSPACE}/${stageName}/results_isolated_${isolatedNum}.xml"
-                    ])
-                }
-            }
-        }
-    }
-
-    // Collect rerun result files and corresponding original result files
-    def rerunResultFiles = []
-
-    echo "Found regular reruns: ${hasRegularReruns}"
-    echo "Found isolated tests with reruns: ${isolatedTestsWithReruns.collect { "isolated_${it.num}" }}"
-
-    if (!hasRegularReruns && !hasIsolatedReruns) {
+    if (!hasReruns) {
         echo "No rerun results found, skipping rerun report generation"
         return
     }
 
+    // Collect rerun result files and corresponding original result files
+    def rerunResultFiles = []
+    def allInputFiles = []
+
+    echo "Found reruns: ${hasReruns}"
+
     // Specify the stage name correctly for all result xml files.
     sh "cd ${WORKSPACE}/${stageName} && find . -name '*.xml' -exec sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' {} + || true"
-
-    // Collect all original and rerun result files
-    def allInputFiles = []
 
     // Add original results
     if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
-        // Add to rerunResultFiles only if it has reruns
-        if (hasRegularReruns) {
-            rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
-        }
+        rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
     }
 
-    // Add ALL isolated test results to allInputFiles
-    def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
-    if (isolatedResults) {
-        isolatedResults.split('\n').each { file ->
-            if (file.trim()) {
-                allInputFiles.add(file.trim())
-            }
-        }
-        // Add isolated test results that have reruns to rerunResultFiles and add their rerun results to allInputFiles
-        isolatedTestsWithReruns.each { isolatedTest ->
-            if (fileExists(isolatedTest.originalResult)) {
-                rerunResultFiles.add(isolatedTest.originalResult)
-                echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
-            }
-            for (times in [1, 2]) {
-                def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
-                if (fileExists(rerunFile)) {
-                    allInputFiles.add(rerunFile)
-                    rerunResultFiles.add(rerunFile)
-                }
-            }
-        }
-    }
-
-    // Add regular rerun results
-    if (hasRegularReruns) {
-        for (times in [1, 2]) {
-            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
-            if (fileExists(rerunFile)) {
-                allInputFiles.add(rerunFile)
-                rerunResultFiles.add(rerunFile)
-            }
+    // Add rerun results
+    for (times in [1, 2]) {
+        def rerunFile = "${rerunBaseDir}/rerun_results_${times}.xml"
+        if (fileExists(rerunFile)) {
+            allInputFiles.add(rerunFile)
+            rerunResultFiles.add(rerunFile)
         }
     }
 
@@ -2533,9 +2225,6 @@ def generateRerunReport(stageName, llmSrc) {
         )
         echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
     }
-
-    // Remove isolation results since they are merged into results.xml
-    sh "rm -rf ${WORKSPACE}/${stageName}/results_isolated_*.xml || true"
 
     echo "Rerun report generation completed for stage: ${stageName}"
 }
@@ -2761,9 +2450,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
         }
 
-        // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
-
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
         sh "echo ${TRTLLM_WHL_PATH}"
@@ -2796,15 +2482,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             TRTLLM_WHL_PATH,
             coverageConfigFile,
             "",  // pytestUtil
-            [],  // extraArgs
+            ["--test-list=${testDBList}", "--splitting-algorithm least_duration", "--splits ${splits}", "--group ${splitId}"],  // extraArgs
             containerPortStart,
             containerPortNum
         )
-
-        // Only add --test-list if there are regular tests to run
-        if (preprocessedLists.regularCount > 0) {
-            pytestCommand += ["--test-list=${preprocessedLists.regular}"]
-        }
 
         def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
         def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
@@ -2824,25 +2505,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             ]) {
                 sh "env | sort"
                 try {
-                    if (preprocessedLists.regularCount > 0) {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${pytestCommand.join(" ")}
-                        """
-                    } else {
-                        echo "No regular tests to run for stage ${stageName}"
-                        noRegularTests = true
-                        sh "mkdir -p ${stageName}"
-                        // Create an empty results.xml file for consistency
-                        sh """
-                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
-                            echo '<testsuites>' >> ${stageName}/results.xml
-                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
-                            echo '</testsuite>' >> ${stageName}/results.xml
-                            echo '</testsuites>' >> ${stageName}/results.xml
-                        """
-                    }
+                    sh """
+                        rm -rf ${stageName}/ && \
+                        cd ${llmSrc}/tests/integration/defs && \
+                        ${pytestCommand.join(" ")}
+                    """
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
@@ -2853,21 +2520,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         }
                         rerunFailed = true
                     }
-                }
-
-                // Run the isolated tests if exists
-                if (preprocessedLists.isolateCount > 0) {
-                    stage ("[${stageName}] Run Pytest (Isolated)") {
-                        echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                        rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
-                    }
-                } else {
-                    echo "No isolated tests to run for stage ${stageName}"
-                    noIsolateTests = true
-                }
-
-                if (noRegularTests && noIsolateTests) {
-                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
                 }
             }
         }

@@ -18,7 +18,7 @@ from .trt_test_alternative import print_info, print_warning
 
 # from misc.reorder_venv_tests import reorder_tests
 
-kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT"]
+kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT", "ISOLATION"]
 record_invalid_tests = True
 
 kSTRIP_PARENS_PAT = re.compile(r'\((.*?)\)')
@@ -138,6 +138,7 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
         marker = None
         reason = None
         timeout = None
+        isolation = False
         for tmp_marker in kVALID_TEST_LIST_MARKERS:
             if f" {tmp_marker}" in line:
                 test_name, marker, reason_raw = line.partition(f" {tmp_marker}")
@@ -152,6 +153,10 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
                             f'{test_list}:{lineno}: Invalid syntax for TIMEOUT value: "{reason_raw}". '
                             "Expected a numeric value in parentheses.")
                     timeout = int(timeout) * 60
+                elif marker == "ISOLATION":
+                    # ISOLATION marker does not require a reason
+                    isolation = True
+                    print_info(f"Isolation mode enabled for {test_name}")
                 elif len(reason_raw) > 0:
                     reason = strip_parens(reason_raw.strip())
                     if not reason:
@@ -178,7 +183,7 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
 
         test_name = parse_test_name(test_name)
 
-        return (test_name, marker, reason, timeout)
+        return (test_name, marker, reason, timeout, isolation)
 
     parsed_test_list = map(parse_test_line, enumerate(lines))
     parsed_test_list = list(filter(lambda x: x[0] is not None,
@@ -664,10 +669,14 @@ def modify_by_test_list(test_list, items, config):
             item = found_items[name]
             selected.append(item)
             # Also update the item based on the marker specified in the file
-            marker, reason, timeout = full_test_name_to_marker_dict[name]
+            marker, reason, timeout, isolation = full_test_name_to_marker_dict[
+                name]
             if marker:
                 if marker == "TIMEOUT" and timeout:
                     item.add_marker(pytest.mark.timeout(timeout))
+                elif marker == "ISOLATION":
+                    # Apply pytest-forked marker for isolated tests
+                    item.add_marker(pytest.mark.forked)
                 else:
                     mark_func = getattr(pytest.mark, marker.lower())
                     mark = mark_func(reason=reason)
