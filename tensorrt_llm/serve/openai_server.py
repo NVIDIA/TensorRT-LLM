@@ -1135,7 +1135,7 @@ class OpenAIServer:
         return JSONResponse(content={"status": "success"})
 
     async def get_server_info(self) -> JSONResponse:
-        return JSONResponse(content=self.llm.llm_info)
+        return JSONResponse(content={"disaggregated_params": self.llm.disaggregated_params})
 
     async def __call__(self, host, port, sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration
