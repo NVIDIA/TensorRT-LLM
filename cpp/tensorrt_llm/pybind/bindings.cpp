@@ -31,6 +31,7 @@
 #include "tensorrt_llm/pybind/batch_manager/buffers.h"
 
 #include "tensorrt_llm/pybind/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/pybind/suffixAutomaton/bindings.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManagerV2Utils.h"
@@ -500,6 +501,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     auto mUserbuffers = mInternal.def_submodule("userbuffers", "User buffers internal bindings");
     tensorrt_llm::kernels::userbuffers::UserBufferBindings::initBindings(mUserbuffers);
+
+    auto mSuffixAutomaton = mInternal.def_submodule("suffix_automaton", "Suffix automaton internal bindings");
+    tensorrt_llm::pybind::suffix_automaton::initBindings(mSuffixAutomaton);
 
     // NVLS allocators
     py::class_<tr::IpcNvlsHandle>(m, "IpcNvlsHandle")

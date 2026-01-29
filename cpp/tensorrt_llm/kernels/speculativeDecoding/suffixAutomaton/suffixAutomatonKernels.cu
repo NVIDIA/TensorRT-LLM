@@ -1,0 +1,103 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Adapted from Baseten's sa_spec library (Apache-2.0)
+ * https://github.com/basetenlabs/sa_spec
+ */
+
+#include "suffixAutomatonKernels.h"
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::speculative_decoding::suffix_automaton
+{
+
+__global__ void suffixAutomatonExtendKernel(int batchSize, int draftLength, SuffixAutomaton* slots,
+    int const* batchIndices, int* matchLenOut, int* draftTokensOut, int const* acceptedTokensIn,
+    int const* acceptedLensIn)
+{
+    // Only one thread per block does the work
+    if (threadIdx.x > 0)
+    {
+        return;
+    }
+
+    int i = blockIdx.x;
+    if (i >= batchSize)
+    {
+        return;
+    }
+
+    int batchIndex = batchIndices[i];
+    TLLM_ASSERT(batchIndex >= 0 && batchIndex < static_cast<int>(SAConfig::MAX_SLOTS));
+
+    SuffixAutomaton& slot = slots[batchIndex];
+
+    int numNewTokens = acceptedLensIn[i];
+
+    // Extend the automaton with accepted tokens
+    for (int j = 0; j < numNewTokens; j++)
+    {
+        slot.extend(Token(acceptedTokensIn[i * (draftLength + 1) + j]));
+    }
+
+    // Lookup the longest suffix match
+    auto result = slot.lookup();
+    if (result.hasValue())
+    {
+        matchLenOut[i] = result->len;
+        slot.getDraftTokens(&draftTokensOut[i * draftLength], draftLength, result->pos);
+    }
+    else
+    {
+        matchLenOut[i] = 0;
+    }
+}
+
+void invokeSuffixAutomatonExtend(SuffixAutomatonExtendParams const& params, cudaStream_t stream)
+{
+    params.checkParams();
+
+    int batchSize = params.batchSize;
+    if (batchSize > static_cast<int>(SAConfig::MAX_SLOTS))
+    {
+        batchSize = static_cast<int>(SAConfig::MAX_SLOTS);
+    }
+
+    // Launch one block per sequence, one thread per block
+    suffixAutomatonExtendKernel<<<batchSize, 1, 0, stream>>>(batchSize, params.draftLength, params.slots,
+        params.batchIndices, params.matchLenOut, params.draftTokensOut, params.acceptedTokensIn, params.acceptedLensIn);
+}
+
+size_t getSuffixAutomatonStateSize()
+{
+    return sizeof(SuffixAutomaton);
+}
+
+size_t getSuffixAutomatonMaxSlots()
+{
+    return SAConfig::MAX_SLOTS;
+}
+
+size_t getSuffixAutomatonMaxSeqLen()
+{
+    return SAConfig::MAX_SEQUENCE_LENGTH;
+}
+
+} // namespace kernels::speculative_decoding::suffix_automaton
+
+TRTLLM_NAMESPACE_END

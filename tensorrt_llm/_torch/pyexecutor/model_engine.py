@@ -3321,6 +3321,20 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
+        if self.mapping.is_last_pp_rank():
+            for request in itertools.chain(
+                scheduled_requests.context_requests,
+                scheduled_requests.generation_requests
+            ):
+                if request.py_request_id not in self.sa_spec_seen_requests:
+                    self.sa_spec_seen_requests.add(request.py_request_id)
+
+                    # builds the initial suffix automaton state from the context tokens.
+                    # could use a thread pool for add_request
+                    # Use lazy import to avoid circular dependency
+                    from ..speculative import suffix_automaton as sa_spec
+                    sa_spec.add_request(request.py_request_id, request.get_tokens(0))
+
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
             new_tensors_device, cache_indirection_buffer,

@@ -8,6 +8,10 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     MambaHybridCacheManager
 from tensorrt_llm.mapping import Mapping
 
+# Use native suffix automaton implementation instead of external sa_spec
+from . import suffix_automaton as sa_spec
+
+
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig

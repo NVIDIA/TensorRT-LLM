@@ -997,6 +997,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
 
+        # Suffix Automaton Decoding: copy newly-built suffix automaton states
+        # to the device and update the RequestID->batch_index mapping.
+        # Use lazy import to avoid circular dependency
+        from ..speculative import suffix_automaton as sa_spec
+        sa_spec.prepare(self.request_ids[self.num_contexts:])
+
     def prepare_flash_mla(self) -> None:
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
             self.request_ids).pin_memory()
