@@ -1852,22 +1852,18 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # MTP is beneficial for low-latency scenarios (small batch sizes)
         # and is incompatible with certain features
 
-        # Get values from llm_args with safe defaults
-        max_batch_size = getattr(llm_args, 'max_batch_size', 2048) or 2048
-        pipeline_parallel_size = getattr(llm_args, 'pipeline_parallel_size',
-                                         1) or 1
-        speculative_model = getattr(llm_args, 'speculative_model', None)
-        logits_post_processor = getattr(llm_args, 'logits_post_processor', None)
-        cache_transceiver_config = getattr(llm_args, 'cache_transceiver_config',
-                                           None)
-        disable_overlap_scheduler = getattr(llm_args,
-                                            'disable_overlap_scheduler', False)
+        max_batch_size = llm_args.max_batch_size or 2048
+        pipeline_parallel_size = llm_args.pipeline_parallel_size or 1
+        speculative_model = llm_args.speculative_model
+        batched_logits_processor = llm_args.batched_logits_processor
+        cache_transceiver_config = llm_args.cache_transceiver_config
+        disable_overlap_scheduler = llm_args.disable_overlap_scheduler
 
         # Check for hard blockers
         has_blockers = (
             pipeline_parallel_size > 1 or  # MTP + PP not supported
             speculative_model is not None or  # MTP conflicts with speculation
-            logits_post_processor is
+            batched_logits_processor is
             not None  # MTP doesn't support logits processors
         )
 
@@ -1886,8 +1882,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:  # 17-32
                 num_layers = 1  # Conservative
 
-            defaults["mtp_enabled"] = True
-            defaults["num_mtp_layers"] = num_layers
+            # Set MTP configuration as a dictionary matching MTPDecodingConfig
+            defaults["speculative_config"] = {
+                "num_nextn_predict_layers": num_layers,
+                "num_batch_slots": 64,  # Default batch slots for MTP
+            }
 
         return defaults
 
