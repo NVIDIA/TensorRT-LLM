@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -188,14 +188,16 @@ inline Dtype dtypeEltType(Dtype dtype)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline int dtypeNumEltsPerSf(Dtype dtype)
+// Note: the block size from the options should be used instead.
+// TODO: remove this function?
+inline int dtypeNumEltsPerSf(Dtype dtype, bool useSparsity = false)
 {
     switch (dtype)
     {
-    case Dtype::E2m1: return 16;
+    case Dtype::E2m1: return useSparsity ? 32 : 16;
     case Dtype::MxE2m1:
     case Dtype::MxE4m3:
-    case Dtype::MxInt4: return 32;
+    case Dtype::MxInt4: return useSparsity ? 64 : 32;
     default: assert(false); return -1;
     }
 }
@@ -256,6 +258,14 @@ inline MmaKind dtypeGetMmaKind(Dtype dtypeA, Dtype dtypeB)
         return MmaKind::MxFp8Fp6Fp4;
     }
     return MmaKind::Tf32;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool dtypeNeedsPadding(Dtype dtype, MmaKind mmaKind, [[maybe_unused]] int mmaK, [[maybe_unused]] bool isSparseA)
+{
+    bool needsPadding = mmaKind == MmaKind::MxFp8Fp6Fp4 && dtype == Dtype::MxE2m1;
+    return needsPadding;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

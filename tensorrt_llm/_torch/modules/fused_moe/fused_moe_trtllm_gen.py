@@ -20,7 +20,7 @@ from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod,
+    DeepSeekFP8TRTLLMGenBlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
     W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16MXFP4TRTLLMGenFusedMoEMethod)
@@ -219,7 +219,7 @@ class TRTLLMGenFusedMoE(MoE):
     def _get_quant_method(self):
         if self.quant_config is not None:
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
+                return DeepSeekFP8TRTLLMGenBlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
