@@ -476,6 +476,7 @@ class BaseLLM:
             if multimodal_data:
                 multimodal_params = MultimodalParams(
                     multimodal_data=multimodal_data)
+
         elif "prompt" in inputs:
             if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
