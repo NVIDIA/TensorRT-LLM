@@ -998,14 +998,14 @@ def get_layer_after_linear_node(
             # Mamba layers should not have any intermediate linear nodes.
             if len(intermediate_lin_nodes) > 0:
                 return LayerType.UNKNOWN, 1
-            # Mamba layer should have exactly 6 intermediate weight nodes:
-            # - RMS norm
+            # Mamba layer should have 3 to 6 intermediate weight nodes:
             # - conv1d weight
-            # - conv1d bias
-            # - dt_bias
             # - A (A_log)
             # - D
-            if len(intermediate_weight_nodes) != 6:
+            # - conv1d bias [optional]
+            # - dt_bias [optional]
+            # - RMS norm [optional]
+            if len(intermediate_weight_nodes) not in list(range(3, 7)):
                 return LayerType.UNKNOWN, 1
             return LayerType.SSM, head_size
 
