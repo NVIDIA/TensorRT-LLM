@@ -449,6 +449,14 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
+    # Set default value for cache_transceiver_config.max_tokens_in_buffer
+    # Priority: max_input_len (if set) > max_seq_len (inferred or set)
+    if cache_transceiver_config is not None and cache_transceiver_config.max_tokens_in_buffer is None:
+        if llm_args.max_input_len is not None:
+            cache_transceiver_config.max_tokens_in_buffer = llm_args.max_input_len
+        else:
+            cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
+
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
