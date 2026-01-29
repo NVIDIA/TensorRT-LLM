@@ -1,6 +1,7 @@
 import bisect
 import contextlib
 import functools
+import itertools
 import gc
 import inspect
 import math
@@ -68,6 +69,8 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
+
+import sa_spec
 
 
 class ModelEngine(ABC):
@@ -467,6 +470,8 @@ class PyTorchModelEngine(ModelEngine):
             self.cache_indirection_attention = None
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
+
+        self.sa_spec_seen_requests: set[int] = set()
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
@@ -3321,11 +3326,26 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
+        if self.mapping.is_last_pp_rank():
+            for request in itertools.chain(
+                scheduled_requests.context_requests,
+                scheduled_requests.generation_requests
+            ):
+                if request.py_request_id not in self.sa_spec_seen_requests:
+                    self.sa_spec_seen_requests.add(request.py_request_id)
+
+                    # builds the initial suffix automaton state from the context tokens.
+                    # could use a thread pool for add_request
+                    sa_spec.add_request(request.py_request_id, request.get_tokens(0))
+
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
             new_tensors_device, cache_indirection_buffer,
             num_accepted_tokens_device, req_id_to_old_request, resource_manager,
             maybe_graph)
+
+
+
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
