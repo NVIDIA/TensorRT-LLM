@@ -16,13 +16,13 @@
  */
 
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
-
 #include <algorithm>
 
 namespace tensorrt_llm::batch_manager
@@ -54,9 +54,13 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
 
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    // reuse the same pickUpConnections as in unformat()
-    auto pickUpConnections
-        = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    if (!cache_formatter_utils::needSendCache<RnnCacheState>(selfConfig, destConfig, selfIdx))
+    {
+        return;
+    }
+
+    auto pickUpConnections = cache_formatter_utils::pickSendConnections<RnnCacheState>(
+        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     auto const targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
@@ -131,55 +135,41 @@ void RnnCacheFormatter::format(TransferSession& session)
     size_t ssmBytesPerLayer = numHeadsLocal * modelConfig.mHeadDim * modelConfig.mDState
         * common::getDTypeSize(selfConfig.getSsmStateDataType());
 
+    int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
+    auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
+
     std::vector<size_t> bufferSizesPerTarget(targetNum, 0);
 
     for (size_t i = 0; i < targetNum; i++)
     {
         SizeType32 layersForTarget = targetInfo.mPeerAttentionLayerNumInDomainPP[i];
-        bufferSizesPerTarget[i] = layersForTarget * (convBytesPerLayer + ssmBytesPerLayer);
+        bufferSizesPerTarget[i] = layersForTarget * (convBytesPerLayer + ssmBytesPerLayer) * peerDuplicateHeadFactor;
     }
 
     auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
     auto [outputBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
         = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
-            cacheBufferId, static_cast<int>(targetNum), bufferSizesPerTarget, bufferManager);
+            cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
 
     TLLM_CHECK(outputBuffers.size() == targetNum);
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
 
-    // TODO: This should go in a kernel if perf is slow
-    auto stream = bufferManager.getStream().get();
-    SizeType32 localLayerOffset = 0;
-    for (size_t targetIdx = 0; targetIdx < targetNum; targetIdx++)
-    {
-        SizeType32 layersToSend = targetInfo.mPeerAttentionLayerNumInDomainPP[targetIdx];
+    std::vector<runtime::ITensor::SharedPtr> inputConvBlocks;
+    std::vector<runtime::ITensor::SharedPtr> inputSsmBlocks;
 
-        int8_t* outPtr = static_cast<int8_t*>(outputBuffers[targetIdx]->data());
-        size_t byteOffset = 0;
+    auto convBlock = mRnnStateManager->getConvStatesForSlot(slotIdx); // [numLocalLayers, convDim, dConv-1]
+    auto ssmBlock = mRnnStateManager->getSsmStatesForSlot(slotIdx);   // [numLocalLayers, numHeads, headDim, dState]
 
-        for (SizeType32 layer = 0; layer < layersToSend; layer++)
-        {
-            auto convState = mRnnStateManager->getConvStates(mRnnStateManager->getGlobalLayerNum(localLayerOffset + layer));
-            auto slotConv = runtime::ITensor::slice(convState, slotIdx, 1);
-            size_t numBytes = slotConv->getSizeInBytes();
+    // Check if loop over targetNum is needed
+    inputConvBlocks.push_back(convBlock);
+    inputSsmBlocks.push_back(ssmBlock);
 
-            TLLM_CUDA_CHECK(
-                cudaMemcpyAsync(outPtr + byteOffset, slotConv->data(), numBytes, cudaMemcpyDeviceToDevice, stream));
-            byteOffset += numBytes;
-        }
+    tensorrt_llm::executor::rnn_cache::splitRnnConvStateDispatch(
+        inputConvBlocks, outputBuffers, destConfig, selfConfig, selfIdx, bufferManager);
 
-        for (SizeType32 layer = 0; layer < layersToSend; layer++)
-        {
-            auto ssmState = mRnnStateManager->getSsmStates(mRnnStateManager->getGlobalLayerNum(localLayerOffset + layer));
-            auto slotSsm = runtime::ITensor::slice(ssmState, slotIdx, 1);
-            size_t numBytes = slotSsm->getSizeInBytes();
-
-            TLLM_CUDA_CHECK(
-                cudaMemcpyAsync(outPtr + byteOffset, slotSsm->data(), numBytes, cudaMemcpyDeviceToDevice, stream));
-            byteOffset += numBytes;
-        }
-        localLayerOffset += layersToSend;
-    }
+    // Conv and SSM use same output buffer. So need to track convBytesPerLayer to compute offset.
+    tensorrt_llm::executor::rnn_cache::splitRnnSsmStateDispatch(
+        inputSsmBlocks, outputBuffers, convBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
 
     bufferManager.getStream().synchronize();
     session.setTime(TransferSession::kTimePreprocess);
@@ -218,8 +208,8 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     int deviceId;
     TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
 
-    auto pickUpConnections
-        = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto pickUpConnections = cache_formatter_utils::pickRecvConnections<RnnCacheState>(
+        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     auto const sourceNum = pickUpConnections.size();
 
     if (sourceNum == 0)
@@ -428,46 +418,22 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     session.setTime(TransferSession::kTimeTransmissions);
 
     // Unpack received buffers into RNN states
-    {
-        NVTX3_SCOPED_RANGE(unpackRnnStates);
-        auto stream = bufferManager.getStream().get();
-        SizeType32 localLayerOffset = 0;
+    std::vector<runtime::ITensor::SharedPtr> outputConvBlocks;
+    std::vector<runtime::ITensor::SharedPtr> outputSsmBlocks;
 
-        for (size_t srcIdx = 0; srcIdx < sourceNum; srcIdx++)
-        {
-            SizeType32 layersFromSource = sourceInfo.mPeerAttentionLayerNumInDomainPP[srcIdx];
+    auto convBlock = mRnnStateManager->getConvStatesForSlot(slotIdx);
+    auto ssmBlock = mRnnStateManager->getSsmStatesForSlot(slotIdx);
 
-            int8_t const* inPtr = static_cast<int8_t const*>(recvBuffers[srcIdx]->data());
-            size_t byteOffset = 0;
+    outputConvBlocks.push_back(convBlock);
+    outputSsmBlocks.push_back(ssmBlock);
 
-            // Unpack conv states first
-            for (SizeType32 layer = 0; layer < layersFromSource; layer++)
-            {
-                auto convState = mRnnStateManager->getConvStates(mRnnStateManager->getGlobalLayerNum(localLayerOffset + layer));
-                auto slotConv = runtime::ITensor::slice(convState, slotIdx, 1);
-                size_t numBytes = slotConv->getSizeInBytes();
+    tensorrt_llm::executor::rnn_cache::concatRnnConvStateDispatch(
+        recvBuffers, outputConvBlocks, destConfig, selfConfig, selfIdx, bufferManager);
 
-                TLLM_CUDA_CHECK(
-                    cudaMemcpyAsync(slotConv->data(), inPtr + byteOffset, numBytes, cudaMemcpyDeviceToDevice, stream));
-                byteOffset += numBytes;
-            }
+    tensorrt_llm::executor::rnn_cache::concatRnnSsmStateDispatch(
+        recvBuffers, outputSsmBlocks, convBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
 
-            // Unpack SSM states
-            for (SizeType32 layer = 0; layer < layersFromSource; layer++)
-            {
-                auto ssmState = mRnnStateManager->getSsmStates(mRnnStateManager->getGlobalLayerNum(localLayerOffset + layer));
-                auto slotSsm = runtime::ITensor::slice(ssmState, slotIdx, 1);
-                size_t numBytes = slotSsm->getSizeInBytes();
-
-                TLLM_CUDA_CHECK(
-                    cudaMemcpyAsync(slotSsm->data(), inPtr + byteOffset, numBytes, cudaMemcpyDeviceToDevice, stream));
-                byteOffset += numBytes;
-            }
-            localLayerOffset += layersFromSource;
-        }
-
-        bufferManager.getStream().synchronize();
-    }
+    bufferManager.getStream().synchronize();
 
     if (cacheBufferId.has_value())
     {
@@ -510,20 +476,11 @@ bool RnnCacheFormatter::inquireSupport(RnnCacheState const& selfConfig, RnnCache
     auto const& selfParallel = selfConfig.getParallelConfig();
     auto const& destParallel = destConfig.getParallelConfig();
 
-    // Require same TP for now (different TP would require state resharding)
-    // TODO
-    if (selfParallel.mTensorParallelism != destParallel.mTensorParallelism)
+    if (selfParallel.mContextParallelism != 1 || destParallel.mContextParallelism != 1)
     {
-        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: different TP not yet supported (self=%d, dest=%d)",
-            selfParallel.mTensorParallelism, destParallel.mTensorParallelism);
+        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: RNN only supports CP=1 (selfCP=%d, destCP=%d)",
+            selfParallel.mContextParallelism, destParallel.mContextParallelism);
         return false;
-    }
-
-    if (common::getEnvDisaggLayerwise())
-    {
-        TLLM_LOG_WARNING(
-            "RnnCacheFormatter::inquireSupport: layerwise cache transfer not yet supported for RNN. \
-                            Will default to non-layerwise transfer.");
     }
 
     return true;
@@ -534,23 +491,6 @@ std::vector<RnnCacheFormatter::SizeType32> RnnCacheFormatter::getCounterparts(
 {
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     return targetInfo.mIRanks;
-}
-
-std::vector<size_t> RnnCacheFormatter::pickRecvConnections(size_t numConnections, RnnCacheState const& selfConfig,
-    SizeType32 selfIdx, RnnCacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
-{
-    TLLM_CHECK(numConnections == counterPartRanks.size());
-    // Map needed ranks to base indices in counterPartRanks to use for connections
-    // No duplicate handling
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    std::vector<size_t> baseIndices;
-    for (auto rank : targetInfo.mIRanks)
-    {
-        auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
-        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
-        baseIndices.push_back(std::distance(counterPartRanks.begin(), it));
-    }
-    return baseIndices;
 }
 
 } // namespace tensorrt_llm::batch_manager

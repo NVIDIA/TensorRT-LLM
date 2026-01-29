@@ -271,29 +271,6 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
     return blockRange;
 }
 
-bool CacheFormatter::needSendCache(
-    CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx)
-{
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    if (targetInfo.mDupHeadFactor <= 1)
-    {
-        return true;
-    }
-
-    int selfCpSize = selfConfig.getParallelConfig().mContextParallelism;
-    int selfTpRank = (selfIdx % (selfConfig.getParallelConfig().mTensorParallelism * selfCpSize)) / selfCpSize;
-    int selfTpRankInDpGroup = selfTpRank;
-    if (selfConfig.getParallelConfig().mEnableAttentionDP)
-    {
-        int selfTPNumInDPGroup
-            = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
-        selfTpRankInDpGroup = selfTpRank % selfTPNumInDPGroup;
-    }
-    int destDPRank = destConfig.getParallelConfig().mEnableAttentionDP ? destConfig.getParallelConfig().mDPrank : 0;
-
-    return (destDPRank % targetInfo.mDupHeadFactor) == (selfTpRankInDpGroup % targetInfo.mDupHeadFactor);
-}
-
 void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::CacheState const& selfConfig,
     BaseCacheFormatter::CacheState const& destConfig)
 {
@@ -329,53 +306,11 @@ void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::
     }
 }
 
-std::vector<size_t> CacheFormatter::pickSendConnections(size_t numConnections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
-{
-    TLLM_CHECK(numConnections == counterPartRanks.size());
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-
-    // Map needed ranks to indices in counterPartRanks
-    // NO duplicate head filtering - format/sendBuffer/computeBufferIdx handles that
-    std::vector<size_t> indices;
-    for (auto rank : targetInfo.mIRanks)
-    {
-        auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
-        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
-        indices.push_back(std::distance(counterPartRanks.begin(), it));
-    }
-    return indices;
-}
-
 std::vector<size_t> CacheFormatter::pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
     SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
 {
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    if (targetInfo.mIRanks.empty())
-    {
-        return {};
-    }
-    auto baseIndices = pickSendConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
-    if (targetInfo.mPeerDupHeadFactor <= 1)
-    {
-        return baseIndices;
-    }
-    // TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
-    int selfDPRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
-
-    std::vector<size_t> ret;
-    for (int i = 0; i < targetInfo.mDomainTPSize; i++)
-    {
-        if ((i % targetInfo.mPeerDupHeadFactor) == (selfDPRank % targetInfo.mPeerDupHeadFactor))
-        {
-            for (int j = 0; j < targetInfo.mDomainPPSize; j++)
-            {
-                size_t localIdx = (i * targetInfo.mDomainPPSize) + j;
-                ret.push_back(baseIndices.at(localIdx));
-            }
-        }
-    }
-    return ret;
+    return cache_formatter_utils::pickRecvConnections<CacheState>(
+        numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
 }
 
 void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
@@ -394,13 +329,13 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto indexFromEnd = session.getIndexFromEnd();
     auto& bufferManager = session.getBufferManager();
     // Some TP rank don't need to send cache since duplicate header is not needed.
-    if (!needSendCache(selfConfig, destConfig, selfIdx))
+    if (!cache_formatter_utils::needSendCache<CacheState>(selfConfig, destConfig, selfIdx))
     {
         return;
     }
 
-    auto pickUpConnections
-        = pickSendConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto pickUpConnections = cache_formatter_utils::pickSendConnections<CacheState>(
+        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     size_t targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {

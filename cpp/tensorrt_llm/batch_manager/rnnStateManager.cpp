@@ -48,7 +48,7 @@ RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runti
         = modelConfig.getNbRnnLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
     auto const dataType = modelConfig.getDataType();
 
-    // TODO(shreyasm): This might not be correct with ADP cause of getPipelineParallelRank method. 
+    // TODO(shreyasm): This might not be correct with ADP cause of getPipelineParallelRank method.
     // This constructor is not used so should be ok for now.
     SizeType32 totalRnnLayers = modelConfig.getNbRnnLayers();
     SizeType32 ppSize = worldConfig.getPipelineParallelism();
@@ -119,7 +119,8 @@ RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runti
 
 RnnStateManager::RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32 numHeads, SizeType32 nGroups,
     SizeType32 headDim, SizeType32 maxBatchSize, WorldConfig const& worldConfig, int64_t stream,
-    nvinfer1::DataType dtype, nvinfer1::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers, SizeType32 numLayers)
+    nvinfer1::DataType dtype, nvinfer1::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers,
+    SizeType32 numLayers)
     : mMaxNumSequences(maxBatchSize)
     , mMaxBeamWidth{1}
     , mBeamSlotsPerSequence{1}
@@ -310,6 +311,24 @@ RnnStateManager::TensorPtr RnnStateManager::getSsmStates(SizeType32 layerIdx) co
     auto result = ITensor::slice(pagedRnnStates, it->second, 1);
     result->squeeze(0);
     return result;
+}
+
+RnnStateManager::TensorPtr RnnStateManager::getConvStatesForSlot(SizeType32 slotIdx) const
+{
+    // pagedConvStates shape: [numLocalLayers, maxBatchSize, convDim, dConv-1]
+    // Slice at batch dimension (dim=1) to get all layers for this slot
+    auto result = ITensor::slice(pagedConvStates, {0, slotIdx}, 1);
+    result->squeeze(1);
+    return result; // [numLocalLayers, convDim, dConv-1]
+}
+
+RnnStateManager::TensorPtr RnnStateManager::getSsmStatesForSlot(SizeType32 slotIdx) const
+{
+    // pagedRnnStates shape: [numLocalLayers, maxBatchSize, numHeads, headDim, dState]
+    // Slice at batch dimension (dim=1) to get all layers for this slot
+    auto result = ITensor::slice(pagedRnnStates, {0, slotIdx}, 1);
+    result->squeeze(1);
+    return result; //  [numLocalLayers, numHeads, headDim, dState]
 }
 
 nvinfer1::DataType RnnStateManager::getConvStateDataType() const noexcept

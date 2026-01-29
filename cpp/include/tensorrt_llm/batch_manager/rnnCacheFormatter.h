@@ -113,15 +113,6 @@ public:
     [[nodiscard]] std::vector<SizeType32> getCounterparts(
         RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const;
 
-    /// @brief Pick which connections to receive from.
-    /// @param numConnections Total number of connections.
-    /// @param selfConfig Source configuration.
-    /// @param selfIdx The index of this process.
-    /// @param destConfig Destination configuration.
-    /// @return Indices of connections to receive from.
-    [[nodiscard]] std::vector<size_t> pickRecvConnections(size_t numConnections, RnnCacheState const& selfConfig,
-        SizeType32 selfIdx, RnnCacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const;
-
     /// @brief Get the RNN state manager.
     /// @return Pointer to the RNN state manager.
     [[nodiscard]] rnn_state_manager::RnnStateManager* getRnnStateManager() const noexcept

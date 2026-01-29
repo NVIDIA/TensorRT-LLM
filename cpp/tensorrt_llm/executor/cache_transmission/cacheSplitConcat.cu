@@ -160,7 +160,7 @@ TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheSta
         return TargetRanksInfo{.mDomainPPSize = 0,
             .mDomainTPSize = 0,
             .mDomainCPSize = 0,
-            .mIRanks = {},
+            .mIRanks = {}, // caller should handle this case. No transfer needed.
             .mDupHeadFactor = 1,
             .mPeerDupHeadFactor = 1,
             .mPeerAttentionLayerNumInDomainPP = {}};

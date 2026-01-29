@@ -457,6 +457,7 @@ public:
         bool mEnableAttentionDP;
         SizeType32 mDPrank;
         SizeType32 mDPsize;
+        SizeType32 mContextParallelism = 1; // Always 1.
         // Number of RNN layers per pipeline parallelism rank
         std::vector<SizeType32> mRnnLayerNumPerPP;
 
@@ -464,7 +465,8 @@ public:
         {
             return mTensorParallelism == other.mTensorParallelism && mPipelineParallelism == other.mPipelineParallelism
                 && mEnableAttentionDP == other.mEnableAttentionDP && mDPrank == other.mDPrank
-                && mDPsize == other.mDPsize && mRnnLayerNumPerPP == other.mRnnLayerNumPerPP;
+                && mContextParallelism == other.mContextParallelism && mDPsize == other.mDPsize
+                && mRnnLayerNumPerPP == other.mRnnLayerNumPerPP;
         }
     };
 
