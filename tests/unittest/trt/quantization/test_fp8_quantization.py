@@ -93,6 +93,16 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         torch.testing.assert_close(B_s.float(), B_ref.float())
 
+        from tensorrt_llm._torch.autotuner import autotune
+        with autotune(tune_mode=True):
+            B_tunable, s_tunable = torch.ops.trtllm.quantize_e4m3_per_tensor(A)
+
+        torch.testing.assert_close(s_tunable, s_ref)
+        torch.testing.assert_close(B_tunable.float(),
+                                   B_ref.float(),
+                                   rtol=0.125,
+                                   atol=0)
+
     @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
                           name_func=unittest_name_func)
     def test_quantization_dequantization_activation(self, dtype):
@@ -189,6 +199,38 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         B = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(qA, s)
 
         torch.testing.assert_close(A, B)
+
+        from tensorrt_llm._torch.autotuner import autotune
+
+        # Test with random data
+        A = torch.randn((n, m), dtype=dtype).cuda()
+
+        with autotune(tune_mode=True):
+            qA_tunable, s_tunable = torch.ops.trtllm.quantize_e4m3_per_tensor(A)
+
+        assert qA_tunable.shape == A.shape
+        assert qA_tunable.dim() == s_tunable.dim()
+        assert s_tunable.numel() == 1
+
+        s_ref_tunable = (A.flatten().float().abs().max().view(1, 1) /
+                         FP8_E4M3_MAX).to(dtype)
+        torch.testing.assert_close(s_ref_tunable, s_tunable)
+
+        B_tunable = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(
+            qA_tunable, s_tunable)
+
+        # per tensor is less accurate than others, so larger atol is used.
+        torch.testing.assert_close(A, B_tunable, atol=0.25, rtol=0)
+
+        # testing exact match with tunable API
+        A = torch.randint(0, 8, (n, m), dtype=dtype).cuda()
+
+        with autotune(tune_mode=True):
+            qA_tunable, s_tunable = torch.ops.trtllm.quantize_e4m3_per_tensor(A)
+        B_tunable = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(
+            qA_tunable, s_tunable)
+
+        torch.testing.assert_close(A, B_tunable)
 
 
 if __name__ == '__main__':
