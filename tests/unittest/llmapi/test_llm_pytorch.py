@@ -1462,7 +1462,7 @@ async def test_llm_disagg_streaming_gen_cancelled():
 
             prompt = [
                 "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua "
-                * 10
+                * random.randint(5, 15)
             ]
             # Send context-only request
             ctx_outputs = []
@@ -1474,7 +1474,7 @@ async def test_llm_disagg_streaming_gen_cancelled():
 
             assert len(ctx_outputs) == 1
 
-            max_tokens = 100
+            max_tokens = 300
             sampling_params = SamplingParams(max_tokens=max_tokens,
                                              ignore_eos=True)
             disaggregated_params = ctx_outputs[0].disaggregated_params
@@ -1482,18 +1482,20 @@ async def test_llm_disagg_streaming_gen_cancelled():
 
             # Send gen-only request
             tokens_out = 0
-            stop_after_tokens = 50
+            stop_after_tokens = random.randint(10, max_tokens)
+            finished_reason = None
             async for gen_output in llm_gen.generate_async(
                     prompt[0],
                     sampling_params=sampling_params,
                     disaggregated_params=disaggregated_params,
                     streaming=True):
-                print(gen_output.outputs[0].text)
-                print("finished_reason", gen_output.outputs[0].finish_reason)
                 tokens_out += 1
+                finished_reason = gen_output.outputs[0].finish_reason
                 if tokens_out == stop_after_tokens:
                     gen_output.abort()
 
+            assert finished_reason is not None
+            assert finished_reason == "cancelled"
             # Num check that the number of free/used blocks is as expected
             time.sleep(1.)
             max_retries = 10
@@ -1508,10 +1510,6 @@ async def test_llm_disagg_streaming_gen_cancelled():
                     f"Failed to get stats with len=={stop_after_tokens} after {max_retries} retries"
                 )
 
-            print("results[0]:", results[0])
-            print("results[1]:", results[1])
-            print("results[-2]:", results[-2])
-            print("results[-1]:", results[-1])
             after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
             assert after_used_num_blocks == 0
 
