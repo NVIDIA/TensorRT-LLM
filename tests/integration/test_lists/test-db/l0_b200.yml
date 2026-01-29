@@ -87,6 +87,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
+  - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/_torch/modeling/test_modeling_exaone4.py::TestEXAONE4::test_llm_load_1_FP8
   - unittest/kv_cache_manager_v2_tests/
 - condition:
@@ -174,5 +175,5 @@ l0_b200:
       backend: autodeploy
   tests:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
   - unittest/_torch/auto_deploy/unit/singlegpu

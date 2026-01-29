@@ -35,6 +35,7 @@ from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..distributed import Distributed
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -244,7 +245,7 @@ class PyExecutor:
                  max_num_sequences: int,
                  drafter: Optional[Drafter] = None,
                  disable_overlap_scheduler: bool = False,
-                 max_input_len: int = 2048,
+                 max_input_len: int = 0x7fffffff,
                  max_batch_size: int = 8,
                  max_beam_width: int = 1,
                  max_draft_len: int = 0,
@@ -736,8 +737,11 @@ class PyExecutor:
                                                     record_shapes=True,
                                                     with_modules=True)
 
+        calibrator = get_calibrator()
+
         def profile_step():
             nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
+            calibrator.post_step(it)
             if it in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
@@ -746,6 +750,7 @@ class PyExecutor:
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
+                calibrator.stop()
                 enabled = False
 
             if start_time is not None and self.print_log and self.dist.rank == 0:
@@ -786,11 +791,13 @@ class PyExecutor:
 
             if it in self.profile_start_iters and not self.is_warmup:
                 assert not enabled, "Inconsistent CUDA profiling state"
+                calibrator.start()
                 torch.cuda.cudart().cudaProfilerStart()
                 if enable_torch_trace:
                     torch_profiler.start()
                 logger.info(f"Profiling started at iteration {it}.")
                 enabled = True
+            calibrator.pre_step(it)
             start_time = time.time()
             if it % 2 == 0:
                 if start_event_1 is None:
@@ -812,6 +819,7 @@ class PyExecutor:
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
+                calibrator.stop()
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
@@ -1503,6 +1511,7 @@ class PyExecutor:
                 if scheduled_batch is None:
                     break
 
+                self._terminate_requests(scheduled_batch.paused_requests)
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
@@ -1722,7 +1731,7 @@ class PyExecutor:
                         else:
                             can_forward = True
 
-                self._pause_requests(scheduled_batch.paused_requests)
+                self._terminate_requests(scheduled_batch.paused_requests)
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -1818,6 +1827,8 @@ class PyExecutor:
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
+
+                self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
                     guided_decoder_failed_requests = None
@@ -2062,6 +2073,8 @@ class PyExecutor:
         num_scheduled_tokens = sum(
             [len(req.get_tokens(0))
              for req in context_requests]) + num_scheduled_generation_requests
+        # Note: We use tp_allgather instead of tp_cp_allgather because we want to
+        # balance the requests across DP ranks; not CP ranks within those DP ranks.
         responses_list = self.dist.tp_allgather([
             num_scheduled_context_requests, num_scheduled_generation_requests,
             num_scheduled_tokens
@@ -2871,13 +2884,15 @@ class PyExecutor:
             self.responses.pop(id)
             return response
 
-    def _pause_requests(self, requests_to_pause):
+    def _terminate_requests(self, requests_to_pause):
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not.
-        max_input_len = self.max_input_len
         for req in requests_to_pause:
-            req.pause(max_input_len)
             self._terminate_request(req)
+
+    def _pause_requests(self, requests_to_pause):
+        for req in requests_to_pause:
+            req.pause(self.max_input_len)
 
     def _add_inflight_ids(self, scheduled_requests):
         """Add request IDs of current requests to self.inflight_req_ids.

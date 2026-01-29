@@ -16,7 +16,7 @@ NODES=$(squeue -j $SLURM_JOB_ID -h -o "%D")
 
 if [ -z "${CONTAINER_IMAGE:-}" ]; then
     # Read Docker image from current_image_tags.properties
-    MACHINE="$(uname -m)"
+    MACHINE="$(srun -N 1 uname -m)"
     if [ "$MACHINE" == "x86_64" ]; then
         DOCKER_IMAGE=$(source "$TRTLLM_ROOT/jenkins/current_image_tags.properties" && echo $LLM_DOCKER_IMAGE)
     elif [ "$MACHINE" == "aarch64" ]; then

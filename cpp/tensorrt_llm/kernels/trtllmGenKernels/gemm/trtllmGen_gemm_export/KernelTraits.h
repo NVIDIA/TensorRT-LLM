@@ -537,7 +537,7 @@ public:
 
 public:
     // The MMA kind.
-    tg::MmaKind mMmaKind;
+    tg::MmaKind mMmaKind{};
     // Helper for SMEM allocation.
     MemAllocatorHelper mSmemAllocatorHelper;
     // Helper for TMEM allocation.

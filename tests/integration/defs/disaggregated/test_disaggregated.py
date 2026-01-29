@@ -95,6 +95,7 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
+        "tool_calls": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
         "perf_metrics": (2, f"{test_configs_root}/disagg_config_metrics.yaml"),
         "trtllm_sampler":
         (2, f"{test_configs_root}/disagg_config_trtllm_sampler.yaml"),
@@ -271,6 +272,8 @@ def run_client_tests(example_dir,
         if prompt_file == "long_prompts.json":
             # Use max_tokens 4 for long prompts to reduce test time
             client_cmd.extend(['--max-tokens', '4'])
+        if test_desc == "tool_calls":
+            client_cmd.extend(['-e', 'chat', '-o', 'output_tool_calls.json'])
 
         # Prepare poll processes
         worker_processes = []
@@ -282,6 +285,10 @@ def run_client_tests(example_dir,
 
         poll_procs = worker_processes + [server_proc]
         check_call(client_cmd, env=env, poll_procs=poll_procs)
+
+        # tool calls test does not need to run streaming and completion
+        if test_desc == "tool_calls":
+            continue
 
         # Streaming client run
         streaming_client_cmd = client_cmd + [
@@ -304,7 +311,7 @@ def run_client_tests(example_dir,
                        poll_procs=poll_procs)
 
         # Skip output verification for long prompts test
-        if prompt_file == "long_prompts.json":
+        if prompt_file == "long_prompts.json" or prompt_file == "tool_call_prompts.json":
             continue
 
         if extra_endpoints_test is not None:
@@ -784,6 +791,29 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
                            extra_endpoints_test=extra_endpoints_test)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
+                                                  llm_venv,
+                                                  disaggregated_example_root,
+                                                  llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "tool_calls",
+                           num_iters=1,
+                           prompt_file="tool_call_prompts.json",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
