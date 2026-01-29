@@ -27,6 +27,7 @@
 
 namespace tensorrt_llm::batch_manager
 {
+using RnnCacheState = executor::rnn_cache::RnnCacheState;
 
 RnnCacheFormatter::RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager,
     rnn_state_manager::RnnCacheTransBufferManager* rnnCacheTransBufferManager)
@@ -142,7 +143,7 @@ void RnnCacheFormatter::format(TransferSession& session)
 
     for (size_t i = 0; i < targetNum; i++)
     {
-        SizeType32 layersForTarget = targetInfo.mPeerAttentionLayerNumInDomainPP[i];
+        SizeType32 layersForTarget = targetInfo.mPeerLayerNumInDomainPP[i];
         bufferSizesPerTarget[i] = layersForTarget * (convBytesPerLayer + ssmBytesPerLayer) * peerDuplicateHeadFactor;
     }
 
@@ -291,7 +292,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     std::vector<size_t> bufferSizesPerSource(sourceNum, 0);
     for (size_t i = 0; i < sourceNum; i++)
     {
-        SizeType32 layersFromSource = sourceInfo.mPeerAttentionLayerNumInDomainPP[i];
+        SizeType32 layersFromSource = sourceInfo.mPeerLayerNumInDomainPP[i];
         bufferSizesPerSource[i] = layersFromSource * (convBytesPerLayer + ssmBytesPerLayer);
     }
 

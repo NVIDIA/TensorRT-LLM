@@ -86,7 +86,7 @@ TEST_F(RnnTargetIRanksTest, ContextPP1GenPP2)
     auto result0 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 0);
     EXPECT_EQ(result0.mIRanks, (std::vector<int>{0, 2}));
     EXPECT_EQ(result0.mDomainPPSize, 2);
-    EXPECT_EQ(result0.mPeerAttentionLayerNumInDomainPP, (std::vector<int>{4, 4}));
+    EXPECT_EQ(result0.mPeerLayerNumInDomainPP, (std::vector<int>{4, 4}));
 
     // Context rank 1 (PP=0, TP=1, has layers 0-7) needs:
     //   Gen PP=0 at TP=1 -> rank 1
@@ -115,12 +115,12 @@ TEST_F(RnnTargetIRanksTest, ContextPP2GenPP1)
     auto result0 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 0);
     EXPECT_EQ(result0.mIRanks, std::vector<int>({0}));
     EXPECT_EQ(result0.mDomainPPSize, 1);
-    EXPECT_EQ(result0.mPeerAttentionLayerNumInDomainPP, std::vector<int>({4}));
+    EXPECT_EQ(result0.mPeerLayerNumInDomainPP, std::vector<int>({4}));
 
     // Context rank 2 (PP=1, TP=0, has layers 4-7) also needs gen rank 0
     auto result2 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 2);
     EXPECT_EQ(result2.mIRanks, std::vector<int>({0}));
-    EXPECT_EQ(result2.mPeerAttentionLayerNumInDomainPP, std::vector<int>({4}));
+    EXPECT_EQ(result2.mPeerLayerNumInDomainPP, std::vector<int>({4}));
 }
 
 // Test: Non-uniform layer distribution with CTX 8 GPUs, Gen 16 GPUs
@@ -156,7 +156,7 @@ TEST_F(RnnTargetIRanksTest, NonUniformLayers)
     auto result0 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 0);
     EXPECT_EQ(result0.mIRanks, (std::vector<int>{0, 4, 8}));
     EXPECT_EQ(result0.mDomainPPSize, 3);
-    EXPECT_EQ(result0.mPeerAttentionLayerNumInDomainPP, (std::vector<int>{4, 4, 2}));
+    EXPECT_EQ(result0.mPeerLayerNumInDomainPP, (std::vector<int>{4, 4, 2}));
 
     // Context rank 1 (PP=0, TP=1, has layers 0-9) needs:
     //   Gen PP=0 at TP=1 -> rank 1
@@ -172,7 +172,7 @@ TEST_F(RnnTargetIRanksTest, NonUniformLayers)
     auto result4 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 4);
     EXPECT_EQ(result4.mIRanks, (std::vector<int>{8, 12}));
     EXPECT_EQ(result4.mDomainPPSize, 2);
-    EXPECT_EQ(result4.mPeerAttentionLayerNumInDomainPP, (std::vector<int>{2, 4}));
+    EXPECT_EQ(result4.mPeerLayerNumInDomainPP, (std::vector<int>{2, 4}));
 
     // Context rank 7 (PP=1, TP=3, has layers 10-15) needs:
     //   Gen PP=2 at TP=3 -> rank 11
@@ -526,7 +526,7 @@ TEST_F(AttentionOnlyModelTest, ContextPP1GenPP4)
     auto result0 = texec::kv_cache::targetIRanks(genKvState, contextKvState, 0);
     EXPECT_EQ(result0.mIRanks, (std::vector<int>{0, 2, 4, 6}));
     EXPECT_EQ(result0.mDomainPPSize, 4);
-    EXPECT_EQ(result0.mPeerAttentionLayerNumInDomainPP, (std::vector<int>{8, 8, 8, 8}));
+    EXPECT_EQ(result0.mPeerLayerNumInDomainPP, (std::vector<int>{8, 8, 8, 8}));
 
     // Context rank 1 (PP=0, TP=1) needs from all Gen PP ranks at TP=1
     auto result1 = texec::kv_cache::targetIRanks(genKvState, contextKvState, 1);
@@ -548,12 +548,12 @@ TEST_F(AttentionOnlyModelTest, GenPP1ContextPP4)
     // Context rank 0 (PP=0, TP=0) has layers 0-7, needs from Gen rank 0
     auto result0 = texec::kv_cache::targetIRanks(genKvState, contextKvState, 0);
     EXPECT_EQ(result0.mIRanks, std::vector<int>({0}));
-    EXPECT_EQ(result0.mPeerAttentionLayerNumInDomainPP, std::vector<int>({8}));
+    EXPECT_EQ(result0.mPeerLayerNumInDomainPP, std::vector<int>({8}));
 
     // Context rank 4 (PP=2, TP=0) has layers 16-23, still needs from Gen rank 0
     auto result4 = texec::kv_cache::targetIRanks(genKvState, contextKvState, 4);
     EXPECT_EQ(result4.mIRanks, std::vector<int>({0}));
-    EXPECT_EQ(result4.mPeerAttentionLayerNumInDomainPP, std::vector<int>({8}));
+    EXPECT_EQ(result4.mPeerLayerNumInDomainPP, std::vector<int>({8}));
 }
 
 // Test: Attention-only model with non-uniform layer distribution
@@ -573,14 +573,14 @@ TEST_F(AttentionOnlyModelTest, NonUniformLayerDistribution)
     //   Gen PP1 (layers 12-23) -> rank 2, 12 layers overlap
     auto result0 = texec::kv_cache::targetIRanks(genKvState, contextKvState, 0);
     EXPECT_EQ(result0.mIRanks, (std::vector<int>{0, 2}));
-    EXPECT_EQ(result0.mPeerAttentionLayerNumInDomainPP, (std::vector<int>{12, 12}));
+    EXPECT_EQ(result0.mPeerLayerNumInDomainPP, (std::vector<int>{12, 12}));
 
     // Context rank 2 (PP=1, TP=0) has layers 24-39
     //   Gen PP2 (layers 24-31) -> rank 4, 8 layers overlap
     //   Gen PP3 (layers 32-39) -> rank 6, 8 layers overlap
     auto result2 = texec::kv_cache::targetIRanks(genKvState, contextKvState, 2);
     EXPECT_EQ(result2.mIRanks, (std::vector<int>{4, 6}));
-    EXPECT_EQ(result2.mPeerAttentionLayerNumInDomainPP, (std::vector<int>{8, 8}));
+    EXPECT_EQ(result2.mPeerLayerNumInDomainPP, (std::vector<int>{8, 8}));
 }
 
 // ==================== MORE HYBRID MODEL TESTS ====================
