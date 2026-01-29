@@ -18,7 +18,50 @@ from pathlib import Path
 from typing import List
 
 from setuptools import find_packages, setup
+from setuptools.command.build_py import build_py
 from setuptools.dist import Distribution
+
+
+class BuildPyWithProtoCompile(build_py):
+    """Custom build_py command that compiles protobuf files before building."""
+
+    def run(self):
+        self.compile_grpc_protos()
+        super().run()
+
+    def compile_grpc_protos(self):
+        """Compile gRPC protobuf files if the proto file exists."""
+        grpc_dir = Path(__file__).parent / "tensorrt_llm" / "grpc"
+        proto_file = grpc_dir / "trtllm_service.proto"
+        compile_script = grpc_dir / "compile_protos.py"
+
+        if not proto_file.exists():
+            return
+
+        # Check if pb2 files need to be generated
+        pb2_file = grpc_dir / "trtllm_service_pb2.py"
+        pb2_grpc_file = grpc_dir / "trtllm_service_pb2_grpc.py"
+
+        # Regenerate if pb2 files don't exist or are older than proto file
+        needs_compile = (not pb2_file.exists() or not pb2_grpc_file.exists() or
+                         pb2_file.stat().st_mtime < proto_file.stat().st_mtime)
+
+        if needs_compile and compile_script.exists():
+            import subprocess
+            import sys
+
+            print("Compiling gRPC protobuf files...")
+            try:
+                subprocess.run(
+                    [sys.executable, str(compile_script)],
+                    check=True,
+                    cwd=str(grpc_dir.parent.parent),
+                )
+                print("gRPC protobuf compilation successful")
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: Failed to compile gRPC protos: {e}")
+            except Exception as e:
+                print(f"Warning: gRPC proto compilation skipped: {e}")
 
 
 def parse_requirements(filename: os.PathLike):
@@ -374,6 +417,7 @@ packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 setup(
     name='tensorrt_llm',
     version=get_version(),
+    cmdclass={'build_py': BuildPyWithProtoCompile},
     description=
     ('TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports '
      'state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.'
