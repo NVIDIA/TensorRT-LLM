@@ -9,18 +9,17 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
+from ....llmapi.llm_args import KvCacheConfig
 from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args
 from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
     Constant,
     MHACallable,
-    SequenceInfo,
+    ResourceHandlerDict,
+    UnpagedResourceHandler,
 )
 from .triton_kernels.attention_with_kv_cache import (
     attention_kv_stage2,
@@ -313,11 +312,6 @@ def flattened_mha_fake(
 @AttentionRegistry.register("triton")
 class TritonAttention(AttentionDescriptor):
     @classmethod
-    def is_paged(cls) -> bool:
-        """Return if the attention op is paged or not."""
-        return False
-
-    @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         """Get the attention layout expected by the source op and the cached attention op."""
         return "bsnd"
@@ -341,8 +335,8 @@ class TritonAttention(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         # source op is [bsnd] layout already
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         v_fake: FakeTensor = source_attn_node.args[2].meta["val"]
@@ -350,33 +344,18 @@ class TritonAttention(AttentionDescriptor):
         k_head_dim = k_fake.shape[3]
         v_head_dim = v_fake.shape[3]
 
-        def _get_k_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for triton"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
+        return {
+            "k_cache": UnpagedResourceHandler(
                 num_kv_heads,
                 k_head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or k_fake.dtype,
-            )
-
-        def _get_v_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for triton"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
+            ),
+            "v_cache": UnpagedResourceHandler(
                 num_kv_heads,
                 v_head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or v_fake.dtype,
-            )
-
-        return {"k_cache": _get_k_cache, "v_cache": _get_v_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, v_fake.dtype),
+            ),
+        }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

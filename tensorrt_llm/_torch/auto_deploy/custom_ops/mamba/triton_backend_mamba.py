@@ -24,17 +24,17 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import cu_seqlens_to_chun
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
+from .....llmapi.llm_args import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    CacheConfig,
-    CacheInitializerDict,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
-    SequenceInfo,
+    ResourceHandlerDict,
+    StateResourceHandler,
 )
 
 
@@ -144,8 +144,15 @@ def _triton_cached_ssm(
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
-    y_prefill = None
-    y_decode = None
+    # Preallocate output tensor to avoid memcpy cost for merging prefill
+    # and decode outputs
+    preallocated_ssm_out = torch.empty(
+        [bs, num_heads, head_dim],
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
+    preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
 
     # Prefill: concatenate tokens at the front and run combined scan
     if num_prefill > 0:
@@ -165,7 +172,7 @@ def _triton_cached_ssm(
             chunk_indices = None
             chunk_offsets = None
 
-        y_prefill, varlen_states = mamba_chunk_scan_combined(
+        varlen_states = mamba_chunk_scan_combined(
             hs_prefill,
             dt_prefill,
             A,
@@ -184,11 +191,12 @@ def _triton_cached_ssm(
             dt_limit=(time_step_limit[0], time_step_limit[1]),
             return_final_states=False,
             return_varlen_states=True,
-            mamba_ssm_cache_dtype=ssm_state_cache.dtype,
+            out=preallocated_ssm_out_p.unsqueeze(0),
+            state_dtype=ssm_state_cache.dtype,
         )
 
         ssm_state_cache.index_copy_(
-            0, slot_idx[:num_prefill], varlen_states.to(ssm_state_cache.dtype)
+            0, slot_idx[:num_prefill].long(), varlen_states.to(ssm_state_cache.dtype)
         )
 
     # Decode: batch single-token updates via selective_state_update
@@ -205,7 +213,7 @@ def _triton_cached_ssm(
         A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
         D_full = D[..., None].expand(num_heads, head_dim)
 
-        y_decode = selective_state_update(
+        selective_state_update(
             ssm_state_cache,
             x_decode,
             dt_hp,
@@ -217,19 +225,16 @@ def _triton_cached_ssm(
             dt_bias=dt_bias_hp,
             dt_softplus=True,
             state_batch_indices=slot_idx_decode,
-        )  # [nd, H, D]
+            out=preallocated_ssm_out_d,
+        )
 
-    # Dispatch return logic
-    if num_prefill > 0 and num_decode > 0:
-        y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
-        y_flat = y.view(bs, *y.shape[2:])
-        y_flat[:num_prefill_tokens].copy_(y_prefill[0])
-        y_flat[num_prefill_tokens:num_total_tokens].copy_(y_decode)
-        return y
-    elif num_prefill > 0:
-        return y_prefill[0].view(b, s, num_heads, head_dim).to(hidden_states.dtype)
-    elif num_decode > 0:
-        return y_decode.view(b, s, num_heads, head_dim).to(hidden_states.dtype)
+    # Return the preallocated output reshaped to original dimensions
+    if num_total_tokens > 0:
+        return (
+            preallocated_ssm_out[:num_total_tokens]
+            .view(b, s, num_heads, head_dim)
+            .to(hidden_states.dtype)
+        )
     else:
         return torch.empty_like(hidden_states)
 
@@ -270,10 +275,6 @@ def _triton_cached_ssm_fake(
 @AttentionRegistry.register("triton_ssm")
 class TritonBackendSSM(AttentionDescriptor):
     @classmethod
-    def is_paged(cls) -> bool:
-        return True
-
-    @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         # Hidden states follow [b, s, n, d]
         return "bsnd"
@@ -308,8 +309,8 @@ class TritonBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         # Shapes from fake tensors
         hs_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         B_fake: torch.Tensor = source_attn_node.args[2].meta["val"]
@@ -323,19 +324,13 @@ class TritonBackendSSM(AttentionDescriptor):
             ssm_state_size = max(1, B_fake.shape[-1])
 
         # extract ssm_state_dtype from cache_config or hs_fake
-        ssm_state_dtype = cache_config.mamba_dtype or hs_fake.dtype
+        ssm_state_dtype = cls.resolve_cache_dtype(cache_config.mamba_ssm_cache_dtype, hs_fake.dtype)
 
-        def _get_ssm_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_state_slots,
-                num_heads,
-                head_dim,
-                ssm_state_size,
-                device=si.device,
-                dtype=ssm_state_dtype,
+        return {
+            "ssm_state_cache": StateResourceHandler(
+                num_heads, head_dim, ssm_state_size, dtype=ssm_state_dtype
             )
-
-        return {"ssm_state_cache": _get_ssm_cache}
+        }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

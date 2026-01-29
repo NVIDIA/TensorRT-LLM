@@ -9,7 +9,6 @@ from typing import Iterable, List, Optional, Tuple
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
-from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest
 from .request_utils import get_num_child_requests
 
@@ -50,7 +49,6 @@ class ExecutorRequestQueue:
         max_beam_width: int,
         enable_iter_perf_stats: bool,
         batch_wait_timeout_ms: float,
-        hang_detector: Optional[HangDetector] = None,
     ):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
@@ -62,7 +60,6 @@ class ExecutorRequestQueue:
         self.start_times = {}
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
-        self.hang_detector = hang_detector or HangDetector()
 
     def _get_request_id(self, request: Optional[ExecutorRequest] = None):
         # if request has a disagg_request_id, use it as request id so that

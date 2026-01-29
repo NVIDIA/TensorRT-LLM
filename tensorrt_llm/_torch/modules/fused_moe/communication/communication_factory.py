@@ -76,6 +76,7 @@ class CommunicationFactory:
             expert_size_per_partition: Number of experts per partition (required for DeepEP)
             payload_in_workspace: If True, final_hidden_states is already in workspace (for NVLinkOneSided)
             alltoall_result_do_sum: If True, sum the alltoall results (for NVLinkTwoSided)
+            # TODO: Need a way to indicate whether EPLB is enabled.
 
         Returns:
             The selected communication method, or None if attention does not use DP
@@ -122,6 +123,7 @@ class CommunicationFactory:
         # Priority: NVLinkOneSided > NVLinkTwoSided > DeepEP > DeepEPLowLatency > AllGather
 
         try:
+            enable_eplb = model_config.moe_load_balancer is not None
             strategy = NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -130,6 +132,7 @@ class CommunicationFactory:
                 payload_in_workspace,
                 hidden_size=hidden_size,
                 dtype=act_dtype,
+                num_experts=num_experts if enable_eplb else None,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
@@ -231,6 +234,7 @@ class CommunicationFactory:
                 alltoall_result_do_sum=alltoall_result_do_sum,
             )
         elif method in ["NVLINK_ONE_SIDED"]:
+            enable_eplb = model_config.moe_load_balancer is not None
             return NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -239,6 +243,7 @@ class CommunicationFactory:
                 payload_in_workspace,
                 hidden_size=hidden_size,
                 dtype=act_dtype,
+                num_experts=num_experts if enable_eplb else None,
             )
         elif method == "DEEPEP":
             return DeepEP(

@@ -356,10 +356,22 @@ class AutoTunerProfilingCache:
         - Use save_cache() to save the cache after tuning
         - Use load_cache() to restore cached results before inference
         - JSON format provides human-readable output and cross-platform compatibility
+
+    Cache organization:
+        - Ops with INDEPENDENT strategy are stored per-rank (rank_0, rank_1, ...)
+        - Ops with non-INDEPENDENT strategy (BROADCAST, MERGE, PARALLEL) are stored
+          in a shared dict since all ranks share the same tuning results
     """
+
+    # Key for shared cache entries (non-INDEPENDENT ops)
+    SHARED_CACHE_KEY = "shared"
 
     def __init__(self):
         self.cache: Dict[Tuple, Tuple] = dict()
+
+        # Track which ops use which distributed strategy
+        # Maps custom_op name -> DistributedTuningStrategy
+        self.independent_op: Set[str] = set()
 
         # Cache metadata for local storage and validation
         self.lib_version = tensorrt_llm.__version__
@@ -379,6 +391,7 @@ class AutoTunerProfilingCache:
 
     def clear(self) -> None:
         self.cache.clear()
+        self.independent_op.clear()
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -443,11 +456,42 @@ class AutoTunerProfilingCache:
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
         return {k: v for k, v in self.cache.items() if k[0] == custom_op}
 
+    def add_independent_op(self, custom_op: str,
+                           strategy: DistributedTuningStrategy) -> None:
+        if strategy != DistributedTuningStrategy.INDEPENDENT:
+            self.independent_op.add(custom_op)
+
+    def _partition_cache_by_strategy(
+            self) -> Tuple[Dict[Tuple, Tuple], Dict[Tuple, Tuple]]:
+        """Partition cache entries into shared and rank-specific caches.
+
+        Returns:
+            A tuple of (shared_cache, rank_cache) where:
+            - shared_cache: entries for non-INDEPENDENT ops (BROADCAST, MERGE, PARALLEL)
+            - rank_cache: entries for INDEPENDENT ops
+        """
+        shared_cache = {}
+        rank_cache = {}
+
+        for key, value in self.cache.items():
+            custom_op = key[0]  # First element of cache key is custom_op name
+            if custom_op not in self.independent_op:
+                rank_cache[key] = value
+            else:
+                shared_cache[key] = value
+
+        return shared_cache, rank_cache
+
     def save_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Save the profiling cache to disk in JSON format.
 
+        Cache entries are organized based on distributed strategy:
+        - INDEPENDENT ops are saved per-rank (rank_0, rank_1, ...)
+        - Non-INDEPENDENT ops (BROADCAST, MERGE, PARALLEL) are saved in a shared dict
+
         Args:
             file_path: Path where to save the cache
+            rank: The rank of the current process
 
         Raises:
             IOError: If file cannot be written
@@ -460,7 +504,12 @@ class AutoTunerProfilingCache:
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            serialized_rank_cache_data = self._serialize_cache_data()
+            # Partition cache into shared (non-INDEPENDENT) and rank-specific (INDEPENDENT)
+            shared_cache, rank_cache = self._partition_cache_by_strategy()
+
+            serialized_shared_cache = self._serialize_cache_data(shared_cache)
+            serialized_rank_cache = self._serialize_cache_data(rank_cache)
+
             with open(file_path, 'a+') as f:
                 fcntl.flock(f, fcntl.LOCK_EX)
                 f.seek(0)
@@ -473,7 +522,16 @@ class AutoTunerProfilingCache:
                     }
                 f.seek(0)
                 f.truncate()
-                current_cache[f"rank_{rank}"] = serialized_rank_cache_data
+
+                # Merge shared cache entries (non-INDEPENDENT ops)
+                if self.SHARED_CACHE_KEY not in current_cache:
+                    current_cache[self.SHARED_CACHE_KEY] = {}
+                current_cache[self.SHARED_CACHE_KEY].update(
+                    serialized_shared_cache)
+
+                # Save rank-specific cache entries (INDEPENDENT ops)
+                current_cache[f"rank_{rank}"] = serialized_rank_cache
+
                 json.dump(current_cache, f, indent=2, default=str)
             logger.info(
                 f"[AutoTuner] Successfully saved cache to {file_path} using JSON format"
@@ -485,8 +543,12 @@ class AutoTunerProfilingCache:
     def load_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Load the profiling cache from disk in JSON format.
 
+        Loads both shared cache entries (non-INDEPENDENT ops) and rank-specific
+        entries (INDEPENDENT ops) and merges them into the current cache.
+
         Args:
             file_path: Path to the cache file
+            rank: The rank of the current process
 
         Raises:
             FileNotFoundError: If cache file doesn't exist
@@ -505,10 +567,39 @@ class AutoTunerProfilingCache:
                 fcntl.flock(f, fcntl.LOCK_SH)
                 current_cache_contents = json.load(f)
                 self._deserialize_metadata(current_cache_contents["metadata"])
-            self.cache = self._deserialize_cache_data(
-                current_cache_contents.get(f'rank_{rank}', {}))
+
+            # Start with empty cache and independent ops set
+            self.cache = {}
+            self.independent_op = set()
+
+            # Load shared cache entries (non-INDEPENDENT ops)
+            if self.SHARED_CACHE_KEY in current_cache_contents:
+                shared_cache = self._deserialize_cache_data(
+                    current_cache_contents[self.SHARED_CACHE_KEY])
+                self.cache.update(shared_cache)
+                # add custom op in shared cache to independent ops set
+                for key in shared_cache.keys():
+                    self.independent_op.add(key[0])
+                logger.debug(
+                    f"[AutoTuner] Loaded {len(shared_cache)} shared cache entries"
+                )
+
+            # Load rank-specific cache entries (INDEPENDENT ops)
+            rank_key = f"rank_{rank}"
+            if rank_key in current_cache_contents:
+                rank_cache = self._deserialize_cache_data(
+                    current_cache_contents[rank_key])
+                self.cache.update(rank_cache)
+                logger.debug(
+                    f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
+                )
+
             logger.info(
-                f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format"
+                f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"
+            )
+
+            logger.info(
+                f"[AutoTuner] independent_op: {type(self.independent_op) if hasattr(self, 'independent_op') else 'not found'}"
             )
         except Exception as e:
             logger.error(f"[AutoTuner] Failed to load cache with JSON: {e}")
@@ -528,8 +619,13 @@ class AutoTunerProfilingCache:
         self.device_name = metadata["device_name"]
         self.device_capability = metadata["device_capability"]
 
-    def _serialize_cache_data(self) -> Dict[str, Any]:
+    def _serialize_cache_data(self,
+                              cache: Optional[Dict[Tuple, Tuple]] = None
+                              ) -> Dict[str, Any]:
         """Convert the profiling cache to a JSON-serializable format.
+
+        Args:
+            cache: Optional cache dict to serialize. If None, uses self.cache.
 
         Returns:
             Dictionary that can be serialized to JSON
@@ -538,9 +634,12 @@ class AutoTunerProfilingCache:
             This method handles the conversion of complex objects to JSON-compatible
             representations. Some type information may be lost in the conversion.
         """
+        if cache is None:
+            cache = self.cache
+
         serializable_cache = {}
 
-        for key, value in self.cache.items():
+        for key, value in cache.items():
             # Convert any simple object to string for JSON compatibility
             key_str = str(key)
             runner_id, tactic, min_time = value
@@ -636,8 +735,6 @@ class AutoTuner:
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
         # Dsitributed tuning state
-        self._map_op_to_distributed_strategy: Dict[
-            str, DistributedTuningStrategy] = {}
         self._dist: Optional[Distributed] = None
         self._has_received_cache: bool = False
         self.mapping: Mapping = Mapping()
@@ -844,8 +941,8 @@ class AutoTuner:
             "All Given runners must be subclass of TunableRunner"
 
         # Record the distributed tuning strategy for the custom_op
-        self._map_op_to_distributed_strategy[
-            custom_op] = tuning_config.distributed_tuning_strategy
+        self.profiling_cache.add_independent_op(
+            custom_op, strategy=tuning_config.distributed_tuning_strategy)
 
         tuning_start_time = time.perf_counter()
         profiles = self._optimization_profiles(tuning_config, inputs)

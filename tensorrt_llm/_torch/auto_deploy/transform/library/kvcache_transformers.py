@@ -163,8 +163,8 @@ def get_cached_attn(
             query,
             key,
             value,
-            # metadata+caches+buffers with name lookup set up during kvcache transform
-            *[kwargs[k] for k in module._node_ref.meta["metadata_cache_buffer_keys"]],
+            # metadata+caches with name lookup set up during kvcache transform
+            *[kwargs[k] for k in module._node_ref.meta["metadata_cache_keys"]],
             # constants set up during kvcache transform
             *module._node_ref.meta["constants"],
         )
@@ -242,17 +242,11 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
-        buffer_nodes: List[Node],
         constants: List[Constant],
     ):
         """Here we now need to actually do the correct mapping of the cached attn nodes."""
-        # store reference to metadata, caches, buffers, and constants for this attn node
-        attn_node.meta["metadata_cache_buffer_keys"] = (
-            *meta_nodes_std,
-            *meta_nodes_extra,
-            *cache_nodes,
-            *buffer_nodes,
-        )
+        # store reference to metadata, caches, and constants for this attn node
+        attn_node.meta["metadata_cache_keys"] = (*meta_nodes_std, *meta_nodes_extra, *cache_nodes)
         attn_node.meta["constants"] = constants
 
     def _apply_to_full_model(
