@@ -21,14 +21,16 @@ from .interface import (
 
 
 class InferenceOptimizer:
-    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig):
+    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig, mapping=None):
         self.factory = factory
         self.config = self._clean_config(config)
         if not dist.is_initialized():
             local_rank, world_size = 0, 1
         else:
             local_rank, world_size = dist_ad.get_rank_world_size()
-        self.shared_config = SharedConfig(local_rank=local_rank, world_size=world_size)
+        self.shared_config = SharedConfig(
+            local_rank=local_rank, world_size=world_size, mapping=mapping
+        )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
         """Get a typed checked ("strict") config with sorted keys according to stages."""

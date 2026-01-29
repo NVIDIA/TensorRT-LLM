@@ -144,6 +144,8 @@ def _process_moe_node(
         w2_list,
         w3_list,
         apply_routing_on_input,
+        enable_alltoall,
+        mapping_config,
     ) = extract_op_args(
         node,
         "x",
@@ -153,6 +155,8 @@ def _process_moe_node(
         "w2_weight",
         "w3_weight",
         "apply_routing_on_input",
+        "enable_alltoall",
+        "mapping_config",
     )
 
     # Stack weights based on MLP style
@@ -211,13 +215,21 @@ def _process_moe_node(
             args=(hidden_states, weight_dtype),
         )
 
+        # Build kwargs for new node
+        fused_kwargs = {
+            "is_gated_mlp": is_gated_mlp,
+            "act_fn": act_fn,
+            "apply_routing_on_input": apply_routing_on_input,
+            "enable_alltoall": enable_alltoall,
+        }
+        # Only include mapping_config if enable_alltoall is True
+        if enable_alltoall:
+            fused_kwargs["mapping_config"] = mapping_config
+
         new_node = graph.call_function(
             replacement_op,
             args=(hidden_states, selected_experts, routing_weights, w_up_arg, w_down_arg),
-            kwargs={
-                "is_gated_mlp": is_gated_mlp,
-                "act_fn": act_fn,
-            },
+            kwargs=fused_kwargs,
         )
 
     node.replace_all_uses_with(new_node)

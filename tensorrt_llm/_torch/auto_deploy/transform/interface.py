@@ -117,9 +117,11 @@ class SharedConfig(BaseModel):
     model_config = {
         # to provide an easy way to do config validation of child config classes with more fields
         "extra": "allow",
+        "arbitrary_types_allowed": True,
     }
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
+    mapping: Any = Field(default=None)  # Mapping object from ad_executor
 
 
 class TransformConfig(BaseModel):
