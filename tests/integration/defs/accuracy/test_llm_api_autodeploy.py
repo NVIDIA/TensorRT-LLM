@@ -287,6 +287,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                     "sharding_source": ['factory', 'heuristic'],
                     "sharding_dims": ['ep', 'bmm'],
                 },
+                "fuse_fp8_moe": {
+                    "allow_different_input_scales": True,
+                },
             }
         }
 
@@ -313,12 +316,15 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip("Skipping FP8 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [1, 4, 8])
     def test_fp8(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
+        if world_size > 1:
+            pytest.skip(
+                "Skipping for now - check accuracy degradation for world_size > 1"
+            )
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
