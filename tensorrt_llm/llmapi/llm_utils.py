@@ -391,16 +391,21 @@ class ModelLoader:
             with open(hf_config_path, "r") as f:
                 hf_config = json.load(f)
                 hf_quant_config = hf_config.get("quantization_config", None)
+                if hf_quant_config is not None:
+                    logger.info(
+                        f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
+                    )
         if self.llm_args.model_kwargs is not None and "quantization_config" in self.llm_args.model_kwargs:
             logger.info(
                 f"Update hf_quant_config from model_kwargs: quantization_config={self.llm_args.model_kwargs['quantization_config']} (previous value: {hf_quant_config})"
             )
             hf_quant_config = self.llm_args.model_kwargs["quantization_config"]
+        elif hf_quant_config is not None:
+            logger.info(
+                f"Use quantization_config from {hf_config_path}: quantization_config={hf_quant_config}"
+            )
 
         if hf_quant_config is not None:
-            logger.info(
-                f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
-            )
             # DeepSeek V3 FP8 ckpt
             if hf_quant_config.get(
                     "quant_method") == "fp8" and hf_quant_config.get(
