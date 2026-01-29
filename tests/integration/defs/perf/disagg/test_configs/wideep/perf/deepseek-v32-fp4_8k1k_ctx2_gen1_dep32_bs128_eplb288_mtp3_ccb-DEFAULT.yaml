@@ -13,7 +13,7 @@ slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
   account: <account>
-  job_time: 02:00:00
+  job_time: 04:00:00
   job_name: disaggr-test
   extra_args: "--gres=gpu:4"
   numa_bind: true
@@ -44,9 +44,6 @@ profiling:
   nsys_on: false
 accuracy:
   enable_accuracy_test: false
-  model: local-completions
-  tasks: gsm8k
-  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
     tensor_parallel_size: 32

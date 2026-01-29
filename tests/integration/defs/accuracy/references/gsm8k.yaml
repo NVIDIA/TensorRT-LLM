@@ -253,10 +253,6 @@ microsoft/phi-4:
     accuracy: 90.64
 mistralai/Codestral-22B-v0.1:
   - accuracy: 67.10
-GPT-OSS/BF16:
-  - accuracy: 90.3
-  - kv_cache_quant_algo: FP8
-    accuracy: 90.3
 GPT-OSS/120B-MXFP4:
   - accuracy: 90.3
   - spec_dec_algo: Eagle
@@ -347,6 +343,11 @@ nvidia/Nemotron-Super-V3:
     accuracy: 82.25
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
+    accuracy: 80.85
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    mtp_enabled: true
+    num_nextn_predict_layers: 3
     accuracy: 80.85
 nvidia/Nemotron-3-Nano:
   - accuracy: 69.37

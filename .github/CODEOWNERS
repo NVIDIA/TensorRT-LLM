@@ -185,8 +185,6 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/pybind/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/pybind/batch_manager/kvCacheManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
@@ -218,6 +216,12 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ### Third-Party Dependencies
 ## Any changes to versions, additions, or removals of third-party libraries
 /3rdparty/** @NVIDIA/trt-llm-oss-compliance
+
+### Vendored Third-Party Code (triton-kernels)
+## This is a temporary vendored copy of triton-kernels from the Triton project (MIT License).
+## Do not accept contributions to this directory - it should only be updated via scripts/vendor_triton_kernels.py
+## This can be removed if and when triton-kernels is published as a separate wheel.
+/triton_kernels/** @NVIDIA/trt-llm-oss-compliance
 
 ### Docker & Installation Scripts
 ## These scripts install and pin dependency versions

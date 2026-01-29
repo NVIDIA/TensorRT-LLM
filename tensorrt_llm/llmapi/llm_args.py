@@ -840,6 +840,37 @@ class KvCacheConnectorConfig(StrictBaseModel):
         ..., description="The class name of the worker within the module.")
 
 
+class LayerwiseBenchmarksConfig(StrictBaseModel):
+    """
+    Configuration for layer-wise benchmarks calibration.
+    """
+    calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
+        default="NONE",
+        description=
+        "Instruct the layer-wise benchmarks calibrator to work on MARK mode, or COLLECT mode",
+        status="prototype")
+
+    calibration_file_path: Optional[str] = Field(
+        default=None,
+        description=
+        "The file path which the layer-wise benchmarks calibrator saves to or loads from",
+        status="prototype")
+
+    calibration_layer_indices: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Layer indices to filter. If None, all layers are collected in COLLECT mode.",
+        status="prototype")
+
+    @model_validator(mode='after')
+    def validate_calibration_file_path(self) -> 'LayerwiseBenchmarksConfig':
+        if self.calibration_mode == "COLLECT" and not self.calibration_file_path:
+            raise ValueError(
+                f"Expect calibration_file_path not to be empty when work on {self.calibration_mode} mode"
+            )
+        return self
+
+
 class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
@@ -1203,7 +1234,7 @@ class AutoDecodingConfig(DecodingBaseConfig):
 class RayPlacementConfig(StrictBaseModel):
     """
     Configuration for Ray GPU workers placement.
-    This config is only used with AsyncLLM for RL scenarios.
+    Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
         default=False,
@@ -1217,8 +1248,11 @@ class RayPlacementConfig(StrictBaseModel):
 
     placement_bundle_indices: Optional[List[List[int]]] = Field(
         default=None,
-        description="List of bundle indices for each placement group. "
-        "Outer list corresponds to placement_groups, inner list contains bundle indices for that group."
+        description=
+        "List of lists of bundle indices. The outer list corresponds to "
+        "`placement_groups`. Each inner list specifies the bundle indices to use within "
+        "that placement group. For example, if `placement_groups=[pg1, pg2]`, "
+        "`[[0, 1], [0, 1]]` assigns bundles 0 and 1 from `pg1` and bundles 0 and 1 from `pg2`."
     )
 
     per_worker_gpu_share: Optional[float] = Field(
@@ -1243,12 +1277,15 @@ class RayPlacementConfig(StrictBaseModel):
                     f"placement_groups length ({len(self.placement_groups)}) must equal "
                     f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
                 )
-            if PlacementGroup is not None:
-                for i, pg in enumerate(self.placement_groups):
-                    if not isinstance(pg, PlacementGroup):
-                        raise TypeError(
-                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
-                            f"got {type(pg).__name__}")
+            if PlacementGroup is None:
+                raise ValueError(
+                    "Ray must be installed to use `placement_groups`")
+
+            for i, pg in enumerate(self.placement_groups):
+                if not isinstance(pg, PlacementGroup):
+                    raise TypeError(
+                        f"placement_groups[{i}] must be a Ray PlacementGroup, "
+                        f"got {type(pg).__name__}")
 
         if self.per_worker_gpu_share is not None:
             if not (0 < self.per_worker_gpu_share <= 1.0):
@@ -2929,6 +2966,7 @@ class TorchLlmArgs(BaseLlmArgs):
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
                                    description="Allreduce strategy to use.",
                                    status="beta")
+
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description=
@@ -3004,6 +3042,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description="The max number of performance statistic entries.",
         status="prototype",
     )
+
+    layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
+        default_factory=LayerwiseBenchmarksConfig,
+        description="Configuration for layer-wise benchmarks calibration.",
+        status="prototype")
 
     @property
     def quant_config(self) -> QuantConfig:

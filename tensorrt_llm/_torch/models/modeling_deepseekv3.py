@@ -1120,13 +1120,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=not self.enable_attention_dp
                 and self.mapping.tp_size > 1)
         else:
+            # When enable_attention_dp is True, TP reduction is skipped since each DP rank
+            # works on different batch elements. However, with CP > 1, attention is split
+            # across CP ranks for the SAME batch element, so reduction is still needed
+            # within the CP group.
+            needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
+            needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+            )
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
                 mapping_with_cp=mapping_with_cp,
-                reduce_output=not self.enable_attention_dp
-                and self.mapping.tp_size > 1)
+                reduce_output=needs_tp_reduce or needs_cp_reduce)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -1192,10 +1198,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
 
+        # When enable_attention_dp is True, we normally skip attention all-reduce since each
+        # DP rank works on different batch elements. However, with CP > 1, attention is split
+        # across CP ranks for the SAME batch element, so all-reduce is still needed.
+        has_cp = mapping_with_cp is not None and mapping_with_cp.cp_size > 1
+        can_skip_for_attention_dp = self.enable_attention_dp and not has_cp
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.fusion_config.PRE_MLP_FUSION
                                        or self.mapping.tp_size == 1
-                                       or self.enable_attention_dp)
+                                       or can_skip_for_attention_dp)
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,

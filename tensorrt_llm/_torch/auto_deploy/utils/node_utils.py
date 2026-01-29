@@ -143,8 +143,19 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def extract_weight_name(node: Node) -> str:
+def get_all_weights_in_subgraph(
+    sources: list[Node],
+    sinks: list[Node],
+):
+    """Get all weight nodes (get_attr nodes) in the subgraph between sources and sinks."""
+    weight_nodes = subgraph(sources, sinks, include=is_weight_node)
+    return weight_nodes
+
+
+def extract_weight_name(node: Node) -> Union[str, bool]:
     weight_nodes = extract_weight_nodes(node)
+    if len(weight_nodes.weights) == 0:
+        return False
     return weight_nodes.weights[0].node_key
 
 
@@ -429,6 +440,10 @@ def is_dist_op(node: Node) -> bool:
         torch.ops.auto_deploy.trtllm_dist_all_reduce,
     }
     return is_op(node, dist_ops)
+
+
+def is_weight_node(node: Node) -> bool:
+    return node.op == "get_attr" and node.target and has_shape(node) and len(shape(node)) > 0
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
@@ -952,7 +967,9 @@ def get_layer_after_linear_node(
         min_local_shape=min_local_shape,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
-        "Linear node not found in opening linear nodes"
+        f"Linear node not found in opening linear nodes - "
+        f"terminating_linear_node:{terminating_linear_node.name}, "
+        f"opening_linear_nodes: {[n.name for n in opening_linear_nodes]}"
     )
 
     # return the index of the terminating linear node

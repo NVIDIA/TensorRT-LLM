@@ -84,8 +84,7 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
     )
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
@@ -118,8 +117,6 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         # CACHES
         k_cache,
         v_cache,
-        # BUFFERS
-        workspace,
         # CONSTANTS
         None,
         1.0,
@@ -229,8 +226,7 @@ def test_flashinfer_attention_op_decode(
     )
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
@@ -262,8 +258,6 @@ def test_flashinfer_attention_op_decode(
         # CACHES
         k_cache,
         v_cache,
-        # BUFFERS
-        workspace,
         # CONSTANTS
         None,
         1.0,
@@ -361,8 +355,7 @@ def test_flashinfer_attention_context_and_generate(
     )
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
@@ -395,8 +388,6 @@ def test_flashinfer_attention_context_and_generate(
         # CACHES
         k_cache,
         v_cache,
-        # BUFFERS
-        workspace,
         # CONSTANTS
         None,
         1.0,
@@ -454,7 +445,7 @@ def test_flashinfer_attention_context_and_generate(
     v_3 = torch.randn(BATCH_SIZE, 1, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
 
     # Create FlashInferAttention class before calling the custom op
-    _GlobalFlashInferPlanner.reset()
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
@@ -485,8 +476,6 @@ def test_flashinfer_attention_context_and_generate(
         # CACHES
         k_cache,
         v_cache,
-        # BUFFERS
-        workspace,
         # CONSTANTS
         None,
         1.0,
@@ -586,8 +575,7 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         )
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
@@ -620,8 +608,6 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         # CACHES
         k_cache,
         v_cache,
-        # BUFFERS
-        workspace,
         # CONSTANTS
         None,
         1.0,
@@ -748,8 +734,7 @@ def test_flashinfer_attention_with_fp8_cache(
     v_cache = v_cache.to(torch.float8_e4m3fn)
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
@@ -782,8 +767,6 @@ def test_flashinfer_attention_with_fp8_cache(
         # CACHES
         k_cache,
         v_cache,
-        # BUFFERS
-        workspace,
         # CONSTANTS
         None,
         K_SCALE,
@@ -859,8 +842,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
@@ -891,8 +873,6 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # CACHES
         k_cache,
         v_cache,
-        # BUFFERS
-        workspace,
         # CONSTANTS
         None,
         1.0,
@@ -956,7 +936,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     seq_len_with_cache2_host = (offsets2 + seq_len_tensor2).cpu()
 
     # Create FlashInferAttention class before calling the custom op
-    _GlobalFlashInferPlanner.reset()
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr2,
@@ -987,8 +967,6 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # CACHES
         k_cache,
         v_cache,
-        # BUFFERS
-        workspace,
         # CONSTANTS
         None,
         1.0,

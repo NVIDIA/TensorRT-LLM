@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    MambaHybridCacheManager
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -222,10 +224,17 @@ class MTPSampler(TorchSampler):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
         max_total_draft_tokens: torch.Tensor
-        finish_reasons: None = None  # Necessary to satisfy the interface of TorchSampler.Store
+        # Necessary to satisfy the interface of TorchSampler.Store
+        finish_reasons: None = None
+        end_ids: None = None
+        max_lengths_tensor: None = None
 
         def __post_init__(self):
             pass  # finish_reasons has no size to compare against new_tokens in MTPSampler
+
+    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
+        # MTPSampler does not need to setup additional buffers before the sampler step
+        pass
 
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
@@ -1132,6 +1141,7 @@ class MTPEagleWorker(MTPWorker):
         super().__init__(spec_config, model_config)
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
+        self._is_mamba_hybrid_cache = None
 
     @torch.compile(options={"max-autotune": True})
     def update_draft_tokens(self, next_draft_tokens, new_draft_token,
@@ -1163,6 +1173,14 @@ class MTPEagleWorker(MTPWorker):
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
+
+        if self._is_mamba_hybrid_cache is None:
+            self._is_mamba_hybrid_cache = isinstance(
+                attn_metadata.kv_cache_manager, MambaHybridCacheManager)
+        if num_gens > 0 and self._is_mamba_hybrid_cache:
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens)
 
         # Save the old attn_metadata and spec_metadata
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)

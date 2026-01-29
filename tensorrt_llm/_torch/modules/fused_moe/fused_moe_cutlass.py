@@ -8,6 +8,7 @@ import torch
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm.logger import logger
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
@@ -166,15 +167,22 @@ class CutlassFusedMoE(MoE):
                     dtype = self.dtype or torch.float16
 
                     workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-                        ep_size, self.routing_method.experts_per_token,
-                        max_num_tokens, hidden_size, dtype)
+                        ep_size,
+                        self.routing_method.experts_per_token,
+                        max_num_tokens,
+                        hidden_size,
+                        dtype,
+                        self.num_experts if self.layer_load_balancer else None,
+                    )
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_slots,
+                        num_slots=self.num_slots,
                         workspace_size_per_rank=workspace_size,
+                        num_experts=self.num_experts
+                        if self.layer_load_balancer else None,
                     )
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
@@ -404,6 +412,7 @@ class CutlassFusedMoE(MoE):
         tuner_num_tokens: Optional[int] = None,
         tuner_top_k: Optional[int] = None,
         moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with Cutlass backend.
@@ -422,6 +431,7 @@ class CutlassFusedMoE(MoE):
             tuner_num_tokens: Number of tokens for profiling tuner (optional)
             tuner_top_k: Top-k value for profiling tuner (optional)
             moe_output: Pre-allocated output buffer (optional)
+            enable_alltoall: Whether alltoall communication is enabled (optional). If None, defaults to self.enable_alltoall.
 
         Returns:
             final_hidden_states: Output tensor from MoE computation
@@ -433,6 +443,9 @@ class CutlassFusedMoE(MoE):
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 weight_dtype = torch.uint8
+
+        if enable_alltoall is None:
+            enable_alltoall = self.enable_alltoall
 
         result = torch.ops.trtllm.fused_moe(
             x,
@@ -455,7 +468,7 @@ class CutlassFusedMoE(MoE):
             ep_rank=self.ep_rank,
             cluster_size=self.cluster_size,
             cluster_rank=self.cluster_rank,
-            enable_alltoall=self.enable_alltoall,
+            enable_alltoall=enable_alltoall,
             use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
             use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
             use_int8_woq_per_channel=self.has_int8_woq_per_channel,
@@ -509,7 +522,10 @@ class CutlassFusedMoE(MoE):
 
         if self.layer_load_balancer:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
-            ignore_allreduce = self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type in (
+                AlltoallMethodType.NVLinkTwoSided,
+                AlltoallMethodType.NVLinkOneSided,
+            )
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -524,6 +540,8 @@ class CutlassFusedMoE(MoE):
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
+            self.num_slots, token_selected_slots)
 
         if self.apply_router_weight_on_input:
             assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
@@ -608,14 +626,32 @@ class CutlassFusedMoE(MoE):
                 payloads.append(token_selected_slots)
                 payloads.append(token_final_scales)
 
-                recv_tensors = self.moe_a2a.dispatch(
-                    token_selected_slots,
-                    payloads,
-                    runtime_max_tokens_per_rank,
-                    invalid_token_expert_id=self.
-                    num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
-                    expert_id_payload_index=expert_id_payload_index,
-                )
+                loadbalancer_local_statistic_info = None
+                if self.layer_load_balancer and is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
+                    )
+                if loadbalancer_local_statistic_info is not None:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_slots,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=self.
+                        num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                        eplb_local_stats=loadbalancer_local_statistic_info,
+                    )
+                    gathered_stats = self.moe_a2a._state.eplb_gathered_stats
+                    self._load_balancer_update_statistic_with_gathered_statistic(
+                        gathered_stats)
+                else:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_slots,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=self.
+                        num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                    )
 
                 if x_sf is not None:
                     x_recv, x_sf_recv, token_selected_slots_recv, token_final_scales_recv = recv_tensors

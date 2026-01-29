@@ -316,7 +316,8 @@ GemmGatedActConfig const* GemmGatedActInterface::getGemmConfigs() const
 size_t GemmGatedActInterface::getNumGemmConfigs() const
 {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-    return tensorrt_llm::kernels::tllmGenGemmGatedActListLen;
+    return sizeof(tensorrt_llm::kernels::tllmGenGemmGatedActList)
+        / sizeof(tensorrt_llm::kernels::tllmGenGemmGatedActList[0]);
 #else
     return 0;
 #endif

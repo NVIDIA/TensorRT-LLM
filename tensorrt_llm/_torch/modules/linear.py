@@ -752,7 +752,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         self.rescale_fused_weights(module)
 
         # Handle kv_scales for NVFP4 KV cache
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "0") == "1":
+        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
             k_scales = getattr(module, "tmp_k_scales", [])
             v_scales = getattr(module, "tmp_v_scales", [])
             if k_scales:
@@ -1360,8 +1360,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Load k and v scales, used for NVFP4 KV cache
         k_scale, v_scale = self.load_kv_scales(weights)
-        # NOTE: Currently the calibrated kv scales may cause overflow for certain input, disabling by default.
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "0") == "1":
+        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
             if len(k_scale) != 0:
                 assert len(v_scale) != 0
                 copy_weight(
