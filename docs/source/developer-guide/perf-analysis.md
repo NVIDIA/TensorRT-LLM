@@ -66,7 +66,7 @@ Consult the Nsight Systems User Guide for full overview of MPI-related options.
 
 ### Profiling specific iterations on a `trtllm-bench`/`trtllm-serve` run
 
-Say we want to profile iterations 100 to 150 on a `trtllm-bench`/`trtllm-serve` run, we want to collect as much information as possible for debugging, such as GIL, debugging NVTX markers, etc:
+To profile iterations 100 to 150 of a `trtllm-bench` or `trtllm-serve` run with extensive debugging information, including `GIL` and `NVTX` markers, you may need to coordinate the run using the `nsys` profiler and specific environment variables.
 
 ```bash
 #!/bin/bash
@@ -80,15 +80,20 @@ trtllm-bench --model ${MODEL_PATH} \
     --input-mean=1000 --output-mean=1000 --input-stdev=0 --output-stdev=0
 
 # Benchmark and profile
-TLLM_PROFILE_START_STOP=100-150 nsys profile \
+# Run with trtllm-bench or trtllm-serve command
+TLLM_PROFILE_START_STOP=100-150 \
+TLLM_PROFILE_RECORD_GC=1 \
+TLLM_LLMAPI_ENABLE_NVTX=1 \
+TLLM_TORCH_PROFILE_TRACE="trace.json" \
+
+nsys profile \
   -o trace -f true \
   -t 'cuda,nvtx,python-gil' -c cudaProfilerApi \
   --cuda-graph-trace node \
-  -e TLLM_PROFILE_RECORD_GC=1,TLLM_LLMAPI_ENABLE_NVTX=1,TLLM_TORCH_PROFILE_TRACE=trace.json \
   --trace-fork-before-exec=true \
-  trtllm-bench \ # or trtllm-serve command
-    --model deepseek-ai/DeepSeek-V3 \
-    --model_path ${MODEL_PATH} \
+  trtllm-bench \
+    --model deepseek-ai/deepseek-v3 \
+    --model_path "${MODEL_PATH}" \
     throughput \
     --dataset /tmp/dataset.txt --warmup 0 \
     --backend pytorch \
