@@ -1253,7 +1253,7 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         self.preload_weight_modules = self.model.preload_weight_modules
 
     @classmethod
-    def get_llmapi_defaults(cls) -> dict:
+    def get_llmapi_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
         """Return model-specific LLM API defaults."""
         return {"kv_cache_config": {"enable_block_reuse": False}}
 
