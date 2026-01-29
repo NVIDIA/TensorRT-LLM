@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import functools
 import math
 import tempfile
 from collections import defaultdict
@@ -782,9 +783,7 @@ def default_multimodal_input_loader(
 
     processor = None
     if model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  use_fast=True,
-                                                  trust_remote_code=True)
+        processor = _get_processor(model_dir)
 
     inputs = []
     for prompt_idx, (prompt,
@@ -836,3 +835,11 @@ def get_cache_salt_id(cache_salt: str) -> int:
             f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
 
     return cache_salt_id
+
+
+@functools.lru_cache
+def _get_processor(model_dir):
+    processor = AutoProcessor.from_pretrained(model_dir,
+                                              use_fast=True,
+                                              trust_remote_code=True)
+    return processor
