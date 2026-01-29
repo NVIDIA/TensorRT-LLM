@@ -38,11 +38,9 @@ def test_fp8_block_scale_gemm(m, k, n):
     a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16) / k
     b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16) / k
 
-    act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
     act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
 
-    output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8, act_b_fp8,
-                                                     act_a_sf, act_b_sf)
+    output = torch.ops.trtllm.fp8_block_scaling_gemm(a, act_b_fp8, act_b_sf)
 
     output_expected = a @ b.t()
     diff = calc_diff(output, output_expected)

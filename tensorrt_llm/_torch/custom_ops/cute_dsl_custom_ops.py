@@ -315,7 +315,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
-        BlockwiseGemmKernel
+        Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
@@ -2164,8 +2164,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    device=input_scale.device)
         return output, output_scale
 
-    class CuteDSLFp8BlackwellLinear(TunableRunner):
-        kernel_class = BlockwiseGemmKernel
+    class CuteDSLFP8BlackwellLinear(TunableRunner):
+        kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
         tuning_config = TuningConfig(
@@ -2173,10 +2173,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0, 0, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(2, 1, fp8_scale_infer_shape), ),
+            use_cold_l2_cache=True,
         )
 
-        def __init__(self):
+        def __init__(self,
+                     output_dtype: torch.dtype = torch.bfloat16,
+                     use_tvm_ffi: bool = True):
             super().__init__()
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
+                )
+            self.output_dtype = output_dtype
+            self.use_tvm_ffi = use_tvm_ffi
 
         def get_valid_tactics(
             self,
@@ -2247,10 +2256,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             Args:
                 inputs (List[torch.Tensor]):
-                    inputs[0]: Input tensor of shape (m, k), dtype: fp8.
+                    inputs[0]: Input tensor of shape (m, k), dtype: bf16.
                     inputs[1]: Weight tensor of shape (n, k), dtype: fp8.
-                    inputs[2]: Input scale factor tensor of shape (k // 128, m), dtype: fp32.
-                    inputs[3]: Weight scale factor tensor of shape (n // 128, k // 128), dtype: fp32.
+                    inputs[2]: Weight scale factor tensor of shape (n // 128, k // 128), dtype: fp32.
                 tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
 
             Returns:
@@ -2265,7 +2273,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     (128, 128),
                     (1, 1),
                 ]
-            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
+            a_bf16, b_tensor, b_sf_tensor = inputs
+            assert a_bf16.dtype == torch.bfloat16
+            a_tensor, a_sf_tensor = torch.ops.trtllm.fp8_quantize_1x128(a_bf16)
+
             m, n, k = a_tensor.shape[0], b_tensor.shape[0], b_tensor.shape[1]
             sf_m = m
             sf_k = ceil_div(k, 128)
@@ -2371,14 +2382,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
     def cute_dsl_fp8_gemm_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
-        input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
         tuner = AutoTuner.get()
 
-        runner = CuteDSLFp8BlackwellLinear()
+        runner = CuteDSLFP8BlackwellLinear()
 
-        inputs = [input, weight, input_scale, weight_scale]
+        inputs = [input, weight, weight_scale]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_fp8_gemm_blackwell::gemm",
             [runner],
@@ -2402,8 +2412,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
-    class CuteDSLFp8BlackwellBmm(TunableRunner):
-        kernel_class = BlockwiseGemmKernel
+    class CuteDSLFP8BlackwellBmm(TunableRunner):
+        kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
         tuning_config = TuningConfig(
@@ -2411,6 +2421,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0, 1, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(2, 2, fp8_scale_infer_shape), ),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self):
@@ -2606,7 +2617,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     # a/b: fp8, scale: fp32, out: bf16
     @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
-                             mutates_args=(),
+                             mutates_args=("out", ),
                              device_types="cuda")
     def cute_dsl_fp8_bmm_blackwell(
         input: torch.Tensor,
@@ -2617,7 +2628,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         tuner = AutoTuner.get()
 
-        runner = CuteDSLFp8BlackwellBmm()
+        runner = CuteDSLFP8BlackwellBmm()
 
         inputs = [input, weight, input_scale, weight_scale, out]
 

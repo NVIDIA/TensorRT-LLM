@@ -23,14 +23,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.quantization.utils.fp8_utils import (
-    per_token_quant_and_transform, resmooth_to_fp8_e8m0,
-    transform_sf_into_required_layout)
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_sm_version
 from ...models.modeling_utils import QuantConfig
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     replace_parameter_and_save_metadata, unswizzle_sf)
+from ..utils import Fp4QuantizedTensor, get_model_extra_attrs, unswizzle_sf
 
 
 class WeightMode(str, enum.Enum):
@@ -982,29 +978,15 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        if is_sm_100f():
-            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                    act_input_fp8, module.weight, act_input_sf,
-                    module.weight_scale)
-            else:
-                output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    disable_ue8m0_cast=True,
-                )
-        elif get_sm_version() == 120:
-            act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
-            output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
-        else:
-            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                input)
-            output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        allowed_backends_str = ','.join(
+            module.fp8_block_scaling_allowed_backends)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm_unified(
+            input=input,
+            weight=module.weight,
+            weight_scale=module.weight_scale,
+            output_dtype=torch.bfloat16,
+            allowed_backends=allowed_backends_str,
+        )
 
         if bias is not None:
             output = output + bias
@@ -1116,25 +1098,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                   shard_size)
 
     def post_load_weights(self, module: Linear):
-        super().post_load_weights(module)
-        if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
-                                 or module.disable_deep_gemm)) or \
-           get_sm_version() == 120:
-            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
-                                                        module.weight_scale)
-            transformed_scale = transform_sf_into_required_layout(
-                weight_scale,
-                mn=weight.shape[0],
-                k=weight.shape[1],
-                recipe=(1, 128, 128),
-                is_sfa=False)
-            replace_parameter_and_save_metadata(
-                module, "weight", nn.Parameter(weight, requires_grad=False),
-                module.rebuild_tensor_metadata)
-            replace_parameter_and_save_metadata(
-                module, "weight_scale",
-                nn.Parameter(transformed_scale, requires_grad=False),
-                module.rebuild_tensor_metadata)
+        pass
 
 
 class NVFP4LinearMethod(LinearMethodBase):
@@ -2359,6 +2323,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        fp8_block_scaling_allowed_backends: Optional[List[str]] = None,
     ):
         """
         Args:
@@ -2367,6 +2332,11 @@ class Linear(nn.Module):
                 Add 'cutedsl' for extreme performance at the cost of longer build time.
                 Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
                 Configure via nvfp4_gemm_config.allowed_backends in extra_llm_api_options.yaml.
+            fp8_block_scaling_allowed_backends: List of backends to consider for FP8 Block Scaling GEMM auto-selection.
+                Default (via config): ['cutlass/trtllmgen', 'deepgemm'] - excludes cutedsl for faster build.
+                Add 'cutedsl' for extreme performance at the cost of longer build time.
+                Valid backends: 'cutlass/trtllmgen', 'deepgemm', 'cutedsl'.
+                Configure via fp8_block_scaling_gemm_config.allowed_backends in extra_llm_api_options.yaml.
         """
         from ..distributed import AllReduce
 
@@ -2394,9 +2364,17 @@ class Linear(nn.Module):
             if model_attrs:
                 nvfp4_allowed_backends = model_attrs.get(
                     'nvfp4_gemm_allowed_backends')
+        if fp8_block_scaling_allowed_backends is None:
+            model_attrs = get_model_extra_attrs()
+            if model_attrs:
+                fp8_block_scaling_allowed_backends = model_attrs.get(
+                    'fp8_block_scaling_gemm_allowed_backends')
         # Default: exclude cutedsl for faster build time
         self.nvfp4_allowed_backends = nvfp4_allowed_backends or [
             'cutlass', 'cublaslt', 'cuda_core'
+        ]
+        self.fp8_block_scaling_allowed_backends = fp8_block_scaling_allowed_backends or [
+            'cutlass/trtllmgen', 'deepgemm'
         ]
 
         local_in_features = in_features
