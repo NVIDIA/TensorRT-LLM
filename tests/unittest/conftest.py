@@ -14,6 +14,7 @@
 # limitations under the License.
 # # Force resource release after test
 import os
+import signal
 import sys
 import traceback
 import warnings
@@ -33,13 +34,22 @@ from mpi4py.futures import MPIPoolExecutor
 from utils.cpp_paths import llm_root  # noqa: F401
 from utils.util import get_current_process_gpu_memory
 
+from tensorrt_llm._utils import print_all_stacks
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
+
+
+def dump_threads(signum, frame):
+    print_all_stacks()
 
 
 def pytest_configure(config):
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
+
+    # Dump all threads' stacks when SIGALRM is received
+    signal.signal(signal.SIGALRM, dump_threads)
 
 
 @pytest.hookimpl(wrapper=True)
