@@ -74,7 +74,7 @@ l0_b200:
   - unittest/_torch/debugger
   - unittest/_torch/executor
   - unittest/_torch/misc
-  - unittest/_torch/modules
+  - unittest/_torch/modules TIMEOUT (360)
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
   - unittest/_torch/speculative
