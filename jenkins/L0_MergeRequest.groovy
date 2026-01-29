@@ -356,6 +356,7 @@ def mergeWaiveList(pipeline, globalVars)
             throw e
         } catch (Exception e) {
             echo "Failed to checkout TOT waive list from internal GitLab repository. Error: ${e.toString()}"
+            
         }
     }
 
