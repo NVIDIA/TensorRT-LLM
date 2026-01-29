@@ -1148,6 +1148,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
 
 
 @register_auto_model(VilaConfig.model_architecture)
+@register_auto_model("LlavaLlamaForCausalLM")
 @register_input_processor(
     VilaInputProcessor,
     model_type="llava_llama",
@@ -1189,6 +1190,11 @@ class VilaModel(PreTrainedModel):
         self.llm.to(device=device, dtype=self.model_dtype)
 
         self.post_config()
+
+    @classmethod
+    def get_llmapi_defaults(cls) -> dict:
+        """Return model-specific LLM API defaults."""
+        return {"enable_chunked_prefill": False}
 
     @torch.inference_mode()
     def forward(
