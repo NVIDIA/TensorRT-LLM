@@ -124,10 +124,11 @@ def extract_transpose_xbc_prefill_autotuned(
     out = torch.empty(conv_dim, num_prefill_tokens, dtype=zxbcdt.dtype, device=zxbcdt.device)
     d_in_proj = zxbcdt.shape[1]
 
-    grid = lambda meta: (
-        triton.cdiv(num_prefill_tokens, meta["BLOCK_SEQ"]),
-        triton.cdiv(conv_dim, meta["BLOCK_CONV"]),
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(num_prefill_tokens, meta["BLOCK_SEQ"]),
+            triton.cdiv(conv_dim, meta["BLOCK_CONV"]),
+        )
 
     _extract_transpose_prefill_kernel_autotuned[grid](
         zxbcdt,

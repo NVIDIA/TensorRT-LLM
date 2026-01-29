@@ -144,22 +144,48 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
                 x, *reinterpret_cast<input_t(*)[kNElts]>(&x_vals_load[kNElts]), seqlen - chunk * kChunkSize);
         }
         x += kChunkSize;
+
+        // Optimization: Use warp shuffle for intra-warp neighbor exchange
+        // This reduces shared memory traffic by ~97% (only 4/128 threads need smem reads)
+        int const lane_id = tidx & 31;  // tidx % 32
+        vec_t my_high = reinterpret_cast<vec_t*>(x_vals_load)[1];
+
         __syncthreads();
         // Thread kNThreads - 1 don't write yet, so that thread 0 can read
         // the last elements of the previous chunk.
         if (tidx < kNThreads - 1)
         {
-            smem_exchange[tidx] = reinterpret_cast<vec_t*>(x_vals_load)[1];
+            smem_exchange[tidx] = my_high;
         }
         __syncthreads();
-        reinterpret_cast<vec_t*>(x_vals_load)[0] = smem_exchange[tidx > 0 ? tidx - 1 : kNThreads - 1];
+
+        // Get neighbor data: use warp shuffle for most threads, shared memory for warp boundaries
+        // IMPORTANT: All threads must participate in __shfl_up_sync to avoid hangs
+        vec_t neighbor;
+        uint32_t* my_p = reinterpret_cast<uint32_t*>(&my_high);
+        uint32_t* nbr_p = reinterpret_cast<uint32_t*>(&neighbor);
+
+        // All threads execute shuffle (required for sync semantics)
+        nbr_p[0] = __shfl_up_sync(0xFFFFFFFF, my_p[0], 1);
+        nbr_p[1] = __shfl_up_sync(0xFFFFFFFF, my_p[1], 1);
+        nbr_p[2] = __shfl_up_sync(0xFFFFFFFF, my_p[2], 1);
+        nbr_p[3] = __shfl_up_sync(0xFFFFFFFF, my_p[3], 1);
+
+        // Lane 0 of each warp must use shared memory (cross-warp boundary)
+        // For lane 0, the shuffle returns its own value, so we override it
+        if (lane_id == 0) {
+            neighbor = smem_exchange[tidx > 0 ? tidx - 1 : kNThreads - 1];
+        }
+        reinterpret_cast<vec_t*>(x_vals_load)[0] = neighbor;
+
         __syncthreads();
         // Now thread kNThreads - 1 can write the last elements of the current chunk.
         if (tidx == kNThreads - 1)
         {
-            smem_exchange[tidx] = reinterpret_cast<vec_t*>(x_vals_load)[1];
+            smem_exchange[tidx] = my_high;
         }
 
+        // Convert bf16 to fp32 for computation
         float x_vals[2 * kNElts];
 #pragma unroll
         for (int i = 0; i < 2 * kNElts; ++i)
@@ -167,16 +193,19 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
             x_vals[i] = float(x_vals_load[i]);
         }
 
+        // Optimization 2: Use explicit __fmaf_rn for better FMA instruction generation
         float out_vals[kNElts];
 #pragma unroll
         for (int i = 0; i < kNElts; ++i)
         {
-            out_vals[i] = bias_val;
+            float acc = bias_val;
 #pragma unroll
             for (int w = 0; w < kWidth; ++w)
             {
-                out_vals[i] += weight_vals[w] * x_vals[kNElts + i - (kWidth - w - 1)];
+                // Explicit FMA: acc = weight * x + acc
+                acc = __fmaf_rn(weight_vals[w], x_vals[kNElts + i - (kWidth - w - 1)], acc);
             }
+            out_vals[i] = acc;
         }
 
         if (params.silu_activation)
@@ -184,7 +213,10 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
 #pragma unroll
             for (int i = 0; i < kNElts; ++i)
             {
-                out_vals[i] = out_vals[i] / (1 + expf(-out_vals[i]));
+                // SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+                // Optimization: Use fast math intrinsics
+                // __expf: fast exp approximation, __frcp_rn: fast reciprocal with round-to-nearest
+                out_vals[i] = out_vals[i] * __frcp_rn(1.0f + __expf(-out_vals[i]));
             }
         }
 
