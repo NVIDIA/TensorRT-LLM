@@ -346,10 +346,9 @@ class CachedSequenceInterface:
 
     def _requires_token_estimate(self) -> bool:
         """Check if our kv_cache_config requires."""
-        return (
-            self._kv_cache_config_original.free_gpu_memory_fraction in [None, 0.0]
-            and self._kv_cache_config_original.max_tokens is None
-        )
+        needs_max_tokens = self._kv_cache_config_original.free_gpu_memory_fraction in [None, 0.0]
+        needs_max_tokens |= not (self._paged_cache_order)
+        return needs_max_tokens and self._kv_cache_config_original.max_tokens is None
 
     def needs_resize(self) -> bool:
         """Check if we need a resize or not."""

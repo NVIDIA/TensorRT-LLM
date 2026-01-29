@@ -20,7 +20,31 @@ from .attention_interface import (
     ResourceHandlerDict,
     UnpagedResourceHandler,
 )
-from .torch_attention import repeat_kv, update_kv_cache
+from .torch_attention import repeat_kv
+
+
+def _update_kv_cache(
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    seq_len: torch.Tensor,  # metadata
+    input_pos: torch.Tensor,  # metadata
+    cache_loc: torch.Tensor,
+    seq_start: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Reference implementation for update kv cache function. Assumes KV cache layout to be [B,S,N,D].
+    This function can be used to build reference attention implementations that use KV cache.
+    """
+
+    for idx in range(seq_len.shape[0]):
+        k_cache[cache_loc[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = key_states[
+            seq_start[idx] : seq_start[idx] + seq_len[idx], ...
+        ]
+        v_cache[cache_loc[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = (
+            value_states[seq_start[idx] : seq_start[idx] + seq_len[idx], ...]
+        )
 
 
 def _apply_logit_softcapping(attn_scores: torch.Tensor, logit_cap: Optional[float]) -> torch.Tensor:
@@ -134,7 +158,7 @@ def _torch_context_mha(
 ) -> None:
     """Context attention (multiple tokens, potentially multiple sequences) using existing torch functions."""
     # Update KV cache first using existing function
-    update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, cache_loc, seq_start)
+    _update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, cache_loc, seq_start)
 
     # Compute attention for each sequence
     attn_outputs = []
