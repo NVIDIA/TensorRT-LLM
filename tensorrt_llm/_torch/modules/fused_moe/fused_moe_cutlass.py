@@ -8,6 +8,7 @@ import torch
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm.logger import logger
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
@@ -539,6 +540,8 @@ class CutlassFusedMoE(MoE):
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
+            self.num_slots, token_selected_slots)
 
         if self.apply_router_weight_on_input:
             assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
