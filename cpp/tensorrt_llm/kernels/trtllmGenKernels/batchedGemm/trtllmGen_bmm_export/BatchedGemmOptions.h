@@ -310,7 +310,7 @@ inline bool checkAndUpdateBatchedGemmOptions(
         TLLM_CHECK_ERROR((options.mRouteSfsImpl.value() == RouteImpl::Ldgsts
                              || options.mRouteSfsImpl.value() == RouteImpl::LdgPlusSts)
                 && options.mRouteImpl == RouteImpl::Tma,
-            "RouteSfsImpl must be equal to RouteImpl, or Ldgsts/LdgPlusSts, when RouteImpl is Tma");
+            "RouteSfsImpl must be equal to RouteImpl, or Ldgsts/LdgPlusSts when RouteImpl is Tma");
     }
     else if (!options.mRouteSfsImpl.has_value())
     {
@@ -379,8 +379,6 @@ inline bool checkAndUpdateBatchedGemmOptions(
 
         if (doesRouteImplUseTma(options.mRouteSfsImpl.value()))
         {
-            TLLM_CHECK_ERROR(!batchM, "UTMALDG.GATHER4 only supported for batch N.");
-
             if (tg::mmaKindIsBlockFmt(options.mMmaKind))
             {
                 int const numEltsPerSfRoute = batchM ? options.mSfBlockSizeA : options.mSfBlockSizeB;
@@ -393,7 +391,7 @@ inline bool checkAndUpdateBatchedGemmOptions(
         if (!batchM || doesRouteImplUseNoRoute(options.mRouteImpl))
         {
             TLLM_CHECK_ERROR(options.mSfLayoutA == tg::SfLayout::R128c4,
-                "options.mSfLayoutA has to be tg::SfLayout::R128c4 when not being routed");
+                "options.mSfLayoutA has to be tg::SfLayout::R128c4 when not batch M or not routed");
         }
     }
 
@@ -420,12 +418,6 @@ inline bool checkAndUpdateBatchedGemmOptions(
     {
         TLLM_CHECK_ERROR(
             options.mK % options.mTileK == 0, "K must be a multiple of tileK when using Ldg based SF routing");
-    }
-
-    if (options.mClusterDimX > 1 && batchM && options.mRouteSfsImpl.has_value())
-    {
-        TLLM_CHECK_ERROR(options.mRouteSfsImpl.value() != RouteImpl::Tma,
-            "2CTA BatchedGemm does not support routing Sf along M dimension with TMA.");
     }
 
     // Check if all elements in mBatchedM or mBatchedN are the same (uniform tokens per batch) and
