@@ -942,6 +942,11 @@ class KVCacheManager(BaseResourceManager):
         result = self.impl.get_indexer_k_cache_pool_data(layer_idx)
         return result.view(result.shape[0], -1)
 
+    @property
+    def is_nvfp4_kv_cache(self) -> bool:
+        """Check if NVFP4 KV cache quantization is enabled."""
+        return self.dtype == DataType.NVFP4
+
     def check_invalid_values_in_kv_cache(self,
                                          fill_with_zero: bool = False) -> bool:
         some_checks_unavailable = False

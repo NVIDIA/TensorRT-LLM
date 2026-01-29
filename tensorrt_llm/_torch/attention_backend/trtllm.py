@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
+from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -24,6 +25,14 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams)
+
+# Enable TRTLLM-Gen attention backend via environment variable.
+# _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
+#     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
+_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = True
+
+if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
+    from .trtllm_gen import trtllm_gen_attention
 
 
 @dataclass(kw_only=True, init=False)
@@ -182,6 +191,10 @@ class TrtllmAttentionWrapper:
         kv_cache_block_offsets: Optional[torch.Tensor] = None,
         host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
         host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
+        kv_cache: Optional[
+            torch.
+            Tensor] = None,  # Actual KV cache tensor from kv_cache_manager.get_buffers()
+        is_nvfp4_kv_cache: bool = False,  # Whether NVFP4 KV cache is used
         block_ids_per_seq: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
         cache_indirection: Optional[torch.Tensor] = None,
@@ -283,6 +296,8 @@ class TrtllmAttentionWrapper:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
+        self.kv_cache = kv_cache  # Actual KV cache tensor
+        self.is_nvfp4_kv_cache = is_nvfp4_kv_cache
         self.workspace = workspace
         self.cache_indirection = cache_indirection
         self.kv_scale_orig_quant = kv_scale_orig_quant if kv_scales_sf_inv is None else kv_scales_sf_inv
@@ -493,86 +508,204 @@ class TrtllmAttentionWrapper:
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
-        thop.attention(
-            q,
-            k,
-            v,
-            output,
-            output_sf,
-            self.workspace,
-            self.sequence_length,
-            self.host_past_key_value_lengths,
-            self.host_total_kv_lens,
-            self.context_lengths,
-            self.host_context_lengths,
-            self.host_request_types,
-            self.kv_cache_block_offsets,
-            self.host_kv_cache_pool_pointers,
-            self.host_kv_cache_pool_mapping,
-            self.cache_indirection,
-            self.kv_scale_orig_quant,
-            self.kv_scale_quant_orig,
-            self.out_scale_sf if self.use_nvfp4_output else self.out_scale,
-            self.rotary_inv_freq,
-            self.rotary_cos_sin,
-            self.latent_cache,
-            self.q_pe,
-            self.block_ids_per_seq,
-            self.attention_sinks,
-            is_fused_qkv,
-            update_kv_cache,
-            self.predicted_tokens_per_seq,
-            self.layer_idx,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            self.tokens_per_block,
-            self.max_num_requests,
-            self.max_context_length,
-            self.attention_window_size,
-            self.sink_token_length,
-            self.beam_width,
-            int(mask_type),
-            self.quant_mode,
-            self.q_scaling,
-            self.position_embedding_type,
-            self.rotary_embedding_dim,
-            self.rotary_embedding_base,
-            self.rotary_embedding_scale_type,
-            rotary_embedding_scales,
-            rotary_embedding_max_position_info,
-            self.use_paged_context_fmha,
-            self.attention_input_type,
-            self.is_mla_enable,
-            self.chunked_prefill_buffer_batch_size,
-            self.q_lora_rank,
-            self.kv_lora_rank,
-            self.qk_nope_head_dim,
-            self.qk_rope_head_dim,
-            self.v_head_dim,
-            self.mrope_rotary_cos_sin,
-            self.mrope_position_deltas,
-            mla_tensor_params,
-            self.attention_chunk_size,
-            self.softmax_stats_tensor,
-            spec_decoding_bool_params,
-            spec_decoding_tensor_params,
-            self.sparse_kv_indices,
-            self.sparse_kv_offsets,
-            self.sparse_attn_indices,
-            self.sparse_attn_offsets,
-            self.sparse_attn_indices_block_size,
-            self.sparse_mla_topk,
-            self.skip_softmax_threshold_scale_factor_prefill,
-            self.skip_softmax_threshold_scale_factor_decode,
-            self.skip_softmax_stat,
-            cu_q_seqlens,
-            cu_kv_seqlens,
-            fmha_scheduler_counter,
-            mla_bmm1_scale,
-            mla_bmm2_scale,
-            quant_q_buffer,
-        )
+        out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
+
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and trtllm_gen.is_supported(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=q.dtype,
+                kv_cache_dtype=k.dtype if k is not None else
+            (v.dtype if v is not None else q.dtype),
+                out_dtype=output.dtype,
+                mask_type=int(mask_type),
+                has_alibi=(self.position_embedding_type == 4
+                           or self.position_embedding_type == 5),
+                is_padded=False,
+                use_paged_kv_cache=(self.kv_cache_block_offsets is not None),
+                tokens_per_block=self.tokens_per_block,
+                beam_width=self.beam_width,
+                position_shift_enabled=False,
+                sink_token_length=self.sink_token_length,
+                cross_attention=False,
+                cyclic_attention_window_size=self.attention_window_size,
+                max_attention_window_size=self.attention_window_size,
+                is_spec_decoding=spec_decoding_bool_params[0]
+                if spec_decoding_bool_params else False,
+                is_mla_enable=self.is_mla_enable,
+                is_fused_qkv=is_fused_qkv,
+                update_kv_cache=update_kv_cache,
+                has_rotary_inv_freq=(self.rotary_inv_freq is not None),
+                has_rotary_cos_sin=(self.rotary_cos_sin is not None),
+                has_kv_scale=(self.kv_scale_orig_quant is not None
+                              or self.kv_scale_quant_orig is not None),
+                has_cross_kv=False,
+                is_nvfp4_kv_cache=self.is_nvfp4_kv_cache,
+        )[0]:
+            trtllm_gen_attention(
+                q,
+                k,
+                v,
+                output,
+                output_sf,
+                self.workspace,
+                self.sequence_length,
+                self.host_past_key_value_lengths,
+                self.host_total_kv_lens,
+                self.context_lengths,
+                self.host_context_lengths,
+                self.host_request_types,
+                self.kv_cache_block_offsets,
+                self.host_kv_cache_pool_pointers,
+                self.host_kv_cache_pool_mapping,
+                self.
+                kv_cache,  # Actual KV cache tensor from kv_cache_manager.get_buffers()
+                self.is_nvfp4_kv_cache,
+                self.cache_indirection,
+                self.kv_scale_orig_quant,
+                self.kv_scale_quant_orig,
+                out_scale,
+                self.rotary_inv_freq,
+                self.rotary_cos_sin,
+                self.latent_cache,
+                self.q_pe,
+                self.block_ids_per_seq,
+                self.attention_sinks,
+                is_fused_qkv,
+                update_kv_cache,
+                self.predicted_tokens_per_seq,
+                self.layer_idx,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self.tokens_per_block,
+                self.max_num_requests,
+                self.max_context_length,
+                self.attention_window_size,
+                self.sink_token_length,
+                self.beam_width,
+                int(mask_type),
+                self.quant_mode,
+                self.q_scaling,
+                self.position_embedding_type,
+                self.rotary_embedding_dim,
+                self.rotary_embedding_base,
+                self.rotary_embedding_scale_type,
+                rotary_embedding_scales,
+                rotary_embedding_max_position_info,
+                self.use_paged_context_fmha,
+                self.attention_input_type,
+                self.is_mla_enable,
+                self.chunked_prefill_buffer_batch_size,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                self.v_head_dim,
+                self.mrope_rotary_cos_sin,
+                self.mrope_position_deltas,
+                mla_tensor_params,
+                self.attention_chunk_size,
+                self.softmax_stats_tensor,
+                spec_decoding_bool_params,
+                spec_decoding_tensor_params,
+                self.sparse_kv_indices,
+                self.sparse_kv_offsets,
+                self.sparse_attn_indices,
+                self.sparse_attn_offsets,
+                self.sparse_attn_indices_block_size,
+                self.sparse_mla_topk,
+                self.skip_softmax_threshold_scale_factor_prefill,
+                self.skip_softmax_threshold_scale_factor_decode,
+                self.skip_softmax_stat,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                quant_q_buffer,
+            )
+        else:
+            thop.attention(
+                q,
+                k,
+                v,
+                output,
+                output_sf,
+                self.workspace,
+                self.sequence_length,
+                self.host_past_key_value_lengths,
+                self.host_total_kv_lens,
+                self.context_lengths,
+                self.host_context_lengths,
+                self.host_request_types,
+                self.kv_cache_block_offsets,
+                self.host_kv_cache_pool_pointers,
+                self.host_kv_cache_pool_mapping,
+                self.cache_indirection,
+                self.kv_scale_orig_quant,
+                self.kv_scale_quant_orig,
+                out_scale,
+                self.rotary_inv_freq,
+                self.rotary_cos_sin,
+                self.latent_cache,
+                self.q_pe,
+                self.block_ids_per_seq,
+                self.attention_sinks,
+                is_fused_qkv,
+                update_kv_cache,
+                self.predicted_tokens_per_seq,
+                self.layer_idx,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self.tokens_per_block,
+                self.max_num_requests,
+                self.max_context_length,
+                self.attention_window_size,
+                self.sink_token_length,
+                self.beam_width,
+                int(mask_type),
+                self.quant_mode,
+                self.q_scaling,
+                self.position_embedding_type,
+                self.rotary_embedding_dim,
+                self.rotary_embedding_base,
+                self.rotary_embedding_scale_type,
+                rotary_embedding_scales,
+                rotary_embedding_max_position_info,
+                self.use_paged_context_fmha,
+                self.attention_input_type,
+                self.is_mla_enable,
+                self.chunked_prefill_buffer_batch_size,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                self.v_head_dim,
+                self.mrope_rotary_cos_sin,
+                self.mrope_position_deltas,
+                mla_tensor_params,
+                self.attention_chunk_size,
+                self.softmax_stats_tensor,
+                spec_decoding_bool_params,
+                spec_decoding_tensor_params,
+                self.sparse_kv_indices,
+                self.sparse_kv_offsets,
+                self.sparse_attn_indices,
+                self.sparse_attn_offsets,
+                self.sparse_attn_indices_block_size,
+                self.sparse_mla_topk,
+                self.skip_softmax_threshold_scale_factor_prefill,
+                self.skip_softmax_threshold_scale_factor_decode,
+                self.skip_softmax_stat,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                quant_q_buffer,
+            )
 
         if self.print_skip_softmax_stat:
             (total_blocks, skipped_blocks) = self.skip_softmax_stat
@@ -1686,6 +1819,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
 
+        is_nvfp4_kv_cache = False
+        kv_cache = None
+        if metadata.kv_cache_manager is not None:
+            is_nvfp4_kv_cache = metadata.kv_cache_manager.is_nvfp4_kv_cache
+            if not is_nvfp4_kv_cache:
+                kv_cache = metadata.kv_cache_manager.get_buffers(
+                    self.layer_idx, kv_layout="HND")
+
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -1705,6 +1846,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_cache_block_offsets=metadata.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
+            kv_cache=kv_cache,
+            is_nvfp4_kv_cache=is_nvfp4_kv_cache,
             block_ids_per_seq=metadata.block_ids_per_seq,
             # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
             workspace=metadata.workspace
