@@ -423,61 +423,10 @@ def trtllm_mha_with_cache(
     - No MLA
     - Causal attention mask
     """
-    # Debug tracking
-    if not hasattr(trtllm_mha_with_cache, "_debug_state"):
-        trtllm_mha_with_cache._debug_state = {
-            "printed_layers": set(),
-            "call_count": 0,
-            "prefill_calls": 0,
-            "decode_calls": 0,
-            "mixed_calls": 0,
-        }
-
-    debug_state = trtllm_mha_with_cache._debug_state
-    debug_state["call_count"] += 1
-
-    # Track call types
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-    if num_prefill > 0 and num_decode > 0:
-        debug_state["mixed_calls"] += 1
-    elif num_prefill > 0:
-        debug_state["prefill_calls"] += 1
-    else:
-        debug_state["decode_calls"] += 1
-
-    # Print debug info once per layer
-    if layer_idx not in debug_state["printed_layers"]:
-        print(
-            f"[DEBUG TRT-LLM AD] layer={layer_idx}, q.dtype={q.dtype}, "
-            f"k_cache.dtype={k_cache.dtype}, v_cache.dtype={v_cache.dtype}"
-        )
-        print(
-            f"[DEBUG TRT-LLM AD] num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
-            f"head_dim={head_dim}, tokens_per_block={tokens_per_block}"
-        )
-        print(f"[DEBUG TRT-LLM AD] k_cache.shape={k_cache.shape}, v_cache.shape={v_cache.shape}")
-        print(f"[DEBUG TRT-LLM AD] CUDA compute capability = {torch.cuda.get_device_capability(0)}")
-        debug_state["printed_layers"].add(layer_idx)
-
     # Get batch dimensions
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
-
-    # Print periodic stats (after num_seq is computed)
-    if debug_state["call_count"] % 100 == 0:
-        # Compute total context length for debugging
-        total_ctx_len = seq_len_with_cache_host[:num_seq].sum().item() if num_seq > 0 else 0
-        max_ctx_len = seq_len_with_cache_host[:num_seq].max().item() if num_seq > 0 else 0
-        total_pages = cu_num_pages_host[num_seq].item() if num_seq > 0 else 0
-        print(
-            f"[DEBUG TRT-LLM AD] calls={debug_state['call_count']}, "
-            f"prefill_only={debug_state['prefill_calls']}, "
-            f"decode_only={debug_state['decode_calls']}, "
-            f"mixed={debug_state['mixed_calls']}, "
-            f"num_seq={num_seq}, total_ctx={total_ctx_len}, "
-            f"max_ctx={max_ctx_len}, total_pages={total_pages}"
-        )
 
     # Reshape inputs to TRT-LLM expected format: [num_tokens, hidden_dim]
     q_shape_og = q.shape
@@ -599,42 +548,6 @@ def trtllm_mha_with_cache(
         spec_decoding_tensor_params.extend([None, None, None])
 
     mla_tensor_params = [None, None]
-
-    # DEBUG: Validate block offsets before attention call
-    # NOTE: Skip during CUDA graph capture since .item() requires sync
-    import os
-
-    is_capturing = torch.cuda.is_current_stream_capturing()
-    # Always print for first call to debug tensor shapes (call_count is already 1 after increment)
-    if debug_state["call_count"] == 1 and not is_capturing:
-        pool_ptrs_shape = (
-            host_kv_cache_pool_pointers.shape if host_kv_cache_pool_pointers is not None else None
-        )
-        pool_map_shape = (
-            host_kv_cache_pool_mapping.shape if host_kv_cache_pool_mapping is not None else None
-        )
-        print(
-            f"[DEBUG TRT-LLM AD SHAPES] layer={layer_idx}, "
-            f"block_offsets.shape={kv_cache_block_offsets.shape}, "
-            f"pool_ptrs.shape={pool_ptrs_shape}, "
-            f"pool_mapping.shape={pool_map_shape}, "
-            f"sequence_length.shape={sequence_length.shape}, "
-            f"context_lengths.shape={context_lengths.shape}, "
-            f"host_request_types.shape={host_request_types.shape}"
-        )
-    if (
-        os.environ.get("TRTLLM_AD_DEBUG_ATTN", "0") == "1"
-        and debug_state["call_count"] % 100 == 0
-        and not is_capturing
-    ):
-        max_block_idx = kv_cache_block_offsets.max().item()
-        print(
-            f"[DEBUG TRT-LLM AD] layer={layer_idx}, "
-            f"block_offsets.shape={kv_cache_block_offsets.shape}, "
-            f"max_block_idx={max_block_idx}, "
-            f"k_cache.shape={k_cache.shape}, "
-            f"pool_ptrs={host_kv_cache_pool_pointers.tolist() if host_kv_cache_pool_pointers is not None else None}"
-        )
 
     try:
         thop.attention(

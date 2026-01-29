@@ -885,33 +885,6 @@ class PTCacheBackend(CacheBackend):
             block_offsets[:, :num_seq, :, :].zero_()  # Shape: [num_pools, num_seq, 2, max_blocks]
             return
 
-        # DEBUG: Track statistics for diagnosing 2k OSL issue
-        if not hasattr(self, "_fill_call_count"):
-            self._fill_call_count = 0
-            self._last_logged_pages = 0
-        self._fill_call_count += 1
-
-        # Log every 100 calls or when total_pages changes significantly
-        pages_per_seq_avg = total_pages / num_seq if num_seq > 0 else 0
-        should_log = self._fill_call_count % 100 == 0 or total_pages > self._last_logged_pages + 100
-        if should_log:
-            # Get max cache_loc value for bounds checking debug
-            cache_loc_slice = cache_loc[:total_pages]
-            max_cache_loc = cache_loc_slice.max().item() if total_pages > 0 else 0
-            # Also log host tensor values for CUDA graph debugging
-            max_seq_len = (
-                self._host_past_key_value_lengths[:num_seq].max().item() if num_seq > 0 else 0
-            )
-            total_kv_lens = self._host_total_kv_lens.tolist()
-            ad_logger.info(
-                f"[PTCacheBackend DEBUG] call={self._fill_call_count}, num_seq={num_seq}, "
-                f"total_pages={total_pages}, pages_per_seq_avg={pages_per_seq_avg:.1f}, "
-                f"max_blocks={max_blocks}, num_pages_pool={self._num_pages}, "
-                f"max_cache_loc={max_cache_loc}, max_past_kv_len={max_seq_len}, "
-                f"total_kv_lens={total_kv_lens}"
-            )
-            self._last_logged_pages = total_pages
-
         # Zero only the sequences we're updating
         # Shape: [num_pools, num_seq, 2, max_blocks]
         block_offsets[:, :num_seq, :, :].zero_()
