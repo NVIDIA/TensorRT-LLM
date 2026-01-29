@@ -1738,22 +1738,35 @@ inline bool checkAndUpdateGemmOptions(
     {
         bool const isBlockA = options.mLayoutA == MatrixLayout::BlockMajorK;
 
-        // Block K size must be 128B.
-        // TODO Leaving this as an option for now in case we want to expertiment with other block sizes
-        // As the user is not expected to set this, do not fail if updateOptions is false
+        int32_t const padMultiplier = (isBlockA) ? padMultiplierA : padMultiplierB;
         int32_t const elemSizeInBits
             = (isBlockA) ? tg::dtypeGetNumBits(options.mDtypeA) : tg::dtypeGetNumBits(options.mDtypeB);
         int32_t const elemsIn128B = 128 * 8 /* Bits in byte */ / elemSizeInBits;
 
-        if (options.mBlockK != elemsIn128B)
+        // Number of non-zero elements in the k dimension.
+        int32_t const nzTileK = options.mTileK >> static_cast<int32_t>(isBlockA && isSparseA);
+        // Number of 128B SMEM slices per tile.
+        int32_t const smemSlicesPerTile = padMultiplier * nzTileK / elemsIn128B;
+
+        if (smemSlicesPerTile > 2)
         {
-            if (updateOptions)
+            if (options.mBlockK != elemsIn128B / padMultiplier)
             {
-                options.mBlockK = elemsIn128B;
+                // This is to prevent a bug when the TMA box width is truncated to 128B (after padding)
+                // and multiple TMA instructions are loading multiple non-contiguous slices each.
+                // E.g. TMA #0 loads slices (0,2), TMA #1 loads slices (1,3)
+                TLLM_LOG_WARNING("TileK=", options.mTileK, " with ", padMultiplier, "x padding spans across ",
+                    smemSlicesPerTile, " 128B SMEM slices. Setting blockK to ", elemsIn128B / padMultiplier);
+                GEMM_UPDATE_OR_ERROR(options.mBlockK, elemsIn128B / padMultiplier);
             }
-            else
+        }
+        else
+        {
+            // The larger blockK (128B vs 64B) is generally 1-2% more performant.
+            if (options.mBlockK != elemsIn128B && options.mBlockK != elemsIn128B / padMultiplier)
             {
-                return false;
+                TLLM_LOG_WARNING("Setting blockK to ", elemsIn128B);
+                GEMM_UPDATE_OR_ERROR(options.mBlockK, elemsIn128B);
             }
         }
 
