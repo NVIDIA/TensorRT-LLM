@@ -344,7 +344,6 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        self.block_reuse_enabled = True if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse else False
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
 
@@ -355,7 +354,7 @@ class PyExecutor:
         self.expected_num_active_requests = 0
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
-            should_store_blocks=self.block_reuse_enabled
+            should_store_blocks=self.enable_kv_cache_reuse
             and not self.kv_cache_manager.is_vswa)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
@@ -1096,7 +1095,7 @@ class PyExecutor:
             raise RuntimeError(
                 "No context cache transmission is in progress, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
             )
-        if self.block_reuse_enabled and self._disagg_pp_termination_handler is not None:
+        if self.enable_kv_cache_reuse and self._disagg_pp_termination_handler is not None:
             raise RuntimeError(
                 "Cannot terminate requests in cache transmission and release their KV cache resources when block reuse is enabled. Please consider increasing the KV cache size."
             )
@@ -2073,6 +2072,8 @@ class PyExecutor:
         num_scheduled_tokens = sum(
             [len(req.get_tokens(0))
              for req in context_requests]) + num_scheduled_generation_requests
+        # Note: We use tp_allgather instead of tp_cp_allgather because we want to
+        # balance the requests across DP ranks; not CP ranks within those DP ranks.
         responses_list = self.dist.tp_allgather([
             num_scheduled_context_requests, num_scheduled_generation_requests,
             num_scheduled_tokens
@@ -2801,7 +2802,7 @@ class PyExecutor:
                                 logger.debug(
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
-                if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
+                if self.enable_kv_cache_reuse and not self.kv_cache_manager.is_vswa:
                     requests_to_terminate.append(request)
                 else:
                     if not request.is_disagg_context_transmission_state:
