@@ -75,6 +75,7 @@ class AttentionConfig:
     max_num_requests: int = 256
     max_context_length: int = 8192
     attention_window_size: int = -1  # -1 means unlimited
+    is_nvfp4_kv_cache: bool = False
 
     # Data types
     dtype: torch.dtype = torch.float16
@@ -183,6 +184,10 @@ class TrtllmGenSupportChecker:
     @classmethod
     def check_dtypes(cls, config: AttentionConfig) -> Tuple[bool, str]:
         """Check if data types are supported."""
+
+        if config.is_nvfp4_kv_cache:
+            return False, "NVFP4 KV cache is not supported by flashinfer trtllm-gen kernels."
+
         if config.dtype not in cls.SUPPORTED_INPUT_DTYPES:
             return (
                 False,
@@ -1191,6 +1196,7 @@ def is_supported(
     has_rotary_cos_sin: bool = False,
     has_kv_scale: bool = False,
     has_cross_kv: bool = False,
+    is_nvfp4_kv_cache: bool = False,
     phase: str = "both",
 ) -> Tuple[bool, str]:
     """
@@ -1250,6 +1256,7 @@ def is_supported(
         is_mla_enable=is_mla_enable,
         is_fused_qkv=is_fused_qkv,
         update_kv_cache=update_kv_cache,
+        is_nvfp4_kv_cache=is_nvfp4_kv_cache,
     )
 
     return TrtllmGenSupportChecker.is_supported(config, phase)
