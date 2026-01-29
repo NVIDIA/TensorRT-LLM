@@ -17,6 +17,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 @pytest.fixture(scope="function")
 def enforce_single_worker(monkeypatch):
+    breakpoint()
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
 
@@ -38,7 +39,7 @@ def test_dynamic_spec_decode(enforce_single_worker,
     max_batch_size = 1
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(batch_sizes=[1])
+    cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2], enable_padding=True)
 
     llm_common_config = dict(
         model=target_model_dir,
@@ -73,6 +74,12 @@ def test_dynamic_spec_decode(enforce_single_worker,
     # Mock should_use_spec_decode to turn on/off spec decode dynamically.
     def mock_should_use_spec_decode(requests, max_batch_size, max_num_tokens,
                                     max_total_draft_tokens):
+        print(
+            f"mock_should_use_spec_decode called with requests: {requests}, max_batch_size: {max_batch_size}, max_num_tokens: {max_num_tokens}, max_total_draft_tokens: {max_total_draft_tokens}"
+        )
+        print(
+            f"mock_should_use_spec_decode.call_count: {mock_should_use_spec_decode.call_count}"
+        )
         for req in requests:
             if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 continue
@@ -101,6 +108,112 @@ def test_dynamic_spec_decode(enforce_single_worker,
     with patch(
             'tensorrt_llm._torch.speculative.model_drafter.ModelDrafter.should_use_spec_decode',
             mock_should_use_spec_decode):
+        results_spec = llm_spec.generate(prompts, sampling_params)
+    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.shutdown()
+
+    llm_ref = LLM(**llm_common_config)
+    results_ref = llm_ref.generate(prompts, sampling_params)
+    generated_text_ref = [result.outputs[0].text for result in results_ref]
+    llm_ref.shutdown()
+
+    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
+        # The spec decode algorithm currently guarantees identical results
+        assert text_spec == text_ref
+
+
+@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
+@pytest.mark.high_cuda_memory
+def test_dynamic_spec_decode_one_model(enforce_single_worker,
+                                       disable_overlap_scheduler: bool):
+    # For one-model path, we mock get_draft_len_for_batch_size to dynamically
+    # change the effective draft length, since one-model doesn't use should_use_spec_decode.
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    eagle_model_dir = f"{models_path}/Qwen3/qwen3_8b_eagle3"
+    target_model_dir = f"{models_path}/Qwen3/Qwen3-8B"
+
+    max_draft_len = 4
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True, max_tokens=8192)
+    max_batch_size = 2
+    cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2])
+
+    llm_common_config = dict(
+        model=target_model_dir,
+        attn_backend="TRTLLM",
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_seq_len=8192,
+    )
+
+    # Enable draft_len_schedule to activate the dynamic draft length path
+    spec_config = EagleDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model=eagle_model_dir,
+        # Qwen3 supports one model eagle.
+        eagle3_one_model=True,
+        # Enable draft_len_schedule so that get_draft_len_for_batch_size is called
+        draft_len_schedule={1: max_draft_len},
+    )
+
+    breakpoint()  # BREAKPOINT 1: Before LLM init
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+    breakpoint()  # BREAKPOINT 2: After LLM init, before patch
+
+    # Output tests
+    prompts = [
+        "The president of the United States is",
+    ]
+    sampling_params = SamplingParams(max_tokens=20, temperature=0)
+
+    # Mock get_draft_len_for_batch_size to turn on/off spec decode dynamically.
+    # For one-model path, effective_draft_len controls whether drafting happens.
+    # When effective_draft_len == 0, skip_drafting() is called.
+    def mock_get_draft_len_for_batch_size(draft_len_schedule, batch_size,
+                                          max_total_draft_tokens):
+        breakpoint()
+        # mock_get_draft_len_for_batch_size.call_count += 1
+        # Turn spec decoding on/off alternately.
+        # When call_count % 4 is 0 or 1, spec decoding is on (return max_draft_len).
+        # When call_count % 4 is 2 or 3, spec decoding is off (return 0).
+        # By doing this, we can cover all the cases of dynamic spec decoding.
+        # 1. Using spec decoding in iteration i, then using spec decoding in iteration i+1.
+        # 2. Using spec decoding in iteration i, then not using spec decoding in iteration i+1.
+        # 3. Not using spec decoding in iteration i, then using spec decoding in iteration i+1.
+        # 4. Not using spec decoding in iteration i, then not using spec decoding in iteration i+1.
+        if mock_get_draft_len_for_batch_size.call_count % 4 < 2:
+            return max_draft_len
+        else:
+            return 0
+
+    # Create a Mock object with the mock function as side_effect
+    mock_get_draft_len_for_batch_size = Mock(
+        side_effect=mock_get_draft_len_for_batch_size)
+    # Reset mock state before using it
+    mock_get_draft_len_for_batch_size.reset_mock()
+    mock_get_draft_len_for_batch_size.call_count = 0
+
+    # Debug: check the module and function before/after patch
+    import sys
+
+    import tensorrt_llm._torch.pyexecutor.model_engine as me_module
+    print(
+        f"DEBUG TEST: Before patch, model_engine.get_draft_len_for_batch_size = {me_module.get_draft_len_for_batch_size}",
+        file=sys.stderr,
+        flush=True)
+
+    with patch(
+            'tensorrt_llm._torch.pyexecutor.model_engine.get_draft_len_for_batch_size',
+            mock_get_draft_len_for_batch_size):
+        print(
+            f"DEBUG TEST: Inside patch, model_engine.get_draft_len_for_batch_size = {me_module.get_draft_len_for_batch_size}",
+            file=sys.stderr,
+            flush=True)
         results_spec = llm_spec.generate(prompts, sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()

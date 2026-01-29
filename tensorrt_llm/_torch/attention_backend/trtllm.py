@@ -628,6 +628,7 @@ class TrtllmAttentionWrapper:
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
+    kv_lens_runtime_buffer: Optional[torch.Tensor] = None
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -757,16 +758,36 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                         pin_memory=True)
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
+        if self.kv_lens_runtime_buffer is None:
+            self.kv_lens_runtime_buffer = torch.empty_like(self.kv_lens,
+                                                           device='cpu',
+                                                           pin_memory=True)
 
-        # For debugging, can use it to call the wrapper's plan function
-        if self.workspace is None:
+        # For debugging, can use it to call the wrapper's plan function.
+        # For CUDA graphs, allocate a dedicated workspace to avoid sharing
+        # with eager metadata (which may resize and change pointers).
+        if self.is_cuda_graph:
+            self.workspace = torch.empty(
+                (0, ),
+                device='cuda',
+                dtype=torch.int8,
+            )
+        elif self.workspace is None:
             self.workspace = torch.empty(
                 (0, ),
                 device='cuda',
                 dtype=torch.int8,
             )
 
-        if self.cuda_graph_workspace is None:
+        # For CUDA graphs, ensure each graph metadata gets a dedicated workspace
+        # tensor to avoid pointer churn across different graph keys.
+        if self.is_cuda_graph:
+            self.cuda_graph_workspace = torch.empty(
+                (0, ),
+                device='cuda',
+                dtype=torch.int8,
+            )
+        elif self.cuda_graph_workspace is None:
             self.cuda_graph_workspace = torch.empty(
                 (0, ),
                 device='cuda',
@@ -991,7 +1012,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Don't use self.kv_lens here because it includes extra tokens.
         # Use actual KV length (without extra tokens) for kv_lens_runtime,
         # which becomes host_past_key_value_lengths and eventually mMaxSeqLenKv.
-        self.kv_lens_runtime = kv_lens[:self.num_seqs]
+        self.kv_lens_runtime_buffer[:self.num_seqs].copy_(
+            kv_lens[:self.num_seqs])
+        # Keep a stable buffer; only expose a view for the active batch.
+        self.kv_lens_runtime = self.kv_lens_runtime_buffer[:self.num_seqs]
         self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
         self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self.host_request_types_runtime = self.host_request_types[:self.

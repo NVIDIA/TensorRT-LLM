@@ -476,6 +476,11 @@ class KVCacheManager(BaseResourceManager):
                                 req, block_ids)
 
             for req in generation_batch:
+                # Skip CUDA graph dummy requests - they have pre-allocated KV cache
+                # from warmup and should not have tokens added during runtime reuse.
+                # Adding tokens would exhaust their minimal KV cache allocation.
+                if getattr(req, 'is_cuda_graph_dummy', False):
+                    continue
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
                     decode_block_id = (req.py_decoding_iter -

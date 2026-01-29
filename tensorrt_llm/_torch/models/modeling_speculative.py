@@ -972,6 +972,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
+<<<<<<< HEAD
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -980,6 +981,44 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
+=======
+        # Debug logging (skip during CUDA graph capture)
+        if not torch.cuda.is_current_stream_capturing():
+            print(f"\n[SPEC_DEC_MODEL] forward: START")
+            print(
+                f"  input_ids shape: {input_ids.shape if input_ids is not None else 'None'}"
+            )
+            if spec_metadata:
+                print(
+                    f"  spec_metadata.runtime_draft_len: {spec_metadata.runtime_draft_len if hasattr(spec_metadata, 'runtime_draft_len') else 'N/A'}"
+                )
+                if hasattr(spec_metadata, 'draft_tokens'
+                           ) and spec_metadata.draft_tokens is not None:
+                    print(
+                        f"  spec_metadata.draft_tokens.shape: {spec_metadata.draft_tokens.shape}"
+                    )
+            print(f"[SPEC_DEC_MODEL] Calling self.model() (decoder)")
+
+        try:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
+            if not torch.cuda.is_current_stream_capturing():
+                print(
+                    f"[SPEC_DEC_MODEL] self.model() completed, hidden_states shape: {hidden_states.shape}"
+                )
+        except Exception as e:
+            if not torch.cuda.is_current_stream_capturing():
+                print(f"[SPEC_DEC_MODEL] self.model() FAILED - {e}")
+                print(f"  ❌ Error in decoder model forward")
+            raise
+
+>>>>>>> dee364869 (Add debugging lines. Fix overlap scheduler and cuda graph replay error.)
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
@@ -989,12 +1028,29 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.draft_model is not None:
             # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            if not torch.cuda.is_current_stream_capturing():
+                print(f"[SPEC_DEC_MODEL] Getting logits via logits_processor")
+                print(
+                    f"  gather_ids shape: {spec_metadata.gather_ids.shape if spec_metadata and hasattr(spec_metadata, 'gather_ids') else 'N/A'}"
+                )
+
+            try:
+                logits = self.logits_processor.forward(
+                    hidden_states[spec_metadata.gather_ids],
+                    self.lm_head,
+                    attn_metadata,
+                    True,
+                )
+                if not torch.cuda.is_current_stream_capturing():
+                    print(
+                        f"[SPEC_DEC_MODEL] logits_processor completed, logits shape: {logits.shape}"
+                    )
+            except Exception as e:
+                if not torch.cuda.is_current_stream_capturing():
+                    print(f"[SPEC_DEC_MODEL] logits_processor FAILED - {e}")
+                    print(f"  ❌ Error in logits processing")
+                raise
+
             mtp_input_ids = input_ids
             mtp_position_ids = position_ids
             if attn_metadata.padded_num_tokens is not None:
@@ -1007,13 +1063,32 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                                     num_tokens]
 
             # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=mtp_input_ids,
-                                    position_ids=mtp_position_ids,
-                                    hidden_states=hidden_states,
-                                    logits=logits,
-                                    attn_metadata=attn_metadata,
-                                    spec_metadata=spec_metadata,
-                                    draft_model=self.draft_model)
+            if not torch.cuda.is_current_stream_capturing():
+                print(f"[SPEC_DEC_MODEL] Calling spec_worker")
+                print(
+                    f"  mtp_input_ids shape: {mtp_input_ids.shape if mtp_input_ids is not None else 'None'}"
+                )
+                print(
+                    f"  runtime_draft_len: {spec_metadata.runtime_draft_len if hasattr(spec_metadata, 'runtime_draft_len') else 'N/A'}"
+                )
+
+            try:
+                result = self.spec_worker(input_ids=mtp_input_ids,
+                                          position_ids=mtp_position_ids,
+                                          hidden_states=hidden_states,
+                                          logits=logits,
+                                          attn_metadata=attn_metadata,
+                                          spec_metadata=spec_metadata,
+                                          draft_model=self.draft_model)
+                if not torch.cuda.is_current_stream_capturing():
+                    print(
+                        f"[SPEC_DEC_MODEL] spec_worker completed successfully")
+                return result
+            except Exception as e:
+                if not torch.cuda.is_current_stream_capturing():
+                    print(f"[SPEC_DEC_MODEL] spec_worker FAILED - {e}")
+                    print(f"  ❌ Error in spec_worker (MTP/Eagle3)")
+                raise
         else:
             logits = self.logits_processor.forward(
                 hidden_states,

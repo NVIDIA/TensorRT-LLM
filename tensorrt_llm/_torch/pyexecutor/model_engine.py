@@ -53,7 +53,7 @@ from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import (Eagle3OneModelSpecMetadata,
                                   Eagle3ResourceManager, Eagle3SpecMetadata)
 from ..speculative.mtp import SampleStateTensorsMTP
-from ..speculative.utils import SpecDecodingTensor
+from ..speculative.utils import SpecDecodingTensor, get_draft_len_for_batch_size
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
@@ -124,7 +124,6 @@ def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                 )
                 result.append(max_cuda_graph_bs)
             break
-
     return result
 
 
@@ -370,6 +369,8 @@ class PyTorchModelEngine(ModelEngine):
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
                                            self._cuda_graph_batch_sizes else 0)
+        self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping(
+        )
 
         self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
                                                        dtype=torch.int,
@@ -437,6 +438,7 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             spec_config=self.spec_config,
             cuda_graph_mem_pool=self._cuda_graph_mem_pool,
+            dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
             max_num_tokens=self.max_num_tokens,
             use_mrope=self.use_mrope,
             original_max_draft_len=self.original_max_draft_len,
@@ -484,9 +486,28 @@ class PyTorchModelEngine(ModelEngine):
         else:
             return 2
 
-    @property
-    def runtime_draft_len(self):
-        return self.max_total_draft_tokens if self.enable_spec_decode else 0
+    def _get_runtime_draft_len(self,
+                               spec_metadata: Optional[SpecMetadata]) -> int:
+        """
+        Get the ACTUAL draft length at runtime for the current batch.
+
+        With dynamic draft length (draft_len_schedule), this varies per batch:
+        - Small batch (e.g., size=1): might use 4 draft tokens
+        - Large batch (e.g., size=8): might use 0 draft tokens (speculation disabled)
+
+        Without dynamic draft length: returns max_total_draft_tokens (constant maximum capacity)
+
+        Args:
+            spec_metadata: Metadata containing runtime_draft_len (if dynamic draft enabled)
+
+        Returns:
+            The actual draft length for this batch at runtime
+        """
+        if (spec_metadata is not None
+                and hasattr(spec_metadata, 'runtime_draft_len')
+                and spec_metadata.runtime_draft_len is not None):
+            return spec_metadata.runtime_draft_len
+        return self.max_total_draft_tokens
 
     def set_lora_model_config(self,
                               lora_target_modules: list[str],
@@ -644,8 +665,8 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         # The lifetime of model engine and kv cache manager can be different.
-        # Reset the global cuda graph dummy request to None in warmup.
-        self.cuda_graph_runner.padding_dummy_request = None
+        # Reset the global cuda graph dummy requests in warmup.
+        self.cuda_graph_runner.padding_dummy_requests = {}
 
         if self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config.get("cp_type", None)
@@ -654,10 +675,16 @@ class PyTorchModelEngine(ModelEngine):
             )
             return
 
+        # breakpoint()
+        print(f"[MODEL_ENGINE] warmup: entering _run_torch_compile_warmup")
         self._run_torch_compile_warmup(resource_manager)
+        # breakpoint()
+        print(f"[MODEL_ENGINE] warmup: entering _run_autotuner_warmup")
         self._run_autotuner_warmup(resource_manager)
+        # breakpoint()
+        print(f"[MODEL_ENGINE] warmup: entering _run_cuda_graph_warmup")
         self._run_cuda_graph_warmup(resource_manager)
-
+        print(f"[MODEL_ENGINE] warmup: exiting")
         # Set the value back to the original value after all warmups are complete
         self.enable_spec_decode = self.is_spec_decode
 
@@ -672,7 +699,7 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size * (self.max_seq_len - 1))
         max_batch_size = min(
             self.batch_size,
-            curr_max_num_tokens // (1 + self.runtime_draft_len))
+            curr_max_num_tokens // (1 + self.max_total_draft_tokens))
 
         warmup_requests_configs = {
             (1, 1),  # Specialize for 1 token.
@@ -757,14 +784,125 @@ class PyTorchModelEngine(ModelEngine):
         )
         AutoTuner.get().print_profiling_cache()
 
+    def _compute_dynamic_draft_len_mapping(self) -> dict:
+        """Compute graph_bs → draft_len mapping for dynamic draft length feature.
+
+        Example: draft_len_schedule = {4:4, 8:2, 32:1}, cuda_graph_batch_sizes = [1,2,3,4,5,6,7,8,16,24,32,64]
+        - Batch sizes 1-4:   use draft_len=4 (up to key 4)
+        - Batch sizes 5-8:   use draft_len=2 (up to key 8)
+        - Batch sizes 9-32:  use draft_len=1 (up to key 32)
+        - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled)
+
+        Returns: {1:4, 2:4, 3:4, 4:4, 5:2, 6:2, 7:2, 8:2, 16:1, 24:1, 32:1, 64:0}
+        """
+        # Dynamic draft length for CUDA graphs is only supported for one-model path
+        if (not self.spec_config
+                or not hasattr(self.spec_config, 'draft_len_schedule')
+                or not self.spec_config.draft_len_schedule or
+                not self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
+            return None
+
+        schedule = self.spec_config.draft_len_schedule
+        schedule_keys = list(schedule.keys())
+
+        mapping = {}
+        key_idx = 0
+        for graph_bs in self._cuda_graph_batch_sizes:
+            while key_idx < len(
+                    schedule_keys) and schedule_keys[key_idx] < graph_bs:
+                key_idx += 1
+            if key_idx < len(schedule_keys):
+                draft_len = schedule[schedule_keys[key_idx]]
+            else:
+                draft_len = 0
+            mapping[graph_bs] = draft_len
+        # breakpoint()
+        return mapping
+
+    def _graphs_for_dynamic_draft_length(self) -> list:
+        """Convert the dynamic draft_len mapping to list of (batch_size, draft_len) pairs."""
+        if not self._dynamic_draft_len_mapping:
+            return []
+        return [
+            (graph_bs, draft_len)
+            for graph_bs, draft_len in self._dynamic_draft_len_mapping.items()
+        ]
+
+    def _get_graphs_to_capture(
+        self, cuda_graph_batch_sizes: list[int],
+        spec_resource_manager: Optional[BaseResourceManager]
+    ) -> list[tuple[int, int]]:
+        """Determine which (batch_size, draft_len) graphs to capture.
+
+        Returns:
+            List of (batch_size, draft_len) tuples for CUDA graph capture.
+        """
+        # Case 1: Draft model (two-model speculative decoding)
+        if self.is_draft_model:
+            draft_len = self._get_draft_model_draft_len(spec_resource_manager)
+            return [(bs, draft_len) for bs in cuda_graph_batch_sizes]
+
+        # Case 2: One-model with dynamic draft length
+        if self.spec_config is not None and self.spec_config.draft_len_schedule is not None and self.spec_config.spec_dec_mode.support_dynamic_draft_len(
+        ):
+            graphs = self._graphs_for_dynamic_draft_length()
+            logger.info(f"Dynamic draft length enabled for one-model path. "
+                        f"Capturing {len(graphs)} graphs: {graphs}")
+            return graphs
+
+        # Case 3: Target model (two-model) or one-model without dynamic draft
+        return self._get_target_model_graphs(cuda_graph_batch_sizes)
+
+    def _get_draft_model_draft_len(
+            self, spec_resource_manager: Optional[BaseResourceManager]) -> int:
+        """Get draft_len for draft model CUDA graphs."""
+        # CDL (Chain Drafter Loop) path: need original draft tokens for loop iterations
+        is_cdl_eagle3 = (self.model_is_wrapped
+                         and self.is_spec_decode and isinstance(
+                             spec_resource_manager, Eagle3ResourceManager))
+        if is_cdl_eagle3:
+            return self.original_max_total_draft_tokens
+        # Non-CDL: draft model is called iteratively, doesn't receive draft tokens
+        return self.max_total_draft_tokens  # This is 0 for draft models
+
+    def _get_target_model_graphs(
+            self, cuda_graph_batch_sizes: list[int]) -> list[tuple[int, int]]:
+        """Get graphs for target model (two-model) or one-model without dynamic draft."""
+        graphs = []
+
+        # For two-model path: also capture draft_len=0 for runtime spec decode disable
+        # TODO: remove two-model path dynamic speculation support
+        should_capture_no_spec = (
+            self.max_total_draft_tokens > 0
+            and not self.spec_config.spec_dec_mode.use_one_engine()
+            # Assume speculation is always on if no max_concurrency set (saves memory)
+            and self.spec_config.max_concurrency is not None)
+        if should_capture_no_spec:
+            graphs.extend([(bs, 0) for bs in cuda_graph_batch_sizes])
+
+        # Always capture with max_total_draft_tokens
+        graphs.extend([(bs, self.max_total_draft_tokens)
+                       for bs in cuda_graph_batch_sizes])
+        return graphs
+
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Captures CUDA graphs for various batch sizes and draft lengths."""
+
         if not (self.cuda_graph_runner.enabled
                 or self._torch_compile_piecewise_cuda_graph):
             return
-
+        # breakpoint()
+        print(
+            f"[MODEL_ENGINE] _run_cuda_graph_warmup: entering _capture_generation_cuda_graphs"
+        )
         self._capture_generation_cuda_graphs(resource_manager)
+        # breakpoint()
+        print(
+            f"[MODEL_ENGINE] _run_cuda_graph_warmup: entering _capture_piecewise_cuda_graphs"
+        )
         self._capture_piecewise_cuda_graphs(resource_manager)
+        # breakpoint()
+        print(f"[MODEL_ENGINE] _run_cuda_graph_warmup: exiting")
 
     def _capture_generation_cuda_graphs(self,
                                         resource_manager: ResourceManager):
@@ -781,28 +919,10 @@ class PyTorchModelEngine(ModelEngine):
         # Reverse order so smaller graphs can reuse memory from larger ones
         cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                         reverse=True)
-        # Create CUDA graphs for different draft lengths
-        draft_lengths = []
-        if self.is_draft_model:
-            if self.model_is_wrapped and self.is_spec_decode and spec_resource_manager is not None and isinstance(
-                    spec_resource_manager, Eagle3ResourceManager):
-                # The CDL path uses draft_len > 0 for the number of iterations in the drafting loop.
-                draft_lengths.append(self.original_max_total_draft_tokens)
-            else:
-                draft_lengths.append(self.max_total_draft_tokens)
-        else:
-            draft_lengths.append(self.max_total_draft_tokens)
-            # For non-draft model, we also capture the CUDA graph instance for draft length 0,
-            # so that when we disable spec decode at runtime, we can still run the captured graph.
-            # Note that for one engine mode, we are not able to turn off spec decode at runtime.
-            if (self.max_total_draft_tokens > 0
-                    and not self.spec_config.spec_dec_mode.use_one_engine()
-                    # Assume that speculation is always on if the user didn't give us a max_concurrency
-                    # value. This will save on memory.
-                    and self.spec_config.max_concurrency is not None):
-                draft_lengths.append(0)
-        # Reverse order so smaller graphs can reuse memory from larger ones
-        draft_lengths = sorted(set(draft_lengths), reverse=True)
+        # Determine which graphs to capture
+        graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes,
+                                                        spec_resource_manager)
+        graphs_to_capture = sorted(graphs_to_capture, reverse=True)
 
         # Create CUDA graphs for short and long sequences separately for sparse attention.
         sparse_config = self.sparse_attention_config
@@ -820,32 +940,37 @@ class PyTorchModelEngine(ModelEngine):
         else:
             max_seq_len_list = [self.max_seq_len]
 
-        for bs in cuda_graph_batch_sizes:
+        for bs, draft_len in graphs_to_capture:
             if bs > self.batch_size:
                 continue
 
-            for draft_len in draft_lengths:
-                for max_seq_len in max_seq_len_list:
-                    warmup_request = self._create_cuda_graph_warmup_request(
-                        resource_manager, bs, draft_len, max_seq_len)
-                    with self._release_batch_context(warmup_request,
-                                                     resource_manager) as batch:
-                        if batch is None:
-                            # No KV cache space, cannot continue capturing graphs
-                            continue
+            for max_seq_len in max_seq_len_list:
+                warmup_request = self._create_cuda_graph_warmup_request(
+                    resource_manager, bs, draft_len, max_seq_len)
+                with self._release_batch_context(warmup_request,
+                                                 resource_manager) as batch:
+                    if batch is None:
+                        # No KV cache space, cannot continue capturing graphs
+                        continue
 
-                        logger.info(
-                            f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
-                        )
+                    logger.info(
+                        f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
+                    )
+                    # breakpoint()
+                    enable_dynamic_draft_len = (
+                        self.spec_config is not None
+                        and self.spec_config.draft_len_schedule is not None
+                        and self.spec_config.spec_dec_mode.
+                        support_dynamic_draft_len())
+                    # dynamic draft length may have draft_len == 0 when batch size is larger than the max batch size, so we need to check enable_dynamic_draft_len
+                    self.enable_spec_decode = draft_len > 0 or self.is_draft_model or enable_dynamic_draft_len
+                    self._update_draft_inference_state_for_warmup(
+                        batch, draft_len > 0, resource_manager)
 
-                        self.enable_spec_decode = draft_len > 0 or self.is_draft_model
-                        self._update_draft_inference_state_for_warmup(
-                            batch, draft_len > 0, resource_manager)
-
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
-                        torch.cuda.synchronize()
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
+                    torch.cuda.synchronize()
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -945,7 +1070,7 @@ class PyTorchModelEngine(ModelEngine):
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
 
         available_tokens = kv_cache_manager.get_num_available_tokens(
-            self.runtime_draft_len)
+            self.max_total_draft_tokens)
         available_blocks = kv_cache_manager.get_num_free_blocks()
         if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
             return None
@@ -954,7 +1079,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if num_gen_requests > self.batch_size:
             return None
-        num_gen_tokens = num_gen_requests * (1 + self.runtime_draft_len)
+        num_gen_tokens = num_gen_requests * (1 + self.max_total_draft_tokens)
         if num_gen_tokens > self.max_num_tokens:
             return None
 
@@ -1010,7 +1135,7 @@ class PyTorchModelEngine(ModelEngine):
                 list(range(num_ctx_requests)),
                 token_nums=ctx_token_nums,
                 is_gen=False,
-                max_num_draft_tokens=self.runtime_draft_len,
+                max_num_draft_tokens=self.max_total_draft_tokens,
                 use_mrope=self.use_mrope,
                 num_extra_decoding_steps=num_extra_decoding_steps)
 
@@ -1315,6 +1440,30 @@ class PyTorchModelEngine(ModelEngine):
         """
         Make some changes to the device inputs and avoid block the async data transfer
         """
+        # Skip prints during CUDA graph capture
+        if not torch.cuda.is_current_stream_capturing():
+            print(f"\n[MODEL_ENGINE] _preprocess_inputs: START")
+            print(
+                f"  input_ids shape: {inputs.get('input_ids', torch.tensor([])).shape if 'input_ids' in inputs else 'N/A'}"
+            )
+            if 'draft_tokens' in inputs and inputs['draft_tokens'] is not None:
+                print(f"  draft_tokens shape: {inputs['draft_tokens'].shape}")
+                print(f"  draft_tokens[:10]: {inputs['draft_tokens'][:10]}")
+            if 'spec_metadata' in inputs and inputs['spec_metadata'] is not None:
+                spec_md = inputs['spec_metadata']
+                if hasattr(spec_md, 'runtime_draft_len'):
+                    print(
+                        f"  spec_metadata.runtime_draft_len: {spec_md.runtime_draft_len}"
+                    )
+                if hasattr(spec_md,
+                           'draft_tokens') and spec_md.draft_tokens is not None:
+                    print(
+                        f"  spec_metadata.draft_tokens shape: {spec_md.draft_tokens.shape}"
+                    )
+                    print(
+                        f"  spec_metadata.draft_tokens[:10]: {spec_md.draft_tokens[:10]}"
+                    )
+
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_total_draft_tokens. But we need to use
@@ -1331,10 +1480,41 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
+
+                if not torch.cuda.is_current_stream_capturing():
+                    print(f"  [PREPROCESS] Updating position_ids and kv_lens:")
+                    print(
+                        f"    num_seqs={num_seqs}, num_ctx_requests={num_ctx_requests}, num_gen_requests={num_gen_requests}"
+                    )
+                    print(
+                        f"    num_ctx_tokens={num_ctx_tokens}, num_chunked_ctx_requests={num_chunked_ctx_requests}"
+                    )
+                    print(f"    previous_batch_tokens={previous_batch_tokens}")
+                    print(
+                        f"    input_ids.shape[0]={inputs['input_ids'].shape[0]}"
+                    )
+
                 inputs['position_ids'][0, num_ctx_tokens:] += (
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+
+                if not torch.cuda.is_current_stream_capturing():
+                    print(f"  [PREPROCESS] ✓ position_ids updated successfully")
+
                 if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
+                    if not torch.cuda.is_current_stream_capturing():
+                        print(f"  [PREPROCESS] About to update kv_lens_cuda:")
+                        print(
+                            f"    kv_lens_cuda shape: {inputs['attn_metadata'].kv_lens_cuda.shape}"
+                        )
+
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
+                        if not torch.cuda.is_current_stream_capturing():
+                            print(
+                                f"    Branch: chunked context (num_chunked_ctx_requests > 0)"
+                            )
+                            print(
+                                f"    Updating slice [{num_ctx_requests - num_chunked_ctx_requests}:{num_ctx_requests}]"
+                            )
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
                         inputs['attn_metadata'].kv_lens_cuda[
                             num_ctx_requests -
@@ -1344,15 +1524,56 @@ class PyTorchModelEngine(ModelEngine):
                                                               num_chunked_ctx_requests]
                             )
                     else:
+                        if not torch.cuda.is_current_stream_capturing():
+                            print(f"    Branch: normal generation")
+                            print(
+                                f"    Updating slice [{num_ctx_requests}:{num_seqs}]"
+                            )
+                            print(
+                                f"    Using offsets [:num_gen_requests={num_gen_requests}]"
+                            )
                         inputs['attn_metadata'].kv_lens_cuda[
                             num_ctx_requests:num_seqs] += (
                                 self.
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
+
+                    if not torch.cuda.is_current_stream_capturing():
+                        print(
+                            f"  [PREPROCESS] ✓ kv_lens_cuda updated, now calling on_update_kv_lens()"
+                        )
+
                     inputs['attn_metadata'].on_update_kv_lens()
+
+                    if not torch.cuda.is_current_stream_capturing():
+                        print(
+                            f"  [PREPROCESS] ✓ on_update_kv_lens() completed successfully"
+                        )
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
+
+        # Skip prints during CUDA graph capture
+        if not torch.cuda.is_current_stream_capturing():
+            print(
+                f"[MODEL_ENGINE] _preprocess_inputs: COMPLETE, returning inputs"
+            )
+            print(
+                f"  input_ids shape: {inputs.get('input_ids', torch.tensor([])).shape if 'input_ids' in inputs else 'N/A'}"
+            )
+            if 'draft_tokens' in inputs and inputs['draft_tokens'] is not None:
+                print(f"  draft_tokens shape: {inputs['draft_tokens'].shape}")
+                print(f"  draft_tokens[:10]: {inputs['draft_tokens'][:10]}")
+            if 'spec_metadata' in inputs and inputs['spec_metadata'] is not None:
+                spec_md = inputs['spec_metadata']
+                if hasattr(spec_md,
+                           'draft_tokens') and spec_md.draft_tokens is not None:
+                    print(
+                        f"  spec_metadata.draft_tokens shape: {spec_md.draft_tokens.shape}"
+                    )
+                    print(
+                        f"  spec_metadata.draft_tokens[:10]: {spec_md.draft_tokens[:10]}"
+                    )
 
         return inputs
 
@@ -1395,6 +1616,46 @@ class PyTorchModelEngine(ModelEngine):
         if self.enable_attention_dp:
             return list(self.dist.tp_allgather(attn_metadata.num_tokens))
         return None
+
+    def _set_runtime_draft_len(self,
+                               spec_metadata: Optional[SpecMetadata],
+                               runtime_draft_len: Optional[int] = None) -> None:
+        if spec_metadata is None or runtime_draft_len is None:
+            return
+        spec_metadata.runtime_draft_len = runtime_draft_len
+
+    def _adjust_draft_tokens_for_dynamic_draft_length(
+            self, scheduled_requests: ScheduledRequests,
+            target_draft_len: int) -> None:
+        """
+        Truncate or pad draft tokens in scheduled_requests to match the target draft length.
+        This is for CUDA graph compatibility for draft length transition in dynamic draft length feature.
+        """
+        PADDING_TOKEN = 0
+
+        print(
+            f"\n[MODEL_ENGINE] _adjust_draft_tokens_for_dynamic_draft_length:")
+        print(f"  target_draft_len (runtime_draft_len): {target_draft_len}")
+
+        for i, request in enumerate(scheduled_requests.generation_requests):
+            current_draft_len = len(request.py_draft_tokens)
+            print(
+                f"  Request {i}: current_draft_len={current_draft_len}, py_draft_tokens={request.py_draft_tokens[:min(8, current_draft_len)] if current_draft_len > 0 else []}"
+            )
+
+            if current_draft_len < target_draft_len:
+                padding_needed = target_draft_len - current_draft_len
+                request.py_draft_tokens.extend([PADDING_TOKEN] * padding_needed)
+                print(f"    → Padded to {len(request.py_draft_tokens)}")
+
+            elif current_draft_len > target_draft_len:
+                request.py_draft_tokens = request.py_draft_tokens[:
+                                                                  target_draft_len]
+                print(
+                    f"    → Truncated to {len(request.py_draft_tokens)}: {request.py_draft_tokens}"
+                )
+            else:
+                print(f"    → No change needed")
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
@@ -1775,8 +2036,11 @@ class PyTorchModelEngine(ModelEngine):
         self.previous_kv_lens_offsets_cuda.mul_(0)
 
         # Prepare input_ids
+        # CRITICAL: Only extract the needed tokens based on num_tokens_per_extend_request
+        # new_tokens_device shape: [batch, 1 + max_draft_len]
+        # We need: [previous_batch, num_tokens_per_extend_request]
         new_tokens = new_tokens_device.transpose(
-            0, 1)[previous_slots, :].flatten()
+            0, 1)[previous_slots, :num_tokens_per_extend_request].flatten()
         self.input_ids_cuda[:total_num_tokens].copy_(new_tokens,
                                                      non_blocking=True)
 
@@ -1880,7 +2144,13 @@ class PyTorchModelEngine(ModelEngine):
         prompt_lengths = prompt_lengths.tolist()
         num_cached_tokens_per_seq = num_cached_tokens_per_seq.tolist()
 
-        previous_batch_draft_tokens = num_extend_reqeust_wo_dummy * self.runtime_draft_len
+        # CRITICAL: Use actual draft length for this batch (not maximum capacity)
+        # KEY BUG FIX: Was using max_total_draft_tokens (capacity=4) instead of runtime_draft_len (actual=0)
+        runtime_draft_len = self._get_runtime_draft_len(spec_metadata)
+        previous_batch_draft_tokens = num_extend_reqeust_wo_dummy * runtime_draft_len
+        print(
+            f"  previous_batch_draft_tokens: {previous_batch_draft_tokens} (using runtime_draft_len={runtime_draft_len})"
+        )
 
         self._update_target_input_tensors(
             num_accepted_tokens_device=num_accepted_tokens_device,
@@ -1897,8 +2167,26 @@ class PyTorchModelEngine(ModelEngine):
         num_generation_tokens = num_extend_requests * num_tokens_per_extend_request
         if spec_metadata is not None:
             total_draft_lens = self.max_total_draft_tokens * num_extend_requests
+            print(
+                f"\n[MODEL_ENGINE] _apply_incremental_update_target: Setting spec_metadata.draft_tokens"
+            )
+            print(f"  num_extend_requests: {num_extend_requests}")
+            print(f"  max_total_draft_tokens: {self.max_total_draft_tokens}")
+            print(f"  total_draft_lens: {total_draft_lens}")
+            print(
+                f"  spec_metadata.runtime_draft_len: {spec_metadata.runtime_draft_len if hasattr(spec_metadata, 'runtime_draft_len') else 'N/A'}"
+            )
+            print(
+                f"  draft_tokens_cuda[:total_draft_lens] shape: {self.draft_tokens_cuda[:total_draft_lens].shape}"
+            )
+            print(
+                f"  draft_tokens_cuda[:total_draft_lens] values: {self.draft_tokens_cuda[:total_draft_lens]}"
+            )
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
+            print(
+                f"  ❌ MISMATCH: runtime_draft_len={spec_metadata.runtime_draft_len if hasattr(spec_metadata, 'runtime_draft_len') else 'N/A'} but draft_tokens.shape={spec_metadata.draft_tokens.shape}"
+            )
             spec_metadata.gather_ids = self.gather_ids_cuda[:total_num_tokens]
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:
                                                                                           num_extend_requests]
@@ -1977,6 +2265,19 @@ class PyTorchModelEngine(ModelEngine):
                 assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+
+                print(f"\n[MODEL_ENGINE] Extracted from new_tensors_device:")
+                print(f"  new_tokens_lens_device: {new_tokens_lens_device}")
+                if next_draft_tokens_device is not None:
+                    print(
+                        f"  next_draft_tokens_device shape: {next_draft_tokens_device.shape}"
+                    )
+                    print(
+                        f"  next_draft_tokens_device all zeros: {(next_draft_tokens_device == 0).all()}"
+                    )
+                    print(
+                        f"  next_draft_tokens_device values: {next_draft_tokens_device}"
+                    )
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
@@ -2156,6 +2457,13 @@ class PyTorchModelEngine(ModelEngine):
                     draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
                 num_draft_tokens = get_draft_token_length(request)
+                # For dynamic draft length: use runtime_draft_len if available (overrides request's draft tokens)
+                # This ensures consistency when draft length changes dynamically
+                if spec_metadata is not None and hasattr(
+                        spec_metadata, 'runtime_draft_len'
+                ) and spec_metadata.runtime_draft_len is not None:
+                    num_draft_tokens = min(num_draft_tokens,
+                                           spec_metadata.runtime_draft_len)
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
@@ -2168,10 +2476,12 @@ class PyTorchModelEngine(ModelEngine):
 
                 sequence_lengths.append(1 + num_draft_tokens)
                 num_accepted_draft_tokens.append(num_draft_tokens)
+                # Note: num_draft_tokens was potentially overridden by runtime_draft_len (line 2296)
+                # So it respects dynamic draft length even for requests without previous batch
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
-                              len(position_ids) + 1 + self.runtime_draft_len)))
+                              len(position_ids) + 1 + num_draft_tokens)))
                 # For the target model + tree decoding
                 if not self.is_draft_model and not spec_config.is_linear_tree:
                     assert spec_tree_manager is not None
@@ -2195,17 +2505,22 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_idx = request.py_batch_idx
                 request.py_batch_idx = request.py_seq_slot
                 # inputs
-                # overlap scheduler can only support the speculative decoding
-                # methods with a fixed number of draft tokens
-                sequence_lengths.append(1 + self.runtime_draft_len)
+                # CRITICAL: Use actual draft length for THIS batch, not maximum capacity!
+                # - runtime_draft_len: actual runtime value (e.g., 0, 2, 4) for current batch
+                # - max_total_draft_tokens: maximum capacity (e.g., 4) for buffer sizing only
+                # With dynamic draft length, runtime_draft_len can be less than max_total_draft_tokens
+                runtime_draft_len = self._get_runtime_draft_len(spec_metadata)
+
+                sequence_lengths.append(1 + runtime_draft_len)
                 num_accepted_draft_tokens.append(
                     request.py_num_accepted_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
-                draft_lens.append(self.runtime_draft_len)
+
+                draft_lens.append(runtime_draft_len)
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
-                              len(position_ids) + 1 + self.runtime_draft_len)))
+                              len(position_ids) + 1 + runtime_draft_len)))
                 # For the target model + tree decoding
                 if not self.is_draft_model and not spec_config.is_linear_tree:
                     assert spec_tree_manager is not None
@@ -2217,20 +2532,19 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     position_ids.extend(
                         list(
-                            range(
-                                past_seen_token_num, past_seen_token_num + 1 +
-                                self.runtime_draft_len)))
+                            range(past_seen_token_num,
+                                  past_seen_token_num + 1 + runtime_draft_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
-                                            (1 + self.runtime_draft_len))
+                                            (1 + runtime_draft_len))
 
                 num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 self.runtime_draft_len + 1)
+                                                 runtime_draft_len + 1)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
-                    prompt_lengths.append(1 + self.runtime_draft_len)
+                    prompt_lengths.append(1 + runtime_draft_len)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
@@ -2514,29 +2828,81 @@ class PyTorchModelEngine(ModelEngine):
                     draft_request_indices_buffer_cuda[:
                                                       num_first_draft]] = accepted_tokens
         if next_draft_tokens_device is not None:
+            # CRITICAL: Use actual draft length for this batch (not maximum capacity)
+            # With dynamic draft length, runtime_draft_len (e.g., 0) can differ from max_total_draft_tokens (e.g., 4)
+            # We must use runtime_draft_len for all per-batch operations to avoid memory mismatch
+            runtime_draft_len = self._get_runtime_draft_len(spec_metadata)
+
+            print(
+                f"\n[MODEL_ENGINE] Line 2579: Entering next_draft_tokens_device block"
+            )
+            print(f"  previous_batch_len: {previous_batch_len}")
+            print(
+                f"  runtime_draft_len (actual for this batch): {runtime_draft_len}"
+            )
+            print(
+                f"  max_total_draft_tokens (max capacity): {self.max_total_draft_tokens}"
+            )
+            if spec_metadata is not None and hasattr(spec_metadata,
+                                                     'runtime_draft_len'):
+                print(
+                    f"  spec_metadata.runtime_draft_len: {spec_metadata.runtime_draft_len}"
+                )
+            else:
+                print(f"  spec_metadata.runtime_draft_len: NOT AVAILABLE")
+
             # Initialize these two values to zeros
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
 
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
+                print(f"  previous_slots: {previous_slots}")
+
                 # previous input ids
-                previous_batch_tokens = previous_batch_len * (
-                    1 + self.runtime_draft_len)
+                previous_batch_tokens = previous_batch_len * (1 +
+                                                              runtime_draft_len)
+                # CRITICAL: Only slice the needed tokens (1 + runtime_draft_len per request)
+                # new_tokens_device shape: [batch, 1 + max_draft_len]
+                # We need: [previous_batch_len, 1 + runtime_draft_len]
                 new_tokens = new_tokens_device.transpose(
-                    0, 1)[previous_slots, :].flatten()
+                    0, 1)[previous_slots, :(1 + runtime_draft_len)].flatten()
+                print(
+                    f"  new_tokens shape before copy: {new_tokens.shape} (expected: {previous_batch_tokens})"
+                )
                 self.input_ids_cuda[num_tokens:num_tokens +
                                     previous_batch_tokens].copy_(
                                         new_tokens, non_blocking=True)
+
                 # previous draft tokens
-                previous_batch_draft_tokens = previous_batch_len * self.runtime_draft_len
-                self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
-                                       previous_batch_draft_tokens].copy_(
-                                           next_draft_tokens_device[
-                                               previous_slots, :].flatten(),
-                                           non_blocking=True)
+                previous_batch_draft_tokens = previous_batch_len * runtime_draft_len
+                print(f"  About to copy draft tokens:")
+                print(
+                    f"    previous_batch_draft_tokens: {previous_batch_draft_tokens} (using runtime_draft_len={runtime_draft_len})"
+                )
+                print(
+                    f"    Destination slice: [{num_draft_tokens}:{num_draft_tokens + previous_batch_draft_tokens}]"
+                )
+                print(
+                    f"    Source shape: next_draft_tokens_device[{previous_slots}, :{runtime_draft_len}] = {next_draft_tokens_device[previous_slots, :runtime_draft_len].shape}"
+                )
+                if runtime_draft_len > 0:
+                    print(
+                        f"    Source content sample: {next_draft_tokens_device[previous_slots, :min(4, runtime_draft_len)]}"
+                    )
+
+                if runtime_draft_len > 0:
+                    self.draft_tokens_cuda[
+                        num_draft_tokens:num_draft_tokens +
+                        previous_batch_draft_tokens].copy_(
+                            next_draft_tokens_device[
+                                previous_slots, :runtime_draft_len].flatten(),
+                            non_blocking=True)
+                print(
+                    f"  Copy completed successfully (copied {previous_batch_draft_tokens} tokens)"
+                )
                 # prepare data for the preprocess inputs
-                kv_len_offsets_device = new_tokens_lens_device - self.runtime_draft_len - 1
+                kv_len_offsets_device = new_tokens_lens_device - runtime_draft_len - 1
                 previous_pos_indices_host = torch.tensor(previous_pos_indices,
                                                          dtype=torch.int,
                                                          pin_memory=True)
@@ -2561,8 +2927,8 @@ class PyTorchModelEngine(ModelEngine):
                     extend_dummy_requests)
                 self.previous_pos_id_offsets_cuda[
                     (num_extend_reqeust_wo_dummy - previous_batch_len) *
-                    (1 + self.runtime_draft_len):num_extend_reqeust_wo_dummy *
-                    (1 + self.runtime_draft_len)].copy_(
+                    (1 + runtime_draft_len):num_extend_reqeust_wo_dummy *
+                    (1 + runtime_draft_len)].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
                             0:previous_batch_tokens]],
                         non_blocking=True)
@@ -2744,8 +3110,31 @@ class PyTorchModelEngine(ModelEngine):
 
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
+            print(
+                f"\n[MODEL_ENGINE] _prepare_tp_inputs (main path): Setting spec_metadata.draft_tokens"
+            )
+            print(f"  draft_lens list: {draft_lens}")
+            print(f"  total_draft_lens: {total_draft_lens}")
+            print(
+                f"  spec_metadata.runtime_draft_len: {spec_metadata.runtime_draft_len if hasattr(spec_metadata, 'runtime_draft_len') else 'N/A'}"
+            )
+            print(
+                f"  draft_tokens_cuda[:total_draft_lens].shape: {self.draft_tokens_cuda[:total_draft_lens].shape}"
+            )
+            if total_draft_lens > 0 and total_draft_lens <= 10:
+                print(
+                    f"  draft_tokens_cuda[:total_draft_lens] values: {self.draft_tokens_cuda[:total_draft_lens]}"
+                )
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
+            if hasattr(spec_metadata, 'runtime_draft_len'
+                       ) and spec_metadata.runtime_draft_len is not None:
+                expected_draft_lens = spec_metadata.runtime_draft_len * len(
+                    scheduled_requests.generation_requests)
+                if expected_draft_lens != total_draft_lens:
+                    print(
+                        f"  ❌ MISMATCH: runtime_draft_len={spec_metadata.runtime_draft_len} * {len(scheduled_requests.generation_requests)} requests = {expected_draft_lens} expected, but total_draft_lens={total_draft_lens}"
+                    )
             spec_metadata.request_ids = request_ids
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             spec_metadata.num_generations = len(
@@ -2759,6 +3148,7 @@ class PyTorchModelEngine(ModelEngine):
             if isinstance(spec_metadata, Eagle3OneModelSpecMetadata):
                 spec_metadata.populate_sampling_params_for_one_model(
                     scheduled_requests.all_requests())
+
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -2794,6 +3184,15 @@ class PyTorchModelEngine(ModelEngine):
                 for request in scheduled_requests.generation_requests
             ]
             self.has_previous_device_draft = next_draft_tokens_device is not None
+
+        print(
+            f"\n[MODEL_ENGINE] _prepare_tp_inputs completed, returning inputs")
+        print(
+            f"  input_ids total length: {len(self.input_ids_cuda) if hasattr(self, 'input_ids_cuda') else 'N/A'}"
+        )
+        print(
+            f"  draft_tokens total length: {len(self.draft_tokens_cuda) if hasattr(self, 'draft_tokens_cuda') else 'N/A'}"
+        )
 
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
@@ -3385,9 +3784,27 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     return self._forward_step(inputs, gather_ids,
                                               gather_context_logits)
+        # Truncate or pad draft tokens to match the target draft length for CUDA graph compatibility for dynamic draft length feature.
+        if (self.spec_config is not None
+                and hasattr(self.spec_config, 'draft_len_schedule')
+                and self.spec_config.draft_len_schedule is not None
+                and self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
+            runtime_draft_len = get_draft_len_for_batch_size(
+                self.spec_config.draft_len_schedule,
+                scheduled_requests.batch_size, self.max_total_draft_tokens)
+
+            # Adjust draft tokens to match the target draft length for CUDA graph compatibility
+            self._adjust_draft_tokens_for_dynamic_draft_length(
+                scheduled_requests, runtime_draft_len)
+        else:
+            # No dynamic draft length: use maximum capacity as the actual runtime value
+            runtime_draft_len = self.max_total_draft_tokens
+
+        # breakpoint()
+
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager,
-                self.runtime_draft_len) as padded_requests:
+                runtime_draft_len) as padded_requests:
 
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
@@ -3400,29 +3817,109 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager=spec_resource_manager,
             )
             can_run_graph = key is not None
+            print(f"\n[MODEL_ENGINE] forward: CUDA graph decision")
+            print(f"  key: {key}")
+            print(f"  can_run_graph: {can_run_graph}")
+
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
+                print(f"  → Using CUDA graph with key={key}")
             else:
                 attn_metadata = self.attn_metadata
                 if self.enable_spec_decode:
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
-            inputs, gather_ids = self._prepare_inputs(
-                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
-                new_tensors_device, cache_indirection_buffer,
-                num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager, can_run_graph)
+                print(f"  → Eager execution (no graph available)")
+
+            if self.spec_config and self.spec_config.spec_dec_mode.support_dynamic_draft_len(
+            ):
+                print(
+                    f"\n[MODEL_ENGINE] forward: Setting runtime_draft_len={runtime_draft_len}"
+                )
+                self._set_runtime_draft_len(spec_metadata, runtime_draft_len)
+                if spec_metadata and hasattr(spec_metadata,
+                                             'runtime_draft_len'):
+                    print(
+                        f"[MODEL_ENGINE] forward: spec_metadata.runtime_draft_len = {spec_metadata.runtime_draft_len}"
+                    )
+
+            if not torch.cuda.is_current_stream_capturing():
+                print(f"\n[MODEL_ENGINE] forward: Calling _prepare_inputs")
+                print(
+                    f"  padded_requests.batch_size: {padded_requests.batch_size}"
+                )
+                print(
+                    f"  attn_metadata.num_seqs: {attn_metadata.num_seqs if hasattr(attn_metadata, 'num_seqs') else 'N/A'}"
+                )
+
+            try:
+                inputs, gather_ids = self._prepare_inputs(
+                    padded_requests, kv_cache_manager, attn_metadata,
+                    spec_metadata, new_tensors_device, cache_indirection_buffer,
+                    num_accepted_tokens_device, req_id_to_old_request,
+                    resource_manager)
+            except Exception as e:
+                if not torch.cuda.is_current_stream_capturing():
+                    print(f"[MODEL_ENGINE] forward: ❌ _prepare_inputs FAILED")
+                    print(f"  Exception: {e}")
+                    import traceback
+                    traceback.print_exc()
+                raise
+
+            if not torch.cuda.is_current_stream_capturing():
+                print(f"[MODEL_ENGINE] forward: _prepare_inputs returned")
+                print(f"  inputs keys: {inputs.keys()}")
+                print(
+                    f"  input_ids shape: {inputs.get('input_ids', torch.tensor([])).shape if 'input_ids' in inputs else 'N/A'}"
+                )
+                if 'draft_tokens' in inputs and inputs[
+                        'draft_tokens'] is not None:
+                    print(
+                        f"  draft_tokens shape: {inputs['draft_tokens'].shape}")
+                    print(f"  draft_tokens[:10]: {inputs['draft_tokens'][:10]}")
+                if 'spec_metadata' in inputs and inputs[
+                        'spec_metadata'] is not None:
+                    spec_md = inputs['spec_metadata']
+                    if hasattr(spec_md, 'runtime_draft_len'):
+                        print(
+                            f"  spec_metadata.runtime_draft_len: {spec_md.runtime_draft_len}"
+                        )
+                    if hasattr(spec_md, 'draft_tokens'
+                               ) and spec_md.draft_tokens is not None:
+                        print(
+                            f"  spec_metadata.draft_tokens shape: {spec_md.draft_tokens.shape}"
+                        )
+                        print(
+                            f"  spec_metadata.draft_tokens[:10]: {spec_md.draft_tokens[:10]}"
+                        )
+                if 'attn_metadata' in inputs and inputs[
+                        'attn_metadata'] is not None:
+                    attn_md = inputs['attn_metadata']
+                    print(
+                        f"  attn_metadata.num_seqs: {attn_md.num_seqs if hasattr(attn_md, 'num_seqs') else 'N/A'}"
+                    )
+                    print(
+                        f"  attn_metadata.num_tokens: {attn_md.num_tokens if hasattr(attn_md, 'num_tokens') else 'N/A'}"
+                    )
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
+                    # breakpoint()
                     # Fallback to eager execution if graph was not used
+                    print(
+                        f"\n[MODEL_ENGINE] forward: Executing eager mode (no CUDA graph)"
+                    )
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self._forward_step(inputs, gather_ids,
                                                      gather_context_logits)
                 else:
+                    # breakpoint()
                     if self.cuda_graph_runner.needs_capture(key):
+                        print(
+                            f"\n[MODEL_ENGINE] forward: Need to capture CUDA graph for key={key}"
+                        )
 
                         def capture_forward_fn(inputs: Dict[str, Any]):
                             with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -3441,12 +3938,38 @@ class PyTorchModelEngine(ModelEngine):
                             enable_spec_decode=self.enable_spec_decode,
                             postprocess_fn=capture_postprocess_fn)
 
+                        print(
+                            f"[MODEL_ENGINE] forward: Graph captured, now replaying for key={key}"
+                        )
                         # here we don't need to use context since cuda graph capture didn't run kernel.
                         # maybe we need a cleaner way to do this.
                         outputs = self.cuda_graph_runner.replay(key, inputs)
+                        print(
+                            f"[MODEL_ENGINE] forward: ✓ Graph replay completed successfully"
+                        )
                     else:
-                        with MoeLoadBalancerIterContext(moe_load_balancer):
-                            outputs = self.cuda_graph_runner.replay(key, inputs)
+                        # breakpoint()
+                        print(
+                            f"\n[MODEL_ENGINE] forward: Replaying existing CUDA graph for key={key}"
+                        )
+                        print(f"  About to call cuda_graph_runner.replay()")
+                        try:
+                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                                outputs = self.cuda_graph_runner.replay(
+                                    key, inputs)
+                            print(
+                                f"[MODEL_ENGINE] forward: ✓ Graph replay completed successfully"
+                            )
+                        except Exception as e:
+                            print(
+                                f"[MODEL_ENGINE] forward: ❌ Graph replay FAILED"
+                            )
+                            print(f"  key={key}")
+                            print(f"  Exception: {e}")
+                            print(f"  🔴 THE BUG IS IN CUDA GRAPH REPLAY!")
+                            import traceback
+                            traceback.print_exc()
+                            raise
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
@@ -3456,6 +3979,30 @@ class PyTorchModelEngine(ModelEngine):
             return outputs
 
     def model_forward(self, **kwargs):
+        # Debug: Log what we're passing to model.forward (skip during capture)
+        if not torch.cuda.is_current_stream_capturing():
+            print(
+                f"\n[MODEL_ENGINE] model_forward: ENTRY to self.model.forward()"
+            )
+            print(f"  Model type: {type(self.model).__name__}")
+            if 'input_ids' in kwargs:
+                print(f"  input_ids shape: {kwargs['input_ids'].shape}")
+            if 'spec_metadata' in kwargs and kwargs['spec_metadata'] is not None:
+                spec_md = kwargs['spec_metadata']
+                if hasattr(spec_md, 'runtime_draft_len'):
+                    print(
+                        f"  spec_metadata.runtime_draft_len: {spec_md.runtime_draft_len}"
+                    )
+                if hasattr(spec_md,
+                           'draft_tokens') and spec_md.draft_tokens is not None:
+                    print(
+                        f"  spec_metadata.draft_tokens.shape: {spec_md.draft_tokens.shape}"
+                    )
+                    if spec_md.draft_tokens.shape[0] > 0:
+                        print(
+                            f"  spec_metadata.draft_tokens: {spec_md.draft_tokens}"
+                        )
+
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
@@ -3468,27 +4015,130 @@ class PyTorchModelEngine(ModelEngine):
             attrs["events"] = weakref.ref(self._torch_compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 
-        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-            return trace_func(self.model.forward)(**kwargs)
-        else:
-            return self.model.forward(**kwargs)
+        try:
+            if not torch.cuda.is_current_stream_capturing():
+                print(
+                    f"[MODEL_ENGINE] model_forward: About to call self.model.forward()"
+                )
+                print(f"  Checking attention_metadata state before forward:")
+                attn_md = kwargs.get('attn_metadata')
+                if attn_md:
+                    print(
+                        f"    attn_metadata.num_seqs: {getattr(attn_md, 'num_seqs', 'N/A')}"
+                    )
+                    print(
+                        f"    attn_metadata.num_tokens: {getattr(attn_md, 'num_tokens', 'N/A')}"
+                    )
+                    print(
+                        f"    attn_metadata.padded_num_tokens: {getattr(attn_md, 'padded_num_tokens', 'N/A')}"
+                    )
+                    if hasattr(attn_md, 'seq_lens_tensor'
+                               ) and attn_md.seq_lens_tensor is not None:
+                        print(
+                            f"    attn_metadata.seq_lens_tensor shape: {attn_md.seq_lens_tensor.shape}"
+                        )
+                print(
+                    f"  🔍 Now entering self.model.forward() - if crash occurs HERE, the bug is INSIDE model.forward()"
+                )
+
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                result = trace_func(self.model.forward)(**kwargs)
+            else:
+                result = self.model.forward(**kwargs)
+
+            if not torch.cuda.is_current_stream_capturing():
+                print(
+                    f"[MODEL_ENGINE] model_forward: self.model.forward() returned successfully"
+                )
+            return result
+        except Exception as e:
+            if not torch.cuda.is_current_stream_capturing():
+                print(
+                    f"[MODEL_ENGINE] model_forward: self.model.forward() FAILED"
+                )
+                print(f"  Exception: {e}")
+                print(
+                    f"  ❌ This is where the illegal memory access occurs inside model.forward()"
+                )
+            raise
 
     @nvtx_range("_forward_step")
     def _forward_step(self,
                       inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor],
                       gather_context_logits: bool = False) -> Dict[str, Any]:
-        inputs = self._preprocess_inputs(inputs)
+        # Skip prints during CUDA graph capture
+        is_capturing = torch.cuda.is_current_stream_capturing()
+
+        if not is_capturing:
+            print(f"\n[MODEL_ENGINE] _forward_step: START")
+            print(
+                f"  input_ids shape: {inputs.get('input_ids', torch.tensor([])).shape if 'input_ids' in inputs else 'N/A'}"
+            )
+            if 'draft_tokens' in inputs and inputs['draft_tokens'] is not None:
+                print(f"  draft_tokens shape: {inputs['draft_tokens'].shape}")
+                print(f"  draft_tokens[:10]: {inputs['draft_tokens'][:10]}")
+            if 'spec_metadata' in inputs and inputs['spec_metadata'] is not None:
+                spec_md = inputs['spec_metadata']
+                if hasattr(spec_md, 'runtime_draft_len'):
+                    print(
+                        f"  spec_metadata.runtime_draft_len: {spec_md.runtime_draft_len}"
+                    )
+                if hasattr(spec_md,
+                           'draft_tokens') and spec_md.draft_tokens is not None:
+                    print(
+                        f"  spec_metadata.draft_tokens shape: {spec_md.draft_tokens.shape}"
+                    )
+
+            print(f"[MODEL_ENGINE] _forward_step: calling _preprocess_inputs")
+
+        try:
+            inputs = self._preprocess_inputs(inputs)
+            if not is_capturing:
+                print(
+                    f"[MODEL_ENGINE] _forward_step: _preprocess_inputs completed"
+                )
+                print(
+                    f"  After preprocess - input_ids shape: {inputs.get('input_ids', torch.tensor([])).shape if 'input_ids' in inputs else 'N/A'}"
+                )
+                if 'draft_tokens' in inputs and inputs[
+                        'draft_tokens'] is not None:
+                    print(
+                        f"  After preprocess - draft_tokens shape: {inputs['draft_tokens'].shape}"
+                    )
+        except Exception as e:
+            if not is_capturing:
+                print(
+                    f"[MODEL_ENGINE] _forward_step: _preprocess_inputs FAILED - {e}"
+                )
+                import traceback
+                traceback.print_exc()
+            raise
+
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
-        outputs = self.model_forward(
-            **inputs,
-            return_context_logits=gather_ids is not None
-            or gather_context_logits,
-        )
+        if not is_capturing:
+            print(f"[MODEL_ENGINE] _forward_step: calling model_forward")
+        try:
+            outputs = self.model_forward(
+                **inputs,
+                return_context_logits=gather_ids is not None
+                or gather_context_logits,
+            )
+            if not is_capturing:
+                print(
+                    f"[MODEL_ENGINE] _forward_step: model_forward completed successfully"
+                )
+        except Exception as e:
+            if not is_capturing:
+                print(
+                    f"[MODEL_ENGINE] _forward_step: model_forward FAILED - {e}")
+                import traceback
+                traceback.print_exc()
+            raise
 
         if self.without_logits:
             return outputs

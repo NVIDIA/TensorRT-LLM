@@ -109,6 +109,9 @@ class SpeculativeDecodingMode(IntEnum):
     def support_capturable_guided_decoder(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
+    def support_dynamic_draft_len(self):
+        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
 
@@ -241,6 +244,14 @@ class SpecMetadata:
     is_spec_dec_tree: bool = False
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
+
+    # Dynamic draft length support: ACTUAL draft length at runtime for current batch.
+    # This is set by model_engine BEFORE forward() based on batch size (from draft_len_schedule).
+    # The spec_worker reads this to determine how many draft iterations to run.
+    # - With dynamic draft length: varies per batch (e.g., 0, 2, 4)
+    # - Without dynamic draft length: None (falls back to max_draft_len)
+    # Example: batch_size=8 might have runtime_draft_len=0 (disable speculation)
+    runtime_draft_len: Optional[int] = None
 
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False
@@ -398,6 +409,7 @@ class SpecWorkerBase(nn.Module, ABC):
         spec_metadata,
         draft_model,
     ):
+        """Skip spec dec for non-last rank (PP). Returns placeholder outputs."""
         batch_size = attn_metadata.num_seqs
         accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
@@ -411,6 +423,104 @@ class SpecWorkerBase(nn.Module, ABC):
         next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
+        return {
+            'logits': logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
+
+    def skip_drafting(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """
+        When runtime_draft_len == 0, skip draft iterations but still sample from target model.
+        Used when speculation is disabled for dynamic draft length (e.g., large batch size).
+        """
+        # breakpoint()
+        # Debug logging (skip during CUDA graph capture)
+        if not torch.cuda.is_current_stream_capturing():
+            print(f"\n[SPEC_WORKER_BASE] skip_drafting: ENTRY")
+            print(
+                f"  batch_size (attn_metadata.num_seqs): {attn_metadata.num_seqs}"
+            )
+            print(f"  logits shape: {logits.shape}")
+            if spec_metadata and hasattr(
+                    spec_metadata,
+                    'draft_tokens') and spec_metadata.draft_tokens is not None:
+                print(
+                    f"  spec_metadata.draft_tokens.shape: {spec_metadata.draft_tokens.shape}"
+                )
+                if spec_metadata.draft_tokens.shape[0] > 0:
+                    print(
+                        f"  ❌ WARNING: draft_tokens has size {spec_metadata.draft_tokens.shape[0]} but runtime_draft_len=0"
+                    )
+
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        max_draft_len = self.max_draft_len
+
+        if self.guided_decoder is not None:
+            if not torch.cuda.is_current_stream_capturing():
+                print(
+                    f"[SPEC_WORKER_BASE] skip_drafting: executing guided_decoder"
+                )
+            self.guided_decoder.execute(logits)
+
+        # Sample from target model (must generate valid tokens!)
+        if not torch.cuda.is_current_stream_capturing():
+            print(f"[SPEC_WORKER_BASE] skip_drafting: sampling tokens")
+        try:
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
+            if not torch.cuda.is_current_stream_capturing():
+                print(
+                    f"[SPEC_WORKER_BASE] skip_drafting: sampling completed, target_tokens shape: {target_tokens.shape}"
+                )
+        except Exception as e:
+            if not torch.cuda.is_current_stream_capturing():
+                print(
+                    f"[SPEC_WORKER_BASE] skip_drafting: _sample_tokens_for_batch FAILED - {e}"
+                )
+                print(f"  ❌ Error during sampling")
+            raise
+
+        # Create accepted_tokens with only target tokens (no drafts accepted)
+        accepted_tokens = torch.zeros((batch_size, (max_draft_len + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        accepted_tokens[:, 0] = target_tokens
+
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        # No draft tokens generated (all zeros)
+        next_draft_tokens = torch.zeros((batch_size, max_draft_len),
+                                        dtype=torch.int,
+                                        device=logits.device)
+
+        # Next iteration input: only the accepted target token
+        next_new_tokens = torch.zeros((batch_size, (max_draft_len + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        next_new_tokens[:, 0] = target_tokens
+
+        # Note: Print statements cannot be used here as this code runs during CUDA graph capture
+        # print(f"[SPEC_WORKER_BASE] skip_drafting: returning outputs "
+        #       f"'logits': {logits}, "
+        #       f"'new_tokens': {accepted_tokens}, "
+        #       f"'new_tokens_lens': {num_accepted_tokens}, "
+        #       f"'next_draft_tokens': {next_draft_tokens}, "
+        #       f"'next_new_tokens': {next_new_tokens}")
         return {
             'logits': logits,
             'new_tokens': accepted_tokens,
@@ -616,15 +726,39 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
+        if not torch.cuda.is_current_stream_capturing():
+            print(f"\n[SPEC_WORKER_BASE] _sample_tokens_for_batch: START")
+            print(f"  batch_size: {batch_size}, num_contexts: {num_contexts}")
+            print(f"  logits shape: {logits.shape}")
+            print(
+                f"  allow_advanced_sampling: {spec_metadata.allow_advanced_sampling if spec_metadata else 'N/A'}"
+            )
+
         if spec_metadata.allow_advanced_sampling:
             from .one_model_sampler import sampling_batch_spec_dec_one_model
 
             num_gens = batch_size - num_contexts
             num_tokens = num_contexts + num_gens * (self.max_draft_len + 1)
 
-            temperatures = spec_metadata.temperatures[:num_tokens]
-            top_ks = spec_metadata.top_ks[:num_tokens]
-            top_ps = spec_metadata.top_ps[:num_tokens]
+            if not torch.cuda.is_current_stream_capturing():
+                print(f"  num_gens: {num_gens}")
+                print(f"  self.max_draft_len: {self.max_draft_len}")
+                print(
+                    f"  ❌ BUG: num_tokens = {num_contexts} + {num_gens} * ({self.max_draft_len} + 1) = {num_tokens}"
+                )
+                print(
+                    f"  But should use runtime_draft_len from spec_metadata instead!"
+                )
+                print(
+                    f"  spec_metadata.temperatures.shape: {spec_metadata.temperatures.shape}"
+                )
+                print(
+                    f"  spec_metadata.top_ks.shape: {spec_metadata.top_ks.shape}"
+                )
+                print(
+                    f"  spec_metadata.top_ps.shape: {spec_metadata.top_ps.shape}"
+                )
+                print(f"  Trying to access [:num_tokens] = [:{num_tokens}]")
 
             if self.use_flashinfer:
                 self.seed += 1
@@ -640,5 +774,10 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             # cute_argmax returns (M, 2) where col 0 = max value, col 1 = argmax index
             sampled_tokens = cute_argmax(logits)[:, 1].long()
+
+        if not torch.cuda.is_current_stream_capturing():
+            print(
+                f"[SPEC_WORKER_BASE] _sample_tokens_for_batch: COMPLETE, sampled_tokens shape: {sampled_tokens.shape}"
+            )
 
         return sampled_tokens

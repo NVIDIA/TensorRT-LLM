@@ -494,7 +494,30 @@ def add_token(
     # NB: Accessing nested lists faster than torch.Tensor or numpy.ndarray
     seq_slot = request.py_seq_slot
     assert seq_slot is not None
-    new_token = new_tokens[step][seq_slot][beam_idx]
+    try:
+        new_token = new_tokens[step][seq_slot][beam_idx]
+    except IndexError as e:
+        # Provide high-signal debugging context (only on failure).
+        outer_len = None
+        step0_len = None
+        step0_seq_len = None
+        try:
+            outer_len = len(new_tokens)
+        except Exception:
+            pass
+        try:
+            if outer_len and outer_len > 0:
+                step0_len = len(new_tokens[0])
+                step0_seq_len = len(new_tokens[0][seq_slot])
+        except Exception:
+            pass
+        raise IndexError(
+            f"add_token IndexError: step={step} (len(new_tokens)={outer_len}), "
+            f"seq_slot={seq_slot} (len(new_tokens[0])={step0_len}), "
+            f"beam_idx={beam_idx} (len(new_tokens[0][seq_slot])={step0_seq_len}); "
+            f"request_id={getattr(request, 'py_request_id', None)}, "
+            f"request_state={getattr(request, 'state', None)}"
+        ) from e
     request.add_new_token(new_token, beam_idx)
     return new_token
 

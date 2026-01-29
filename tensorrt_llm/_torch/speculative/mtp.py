@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -14,8 +14,7 @@ from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, SampleState,
-                                  SampleStateTensors, TorchSampler, add_token,
-                                  int_tensor)
+                                  SampleStateTensors, TorchSampler, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -33,6 +32,14 @@ class SampleStateTensorsMTP(SampleStateTensors):
 class SampleStateMTP(SampleState):
     device: SampleStateTensorsMTP
     host: SampleStateTensorsMTP
+    # Dynamic draft length support:
+    # Store the *runtime* draft length used when producing this SampleState so that
+    # overlap scheduler can safely update requests in a later iteration even if
+    # the global runtime_draft_len has changed meanwhile.
+    runtime_draft_len: int = 0
+    # Map request_id -> batch index (0..batch_size-1) for host tensors.
+    # This avoids relying on `py_seq_slot` when consuming host snapshots under overlap scheduling.
+    request_id_to_batch_idx: Dict[int, int] = field(default_factory=dict)
 
 
 class MTPHiddenStatesManager(BaseResourceManager):
@@ -250,6 +257,18 @@ class MTPSampler(TorchSampler):
                 (seq_slots, args.max_total_draft_tokens)),
         )
 
+        # Overlap scheduler correctness/perf:
+        # MTPSampler reuses persistent device buffers (`self.store.*`) across iterations.
+        # Under overlap scheduling, host-side `update_requests()` consumes the previous
+        # iteration's results while the next iteration may already be producing new
+        # results. To keep host tensors as a *stable snapshot* without blocking the
+        # main thread/stream, enable the sampler's async worker when overlap scheduling
+        # is active. This makes D2H copies happen on a side stream/thread and, crucially,
+        # snapshots the device source tensors (`src.clone()`) before copying so later
+        # writes to `self.store.*` cannot corrupt the in-flight host copy.
+        self._async_worker_init(
+            enable_async_worker=not args.disable_overlap_scheduler)
+
     def _request_common_handling(self, request: LlmRequest,
                                  next_draft_tokens: list[list[int]]):
         assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
@@ -266,38 +285,76 @@ class MTPSampler(TorchSampler):
         assert isinstance(state, SampleStateMTP)
 
         state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens.tolist()
-        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
-        next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
+        runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
+
+        # Host tensors are stored in *batch order* (0..batch_size-1) to avoid relying
+        # on `py_seq_slot` under overlap scheduling.
+        host_new_tokens = state.host.new_tokens  # [batch, max_tokens] (CPU)
+        host_new_tokens_lens = state.host.new_tokens_lens  # [batch] (CPU)
+        host_next_draft_tokens = state.host.next_draft_tokens  # [batch, draft_len] (CPU)
+        req_id_to_batch_idx = getattr(state, "request_id_to_batch_idx",
+                                      None) or {}
+
+        max_steps = int(host_new_tokens.size(1))
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
-            new_token = add_token(req, new_tokens, beam_idx=beam_idx)
+            # No draft tokens are consumed for context token sampling in MTP.
+            req.py_rewind_len = 0
+            batch_idx = req_id_to_batch_idx.get(
+                getattr(req, "py_request_id", -1), None)
+            if batch_idx is None:
+                raise KeyError(
+                    f"[MTPSampler.update_requests] missing batch index for request_id={getattr(req, 'py_request_id', None)}"
+                )
+            new_token = int(host_new_tokens[batch_idx, 0].item())
+            req.add_new_token(new_token, beam_idx)
             TorchSampler._handle_stop_criteria(req,
                                                new_token,
                                                max_seq_len=self.max_seq_len,
                                                beam_idx=beam_idx)
-            self._request_common_handling(req, next_draft_tokens_list)
+            req.py_draft_tokens = host_next_draft_tokens[batch_idx].tolist()
+            req.py_decoding_iter += 1
 
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
+            batch_idx = req_id_to_batch_idx.get(
+                getattr(req, "py_request_id", -1), None)
+            if batch_idx is None:
+                raise KeyError(
+                    f"[MTPSampler.update_requests] missing batch index for request_id={getattr(req, 'py_request_id', None)}"
+                )
+            num_new_tokens = int(host_new_tokens_lens[batch_idx].item())
+            if num_new_tokens < 0 or num_new_tokens > max_steps:
+                raise IndexError(
+                    f"[MTPSampler.update_requests] num_new_tokens out of range: num_new_tokens={num_new_tokens}, "
+                    f"max_steps={max_steps}, batch_idx={batch_idx}, "
+                    f"runtime_draft_len(state)={runtime_draft_len}, "
+                    f"state.host.new_tokens.shape={tuple(state.host.new_tokens.shape)}, "
+                    f"state.host.new_tokens_lens[{batch_idx}]={int(host_new_tokens_lens[batch_idx].item())}, "
+                    f"request_id={getattr(req, 'py_request_id', None)}, req_state={req.state}"
+                )
             for i in range(num_new_tokens):
-                new_token = add_token(req,
-                                      new_tokens,
-                                      beam_idx=beam_idx,
-                                      step=i)
+                new_token = int(host_new_tokens[batch_idx, i].item())
+                req.add_new_token(new_token, beam_idx)
                 if TorchSampler._handle_stop_criteria(
                         req,
                         new_token,
                         max_seq_len=self.max_seq_len,
                         beam_idx=beam_idx):
                     break
-            req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list)
+            req.py_num_accepted_draft_tokens = max(num_new_tokens - 1, 0)
+            # IMPORTANT: Use runtime_draft_len (actual for this batch), not self.draft_len (max),
+            # otherwise overlap scheduler + dynamic draft length can over-rewind KV cache.
+            actual_draft_len = int(runtime_draft_len)
+            if actual_draft_len < 0:
+                actual_draft_len = 0
+            req.py_rewind_len = max(
+                actual_draft_len - req.py_num_accepted_draft_tokens, 0)
+            req.py_draft_tokens = host_next_draft_tokens[batch_idx].tolist()
+            req.py_decoding_iter += 1
 
     def sample_async(
             self, scheduled_requests: ScheduledRequests,
@@ -309,13 +366,62 @@ class MTPSampler(TorchSampler):
         # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
 
         requests = scheduled_requests.all_requests()
+        print(f"\n[MTP_SAMPLER] sample_async called:")
+        print(f"  num_requests: {len(requests)}")
+        print(f"  outputs keys: {outputs.keys()}")
+        for key in [
+                'new_tokens', 'new_tokens_lens', 'next_draft_tokens',
+                'next_new_tokens'
+        ]:
+            if key in outputs and outputs[key] is not None:
+                print(
+                    f"  outputs['{key}'] shape: {outputs[key].shape}, dtype: {outputs[key].dtype}, values: {outputs[key]}"
+                )
+
         slots = torch.as_tensor([r.py_seq_slot for r in requests])
         slots = slots.to(device="cuda", non_blocking=True)
+        request_id_to_batch_idx = {
+            r.py_request_id: i
+            for i, r in enumerate(requests)
+        }
 
-        o_new_tokens = outputs['new_tokens'][:len(requests)]
-        o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
-        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
-        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
+        # o_new_tokens = outputs['new_tokens'][:len(requests)]
+        # o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
+        # o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
+        # o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
+
+        print(
+            f"  Attempting to slice outputs with [:len(requests)] = [:{len(requests)}]"
+        )
+        try:
+            o_new_tokens = outputs['new_tokens'][:len(requests)]
+            print(f"    o_new_tokens: OK, shape {o_new_tokens.shape}")
+        except Exception as e:
+            print(f"    o_new_tokens: FAILED - {e}")
+            raise
+
+        try:
+            o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
+            print(f"    o_new_tokens_lens: OK, shape {o_new_tokens_lens.shape}")
+        except Exception as e:
+            print(f"    o_new_tokens_lens: FAILED - {e}")
+            raise
+
+        try:
+            o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
+            print(
+                f"    o_next_draft_tokens: OK, shape {o_next_draft_tokens.shape}"
+            )
+        except Exception as e:
+            print(f"    o_next_draft_tokens: FAILED - {e}")
+            raise
+
+        try:
+            o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
+            print(f"    o_next_new_tokens: OK, shape {o_next_new_tokens.shape}")
+        except Exception as e:
+            print(f"    o_next_new_tokens: FAILED - {e}")
+            raise
 
         new_tokens = self.store.new_tokens
         next_new_tokens = self.store.next_new_tokens
@@ -333,12 +439,33 @@ class MTPSampler(TorchSampler):
             next_draft_tokens=next_draft_tokens,
         )
         host = SampleStateTensorsMTP(
-            new_tokens=new_tokens.to('cpu', non_blocking=True),
-            new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
-            next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),
+            # Stable host snapshot for update_requests():
+            # Copy directly from per-step outputs (o_*), not from persistent store buffers.
+            # This avoids races/corruption when store buffers are reused across overlapped iterations.
+            #
+            # Shapes (CPU):
+            # - new_tokens: [batch, max_tokens]
+            # - new_tokens_lens: [batch]
+            # - next_draft_tokens: [batch, draft_len]
+            new_tokens=self._copy_to_host(o_new_tokens),
+            new_tokens_lens=self._copy_to_host(o_new_tokens_lens),
+            next_draft_tokens=self._copy_to_host(o_next_draft_tokens),
         )
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        # Capture the runtime draft length for THIS batch. This is needed because the overlap
+        # scheduler calls update_requests() for a batch in a later iteration, after the
+        # executor/model_engine may have already changed the runtime draft length again.
+        runtime_draft_len = 0
+        if scheduled_requests.generation_requests:
+            # For dynamic draft length, model_engine truncates/pads py_draft_tokens to exactly the runtime value.
+            runtime_draft_len = len(
+                scheduled_requests.generation_requests[0].py_draft_tokens)
+        runtime_draft_len = max(
+            0, min(int(runtime_draft_len), int(self.draft_len)))
+
+        # Record an event that also carries async-worker futures (if enabled) so
+        # `state.sampler_event.synchronize()` in update_requests() waits for D2H
+        # copies to complete.
+        sampler_event = self._record_sampler_event()
         # add dummy draft tokens to context requests to prepare kv cache in advance
         # with the max draft token length
         for request in scheduled_requests.context_requests:
@@ -346,7 +473,9 @@ class MTPSampler(TorchSampler):
         return SampleStateMTP(scheduled_requests=scheduled_requests,
                               device=device,
                               host=host,
-                              sampler_event=sampler_event)
+                              sampler_event=sampler_event,
+                              runtime_draft_len=runtime_draft_len,
+                              request_id_to_batch_idx=request_id_to_batch_idx)
 
 
 class MTPWorker(SpecWorkerBase):
@@ -471,6 +600,15 @@ class MTPWorker(SpecWorkerBase):
                     - new generated draft tokens: UVQ
         '''
 
+        # override the draft length if dynamic draft length is enabled
+        runtime_draft_len = spec_metadata.runtime_draft_len if spec_metadata.runtime_draft_len is not None else self.max_draft_len
+
+        # skip the draft forward if the runtime draft length is 0
+        if runtime_draft_len == 0:
+            return self.skip_drafting(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model)
+
         batch_size = attn_metadata.num_seqs
 
         raw_logits = logits
@@ -505,10 +643,13 @@ class MTPWorker(SpecWorkerBase):
             draft_inputs.update(attn_metadata=attn_metadata)
 
         # Run MTP layers to predict draft tokens
+        # Use runtime_draft_len to limit the number of draft iterations
         next_draft_tokens = []
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-        for i, mtp_layer in enumerate(draft_model.mtp_layers):
+        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        for i in range(runtime_draft_len):
+            mtp_layer = draft_model.mtp_layers[i]
             if self.guided_decoder is not None:
                 new_tokens = draft_inputs['input_ids'][last_tokens_idx]
                 self.guided_decoder.add_draft_batch(new_tokens,
@@ -538,6 +679,15 @@ class MTPWorker(SpecWorkerBase):
                 "hidden_states": draft_hidden_states,
                 "attn_metadata": draft_inputs["attn_metadata"],
             }
+
+        # Pad to max_draft_len if needed for consistent output shapes
+        if runtime_draft_len < mtp_num_modules:
+            padding_tokens = torch.zeros(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+            for _ in range(mtp_num_modules - runtime_draft_len):
+                next_draft_tokens.append(padding_tokens)
+
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn metadata
@@ -1155,6 +1305,15 @@ class MTPEagleWorker(MTPWorker):
         spec_metadata,
         draft_model,
     ):
+        # Get the effective draft length for this forward pass (supports dynamic draft length)
+        runtime_draft_len = self.get_runtime_draft_len(spec_metadata)
+
+        # If runtime_draft_len is 0, skip the draft forward entirely
+        if runtime_draft_len == 0:
+            return self.skip_drafting(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model)
+
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -1196,9 +1355,9 @@ class MTPEagleWorker(MTPWorker):
                                              attn_metadata=attn_metadata,
                                              spec_metadata=spec_metadata)
 
-        # Predict draft tokens
+        # Predict draft tokens using runtime_draft_len
         next_draft_tokens = []
-        for i in range(self.mtp_num_modules):
+        for i in range(runtime_draft_len):
             if i == 0:
                 hidden_states = draft_model.mtp_layers[0](
                     embed_tokens=draft_model.embed_tokens,
@@ -1313,6 +1472,14 @@ class MTPEagleWorker(MTPWorker):
                 "hidden_states": hidden_states,
                 "attn_metadata": attn_metadata,
             }
+
+        # Pad to max_draft_len (mtp_num_modules) if needed for consistent output shapes
+        if runtime_draft_len < self.mtp_num_modules:
+            padding_tokens = torch.zeros(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+            for _ in range(self.mtp_num_modules - runtime_draft_len):
+                next_draft_tokens.append(padding_tokens)
 
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)

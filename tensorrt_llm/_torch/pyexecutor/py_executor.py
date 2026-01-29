@@ -1442,7 +1442,7 @@ class PyExecutor:
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
-
+        # breakpoint()
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
@@ -1498,6 +1498,7 @@ class PyExecutor:
                     iter_start_time = time.time()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                # breakpoint()
                 self._handle_control_request()
 
                 if scheduled_batch is None:
@@ -1687,7 +1688,14 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                print(
+                    f"[PY_EXECUTOR] _executor_loop_overlap: BP1: entering _prepare_and_schedule_batch"
+                )
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                # breakpoint()
+                print(
+                    f"[PY_EXECUTOR] _executor_loop_overlap: entering _handle_control_request"
+                )
                 self._handle_control_request()
 
                 if scheduled_batch is None:
@@ -1808,9 +1816,34 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
+                    # Debug output
+                    print(f"\n[PY_EXECUTOR] Iter {self.iter_counter}:")
+                    print(f"  drafter: {self.drafter is not None}")
+                    print(f"  has_draft_batch: {has_draft_batch}")
+                    print(
+                        f"  use_previous_draft_tokens: {use_previous_draft_tokens}"
+                    )
+                    print(
+                        f"  previous_tensors_device: {previous_tensors_device is not None}"
+                    )
+                    if previous_tensors_device is not None and hasattr(
+                            previous_tensors_device, 'next_draft_tokens'):
+                        if previous_tensors_device.next_draft_tokens is not None:
+                            print(
+                                f"  next_draft_tokens shape: {previous_tensors_device.next_draft_tokens.shape}"
+                            )
+                            print(
+                                f"  next_draft_tokens values: {previous_tensors_device.next_draft_tokens}"
+                            )
+                            print(
+                                f"  next_draft_tokens all zeros: {(previous_tensors_device.next_draft_tokens == 0).all()}"
+                            )
+
+                    print(f"[PY_EXECUTOR] BP3: Before _forward_step")
                     batch_outputs = self._forward_step(
                         scheduled_batch, previous_tensors_device,
                         num_accepted_tokens_device)
+                    print(f"[PY_EXECUTOR] BP4: After _forward_step")
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -1830,10 +1863,12 @@ class PyExecutor:
                         guided_decoder_failed_requests = self.guided_decoder.execute(
                             batch_outputs['logits'])
 
+                    print(f"[PY_EXECUTOR] BP5: Before _sample_async")
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
-                    assert sample_state is not None, "Sampling failed"
 
+                    assert sample_state is not None, "Sampling failed"
+                    print(f"[PY_EXECUTOR] BP6: After _sample_async")
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
                     # causing _sample_async to fail when accessing context_chunk_size property.
@@ -1842,7 +1877,16 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
 
+<<<<<<< HEAD
                 if self.previous_batch is not None and should_process_previous_batch:
+=======
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
+
+                if self.previous_batch is not None:
+                    print(f"[PY_EXECUTOR] BP7: Before _process_previous_batch")
+>>>>>>> dee364869 (Add debugging lines. Fix overlap scheduler and cuda graph replay error.)
                     self._process_previous_batch()
                 else:
                     self._enqueue_responses([])
@@ -1868,6 +1912,10 @@ class PyExecutor:
                 self._kv_connector_terminate_requests()
 
                 self.iter_counter += 1
+                # breakpoint()  # BP9: End of iteration, about to loop back
+                print(
+                    f"[PY_EXECUTOR] _executor_loop_overlap: BP9: End of iteration, about to loop back\n\n"
+                )
 
     @nvtx_range("_accept_draft_tokens")
     def _accept_draft_tokens(
@@ -2524,7 +2572,22 @@ class PyExecutor:
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
         try:
+            print(f"\n[PY_EXECUTOR] _sample_async: START")
+            print(
+                f"  batch_outputs: {'Present' if batch_outputs is not None else 'None'}"
+            )
+
             if batch_outputs is not None:
+                print(f"  batch_outputs keys: {batch_outputs.keys()}")
+                if 'logits' in batch_outputs:
+                    print(
+                        f"  logits shape: {batch_outputs['logits'].shape if batch_outputs['logits'] is not None else 'None'}"
+                    )
+                if 'new_tokens' in batch_outputs:
+                    print(
+                        f"  new_tokens shape: {batch_outputs['new_tokens'].shape if batch_outputs['new_tokens'] is not None else 'None'}"
+                    )
+
                 num_context_logits_prefix_sum = [0]
                 prefix_sum = 0
                 num_context_tokens = 0
@@ -2536,25 +2599,65 @@ class PyExecutor:
 
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
+                print(f"  beam_width: {beam_width}")
 
-                HandleLogits()(scheduled_batch.context_requests,
-                               scheduled_batch.generation_requests,
-                               batch_outputs["logits"], beam_width,
-                               num_context_logits_prefix_sum,
-                               self.sampler.is_generation_model())
+                print(f"[PY_EXECUTOR] _sample_async: calling HandleLogits")
+                try:
+                    HandleLogits()(scheduled_batch.context_requests,
+                                   scheduled_batch.generation_requests,
+                                   batch_outputs["logits"], beam_width,
+                                   num_context_logits_prefix_sum,
+                                   self.sampler.is_generation_model())
+                    print(
+                        f"[PY_EXECUTOR] _sample_async: HandleLogits completed")
+                except Exception as e:
+                    print(
+                        f"[PY_EXECUTOR] _sample_async: HandleLogits FAILED - {e}"
+                    )
+                    raise
 
-                HandleAdditionalOutputs()(scheduled_batch.context_requests,
-                                          scheduled_batch.generation_requests,
-                                          batch_outputs, beam_width,
-                                          num_context_tokens)
+                print(
+                    f"[PY_EXECUTOR] _sample_async: calling HandleAdditionalOutputs"
+                )
+                try:
+                    HandleAdditionalOutputs()(
+                        scheduled_batch.context_requests,
+                        scheduled_batch.generation_requests, batch_outputs,
+                        beam_width, num_context_tokens)
+                    print(
+                        f"[PY_EXECUTOR] _sample_async: HandleAdditionalOutputs completed"
+                    )
+                except Exception as e:
+                    print(
+                        f"[PY_EXECUTOR] _sample_async: HandleAdditionalOutputs FAILED - {e}"
+                    )
+                    raise
 
-                return self.sampler.sample_async(scheduled_batch, batch_outputs,
-                                                 num_context_logits_prefix_sum)
+                print(
+                    f"[PY_EXECUTOR] _sample_async: calling sampler.sample_async"
+                )
+                print(f"  sampler type: {type(self.sampler).__name__}")
+                try:
+                    result = self.sampler.sample_async(
+                        scheduled_batch, batch_outputs,
+                        num_context_logits_prefix_sum)
+                    print(
+                        f"[PY_EXECUTOR] _sample_async: sampler.sample_async completed, result: {'Present' if result is not None else 'None'}"
+                    )
+                    return result
+                except Exception as e:
+                    print(
+                        f"[PY_EXECUTOR] _sample_async: sampler.sample_async FAILED - {e}"
+                    )
+                    raise
         except Exception as e:
+            print(f"[PY_EXECUTOR] _sample_async: EXCEPTION CAUGHT - {e}")
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+            print(f"[PY_EXECUTOR] _sample_async: returning None due to error")
+            return None
 
     @nvtx_range("_setup_sampler_step")
     def _setup_sampler_step(self, requests: ScheduledRequests):

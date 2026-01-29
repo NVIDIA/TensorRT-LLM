@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, TypeAlias
 
@@ -26,6 +27,7 @@ from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
+# Key: (batch_size, draft_len, is_first_draft, short_seq_len_mode)
 KeyType: TypeAlias = Tuple[int, int, bool, bool]
 
 
@@ -77,6 +79,7 @@ class CUDAGraphRunnerConfig:
     mapping: Optional[Mapping]
     dist: Optional[Distributed]
     kv_cache_manager_key: Any
+    dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
 
 
@@ -92,7 +95,6 @@ class CUDAGraphRunner:
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
-
         # High-level configuration from the config object
         self.enabled = config.use_cuda_graph
         self.padding_enabled = config.cuda_graph_padding_enabled
@@ -107,7 +109,9 @@ class CUDAGraphRunner:
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
-        self.padding_dummy_request: Optional["Request"] = None
+        self.padding_dummy_requests: Dict[int, "Request"] = {}
+        self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
+        self.debug_ptrs = bool(int(os.getenv("TLLM_CUDA_GRAPH_PTR_DEBUG", "0")))
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
@@ -142,6 +146,51 @@ class CUDAGraphRunner:
                         }
                     }) for _ in range(max_total_tokens)
             ]
+
+    def _collect_tensor_signatures(self, obj: Optional[Any]) -> Dict[str, Any]:
+        if obj is None:
+            return {}
+        tensor_sigs: Dict[str, Any] = {}
+        # Use __dict__ to avoid triggering properties with side effects.
+        for name, value in getattr(obj, "__dict__", {}).items():
+            if torch.is_tensor(value):
+                tensor_sigs[name] = (value.data_ptr(), tuple(value.shape),
+                                     value.dtype, value.device)
+        return tensor_sigs
+
+    def _check_tensor_signatures(self, label: str, stored: Dict[str, Any],
+                                 current_obj: Optional[Any]) -> None:
+        if not stored or current_obj is None:
+            return
+        current = self._collect_tensor_signatures(current_obj)
+        mismatches = []
+        missing = []
+        for name, (ptr, shape, dtype, device) in stored.items():
+            if name not in current:
+                missing.append(name)
+                continue
+            cur_ptr, cur_shape, cur_dtype, cur_device = current[name]
+            if (cur_ptr != ptr or cur_shape != shape or cur_dtype != dtype
+                    or cur_device != device):
+                mismatches.append((name, (ptr, shape, dtype, device),
+                                   (cur_ptr, cur_shape, cur_dtype, cur_device)))
+        if mismatches or missing:
+            print(
+                f"[CUDA_GRAPH_RUNNER] ❌ Tensor signature mismatch for {label}")
+            if missing:
+                print(
+                    f"  Missing tensors in current {label}: {sorted(missing)}")
+            for name, old_sig, new_sig in mismatches:
+                print(f"  {label}.{name}")
+                print(
+                    f"    captured: ptr={old_sig[0]}, shape={old_sig[1]}, dtype={old_sig[2]}, device={old_sig[3]}"
+                )
+                print(
+                    f"    current:  ptr={new_sig[0]}, shape={new_sig[1]}, dtype={new_sig[2]}, device={new_sig[3]}"
+                )
+            raise RuntimeError(
+                f"CUDA graph replay unsafe: {label} tensors changed since capture."
+            )
 
     def _get_seq_len_mode(
             self,
@@ -211,12 +260,24 @@ class CUDAGraphRunner:
             # With dynamic spec decode, the draft length maybe zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
             draft_len_list = []
-            for request in batch.generation_requests:
-                draft_len_list.append(len(request.py_draft_tokens))
-            draft_len = max(draft_len_list)
+            for i, request in enumerate(batch.generation_requests):
+                req_draft_len = len(request.py_draft_tokens)
+                draft_len_list.append(req_draft_len)
+                print(
+                    f"[CUDA_GRAPH_RUNNER] get_graph_key: request {i} has {req_draft_len} draft tokens, is_dummy={request.is_dummy}"
+                )
+            draft_len = max(draft_len_list) if draft_len_list else 0
+            print(
+                f"[CUDA_GRAPH_RUNNER] get_graph_key: draft_len_list={draft_len_list}, max draft_len={draft_len}"
+            )
             assert len(
-                set(draft_len_list)) == 1, "All draft lengths must be the same"
+                set(draft_len_list)
+            ) == 1, f"All draft lengths must be the same, got {draft_len_list}"
+
             key = (batch_size, draft_len, False, short_seq_len_mode)
+            print(
+                f"[CUDA_GRAPH_RUNNER] get_graph_key: draft_len={draft_len}, key={key}"
+            )
         return key
 
     def __del__(self):
@@ -262,7 +323,7 @@ class CUDAGraphRunner:
             return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager)
-
+        # breakpoint()
         if key in self.graphs:
             return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
@@ -332,6 +393,13 @@ class CUDAGraphRunner:
             "attn_metadata": initial_inputs["attn_metadata"],
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
+        if self.debug_ptrs:
+            self.graph_metadata[key]["attn_tensor_sigs"] = (
+                self._collect_tensor_signatures(
+                    initial_inputs["attn_metadata"]))
+            self.graph_metadata[key]["spec_tensor_sigs"] = (
+                self._collect_tensor_signatures(
+                    initial_inputs.get("spec_metadata", None)))
 
         def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
                                              capture_inputs: Dict[str, Any]):
@@ -349,12 +417,16 @@ class CUDAGraphRunner:
         graph = torch.cuda.CUDAGraph()
         with with_multi_stream(True), piecewise_cuda_graph(False):
             for _ in range(self.WARMUP_STEPS):
+                # breakpoint()
+                print(f"[CUDA_GRAPH_RUNNER] capture: warmup step {_}")
                 _setup_spec_decoding_and_forward(key, forward_fn,
                                                  capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
 
             with torch.cuda.graph(graph, pool=self.memory_pool):
+                # breakpoint()
+                print(f"[CUDA_GRAPH_RUNNER] capture: real graph capture")
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
@@ -363,6 +435,13 @@ class CUDAGraphRunner:
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
+        if self.debug_ptrs:
+            self.graph_metadata[key]["attn_tensor_sigs"] = (
+                self._collect_tensor_signatures(
+                    self.graph_metadata[key]["attn_metadata"]))
+            self.graph_metadata[key]["spec_tensor_sigs"] = (
+                self._collect_tensor_signatures(
+                    self.graph_metadata[key]["spec_metadata"]))
 
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
@@ -372,6 +451,13 @@ class CUDAGraphRunner:
         if stored_meta["spec_metadata"] is not None:
             assert current_inputs.get(
                 "spec_metadata") is stored_meta["spec_metadata"]
+        if self.debug_ptrs:
+            self._check_tensor_signatures(
+                "attn_metadata", stored_meta.get("attn_tensor_sigs", {}),
+                current_inputs["attn_metadata"])
+            self._check_tensor_signatures(
+                "spec_metadata", stored_meta.get("spec_tensor_sigs", {}),
+                current_inputs.get("spec_metadata"))
 
         static_tensors = self.shared_static_tensors
 
@@ -420,9 +506,32 @@ class CUDAGraphRunner:
         if (not self.enabled or not self.padding_enabled
                 or not can_run_cuda_graph
                 or new_batch_size > self.max_supported_batch_size):
+            # breakpoint()
+            print(
+                f"[CUDA_GRAPH_RUNNER] _get_padded_batch: not enabled or padding not enabled or can not run cuda graph or new batch size > max supported batch size"
+            )
+            print(f"  self.enabled: {self.enabled}")
+            print(f"  self.padding_enabled: {self.padding_enabled}")
+            print(f"  can_run_cuda_graph: {can_run_cuda_graph}")
+            print(f"  new_batch_size: {new_batch_size}")
+            print(
+                f"  self.max_supported_batch_size: {self.max_supported_batch_size}"
+            )
             return 0
 
-        padded_batch_size = self._round_up_batch_size(new_batch_size)
+        # When dynamic draft length is enabled (one-model path), we treat the determined runtime draft length
+        # as the source of truth and pad the batch size up to the nearest existing graph
+        # for that draft length.
+        if (self.spec_config and hasattr(self.spec_config, 'draft_len_schedule')
+                and self.spec_config.draft_len_schedule
+                and self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
+            # breakpoint()
+            padded_batch_size = self._round_up_batch_size_with_draft_len(
+                new_batch_size, runtime_draft_len)
+        else:
+            # breakpoint()
+            padded_batch_size = self._round_up_batch_size(new_batch_size)
+
         if batch_size == padded_batch_size:
             return 0
 
@@ -433,32 +542,48 @@ class CUDAGraphRunner:
         # No padding if it would create too many concurrent requests.
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
-        if self.padding_dummy_request is None:
+        # Use per-draft-len dummy requests for dynamic draft length support.
+        if runtime_draft_len not in self.padding_dummy_requests:
             available_blocks = kv_cache_manager.get_num_free_blocks()
             # No padding if not enough KV cache space
             if available_blocks < 1:
                 return 0
 
-            self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
-                [CUDA_GRAPH_DUMMY_REQUEST_ID],
+            # Use unique dummy request ID per draft length
+            dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
+            dummy_request = kv_cache_manager.add_dummy_requests(
+                [dummy_request_id],
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
                 max_beam_width=self.config.max_beam_width)[0]
-            self.padding_dummy_request.is_cuda_graph_dummy = True
+            dummy_request.is_cuda_graph_dummy = True
             spec_res_mgr = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_res_mgr:
-                spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
+                spec_res_mgr.add_dummy_requests([dummy_request_id])
+            self.padding_dummy_requests[runtime_draft_len] = dummy_request
 
         # handle special cases of padding requests + MambaCacheManager or MambaHybridCacheManager
         if isinstance(kv_cache_manager, MambaCacheManager):
             kv_cache_manager.reorder_state_indices_when_padding_requests(
                 batch_size, padding_size)
 
-        self.padding_dummy_request.py_draft_tokens = [0] * runtime_draft_len
-        batch.generation_requests.extend([self.padding_dummy_request] *
-                                         padding_size)
+        padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
+        print(
+            f"[CUDA_GRAPH_RUNNER] _get_padded_batch: Adding {padding_size} dummy requests"
+        )
+        print(
+            f"  dummy_request.py_draft_tokens length: {len(padding_dummy_request.py_draft_tokens)}"
+        )
+        print(
+            f"  dummy_request.py_draft_tokens: {padding_dummy_request.py_draft_tokens}"
+        )
+        batch.generation_requests.extend([padding_dummy_request] * padding_size)
+        # breakpoint()
+        print(
+            f"[CUDA_GRAPH_RUNNER] _get_padded_batch: batch_size: {batch_size}, padding_size: {padding_size}, padded_batch_size: {padded_batch_size}, runtime_draft_len: {runtime_draft_len}"
+        )
         return padding_size
 
     def _round_up_batch_size(self, batch_size: int) -> int:
@@ -469,6 +594,28 @@ class CUDAGraphRunner:
         if idx == len(self.supported_batch_sizes):
             return 0
         return self.supported_batch_sizes[idx]
+
+    def _round_up_batch_size_with_draft_len(self, batch_size: int,
+                                            draft_len: int) -> int:
+        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len."""
+        if not self.dynamic_draft_len_mapping:
+            # Fallback to regular round up if no mapping
+            return self._round_up_batch_size(batch_size)
+
+        start_idx = bisect.bisect_left(self.supported_batch_sizes, batch_size)
+        # Negate the list to make it non-decreasing for bisect
+        # (draft_len decreases as batch_size increases in the schedule)
+        negated_draft_lens = [
+            -self.dynamic_draft_len_mapping.get(self.supported_batch_sizes[i],
+                                                0)
+            for i in range(start_idx, len(self.supported_batch_sizes))
+        ]
+        idx = bisect.bisect_left(negated_draft_lens, -draft_len)
+        if idx < len(
+                negated_draft_lens) and negated_draft_lens[idx] == -draft_len:
+            return self.supported_batch_sizes[start_idx + idx]
+        # No suitable graph found
+        return 0
 
     @contextlib.contextmanager
     def pad_batch(self,
@@ -493,7 +640,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
-        self.padding_dummy_request = None
+        self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()

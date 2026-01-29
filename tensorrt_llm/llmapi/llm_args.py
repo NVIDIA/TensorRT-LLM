@@ -3172,6 +3172,7 @@ class TorchLlmArgs(BaseLlmArgs):
         1. If cuda_graph_config.batch_sizes is provided, cuda_graph_config.max_batch_size must be 0
         2. If cuda_graph_config.batch_sizes is not provided, it is generated based on cuda_graph_config.max_batch_size
         3. If both are provided, cuda_graph_config.batch_sizes must match the generated values
+        4. If draft_len_schedule is set, enable_padding is auto-enabled for optimal CUDA graph utilization
         """
         if self.cuda_graph_config is None:
             return self
@@ -3197,6 +3198,15 @@ class TorchLlmArgs(BaseLlmArgs):
                 max_batch_size, config.enable_padding)
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
+
+        if (self.speculative_config is not None and getattr(
+                self.speculative_config, 'draft_len_schedule', None) is not None
+                and not config.enable_padding):
+            logger.info(
+                "Auto-enabling cuda_graph_config.enable_padding for dynamic draft length feature. "
+                "This ensures batches are padded to captured graph sizes for optimal CUDA graph utilization."
+            )
+            config.enable_padding = True
 
         return self
 

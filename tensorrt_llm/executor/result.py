@@ -24,6 +24,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
+from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
@@ -652,8 +653,41 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                         stream_interval=self.sampling_params._stream_interval,
                         **kwargs)
                 else:
-                    beam_output.text = self.tokenizer.decode(
-                        beam_output.token_ids, **kwargs)
+                    try:
+                        beam_output.text = self.tokenizer.decode(
+                            beam_output.token_ids, **kwargs)
+                    except OverflowError:
+                        # This almost always indicates that one or more token IDs are invalid
+                        # (e.g., negative padding like -1, or extremely large corrupted values).
+                        # Provide actionable diagnostics and try a best-effort sanitization.
+                        raw_ids = beam_output.token_ids or []
+                        converted: list[int] = []
+                        invalid: list[tuple[int, Any]] = []
+                        for idx, tid in enumerate(raw_ids):
+                            try:
+                                val = int(tid)
+                            except Exception:
+                                invalid.append((idx, tid))
+                                continue
+                            # Tokenizers (HF fast) expects unsigned IDs.
+                            if val < 0 or val > 0xFFFFFFFF:
+                                invalid.append((idx, val))
+                            else:
+                                converted.append(val)
+
+                        msg = (
+                            f"Detokenization failed with OverflowError; token_ids contain invalid values. "
+                            f"request_id={self.id}, beam_index={beam_output.index}, "
+                            f"num_token_ids={len(raw_ids)}, num_invalid={len(invalid)}, "
+                            f"first_invalid={invalid[:5]}, "
+                            f"tail_token_ids={converted[-20:] if converted else []}"
+                        )
+                        logger.error(msg)
+
+                        # Best-effort: drop invalid IDs and retry decode.
+                        # If this succeeds, we avoid crashing while still surfacing the root cause via logs.
+                        beam_output.text = self.tokenizer.decode(
+                            converted, **kwargs)
 
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
