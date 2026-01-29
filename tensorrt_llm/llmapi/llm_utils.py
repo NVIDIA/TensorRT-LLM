@@ -489,7 +489,9 @@ class ModelLoader:
 
         # Apply model-specific defaults if the model class provides them
         if hasattr(model_cls, 'get_llmapi_defaults'):
-            model_defaults = model_cls.get_llmapi_defaults()
+            # Pass llm_args directly for model-specific adaptive defaults
+            model_defaults = model_cls.get_llmapi_defaults(self.llm_args)
+
             applied_defaults = apply_model_defaults_to_llm_args(
                 self.llm_args, model_defaults)
             if applied_defaults:
