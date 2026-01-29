@@ -115,7 +115,7 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_triton.sh && \
     if [ -f /etc/redhat-release ]; then \
         echo "Rocky8 detected, skipping mooncake installation"; \
     else \
-        bash ./install_mooncake.sh; \
+        GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_mooncake.sh; \
     fi && \
     rm install_triton.sh && \
     rm install_mooncake.sh
