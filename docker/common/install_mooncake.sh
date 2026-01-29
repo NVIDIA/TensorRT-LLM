@@ -6,7 +6,7 @@ if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
 fi
 
-MOONCAKE_VERSION="v0.3.6.post1"
+MOONCAKE_VERSION="v0.3.7.post2"
 MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"
 
