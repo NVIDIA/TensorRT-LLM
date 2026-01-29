@@ -1418,3 +1418,110 @@ async def test_llm_disagg_gen_cancelled():
     finally:
         llm_ctx.shutdown()
         llm_gen.shutdown()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+@pytest.mark.asyncio
+async def test_llm_disagg_streaming_gen_cancelled():
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+
+    llm_ctx = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config_no_reuse,
+                  tensor_parallel_size=tp_size,
+                  cache_transceiver_config=CacheTransceiverConfig(
+                      backend="UCX", kv_transfer_timeout_ms=1000),
+                  **llm_args_extra)
+
+    llm_gen = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config_no_reuse,
+                  tensor_parallel_size=tp_size,
+                  cache_transceiver_config=CacheTransceiverConfig(
+                      backend="UCX", kv_transfer_timeout_ms=1000),
+                  **llm_args_extra)
+
+    try:
+        num_iterations = 10
+        prev_after_free_num_blocks = 0
+        for iter in range(num_iterations):
+
+            max_tokens = 1
+            sampling_params = SamplingParams(max_tokens=max_tokens)
+            disaggregated_params = DisaggregatedParams(
+                request_type="context_only")
+
+            prompt = [
+                "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua "
+                * 10
+            ]
+            # Send context-only request
+            ctx_outputs = []
+            for output in llm_ctx.generate(
+                    prompt,
+                    sampling_params=sampling_params,
+                    disaggregated_params=disaggregated_params):
+                ctx_outputs.append(output)
+
+            assert len(ctx_outputs) == 1
+
+            max_tokens = 100
+            sampling_params = SamplingParams(max_tokens=max_tokens,
+                                             ignore_eos=True)
+            disaggregated_params = ctx_outputs[0].disaggregated_params
+            disaggregated_params.request_type = "generation_only"
+
+            # Send gen-only request
+            tokens_out = 0
+            stop_after_tokens = 50
+            async for gen_output in llm_gen.generate_async(
+                    prompt[0],
+                    sampling_params=sampling_params,
+                    disaggregated_params=disaggregated_params,
+                    streaming=True):
+                print(gen_output.outputs[0].text)
+                print("finished_reason", gen_output.outputs[0].finish_reason)
+                tokens_out += 1
+                if tokens_out == stop_after_tokens:
+                    gen_output.abort()
+
+            # Num check that the number of free/used blocks is as expected
+            time.sleep(1.)
+            max_retries = 10
+            for _ in range(max_retries):
+                results = llm_gen.get_stats(2)
+                print("len(results):", len(results))
+                if len(results) > stop_after_tokens:
+                    break
+                time.sleep(1)
+            else:
+                pytest.fail(
+                    f"Failed to get stats with len=={stop_after_tokens} after {max_retries} retries"
+                )
+
+            print("results[0]:", results[0])
+            print("results[1]:", results[1])
+            print("results[-2]:", results[-2])
+            print("results[-1]:", results[-1])
+            after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
+            assert after_used_num_blocks == 0
+
+            after_free_num_blocks = results[-1]["kvCacheStats"]["freeNumBlocks"]
+            # Check that number of free blocks stays the same
+            if iter > 0:
+                assert after_free_num_blocks == prev_after_free_num_blocks
+
+            # Check that number of free blocks stays the same
+            prev_after_free_num_blocks = after_free_num_blocks
+    finally:
+        llm_ctx.shutdown()
+        llm_gen.shutdown()
