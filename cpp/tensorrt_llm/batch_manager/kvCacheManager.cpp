@@ -2409,7 +2409,7 @@ std::optional<BlockKey> KVCacheManager::findNewContextBlock(
     return newContextBlockOpt;
 }
 
-void KVCacheManager::addSequence(
+bool KVCacheManager::addSequence(
     RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest)
 {
     // TODO: add streamLLM support
@@ -2423,7 +2423,12 @@ void KVCacheManager::addSequence(
         return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
             mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
     }();
-    TLLM_CHECK(emplaceDone);
+
+    if (!emplaceDone)
+    {
+        return false;
+    }
+
     auto& sequence = seqIt->second;
 
     // Get statistics for block allocations/reuse pre request.
@@ -2484,6 +2489,8 @@ void KVCacheManager::addSequence(
         llmRequest->updateReusedBlocksPerRequest(mBlockManager.getNumReusedBlocks() - numReusedBlocksPreRequest);
         llmRequest->updateMissedBlocksPerRequest(mBlockManager.getNumMissedBlocks() - numMissedBlocksPreRequest);
     }
+
+    return true;
 }
 
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
