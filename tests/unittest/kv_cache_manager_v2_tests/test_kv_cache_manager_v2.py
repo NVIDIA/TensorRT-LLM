@@ -28,8 +28,8 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, cast
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
+        DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
-        BeamIndex,
         BufferConfig,
         CacheLevel,
         CudaStream,
@@ -53,13 +53,14 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         init_cuda_once,
         remove_if,
         round_up,
+        temporary_sys_path,
         typed_range,
         unwrap_rawref,
     )
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
-        BeamIndex,
         BufferConfig,
         CacheLevel,
         CudaStream,
@@ -87,14 +88,14 @@ else:
         init_cuda_once,
         remove_if,
         round_up,
+        temporary_sys_path,
         typed_range,
         unwrap_rawref,
     )
 
-from dynamic_path_manager import DynamicPathManager
 from parameterized import parameterized
 
-with DynamicPathManager(os.path.dirname(os.path.abspath(__file__)), clear_cache=False):
+with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
     from fake_engine import FakeEngine, Role, Step
     from kernels import enable_kernel_delay
 
@@ -319,7 +320,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             ]
             for id in range(num_layer_groups):
                 req0.kv_cache.set_page_index_buf(
-                    BeamIndex(0), LayerGroupId(id), memoryview(page_indices[id])
+                    DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(page_indices[id])
                 )
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
@@ -346,7 +347,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             ]
             for id in range(num_layer_groups):
                 req0.kv_cache.set_page_index_buf(
-                    BeamIndex(0), LayerGroupId(id), memoryview(page_indices[id])
+                    DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(page_indices[id])
                 )
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)

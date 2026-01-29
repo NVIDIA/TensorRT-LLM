@@ -56,6 +56,7 @@ LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
 
 BeamIndex = NewType("BeamIndex", int)
+DEFAULT_BEAM_INDEX: Final[BeamIndex] = BeamIndex(0)
 
 UserId = NewType("UserId", int)
 

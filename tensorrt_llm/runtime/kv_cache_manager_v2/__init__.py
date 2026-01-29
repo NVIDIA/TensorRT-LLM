@@ -36,7 +36,7 @@ from ._config import (
     HostCacheTierConfig,
     KVCacheManagerConfig,
 )
-from ._core import BeamIndex, KVCacheManager, _KVCache
+from ._core import DEFAULT_BEAM_INDEX, BeamIndex, KVCacheManager, _KVCache
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
 
 __all__ = [
@@ -47,6 +47,7 @@ __all__ = [
     "KVCacheManager",
     "_KVCache",
     "BeamIndex",
+    "DEFAULT_BEAM_INDEX",
     "LayerId",
     "Priority",
     "CacheLevel",
