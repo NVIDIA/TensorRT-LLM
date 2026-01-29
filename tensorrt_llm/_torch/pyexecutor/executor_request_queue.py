@@ -445,7 +445,7 @@ class ExecutorRequestQueue:
                 return True
             return scheduling_params.attention_dp_relax
 
-        new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
+        new_requests = sorted(new_requests, key=get_relax_value)
 
         # Try to put the requests to the target dp rank until the max_num_active_requests is reached
         remaining_unscheduled = []
