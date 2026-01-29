@@ -411,6 +411,7 @@ class CutlassFusedMoE(MoE):
         tuner_num_tokens: Optional[int] = None,
         tuner_top_k: Optional[int] = None,
         moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with Cutlass backend.
@@ -429,6 +430,7 @@ class CutlassFusedMoE(MoE):
             tuner_num_tokens: Number of tokens for profiling tuner (optional)
             tuner_top_k: Top-k value for profiling tuner (optional)
             moe_output: Pre-allocated output buffer (optional)
+            enable_alltoall: Whether alltoall communication is enabled (optional). If None, defaults to self.enable_alltoall.
 
         Returns:
             final_hidden_states: Output tensor from MoE computation
@@ -440,6 +442,9 @@ class CutlassFusedMoE(MoE):
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 weight_dtype = torch.uint8
+
+        if enable_alltoall is None:
+            enable_alltoall = self.enable_alltoall
 
         result = torch.ops.trtllm.fused_moe(
             x,
@@ -462,7 +467,7 @@ class CutlassFusedMoE(MoE):
             ep_rank=self.ep_rank,
             cluster_size=self.cluster_size,
             cluster_rank=self.cluster_rank,
-            enable_alltoall=self.enable_alltoall,
+            enable_alltoall=enable_alltoall,
             use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
             use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
             use_int8_woq_per_channel=self.has_int8_woq_per_channel,
