@@ -251,9 +251,7 @@ class ModelConfig(Generic[TConfig]):
             elif 90 <= sm_version < 100:  # Hopper
                 return "TRITON"
             else:
-                raise ValueError(
-                    f"Unsupported SM version {sm_version} for GptOssForCausalLM."
-                )
+                return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
 
         return "CUTLASS"
 
