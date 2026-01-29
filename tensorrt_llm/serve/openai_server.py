@@ -586,8 +586,19 @@ class OpenAIServer:
 
             trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
+            if prompt.get("prompt") is not None:
+                prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(
+                    self.llm.input_processor, prompt, sampling_params
+                )
+                tokens_prompt = TokensPrompt(
+                    prompt_token_ids=prompt_token_ids,
+                    query_token_ids=extra_processed_inputs.get("query_token_ids") if extra_processed_inputs is not None else None
+                )
+            else:
+                tokens_prompt = prompt
+
             promise = self.llm.generate_async(
-                inputs=prompt,
+                inputs=tokens_prompt,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
