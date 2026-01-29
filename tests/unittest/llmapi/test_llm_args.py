@@ -935,3 +935,157 @@ class TestStrictBaseModelArbitraryArgs:
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
             TestConfig(field1="test", field2=100, extra_field="should_fail")
         assert "extra_field" in str(exc_info.value)
+
+
+class TestServeDefaults:
+    """Test serve.py's parameter filtering and model defaults handling."""
+
+    def test_serve_get_llm_args_preserves_model_defaults(self):
+        """Test that serve.py's get_llm_args doesn't block model defaults."""
+        from tensorrt_llm.commands.serve import get_llm_args
+
+        # Get llm_args with default values (simulating serve.py behavior)
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            # Don't pass parameters to test default behavior
+        )
+
+        # Verify that required params are present
+        assert "model" in llm_args
+        assert "backend" in llm_args
+        assert "postprocess_tokenizer_dir" in llm_args
+
+        # For PyTorch backend, build_config and scheduler_config should NOT be included
+        assert "build_config" not in llm_args
+        assert "scheduler_config" not in llm_args
+
+        # Test that when we DO pass values, they're included appropriately
+        llm_args_with_values, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            max_batch_size=128,  # Non-default value
+            tensor_parallel_size=4,  # Non-default value
+        )
+        assert llm_args_with_values.get("max_batch_size") == 128
+        assert llm_args_with_values.get("tensor_parallel_size") == 4
+
+    def test_serve_filters_default_values(self):
+        """Test that serve.py only passes non-default values."""
+        from tensorrt_llm.commands.serve import get_llm_args
+
+        # Test with all defaults for PyTorch backend
+        llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
+
+        # Should only include required params
+        assert "model" in llm_args
+        assert "backend" in llm_args
+        assert "postprocess_tokenizer_dir" in llm_args
+
+        # Should NOT include build_config or scheduler_config for PyTorch
+        assert "build_config" not in llm_args
+        assert "scheduler_config" not in llm_args
+
+        # Test with custom values
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            max_batch_size=128,  # Non-default value
+            tensor_parallel_size=4,  # Non-default value
+        )
+
+        # Custom values should be included
+        assert llm_args.get("max_batch_size") == 128
+        assert llm_args.get("tensor_parallel_size") == 4
+
+    def test_serve_backend_specific_configs(self):
+        """Test that build_config and scheduler_config are conditional on backend."""
+        from tensorrt_llm.commands.serve import get_llm_args
+
+        # Test PyTorch backend
+        llm_args_pytorch, _ = get_llm_args(model=llama_model_path,
+                                           backend="pytorch")
+        assert "build_config" not in llm_args_pytorch
+        assert "scheduler_config" not in llm_args_pytorch
+
+        # Test TensorRT backend
+        llm_args_trt, _ = get_llm_args(model=llama_model_path,
+                                       backend="tensorrt")
+        assert "build_config" in llm_args_trt
+        assert "scheduler_config" in llm_args_trt
+
+    def test_serve_is_non_default_or_required_helper(self):
+        """Test the is_non_default_or_required helper function."""
+        from tensorrt_llm.commands.serve import is_non_default_or_required
+
+        # Test always_include parameters
+        assert is_non_default_or_required("model", "test-model", "pytorch")
+        assert is_non_default_or_required("backend", "pytorch", "pytorch")
+        assert is_non_default_or_required("tokenizer", "test-tokenizer",
+                                          "pytorch")
+
+        # Test None values
+        assert not is_non_default_or_required("max_batch_size", None, "pytorch")
+
+        # Test default values (should return False)
+        assert not is_non_default_or_required("tensor_parallel_size", 1,
+                                              "pytorch")
+        assert not is_non_default_or_required("pipeline_parallel_size", 1,
+                                              "pytorch")
+
+        # Test non-default values (should return True)
+        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch")
+        assert is_non_default_or_required("max_batch_size", 128, "pytorch")
+
+    def test_qwen3next_defaults_work_end_to_end(self):
+        """Verify Qwen3Next disables block_reuse even when default is True."""
+        from tensorrt_llm._torch.models.modeling_qwen3_next import \
+            Qwen3NextForCausalLM
+        from tensorrt_llm.commands.serve import get_llm_args
+
+        # Simulate serve.py creating llm_args
+        llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
+
+        # Create TorchLlmArgs with serve's output
+        args = TorchLlmArgs(**llm_args)
+
+        # Verify default is True before model defaults are applied
+        assert args.kv_cache_config.enable_block_reuse is True
+
+        # Apply model defaults (simulating what happens in llm_utils)
+        model_defaults = Qwen3NextForCausalLM.get_llmapi_defaults(args)
+        applied = apply_model_defaults_to_llm_args(args, model_defaults)
+
+        # Verify block_reuse is disabled by model defaults
+        assert args.kv_cache_config.enable_block_reuse is False
+        assert "kv_cache_config" in applied
+        assert "enable_block_reuse" in applied["kv_cache_config"]
+
+    def test_user_overrides_preserved_through_serve(self):
+        """Test that explicit user values override model defaults."""
+        from tensorrt_llm._torch.models.modeling_qwen3_next import \
+            Qwen3NextForCausalLM
+
+        # Simulate user creating args with explicit override
+        # User wants to keep block_reuse=True even though Qwen3Next disables it
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True))
+
+        # Verify user's explicit value is set
+        assert args.kv_cache_config.enable_block_reuse is True
+
+        # Apply Qwen3Next model defaults (which normally disable block_reuse)
+        model_defaults = Qwen3NextForCausalLM.get_llmapi_defaults(args)
+
+        # This should try to set enable_block_reuse=False
+        assert model_defaults.get("kv_cache_config",
+                                  {}).get("enable_block_reuse") is False
+
+        # Apply the model defaults
+        applied = apply_model_defaults_to_llm_args(args, model_defaults)
+
+        # User override should be preserved (user explicitly set it)
+        assert args.kv_cache_config.enable_block_reuse is True
+        # Model default should NOT be applied since user explicitly set it
+        assert "enable_block_reuse" not in applied.get("kv_cache_config", {})
