@@ -243,14 +243,17 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
-        # Models that prefer TRTLLM backend for better performance on Blackwell
-        TRTLLM_PREFERRED_ARCHS = {
-            "GptOssForCausalLM",
-        }
-
-        sm_version = get_sm_version()
-        if architecture in TRTLLM_PREFERRED_ARCHS and 100 <= sm_version < 120:
-            return "TRTLLM"
+        if architecture == "GptOssForCausalLM":
+            sm_version = get_sm_version()
+            # Select the best performing backend based on SM version
+            if 100 <= sm_version < 120:  # Blackwell
+                return "TRTLLM"
+            elif 90 <= sm_version < 100:  # Hopper
+                return "TRITON"
+            else:
+                raise ValueError(
+                    f"Unsupported SM version {sm_version} for GptOssForCausalLM."
+                )
 
         return "CUTLASS"
 
