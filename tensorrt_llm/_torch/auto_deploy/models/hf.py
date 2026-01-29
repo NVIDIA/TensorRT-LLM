@@ -1,5 +1,6 @@
 """Interface to initialize and load HF models."""
 
+import json
 import os
 import re
 import types
@@ -7,6 +8,7 @@ from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
+import safetensors.torch
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights, load_checkpoint_in_model
@@ -434,19 +436,89 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # Ensure it's the first one.
         model._state_dict_hooks.move_to_end(key=get_handle.id, last=False)
 
-        # reuse the load checkpoint utility from accelerate
+        # Choose loading method based on environment variable
+        # Default behavior: preload checkpoint files to CPU
+        # Set AD_DISABLE_PRELOAD=1 to use accelerate's load_checkpoint_in_model (no CPU preload)
+        disable_preload = os.environ.get("AD_DISABLE_PRELOAD", "0") == "1"
+
         try:
-            with hf_load_state_dict_with_device(device):
-                # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
-                # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
-                # which collects local model params, syncs weights from checkpoint, and applies them via
-                # model.load_state_dict.
-                # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
-                # model-transformed weights,leading to unexpected key mismatches or format issues.
-                load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+            if disable_preload:
+                # Load checkpoint directly to GPU using accelerate's load_checkpoint_in_model (no CPU preload)
+                ad_logger.info(
+                    "AD_DISABLE_PRELOAD=1: Using accelerate's load_checkpoint_in_model (no CPU preload)"
+                )
+                with hf_load_state_dict_with_device(device):
+                    load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+            else:
+                # Preload checkpoint files to CPU
+                ad_logger.info("Preloading checkpoint files to CPU")
+                self._load_checkpoint_with_preload(model, ckpt_file, device)
         finally:
             load_handle.remove()
             get_handle.remove()
+
+    def _load_checkpoint_with_preload(
+        self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
+    ):
+        from tensorrt_llm._utils import local_mpi_rank
+
+        rank = local_mpi_rank()
+
+        ad_logger.info(f"Rank {rank}: Loading full checkpoint to CPU memory...")
+        all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
+
+        # Load into model
+        ad_logger.info(f"Rank {rank}: Loading weights into model (device: {device})...")
+        model.load_state_dict(all_weights, strict=False)
+
+        # Free CPU memory
+        del all_weights
+
+        ad_logger.info(f"Rank {rank}: Checkpoint loading completed")
+
+    def _load_full_checkpoint_to_cpu(self, ckpt_file: str) -> dict:
+        """Load the full checkpoint to CPU memory."""
+
+        if ckpt_file.endswith(".index.json"):
+            # checkpoint - load from index file
+            with open(ckpt_file, "r") as f:
+                index_data = json.load(f)
+
+            # Get the directory containing the index file
+            checkpoint_dir = os.path.dirname(ckpt_file)
+
+            # Load weights from each file
+            weight_map = index_data.get("weight_map", {})
+            weight_files = set(weight_map.values())
+
+            # Collect all weights from files
+            all_weights = {}
+            for weight_file in weight_files:
+                weight_path = os.path.join(checkpoint_dir, weight_file)
+                ad_logger.info(f"Loading weight file: {weight_path}")
+
+                if weight_file.endswith(".safetensors"):
+                    file_weights = safetensors.torch.load_file(weight_path, device="cpu")
+                elif weight_file.endswith((".bin", ".pth")):
+                    file_weights = torch.load(weight_path, map_location="cpu", weights_only=True)
+                else:
+                    ad_logger.warning(f"Skipping unsupported weight file: {weight_file}")
+                    continue
+
+                all_weights.update(file_weights)
+
+            return all_weights
+
+        elif os.path.isfile(ckpt_file):
+            # Single checkpoint file
+            if ckpt_file.endswith(".safetensors"):
+                return safetensors.torch.load_file(ckpt_file, device="cpu")
+            elif ckpt_file.endswith((".bin", ".pth")):
+                return torch.load(ckpt_file, map_location="cpu", weights_only=True)
+            else:
+                raise ValueError(f"Unsupported checkpoint format: {ckpt_file}")
+        else:
+            raise ValueError(f"Checkpoint file not found or unsupported: {ckpt_file}")
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
