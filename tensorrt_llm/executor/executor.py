@@ -357,7 +357,7 @@ class GenerationExecutor(ABC):
         self._iter_kv_events_result.set_timeout(timeout)
         return self._iter_kv_events_result
 
-    def get_disagg_context_state(self) -> dict:
+    def get_disaggregated_params(self) -> dict:
         return {}
 
     @staticmethod
