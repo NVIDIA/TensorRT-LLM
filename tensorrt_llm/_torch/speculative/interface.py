@@ -377,8 +377,8 @@ class SpecWorkerBase(nn.Module, ABC):
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
         self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.0"
-        self.seed = 0
-        self.offset = 0
+        self.seed: Optional[torch.Tensor] = None
+        self.offset: Optional[torch.Tensor] = None
 
     @property
     @abstractmethod
@@ -627,6 +627,10 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
+                # Lazily initialize seed/offset tensors on correct device
+                if self.seed is None:
+                    self.seed = torch.tensor([0], dtype=torch.int64, device=logits.device)
+                    self.offset = torch.tensor([0], dtype=torch.int64, device=logits.device)
                 self.seed += 1
 
             sampled_tokens = sampling_batch_spec_dec_one_model(
