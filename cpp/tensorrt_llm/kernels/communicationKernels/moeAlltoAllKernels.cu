@@ -377,11 +377,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-
     int thread_idx = ThreadingPolicy::offset();
     int local_token_idx = ThreadingPolicy::token_idx();
 
@@ -392,6 +387,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         // Other threads should return.
         if (local_token_idx > 0)
             return;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaGridDependencySynchronize();
+#endif
     }
     else
     {
@@ -418,6 +416,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         uint64_t already_copied = 0;
         int num_experts_per_rank = num_experts / ep_size;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaGridDependencySynchronize();
+#endif
         for (int k = 0; k < TOP_K; k++)
         {
             int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
@@ -477,6 +478,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         ThreadingPolicy::sync();
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 
     bool is_first_warp = threadIdx.x / warpSize == 0;
     if (is_first_warp)
@@ -1067,6 +1071,11 @@ __global__ void moeA2ACombineKernel(
             return;
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
 #if !DISABLE_SYNC_FOR_PROFILING
     // In-kernel readiness synchronization at start of combine:
     // - One warp signals readiness to all peers with current flag_val.
@@ -1135,13 +1144,11 @@ __global__ void moeA2ACombineKernel(
     // Get output location for this token (using src_data_ptrs[0] as output)
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-
     // Accumulate across ranks in registers, then store once per segment
     vectorized_combine<TOP_K, ThreadingPolicy, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
@@ -1244,9 +1251,6 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t const* recv_counters_ptr, int ep_size,
     int max_tokens_per_rank, int top_k, int32_t invalid_id)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_tokens = ep_size * max_tokens_per_rank;
     if (tid >= total_tokens)
@@ -1255,6 +1259,10 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t c
     int source_rank = tid / max_tokens_per_rank;
     int token_idx = tid % max_tokens_per_rank;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
     if (token_idx >= recv_counters_ptr[source_rank])
     {
         int32_t* token_expert_ids = expert_ids_ptr + tid * top_k;
@@ -1263,9 +1271,6 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t c
             token_expert_ids[k] = invalid_id;
         }
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, int32_t invalid_id,
