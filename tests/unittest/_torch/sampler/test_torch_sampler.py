@@ -701,16 +701,40 @@ class RequestCase:
         seq_slots = torch.tensor(
             [req.request.py_seq_slot for req in requests], device="cuda", dtype=torch.int64
         )
+        seq_lens = torch.tensor(
+            [req.request.max_beam_num_tokens for req in requests], dtype=torch.int32, device="cuda"
+        )
         new_tokens = torch.tensor(
             [req.new_tokens for req in requests], dtype=torch.int32, device="cuda"
         ).T
         sampler.store.new_tokens[:, seq_slots, BEAM] = new_tokens
+        max_seq_lens = torch.tensor(
+            [
+                min(
+                    sampler.max_seq_len, req.request.orig_prompt_len + req.request.py_max_new_tokens
+                )
+                for req in requests
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        end_ids = torch.tensor(
+            [
+                req.request.py_end_id if req.request.py_end_id is not None else -1
+                for req in requests
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        sampler.store.max_lengths_tensor[seq_slots] = max_seq_lens
+        sampler.store.end_ids[seq_slots] = end_ids
 
         def run():
             sampler._write_finish_reasons(
                 [req.request for req in requests],
                 finish_reasons=sampler.store.finish_reasons,
                 new_tokens=sampler.store.new_tokens,
+                seq_lens=seq_lens,
                 seq_slots=seq_slots,
             )
 
