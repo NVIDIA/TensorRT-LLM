@@ -6,6 +6,7 @@
   - [NIXL Backend Configuration](#nixl-backend-configuration)
   - [Overlap Optimization](#Overlap-Optimization)
   - [Cache Layout Transformation](#Cache-Layout-Transformation)
+  - [Unique Global Request ID](`#Unique-Global-Request-ID`)
 - [Usage](#Usage)
   - [Dynamo](#Dynamo)
   - [trtllm-serve](#trtllm-serve)

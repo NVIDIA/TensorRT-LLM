@@ -1,5 +1,6 @@
 import asyncio
 import heapq
+import random
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
@@ -459,9 +460,15 @@ class RoundRobinRouter(Router):
                 raise ValueError(f"No {self._server_role} servers available")
 
         async with self._lock:
-            servers_after_exclude = [
-                server for server in self._servers if server != exclude_server
-            ] if exclude_server else self._servers
+            if exclude_server:
+                # shuffle to ensure every server can be selected when exclude_server is provided
+                servers_after_exclude = [
+                    server for server in self._servers
+                    if server != exclude_server
+                ]
+                random.shuffle(servers_after_exclude)
+            else:
+                servers_after_exclude = self._servers
             server = servers_after_exclude[self._server_idx %
                                            len(servers_after_exclude)]
             self._server_idx += 1
@@ -530,16 +537,25 @@ class LoadBalancingRouter(Router):
                 raise ValueError(f"No {self._server_role} servers available")
 
         async with self._lock:
-            server_load_heap = heapq.heapify([
-                (self._get_server_load(server), server)
-                for server in self._servers if server != exclude_server
-            ]) if exclude_server else self._server_load_heap
+            if exclude_server:
+                server_load_heap = [(self._get_server_load(server), server)
+                                    for server in self._servers
+                                    if server != exclude_server]
+                heapq.heapify(server_load_heap)
+            else:
+                server_load_heap = self._server_load_heap
+
             server = heapq.heappop(server_load_heap)[1]
             await self._server_state[server].increment_load(request)
-            if not exclude_server:
-                # if exclude_servers is not provided, maintain the original heap
-                heapq.heappush(server_load_heap,
-                               (self._get_server_load(server), server))
+            # maintain the member heap
+            if exclude_server:
+                self._server_load_heap = server_load_heap
+                if exclude_server in self._server_state:
+                    heapq.heappush(
+                        self._server_load_heap,
+                        (self._get_server_load(exclude_server), exclude_server))
+            heapq.heappush(self._server_load_heap,
+                           (self._get_server_load(server), server))
 
             self._req_routing_table[id(request)] = server
 
@@ -618,9 +634,10 @@ class KvCacheAwareRouter(Router):
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         async with self._lock:
-            servers = list(self._server_state.keys())
-        if exclude_server:
-            servers.remove(exclude_server)
+            servers = list([
+                server for server in self._server_state.keys()
+                if server != exclude_server
+            ])
         token_lists = self._tokenize(request)
         block_hashes: list[list[int]] = []
         for token_list in token_lists:
