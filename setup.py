@@ -305,6 +305,12 @@ sanity_check()
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
+packages = find_packages()
+# Add vendored triton_kernels as an explicit top-level package.
+# This is vendored from the Triton project and kept at repo root so its
+# internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
+packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
@@ -318,7 +324,7 @@ setup(
     author="NVIDIA Corporation",
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
-    packages=find_packages(),
+    packages=packages,
     # TODO Add windows support for python bindings.
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -331,6 +337,7 @@ setup(
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
         'tensorrt_llm': package_data,
+        'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
     },
     license_files=get_license(),
     entry_points={
