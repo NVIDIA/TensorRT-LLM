@@ -27,7 +27,7 @@ Requirements:
     pip install grpcio-tools
 """
 
-import subprocess
+import subprocess  # nosec B404
 import sys
 from pathlib import Path
 

@@ -359,12 +359,12 @@ message GenerateStreamChunk {
   repeated uint32 token_ids = 1;
 
   // Beam/sequence index (for beam_width > 1 or n > 1)
-  int32 sequence_index = 2;
+  uint32 sequence_index = 2;
 
   // Token counts for usage tracking
-  int32 prompt_tokens = 3;
-  int32 completion_tokens = 4;
-  int32 cached_tokens = 5;
+  uint32 prompt_tokens = 3;
+  uint32 completion_tokens = 4;
+  uint32 cached_tokens = 5;
 
   // Log probabilities for this chunk's tokens (if requested)
   repeated TokenLogprob logprobs = 6;
@@ -376,7 +376,7 @@ message GenerateComplete {
   repeated uint32 output_token_ids = 1;
 
   // Beam/sequence index
-  int32 sequence_index = 2;
+  uint32 sequence_index = 2;
 
   // Finish reason: "stop", "length", "stop_word"
   string finish_reason = 3;
@@ -385,9 +385,9 @@ message GenerateComplete {
   optional string stop_reason = 4;
 
   // Token counts for usage tracking
-  int32 prompt_tokens = 5;
-  int32 completion_tokens = 6;
-  int32 cached_tokens = 7;
+  uint32 prompt_tokens = 5;
+  uint32 completion_tokens = 6;
+  uint32 cached_tokens = 7;
 
   // Generation log probabilities (if requested)
   repeated TokenLogprob logprobs = 8;
@@ -449,7 +449,7 @@ message EmbedRequest {
 message EmbedResponse {
   string request_id = 1;
   repeated float embedding = 2;  // Embedding vector
-  int32 prompt_tokens = 3;
+  uint32 prompt_tokens = 3;
 }
 
 // ============================================================================
