@@ -12,6 +12,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    ConsumableWeightsDict
 from tensorrt_llm._utils import local_mpi_rank
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
@@ -969,7 +971,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
-                          weights: Dict,
+                          weights: ConsumableWeightsDict,
                           weight_mapper: "BaseWeightMapper",
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
@@ -1008,6 +1010,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                     module, module_name, module_names_breakdown, weights)
                 module.load_weights(weights=module_weights,
                                     allow_partial_loading=allow_partial_loading)
+
+                # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
+                if hasattr(weights, 'mark_consumed'):
+                    for src_name in weight_mapper._mapping.get(module_name, []):
+                        prefix = '.'.join(module_names_breakdown + [src_name])
+                        weights.mark_consumed(prefix)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
@@ -1038,6 +1046,10 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                 n,
                                 p,
                                 allow_partial_loading=allow_partial_loading)
+
+                    # Mark consumed weights
+                    if hasattr(weights, 'mark_consumed'):
+                        weights.mark_consumed(name)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
