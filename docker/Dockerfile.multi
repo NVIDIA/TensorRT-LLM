@@ -75,7 +75,7 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
 COPY constraints.txt /tmp/constraints.txt
 RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
 
-# Remove nbconvert to avoid the nbconvert vulnerability issue in the base NGC PyTorch image.
+# Remove nbconvert to avoid https://github.com/advisories/GHSA-xm59-rqc7-hhvf in the base NGC PyTorch image.
 RUN pip3 uninstall -y nbconvert || true
 
 # Install UCX, NIXL, etcd
@@ -85,7 +85,13 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \
     bash ./install_etcd.sh && \
     rm install_ucx.sh && \
     rm install_nixl.sh && \
-    rm install_etcd.sh
+    rm install_etcd.sh && \
+    rm -rf /root/.cache/pip && \
+    rm -rf /root/.cache/uv/archive-v0 && \
+    # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
+    rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
+    # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
+    rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-0.45.1.dist-info
 
 # Generate OSS attribution file for devel image
 ARG TRT_LLM_VER
@@ -178,7 +184,12 @@ RUN chmod -R a+w examples && \
       benchmarks/cpp/gptManagerBenchmark.cpp \
       benchmarks/cpp/disaggServerBenchmark.cpp \
       benchmarks/cpp/CMakeLists.txt && \
-    rm -rf /root/.cache/pip
+    rm -rf /root/.cache/pip && \
+    rm -rf /root/.cache/uv/archive-v0 && \
+    # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
+    rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
+    # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
+    rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-0.45.1.dist-info
 
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
