@@ -1345,72 +1345,76 @@ async def test_llm_disagg_gen_cancelled():
                       backend="UCX", kv_transfer_timeout_ms=1000),
                   **llm_args_extra)
 
-    num_iterations = 10
-    prev_after_free_num_blocks = 0
-    for iter in range(num_iterations):
+    try:
+        num_iterations = 10
+        prev_after_free_num_blocks = 0
+        for iter in range(num_iterations):
 
-        max_tokens = 1
-        sampling_params = SamplingParams(max_tokens=max_tokens)
-        disaggregated_params = DisaggregatedParams(request_type="context_only")
+            max_tokens = 1
+            sampling_params = SamplingParams(max_tokens=max_tokens)
+            disaggregated_params = DisaggregatedParams(
+                request_type="context_only")
 
-        prompt = [
-            "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua "
-            * 10
-        ]
-        # Send context-only request
-        ctx_outputs = []
-        for output in llm_ctx.generate(
-                prompt,
+            prompt = [
+                "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua "
+                * 10
+            ]
+            # Send context-only request
+            ctx_outputs = []
+            for output in llm_ctx.generate(
+                    prompt,
+                    sampling_params=sampling_params,
+                    disaggregated_params=disaggregated_params):
+                ctx_outputs.append(output)
+
+            assert len(ctx_outputs) == 1
+
+            max_tokens = 10000
+            sampling_params = SamplingParams(max_tokens=max_tokens,
+                                             ignore_eos=True)
+            disaggregated_params = ctx_outputs[0].disaggregated_params
+            disaggregated_params.request_type = "generation_only"
+
+            # Send gen-only request
+            gen_output = llm_gen.generate_async(
+                prompt[0],
                 sampling_params=sampling_params,
-                disaggregated_params=disaggregated_params):
-            ctx_outputs.append(output)
+                disaggregated_params=disaggregated_params)
 
-        assert len(ctx_outputs) == 1
+            # Sleep a little to have tokens generated, between 0.2 and 0.7 seconds
+            sleep_time = random.uniform(0.2, 0.7)
+            time.sleep(sleep_time)
+            #Abort the generation request
+            gen_output.abort()
+            result = await gen_output.aresult()
+            num_output_tokens = len(result.outputs[0].token_ids)
+            print(f"num output tokens: {num_output_tokens}")
+            assert result.outputs[0].finish_reason == "cancelled"
 
-        max_tokens = 10000
-        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
-        disaggregated_params = ctx_outputs[0].disaggregated_params
-        disaggregated_params.request_type = "generation_only"
+            # Num check that the number of free/used blocks is as expected
+            time.sleep(1.)
+            max_retries = 10
+            for _ in range(max_retries):
+                results = llm_gen.get_stats(2)
+                print("len(results):", len(results))
+                if len(results) == num_output_tokens - (1 if iter == 0 else 0):
+                    break
+                time.sleep(1)
+            else:
+                pytest.fail(
+                    f"Failed to get stats with len=={num_output_tokens - 1} after {max_retries} retries"
+                )
 
-        llm_gen.args.kv_cache_config.tokens_per_block
+            after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
+            assert after_used_num_blocks == 0
 
-        # Send gen-only request
-        gen_output = llm_gen.generate_async(
-            prompt[0],
-            sampling_params=sampling_params,
-            disaggregated_params=disaggregated_params)
+            after_free_num_blocks = results[-1]["kvCacheStats"]["freeNumBlocks"]
+            # Check that number of free blocks stays the same
+            if iter > 0:
+                assert after_free_num_blocks == prev_after_free_num_blocks
 
-        # Sleep a little to have tokens generated, between 0.2 and 0.7 seconds
-        sleep_time = random.uniform(0.2, 0.7)
-        time.sleep(sleep_time)
-        #Abort the generation request
-        gen_output.abort()
-        result = await gen_output.aresult()
-        num_output_tokens = len(result.outputs[0].token_ids)
-        print(f"num output tokens: {num_output_tokens}")
-        assert result.outputs[0].finish_reason == "cancelled"
-
-        # Num check that the number of free/used blocks is as expected
-        time.sleep(1.)
-        max_retries = 10
-        for _ in range(max_retries):
-            results = llm_gen.get_stats(2)
-            print("len(results):", len(results))
-            if len(results) == num_output_tokens - (1 if iter == 0 else 0):
-                break
-            time.sleep(1)
-        else:
-            pytest.fail(
-                f"Failed to get stats with len=={num_output_tokens - 1} after {max_retries} retries"
-            )
-
-        after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
-        assert after_used_num_blocks == 0
-
-        after_free_num_blocks = results[-1]["kvCacheStats"]["freeNumBlocks"]
-        # Check that number of free blocks stays the same
-        if iter > 0:
-            assert after_free_num_blocks == prev_after_free_num_blocks
-
-        # Check that number of free blocks stays the same
-        prev_after_free_num_blocks = after_free_num_blocks
+            # Check that number of free blocks stays the same
+            prev_after_free_num_blocks = after_free_num_blocks
+    finally:
+        llm_ctx.shutdown()
+        llm_gen.shutdown()
