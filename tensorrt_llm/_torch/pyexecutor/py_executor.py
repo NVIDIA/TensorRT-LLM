@@ -1682,11 +1682,32 @@ class PyExecutor:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
 
+        if self.kv_connector_manager:
+            # Some of our connector requests may not be doing an async load.
+            # In this case, we mark them as ready by moving them back to the context init state.
+            self.kv_connector_manager.mark_ready_requests(
+                fitting_disagg_gen_init_requests)
+
+            # Now that we've marked some more requests as ready, we need to re-schedule the batch.
+            # The first time we call schedule, we pick which requests we should allocate kv cache for and pass along to the connector.
+            # The second time is once we know which requests are being loaded synchronously/asynchronously.
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+            )
+
+            assert len(
+                fitting_disagg_gen_init_requests
+            ) == 0, "Fitting disaggregated generation init requests should be empty"
+
+        if self.kv_cache_transceiver or self.kv_connector_manager:
+
             if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
                 logger.warning(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
-                self._check_disagg_ctx_cache_transfer_status(1)
+
+                if self.kv_cache_transceiver:
+                    self._check_disagg_ctx_cache_transfer_status(1)
+                    self._kv_connector_terminate_requests()
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -1697,8 +1718,8 @@ class PyExecutor:
 
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
-            self.kv_connector_manager.take_scheduled_requests_pending_load(
-                scheduled_batch)
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self.kv_cache_manager)
             self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
@@ -2481,6 +2502,14 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
+        # When using a KV connector, mark new requests as disagg generation init.
+        # If the connector later decides not to load asynchronously, mark_ready_requests()
+        # will move them back to CONTEXT_INIT.
+        if self.kv_connector_manager:
+            for request in validated_requests:
+                if not request.is_generation_only_request:
+                    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+
         self.active_requests.extend(validated_requests)
         return validated_requests
 
@@ -2709,9 +2738,12 @@ class PyExecutor:
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
-
-            # Trigger KV cache exchange for new disagg_gen_init_requests
-            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            if self.kv_cache_transceiver and not self.kv_connector_manager:
+                # Trigger KV cache exchange for new disagg_gen_init_requests
+                self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            elif self.kv_connector_manager:
+                for req in fitting_disagg_gen_init_requests:
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
