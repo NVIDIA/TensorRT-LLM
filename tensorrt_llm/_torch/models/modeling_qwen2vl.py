@@ -1044,7 +1044,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
         ]
 
     @classmethod
-    def get_llmapi_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
+    def get_model_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
         """Return model-specific LLM API defaults."""
         return {"enable_chunked_prefill": False}
 

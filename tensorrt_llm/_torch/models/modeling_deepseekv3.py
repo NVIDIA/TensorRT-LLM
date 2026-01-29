@@ -1835,9 +1835,61 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config._frozen = True
 
     @classmethod
-    def get_llmapi_defaults(cls) -> dict:
-        """Return model-specific LLM API defaults."""
-        return {"enable_chunked_prefill": False}
+    def get_model_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
+        """
+        Return model-specific LLM API defaults.
+
+        Args:
+            llm_args: Current LlmArgs configuration to adapt defaults based on.
+
+        Returns:
+            Dictionary of model-specific defaults, adapted
+            based on the current configuration.
+        """
+        defaults = {"enable_chunked_prefill": False}
+
+        # Adaptive MTP enablement based on configuration
+        # MTP is beneficial for low-latency scenarios (small batch sizes)
+        # and is incompatible with certain features
+
+        # Get values from llm_args with safe defaults
+        max_batch_size = getattr(llm_args, 'max_batch_size', 2048) or 2048
+        pipeline_parallel_size = getattr(llm_args, 'pipeline_parallel_size',
+                                         1) or 1
+        speculative_model = getattr(llm_args, 'speculative_model', None)
+        logits_post_processor = getattr(llm_args, 'logits_post_processor', None)
+        cache_transceiver_config = getattr(llm_args, 'cache_transceiver_config',
+                                           None)
+        disable_overlap_scheduler = getattr(llm_args,
+                                            'disable_overlap_scheduler', False)
+
+        # Check for hard blockers
+        has_blockers = (
+            pipeline_parallel_size > 1 or  # MTP + PP not supported
+            speculative_model is not None or  # MTP conflicts with speculation
+            logits_post_processor is
+            not None  # MTP doesn't support logits processors
+        )
+
+        # Check for known accuracy issues
+        has_disaggregation = cache_transceiver_config is not None
+        has_overlap_scheduler = not disable_overlap_scheduler
+        has_accuracy_issues = has_disaggregation and has_overlap_scheduler
+
+        # Enable MTP adaptively for low-latency scenarios
+        if not has_blockers and not has_accuracy_issues and max_batch_size <= 32:
+            # Determine optimal MTP layers based on batch size
+            if max_batch_size <= 4:
+                num_layers = 3  # Maximum benefit for ultra-low latency
+            elif max_batch_size <= 16:
+                num_layers = 2  # Balanced
+            else:  # 17-32
+                num_layers = 1  # Conservative
+
+            defaults["mtp_enabled"] = True
+            defaults["num_mtp_layers"] = num_layers
+
+        return defaults
 
     def forward(
         self,

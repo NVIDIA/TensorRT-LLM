@@ -1192,7 +1192,7 @@ class VilaModel(PreTrainedModel):
         self.post_config()
 
     @classmethod
-    def get_llmapi_defaults(cls) -> dict:
+    def get_model_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
         """Return model-specific LLM API defaults."""
         return {"enable_chunked_prefill": False}
 
