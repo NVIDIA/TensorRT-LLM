@@ -12,8 +12,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-    ConsumableWeightsDict
 from tensorrt_llm._utils import local_mpi_rank
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
@@ -971,7 +969,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
-                          weights: ConsumableWeightsDict,
+                          weights,
                           weight_mapper: "BaseWeightMapper",
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
