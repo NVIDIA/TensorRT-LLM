@@ -39,6 +39,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import (
     AllGatherReduceScatter,
@@ -313,7 +314,7 @@ class ConfigurableMoE(MoE):
         2. Validates if current AllToAll strategy can be used for given workload
         3. Falls back to AllGather if current strategy cannot be used (logs info message)
 
-        After calling this method, use _is_using_alltoall() to check which method is active.
+        After calling this method, use enable_alltoall to check which method is active.
 
         Args:
             all_rank_num_tokens: Token counts per rank
@@ -347,23 +348,6 @@ class ConfigurableMoE(MoE):
 
             # Switch to AllGather (always works)
             self.comm = AllGatherReduceScatter(mapping=self.mapping)
-
-    def _is_using_alltoall(self) -> bool:
-        """
-        Check if current communication strategy uses alltoall
-
-        Returns:
-            True: Strategy uses alltoall (NVLINK, DeepEP, etc.)
-            False: Strategy uses allgather (AllGatherReduceScatter or None)
-
-        Note: Can be called anytime. If comm is None, returns False (no alltoall).
-              Typically called after determine_communication_method() to get accurate result.
-        """
-        if self.comm is None:
-            return False  # No strategy means no alltoall
-
-        # AllGather uses allgather, all others use alltoall
-        return not isinstance(self.comm, AllGatherReduceScatter)
 
     def _create_comm_strategy_auto(self) -> Communication:
         """
@@ -626,6 +610,9 @@ class ConfigurableMoE(MoE):
         if token_selected_slots is not None:
             ExpertStatistic.set_layer(self.layer_idx)
             ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
+            self.num_slots, token_selected_slots
+        )
 
         # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
         # NVLINK two-sided has a prepare phase to gather EPLB statistics
@@ -810,11 +797,7 @@ class ConfigurableMoE(MoE):
 
         Same as original implementation - chunking logic is backend-agnostic
 
-        Note: use_all_to_all is determined internally via _is_using_alltoall()
-
         """
-        # Determine if using alltoall
-        use_all_to_all = self._is_using_alltoall()
         # ========== Chunk preparation ==========
         if self.use_dp:
             # When using DP: need all ranks' token counts for reducescatter
@@ -828,7 +811,7 @@ class ConfigurableMoE(MoE):
             chunk_size_list = all_rank_chunk_size_list[self.rank]
 
             # For alltoall, replace 0 with 1 (avoid empty tensor)
-            if use_all_to_all:
+            if self.enable_alltoall:
                 all_rank_num_tokens_list = [
                     [1 if val == 0 else val for val in val_list]
                     for val_list in all_rank_num_tokens_list
@@ -842,7 +825,7 @@ class ConfigurableMoE(MoE):
         router_logits_list = router_logits.split(chunk_size_list)
 
         # Determine if we need multiple streams for overlapped execution
-        use_multi_stream = not use_all_to_all and self.aux_stream is not None
+        use_multi_stream = not self.enable_alltoall and self.aux_stream is not None
 
         # ========== Setup auxiliary stream ==========
         if use_multi_stream:
@@ -1086,7 +1069,8 @@ class ConfigurableMoE(MoE):
             # Only the non-alltoall case is considered for profiling in the warmup phase.
             # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner
             # should be the same as when not using alltoall.
-            if self._is_using_alltoall():
+            kwargs["enable_alltoall"] = self.enable_alltoall
+            if self.enable_alltoall:
                 if all_rank_num_tokens is not None:
                     kwargs["tuner_num_tokens"] = sum(all_rank_num_tokens)
                 else:
@@ -1094,9 +1078,6 @@ class ConfigurableMoE(MoE):
                         x.shape[0] * self.mapping.tp_size if x is not None else None
                     )
                 kwargs["tuner_top_k"] = self.routing_method.top_k
-            else:
-                kwargs["tuner_num_tokens"] = None
-                kwargs["tuner_top_k"] = None
 
             # Get moe_output for NVLinkOneSided backend
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
