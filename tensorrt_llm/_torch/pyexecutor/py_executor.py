@@ -2410,7 +2410,9 @@ class PyExecutor:
             if req.is_context_only_request and req.py_disaggregated_params.
             schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         ]
-        self.kv_cache_transceiver.prepare_context_requests(ctx_only_requests)
+        if ctx_only_requests:
+            self.kv_cache_transceiver.prepare_context_requests(
+                ctx_only_requests)
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
