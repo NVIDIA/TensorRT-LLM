@@ -156,6 +156,7 @@ class Router(ABC):
             **kwargs):
         self._servers = servers or []
         self._metadata_server = metadata_server
+        self._server_info: dict[str, dict] = {}
         self._server_role = server_role
         self._lock = asyncio.Lock()
         self._monitor_task = None
@@ -176,9 +177,25 @@ class Router(ABC):
     def servers(self) -> List[str]:
         return self._servers
 
+    async def _fetch_server_info(self, server: str, timeout: float) -> dict:
+        session = aiohttp.ClientSession()
+        try:
+            async with session.get(f"http://{server}/server_info",
+                                   timeout=timeout) as response:
+                return await response.json()
+        except Exception as e:
+            logger.error(f"Error fetching server info for server {server}: {e}")
+        finally:
+            await session.close()
+            return {}
+
     async def _prepare_server(self, server: str):
         if self._server_preparation_func:
             await self._server_preparation_func(server)
+
+        self._server_info[server] = await self._fetch_server_info(
+            server, self._health_check_timeout)
+        logger.info(f"server is ready with info: {self._server_info[server]}")
 
     async def prepare_servers(self, servers: Optional[List[str]] = None):
         for server in servers or self._servers:
@@ -207,12 +224,20 @@ class Router(ABC):
                 old_server for old_server in old_servers if old_server != server
             ]
             self._on_servers_updated(old_servers, self._servers)
+        self._server_info.pop(server, None)
         logger.debug(
             f"Removed server {server}, current server list: {self._servers}")
 
     @abstractmethod
-    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+    async def _get_next_server(self,
+                               request: OpenAIRequest) -> tuple[str, dict]:
         '''Select server by request and return some intermediate information'''
+
+    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+        server, info = await self._get_next_server(request)
+        info = info or {}
+        info.update(self._server_info.get(server, {}))
+        return server, info
 
     @abstractmethod
     async def finish_request(self, request: OpenAIRequest):
@@ -449,7 +474,8 @@ class RoundRobinRouter(Router):
             # Safety check: ensure index is always within bounds
             self._server_idx = 0
 
-    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+    async def _get_next_server(self,
+                               request: OpenAIRequest) -> tuple[str, dict]:
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
@@ -517,7 +543,8 @@ class LoadBalancingRouter(Router):
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
 
-    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+    async def _get_next_server(self,
+                               request: OpenAIRequest) -> tuple[str, dict]:
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
@@ -534,7 +561,7 @@ class LoadBalancingRouter(Router):
 
             self._req_routing_table[id(request)] = server
 
-        return server, {}
+        return server, {"server_info": self._server_info.get(server, {})}
 
     def _get_server_load(self, server):
         return self._server_state[server]._num_active_tokens if self._use_tokens \
@@ -604,7 +631,8 @@ class KvCacheAwareRouter(Router):
         tokenizer = self._tokenizers[request.model]
         return [tokenizer(prompt)["input_ids"] for prompt in prompts]
 
-    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+    async def _get_next_server(self,
+                               request: OpenAIRequest) -> tuple[str, dict]:
         async with self._lock:
             servers = list(self._server_state.keys())
         token_lists = self._tokenize(request)
@@ -645,6 +673,7 @@ class KvCacheAwareRouter(Router):
             "block_hashes": block_hashes,  # list[list[int]]
             "token_lists": token_lists,  # list[list[int]]
             "matches": matches,  # list[int]
+            "server_info": self._server_info.get(server, {}),
         }
 
     async def finish_request(self,

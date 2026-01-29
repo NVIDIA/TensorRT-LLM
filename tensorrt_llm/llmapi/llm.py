@@ -263,6 +263,15 @@ class BaseLLM:
 
         return self._llm_id
 
+    @property
+    @set_api_status("beta")
+    def llm_info(self) -> dict:
+        return {
+            "model": str(self.args.model),
+            "disaggregated_params":
+            self._executor.get_disagg_context_state() if self._executor else {}
+        }
+
     def generate(
         self,
         inputs: Union[PromptInputs, Sequence[PromptInputs]],
