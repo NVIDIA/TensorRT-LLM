@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Correlation</title>
+    <script
+        src="https://cdn.jsdelivr.net/npm/echarts@6.0.0/dist/echarts.min.js"
+        integrity="sha384-F07Cpw5v8spSU0H113F33m2NQQ/o6GqPTnTjf45ssG4Q6q58ZwhxBiQtIaqvnSpR"
+        crossorigin="anonymous">
+    </script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .chart-container {
+            width: 95%;
+            max-width: 1600px;
+            min-width: 800px;
+            height: 800px;
+            background-color: white;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            margin-bottom: 30px;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <h1>CUDA Kernel Correlation</h1>
+    <div id="durationChart" class="chart-container"></div>
+    <div id="endChart" class="chart-container"></div>
+    <script type="text/javascript">
+        const rawData = {{ rawData }};
+
+        const referenceData = rawData.find(s => s.series.startsWith('reference:'));
+        const xLabelMap = {};
+        let xMax = -Infinity;
+        referenceData.points.forEach(p => {
+            xLabelMap[p.x] = p.name;
+            if (p.x > xMax) xMax = p.x;
+        });
+        const xAxisMin = 0;
+        const xAxisMax = Math.ceil(xMax) + 1;
+
+        function getOption(title, valueKey) {
+            const seriesList = rawData.map(item => {
+                return {
+                    name: item.series,
+                    type: 'line',
+                    symbolSize: 5,
+                    data: item.points.map(p => {
+                        return [p.x, p[valueKey], p.name];
+                    })
+                };
+            });
+
+            return {
+                title: {
+                    text: title,
+                    left: 'center',
+                    top: 5
+                },
+                tooltip: {
+                    trigger: 'item',
+                    formatter: function (params) {
+                        return `<b>${params.seriesName}</b><br/>` +
+                               `Kernel: ${params.data[2]}<br/>` +
+                               `X Index: ${params.data[0].toFixed(2)}<br/>` +
+                               `${valueKey}: ${params.data[1].toFixed(1)}`;
+                    }
+                },
+                legend: {
+                    data: rawData.map(d => d.series),
+                    top: 40,
+                    left: 'center'
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    top: 100,
+                    bottom: 60,
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'value',
+                    min: xAxisMin,
+                    max: xAxisMax,
+                    interval: 1,
+                    axisLabel: {
+                        formatter: function (value) {
+                            const label = xLabelMap[value] || '';
+                            return label.length > 30 ? label.substring(0, 30) + '...' : label;
+                        },
+                        rotate: 60,
+                        fontSize: 11,
+                        hideOverlap: false
+                    },
+                    splitLine: {
+                        lineStyle: {
+                            type: 'dashed'
+                        }
+                    }
+                },
+                yAxis: {
+                    type: 'value',
+                    name: valueKey,
+                    scale: true
+                },
+                dataZoom: [
+                    {
+                        type: 'slider',
+                        show: true,
+                        start: 0,
+                        end: 100,
+                        bottom: 10,
+                        height: 25
+                    },
+                    {
+                        type: 'inside',
+                        start: 0,
+                        end: 100
+                    }
+                ],
+                series: seriesList
+            };
+        }
+
+        const durationChart = echarts.init(document.getElementById('durationChart'));
+        durationChart.setOption(getOption('Kernel Duration', 'duration'));
+
+        const endChart = echarts.init(document.getElementById('endChart'));
+        endChart.setOption(getOption('Kernel End Time', 'end'));
+
+        window.addEventListener('resize', function() {
+            durationChart.resize();
+            endChart.resize();
+        });
+    </script>
+</body>
+</html>
