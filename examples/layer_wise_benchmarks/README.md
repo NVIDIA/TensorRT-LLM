@@ -247,7 +247,7 @@ A complete example can be found in `sample_performance_alignment.sh`. Below is a
    Argument explanations:
 
    | Argument/Parameter | Explanation |
-   |-------------------|-------------|
+   | ------------------ | ----------- |
    | `NP=4` | Should match the end-to-end run. |
    | `--load-format AUTO` | Instructs the benchmark to load model weights instead of using random weights. |
    | `--layer-indices 5,6,7` | A list of contiguous layers to calibrate. |
