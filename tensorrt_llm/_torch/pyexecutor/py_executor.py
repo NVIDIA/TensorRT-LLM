@@ -2118,8 +2118,12 @@ class PyExecutor:
         if self.enable_attention_dp:
             all_ranks_num_active_requests = []
             all_ranks_num_active_tokens = []
-            num_active_tokens = sum(
-                [req.py_orig_prompt_len for req in activate_requests])
+            if self.dist.has_cp_helix:
+                num_active_tokens = sum(
+                    [req.total_input_len_cp for req in activate_requests])
+            else:
+                num_active_tokens = sum(
+                    [req.py_orig_prompt_len for req in activate_requests])
             responses_list = self.dist.tp_allgather(
                 [len(activate_requests), num_active_tokens])
             for num_active_requests, num_active_tokens in responses_list:

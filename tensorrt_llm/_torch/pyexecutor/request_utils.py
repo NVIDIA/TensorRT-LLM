@@ -643,6 +643,9 @@ class RequestBroadcaster:
             new_requests, "py_scheduling_params"
         )
         py_num_logprobs = collect_py_objects_from_requests(new_requests, "py_num_logprobs")
+        py_disaggregated_params = collect_py_objects_from_requests(
+            new_requests, "py_disaggregated_params"
+        )
 
         return tuple(
             filter(
@@ -652,6 +655,7 @@ class RequestBroadcaster:
                     py_multimodal_data,
                     py_scheduling_params,
                     py_num_logprobs,
+                    py_disaggregated_params,
                 ],
             )
         )

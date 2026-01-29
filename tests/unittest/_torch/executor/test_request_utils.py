@@ -24,7 +24,6 @@ from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.mapping import CpType
 
 
-
 @pytest.fixture
 def attention_dp_config():
     """Create a config dict for attention DP testing."""
@@ -42,8 +41,6 @@ def all_ranks_num_active_requests():
 @pytest.fixture
 def all_ranks_num_active_tokens():
     return [10, 5, 15, 8]  # 4 ranks
-
-
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attention_dp_relax=False):
@@ -77,8 +74,6 @@ def append_to_waiting_queue(waiting_queue, rank, attention_dp_relax):
             ),
         )
     )
-
-
 
 
 def test_merge_helix_requests_with_padding():
@@ -200,8 +195,6 @@ def test_merge_helix_requests_insufficient_blocks_error():
             )
 
 
-
-
 @patch("tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request")
 def test_merge_requests_default(mock_convert):
     """Test merging requests with default configuration."""
@@ -265,8 +258,6 @@ def test_merge_requests_with_helix_cp_config():
             assert llm_request.get_tokens(0) == [9, 10, 11, 12]
         else:
             assert llm_request.get_tokens(0) == [13]
-
-
 
 
 def test_get_from_waiting_queue():
@@ -366,8 +357,6 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     assert req1 not in result
 
 
-
-
 def test_can_process_attention_dp_request(attention_dp_config):
     max_num_active_requests = attention_dp_config["max_num_active_requests"]
 
@@ -395,8 +384,6 @@ def test_can_process_attention_dp_request(attention_dp_config):
     assert not can_process_attention_dp_request(
         req_no_capacity, all_ranks_full, max_num_active_requests
     )
-
-
 
 
 def test_schedule_attention_dp_requests_scheduled_requests(
@@ -642,8 +629,6 @@ def test_schedule_attention_dp_requests_no_scheduling_when_capacity_exceeded(
     assert all_ranks_num_active_requests[0] == 8  # Capacity unchanged
 
 
-
-
 def test_filter_and_schedule_integration(
     attention_dp_config, all_ranks_num_active_requests, all_ranks_num_active_tokens
 ):
@@ -746,8 +731,6 @@ def test_achieve_max_num_active_requests(attention_dp_config):
     )
 
     assert len(result) == available_active_requests
-
-
 
 
 @pytest.mark.parametrize(
@@ -908,8 +891,6 @@ def run_test_attention_dp_scheduling(
     for rank, reqs in all_ranks_new_requests.items():
         req_ids = [req.id for req in reqs]
         assert req_ids == all_ranks_expected_req_ids[rank]
-
-
 
 
 def test_balance_requests_across_ranks_empty_requests():
