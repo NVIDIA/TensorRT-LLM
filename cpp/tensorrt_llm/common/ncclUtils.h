@@ -21,6 +21,8 @@
 #include "tensorrt_llm/common/logger.h"
 
 #if ENABLE_MULTI_DEVICE
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/extension.h>
 #endif
@@ -32,7 +34,6 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -377,15 +378,23 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     // Request buffer from allocator
     auto& allocator = NCCLWindowAllocator::getInstance();
-    auto buffer = allocator.requestBuffer(comm, buffer_size);
+    NCCLWindowBuffer buffer;
+
+    try
+    {
+        buffer = allocator.requestBuffer(comm, buffer_size);
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
+        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
+    }
 
     // Defensive validation: ensure buffer is valid before proceeding
     if (!buffer.isValid())
     {
-        std::ostringstream oss;
-        oss << "Failed to allocate NCCL window buffer: invalid buffer returned from requestBuffer "
-            << "(comm=" << static_cast<void*>(comm) << ", buffer_size=" << buffer_size << ")";
-        throw std::runtime_error(oss.str());
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
+        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
     // Create custom deleter that releases the buffer
