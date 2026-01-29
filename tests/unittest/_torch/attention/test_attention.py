@@ -14,8 +14,9 @@ from tensorrt_llm._torch.attention_backend import (AttentionBackend,
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
+                                                             KVCacheManagerV2)
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -131,8 +132,13 @@ paged_backends = {
 }
 
 
-def kv_cache_manager_from(Attention: type[AttentionBackend], s: Scenario,
-                          kv_cache: torch.Tensor) -> KVCacheManager:
+def kv_cache_manager_from(
+        Attention: type[AttentionBackend],
+        s: Scenario,
+        kv_cache: torch.Tensor,
+        request_ids: list[int],
+        token_nums: list[int],
+        use_kv_cache_manager_v2: bool = False) -> KVCacheManager:
     paged = paged_backends[Attention]
 
     num_blocks = s.max_num_pages if paged else s.batch_size
@@ -158,7 +164,12 @@ def kv_cache_manager_from(Attention: type[AttentionBackend], s: Scenario,
 
     cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS if s.cross else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
-    result = KVCacheManager(
+    if use_kv_cache_manager_v2:
+        kv_cache_manager_cls = KVCacheManagerV2
+    else:
+        kv_cache_manager_cls = KVCacheManager
+
+    kv_cache_manager = kv_cache_manager_cls(
         kv_cache_config,
         cache_type,
         num_layers=num_layers,
@@ -171,9 +182,19 @@ def kv_cache_manager_from(Attention: type[AttentionBackend], s: Scenario,
         dtype=kv_cache_dtype,
     )
 
+    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
     for i in range(s.num_layers):
-        result.get_buffers(i).view_as(kv_cache[i]).copy_(kv_cache[i])
-    return result
+        buffer = kv_cache_manager.get_buffers(i)
+        block_ids = [
+            block_id
+            for req_block_ids in kv_cache_manager.get_batch_cache_indices(
+                request_ids, i) for block_id in req_block_ids
+            if block_id is not -1
+        ]
+        for idx, block_id in enumerate(block_ids):
+            buffer[block_id].view_as(kv_cache[i][idx]).copy_(kv_cache[i][idx])
+    return kv_cache_manager
 
 
 def produce_outputs(
@@ -181,6 +202,7 @@ def produce_outputs(
     q_at_layer: torch.Tensor,
     kv: Optional[torch.Tensor],
     s: Scenario,
+    use_kv_cache_manager_v2: bool = False,
     *,
     kv_cache: torch.Tensor,
     num_cached_tokens: Callable[[int], int] | int,
@@ -197,12 +219,13 @@ def produce_outputs(
 
     kv_cache_params = KVCacheParams(
         use_cache=True, num_cached_tokens_per_seq=num_cached_tokens_per_seq)
-    kv_cache_manager = kv_cache_manager_from(Attention, s, kv_cache)
     request_ids = list(range(s.batch_size))
     seq_lens_append = seq_lens_kv if seq_lens_kv is not None else seq_lens
     token_nums = (torch.tensor(num_cached_tokens_per_seq) +
                   seq_lens_append).tolist()
-    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    kv_cache_manager = kv_cache_manager_from(Attention, s, kv_cache,
+                                             request_ids, token_nums,
+                                             use_kv_cache_manager_v2)
 
     metadata = Attention.Metadata(
         num_contexts=num_contexts if num_contexts is not None else s.batch_size,
@@ -414,7 +437,9 @@ def test_flashinfer_prefill():
         Scenario(num_layers=1, qo_len=32, kv_len=64, causal=False)
     ],
     ids=["typical", "non-causal", "cross", "cross-diff-kv-len"])
-def test_attention_backend(s: Scenario):
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
+def test_attention_backend(s: Scenario, use_kv_cache_manager_v2: bool):
     dtype = s.dtype
     num_layers = s.num_layers
     num_heads = s.num_heads
@@ -457,6 +482,7 @@ def test_attention_backend(s: Scenario):
             q_at_layer,
             kv,
             s,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
             kv_cache=kv_cache,
             num_cached_tokens=past_kv_len,
             seq_lens=torch.full((batch_size, ), qo_len).int(),
@@ -559,7 +585,9 @@ def generate_causal_mask(seq_lens, qo_lens, batch_size, dtype):
                   kvcache_dtype=torch.float8_e4m3fn),
 ],
                          ids=["fp16", "fp16-cross", "fp8", "fp8-cross"])
-def test_attention_backend_ifb(s: PagedScenario):
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
+def test_attention_backend_ifb(s: PagedScenario, use_kv_cache_manager_v2: bool):
     dtype = s.dtype
     is_fp8 = s.kvcache_dtype == torch.float8_e4m3fn
     if is_fp8 and getSMVersion() < 89:
@@ -625,6 +653,7 @@ def test_attention_backend_ifb(s: PagedScenario):
             q_at_layer,
             kv,
             s,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
             kv_cache=kv_cache,
             num_cached_tokens=lambda i: num_cached_tokens_prefill
             if i < num_contexts else num_cached_tokens_decode,
