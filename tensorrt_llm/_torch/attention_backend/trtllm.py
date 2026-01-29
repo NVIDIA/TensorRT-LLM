@@ -25,14 +25,12 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams)
+from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable.
 # _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
 #     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = True
-
-if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
-    from .trtllm_gen import trtllm_gen_attention
 
 
 @dataclass(kw_only=True, init=False)
@@ -191,10 +189,8 @@ class TrtllmAttentionWrapper:
         kv_cache_block_offsets: Optional[torch.Tensor] = None,
         host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
         host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
-        kv_cache: Optional[
-            torch.
-            Tensor] = None,  # Actual KV cache tensor from kv_cache_manager.get_buffers()
-        is_nvfp4_kv_cache: bool = False,  # Whether NVFP4 KV cache is used
+        kv_cache: Optional[torch.Tensor] = None,
+        has_fp4_kv_cache: bool = False,
         block_ids_per_seq: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
         cache_indirection: Optional[torch.Tensor] = None,
@@ -297,7 +293,7 @@ class TrtllmAttentionWrapper:
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
         self.kv_cache = kv_cache  # Actual KV cache tensor
-        self.is_nvfp4_kv_cache = is_nvfp4_kv_cache
+        self.has_fp4_kv_cache = has_fp4_kv_cache
         self.workspace = workspace
         self.cache_indirection = cache_indirection
         self.kv_scale_orig_quant = kv_scale_orig_quant if kv_scales_sf_inv is None else kv_scales_sf_inv
@@ -540,7 +536,7 @@ class TrtllmAttentionWrapper:
                 has_kv_scale=(self.kv_scale_orig_quant is not None
                               or self.kv_scale_quant_orig is not None),
                 has_cross_kv=False,
-                is_nvfp4_kv_cache=self.is_nvfp4_kv_cache,
+                has_fp4_kv_cache=self.has_fp4_kv_cache,
         )[0]:
             trtllm_gen_attention(
                 q,
@@ -560,7 +556,7 @@ class TrtllmAttentionWrapper:
                 self.host_kv_cache_pool_mapping,
                 self.
                 kv_cache,  # Actual KV cache tensor from kv_cache_manager.get_buffers()
-                self.is_nvfp4_kv_cache,
+                self.has_fp4_kv_cache,
                 self.cache_indirection,
                 self.kv_scale_orig_quant,
                 self.kv_scale_quant_orig,
@@ -1819,13 +1815,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
 
-        is_nvfp4_kv_cache = False
         kv_cache = None
-        if metadata.kv_cache_manager is not None:
-            is_nvfp4_kv_cache = metadata.kv_cache_manager.is_nvfp4_kv_cache
-            if not is_nvfp4_kv_cache:
-                kv_cache = metadata.kv_cache_manager.get_buffers(
-                    self.layer_idx, kv_layout="HND")
+        if metadata.kv_cache_manager is not None and not self.has_fp4_kv_cache:
+            kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx,
+                                                             kv_layout="HND")
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
@@ -1847,7 +1840,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             kv_cache=kv_cache,
-            is_nvfp4_kv_cache=is_nvfp4_kv_cache,
+            has_fp4_kv_cache=self.has_fp4_kv_cache,
             block_ids_per_seq=metadata.block_ids_per_seq,
             # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
             workspace=metadata.workspace

@@ -28,12 +28,10 @@ from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 
-try:
-    import flashinfer
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
-    FLASHINFER_AVAILABLE = True
-except ImportError:
-    FLASHINFER_AVAILABLE = False
+if IS_FLASHINFER_AVAILABLE:
+    import flashinfer
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
 from tensorrt_llm._utils import get_sm_version
@@ -75,7 +73,7 @@ class AttentionConfig:
     max_num_requests: int = 256
     max_context_length: int = 8192
     attention_window_size: int = -1  # -1 means unlimited
-    is_nvfp4_kv_cache: bool = False
+    has_fp4_kv_cache: bool = False
 
     # Data types
     dtype: torch.dtype = torch.float16
@@ -120,11 +118,6 @@ class AttentionConfig:
     def heads_ratio(self) -> int:
         """Get ratio of query heads to KV heads (for GQA)."""
         return self.num_heads // self.num_kv_heads if self.num_kv_heads > 0 else 1
-
-
-########################################################
-# Support Checker
-########################################################
 
 
 class TrtllmGenSupportChecker:
@@ -185,7 +178,7 @@ class TrtllmGenSupportChecker:
     def check_dtypes(cls, config: AttentionConfig) -> Tuple[bool, str]:
         """Check if data types are supported."""
 
-        if config.is_nvfp4_kv_cache:
+        if config.has_fp4_kv_cache:
             return False, "NVFP4 KV cache is not supported by flashinfer trtllm-gen kernels."
 
         if config.dtype not in cls.SUPPORTED_INPUT_DTYPES:
@@ -199,15 +192,14 @@ class TrtllmGenSupportChecker:
                 return (
                     False,
                     f"KV cache dtype {config.kv_cache_dtype} not supported. "
-                    f"Supported: FP16, BF16, FP8, FP4.",
+                    f"Supported: FP16, BF16, FP8.",
                 )
 
         if config.out_dtype is not None:
             if config.out_dtype not in cls.SUPPORTED_OUT_DTYPES:
                 return (
                     False,
-                    f"Output dtype {config.out_dtype} not supported. "
-                    f"Supported: FP16, BF16, FP8, FP4.",
+                    f"Output dtype {config.out_dtype} not supported. Supported: FP16, BF16, FP8.",
                 )
 
         return True, ""
@@ -215,11 +207,8 @@ class TrtllmGenSupportChecker:
     @classmethod
     def check_head_config(cls, config: AttentionConfig) -> Tuple[bool, str]:
         """Check head configuration validity."""
-        if config.num_heads <= 0:
-            return False, "num_heads must be positive."
-
-        if config.num_kv_heads <= 0:
-            return False, "num_kv_heads must be positive."
+        assert config.num_heads > 0, "num_heads must be positive."
+        assert config.num_kv_heads > 0, "num_kv_heads must be positive."
 
         if config.num_heads % config.num_kv_heads != 0:
             return (
@@ -951,7 +940,7 @@ class FlashInferTrtllmGenBackend(AttentionBackendBase):
 
     def is_supported(self, config: AttentionConfig) -> Tuple[bool, str]:
         """Check if configuration is supported by this backend."""
-        if not FLASHINFER_AVAILABLE:
+        if not IS_FLASHINFER_AVAILABLE:
             return False, "flashinfer package is not installed."
         return self._checker.is_supported(config)
 
@@ -1196,7 +1185,7 @@ def is_supported(
     has_rotary_cos_sin: bool = False,
     has_kv_scale: bool = False,
     has_cross_kv: bool = False,
-    is_nvfp4_kv_cache: bool = False,
+    has_fp4_kv_cache: bool = False,
     phase: str = "both",
 ) -> Tuple[bool, str]:
     """
@@ -1256,7 +1245,7 @@ def is_supported(
         is_mla_enable=is_mla_enable,
         is_fused_qkv=is_fused_qkv,
         update_kv_cache=update_kv_cache,
-        is_nvfp4_kv_cache=is_nvfp4_kv_cache,
+        has_fp4_kv_cache=has_fp4_kv_cache,
     )
 
     return TrtllmGenSupportChecker.is_supported(config, phase)
