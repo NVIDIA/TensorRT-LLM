@@ -38,10 +38,6 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
-########################################################
-# Constants
-########################################################
-
 # Alignment for workspace buffers (256 bytes)
 WORKSPACE_ALIGNMENT = 256
 
@@ -1121,42 +1117,6 @@ def _get_block_tables(
 
     # flashinfer requires int32 block_tables
     return result.to(torch.int32)
-
-
-def _create_kv_cache_placeholder(
-    num_pages: int,
-    num_kv_heads: int,
-    page_size: int,
-    head_size: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Create placeholder KV cache tensors for flashinfer.
-
-    The actual KV cache is managed externally; flashinfer
-    accesses it via block tables.
-
-    Args:
-        num_pages: Number of KV cache pages.
-        num_kv_heads: Number of KV heads.
-        page_size: Tokens per page.
-        head_size: Size of each head.
-        dtype: Data type.
-        device: Device.
-
-    Returns:
-        Tuple of (k_cache, v_cache) tensors.
-    """
-    shape = (num_pages, num_kv_heads, page_size, head_size)
-    k_cache = torch.empty(shape, dtype=dtype, device=device)
-    v_cache = torch.empty(shape, dtype=dtype, device=device)
-    return k_cache, v_cache
-
-
-########################################################
-# Public API - Compatibility Functions
-########################################################
 
 
 def is_supported(
