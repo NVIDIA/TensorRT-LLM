@@ -15,12 +15,26 @@ from torch._subclasses import FakeTensor, FakeTensorMode
 from torch.fx import Graph, GraphModule, Node
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
-from torch.utils._pytree import _LEAF_SPEC
+from torch.utils._pytree import _LEAF_SPEC, TreeSpec
 
 from .logger import ad_logger
 from .node_utils import get_weight_tensor, is_op
 
 _NoValType = type("_NoValType", (), {})
+
+
+def _call_post_init_recursive(spec: TreeSpec) -> None:
+    """Recursively call __post_init__ on TreeSpec starting from leaves.
+
+    This is needed to update internal cached values (like num_leaves) after
+    modifying children_specs.
+    """
+    if hasattr(spec, "children_specs"):
+        for child_spec in spec.children_specs:
+            _call_post_init_recursive(child_spec)
+    spec.__post_init__()
+
+
 _NO_VAL = _NoValType()
 
 
@@ -367,12 +381,7 @@ def add_graph_input(
             in_spec_for_args.context.append(name)
 
     # update pytree info recursively with __post_init__ starting at leaves
-    def call_post_init(spec):
-        for child_spec in spec.children_specs:
-            call_post_init(child_spec)
-        spec.__post_init__()
-
-    call_post_init(in_spec)
+    _call_post_init_recursive(in_spec)
 
     # set fake tensor information if all required information is available
     fake_mode: Optional[FakeTensorMode] = _detect_fake_mode_from_gm(gm)
@@ -527,3 +536,194 @@ def del_attr_by_name(obj, name):
     for part in parts[:-1]:
         obj = getattr(obj, part)
     delattr(obj, parts[-1])
+
+
+def add_graph_output(gm: GraphModule, output_node: Node, name: str) -> None:
+    """Add a graph output to the given GraphModule.
+
+    This function appends a new output to the graph's output node and updates
+    the pytree_info metadata accordingly.
+
+    NOTE: function does NOT do any graph canonicalization. This is left to the user!
+
+    Args:
+        gm (GraphModule): The GraphModule to add the output to.
+        output_node (Node): The node to add as an output.
+        name (str): The name of the new output in the output dict.
+
+    Raises:
+        RuntimeError: If the graph has no output node or multiple output nodes.
+
+    Implementation Notes (Hacky Details):
+        1. **Handling single-output graphs (out_spec == _LEAF_SPEC)**:
+           When the graph originally has a single output, its out_spec is a
+           _LEAF_SPEC (a leaf node in the pytree). To add a new output, we must
+           first convert it to a container spec (tuple with children_specs).
+
+        2. **Forcing output type to dict**:
+           The original out_spec.type is typically a model-specific output class
+           (e.g., CausalLMOutputWithPast from transformers). When we add new
+           outputs with custom names (like "present_key_values_xx"), the original
+           class constructor will fail because these names are not valid data
+           members of that class.
+
+           PyTorch uses the out_spec.type's constructor to wrap the output:
+               result_obj = result_type(**output)
+
+           To avoid constructor failures, we forcibly change out_spec.type to
+           dict using object.__setattr__ (since TreeSpec is a frozen dataclass).
+           This ensures the output is returned as a plain dictionary instead of
+           the original model-specific class.
+    """
+    # extract graph and output spec
+    graph: Graph = gm.graph
+
+    # find the output node
+    output_nodes = graph.find_nodes(op="output")
+    if len(output_nodes) != 1:
+        raise RuntimeError(f"Expected exactly one output node, found {len(output_nodes)}")
+
+    graph_output_node = output_nodes[0]
+
+    # get current outputs
+    current_outputs = graph_output_node.args[0]
+    if not isinstance(current_outputs, (tuple, list)):
+        # single output, convert to tuple
+        current_outputs = (current_outputs,)
+
+    # append new output
+    new_outputs = tuple(current_outputs) + (output_node,)
+    graph_output_node.args = (new_outputs,)
+
+    # update pytree info: append spec for the new output
+    # The out_spec structure mirrors the output structure
+    # For a tuple of outputs, out_spec should be a TreeSpec with children_specs
+    # And graph._codegen.pytree_info is a NamedTuple, so we have to use _replace to replace the out_spec
+    out_spec = graph._codegen.pytree_info.out_spec
+    assert out_spec is not None, "Graph must have an out_spec"
+
+    if out_spec == _LEAF_SPEC:
+        new_out_spec = TreeSpec(type=tuple, children_specs=[_LEAF_SPEC], context=["output"])
+        graph._codegen.pytree_info = graph._codegen.pytree_info._replace(out_spec=new_out_spec)
+        out_spec = graph._codegen.pytree_info.out_spec
+    if hasattr(out_spec, "children_specs"):
+        # out_spec is already a container (tuple/list), append to it
+        out_spec.children_specs.append(_LEAF_SPEC)
+        out_spec.context.append(name)
+    else:
+        # This shouldn't happen in normal cases, but handle it just in case
+        # If out_spec is a single leaf, we need to convert it to a tuple spec
+        raise NotImplementedError(
+            "Cannot add output to a graph with non-container out_spec. "
+            "This case is not currently supported."
+        )
+
+    # update pytree info recursively with __post_init__ starting at leaves
+    _call_post_init_recursive(out_spec)
+
+    # Change the type of the output spec to dict,
+    #
+    # NOTE(yocox) This will affect how torch inteprete the output of the graph.
+    # The original type is some LLM output result class,
+    # for example, CausalLMOutputWithPast, depends on the model.
+    # To add new fields to the output, we need to change the type to dict.
+    # The type's constructor will be used to create an object containing
+    # the result, for example,
+    #
+    #   result_obj = reuslt_type(**output)
+    #
+    # Because we added new output's with names like "present_key_values_xx" which
+    # is not a data member of CausalLMOutputWithPast, so the constructor will fail.
+    # So we need to change the type to dict.
+    #
+    # However the out_spec.type is frozen dataclass,
+    # so we need to use object.__setattr__ to change it.
+    object.__setattr__(out_spec, "type", dict)
+
+
+def remove_graph_input(gm: GraphModule, input_node: Node) -> str:
+    """Remove a graph input from the given GraphModule.
+
+    This is the inverse operation of add_graph_input(). It removes a placeholder node
+    and updates the pytree_info metadata accordingly. The function automatically detects
+    whether the node belongs to args or kwargs and updates the correct spec.
+
+    NOTE: function does NOT do any graph canonicalization. This is left to the user!
+
+    Args:
+        gm (GraphModule): The GraphModule to remove the input from.
+        input_node (Node): The placeholder node to remove.
+
+    Returns:
+        str: The name of the removed node.
+
+    Raises:
+        ValueError: If the provided Node is not a placeholder or not in the graph.
+        RuntimeError: If the input node is still being used by other nodes.
+    """
+    graph: Graph = gm.graph
+
+    # validate that the node is a placeholder
+    if input_node.op != "placeholder":
+        raise ValueError(
+            f"Node '{input_node.name}' is not a placeholder node (op='{input_node.op}'). "
+            f"Only placeholder nodes can be removed as graph inputs."
+        )
+
+    # find all placeholder nodes and validate the node is in this graph
+    placeholder_nodes = graph.find_nodes(op="placeholder", sort=True)
+    if input_node not in placeholder_nodes:
+        raise ValueError(
+            f"Node '{input_node.name}' is not found in the graph's placeholder nodes. "
+            f"It may belong to a different graph or have already been removed."
+        )
+
+    # check that the node is not being used
+    if len(input_node.users) > 0:
+        user_names = [user.name for user in input_node.users.keys()]
+        raise RuntimeError(
+            f"Cannot remove input '{input_node.name}' "
+            f"because it is still being used by nodes: {user_names}. "
+            f"Please remove or replace all usages first."
+        )
+
+    # get pytree info
+    in_spec = graph._codegen.pytree_info.in_spec
+    args_spec = in_spec.children_specs[0]  # tuple for args
+    kwargs_spec = in_spec.children_specs[1]  # dict for kwargs
+    orig_args = graph._codegen.pytree_info.orig_args
+
+    # determine the global index of the node
+    global_idx = placeholder_nodes.index(input_node)
+
+    # determine number of args (kwargs come after args in placeholder order)
+    num_args = len(args_spec.children_specs)
+
+    # determine if this is an arg or kwarg, and compute relative index
+    if global_idx < num_args:
+        # it's an arg
+        relative_idx = global_idx
+        target_spec = args_spec
+        is_kwarg = False
+    else:
+        # it's a kwarg
+        relative_idx = global_idx - num_args
+        target_spec = kwargs_spec
+        is_kwarg = True
+
+    # save the node name before removing
+    removed_node_name = input_node.name
+
+    # remove the node from the graph
+    graph.erase_node(input_node)
+
+    # update pytree info: remove the corresponding spec and arg name
+    target_spec.children_specs.pop(relative_idx)
+    if is_kwarg:
+        target_spec.context.pop(relative_idx)
+    orig_args.pop(global_idx)
+
+    # update pytree info recursively with __post_init__ starting at leaves
+    _call_post_init_recursive(in_spec)
+
+    return removed_node_name

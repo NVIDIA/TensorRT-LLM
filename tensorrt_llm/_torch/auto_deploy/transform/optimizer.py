@@ -64,11 +64,11 @@ class InferenceOptimizer:
             mod = nn.Module()
 
         # iterate over all transforms sorted by stage in the config
-        for t_name, t_config in self.config.items():
+        for idx, (t_name, t_config) in enumerate(self.config.items()):
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
-            mod = transform(mod, cm, self.factory, self.shared_config)
+            mod = transform(mod, cm, self.factory, self.shared_config, idx)
 
         ############################################################################################
         # RETURN OPTIMIZED MODEL

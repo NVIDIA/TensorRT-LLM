@@ -206,7 +206,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    mode: Literal["graph", "transformers"] = Field(
+    mode: Literal["graph", "transformers", "export_edgellm_onnx"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
         "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
@@ -335,5 +335,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         mapping = {
             "graph": str(config_path / "default.yaml"),
             "transformers": str(config_path / "transformers.yaml"),
+            "export_edgellm_onnx": str(config_path / "export_edgellm_onnx.yaml"),
         }
         return mapping.get(mode)
