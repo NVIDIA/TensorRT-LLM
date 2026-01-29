@@ -15,7 +15,7 @@ from tensorrt_llm._utils import torch_dtype_to_str, to_json_file
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
-                          AutoModelForVision2Seq, AutoProcessor,
+                          AutoModelForImageTextToText, AutoProcessor,
                           Blip2ForConditionalGeneration, Blip2Processor,
                           FuyuForCausalLM, FuyuProcessor,
                           LlavaForConditionalGeneration, NougatProcessor,
@@ -953,8 +953,8 @@ def build_kosmos_engine(args):
             img_features, _ = self.connector(img_features)
             return img_features
 
-    model = AutoModelForVision2Seq.from_pretrained(args.model_path,
-                                                   dtype=torch.float16)
+    model = AutoModelForImageTextToText.from_pretrained(args.model_path,
+                                                        dtype=torch.float16)
     wrapper = VisionEncoderWrapper(
         model.vision_model.to(args.device),
         model.image_to_text_projection.to(args.device))
