@@ -23,9 +23,6 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.mapping import CpType
 
-# =============================================================================
-# Fixtures
-# =============================================================================
 
 
 @pytest.fixture
@@ -47,9 +44,6 @@ def all_ranks_num_active_tokens():
     return [10, 5, 15, 8]  # 4 ranks
 
 
-# =============================================================================
-# Helper Functions
-# =============================================================================
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attention_dp_relax=False):
@@ -85,9 +79,6 @@ def append_to_waiting_queue(waiting_queue, rank, attention_dp_relax):
     )
 
 
-# =============================================================================
-# Tests for merge_helix_requests
-# =============================================================================
 
 
 def test_merge_helix_requests_with_padding():
@@ -209,9 +200,6 @@ def test_merge_helix_requests_insufficient_blocks_error():
             )
 
 
-# =============================================================================
-# Tests for merge_requests
-# =============================================================================
 
 
 @patch("tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request")
@@ -279,9 +267,6 @@ def test_merge_requests_with_helix_cp_config():
             assert llm_request.get_tokens(0) == [13]
 
 
-# =============================================================================
-# Tests for get_from_waiting_queue
-# =============================================================================
 
 
 def test_get_from_waiting_queue():
@@ -381,9 +366,6 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     assert req1 not in result
 
 
-# =============================================================================
-# Tests for can_process_attention_dp_request
-# =============================================================================
 
 
 def test_can_process_attention_dp_request(attention_dp_config):
@@ -415,9 +397,6 @@ def test_can_process_attention_dp_request(attention_dp_config):
     )
 
 
-# =============================================================================
-# Tests for schedule_attention_dp_requests
-# =============================================================================
 
 
 def test_schedule_attention_dp_requests_scheduled_requests(
@@ -663,9 +642,6 @@ def test_schedule_attention_dp_requests_no_scheduling_when_capacity_exceeded(
     assert all_ranks_num_active_requests[0] == 8  # Capacity unchanged
 
 
-# =============================================================================
-# Integration tests combining schedule and filter
-# =============================================================================
 
 
 def test_filter_and_schedule_integration(
@@ -737,7 +713,7 @@ def test_achieve_max_num_active_requests(attention_dp_config):
     req_list = []
     req_id = 0
     for rank in range(4):
-        for i in range(5):
+        for _ in range(5):
             req_list.append(
                 RequestQueueItem(
                     req_id,
@@ -772,9 +748,6 @@ def test_achieve_max_num_active_requests(attention_dp_config):
     assert len(result) == available_active_requests
 
 
-# =============================================================================
-# Parametrized tests for attention DP scheduling
-# =============================================================================
 
 
 @pytest.mark.parametrize(
@@ -937,9 +910,6 @@ def run_test_attention_dp_scheduling(
         assert req_ids == all_ranks_expected_req_ids[rank]
 
 
-# =============================================================================
-# Tests for balance_requests_across_ranks
-# =============================================================================
 
 
 def test_balance_requests_across_ranks_empty_requests():
@@ -1059,7 +1029,7 @@ def test_balance_requests_across_ranks_capacity_limits():
 
     # Each rank can only take 1 more request (1 + 1 = 2, which equals expected_num_active_requests)
     total_assigned = sum(len(rank_requests) for rank_requests in result.values())
-    assert total_assigned == 4  # 4 ranks × 1 additional request each
+    assert total_assigned == 4  # 4 ranks with 1 additional request each
 
     # Verify no rank exceeds capacity
     for rank in range(4):

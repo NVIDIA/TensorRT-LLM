@@ -432,7 +432,6 @@ class PyExecutor:
             max_beam_width=self.max_beam_width,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
-            hang_detector=self.hang_detector,
         )
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # sample_async is called twice before the first call to update_requests:
@@ -2042,8 +2041,6 @@ class PyExecutor:
             if not request.check_token_id_range(
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
-
-    # ========== Request fetching and processing methods ==========
 
     def _fetch_and_enqueue_requests(self,
                                     waiting_queue: deque[RequestQueueItem],

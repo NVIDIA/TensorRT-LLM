@@ -18,10 +18,6 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestQueueItem)
 
-# =============================================================================
-# Fixtures
-# =============================================================================
-
 
 @pytest.fixture
 def mock_dist():
@@ -63,11 +59,6 @@ def integration_queue(mock_dist):
                                 batch_wait_timeout_ms=0.0)
 
 
-# =============================================================================
-# Tests for ExecutorRequestQueue initialization
-# =============================================================================
-
-
 def test_executor_queue_init(executor_queue, mock_dist):
     """Test ExecutorRequestQueue initialization."""
     assert executor_queue.dist == mock_dist
@@ -77,11 +68,6 @@ def test_executor_queue_init(executor_queue, mock_dist):
     assert executor_queue.active
     assert isinstance(executor_queue.request_queue, queue.Queue)
     assert isinstance(executor_queue.enqueue_lock, type(threading.Lock()))
-
-
-# =============================================================================
-# Tests for request enqueuing
-# =============================================================================
 
 
 def test_enqueue_requests(executor_queue):
@@ -201,11 +187,6 @@ def test_can_enqueue_request(executor_queue, mock_dist, rank, active, expected):
     assert executor_queue.can_enqueue_request() == expected
 
 
-# =============================================================================
-# Tests for getting from request queue
-# =============================================================================
-
-
 def test_get_from_request_queue_no_timeout(executor_queue):
     """Test getting items from request queue without timeout."""
     # Add some items
@@ -303,11 +284,6 @@ def test_get_from_request_queue_async_behavior(executor_queue):
     thread.join()
 
 
-# =============================================================================
-# Tests for RequestQueueItem
-# =============================================================================
-
-
 def test_request_queue_item_special_types():
     """Test RequestQueueItem special type detection."""
     # Create a mock request without sampling_config to avoid beam validation
@@ -333,11 +309,6 @@ def test_request_queue_item_special_types():
     assert shutdown_req.is_shutdown_request
     assert not shutdown_req.is_canceled_request
     assert not shutdown_req.is_normal_request
-
-
-# =============================================================================
-# Tests for queue size methods
-# =============================================================================
 
 
 def test_queue_size_methods(executor_queue):

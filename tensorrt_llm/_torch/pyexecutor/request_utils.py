@@ -104,7 +104,7 @@ def schedule_attention_dp_requests(
             return True
         return scheduling_params.attention_dp_relax
 
-    new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
+    new_requests = sorted(new_requests, key=get_relax_value)
 
     # Try to put the requests to the target dp rank until the max_num_active_requests is reached
     remaining_unscheduled = []
@@ -533,11 +533,11 @@ def merge_star_attention_requests(
             # anchor + ctx_blocks + qry_block
             pass
         else:
-            print(
-                f"rank = {cp_rank}, len(ctx_blocks)  = {len(ctx_blocks)}, "
+            raise ValueError(
+                f"Invalid context partition: rank = {cp_rank}, "
+                f"len(ctx_blocks) = {len(ctx_blocks)}, "
                 f"num_blocks_per_rank = {num_blocks_per_rank}"
             )
-            assert False, "invalid context partition"
 
         # fake data for scheduler
         ctx_blocks_list = [0] * (block_size + anchor_block_size)
