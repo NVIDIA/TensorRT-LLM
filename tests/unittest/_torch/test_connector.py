@@ -25,8 +25,8 @@ from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager,
     KvCacheConnectorSchedulerOutputManager)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequestState
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 mpi4py.MPI.pickle.__init__(
@@ -113,6 +113,7 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
         req = MagicMock()
 
         req.request_id = 42
+        req.is_generation_only_request = False
 
         assert manager.get_num_new_matched_tokens(req, 32) == 16
 
