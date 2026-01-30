@@ -438,14 +438,14 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         # Choose loading method based on environment variable
         # Default behavior: preload checkpoint files to CPU
-        # Set AD_DISABLE_PRELOAD=1 to use accelerate's load_checkpoint_in_model (no CPU preload)
-        disable_preload = os.environ.get("AD_DISABLE_PRELOAD", "0") == "1"
+        # Set AUTO_DEPLOY_DEBUG_DISABLE_PRELOAD=1 to use accelerate's load_checkpoint_in_model (no CPU preload)
+        disable_preload = os.environ.get("AUTO_DEPLPY_DEBUG_DISABLE_PRELOAD", "0") == "1"
 
         try:
             if disable_preload:
                 # Load checkpoint directly to GPU using accelerate's load_checkpoint_in_model (no CPU preload)
                 ad_logger.info(
-                    "AD_DISABLE_PRELOAD=1: Using accelerate's load_checkpoint_in_model (no CPU preload)"
+                    "AUTO_DEPLOY_DEBUG_DISABLE_PRELOAD=1: Using accelerate's load_checkpoint_in_model (no CPU preload)"
                 )
                 with hf_load_state_dict_with_device(device):
                     load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
