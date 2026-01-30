@@ -19,7 +19,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -124,11 +124,11 @@ class MiniMaxRMSNorm(nn.Module):
         super().__init__()
         self.mapping = mapping
         # for attention input, tp_size * hidden_size = head_num * head_size
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype, requires_grad=False))
+        self.weight = nn.Parameter(torch.empty(hidden_size, dtype=dtype), requires_grad=False)
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
-        self.all_reduce = AllReduce(mapping=self.mapping)
+        self.all_reduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.NCCL)
 
     # TODO: add load weights method
     def load_weights(self, weights: Dict):
@@ -136,14 +136,14 @@ class MiniMaxRMSNorm(nn.Module):
         slice_width = self.hidden_size
         slice_start = self.mapping.tp_rank * slice_width
         slice_end = slice_start + slice_width
-        self.weight.copy_(weights["weight"][slice_start:slice_end].to(self.weight.dtype))
+        self.weight.copy_(weights[0]["weight"][slice_start:slice_end].to(self.weight.dtype))
 
     def forward(self, hidden_states: torch.Tensor):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
 
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        variance = self.all_reduce(variance) / self.mapping.tp_size
+        variance = hidden_states.pow(2).mean(-1, keepdim=True) / self.mapping.tp_size
+        variance = self.all_reduce(variance)
 
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         hidden_states = self.weight * hidden_states.to(input_dtype)
@@ -210,23 +210,25 @@ class MiniMaxM2Attention(Attention):
             )
 
     def apply_qk_norm(self, q, k):
-        if self.qkv_proj.mapping.tp_size > 1:
-            # collect q and k from all gpus
-            from ..distributed import allgather
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        # if self.qkv_proj.mapping.tp_size > 1:
+        #     # collect q and k from all gpus
+        #     from ..distributed import allgather
 
-            temp_q = allgather(q, self.qkv_proj.mapping)
-            temp_k = allgather(k, self.qkv_proj.mapping)
-            temp_q = self.q_norm(temp_q)
-            temp_k = self.k_norm(temp_k)
-            q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
-                -1, self.q_size
-            )
-            k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.tp_rank, :].reshape(
-                -1, self.kv_size
-            )
-        else:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        #     temp_q = allgather(q, self.qkv_proj.mapping)
+        #     temp_k = allgather(k, self.qkv_proj.mapping)
+        #     temp_q = self.q_norm(temp_q)
+        #     temp_k = self.k_norm(temp_k)
+        #     q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
+        #         -1, self.q_size
+        #     )
+        #     k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.tp_rank, :].reshape(
+        #         -1, self.kv_size
+        #     )
+        # else:
+        #     q = self.q_norm(q)
+        #     k = self.k_norm(k)
 
         return q, k
 
