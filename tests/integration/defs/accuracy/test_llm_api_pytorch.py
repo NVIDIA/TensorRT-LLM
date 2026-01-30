@@ -3696,10 +3696,14 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
     )
 
     def test_auto_dtype(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, )
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task.evaluate(
+                llm,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+                kv_cache_config=kv_cache_config,
+            )
 
 
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
@@ -3744,11 +3748,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
-
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  max_batch_size=64) as llm:
@@ -3759,9 +3764,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_dummy_load_format(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         llm = LLM(
             f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
             load_format="dummy",
+            kv_cache_config=kv_cache_config,
         )
         with llm:
             task = MMLU(self.MODEL_NAME)
@@ -3786,11 +3793,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B"
                  if is_cached else "Qwen/Qwen3-8B",
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp) as llm:
             task = CnnDailymail(self.MODEL_NAME)
