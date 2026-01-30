@@ -19,16 +19,6 @@ global_kvcache_config = KvCacheConfig(
 
 
 @pytest.fixture(scope="module", params=[False, True])
-def gather_generation_logits_fixture(request) -> bool:
-    return request.param
-
-
-@pytest.fixture(scope="module", params=[False, True])
-def gather_context_logits_fixture(request) -> bool:
-    return request.param
-
-
-@pytest.fixture(scope="module", params=[False, True])
 def disable_overlap_scheduler_fixture(request) -> bool:
     return request.param
 
@@ -61,44 +51,21 @@ class CacheSalter:
 
 @pytest.fixture(scope="module")
 def llm(
-    gather_context_logits_fixture: bool,
-    gather_generation_logits_fixture: bool,
     sampler_type_fixture: str,
     disable_overlap_scheduler_fixture: bool,
 ):
-    gather_generation_logits = gather_generation_logits_fixture
     sampler_type = sampler_type_fixture
     disable_overlap_scheduler = disable_overlap_scheduler_fixture
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
-        gather_generation_logits=gather_generation_logits,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         sampler_type=sampler_type,
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
-
-    # FIXME: Sometimes LLM shutdown hangs, might be related to https://nvbugs/5577178.
-    #        Remove patch below once fixed.
-    old_exit = LLM.__exit__
-
-    def _exit_with_xfail_on_timeout(self, exc_type, exc_value, traceback) -> bool:
-        import _pytest.outcomes
-
-        try:
-            return old_exit(self, exc_type, exc_value, traceback)
-        except _pytest.outcomes.Failed as e:
-            if e.msg and "pytest-timeout" in e.msg.lower():
-                pytest.xfail("Known LLM shutdown issue (https://nvbugs/5577178).")
-            else:
-                raise
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(LLM, "__exit__", _exit_with_xfail_on_timeout)
-
-        with llm:
-            yield llm
+    with llm:
+        yield llm
 
 
 @pytest.fixture(scope="module", params=[False, True])
@@ -112,89 +79,68 @@ def simple_llm(request) -> LLM:
     return llm
 
 
-@force_ampere  # Save H100 resource
-@pytest.mark.parametrize("reuse_cache", [False, True])
-@pytest.mark.parametrize("return_log_probs", [False, True])
-# FIXME: sometimes LLM shutdown hangs, might be related to https://nvbugs/5577178
-# NB: Timeout covers fixtures https://github.com/pytest-dev/pytest-timeout/issues/134
-@pytest.mark.timeout(120, method="signal")
-@pytest.mark.threadleak(enabled=False)
-def test_generate_with_return_logits(
-    llm,
-    gather_context_logits_fixture: bool,
-    gather_generation_logits_fixture: bool,
-    reuse_cache: bool,
-    return_log_probs: bool,
+def check_generated_output(
+    gather_context_logits,
+    gather_generation_logits,
+    sampling_params,
+    reuse_cache,
+    return_log_probs,
+    idx,
+    output,
+    streaming,
 ):
-    gather_context_logits = gather_context_logits_fixture
-    gather_generation_logits = gather_generation_logits_fixture
+    if gather_context_logits:
+        assert output.context_logits is not None
+        # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
+        expected_len = len(prompts[0].split()) + 1
+        assert expected_len == output.context_logits.shape[0]
+    else:
+        assert output.context_logits is None
 
-    if not (gather_context_logits or gather_generation_logits or return_log_probs):  # prune space
-        pytest.skip("Nothing to test")
-
-    sampling_params = SamplingParams(
-        max_tokens=8,
-        return_context_logits=gather_context_logits,
-        return_generation_logits=gather_generation_logits,
-        logprobs=return_log_probs,
-    )
-
-    for output in llm.generate(
-        prompts,
-        sampling_params=sampling_params,
-        cache_salt=[CacheSalter.get_salt(reuse_cache) for _ in prompts],
-    ):
-        if gather_context_logits:
-            assert output.context_logits is not None
-            # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
-            expected_len = len(prompts[0].split()) + 1
-            try:
-                assert expected_len == output.context_logits.shape[0]
-            except AssertionError:
-                # FIXME: Remove this once the bug has been fixed
-                if gather_context_logits and reuse_cache:
-                    pytest.xfail("Known bug: https://nvbugs/5577178")
-                raise
+    for sequence in output.outputs:
+        if streaming:
+            assert sequence.length == idx + 1
         else:
-            assert output.context_logits is None
-
-        for sequence in output.outputs:
             assert sequence.length == sampling_params.max_tokens
 
-            if gather_generation_logits:
-                gen_logits = sequence.generation_logits
-                assert gen_logits is not None
-                assert gen_logits.ndim == 2
+        if gather_generation_logits:
+            gen_logits = sequence.generation_logits
+            assert gen_logits is not None
+            assert gen_logits.ndim == 2
+            if streaming:
+                assert gen_logits.shape[0] == 1
+                assert torch.argmax(gen_logits, dim=1).tolist()[0] == sequence.token_ids[-1]
+            else:
                 assert gen_logits.shape[0] == sampling_params.max_tokens
                 assert torch.argmax(gen_logits, dim=1).tolist() == sequence.token_ids
-            else:
-                assert sequence.generation_logits is None
-
-            if return_log_probs:
-                assert len(sequence.logprobs) == sampling_params.max_tokens
-            else:
-                assert len(sequence.logprobs) == 0
+        else:
+            assert sequence.generation_logits is None
+        if return_log_probs:
+            assert len(sequence.logprobs) == sequence.length
+        else:
+            assert len(sequence.logprobs) == 0
 
 
 @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("reuse_cache", [False, True])
 @pytest.mark.parametrize("return_log_probs", [False, True])
-# FIXME: sometimes LLM shutdown hangs, might be related to https://nvbugs/5577178
-# NB: Timeout covers fixtures https://github.com/pytest-dev/pytest-timeout/issues/134
+@pytest.mark.parametrize("gather_generation_logits", [False, True])
+@pytest.mark.parametrize("gather_context_logits", [False, True])
+@pytest.mark.parametrize("async_generation", [False, True])
 @pytest.mark.timeout(120, method="signal")
 @pytest.mark.threadleak(enabled=False)
-def test_generate_async_with_return_logits(
+def test_generation_with_return_logits(
     llm,
-    gather_context_logits_fixture: bool,
-    gather_generation_logits_fixture: bool,
+    gather_context_logits: bool,
+    gather_generation_logits: bool,
     reuse_cache: bool,
     return_log_probs: bool,
+    async_generation: bool,
 ):
-    gather_context_logits = gather_context_logits_fixture
-    gather_generation_logits = gather_generation_logits_fixture
-
     if not (gather_context_logits or gather_generation_logits or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
+    if reuse_cache and gather_context_logits:
+        pytest.skip("nvbugs/5577178")
 
     sampling_params = SamplingParams(
         max_tokens=8,
@@ -203,48 +149,45 @@ def test_generate_async_with_return_logits(
         logprobs=return_log_probs,
     )
 
-    for idx, output in enumerate(
-        llm.generate_async(
-            prompts[0],
-            sampling_params=sampling_params,
-            streaming=True,
-            cache_salt=CacheSalter.get_salt(reuse_cache),
-        )
-    ):
-        if gather_context_logits:
-            assert output.context_logits is not None
-            # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
-            expected_len = len(prompts[0].split()) + 1
-            try:
-                assert expected_len == output.context_logits.shape[0]
-            except AssertionError:
-                # FIXME: Remove this once the bug has been fixed
-                if gather_context_logits and reuse_cache:
-                    pytest.xfail("Known bug: https://nvbugs/5577178")
-                raise
-        else:
-            assert output.context_logits is None
-
-        for sequence in output.outputs:
-            assert sequence.length == idx + 1
-
-            if gather_generation_logits:
-                gen_logits = sequence.generation_logits
-                assert gen_logits is not None
-                assert gen_logits.ndim == 2
-                assert gen_logits.shape[0] == 1
-                try:
-                    assert torch.argmax(gen_logits, dim=1).tolist()[0] == sequence.token_ids[-1]
-                except AssertionError:
-                    # FIXME: Remove xfail once the bug is fixed
-                    pytest.xfail("Known bug: https://nvbugs/5573238")
-            else:
-                assert sequence.generation_logits is None
-
-            if return_log_probs:
-                assert len(sequence.logprobs) == idx + 1
-            else:
-                assert len(sequence.logprobs) == 0
+    if async_generation:
+        for idx, output in enumerate(
+            llm.generate_async(
+                prompts[0],
+                sampling_params=sampling_params,
+                streaming=True,
+                cache_salt=CacheSalter.get_salt(reuse_cache),
+            )
+        ):
+            check_generated_output(
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits,
+                sampling_params=sampling_params,
+                reuse_cache=reuse_cache,
+                return_log_probs=return_log_probs,
+                idx=idx,
+                output=output,
+                streaming=True,
+            )
+        assert idx == sampling_params.max_tokens - 1
+    else:
+        for idx, output in enumerate(
+            llm.generate(
+                prompts,
+                sampling_params=sampling_params,
+                cache_salt=[CacheSalter.get_salt(reuse_cache) for _ in prompts],
+            )
+        ):
+            check_generated_output(
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits,
+                sampling_params=sampling_params,
+                reuse_cache=reuse_cache,
+                return_log_probs=return_log_probs,
+                idx=idx,
+                output=output,
+                streaming=False,
+            )
+        assert idx == len(prompts) - 1
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 1, 3], ids=["top_0", "top_1", "top_3"])
