@@ -907,9 +907,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp", [(1, 1, 4), (1, 2, 2),
-                                                      (2, 1, 2)],
-                             ids=["pp1tp1cp4", "pp1tp2cp2", "pp2tp1cp2"])
+    @pytest.mark.parametrize(
+        "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
+            (1, 1, 4, False),
+            (1, 2, 2, False),
+            (1, 2, 2, True),
+            (2, 1, 2, False),
+        ],
+        ids=["pp1tp1cp4", "pp1tp2cp2", "pp1dp2cp2", "pp2tp1cp2"])
     @pytest.mark.parametrize("cuda_graph_config", [
         None,
         {
@@ -927,7 +932,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ])
     @pytest.mark.parametrize("comms_medium", ["fifo", "nccl"])
     def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
-                                   gen_pp, gen_tp, gen_cp):
+                                   gen_pp, gen_tp, gen_cp, enable_attention_dp):
         use_nccl_for_alltoall = comms_medium == "nccl"
         gen_ep = gen_tp * gen_cp
         kv_cache_config = {
@@ -967,6 +972,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "UCX",
                 "max_tokens_in_buffer": 8192,
             },
+            "enable_attention_dp": enable_attention_dp,
         }
         disaggregated_server_config = {
             "hostname": "localhost",

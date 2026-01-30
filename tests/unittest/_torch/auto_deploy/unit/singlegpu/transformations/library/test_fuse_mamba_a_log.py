@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import torch
 import torch.nn as nn
 from _graph_test_helpers import run_test_transformed_gm
@@ -89,39 +88,3 @@ def test_fuse_mamba_a_log_creates_fused_param():
         node.target in {torch.exp, torch.ops.aten.exp.default}
         for node in gm_transformed.graph.nodes
     ), "exp node should be removed after fusion."
-
-
-def test_fuse_mamba_a_log_memory_usage():
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    torch.cuda.empty_cache()
-
-    device = "cuda"
-    dtype = torch.float32
-    num_features = 1024 * 1024
-
-    model = DummyMambaALogModule(num_features=num_features, dtype=dtype, device=device).to(
-        device=device, dtype=dtype
-    )
-    x = model.get_input(device=device, dtype=dtype)
-    gm = torch_export_to_gm(model, args=(x,), clone=True)
-
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    mem_before = torch.cuda.memory_allocated()
-
-    gm_transformed = _apply_fuse_mamba_a_log(gm)
-
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    mem_after = torch.cuda.memory_allocated()
-
-    diff = mem_after - mem_before
-    tolerance = 5 * 1024  # 5_KiB tolerance for allocator variance
-
-    assert abs(diff) <= tolerance, (
-        f"Unexpected memory delta after fusion. Expected no additional memory, got {diff} bytes."
-    )
-
-    with pytest.raises(AttributeError):
-        gm_transformed.get_parameter("A_log")

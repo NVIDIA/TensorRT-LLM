@@ -113,7 +113,7 @@ class _FlashInferPlanner:
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
             self.kv_layout,
-            backend="fa2",
+            backend="fa2" if torch.cuda.get_device_capability(0) == (9, 0) else "auto",
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
@@ -333,9 +333,9 @@ def flashinfer_mha_with_cache(
     q_shape_og = q.shape
     b, s = q_shape_og[:2]
 
-    q = q.reshape(b * s, -1, head_dim)
-    k = k.reshape(b * s, -1, head_dim)
-    v = v.reshape(b * s, -1, head_dim)
+    q = q.reshape(b * s, -1, head_dim).contiguous()
+    k = k.reshape(b * s, -1, head_dim).contiguous()
+    v = v.reshape(b * s, -1, head_dim).contiguous()
 
     # convert to flashinfer-style metadata
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()

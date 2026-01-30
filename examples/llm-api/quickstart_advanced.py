@@ -55,13 +55,17 @@ def add_llm_args(parser):
                             'VANILLA', 'TRTLLM', 'FLASHINFER',
                             'FLASHINFER_STAR_ATTENTION'
                         ])
-    parser.add_argument('--moe_backend',
-                        type=str,
-                        default='CUTLASS',
-                        choices=[
-                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
-                        ])
+    parser.add_argument(
+        '--moe_backend',
+        type=str,
+        default='AUTO',
+        choices=[
+            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP', 'DEEPGEMM',
+            'CUTEDSL', 'TRITON'
+        ],
+        help=
+        'MoE backend to use. AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.'
+    )
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')

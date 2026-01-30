@@ -484,6 +484,11 @@ _SMALL_MODEL_CONFIGS = {
             "num_hidden_layers": 8,
         },
     },
+    "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": {
+        "model_kwargs": {
+            "hidden_size": 64,
+        }
+    },
 }
 
 

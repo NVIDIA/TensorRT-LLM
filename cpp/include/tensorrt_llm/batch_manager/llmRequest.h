@@ -1555,8 +1555,14 @@ public:
 
     void setContextCurrentPosition(SizeType32 contextCurrentPosition)
     {
-        mContextCurrentPositionDraft = contextCurrentPosition;
-        mContextCurrentPositionTarget = contextCurrentPosition;
+        if (mUseDraftModel)
+        {
+            mContextCurrentPositionDraft = contextCurrentPosition;
+        }
+        else
+        {
+            mContextCurrentPositionTarget = contextCurrentPosition;
+        }
     }
 
     /// When chunked, the position of the current chunk is returned. Otherwise, only the beginning

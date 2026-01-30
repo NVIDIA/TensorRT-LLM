@@ -2,6 +2,7 @@
 
 import flashinfer
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
@@ -252,3 +253,65 @@ def gated_rms_norm_ref(
     if z is not None and norm_before_gate:
         out *= F.silu(z)
     return out.to(dtype)
+
+
+# =============================================================================
+# Sharded RMSNorm (for sharded activations)
+# =============================================================================
+
+
+@torch.library.custom_op("auto_deploy::sharded_rmsnorm", mutates_args=())
+def sharded_rmsnorm(
+    input: torch.Tensor, weight: torch.Tensor, eps: float, world_size: int
+) -> torch.Tensor:
+    """RMSNorm for sharded activations that need global reduction.
+
+    When activations are sharded (split along the last dimension across devices),
+    standard RMSNorm computes an incorrect local mean. This op uses all_reduce to compute
+    the global mean of squared values across all shards, ensuring correct normalization.
+
+    The computation is:
+        1. Compute local sum of squares: sum(input^2) over local features
+        2. All-reduce to get global sum of squares across all shards
+        3. Compute global mean: global_sum / (local_dim * world_size)
+        4. Normalize: input * rsqrt(global_mean + eps)
+        5. Scale with local weight (weight is also column-sharded)
+
+    Args:
+        input: Input tensor, shape [..., local_hidden_size] where local_hidden_size
+               is the shard of the full hidden dimension on this device.
+        weight: Scaling weights, shape [local_hidden_size] (column-sharded).
+        eps: Small constant for numerical stability.
+        world_size: Number of devices across which the activation is sharded.
+
+    Returns:
+        Normalized and scaled tensor with same shape as input.
+    """
+    local_dim = input.shape[-1]
+
+    # Cast to float32 for precision
+    input_fp32 = input.to(torch.float32)
+
+    # Compute local sum of squares (NOT mean - we need sum for all_reduce)
+    local_sum_sq = input_fp32.pow(2).sum(-1, keepdim=True)
+
+    # All-reduce to get global sum of squares
+    global_sum_sq = local_sum_sq.clone()
+    dist.all_reduce(global_sum_sq, op=dist.ReduceOp.SUM)
+
+    # Compute global mean: global_sum / total_elements
+    global_count = local_dim * world_size
+    global_mean_sq = global_sum_sq / global_count
+
+    # Normalize
+    input_normalized = input_fp32 * torch.rsqrt(global_mean_sq + eps)
+
+    # Apply weight (local weight since it's also column-sharded)
+    out = weight * input_normalized.to(input.dtype)
+    return out
+
+
+@sharded_rmsnorm.register_fake
+def _(input: torch.Tensor, weight: torch.Tensor, eps: float, world_size: int) -> torch.Tensor:
+    """Fake implementation for tracing."""
+    return torch.empty_like(input)

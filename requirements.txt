@@ -66,7 +66,7 @@ ninja
 etcd3 @ git+https://github.com/kragniz/python-etcd3.git@e58a899579ba416449c4e225b61f039457c8072a
 blake3
 soundfile
-triton==3.5.1
+triton==3.5.1 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
 tiktoken
 blobfile
 openai-harmony==0.0.4

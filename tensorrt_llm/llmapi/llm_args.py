@@ -444,10 +444,13 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA",
-                     "TRITON"] = Field(default='CUTLASS',
-                                       description="MoE backend to use.")
+    backend: Literal[
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
+        "TRITON"] = Field(
+            default='AUTO',
+            description="MoE backend to use. "
+            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+        )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -838,6 +841,37 @@ class KvCacheConnectorConfig(StrictBaseModel):
         ..., description="The class name of the scheduler within the module.")
     connector_worker_class: str = Field(
         ..., description="The class name of the worker within the module.")
+
+
+class LayerwiseBenchmarksConfig(StrictBaseModel):
+    """
+    Configuration for layer-wise benchmarks calibration.
+    """
+    calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
+        default="NONE",
+        description=
+        "Instruct the layer-wise benchmarks calibrator to work on MARK mode, or COLLECT mode",
+        status="prototype")
+
+    calibration_file_path: Optional[str] = Field(
+        default=None,
+        description=
+        "The file path which the layer-wise benchmarks calibrator saves to or loads from",
+        status="prototype")
+
+    calibration_layer_indices: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Layer indices to filter. If None, all layers are collected in COLLECT mode.",
+        status="prototype")
+
+    @model_validator(mode='after')
+    def validate_calibration_file_path(self) -> 'LayerwiseBenchmarksConfig':
+        if self.calibration_mode == "COLLECT" and not self.calibration_file_path:
+            raise ValueError(
+                f"Expect calibration_file_path not to be empty when work on {self.calibration_mode} mode"
+            )
+        return self
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
@@ -2935,6 +2969,7 @@ class TorchLlmArgs(BaseLlmArgs):
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
                                    description="Allreduce strategy to use.",
                                    status="beta")
+
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description=
@@ -3010,6 +3045,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description="The max number of performance statistic entries.",
         status="prototype",
     )
+
+    layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
+        default_factory=LayerwiseBenchmarksConfig,
+        description="Configuration for layer-wise benchmarks calibration.",
+        status="prototype")
 
     @property
     def quant_config(self) -> QuantConfig:

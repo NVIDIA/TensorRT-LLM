@@ -61,6 +61,43 @@ def _preload_python_lib():
 _preload_python_lib()
 
 import sys
+from pathlib import Path
+
+
+def _setup_vendored_triton_kernels():
+    """Ensure our vendored triton_kernels takes precedence over any existing installation.
+
+    Some environments bundle triton_kernels, which can conflict with our vendored version. This function:
+    1. Clears any pre-loaded triton_kernels from sys.modules
+    2. Temporarily adds our package root to sys.path
+    3. Imports triton_kernels (caching our version in sys.modules)
+    4. Removes the package root from sys.path
+    """
+
+    # Clear any pre-loaded triton_kernels from cache
+    for mod in list(sys.modules.keys()):
+        if mod == "triton_kernels" or mod.startswith("triton_kernels."):
+            del sys.modules[mod]
+
+    # Temporarily add our package root to sys.path
+    root = Path(__file__).parent.parent
+
+    vendored = root / "triton_kernels"
+    if not vendored.exists():
+        raise RuntimeError(
+            f"Vendored triton_kernels module not found at {vendored}")
+
+    should_add_to_path = str(root) not in sys.path
+    if should_add_to_path:
+        sys.path.insert(0, str(root))
+
+    import triton_kernels  # noqa: F401
+
+    if should_add_to_path:
+        sys.path.remove(str(root))
+
+
+_setup_vendored_triton_kernels()
 
 # Need to import torch before tensorrt_llm library, otherwise some shared binary files
 # cannot be found for the public PyTorch, raising errors like:

@@ -355,6 +355,13 @@ def get_model_yaml_config(model_label: str,
                 },
                 'guided_decoding_backend': 'xgrammar'
             }
+        },
+        # Gemma3 models require FlashInfer backend due to sliding window attention
+        {
+            'patterns': ['gemma_3', 'gemma3'],
+            'config': {
+                'attn_backend': 'FLASHINFER',
+            }
         }
     ]
 

@@ -552,9 +552,10 @@ protected:
                 mCpSize = genCp;
             }
 
-            mTpRank = mRankInInstance % mTpSize;
+            // Rank formula must match targetIRanks: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank.
+            mCpRank = mRankInInstance % mCpSize;
+            mTpRank = (mRankInInstance / mCpSize) % mTpSize;
             mPpRank = mRankInInstance / (mTpSize * mCpSize);
-            mCpRank = (mRankInInstance % (mTpSize * mCpSize)) / mTpSize;
             mContextRankSize = contextRanks;
             mGenRankSize = genRanks;
             mContextTpSize = contextTp;
@@ -887,7 +888,16 @@ protected:
     auto makeLlmRequestWithDP(SizeType32 length, LlmRequest::RequestIdType requestId, int contextDpRank)
     {
         constexpr SizeType32 maxNewTokens{1};
-        texec::Request request{VecTokens(length), maxNewTokens};
+        auto const tokensPerBlock = mContextCacheState->getModelConfig().mTokensPerBlock;
+
+        std::optional<CPMetaData> cpMetaData;
+        int seqLen = length;
+        if (mCpSize > 1)
+        {
+            cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
+            seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
+        }
+        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
 
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
@@ -905,7 +915,6 @@ protected:
         request.setContextPhaseParams(std::move(stats));
         auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
 
-        std::optional<CPMetaData> cpMetaData;
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -1433,6 +1442,27 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
+    // Filter request lengths based on CP requirements.
+    // Each request must have at least one block per CP rank to be valid for CP tests.
+    std::vector<int> lenList = {60, 30, 60, 10};
+    if (genCp > 1)
+    {
+        std::vector<int> updatedLenList;
+        for (auto len : lenList)
+        {
+            if (len > tokensPerBlock * (genCp - 1))
+            {
+                updatedLenList.push_back(len);
+            }
+        }
+        if (updatedLenList.empty())
+        {
+            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
+                         << tokensPerBlock << ", genCp=" << genCp;
+        }
+        lenList = updatedLenList;
+    }
+
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
     if (mIsContext || mIsGeneration)
@@ -1443,7 +1473,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
         int requestId = 0;
-        for (auto len : {60, 30, 60, 10})
+        for (auto len : lenList)
         {
             requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
             requestId++;
@@ -1817,6 +1847,44 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & DP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(true),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests cases where there's non-trivial DP on context side while non-trivial CP & DP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA1, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(2, 4),
+        /*contextPp*/ testing::Values(1),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(true),
+        /*generationDP*/ testing::Values(true),
         /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
@@ -2231,8 +2299,8 @@ TEST(targetTest, CacheStateContextDP)
     auto const verifyContext = [&](int contextRank, int generationRank, std::vector<int> const& expectRanks,
                                    int expectPPDomain, int expectTPDomain, bool expectNeedSend)
     {
-        int contextDPRank = contextRank % contextTP;
-        int generationDPRank = generationRank % genTP;
+        int contextDPRank = (contextRank % (contextTP * contextCP)) / contextCP;
+        int generationDPRank = (generationRank % (genTP * genCP)) / genCP;
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
                                    : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
 
@@ -2244,12 +2312,12 @@ TEST(targetTest, CacheStateContextDP)
             tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
             genEnableDP, generationDPRank, genTP};
 
-        auto const contextTragetInfo
+        auto const contextTargetInfo
             = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
 
-        EXPECT_EQ(expectRanks, contextTragetInfo.mIRanks);
-        EXPECT_EQ(expectPPDomain, contextTragetInfo.mDomainPPSize);
-        EXPECT_EQ(expectTPDomain, contextTragetInfo.mDomainTPSize);
+        EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
+        EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
+        EXPECT_EQ(expectTPDomain, contextTargetInfo.mDomainTPSize);
         EXPECT_EQ(expectNeedSend, MLACacheFormatter::needSendCache(contextCache, genCache, contextRank));
     };
 
@@ -2335,11 +2403,11 @@ TEST(targetTest, CacheStateContextDP)
     contextTP = 1;
     genTP = 2;
 
-    auto const verfiyGeneration = [&](int contextRank, int generationRank, std::vector<int> const& expectRanks,
+    auto const verifyGeneration = [&](int contextRank, int generationRank, std::vector<int> const& expectRanks,
                                       int expectPPDomain, int expectTPDomain)
     {
-        int contextDPRank = contextRank % contextTP;
-        int generationDPRank = generationRank % genTP;
+        int contextDPRank = (contextRank % (contextTP * contextCP)) / contextCP;
+        int generationDPRank = (generationRank % (genTP * genCP)) / genCP;
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
                                    : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
 
@@ -2351,17 +2419,17 @@ TEST(targetTest, CacheStateContextDP)
             tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
             genEnableDP, generationDPRank, genTP};
 
-        auto const contextTragetInfo
+        auto const contextTargetInfo
             = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(contextCache, genCache, generationRank);
 
-        EXPECT_EQ(expectRanks, contextTragetInfo.mIRanks);
-        EXPECT_EQ(expectPPDomain, contextTragetInfo.mDomainPPSize);
-        EXPECT_EQ(expectTPDomain, contextTragetInfo.mDomainTPSize);
+        EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
+        EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
+        EXPECT_EQ(expectTPDomain, contextTargetInfo.mDomainTPSize);
     };
 
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 1, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
 
     contextTP = 1;
@@ -2371,9 +2439,9 @@ TEST(targetTest, CacheStateContextDP)
     contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
     genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
 
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 1, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
 
     genEnableDP = false;
@@ -2386,8 +2454,8 @@ TEST(targetTest, CacheStateContextDP)
     contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
     genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
 
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
-    verfiyGeneration(
+    verifyGeneration(
         /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
 }

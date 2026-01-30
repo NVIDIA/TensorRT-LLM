@@ -184,6 +184,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
                     "compile_model": {"backend": "torch-simple"},
+                    "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                 },
             },
         ),
@@ -192,6 +193,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
                     "compile_model": {"backend": "torch-cudagraph"},
                 },

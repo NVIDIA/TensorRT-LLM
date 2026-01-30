@@ -8,6 +8,7 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm._utils import is_sm_100f, local_mpi_size
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ...distributed import allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
@@ -439,6 +440,8 @@ class WideEPMoE(MoE):
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
+            self.num_slots, token_selected_slots)
 
         use_allgather = not use_all_to_all
 

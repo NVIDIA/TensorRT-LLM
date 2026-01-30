@@ -2547,7 +2547,6 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
         if (!fileExists("waives.txt")) {
             error "There is no merged waives.txt file, use the default waives.txt."
         }
-        sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
         sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
         echo "Download merged waives.txt successfully"
     } catch (InterruptedException e) {

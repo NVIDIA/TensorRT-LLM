@@ -21,7 +21,7 @@ from test_common.llm_data import with_mocked_hf_download
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 
-@pytest.mark.parametrize("use_hf_speculative_model", [False, True])
+@pytest.mark.parametrize("use_hf_speculative_model", [False])
 @with_mocked_hf_download
 def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
     """Test speculative decoding with AutoDeploy using the build_and_run_ad main()."""

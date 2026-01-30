@@ -197,6 +197,35 @@ class Distributed(ABC):
             obj = self.cp_broadcast(obj, root=root, **kwargs)
         return obj
 
+    @abstractmethod
+    def tp_allgather(self, obj):
+        pass
+
+    @abstractmethod
+    def cp_allgather(self, obj):
+        pass
+
+    def tp_cp_allgather(self, obj):
+        """Allgather across both TP and CP dimensions.
+
+        First gathers within CP group, then across TP groups, returning
+        a flattened list with tp_size * cp_size entries.
+        """
+        # Gather across CP dimension.
+        if self.cp_size > 1:
+            obj = self.cp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match cp_allgather output format.
+
+        # Gather across TP dimension.
+        if self.tp_size > 1:
+            obj = self.tp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match tp_allgather output format.
+
+        # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
+        return [entry for tp_group in obj for entry in tp_group]
+
 
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     """
@@ -465,8 +494,6 @@ class MPIDist(Distributed):
     def tp_comm(self):
         if self._tp_comm is None:
             mapping = self.mapping
-            if mapping.has_cp_helix():
-                mapping = mapping.repurpose_helix_cp_to_tp()
             new_group = mpi_comm().group.Incl(mapping.tp_group)
             self._tp_comm = mpi_comm().Create_group(new_group)
         return self._tp_comm
@@ -475,8 +502,6 @@ class MPIDist(Distributed):
     def pp_comm(self):
         if self._pp_comm is None:
             mapping = self.mapping
-            if mapping.has_cp_helix():
-                mapping = mapping.repurpose_helix_cp_to_tp()
             new_group = mpi_comm().group.Incl(mapping.pp_group)
             self._pp_comm = mpi_comm().Create_group(new_group)
         return self._pp_comm
@@ -831,6 +856,22 @@ class TorchDist(Distributed):
                 group=self.mapping.cp_group_pg,
                 device=torch.device("cpu"))
             return ret[0]
+
+    @log_op
+    def cp_allgather(self, obj):
+        if isinstance(obj, torch.Tensor):
+            output_list = [
+                torch.empty_like(obj)
+                for _ in range(self.mapping.cp_group_pg.size())
+            ]
+            dist.all_gather(output_list, obj, group=self.mapping.cp_group_pg)
+            return output_list
+        else:
+            output_list = [None] * self.mapping.cp_group_pg.size()
+            dist.all_gather_object(output_list,
+                                   obj,
+                                   group=self.mapping.cp_group_pg)
+            return output_list
 
     @log_op
     def pp_allgather(self, obj):

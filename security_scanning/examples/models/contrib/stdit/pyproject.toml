@@ -13,7 +13,7 @@ dependencies = [
     "fabric (>=3.2.2,<4.0.0)",
     "contexttimer (>=0.3.3,<0.4.0)",
     "ray (>=2.53.0,<3.0.0)",
-    "protobuf (>=6.33.4,<7.0.0)",
+    "protobuf (>=6.33.5,<7.0.0)",
     "bitsandbytes (>=0.39.0)",
     "rpyc (==6.0.0)",
     "galore-torch (>=1.0,<2.0)"

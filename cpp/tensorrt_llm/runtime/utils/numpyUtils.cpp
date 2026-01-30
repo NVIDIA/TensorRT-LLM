@@ -105,6 +105,7 @@ void parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data)
 int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, std::vector<size_t>& shapeVec)
 {
     char* header_c = (char*) malloc(header_len * sizeof(char));
+    TLLM_CHECK_WITH_INFO(header_c != nullptr, "Failed to allocate memory for npy header");
     size_t n_elems = fread((void*) header_c, sizeof(char), header_len, f_ptr);
     if (n_elems != header_len)
     {

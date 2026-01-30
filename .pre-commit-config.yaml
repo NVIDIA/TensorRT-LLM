@@ -1366,6 +1366,9 @@ common-files: &common_files |
         triton_backend/tools/whisper/client.py |
     )$
 
+# Global exclude pattern for vendored third-party code
+exclude: '^triton_kernels/'
+
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
 -   repo: https://github.com/pycqa/isort
