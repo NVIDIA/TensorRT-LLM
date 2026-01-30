@@ -37,6 +37,7 @@ from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..modules.fused_add_rmsnorm import fused_add_add_rmsnorm
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType
 from .modeling_deepseekv3 import DeepseekV3MTPHead
@@ -283,13 +284,19 @@ class NemotronHMOE(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream_shared)
 
-        final_hidden_states = shared_output + routed_output
-
-        # Perform all-reduce after combining outputs for multi-GPU support.
+        # Perform all-reduce on each output separately for multi-GPU support.
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
-            final_hidden_states = self.allreduce(final_hidden_states)
+            routed_output = self.allreduce(routed_output)
+            if not isinstance(shared_output, int):
+                shared_output = self.allreduce(shared_output)
 
-        return final_hidden_states.view(orig_shape)
+        # Return separate outputs for fused_add_add_rmsnorm optimization
+        # The next layer will fuse: norm(residual + shared + routed)
+        if not isinstance(shared_output, int):
+            return routed_output.view(orig_shape), shared_output.view(orig_shape)
+        else:
+            # No shared experts, return combined
+            return routed_output.view(orig_shape), None
 
 
 class NemotronHLayer(DecoderLayer):
@@ -350,23 +357,41 @@ class NemotronHLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
+        moe_separate_outputs: Optional[Tuple[torch.Tensor,
+                                             torch.Tensor]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if residual is None:
+        if moe_separate_outputs is not None:
+            # Previous layer was MOE - use fused add+add+rmsnorm
+            routed, shared = moe_separate_outputs
+            if shared is not None:
+                hidden_states = fused_add_add_rmsnorm(
+                    residual, routed, shared, self.norm.weight,
+                    self.norm.variance_epsilon)
+                residual = residual + routed + shared
+            else:
+                # No shared experts, fall back to normal path
+                hidden_states, residual = self.norm(routed, residual)
+        elif residual is None:
             # First layer: no residual from previous layer
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer(hidden_states,
-                                   attn_metadata,
-                                   spec_metadata=spec_metadata,
-                                   **kwargs)
+        mixer_out = self.mixer(hidden_states,
+                               attn_metadata,
+                               spec_metadata=spec_metadata,
+                               **kwargs)
 
-        return hidden_states, residual
+        # Check if mixer is MOE (returns tuple)
+        if isinstance(mixer_out, tuple):
+            # MOE returns (routed, shared) for next layer's fused norm
+            return mixer_out, residual
+        else:
+            return mixer_out, residual
 
 
 class NemotronHModel(DecoderModel):
@@ -452,15 +477,33 @@ class NemotronHModel(DecoderModel):
         hidden_states = inputs_embeds
         # For each layer, the pattern is norm -> mixer -> add residual.
         # Need to handle the first layer without residual and the last layer with explicit redisual addition.
+        # When MOE layer outputs (routed, shared) separately, next layer uses fused_add_add_rmsnorm.
         residual = None
+        moe_separate_outputs = None
         for layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = layer(position_ids,
                                             hidden_states,
                                             attn_metadata,
                                             residual=residual,
+                                            moe_separate_outputs=moe_separate_outputs,
                                             spec_metadata=spec_metadata,
                                             mamba_metadata=self.mamba_metadata)
-        hidden_states = torch.add(hidden_states, residual)
+            # Check if layer returned MOE separate outputs (tuple of routed, shared)
+            if isinstance(hidden_states, tuple):
+                moe_separate_outputs = hidden_states
+                hidden_states = None  # Will be computed by next layer's fused norm
+            else:
+                moe_separate_outputs = None
+
+        # Handle final residual addition
+        if moe_separate_outputs is not None:
+            routed, shared = moe_separate_outputs
+            if shared is not None:
+                hidden_states = residual + routed + shared
+            else:
+                hidden_states = residual + routed
+        else:
+            hidden_states = torch.add(hidden_states, residual)
 
         hidden_states = self.norm_f(hidden_states)
 
