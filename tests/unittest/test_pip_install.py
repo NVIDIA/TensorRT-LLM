@@ -115,7 +115,8 @@ def install_tensorrt_llm():
 
     # Upgrade wheel to user space to avoid conflict with system package
     print("Upgrading wheel package to avoid debian package conflict...")
-    subprocess.check_call("pip3 install --upgrade --user 'wheel>=0.46.2'", shell=True)
+    subprocess.check_call("pip3 install --upgrade --user 'wheel>=0.46.2'",
+                          shell=True)
 
     install_command = "pip3 install tensorrt_llm-*.whl"
 
