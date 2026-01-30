@@ -15,6 +15,8 @@ args:
   disable_overlap_scheduler: true
   kv_cache_config:
     enable_block_reuse: false
+    free_gpu_memory_fraction: 0.88
+    tokens_per_block: 64
   model_kwargs:
     torch_dtype: bfloat16
     # num_hidden_layers: 2

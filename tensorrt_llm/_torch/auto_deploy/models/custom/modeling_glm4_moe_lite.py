@@ -139,7 +139,11 @@ except TypeError:
 
 
 class Glm4MoeLiteRMSNorm(nn.Module):
-    """RMS Normalization for GLM4 MoE Lite."""
+    """RMS Normalization for GLM4 MoE Lite.
+
+    Uses standard torch operations so AD fusion passes can replace with
+    the appropriate backend (flashinfer/triton) based on config.
+    """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -147,9 +151,11 @@ class Glm4MoeLiteRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return torch.ops.auto_deploy.triton_rms_norm(
-            hidden_states, self.weight, self.variance_epsilon
-        ).to(hidden_states.dtype)
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * hidden_states).to(input_dtype)
 
 
 class Glm4MoeLiteRotaryEmbedding(nn.Module):
@@ -157,18 +163,27 @@ class Glm4MoeLiteRotaryEmbedding(nn.Module):
 
     Simplified version that precomputes and caches cos/sin values.
     Returns full cached values (not sliced by seq_len) to enable export.
+
+    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
     """
 
-    def __init__(self, dim: int, max_position_embeddings: int = 2048, base: float = 10000.0):
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 2048,
+        base: float = 10000.0,
+        attention_scaling: float = 1.0,
+    ):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        self.attention_scaling = attention_scaling
 
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Build cos/sin cache
+        # Build cos/sin cache with AD-specific naming
         self._set_cos_sin_cache(max_position_embeddings)
 
     def _set_cos_sin_cache(self, seq_len: int):
@@ -176,16 +191,17 @@ class Glm4MoeLiteRotaryEmbedding(nn.Module):
         t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
+        self.register_buffer("_ad_cos_cached", emb.cos() * self.attention_scaling, persistent=False)
+        self.register_buffer("_ad_sin_cached", emb.sin() * self.attention_scaling, persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Return full cached cos/sin (not sliced) for export compatibility
         return (
-            self.cos_cached.to(dtype=x.dtype, device=x.device),
-            self.sin_cached.to(dtype=x.dtype, device=x.device),
+            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
+            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
         )
 
 
@@ -203,6 +219,7 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1.0,
         mscale_all_dim: float = 0.0,
+        attention_scaling: float = 1.0,
     ):
         self.scaling_factor = scaling_factor
         self.original_max_position_embeddings = original_max_position_embeddings
@@ -210,7 +227,7 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
         self.beta_slow = beta_slow
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
-        super().__init__(dim, max_position_embeddings, base)
+        super().__init__(dim, max_position_embeddings, base, attention_scaling)
 
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
@@ -241,8 +258,10 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
         )
 
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", (emb.cos() * _mscale), persistent=False)
-        self.register_buffer("sin_cached", (emb.sin() * _mscale), persistent=False)
+        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
+        # Note: attention_scaling is already incorporated in _mscale for YaRN
+        self.register_buffer("_ad_cos_cached", (emb.cos() * _mscale), persistent=False)
+        self.register_buffer("_ad_sin_cached", (emb.sin() * _mscale), persistent=False)
 
     @staticmethod
     def _yarn_find_correction_dim(
@@ -443,6 +462,7 @@ class Glm4MoeLiteAttention(nn.Module):
     """Multi-head Latent Attention (MLA) for GLM4 MoE Lite.
 
     Uses compressed KV representation with latent projections.
+    Receives position embeddings from the model level (shared rotary embedding).
     """
 
     def __init__(self, config, layer_idx: Optional[int] = None):
@@ -458,9 +478,6 @@ class Glm4MoeLiteAttention(nn.Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
 
         # Q projection (with optional LoRA)
         if self.q_lora_rank is None:
@@ -492,9 +509,6 @@ class Glm4MoeLiteAttention(nn.Module):
             self.num_heads * self.v_head_dim, self.hidden_size, bias=config.attention_bias
         )
 
-        # Initialize rotary embedding
-        self._init_rope()
-
         # Softmax scale
         self.softmax_scale = self.qk_head_dim ** (-0.5)
         # Apply mscale adjustment if using YaRN scaling with factor
@@ -511,55 +525,11 @@ class Glm4MoeLiteAttention(nn.Module):
                 )
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
-    def _init_rope(self):
-        # Check if rope_scaling is None, empty, or missing required "factor" key
-        use_yarn = (
-            self.config.rope_scaling is not None
-            and isinstance(self.config.rope_scaling, dict)
-            and "factor" in self.config.rope_scaling
-        )
-
-        if not use_yarn:
-            self.rotary_emb = Glm4MoeLiteRotaryEmbedding(
-                self.qk_rope_head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=self.rope_theta,
-            )
-        else:
-            scaling_type = self.config.rope_scaling.get("type", "yarn")
-            scaling_factor = self.config.rope_scaling["factor"]
-
-            if scaling_type == "yarn":
-                kwargs = {
-                    key: self.config.rope_scaling[key]
-                    for key in [
-                        "original_max_position_embeddings",
-                        "beta_fast",
-                        "beta_slow",
-                        "mscale",
-                        "mscale_all_dim",
-                    ]
-                    if key in self.config.rope_scaling
-                }
-                self.rotary_emb = Glm4MoeLiteYarnRotaryEmbedding(
-                    self.qk_rope_head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                    **kwargs,
-                )
-            else:
-                # Default to base rotary embedding for unsupported types
-                self.rotary_emb = Glm4MoeLiteRotaryEmbedding(
-                    self.qk_rope_head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -585,10 +555,8 @@ class Glm4MoeLiteAttention(nn.Module):
         # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
 
-        kv_seq_len = q_len
-
-        # Get cos/sin for RoPE
-        cos, sin = self.rotary_emb(hidden_states, seq_len=kv_seq_len)
+        # Get cos/sin from position_embeddings (full cached from shared rotary embedding)
+        cos, sin = position_embeddings  # Full table: [max_seq_len, head_dim]
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 
@@ -649,11 +617,12 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_ids)
+        hidden_states = self.self_attn(hidden_states, position_ids, position_embeddings)
         hidden_states = residual + hidden_states
 
         # MLP/MoE
@@ -717,7 +686,66 @@ class Glm4MoeLiteModel(Glm4MoeLitePreTrainedModel):
         )
         self.norm = Glm4MoeLiteRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Shared rotary embedding at model level (not per-layer)
+        # This creates a single set of cos/sin buffers for all layers
+        self.rotary_emb = self._init_rope(config)
+
         self.post_init()
+
+    def _init_rope(self, config):
+        """Initialize shared rotary embedding for all layers."""
+        qk_rope_head_dim = config.qk_rope_head_dim
+
+        # Compute attention_scaling for RoPE (same logic as in attention)
+        attention_scaling = 1.0
+        if (
+            config.rope_scaling is not None
+            and isinstance(config.rope_scaling, dict)
+            and "factor" in config.rope_scaling
+        ):
+            mscale_all_dim = config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = config.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = Glm4MoeLiteYarnRotaryEmbedding._yarn_get_mscale(
+                    scaling_factor, mscale_all_dim
+                )
+                attention_scaling = mscale
+
+        # Check if rope_scaling is None, empty, or missing required "factor" key
+        use_yarn = (
+            config.rope_scaling is not None
+            and isinstance(config.rope_scaling, dict)
+            and "factor" in config.rope_scaling
+        )
+
+        if not use_yarn:
+            return Glm4MoeLiteRotaryEmbedding(
+                qk_rope_head_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                base=config.rope_theta,
+                attention_scaling=attention_scaling,
+            )
+        else:
+            scaling_factor = config.rope_scaling["factor"]
+            kwargs = {
+                key: config.rope_scaling[key]
+                for key in [
+                    "original_max_position_embeddings",
+                    "beta_fast",
+                    "beta_slow",
+                    "mscale",
+                    "mscale_all_dim",
+                ]
+                if key in config.rope_scaling
+            }
+            return Glm4MoeLiteYarnRotaryEmbedding(
+                qk_rope_head_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                scaling_factor=scaling_factor,
+                base=config.rope_theta,
+                attention_scaling=attention_scaling,
+                **kwargs,
+            )
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -747,10 +775,14 @@ class Glm4MoeLiteModel(Glm4MoeLitePreTrainedModel):
             position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
+        # Compute position embeddings once from shared rotary embedding
+        # This returns full cached cos/sin tables
+        position_embeddings = self.rotary_emb(inputs_embeds)
+
         hidden_states = inputs_embeds
 
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, position_ids)
+            hidden_states = decoder_layer(hidden_states, position_ids, position_embeddings)
 
         hidden_states = self.norm(hidden_states)
 
@@ -762,7 +794,7 @@ class Glm4MoeLiteForCausalLM(Glm4MoeLitePreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
         self.model = Glm4MoeLiteModel(config)
         self.vocab_size = config.vocab_size
