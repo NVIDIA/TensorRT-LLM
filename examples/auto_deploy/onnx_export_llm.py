@@ -11,16 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""ONNX export script for AutoDeploy models.
 
+This script exports a HuggingFace model to ONNX format using the AutoDeploy
+transform pipeline directly, without initializing the full LLM executor.
+"""
 
 import argparse
 
-from tensorrt_llm._torch.auto_deploy import LLM
+from tensorrt_llm._torch.auto_deploy.export import export_onnx
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Export HuggingFace model to ONNX format using AutoDeploy."
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -63,7 +69,9 @@ def main():
     ad_config.attn_backend = "torch"
     if args.output_dir is not None:
         ad_config.transforms["export_to_onnx"]["output_dir"] = args.output_dir
-    LLM(**ad_config.model_dump(exclude_unset=True))
+
+    # Use direct InferenceOptimizer instead of LLM to avoid executor initialization
+    export_onnx(ad_config)
 
 
 if __name__ == "__main__":

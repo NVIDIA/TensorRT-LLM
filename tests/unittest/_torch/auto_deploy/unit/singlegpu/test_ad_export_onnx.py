@@ -4,7 +4,7 @@ import onnx
 import pytest
 from _model_test_utils import get_small_model_config
 
-from tensorrt_llm._torch.auto_deploy import LLM
+from tensorrt_llm._torch.auto_deploy.export import export_onnx
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
 
@@ -26,7 +26,7 @@ def test_ad_export_onnx(model: str, output_dir: str, num_attn_ops: int):
         max_seq_len=4,
     )
     ad_config.transforms["export_to_onnx"]["output_dir"] = output_dir
-    _ = LLM(**ad_config.model_dump(exclude_unset=True))
+    export_onnx(ad_config)
 
     # check if the output directory exists
     assert os.path.exists(output_dir)
