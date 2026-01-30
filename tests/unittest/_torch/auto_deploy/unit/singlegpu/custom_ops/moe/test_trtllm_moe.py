@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.quant import (
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
     TRTLLM_NVFP4_COLUMN_SIZE,
     TRTLLM_NVFP4_ROW_SIZE,
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,

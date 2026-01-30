@@ -6,8 +6,9 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from ....llmapi.llm_args import KvCacheConfig
-from .attention_interface import (
+from .....llmapi.llm_args import KvCacheConfig
+from ..attention.triton_attention import _flattened_context_mha, _generate_mha
+from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
@@ -15,7 +16,6 @@ from .attention_interface import (
     ResourceHandlerDict,
     UnpagedResourceHandler,
 )
-from .triton_attention import _flattened_context_mha, _generate_mha
 
 Constant = Union[int, float, str, None]
 

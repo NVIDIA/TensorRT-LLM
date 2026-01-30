@@ -9,10 +9,10 @@ from typing import List, Optional
 import torch
 
 # use trtllm distributed ops to improve TP performance if possible
-from ....mapping import Mapping
-from ...distributed import AllReduce, allgather
-from ...modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
-from ..distributed.common import ReduceOp, get_rank_world_size, get_world_size, is_ompi
+from .....mapping import Mapping
+from ....distributed import AllReduce, allgather
+from ....modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
+from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size, is_ompi
 
 # Cache AllReduce modules to avoid recreating on every call
 # This is critical for CUDA graph compatibility - recreating modules during

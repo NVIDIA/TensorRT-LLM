@@ -5,9 +5,9 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from ...flashinfer_utils import get_env_enable_pdl
-from ...modules.mamba.layernorm_gated import _layer_norm_fwd
-from .triton_kernels.rms_norm import rms_norm
+from ....flashinfer_utils import get_env_enable_pdl
+from ....modules.mamba.layernorm_gated import _layer_norm_fwd
+from .triton_rms_norm import rms_norm
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_rms_norm", mutates_args=())

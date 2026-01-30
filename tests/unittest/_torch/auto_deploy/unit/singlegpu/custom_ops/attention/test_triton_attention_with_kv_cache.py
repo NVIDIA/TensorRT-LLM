@@ -7,7 +7,7 @@ import triton
 from _custom_op_utils import torch_rope_reference
 from _model_test_utils import repeat_kv
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.triton_kernels.attention_with_kv_cache import (
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention_with_kv_cache import (
     attention_kv_stage1,
     attention_kv_stage2,
     context_attention_kv,

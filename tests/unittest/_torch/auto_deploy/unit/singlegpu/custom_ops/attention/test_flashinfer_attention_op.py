@@ -3,7 +3,9 @@ import pytest
 import torch
 from torch_attention_reference import TorchAttentionReference
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import _GlobalFlashInferPlanner
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention import (
+    _GlobalFlashInferPlanner,
+)
 
 
 def _attention_with_fp8_kv_cache(

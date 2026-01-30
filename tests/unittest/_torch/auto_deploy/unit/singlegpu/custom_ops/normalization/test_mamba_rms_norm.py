@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.rms_norm import (
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import (
     gated_rms_norm_ref,
     triton_rmsnorm_gated,
 )

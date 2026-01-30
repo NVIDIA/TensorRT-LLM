@@ -12,7 +12,7 @@
 import flashinfer
 import torch
 
-from ...flashinfer_utils import get_env_enable_pdl
+from ....flashinfer_utils import get_env_enable_pdl
 
 
 @torch.library.custom_op(

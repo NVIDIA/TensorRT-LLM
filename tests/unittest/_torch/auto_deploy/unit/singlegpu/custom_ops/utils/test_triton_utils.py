@@ -4,7 +4,7 @@ import pytest
 import torch
 
 # Import to register the custom op
-from tensorrt_llm._torch.auto_deploy.custom_ops import triton_utils  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.utils import triton_utils  # noqa: F401
 
 
 def _reference_gather_scatter(

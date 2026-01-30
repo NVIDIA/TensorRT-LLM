@@ -8,7 +8,7 @@ from typing import List, Optional
 
 import torch
 
-from ..distributed import common as dist
+from ...distributed import common as dist
 
 # ============================================================================
 # PyTorch Distributed Backend Ops (demollm mode)

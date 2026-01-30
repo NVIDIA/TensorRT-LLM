@@ -7,14 +7,14 @@ import torch
 import triton
 
 from .triton_attention import _flattened_context_mha, _generate_mha
-from .triton_kernels.attention_with_kv_cache import (
+from .triton_attention_with_kv_cache import (
     attention_kv_stage2,
     context_attention_kv,
     context_attention_kv_flattened,
     gqa_attention_kv_stage1,
     update_kv_cache_rope_fusion,
 )
-from .triton_kernels.attention_with_paged_kv_cache import (
+from .triton_attention_with_paged_kv_cache import (
     attention_kv_paged_stage1,
     context_attention_kv_paged,
     update_paged_kv_cache,
