@@ -29,13 +29,32 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
 
-    def get_default_kwargs(self, enable_chunked_prefill=False):
+    # Configuration presets for different attention backends
+    ATTN_BACKEND_CONFIGS = {
+        "flashinfer": {
+            "max_batch_size": 512,
+            "max_seq_len": 8192,
+            "compile_backend": "torch-cudagraph",
+        },
+        "torch": {
+            "max_batch_size": 128,
+            "max_seq_len": 2048,
+            "compile_backend": "torch-simple",
+        },
+    }
+
+    def get_default_kwargs(self,
+                           enable_chunked_prefill=False,
+                           attn_backend="flashinfer"):
+        backend_cfg = self.ATTN_BACKEND_CONFIGS[attn_backend]
+
         config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "max_batch_size": 512,
+            "attn_backend": attn_backend,
+            "max_batch_size": backend_cfg["max_batch_size"],
             # 131072 is the max seq len for the model
-            "max_seq_len": 8192,
+            "max_seq_len": backend_cfg["max_seq_len"],
             # max num tokens is derived in the build_config, which is not used by AutoDeploy llmargs.
             # Set it explicitly here to 8192 which is the default in build_config.
             "max_num_tokens": 8192,
@@ -46,7 +65,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "transforms": {
                 "compile_model": {
                     "backend":
-                    "torch-cudagraph",
+                    backend_cfg["compile_backend"],
                     "cuda_graph_batch_sizes":
                     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
                 },
@@ -54,8 +73,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         }
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
-            config[
-                "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
+            # NOTE: must be > max(tokens_per_block, max_batch_size)
+            config["max_num_tokens"] = 512
         return config
 
     def get_default_sampling_params(self):
@@ -69,8 +88,9 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    def test_auto_dtype(self, world_size, enable_chunked_prefill):
-        kwargs = self.get_default_kwargs(enable_chunked_prefill)
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "torch"])
+    def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
@@ -78,8 +98,9 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
+            if attn_backend != "torch":
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm, sampling_params=sampling_params)
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.skip_less_device(2)

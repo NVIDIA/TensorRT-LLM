@@ -432,8 +432,8 @@ l0_h100:
       orchestrator: mpi
   tests:
   - unittest/_torch/auto_deploy/unit/singlegpu
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-True-1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[flashinfer_ssm-False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-True]

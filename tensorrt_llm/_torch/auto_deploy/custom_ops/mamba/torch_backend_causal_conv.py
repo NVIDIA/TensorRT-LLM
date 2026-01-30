@@ -22,10 +22,10 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    CausalConvResourceHandler,
     Constant,
     MHACallable,
     ResourceHandlerDict,
-    StateResourceHandler,
 )
 
 
@@ -302,11 +302,12 @@ class TorchBackendCausalConv(AttentionDescriptor):
         in_channels = inp_fake.shape[-1]
         kernel_size = w_fake.shape[-1]
 
+        # NOTE: torch backend stores kernel_size elements in state (full conv window).
+        # CausalConvResourceHandler.state_shape = (conv_dim, d_conv - 1), so d_conv = kernel_size + 1.
         return {
-            "conv_state_cache": StateResourceHandler(
-                in_channels,
-                kernel_size,
-                # NOTE: not configurable at the moment, using auto to match the input dtype
+            "conv_state_cache": CausalConvResourceHandler(
+                conv_dim=in_channels,
+                d_conv=kernel_size + 1,  # state_shape[-1] = d_conv - 1 = kernel_size
                 dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
             )
         }
