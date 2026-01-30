@@ -1,3 +1,4 @@
+import re
 from typing import Dict, Generic, List, Optional, Tuple
 
 import torch
@@ -452,6 +453,18 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
             vocab_size=config.draft_vocab_size,
         )
         self.load_lm_head_from_target = True
+        config = model_config.pretrained_config
+        if model_config.pretrained_config.eagle_config.get(
+                "parallel_draft_step", 1) > 1:
+            from .modeling_medusa import MedusaForCausalLM
+            self.parallel_draft_heads = nn.ModuleList([
+                MedusaForCausalLM(model_config, start_layer_idx + config.num_hidden_layers, head_idx=i)
+                for i in range(
+                    model_config.pretrained_config.eagle_config.get(
+                        "parallel_draft_step", 1)-1)
+            ])
+        else:
+            self.parallel_draft_heads = nn.ModuleList([])
 
     def forward(
         self,
@@ -485,7 +498,18 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
 
         new_weights = {}
         for k, v in weights.items():
-            if 'lm_head' not in k:
+            if 'parallel_draft_heads' in k:
+                # parallel_draft_heads is a direct attribute of Eagle3ForCausalLM,
+                # not under self.model, so keep the key as-is but transform the format.
+                # Checkpoint format: parallel_draft_heads.{head_idx}.{layer_idx}.linear.{param}
+                # Model format: parallel_draft_heads.{head_idx}.model.medusa_layers.{layer_idx}.{param}
+                match = re.match(r'parallel_draft_heads\.(\d+)\.(\d+)\.linear\.(.+)', k)
+                if match:
+                    head_idx, layer_idx, param = match.groups()
+                    new_k = f'parallel_draft_heads.{head_idx}.model.medusa_layers.{layer_idx}.{param}'
+                else:
+                    new_k = k
+            elif 'lm_head' not in k:
                 new_k = "model." + k
             else:
                 self.load_lm_head_from_target = False
