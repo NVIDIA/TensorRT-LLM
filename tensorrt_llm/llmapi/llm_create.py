@@ -65,6 +65,9 @@ def get_llm_args_from_cli_params(model: str, **params: dict[str, Any]) -> BaseLl
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
+    # Remove model from llm_args_dict if present, since we pass it explicitly as the first argument
+    del llm_args_dict["model"]
+
     logger.info(f"Creating LLM args from dict: {llm_args_dict}")
     return llm_args_cls(model=model, **llm_args_dict)
 

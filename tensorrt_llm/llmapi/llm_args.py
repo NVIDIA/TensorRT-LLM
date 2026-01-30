@@ -1985,9 +1985,6 @@ class BaseLlmArgs(StrictBaseModel):
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
 
-    quant_config: QuantConfig = Field(default_factory=QuantConfig,
-                                      description="Quantization config.")
-
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
                                            description="KV cache config.")
@@ -2051,8 +2048,8 @@ class BaseLlmArgs(StrictBaseModel):
     max_seq_len: Optional[int] = Field(
         default=None, description="The maximum sequence length.")
 
-    max_beam_width: int = Field(default=1,
-                                description="The maximum beam width.")
+    max_beam_width: Optional[int] = Field(default=1,
+                                          description="The maximum beam width.")
 
     max_num_tokens: Optional[int] = Field(
         default=8192, description="The maximum number of tokens.")
@@ -2177,6 +2174,24 @@ class BaseLlmArgs(StrictBaseModel):
                 f"Using default gpus_per_node: {torch.cuda.device_count()}")
             v = torch.cuda.device_count()
         return v
+
+    @model_validator(mode="after")
+    def normalize_optional_fields_to_defaults(self):
+        """Normalize certain fields to their declared default values in case a user explicitly sets them to None.
+
+        This is necessary because downstream code expects these fields to be non-None.
+        """
+        for field_name in (
+                "max_batch_size",
+                "max_input_len",
+                "max_beam_width",
+                "max_num_tokens",
+        ):
+            if getattr(self, field_name) is None:
+                field_info = self.__class__.model_fields.get(field_name)
+                if field_info is not None and field_info.default is not None:
+                    setattr(self, field_name, field_info.default)
+        return self
 
     @model_validator(mode="after")
     def validate_parallel_config(self):
@@ -2334,6 +2349,9 @@ class TrtLlmArgs(BaseLlmArgs):
     extended_runtime_perf_knob_config: Optional[
         ExtendedRuntimePerfKnobConfig] = Field(
             default=None, description="Extended runtime perf knob config.")
+
+    quant_config: QuantConfig = Field(default_factory=QuantConfig,
+                                      description="Quantization config.")
 
     calib_config: CalibConfig = Field(default_factory=CalibConfig,
                                       description="Calibration config.")
@@ -3036,23 +3054,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"
                 ) from e
-        return self
-
-    @model_validator(mode='after')
-    def sync_quant_config_with_kv_cache_config_dtype(self) -> 'TorchLlmArgs':
-        if self.kv_cache_config is None:
-            return self
-
-        assert self.quant_config is not None
-        if self.kv_cache_config.dtype == "auto":
-            return self
-        elif self.kv_cache_config.dtype == 'fp8':
-            self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-        else:
-            logger.warning(
-                f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
-                "please update the validator")
-
         return self
 
     @model_validator(mode='after')

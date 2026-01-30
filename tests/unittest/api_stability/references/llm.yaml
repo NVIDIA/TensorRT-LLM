@@ -83,10 +83,6 @@ methods:
         annotation: Optional[str]
         default: null
         status: deprecated
-      build_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
-        default: null
-        status: deprecated
       cuda_graph_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null

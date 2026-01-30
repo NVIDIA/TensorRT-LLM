@@ -498,7 +498,7 @@ class ModelLoader:
                     dtype=self.llm_args.dtype,
                     mapping=self.mapping,
                     quant_config=self.llm_args.quant_config,
-                    **self.llm_args.calib_config.to_dict(),
+                    **self.llm_args.calib_config.model_dump(),
                     trust_remote_code=self.llm_args.trust_remote_code,
                 )
             if self.llm_args.parallel_config.is_multi_gpu:

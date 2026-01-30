@@ -131,7 +131,9 @@ def llm_test_harness(model_dir: str,
 
     llm_cls = LLM_torch if backend == "pytorch" else LLM
 
-    with assert_resource_freed(llm_cls, model_dir, tokenizer,
+    with assert_resource_freed(llm_cls,
+                               model_dir,
+                               tokenizer=tokenizer,
                                **llm_kwargs) as llm:
         outputs = llm.generate(inputs, sampling_params=sampling_params)
         print(outputs)
