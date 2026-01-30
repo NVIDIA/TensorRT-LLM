@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import pickle
 import sys
 import traceback
@@ -20,6 +19,7 @@ import traceback
 import cloudpickle
 import pytest
 import torch
+import utils.util
 from mpi4py import MPI
 from utils.util import check_accuracy, skip_pre_blackwell
 
@@ -32,8 +32,8 @@ from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
+cloudpickle.register_pickle_by_value(utils.util)
 MPI.pickle.__init__(
     cloudpickle.dumps,
     cloudpickle.loads,
