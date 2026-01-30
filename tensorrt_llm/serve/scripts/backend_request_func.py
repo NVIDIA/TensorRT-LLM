@@ -323,6 +323,9 @@ async def async_request_openai_chat_completions(
         payload["ignore_eos"] = request_func_input.ignore_eos
     if request_func_input.extra_body:
         payload.update(request_func_input.extra_body)
+    if request_func_input.logprobs:
+        payload["logprobs"] = True
+        payload["top_logprobs"] = request_func_input.logprobs
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",

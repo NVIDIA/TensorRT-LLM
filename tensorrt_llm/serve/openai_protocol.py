@@ -381,7 +381,8 @@ class CompletionRequest(OpenAIBaseModel):
     def to_sampling_params(self,
                            vocab_size: int = 32000,
                            gather_generation_logits: bool = False,
-                           backend: Optional[str] = None) -> SamplingParams:
+                           backend: Optional[str] = None,
+                           enable_processpool: bool = False) -> SamplingParams:
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
@@ -427,6 +428,10 @@ class CompletionRequest(OpenAIBaseModel):
                 sampling_params.logprobs = self.logprobs
             else:
                 if gather_generation_logits:
+                    if enable_processpool:
+                        raise ValueError(
+                            "`logprobs` > 1 is not supported when `enable_processpool` is True"
+                        )
                     sampling_params.logprobs = self.logprobs
                 elif self.logprobs > 1:
                     raise ValueError(
@@ -740,7 +745,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            vocab_size: int = 32000,
                            gather_generation_logits: bool = False,
                            reasoning_parser: Optional[str] = None,
-                           backend: Optional[str] = None) -> SamplingParams:
+                           backend: Optional[str] = None,
+                           enable_processpool: bool = False) -> SamplingParams:
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
             max_tokens=self.max_completion_tokens,
@@ -785,6 +791,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 sampling_params.logprobs = logprobs
             else:
                 if gather_generation_logits:
+                    if enable_processpool:
+                        raise ValueError(
+                            "`logprobs` > 1 is not supported when `enable_processpool` is True"
+                        )
                     sampling_params.logprobs = logprobs
                 elif self.top_logprobs:
                     raise ValueError(
