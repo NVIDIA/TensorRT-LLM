@@ -773,7 +773,7 @@ class TestMLADescriptor:
         """Test that MLA descriptor uses standard metadata args."""
         mla_descriptor = self._get_mla_descriptor()
 
-        expected_args = ["batch_info_host", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
+        expected_args = ["batch_info_host", "seq_len", "input_pos", "slot_idx", "cu_seqlen"]
         actual_args = mla_descriptor.get_standard_metadata_args()
         assert actual_args == expected_args, (
             f"Expected standard metadata {expected_args}, got {actual_args}"

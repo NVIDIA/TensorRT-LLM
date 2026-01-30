@@ -6,7 +6,7 @@ args:
   trust_remote_code: true
   compile_backend: torch-simple
   max_seq_len: 512
-  attn_page_size: 512
+  # attn_page_size: 512
   # attn_page_size: 64
   # attn_backend: flashinfer
   model_factory: AutoModelForCausalLM
