@@ -984,8 +984,9 @@ def get_layer_after_linear_node(
             # check if this is MLA:
             # these two intermediate linear nodes are the latent q and kv projections.
             if len(intermediate_lin_nodes) == 2:
-                # MLA has a RMS norm inside, so it should have one intermediate linear node.
-                if len(intermediate_lin_nodes) != 1:
+                # MLA has a RMS norm inside, so it should have one (or two, couning biaas)
+                # intermediate weight nodes
+                if len(intermediate_weight_nodes) not in [1, 2]:
                     return LayerType.UNKNOWN, 1
                 return LayerType.MLA, head_size
             else:
