@@ -242,13 +242,12 @@ class TrtllmGenSupportChecker:
                 f"Input dtype {config.dtype} not supported. Supported: FP16, BF16, FP8 (E4M3).",
             )
 
-        if config.kv_cache_dtype is not None:
-            if config.kv_cache_dtype not in cls.SUPPORTED_KV_CACHE_DTYPES:
-                return (
-                    False,
-                    f"KV cache dtype {config.kv_cache_dtype} not supported. "
-                    f"Supported: FP16, BF16, FP8.",
-                )
+        if config.kv_cache_dtype not in cls.SUPPORTED_KV_CACHE_DTYPES:
+            return (
+                False,
+                f"KV cache dtype {config.kv_cache_dtype} not supported. "
+                f"Supported: FP16, BF16, FP8.",
+            )
 
         if config.out_dtype is not None:
             if config.out_dtype not in cls.SUPPORTED_OUT_DTYPES:
@@ -493,9 +492,6 @@ class WorkspaceManager:
         dtype_size = get_size_in_bytes(dtype=binding_dtype, num_elements=1)
         batch_beam = max_num_seq
 
-        multi_processor_count = torch.cuda.get_device_properties(
-            device=torch.cuda.current_device()
-        ).multi_processor_count
         # Estimate max sequence length tile
         max_seq_len_tile = max(
             1, (multi_processor_count + batch_beam * num_heads - 1) // (batch_beam * num_heads)
@@ -583,14 +579,14 @@ class FlashInferTrtllmGenAttention:
 
     @property
     def layout(self) -> str:
-        """KV cache layout (HND or NHD)."""
+        """KV cache layout."""
         return self._layout
 
     def is_supported(self, config: AttentionConfig, phase: str = "both") -> Tuple[bool, str]:
         """Check if configuration is supported by this backend."""
         if not IS_FLASHINFER_AVAILABLE:
             return False, "flashinfer package is not installed."
-        return self._checker.is_supported(config)
+        return self._checker.is_supported(config, phase)
 
     def _compute_scales(
         self,
@@ -799,18 +795,13 @@ def is_supported(
         position_shift_enabled: Whether position shift is enabled.
         sink_token_length: Sink token length for StreamingLLM.
         cross_attention: Whether cross attention is used.
-        cyclic_attention_window_size: Cyclic attention window size.
-        max_attention_window_size: Max attention window size.
         is_spec_decoding: Whether speculative decoding is enabled.
         is_mla_enable: Whether MLA is enabled.
         is_fused_qkv: Whether QKV is fused.
         update_kv_cache: Whether KV cache update is enabled.
-        has_rotary_inv_freq: Whether rotary_inv_freq is provided.
-        has_rotary_cos_sin: Whether rotary_cos_sin is provided.
-        has_kv_scale: Whether KV scales are provided.
         has_cross_kv: Whether cross KV is provided.
-        quant_config: Quantization configuration (QuantConfig). If provided and kv_cache_dtype
-                     is None, will automatically determine kv_cache_dtype based on
+        quant_config: Quantization configuration (QuantConfig). If provided,
+                     will automatically determine kv_cache_dtype based on
                      has_fp8_kv_cache() or has_fp4_kv_cache().
         phase: Phase to check ("context", "generation", or "both").
 
@@ -1060,7 +1051,7 @@ def trtllm_gen_attention(
 
     kv_cache = None
     if kv_cache_manager is not None and not config.has_fp4_kv_cache:
-        kv_cache = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+        kv_cache = kv_cache_manager.get_buffers(layer_idx, kv_layout=DEFAULT_KV_LAYOUT)
 
     # ========== 2. Get Backend ==========
     backend = FlashInferTrtllmGenAttention()
@@ -1134,14 +1125,14 @@ def trtllm_gen_attention(
         ctx_output = out_tensor[:num_ctx_tokens]
 
         # Build cumulative sequence lengths
-        ctx_lens = host_ctx_lens[:num_contexts].to(torch.int32)
+        ctx_lens = host_ctx_lens[:num_contexts].to(dtype=torch.int32, device=q.device)
         cum_seq_lens_q = torch.zeros(num_contexts + 1, dtype=torch.int32, device=q.device)
-        torch.cumsum(ctx_lens.to(q.device), dim=0, out=cum_seq_lens_q[1:])
+        torch.cumsum(ctx_lens, dim=0, out=cum_seq_lens_q[1:])
 
         # KV sequence lengths
-        ctx_kv_lens = sequence_length[:num_contexts].to(torch.int32)
+        ctx_kv_lens = sequence_length[:num_contexts].to(dtype=torch.int32, device=q.device)
         cum_seq_lens_kv = torch.zeros(num_contexts + 1, dtype=torch.int32, device=q.device)
-        torch.cumsum(ctx_kv_lens.to(q.device), dim=0, out=cum_seq_lens_kv[1:])
+        torch.cumsum(ctx_kv_lens, dim=0, out=cum_seq_lens_kv[1:])
 
         # Use host tensors to avoid device-to-host sync during CUDA graph capture
         # ctx_lens is already on CPU (from host_ctx_lens)
