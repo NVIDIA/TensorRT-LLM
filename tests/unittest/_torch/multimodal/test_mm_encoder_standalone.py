@@ -626,12 +626,15 @@ def test_kv_event_mm_keys_with_uuid_mixed_media_types():
                     inp["multi_modal_data"]["video"] = []
                 inp["multi_modal_data"]["video"].extend(
                     data if isinstance(data, list) else [data])
-
+            
     # Add multi_modal_uuids for both image and video modalities
     inp["multi_modal_uuids"] = {
         "image": image_uuids,  # ["uuid-image-seashore", None]
         "video": [video_uuid]  # ["uuid-video-tokyo-walk"]
     }
+    
+    print("DEBUG: multi_modal_data", inp["multi_modal_data"])
+    print("DEBUG: multi_modal_uuids", inp["multi_modal_uuids"])
 
     with llm:
         _ = llm.generate([inp], sampling_params=sampling_params)
