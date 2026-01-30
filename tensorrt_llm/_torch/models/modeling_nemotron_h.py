@@ -591,6 +591,14 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
+        """Model-specific defaults for NemotronH.
+
+        Disables block reuse due to SSM/hybrid architecture constraints.
+        """
+        return {"kv_cache_config": {"enable_block_reuse": False}}
+
 
 class NemotronHMTPDecoderLayer(NemotronHLayer):
 

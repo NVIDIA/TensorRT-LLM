@@ -625,6 +625,14 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                          vocab_size=model_config.pretrained_config.vocab_size)
         self._execution_stats = None
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
+        """Model-specific defaults for HunyuanDense.
+
+        Disables block reuse due to hybrid Mamba architecture constraints.
+        """
+        return {"kv_cache_config": {"enable_block_reuse": False}}
+
     def load_weights(self, weights: ConsumableWeightsDict):
         tp_size = self.model_config.mapping.tp_size
         head_dim = getattr(
