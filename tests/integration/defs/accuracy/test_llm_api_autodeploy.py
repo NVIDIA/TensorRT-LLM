@@ -354,3 +354,53 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestGLM4Flash(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for GLM-4.7-Flash."""
+
+    MODEL_NAME = "zai-org/GLM-4.7-Flash"
+    MODEL_PATH = MODEL_NAME  # Model is in HF_CACHE
+    # Set minimum possible seq len + small buffer, for test speed & memory usage
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+    MAX_NUM_TOKENS = MAX_SEQ_LEN
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "compile_backend": "torch-simple",
+            "max_batch_size": 64,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_NUM_TOKENS,
+            "skip_loading_weights": False,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.7
+            },
+            "model_kwargs": {
+                "torch_dtype": "bfloat16"
+            },
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    def test_auto_dtype(self):
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
