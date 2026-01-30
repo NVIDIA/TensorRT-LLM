@@ -23,13 +23,14 @@ Eagle drafter implementations.
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, Type
+from typing import Any, Dict, Type
 
 import torch.nn as nn
 from accelerate import init_empty_weights
 from torch._prims_common import DeviceLikeType
 from transformers import PretrainedConfig, PreTrainedModel
 
+from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .custom.modeling_eagle import Eagle3DrafterForCausalLM
 from .factory import ModelFactoryRegistry
@@ -38,11 +39,8 @@ from .hf import AutoModelForCausalLMFactory
 
 @dataclass
 class EagleConfigInfo:
-    """Model-specific configuration for Eagle drafters.
-
-    Attributes:
-        config_class: The drafter model class (e.g., Eagle3DrafterForCausalLM).
-        kwargs: Model-specific kwargs for Eagle3Config (e.g., load_embedding_from_target).
+    """Model-specific configuration for Eagle drafters. This class is used to store Eagle-specific information that
+    we use to build the Eagle drafter model - e.g. whether to load the embedding and lm head from the target model.
     """
 
     config_class: Type[PreTrainedModel]
@@ -58,24 +56,26 @@ class EagleConfig(PretrainedConfig):
 
     Extends PretrainedConfig with Eagle-specific parameters while preserving
     all base model config values.
+
+    Args:
+        config: Base config for the draft model from its config.json.
+        draft_model_defaults: EagleConfigInfo containing model-specific defaults.
+            These defaults can be overridden by values in config.json.
     """
 
-    def __init__(self, config: PretrainedConfig = None, **kwargs):
-        # kwargs are defaults; config values override them if present
-        if config is not None:
-            config_dict = config.to_dict()
-            # Log when config overrides a default kwarg
-            for key, default_value in kwargs.items():
-                if key in config_dict and config_dict[key] != default_value:
-                    ad_logger.info(
-                        f"EagleConfig: config has '{key}={config_dict[key]}', "
-                        f"overriding default '{default_value}'"
-                    )
-            kwargs = {**kwargs, **config_dict}
+    def __init__(self, config: PretrainedConfig, draft_model_defaults: Dict[str, Any]):
+        config_dict = config.to_dict()
 
-        # Initialize parent with all config values
-        # Model-specific defaults are provided via EagleConfigInfo in the factory
-        super().__init__(**kwargs)
+        # Log when config overrides a default
+        for key, value in draft_model_defaults.items():
+            if key in config_dict and config_dict[key] != value:
+                ad_logger.info(
+                    f"EagleConfig: config has '{key}={config_dict[key]}', "
+                    f"overriding default '{value}'"
+                )
+
+        merged = deep_merge_dicts(draft_model_defaults, config_dict)
+        super().__init__(**merged)
 
 
 @ModelFactoryRegistry.register("EagleDrafter")
@@ -92,6 +92,8 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
     """
 
     # Map config model_type -> EagleConfigInfo (drafter class + model-specific kwargs)
+    # TODO: Possibly we can infer some of these kwargs from the drafter model config, e.g.
+    # load_embedding_from_target can be inferred by the state_dict and/or draft vocab size.
     _drafter_mapping: Dict[str, EagleConfigInfo] = {
         "llama": EagleConfigInfo(
             config_class=Eagle3DrafterForCausalLM,
@@ -121,7 +123,7 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
         # Convert base config to Eagle3Config, preserving existing values
         # and applying model-specific kwargs from EagleConfigInfo
-        model_config = EagleConfig(model_config, **config_info.eagle_config_defaults)
+        model_config = EagleConfig(model_config, config_info.eagle_config_defaults)
 
         # Build the model (same pattern as parent's _build_model)
         with (init_empty_weights if device == "meta" else nullcontext)():
@@ -141,7 +143,7 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
         return model
 
-    def build_and_load_model(self, device: DeviceLikeType) -> nn.Module:
+    def build_and_load_model(self, _device: DeviceLikeType) -> nn.Module:
         raise NotImplementedError(
             "EagleDrafterFactory does not support build_and_load_model(). "
             "Use build_model() + load_or_random_init() instead."

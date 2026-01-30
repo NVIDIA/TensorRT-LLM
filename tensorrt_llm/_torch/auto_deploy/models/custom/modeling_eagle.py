@@ -260,9 +260,6 @@ class Eagle3DecoderLayer(nn.Module):
         embeds: torch.Tensor,
         position_embeds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Embeddings could have a different dtype if they come from the target model.
-        embeds = embeds.to(self.dtype)
-
         residual = hidden_states
         hidden_states = self.hidden_norm(hidden_states)
 
@@ -449,6 +446,22 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
             last_hidden_state=last_hidden_state,
         )
 
+    def get_input_embeddings(self):
+        if self.model.embed_tokens is not None:
+            return self.model.embed_tokens
+        else:
+            raise NotImplementedError(
+                "Eagle3DrafterForCausalLM does not have an input embedding layer."
+            )
+
+    def get_output_embeddings(self):
+        if self.lm_head is not None:
+            return self.lm_head
+        else:
+            raise NotImplementedError(
+                "Eagle3DrafterForCausalLM does not have an output embedding layer."
+            )
+
 
 @dataclass
 class EagleWrapperOutput(ModelOutput):
@@ -510,22 +523,24 @@ class EagleWrapper(nn.Module):
         """Apply draft-to-target token mapping if available."""
         d2t = getattr(self.draft_model.model, "d2t", None)
         if d2t is not None:
-            draft_output_ids = d2t.data[draft_output_ids] + draft_output_ids
+            draft_output_ids = d2t[draft_output_ids] + draft_output_ids
         return draft_output_ids
 
     def apply_draft_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Apply embedding to input_ids for the draft model."""
         if self.load_embedding_from_target:
-            return self.target_model.get_input_embeddings()(input_ids)
+            embeds = self.target_model.get_input_embeddings()(input_ids)
+            return embeds.to(self.draft_model.dtype)
         else:
-            return self.draft_model.model.embed_tokens(input_ids)
+            return self.draft_model.get_input_embeddings()(input_ids)
 
     def apply_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply lm_head to get logits from hidden states."""
         if self.load_lm_head_from_target:
-            return self.target_model.get_output_embeddings()(hidden_states)
+            lm_head_weights = self.target_model.get_output_embeddings()(hidden_states)
+            return lm_head_weights.to(self.draft_model.dtype)
         else:
-            return self.draft_model.lm_head(hidden_states)
+            return self.draft_model.get_output_embeddings()(hidden_states)
 
     def sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
         ret = torch.argmax(logits, dim=-1)
@@ -706,18 +721,13 @@ class EagleWrapper(nn.Module):
         if num_previously_accepted is None:
             raise ValueError("num_previously_accepted must be provided for prefill-only mode.")
 
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
-            position_ids = position_ids.expand(batch_size, -1)
-
         # Compute embeddings using the target embedding layer
-        # These embeddings will be passed to both target and draft models
-        inputs_embeds = self.apply_draft_embedding(input_ids)
+        input_embeds = self.target_model.get_input_embeddings()(input_ids)
 
         # target_logits: [batch_size, seq_len, vocab_size]
         # Pass embeddings to target model instead of input_ids
         target_logits = self.target_model(
-            inputs_embeds=inputs_embeds, position_ids=position_ids
+            inputs_embeds=input_embeds, position_ids=position_ids
         ).logits
 
         # output_ids: [batch_size, seq_len]. Contains a prefix of accepted tokens from the target model,
