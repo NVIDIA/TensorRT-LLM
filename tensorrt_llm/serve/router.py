@@ -1,6 +1,5 @@
 import asyncio
 import heapq
-import random
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
@@ -447,6 +446,11 @@ class RoundRobinRouter(Router):
     def _on_servers_updated(self, old_servers, new_servers):
         pass
 
+    def _get_next_server(self) -> str:
+        server = self._servers[self._server_idx % len(self._servers)]
+        self._server_idx += 1
+        return server
+
     async def get_next_server(
             self,
             request: OpenAIRequest,
@@ -460,18 +464,13 @@ class RoundRobinRouter(Router):
                 raise ValueError(f"No {self._server_role} servers available")
 
         async with self._lock:
-            if exclude_server:
-                # shuffle to ensure every server can be selected when exclude_server is provided
-                servers_after_exclude = [
-                    server for server in self._servers
-                    if server != exclude_server
-                ]
-                random.shuffle(servers_after_exclude)
-            else:
-                servers_after_exclude = self._servers
-            server = servers_after_exclude[self._server_idx %
-                                           len(servers_after_exclude)]
-            self._server_idx += 1
+            server = self._get_next_server()
+            if exclude_server and server == exclude_server:
+                server = self._get_next_server()
+                if server == exclude_server:
+                    raise ValueError(
+                        f"No available servers after excluding {exclude_server}"
+                    )
         return server, {}
 
     async def finish_request(self, request: OpenAIRequest):
