@@ -320,9 +320,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
-    MODEL_PATH_BF16 = f"nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"
-    MODEL_PATH_FP8 = "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"
-    MODEL_PATH_FP4 = f"nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"
+    MODEL_PATH_BF16 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"
+    MODEL_PATH_FP8 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"
+    MODEL_PATH_FP4 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"
 
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
