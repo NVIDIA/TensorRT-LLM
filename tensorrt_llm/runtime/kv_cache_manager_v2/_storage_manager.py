@@ -16,6 +16,7 @@
 import math
 import os
 import warnings
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterator, Sequence, cast
 
@@ -65,6 +66,7 @@ from ._utils import (
     remove_if,
     round_up,
     typed_enumerate,
+    typed_map,
     typed_range,
 )
 
@@ -84,8 +86,8 @@ class CacheLevelManager:
         life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex],
         cache_level: CacheLevel,
         config: CacheTierConfig,
-        slot_size_lists: Sequence[Sequence[int]],
-        init_ratio: Sequence[float],
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        init_ratio: TypedIndexList[PoolGroupIndex, float],
     ):
         self.cache_level = cache_level
         self.storage = self._create_cache_level_storage(config, slot_size_lists, init_ratio)
@@ -99,14 +101,14 @@ class CacheLevelManager:
     @staticmethod
     def _create_cache_level_storage(
         config: CacheTierConfig,
-        slot_size_lists: Sequence[Sequence[int]],
-        init_ratio: Sequence[float],
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        init_ratio: TypedIndexList[PoolGroupIndex, float],
     ) -> CacheLevelStorage:
         quota = config.quota
-        num_pools = sum(len(sizes) for sizes in slot_size_lists)
+        total_num_pools = sum(len(sizes) for sizes in slot_size_lists)
 
         def adjust_quota(quota: int, granularity: int) -> int:
-            return max(granularity * num_pools, round_up(quota, granularity))
+            return max(granularity * total_num_pools, round_up(quota, granularity))
 
         if config.tier == CacheTier.GPU_MEM:
             page_size = 2 << 20
@@ -132,7 +134,7 @@ class CacheLevelManager:
 class StorageStatistics:
     "All in number of slots, for one pool group"
 
-    slot_size: HomoTuple[int]
+    slot_size: TypedIndexList[PoolIndex, int]
     total: int
     free: int
     evictable: int
@@ -180,11 +182,9 @@ class StorageManager:
         self._life_cycle_grouping = config.life_cycle_grouping()
         slot_size_lists = [pg.slot_size_list for pg in config.slot_desc_list]
         # @TODO: accept an optional avg_seq_len param and consider sliding window.
-        init_ratio = [
-            float(sum(pg.slot_size_list) * len(pg.variants)) for pg in config.slot_desc_list
-        ]
+        init_ratio = [float(sum(pg.slot_size_list) * len(pg.slots)) for pg in config.pool_groups]
         total = sum(init_ratio)
-        init_ratio = [x / total for x in init_ratio]
+        init_ratio = typed_map(init_ratio, lambda x: x / total)
         num_levels = CacheLevel(len(config.cache_tiers))
         self._levels = cast(
             TypedIndexList,
@@ -201,7 +201,13 @@ class StorageManager:
         self._slot_desc_list = config.slot_desc_list
 
     def __del__(self) -> None:
-        self.__rawref__.invalidate()
+        self.destroy()
+
+    def destroy(self) -> None:
+        if self.__rawref__.is_valid:
+            self.__rawref__.invalidate()
+            for lvl in self._levels:
+                lvl.storage.destroy()
 
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
@@ -214,9 +220,10 @@ class StorageManager:
     def new_slots(
         self, level: CacheLevel, num_slots: TypedIndexList[LifeCycleId, int]
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
+        lc2pg = self._life_cycle_grouping
         pg_num_slots = filled_list(0, self.num_pool_groups)
         for lc in typed_range(self.num_life_cycles):
-            pg_num_slots[self.get_pool_group_index(lc)] += num_slots[lc]
+            pg_num_slots[lc2pg[lc]] += num_slots[lc]
         storage = self._levels[level].storage
         if any(
             pg_num_slots[pg] > storage.get_num_free_slots(pg)
@@ -230,16 +237,31 @@ class StorageManager:
         ret = filled_list(list[Slot](), self.num_life_cycles)
         try:
             for life_cycle in typed_range(self.num_life_cycles):
-                pg_idx = self.get_pool_group_index(life_cycle)
+                pg_idx = lc2pg[life_cycle]
                 ret[life_cycle] = storage.allocate_multiple(pg_idx, num_slots[life_cycle])
         except Exception:
             warnings.warn("Exception not expected here. Please report a bug.")
             for lc, slots in typed_enumerate(ret):
-                pg_idx = self.get_pool_group_index(lc)
+                pg_idx = lc2pg[lc]
                 for s in slots:
                     storage.release(pg_idx, s)
             raise
         return ret
+
+    def new_slots_for_pool_group(
+        self, level: CacheLevel, pg_idx: PoolGroupIndex, num_slots: int
+    ) -> list[Slot]:
+        storage = self._levels[level].storage
+        if num_slots > storage.get_num_free_slots(pg_idx):
+            num_slots_list = filled_list(0, self.num_pool_groups)
+            num_slots_list[pg_idx] = num_slots
+            self.prepare_free_slots(level, num_slots_list)
+        assert num_slots <= storage.get_num_free_slots(pg_idx)
+        try:
+            return storage.allocate_multiple(pg_idx, num_slots)
+        except Exception:
+            warnings.warn("Exception not expected here. Please report a bug.")
+            raise
 
     @property
     def life_cycles(self) -> LifeCycleRegistry:
@@ -264,6 +286,9 @@ class StorageManager:
     def cache_tiers(self) -> HomoTuple[CacheTier]:
         return tuple(cache_level.cache_tier for cache_level in self._levels)
 
+    def get_ratio_list(self, level: CacheLevel) -> TypedIndexList[PoolGroupIndex, float]:
+        return self._levels[level].storage.ratio_list
+
     def is_evictable(self, page: EvictablePage, level: CacheLevel | None = None) -> bool:
         """
         Check if a page is evictable. If level is specified, check if the page will be evictable after
@@ -283,7 +308,7 @@ class StorageManager:
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
         for pg in typed_range(self.num_pool_groups):
             goals[level, pg] = requirements[pg]
-        fallen_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
+        fallen_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
         self._prepare_free_slots(goals, level, fallen_pages)
 
     def _prepare_free_slots(
@@ -299,7 +324,7 @@ class StorageManager:
         storage = self._levels[lvl_id].storage
         ctrl = self._levels[lvl_id].controller
         num_to_evict = filled_list(0, self.num_pool_groups)
-        held_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
+        held_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
         for pg_idx in typed_range(self.num_pool_groups):
             goal = goals[lvl_id, pg_idx]
             fallen = len(fallen_pages[pg_idx])
@@ -322,7 +347,7 @@ class StorageManager:
                     "Impossible to meet the goal ({goal} free slots) for group {pg_idx}"
                 )
         evicted = ctrl.evict(num_to_evict)
-        accepted_pages = make_typed(lambda: list[Page](), self.num_pool_groups)
+        accepted_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
         is_last_level = self.is_last_level(lvl_id)
         if is_last_level:
             for pg_idx in typed_range(self.num_pool_groups):
@@ -400,13 +425,15 @@ class StorageManager:
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
-            tasks_per_pool: list[list[CopyTask]] = [[]] * num_pools
+            tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
+                lambda _: list[CopyTask](), num_pools
+            )
             for src, dst in zip(src_pages, dst_slots):
                 assert src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
                 dst_addresses = dst_pool_group.slot_address(dst.slot_id)
                 src_addresses = src_pool_group.slot_address(src.slot_id)
-                for pool_idx in range(num_pools):
+                for pool_idx in typed_range(num_pools):
                     tasks_per_pool[pool_idx].append(
                         CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx])
                     )
@@ -414,7 +441,7 @@ class StorageManager:
             src_tier = self._levels[src_level].cache_tier
             with TemporaryCudaStream(prior_events) as stream:
                 slot_sizes = self.slot_size(pool_group_index)
-                for pool_idx, tasks in enumerate(tasks_per_pool):
+                for pool_idx, tasks in typed_enumerate(tasks_per_pool):
                     batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
             finish_event = stream.take_finish_event()
             for src, dst in zip(src_pages, dst_slots):
@@ -447,7 +474,7 @@ class StorageManager:
             self._levels, lambda level: level.storage._pool_groups[pool_group_index].num_pools
         )
 
-    def slot_size(self, pool_group_index: PoolGroupIndex) -> HomoTuple[int]:
+    def slot_size(self, pool_group_index: PoolGroupIndex) -> TypedIndexList[PoolIndex, int]:
         return get_uniform_attribute(
             self._levels, lambda level: level.storage.slot_size(pool_group_index)
         )
@@ -500,7 +527,10 @@ class StorageManager:
     def get_statistics(
         self, level: CacheLevel = GPU_LEVEL
     ) -> TypedIndexList[PoolGroupIndex, StorageStatistics]:
-        ret = make_typed(lambda: StorageStatistics((), 0, 0, 0), self.num_pool_groups)
+        ret = make_typed(
+            lambda pg_idx: StorageStatistics(filled_list(0, self.num_pools(pg_idx)), 0, 0, 0),
+            self.num_pool_groups,
+        )
         for pg_idx in typed_range(self.num_pool_groups):
             pg = self._pool_group(level, pg_idx)
             evictable_cnt = self._levels[level].controller.num_evictable_pages(pg_idx)
@@ -512,7 +542,7 @@ class StorageManager:
     def get_utilization(
         self, level: CacheLevel = GPU_LEVEL
     ) -> TypedIndexList[PoolGroupIndex, float]:
-        ret = make_typed(lambda: 0.0, self.num_pool_groups)
+        ret = filled_list(0.0, self.num_pool_groups)
         stats = self.get_statistics(level)
         for pg_idx in typed_range(self.num_pool_groups):
             ret[pg_idx] = stats[pg_idx].unavailable / stats[pg_idx].total
@@ -523,3 +553,81 @@ class StorageManager:
         return sum(sum(s.slot_size) * s.unavailable for s in stats) / sum(
             sum(s.slot_size) * s.total for s in stats
         )
+
+    def shrink_pool_group(
+        self,
+        level: CacheLevel,
+        pg_idx: PoolGroupIndex,
+        new_num_slots: int,
+        persistent_pages: list[Page],
+    ) -> None:
+        """Move pages to eliminate overflow slots then shrink the pool group"""
+        lc2pg = self._life_cycle_grouping
+        assert len(persistent_pages) <= new_num_slots and all(
+            p.cache_level == level and lc2pg[p.life_cycle] == pg_idx for p in persistent_pages
+        ), "Not enough slots"
+        pool_group = self._levels[level].storage._pool_groups[pg_idx]
+        assert new_num_slots < pool_group.num_slots, "Not required for expansion of pools"
+        ctrl = self._levels[level].controller
+        overflow_slots = deque[tuple[int, Page]]()
+        for i, p in enumerate(cast(Iterator[Page], ctrl.page_iterator(pg_idx))):
+            if p.slot_id >= new_num_slots:
+                overflow_slots.append((i, p))
+        overflow_persistent_pages = [p for p in persistent_pages if p.slot_id >= new_num_slots]
+        num_overflow_persistent = len(overflow_persistent_pages)
+        while (
+            overflow_slots and len(overflow_slots) + num_overflow_persistent > overflow_slots[0][0]
+        ):
+            overflow_slots.popleft()
+        overflow_pages = [s[1] for s in overflow_slots] + overflow_persistent_pages
+        allocator = pool_group._slot_allocator
+        # prevent allocating slots with id >= new_num_slots
+        allocator.prepare_for_shrink(new_num_slots)
+        requirements = filled_list(0, self.num_pool_groups)
+        requirements[pg_idx] = len(overflow_pages)
+        self.prepare_free_slots(level, requirements)
+        assert NDEBUG or all(p.cache_level == level for p in overflow_pages), (
+            "Some pages are not overflowed"
+        )
+        self._batched_migrate(pg_idx, level, level, overflow_pages, update_src=True)
+        assert len(allocator._overflow_slots) == allocator._target_capacity - allocator._capacity
+        allocator.finish_shrink()
+        pool_group.resize_pools(new_num_slots)
+
+    def expand_pool_group(
+        self, level: CacheLevel, pg_idx: PoolGroupIndex, new_num_slots: int
+    ) -> None:
+        pool_group = self._levels[level].storage._pool_groups[pg_idx]
+        assert new_num_slots > pool_group.num_slots
+        pool_group.resize_pools(new_num_slots)
+        pool_group._slot_allocator.expand(new_num_slots)
+
+    def adjust_cache_level(
+        self,
+        level: CacheLevel,
+        new_quota: int | None,
+        new_ratio_list: TypedIndexList[PoolGroupIndex, float],
+        persistent_pages: TypedIndexList[PoolGroupIndex, list[Page]] | None = None,
+    ) -> None:
+        """Adapt the cache level by adjusting the ratio list. Persistent pages are those held and not evictable."""
+        num_cache_levels = self.num_cache_levels
+        lvl_storage = self._levels[level].storage
+        old_num_slots = lvl_storage.slot_count_list
+        new_quota = new_quota or lvl_storage.total_quota
+        new_num_slots = lvl_storage._compute_slot_count_list(new_quota, new_ratio_list)
+        if level != num_cache_levels - 1:
+            assert persistent_pages is None, (
+                "Persistent pages should be None for non-last level cache"
+            )
+        # shrink first
+        for pg_idx in typed_range(self.num_pool_groups):
+            if new_num_slots[pg_idx] >= old_num_slots[pg_idx]:
+                continue
+            pages = persistent_pages[pg_idx] if persistent_pages is not None else []
+            self.shrink_pool_group(level, pg_idx, new_num_slots[pg_idx], pages)
+        # then expand
+        for pg_idx in typed_range(self.num_pool_groups):
+            if new_num_slots[pg_idx] <= old_num_slots[pg_idx]:
+                continue
+            self.expand_pool_group(level, pg_idx, new_num_slots[pg_idx])
+        lvl_storage.post_resize()

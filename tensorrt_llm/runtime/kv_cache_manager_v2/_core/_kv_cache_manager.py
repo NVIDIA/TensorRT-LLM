@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, cast
 
+from .. import rawref
 from .._block_radix_tree import BlockRadixTree
 from .._common import (
     GPU_LEVEL,
@@ -33,6 +35,7 @@ from .._common import (
 )
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
+from .._page import Page, _PageHolder
 from .._storage._config import BufferId, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
@@ -43,10 +46,14 @@ from .._utils import (
     exact_div,
     filled_list,
     init_cuda_once,
+    make_typed,
+    typed_enumerate,
+    typed_map,
     typed_range,
     unwrap_rawref,
 )
 from ._kv_cache import _KVCache
+from ._moving_average import MovingAverage
 
 
 @dataclass(slots=True, frozen=True)
@@ -98,11 +105,42 @@ class AggregatedPageDesc:
 
 
 class KVCacheManager:
-    __slots__ = ("_init_config", "_life_cycles", "_radix_tree", "_storage")
+    __slots__ = (
+        "_init_config",
+        "_life_cycles",
+        "_radix_tree",
+        "_storage",
+        "_living_kv_caches",
+        "_avg_reused_length",
+        "_avg_sqr_capacity",
+        "_avg_sqr_history_length",
+        "_target_ratio_list_gpu",
+        "_target_ratio_list_other",
+        "_num_created_kv_caches",
+        "_num_closed_kv_caches",
+        "_last_adjustment_time",
+        "_last_update_num_closed_requests",
+    )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
     _radix_tree: BlockRadixTree
     _storage: StorageManager
+    _living_kv_caches: set[rawref.ref[_KVCache]]
+    # Eventually we should let the eviction controller evict associated pages together, i.e.
+    # when a page eviction makes other pages in the same cache level useless, it should also
+    # evict those pages. When we have that, we can simply decide capacity ratio based on
+    # memory pool utilization. For now, we use a simpler approach based on sequence length.
+    # But this ignores the fact that some pages are shared among multiple sequences.
+    _avg_reused_length: MovingAverage
+    # use squared because longer requests also lives for longer and is sampled more times.
+    _avg_sqr_capacity: MovingAverage
+    _avg_sqr_history_length: MovingAverage
+    _target_ratio_list_gpu: TypedIndexList[PoolGroupIndex, float]
+    _target_ratio_list_other: TypedIndexList[PoolGroupIndex, float]
+    _num_created_kv_caches: int
+    _num_closed_kv_caches: int
+    _last_adjustment_time: float
+    _last_update_num_closed_requests: int
 
     def __init__(self, config: KVCacheManagerConfig) -> None:
         init_cuda_once()
@@ -111,9 +149,24 @@ class KVCacheManager:
         self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
         storage_config = create_storage_config(config)
         self._storage = StorageManager(self._life_cycles, storage_config)
+        self._living_kv_caches = set[rawref.ref[_KVCache]]()
+        decay = 0.9999
+        self._avg_reused_length = MovingAverage(decay)
+        self._avg_sqr_capacity = MovingAverage(decay)
+        self._avg_sqr_history_length = MovingAverage(decay)
+        self._target_ratio_list_gpu = self._current_gpu_ratio
+        self._target_ratio_list_other = self._current_other_ratios
+        self._num_created_kv_caches = 0
+        self._num_closed_kv_caches = 0
+        self._last_adjustment_time = time.monotonic()
+        self._last_update_num_closed_requests = 0
 
     def __del__(self) -> None:
+        self.shutdown()
+
+    def shutdown(self) -> None:
         self.clear_reusable_blocks()
+        self._storage.destroy()
 
     def clear_reusable_blocks(self) -> None:
         for ref in self._radix_tree.clear():
@@ -188,7 +241,15 @@ class KVCacheManager:
         If best_efforts is False, we will resize the quota to the exact value of quota, and give up
         if not possible.
         """
-        raise NotImplementedError("Not implemented")
+        if best_efforts:
+            raise NotImplementedError("Not implemented")
+        else:
+            try:
+                self._adjust_level(cache_level, quota)
+                return True
+            except Exception as e:
+                print(f"Failed to resize cache level {cache_level} to {quota}: {e}")
+                return False
 
     def get_quota(self, cache_level: CacheLevel) -> int:
         return self._storage._levels[cache_level].storage.total_quota
@@ -301,6 +362,123 @@ class KVCacheManager:
             yield AggregatedPageDesc(
                 base, current_end - current_start, stride, lc, tuple(current_buffers)
             )
+
+    def _current_gpu_ratio(self) -> TypedIndexList[PoolGroupIndex, float]:
+        return self._storage.get_ratio_list(GPU_LEVEL)
+
+    @property
+    def _current_other_ratios(self) -> TypedIndexList[PoolGroupIndex, float]:
+        storage = self._storage
+        num_cache_levels = storage.num_cache_levels
+        if num_cache_levels == 1:
+            return self._current_gpu_ratio
+        num_pool_groups = storage.num_pool_groups
+        other_ratios = [
+            storage.get_ratio_list(i) for i in typed_range(CacheLevel(1), num_cache_levels)
+        ]
+        other_ratio = filled_list(0.0, num_pool_groups)
+        for j in typed_range(num_pool_groups):
+            for i in range(1, num_cache_levels):
+                other_ratio[j] += other_ratios[i - 1][j]
+            other_ratio[j] /= num_cache_levels - 1
+        return other_ratio
+
+    def _get_target_ratio_list(self, level: CacheLevel) -> TypedIndexList[PoolGroupIndex, float]:
+        return self._target_ratio_list_gpu if level == GPU_LEVEL else self._target_ratio_list_other
+
+    def _need_adjustment(self, level: CacheLevel) -> bool:
+        def check_mismatch(
+            a: TypedIndexList[PoolGroupIndex, float],
+            b: TypedIndexList[PoolGroupIndex, float],
+            thres: float,
+        ) -> bool:
+            return any(not (1 / thres < x / y < thres) for x, y in zip(a, b))
+
+        if level == GPU_LEVEL:
+            return check_mismatch(self._target_ratio_list_gpu, self._current_gpu_ratio, 1.25)
+        else:
+            return check_mismatch(self._target_ratio_list_other, self._current_other_ratios, 1.25)
+
+    def _adjust_level(self, level: CacheLevel, new_quota: int | None = None) -> None:
+        new_ratio_list = self._get_target_ratio_list(level)
+        storage = self._storage
+        num_cache_levels = storage.num_cache_levels
+        # held and not evictable as they are already in the last level cache.
+        persistent_pages: TypedIndexList[PoolGroupIndex, list[Page]] | None = None
+        if level == num_cache_levels - 1:
+            persistent_pages = self._gather_persistent_pages()
+        storage.adjust_cache_level(level, new_quota, new_ratio_list, persistent_pages)
+
+    def _gather_persistent_pages(self) -> TypedIndexList[PoolGroupIndex, list[Page]]:
+        last_level = self._storage.num_cache_levels - 1
+        lc2pg = self._storage._life_cycle_grouping
+        ret = make_typed(lambda _: list[Page](), self._storage.num_pool_groups)
+        for r in self._living_kv_caches:
+            kv_cache = unwrap_rawref(r)
+            assert kv_cache.status == _KVCache.Status.SUSPENDED
+            for block in kv_cache._blocks:
+                for beam in block.pages:
+                    for lc, holder in typed_enumerate(beam):
+                        if holder is None:
+                            continue
+                        assert type(holder) is _PageHolder
+                        page = holder.page
+                        assert page.status == PageStatus.HELD
+                        assert page.scheduled_for_eviction == (page.cache_level != last_level)
+                        if not page.scheduled_for_eviction:
+                            ret[lc2pg[lc]].append(holder.page)
+        return ret
+
+    @property
+    def need_adjustment(self) -> bool:
+        if self._num_closed_kv_caches < 2000:
+            return False
+        if time.monotonic() - self._last_adjustment_time < 120:
+            return False
+        return self._need_adjustment(GPU_LEVEL) or self._need_adjustment(
+            CacheLevel(self._storage.num_cache_levels - 1)
+        )
+
+    def adjust(self) -> None:
+        assert all(
+            unwrap_rawref(c).status == _KVCache.Status.SUSPENDED for c in self._living_kv_caches
+        )
+        storage = self._storage
+        for level in typed_range(storage.num_cache_levels):
+            if self._need_adjustment(level):
+                self._adjust_level(level)
+        self._last_adjustment_time = time.monotonic()
+
+    def _try_update_target_ratios(self) -> None:
+        if self._num_closed_kv_caches - self._last_update_num_closed_requests < 100:
+            return
+        self._last_update_num_closed_requests = self._num_closed_kv_caches
+        tokens_per_blocks = self.tokens_per_block
+        life_cycles = self._life_cycles.get()
+        num_pool_groups = self._storage.num_pool_groups
+        storage = self._storage
+        lc2pg = storage._life_cycle_grouping
+
+        def ratio_from_length(
+            history_length: int, capacity: int
+        ) -> TypedIndexList[PoolGroupIndex, float]:
+            num_blocks = div_up(capacity, tokens_per_blocks)
+            num_bytes = filled_list(0.0, num_pool_groups)
+            for lc_idx, lc in typed_enumerate(life_cycles):
+                stale_beg, stale_end = _KVCache._get_stale_range(
+                    tokens_per_blocks, history_length, lc
+                )
+                pg_idx = lc2pg[lc_idx]
+                slot_size = storage.slot_size(pg_idx)
+                num_bytes[pg_idx] += (num_blocks - (stale_end - stale_beg)) * sum(slot_size)
+            total = sum(num_bytes)
+            return typed_map(num_bytes, lambda x: x / total)
+
+        avg_reused_length: int = round(self._avg_reused_length.value)
+        avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)
+        avg_history_length: int = round(self._avg_sqr_history_length.value**0.5)
+        self._target_ratio_list_gpu = ratio_from_length(avg_history_length, avg_capacity)
+        self._target_ratio_list_other = ratio_from_length(avg_reused_length, avg_reused_length)
 
     # @TODO: need updating when dynamic resizing is supported.
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int:

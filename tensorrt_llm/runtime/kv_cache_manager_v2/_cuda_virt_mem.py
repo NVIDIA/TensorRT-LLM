@@ -105,6 +105,7 @@ class PooledPhysMemAllocator(PooledFactoryBase[drv.CUmemGenericAllocationHandle,
     phys_mem_size: int
 
     def __init__(self, phys_mem_size: int) -> None:
+        """phys_mem_size is the size of each physical memory chunk."""
         raw_alloc = NativePhysMemAllocator(phys_mem_size)
         self.device_id = raw_alloc.device_id
         self.phys_mem_size = phys_mem_size

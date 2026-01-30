@@ -233,6 +233,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
     def tearDown(self) -> None:
         gc.enable()
         if hasattr(self, "manager"):
+            self.manager.shutdown()
             del self.manager
 
     def next_token(self) -> TokenIdExt:

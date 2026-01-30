@@ -252,13 +252,17 @@ def to_typed(index_type: Type[Index], lst: list[T]) -> TypedIndexList[Index, T]:
     return cast(TypedIndexList[Index, T], lst)
 
 
+def typed_range(*args: Index) -> Reversible[Index]:
+    return cast(Reversible[Index], range(*args))
+
+
 def filled_list(value: T, count: Index) -> TypedIndexList[Index, T]:
     "Note that all elements will be the same value. Do not use mutable values."
     return cast(TypedIndexList[Index, T], [value] * int(count))
 
 
-def make_typed(generator: Callable[[], T], count: Index) -> TypedIndexList[Index, T]:
-    return cast(TypedIndexList[Index, T], [generator() for _ in range(int(count))])
+def make_typed(generator: Callable[[Index], T], count: Index) -> TypedIndexList[Index, T]:
+    return cast(TypedIndexList[Index, T], [generator(Index) for Index in typed_range(count)])
 
 
 def typed_len(iterable: TypedIndexList[IndexO, T]) -> IndexO:
@@ -317,10 +321,6 @@ class Array2D(Generic[Row, Col, T]):
 
 def filled_array2d(rows: Row, cols: Col, val: T) -> Array2D[Row, Col, T]:
     return Array2D(rows, cols, [val] * rows * cols)
-
-
-def typed_range(*args: Index) -> Reversible[Index]:
-    return cast(Reversible[Index], range(*args))
 
 
 def find(seq: Sequence[T], predicate: Callable[[T], bool], default: U) -> T | U:
