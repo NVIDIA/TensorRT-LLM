@@ -23,7 +23,7 @@ from transformers import AutoConfig, PretrainedConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.utils import ActivationType, relu2
+from tensorrt_llm._torch.utils import ActivationType, Fp4QuantizedTensor, relu2
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce
@@ -318,11 +318,28 @@ class NemotronHLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
+        # Check if NVFP4 is enabled for this layer
+        quant_config = model_config.get_quant_config()
+        self.is_nvfp4 = (quant_config is not None
+                         and quant_config.layer_quant_mode.has_nvfp4())
+
+        # Determine if this layer can use fused RMSNorm + Add + Quantize
+        # Mamba layers (M) have BF16 in_proj (excluded from FP4), cannot be fused
+        # MLP (-) and Attention (*) layers have FP4 first linear, can be fused
+        # MoE (E) layers need BF16 for gate and have different scales for shared/routed,
+        # so input-side fusion doesn't provide net benefit (would require dequantization)
+        self.is_nvfp4_fusable = self.is_nvfp4 and layer_type in ["-", "*"]
+
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
         )
+
+        # Enable NVFP4 mode on RMSNorm for fusable layers
+        # This allows the fused_add_rms_norm_quant kernel to be used
+        if self.is_nvfp4_fusable:
+            self.norm.is_nvfp4 = True
 
         if layer_type == "M":
             self.mixer = Mamba2Mixer(d_model=config.hidden_size,
@@ -351,6 +368,17 @@ class NemotronHLayer(DecoderLayer):
         else:
             raise ValueError(f"{layer_type} is not supported")
 
+        # Cache reference to the module containing input_scale for NVFP4 fusion
+        # This avoids repeated hasattr/getattr lookups in forward()
+        self._nvfp4_input_scale_source = None
+        if self.is_nvfp4_fusable:
+            if hasattr(self.mixer, 'up_proj'):
+                # MLP layers (-): first linear is up_proj
+                self._nvfp4_input_scale_source = self.mixer.up_proj
+            elif hasattr(self.mixer, 'qkv_proj'):
+                # Attention layers (*): first linear is qkv_proj
+                self._nvfp4_input_scale_source = self.mixer.qkv_proj
+
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -362,6 +390,14 @@ class NemotronHLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        # Set up NVFP4 fusion if this layer is fusable
+        # This enables fused RMSNorm + Add + Quantize kernel
+        if self._nvfp4_input_scale_source is not None:
+            input_scale = getattr(self._nvfp4_input_scale_source, 'input_scale',
+                                  None)
+            if input_scale is not None:
+                self.norm.nvfp4_scale = input_scale
 
         if moe_separate_outputs is not None:
             # Previous layer was MOE - use fused add+add+rmsnorm
