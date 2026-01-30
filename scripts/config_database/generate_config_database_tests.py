@@ -201,7 +201,9 @@ def _write_if_changed(path: Path, content: str) -> bool:
     return True
 
 
-def generate_tests(test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path = PERF_SANITY_DIR) -> bool:
+def generate_tests(
+    test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path = PERF_SANITY_DIR
+) -> bool:
     """Generate test config files and test list. Returns True if any files were modified."""
     modified = False
 
