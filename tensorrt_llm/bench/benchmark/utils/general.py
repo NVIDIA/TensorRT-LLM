@@ -124,6 +124,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
     tp_size = llm_args.tensor_parallel_size
     pp_size = llm_args.pipeline_parallel_size
+    kv_cache_dtype = llm_args.kv_cache_config.dtype
 
     if llm_args.max_seq_len is None:
         llm_args.max_seq_len = dataset_metadata.max_sequence_length

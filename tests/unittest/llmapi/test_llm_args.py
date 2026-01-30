@@ -127,11 +127,8 @@ max_seq_len: 128
 model_kwargs:
     num_hidden_layers: 2
     """
-        dict_content = self._yaml_to_dict(yaml_content)
-        llm_args = llm_args_cls(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = llm_args_cls(**llm_args_dict)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
+        llm_args = llm_args_cls(model=llama_model_path, **llm_args_dict)
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 

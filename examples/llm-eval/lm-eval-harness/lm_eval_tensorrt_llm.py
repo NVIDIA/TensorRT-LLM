@@ -56,7 +56,7 @@ class TRTLLMEvalBase(TemplateLM):
         free_gpu_memory_fraction: float = 0.9,
         trust_remote_code: bool = False,
         use_cuda_graph: bool = True,
-        backend: str = 'trt',
+        backend: str = 'tensorrt',
         max_context_length: Optional[int] = None,
         moe_expert_parallel_size: Optional[int] = None,
         moe_backend: Optional[str] = "TRTLLM",
