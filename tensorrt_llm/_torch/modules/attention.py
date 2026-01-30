@@ -317,9 +317,6 @@ class Attention(nn.Module):
         self.fused_qkv_lora = LoraLayer([LoraModuleType.ATTENTION_QKV],
                                         [self.q_size + 2 * self.kv_size])
 
-        self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
-                                [self.hidden_size])
-
         # Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
         # If false, RoPE will be applied in self.apply_rope.
@@ -814,7 +811,9 @@ class MLA(nn.Module):
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
+        dp_size = 1
         if self.mapping.enable_attention_dp:
+            dp_size = tp_size
             tp_size = 1
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
@@ -823,9 +822,9 @@ class MLA(nn.Module):
             ), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
-            world_size=tp_size * pp_size * cp_size,
+            world_size=pp_size * dp_size * tp_size * cp_size,
             tp_size=tp_size,
-            pp_size=pp_size,
+            pp_size=pp_size * dp_size,
             cp_size=cp_size,
             cp_config=self.mapping.cp_config,
             rank=self.mapping.rank,
@@ -924,9 +923,9 @@ class MLA(nn.Module):
         )
 
         mapping_o = Mapping(
-            world_size=tp_size * pp_size * cp_size,
+            world_size=pp_size * dp_size * tp_size * cp_size,
             tp_size=tp_size * cp_size,
-            pp_size=pp_size,
+            pp_size=pp_size * dp_size,
             cp_size=1,
             rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,

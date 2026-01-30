@@ -739,9 +739,11 @@ class Qwen3VisionModel(torch.nn.Module):
 
         # Getting positional embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 
         # From this point, pure GPU operation
         hidden_states = self.patch_embed(pixel_values)
+        hidden_states = hidden_states + pos_embeds
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
 

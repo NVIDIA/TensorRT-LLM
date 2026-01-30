@@ -86,7 +86,7 @@ class TestStrategySelection:
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
 
         def get_beam_width_by_iter(
-            self, for_next_iteration: bool
+            self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
             return self.sampling_config.beam_width
 
@@ -445,11 +445,21 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
             def py_return_context_logits(self) -> bool:
                 return self._return_context_logits
 
+            def get_beam_width_by_iter(
+                self, for_next_iteration: bool = False
+            ) -> int:  # Torch sampler accesses this, but it does not affect this test
+                return self.sampling_config.beam_width
+
         class GenRequestMock:
             def __init__(self, draft_len: int):
                 self.is_context_init_state = False
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
+
+            def get_beam_width_by_iter(
+                self, for_next_iteration: bool = False
+            ) -> int:  # Torch sampler accesses this, but it does not affect this test
+                return self.sampling_config.beam_width
 
         class ScheduledRequestsMock:
             @property
@@ -691,16 +701,40 @@ class RequestCase:
         seq_slots = torch.tensor(
             [req.request.py_seq_slot for req in requests], device="cuda", dtype=torch.int64
         )
+        seq_lens = torch.tensor(
+            [req.request.max_beam_num_tokens for req in requests], dtype=torch.int32, device="cuda"
+        )
         new_tokens = torch.tensor(
             [req.new_tokens for req in requests], dtype=torch.int32, device="cuda"
         ).T
         sampler.store.new_tokens[:, seq_slots, BEAM] = new_tokens
+        max_seq_lens = torch.tensor(
+            [
+                min(
+                    sampler.max_seq_len, req.request.orig_prompt_len + req.request.py_max_new_tokens
+                )
+                for req in requests
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        end_ids = torch.tensor(
+            [
+                req.request.py_end_id if req.request.py_end_id is not None else -1
+                for req in requests
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        sampler.store.max_lengths_tensor[seq_slots] = max_seq_lens
+        sampler.store.end_ids[seq_slots] = end_ids
 
         def run():
             sampler._write_finish_reasons(
                 [req.request for req in requests],
                 finish_reasons=sampler.store.finish_reasons,
                 new_tokens=sampler.store.new_tokens,
+                seq_lens=seq_lens,
                 seq_slots=seq_slots,
             )
 

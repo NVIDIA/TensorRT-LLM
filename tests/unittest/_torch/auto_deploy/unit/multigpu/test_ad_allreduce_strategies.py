@@ -19,6 +19,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     SplitDimension,
     WeightShardingInfo,
 )
+from tensorrt_llm._torch.auto_deploy.utils._graph import recompile
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.commands.bench import main
 from tensorrt_llm.functional import AllReduceStrategy
@@ -378,7 +379,7 @@ def test_allreduce_strategy_propagation(strategy):
         if node:
             transform.check_and_apply(gm, node)
 
-    gm.recompile()
+    recompile(gm)
 
     # Verify the graph contains torch_dist_all_reduce nodes with correct strategy
     allreduce_nodes = [

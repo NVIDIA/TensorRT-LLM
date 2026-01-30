@@ -102,6 +102,9 @@ MODEL_PATH_DICT = {
     "gemma_3_27b_it": "gemma/gemma-3-27b-it",
     "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
     "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
+    "gemma_3_12b_it": "gemma/gemma-3-12b-it",
+    "gemma_3_12b_it_fp8": "gemma/gemma-3-12b-it-fp8",
+    "gemma_3_12b_it_fp4": "gemma/gemma-3-12b-it-fp4",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
@@ -125,7 +128,7 @@ MODEL_PATH_DICT = {
     "qwen3_32b_fp4": "Qwen3/nvidia-Qwen3-32B-NVFP4",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
-    "qwen2_5_vl_7b_instruct": "multimodals/Qwen2.5-VL-7B-Instruct",
+    "qwen2_5_vl_7b_instruct": "Qwen2.5-VL-7B-Instruct",
     "qwen2_5_vl_7b_instruct_fp8": "multimodals/Qwen2.5-VL-7B-Instruct-FP8",
     "qwen2_5_vl_7b_instruct_fp4": "multimodals/Qwen2.5-VL-7B-Instruct-FP4",
     "starcoder2_3b": "starcoder2-3b",
@@ -169,6 +172,8 @@ MODEL_PATH_DICT = {
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
+    "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b-Eagle3",
+    "nemotron_nano_3_30b_fp8": "Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
     "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     "starcoder2_7b": "starcoder2-7b",
@@ -236,6 +241,12 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.3_nemotron_super_49b_fp8",
     "llama_v3.1_nemotron_ultra_253b",
     "llama_v3.1_nemotron_ultra_253b_fp8",
+    "kimi_k2_nvfp4",
+}
+
+# Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
+AUTODEPLOY_MODEL_CONFIGS = {
+    "nemotron_nano_3_30b_fp8": "examples/auto_deploy/nano_v3.yaml",
 }
 
 
@@ -342,6 +353,11 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.KV_CACHE_SIZE:
     re.compile(r".*(?:Allocated ([\d\.]+) GiB for max tokens in paged KV cache|"
                r"Final KV cache size after resize: ([\d\.]+) GiB).*"),
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT:
+    re.compile(
+        r"Per User Output Throughput \[w\/ ctx\] \(tps\/user\):\s+([\d\.]+)"),
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT:
+    re.compile(r"Per GPU Output Throughput \(tps\/gpu\):\s+([\d\.]+)"),
 }
 
 AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
@@ -457,6 +473,8 @@ PERF_METRIC_STRING = {
     PerfMetricType.ENGINE_SIZE: "engine_size",
     PerfMetricType.CONTEXT_GPU_MEMORY: "context_gpu_memory",
     PerfMetricType.KV_CACHE_SIZE: "kv_cache_size",
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT: "per_user_output_throughput",
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT: "per_gpu_output_throughput",
 }
 
 BUILDER_METRICS = [
@@ -561,7 +579,6 @@ class PerfTestConfig:
         extra: bool = False,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-opt",
-        free_mem_ratio: float = 0.9,
         extra_runtime: str = "trtllm",
         skip_loading_weights: bool = False,
     ):
@@ -621,7 +638,6 @@ class PerfTestConfig:
         self.extra = extra
         # _autodeploy backend specific parameters
         self.ad_compile_backend = ad_compile_backend
-        self.free_mem_ratio = free_mem_ratio
         self.extra_runtime = extra_runtime
         self.skip_loading_weights = skip_loading_weights
         # Just build engines
@@ -1401,19 +1417,25 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 os.makedirs(os.path.dirname(autodeploy_config_path),
                             exist_ok=True)
 
-            # Create _autodeploy specific configuration
+            # Default autodeploy config
             autodeploy_config = {
                 'transforms': {
                     'compile_model': {
                         'backend': self._config.ad_compile_backend
                     },
-                    'resize_kv_cache': {
-                        'free_mem_ratio': self._config.free_mem_ratio
-                    },
                 },
                 'runtime': self._config.extra_runtime,
                 'skip_loading_weights': self._config.skip_loading_weights
             }
+
+            # If model has a curated config, use it instead
+            if self._config.model_name in AUTODEPLOY_MODEL_CONFIGS:
+                config_file = os.path.join(
+                    self._llm_root,
+                    AUTODEPLOY_MODEL_CONFIGS[self._config.model_name])
+                if os.path.exists(config_file):
+                    with open(config_file, 'r') as f:
+                        autodeploy_config = yaml.safe_load(f)
 
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:

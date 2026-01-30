@@ -1,8 +1,8 @@
-import copy
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
-from functools import wraps
+from enum import IntEnum
+from functools import lru_cache, wraps
 from typing import List, Optional
 
 import numpy as np
@@ -16,6 +16,7 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
+from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -31,10 +32,58 @@ except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
 
+class ReduceOp(IntEnum):
+    SUM = 0
+    PRODUCT = 1
+    MIN = 2
+    MAX = 3
+    BAND = 4
+    BOR = 5
+    BXOR = 6
+
+
+_reduce_op_to_torch_dict = {
+    ReduceOp.SUM: torch.distributed.ReduceOp.SUM,
+    ReduceOp.PRODUCT: torch.distributed.ReduceOp.PRODUCT,
+    ReduceOp.MIN: torch.distributed.ReduceOp.MIN,
+    ReduceOp.MAX: torch.distributed.ReduceOp.MAX,
+    ReduceOp.BAND: torch.distributed.ReduceOp.BAND,
+    ReduceOp.BOR: torch.distributed.ReduceOp.BOR,
+    ReduceOp.BXOR: torch.distributed.ReduceOp.BXOR,
+}
+
+
+def reduce_op_to_torch(op: ReduceOp) -> torch.distributed.ReduceOp:
+    return _reduce_op_to_torch_dict[op]
+
+
+_reduce_op_to_mpi_dict = {
+    ReduceOp.SUM: MPI.SUM,
+    ReduceOp.PRODUCT: MPI.PROD,
+    ReduceOp.MIN: MPI.MIN,
+    ReduceOp.MAX: MPI.MAX,
+    ReduceOp.BAND: MPI.BAND,
+    ReduceOp.BOR: MPI.BOR,
+    ReduceOp.BXOR: MPI.BXOR,
+}
+
+
+def reduce_op_to_mpi(op: ReduceOp) -> MPI.Op:
+    return _reduce_op_to_mpi_dict[op]
+
+
 class Distributed(ABC):
 
     def __init__(self, mapping: Mapping):
         self.mapping = mapping
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def get(mapping: Mapping) -> "Distributed":
+        if mpi_disabled():
+            return TorchDist(mapping)
+        else:
+            return MPIDist(mapping)
 
     @property
     def rank(self):
@@ -109,11 +158,23 @@ class Distributed(ABC):
         return self.mapping.cp_config
 
     @abstractmethod
+    def barrier(self):
+        pass
+
+    @abstractmethod
+    def tp_barrier(self):
+        pass
+
+    @abstractmethod
     def broadcast(self, obj, root=0):
         pass
 
     @abstractmethod
     def allgather(self, obj, root=0):
+        pass
+
+    @abstractmethod
+    def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         pass
 
     @abstractmethod
@@ -135,6 +196,35 @@ class Distributed(ABC):
         if self.cp_size > 1:
             obj = self.cp_broadcast(obj, root=root, **kwargs)
         return obj
+
+    @abstractmethod
+    def tp_allgather(self, obj):
+        pass
+
+    @abstractmethod
+    def cp_allgather(self, obj):
+        pass
+
+    def tp_cp_allgather(self, obj):
+        """Allgather across both TP and CP dimensions.
+
+        First gathers within CP group, then across TP groups, returning
+        a flattened list with tp_size * cp_size entries.
+        """
+        # Gather across CP dimension.
+        if self.cp_size > 1:
+            obj = self.cp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match cp_allgather output format.
+
+        # Gather across TP dimension.
+        if self.tp_size > 1:
+            obj = self.tp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match tp_allgather output format.
+
+        # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
+        return [entry for tp_group in obj for entry in tp_group]
 
 
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
@@ -362,24 +452,9 @@ class MPIDist(Distributed):
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
-        self.create_cp_comm()
-        # Repurpose CP ranks to TP for Helix so that the right comms are created.
-        mapping_with_cp = None
-        if self.mapping.has_cp_helix():
-            logger.info(
-                f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
-            mapping_with_cp = copy.deepcopy(self.mapping)
-            self.mapping = self.mapping.repurpose_helix_cp_to_tp()
-
-        self.create_tp_comm()
-        self.create_pp_comm()
-
-        # Restore the original mapping.
-        if mapping_with_cp is not None:
-            logger.info(
-                f"[MPIDist::__init__] Restoring original mapping undoing Helix manipulation."
-            )
-            self.mapping = mapping_with_cp
+        self._cp_comm = None
+        self._tp_comm = None
+        self._pp_comm = None
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
@@ -390,6 +465,9 @@ class MPIDist(Distributed):
 
     def barrier(self):
         mpi_barrier()
+
+    def tp_barrier(self):
+        self.tp_comm.Barrier()
 
     def isend(self, buf: np.ndarray, dest, tag=0):
         # non-blocking send numpy buffer
@@ -412,17 +490,28 @@ class MPIDist(Distributed):
     def recv_object(self, src, tag=0):
         return mpi_recv_object(src, tag)
 
-    def create_tp_comm(self):
-        new_group = mpi_comm().group.Incl(self.mapping.tp_group)
-        self.tp_comm = mpi_comm().Create_group(new_group)
+    @property
+    def tp_comm(self):
+        if self._tp_comm is None:
+            mapping = self.mapping
+            new_group = mpi_comm().group.Incl(mapping.tp_group)
+            self._tp_comm = mpi_comm().Create_group(new_group)
+        return self._tp_comm
 
-    def create_pp_comm(self):
-        new_group = mpi_comm().group.Incl(self.mapping.pp_group)
-        self.pp_comm = mpi_comm().Create_group(new_group)
+    @property
+    def pp_comm(self):
+        if self._pp_comm is None:
+            mapping = self.mapping
+            new_group = mpi_comm().group.Incl(mapping.pp_group)
+            self._pp_comm = mpi_comm().Create_group(new_group)
+        return self._pp_comm
 
-    def create_cp_comm(self):
-        new_group = mpi_comm().group.Incl(self.mapping.cp_group)
-        self.cp_comm = mpi_comm().Create_group(new_group)
+    @property
+    def cp_comm(self):
+        if self._cp_comm is None:
+            new_group = mpi_comm().group.Incl(self.mapping.cp_group)
+            self._cp_comm = mpi_comm().Create_group(new_group)
+        return self._cp_comm
 
     def cp_allgather(self, obj):
         return self.cp_comm.allgather(obj)
@@ -458,6 +547,10 @@ class MPIDist(Distributed):
 
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
+
+    def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        reduce_op = reduce_op_to_mpi(op)
+        return mpi_comm().allreduce(obj, reduce_op)
 
 
 class MultiHandleWrapper:
@@ -610,6 +703,10 @@ class TorchDist(Distributed):
         dist.barrier()
 
     @log_op
+    def tp_barrier(self):
+        dist.barrier(group=self.mapping.tp_group_pg)
+
+    @log_op
     def isend(self, buf: np.ndarray, dest, tag=0):
         # non-blocking send numpy buffer
         tensor = torch.from_numpy(buf)
@@ -672,14 +769,16 @@ class TorchDist(Distributed):
         return MultiHandleWrapper(works)
 
     @log_op
-    def allreduce(self,
-                  obj: int | float | torch.Tensor,
-                  op=torch.distributed.ReduceOp.SUM):
+    def allreduce(
+        self,
+        obj: int | float | torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+    ):
         is_base_type = isinstance(obj, int) or isinstance(obj, float)
         if is_base_type:
             obj = torch.tensor(obj)
 
-        dist.all_reduce(obj, op=op)
+        dist.all_reduce(obj, op=reduce_op_to_torch(op))
 
         if is_base_type:
             obj = obj.item()
@@ -757,6 +856,22 @@ class TorchDist(Distributed):
                 group=self.mapping.cp_group_pg,
                 device=torch.device("cpu"))
             return ret[0]
+
+    @log_op
+    def cp_allgather(self, obj):
+        if isinstance(obj, torch.Tensor):
+            output_list = [
+                torch.empty_like(obj)
+                for _ in range(self.mapping.cp_group_pg.size())
+            ]
+            dist.all_gather(output_list, obj, group=self.mapping.cp_group_pg)
+            return output_list
+        else:
+            output_list = [None] * self.mapping.cp_group_pg.size()
+            dist.all_gather_object(output_list,
+                                   obj,
+                                   group=self.mapping.cp_group_pg)
+            return output_list
 
     @log_op
     def pp_allgather(self, obj):
@@ -838,9 +953,13 @@ class PPCommNCCL:
             self.nccl_comm.send(tensor, dest)
             return
 
-        self.tensor_ready_event.record()
+        # If the tensor is allocated from non-default memory pool
+        # like userbuffers, its underlying memory may be reused
+        # before the send operation is completed.
+        # We clone the tensor to avoid write-write conflicts.
+        tensor = tensor.clone()
+        self.send_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.send_stream):
-            self.tensor_ready_event.wait()
             self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
@@ -888,6 +1007,7 @@ def init_pp_comm(mapping):
         _pp_comm = PPCommTorch(mapping)
     else:
         _pp_comm = PPCommNCCL(mapping)
+    init_helix_cp_comm(mapping)
 
 
 @TorchDist.log_op

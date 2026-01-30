@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, mpi_disabled
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           GuidedDecodingConfig, LoadFormat,
@@ -24,10 +24,11 @@ from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
-from ..distributed import MPIDist, TorchDist
+from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import ExecutorMemoryType, RestoreMode
@@ -303,10 +304,7 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
-    if mpi_disabled():
-        dist = TorchDist(mapping=mapping)
-    else:
-        dist = MPIDist(mapping=mapping)
+    dist = Distributed.get(mapping)
 
     vm_pools = {}
     enable_sleep = llm_args.enable_sleep
@@ -357,6 +355,15 @@ def create_py_executor(
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
+    calibrator = get_calibrator()
+    layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
+    calibrator.init(layer_wise_benchmarks_config.calibration_mode,
+                    layer_wise_benchmarks_config.calibration_file_path,
+                    layer_wise_benchmarks_config.calibration_layer_indices,
+                    mapping=mapping,
+                    dist=dist)
+    model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
+
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT,
                               RestoreMode.PINNED):
@@ -398,7 +405,7 @@ def create_py_executor(
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model_dir,
+                model_path=spec_config.speculative_model,
                 llm_args=draft_llm_args,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
@@ -508,7 +515,8 @@ def create_py_executor(
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
                     "max_num_sequences": max_batch_size,
-                    "vocab_size_padded": model_engine.model.vocab_size_padded
+                    "vocab_size_padded": model_engine.model.vocab_size_padded,
+                    "rank": mapping.rank,
                 }
                 if spec_config is not None:
                     kwargs[
@@ -556,9 +564,6 @@ def create_py_executor(
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
-        elif spec_config is not None:
-            raise NotImplementedError(
-                "KV connector is not supported with speculative decoding.")
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)

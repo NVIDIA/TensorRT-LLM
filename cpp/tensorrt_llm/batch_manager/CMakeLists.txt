@@ -21,6 +21,7 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(SRCS
     allocateKvCache.cpp
     assignReqSeqSlots.cpp
+    baseTransBuffer.cpp
     cacheFormatter.cpp
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp
@@ -36,6 +37,8 @@ set(SRCS
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
+    kvCacheManagerV2Utils.cpp
+    kvCacheManagerV2Utils.cu
     llmRequest.cpp
     logitsPostProcessor.cpp
     loraBuffers.cpp

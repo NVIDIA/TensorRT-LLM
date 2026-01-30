@@ -10,13 +10,15 @@ build-backend = "setuptools.build_meta"
 ####################################################################################################
 [tool.isort]
 line_length = 80
+known_first_party = ["tensorrt_llm"]
+known_third_party = ["triton_kernels"]
 
 [tool.yapf]
 based_on_style = "pep8"
 column_limit = 80
 
 [tool.codespell]
-skip = ".git,3rdparty,tests/integration/test_input_files**,**.jsonl,**.json"
+skip = ".git,3rdparty,triton_kernels,tests/integration/test_input_files**,**.jsonl,**.json"
 exclude-file = "examples/models/core/whisper/tokenizer.py"
 ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw,dOut"
 
@@ -42,6 +44,7 @@ fix = true
 # orders of magnitude faster, so we should move to deprecate `yapf`.
 exclude = [
     "**3rdparty/**",
+    "triton_kernels/**",
     ".devcontainer/make_env.py",
     ".github/scripts/label_community_user.py",
     ".github/scripts/pr_checklist_check.py",
@@ -992,7 +995,6 @@ exclude = [
     "tests/unittest/_torch/attention/test_attention_no_cache.py",
     "tests/unittest/_torch/attention/test_attention.py",
     "tests/unittest/_torch/attention/test_flashinfer_attention.py",
-    "tests/unittest/_torch/attention/test_flashinfer_star_attn.py",
     "tests/unittest/_torch/attention/test_vanilla_attention.py",
     "tests/unittest/_torch/compilation/test_add_norm.py",
     "tests/unittest/_torch/debugger/test_debugger_addon.py",
@@ -1045,7 +1047,6 @@ exclude = [
     "tests/unittest/_torch/multi_gpu/test_mnnvl_allreduce.py",
     "tests/unittest/_torch/multi_gpu/test_mnnvl_memory.py",
     "tests/unittest/_torch/multi_gpu/test_moe_a2a.py",
-    "tests/unittest/_torch/multi_gpu/test_star_attention.py",
     "tests/unittest/_torch/multi_gpu/test_user_buffers.py",
     "tests/unittest/_torch/multimodal/test_external_embedding.py",
     "tests/unittest/_torch/multimodal/test_find_num_image_tokens.py",
@@ -1063,7 +1064,6 @@ exclude = [
     "tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py",
     "tests/unittest/_torch/sampler/test_beam_search.py",
     "tests/unittest/_torch/sampler/test_best_of_n.py",
-    "tests/unittest/_torch/sampler/test_return_logits.py",
     "tests/unittest/_torch/sampler/test_torch_multi_arange.py",
     "tests/unittest/_torch/sampler/test_trtllm_sampler.py",
     "tests/unittest/_torch/speculative/test_draft_target.py",
@@ -1461,6 +1461,7 @@ convention = "google"
 
 [tool.ruff.lint.isort]
 known-first-party = ["tensorrt_llm"]
+known-third-party = ["triton_kernels"]
 split-on-trailing-comma = false
 
 
@@ -1493,7 +1494,7 @@ disallow_untyped_calls = false
 disallow_incomplete_defs = false
 disallow_untyped_defs = false
 warn_return_any = false
-exclude = []
+exclude = ["triton_kernels"]
 
 
 [[tool.mypy.overrides]]

@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import heapq
+import os
 import queue
 import threading
 import time
@@ -11,6 +12,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import mpi_disabled, nvtx_range
+from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -206,10 +208,15 @@ class ExecutorRequestQueue:
 
         return False
 
-    def _get_request_id(self):
-        # (next_request_id + 1) % UINT64_MAX
+    def _get_request_id(self, request: Optional[ExecutorRequest] = None):
+        # if request has a disagg_request_id, use it as request id so that
+        # corresponding context and generation requests have the same request id
+        if request and request.disagg_request_id and isinstance(
+                request.disagg_request_id, int):
+            return request.disagg_request_id
+
         current_id = self.next_request_id
-        self.next_request_id = (self.next_request_id + 1) & ((1 << 64) - 1)
+        self.next_request_id = get_local_request_id(current_id)
         return current_id
 
     def _generate_child_request_ids(
@@ -236,7 +243,7 @@ class ExecutorRequestQueue:
             assert self.active, "PyExecutor has already been shutdown."
             start_time = time.time()
             for request, query in requests_and_queries:
-                req_id = self._get_request_id()
+                req_id = self._get_request_id(request)
                 if self.enable_iter_perf_stats:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
@@ -369,13 +376,22 @@ class ExecutorRequestQueue:
     def _fetch_new_requests_attention_dp(
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
-        # Get active request counts across all ranks
+        # Get active request counts across all ranks.
         all_ranks_num_active_requests = []
         all_ranks_num_active_tokens = []
-        num_active_tokens = sum(
-            [req.py_orig_prompt_len for req in activate_requests])
+
+        if self.dist.has_cp_helix:
+            num_active_tokens = sum(
+                [req.total_input_len_cp for req in activate_requests])
+        else:
+            num_active_tokens = sum(
+                [req.py_orig_prompt_len for req in activate_requests])
+
+        # Note: We use tp_allgather even for CP assuming that all CP ranks with the
+        # same dp_rank have the same num_active_tokens and num_active_requests.
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
+
         for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
             all_ranks_num_active_tokens.append(num_active_tokens)
@@ -429,7 +445,7 @@ class ExecutorRequestQueue:
                 return True
             return scheduling_params.attention_dp_relax
 
-        new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
+        new_requests = sorted(new_requests, key=get_relax_value)
 
         # Try to put the requests to the target dp rank until the max_num_active_requests is reached
         remaining_unscheduled = []
@@ -475,10 +491,13 @@ class ExecutorRequestQueue:
                 new_requests, "py_scheduling_params")
             py_num_logprobs = self._collect_py_objects_from_requests(
                 new_requests, "py_num_logprobs")
+            py_disaggregated_params = self._collect_py_objects_from_requests(
+                new_requests, "py_disaggregated_params")
             py_request_objects = tuple(
                 filter(None, [
                     py_logits_post_processors, py_multimodal_data,
-                    py_scheduling_params, py_num_logprobs
+                    py_scheduling_params, py_num_logprobs,
+                    py_disaggregated_params
                 ]))
         else:
             py_request_objects = None
@@ -611,12 +630,20 @@ class ExecutorRequestQueue:
             with nvtx_range("recv_requests_from_prev_pp"):
                 payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
+        # isend new requests may cause deadlock, when CUDA_LAUNCH_BLOCKING=1 or PP microbatches can't overlap,
+        # the deadlock will happen deterministicly:
+        # 1. rank1 will wait on nccl.send(rank2), without invoking mpi.wait(isend-handle)
+        # 2. rank2 will wait on mpi.recv(rank1) but never receive the new requests.
+        # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
+        pp_send_func = self.dist.isend_object if os.environ.get(
+            "TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1" else self.dist.send_object
+
         if not self.dist.is_last_pp_rank:
             if self.send_requests_handler is not None:
                 with nvtx_range("wait_prev_send_requests_handler"):
                     self.send_requests_handler.wait()
             with nvtx_range("send_requests_to_next_pp"):
-                self.send_requests_handler = self.dist.isend_object(
+                self.send_requests_handler = pp_send_func(
                     payloads, self.dist.next_pp_rank, tag)
 
         return payloads

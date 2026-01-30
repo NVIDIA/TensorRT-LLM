@@ -694,7 +694,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp",
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
         "cpp/tensorrt_llm/plugins/ncclPlugin/",
-        "cpp/tensorrt_llm/pybind/",
+        "cpp/tensorrt_llm/nanobind/",
         "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
         "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
@@ -719,6 +719,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
         "tensorrt_llm/evaluate/json_mode_eval.py",
         "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
@@ -740,7 +741,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/defs/accuracy/test_disaggregated_serving.py",
         "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
         "tests/integration/defs/examples/test_ray.py",
+        "tests/integration/defs/accuracy/test_llm_api_autodeploy.py",
         "tests/unittest/llmapi/test_async_llm.py",
+        "docker/common/install_ucx.sh",
+        "docker/common/install_nixl.sh",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
@@ -864,6 +868,30 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        stage("Collect Perf Regression Result") {
+            def yamlFiles = sh(
+                returnStdout: true,
+                script: 'find . -type f -name "regression_data.yaml" 2>/dev/null || true'
+            ).trim()
+            echo "Regression data yaml files: ${yamlFiles}"
+            if (yamlFiles) {
+                def yamlFileList = yamlFiles.split(/\s+/).collect { it.trim() }.findAll { it }.join(",")
+                echo "Found regression data files: ${yamlFileList}"
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml")
+                sh """
+                    python3 llm/jenkins/scripts/perf/perf_regression.py \
+                    --input-files=${yamlFileList} \
+                    --output-file=perf_regression.html
+                """
+                trtllm_utils.uploadArtifacts("perf_regression.html", "${UPLOAD_PATH}/test-results/")
+                echo "Perf regression report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_regression.html"
+            } else {
+                echo "No regression_data.yaml files found."
+            }
+        } // Collect Perf Regression Result stage
         stage("Rerun Report") {
             sh "rm -rf rerun && mkdir -p rerun"
             sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"

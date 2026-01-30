@@ -227,6 +227,18 @@ methods:
         annotation: Optional[Dict[str, str]]
         default: null
         status: prototype
+      max_stats_len:
+        annotation: int
+        default: 1000
+        status: prototype
+      layer_wise_benchmarks_config:
+        annotation: tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig
+        default: null
+        status: prototype
+      model_kwargs:
+        annotation: Optional[Dict[str, Any]]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:

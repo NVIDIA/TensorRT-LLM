@@ -4,6 +4,34 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.2
+
+### Key Features and Enhancements
+
+- **DGX Spark Support (Beta)**
+  - Added beta support for single-node DGX Spark.
+  - Validated models and precision formats:
+    - GPT-OSS-20B, GPT-OSS-120B (MXFP4)
+    - Llama-3.1-8B-Instruct (FP16/FP8/NVFP4)
+    - Llama-3.3-70B-Instruct (FP8/NVFP4)
+    - Qwen3-8B, Qwen3-14B (FP16/FP8/NVFP4)
+    - Qwen3-32B (FP16/NVFP4)
+    - Qwen3-30B-A3B (FP16/NVFP4)
+    - NVIDIA-Nemotron-Nano-9B-v2 (FP4)
+    - Llama-3.3-Nemotron-Super-49B-v1.5 (FP8)
+    - Phi-4-multimodal-instruct (FP16/FP8/NVFP4)
+    - Phi-4-reasoning-plus (FP16/FP8/NVFP4)
+
+### Infrastructure Changes
+
+### API Changes
+
+### Fixed Issues
+
+### Known Issues
+
+- **DGX Spark:** DGX Spark support is in beta. Only single-node configurations and the models listed above have been validated in this release.
+
 ## TensorRT-LLM Release 1.1
 
 ### Key Features and Enhancements

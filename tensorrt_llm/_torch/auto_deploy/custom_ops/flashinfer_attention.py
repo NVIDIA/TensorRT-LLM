@@ -1,5 +1,5 @@
 from dataclasses import dataclass, fields
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import flashinfer
 import torch
@@ -7,6 +7,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
+from ....llmapi.llm_args import KvCacheConfig
 from ...flashinfer_utils import get_env_enable_pdl
 from ..utils.cuda_graph import cuda_graph_state
 from ..utils.logger import ad_logger
@@ -15,165 +16,13 @@ from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
     Constant,
     MHACallable,
+    PagedResourceHandler,
     PrepareMetadataCallable,
     PrepareMetadataHostCallable,
-    SequenceInfo,
+    ResourceHandlerDict,
 )
-
-
-# TODO: remove this when flashinfer version is updated to >0.5
-def fast_decode_plan(
-    wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
-    indptr: torch.Tensor,
-    indices: torch.Tensor,
-    last_page_len: torch.Tensor,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    pos_encoding_mode: str = "NONE",
-    window_left: int = -1,
-    logits_soft_cap: Optional[float] = None,
-    q_data_type: Optional[Union[str, torch.dtype]] = None,
-    kv_data_type: Optional[Union[str, torch.dtype]] = None,
-    data_type: Optional[Union[str, torch.dtype]] = None,
-    sm_scale: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-    non_blocking: bool = True,
-    fixed_split_size: Optional[int] = None,
-    disable_split_kv: bool = False,
-    global_override_indptr_cpu: Optional[torch.Tensor] = None,
-) -> None:
-    """
-    Copied from flashinfer.decode.fast_decode_plan in flashinfer version >0.5.
-    Does not exist in flashinfer version 0.3.1, hence copied here.
-    """
-    batch_size = len(last_page_len)
-    if logits_soft_cap is None:
-        logits_soft_cap = 0.0
-
-    # Handle data types consistently
-    if data_type is not None:
-        if q_data_type is None:
-            q_data_type = data_type
-        if kv_data_type is None:
-            kv_data_type = data_type
-    elif q_data_type is None:
-        q_data_type = "float16"
-
-    if kv_data_type is None:
-        kv_data_type = q_data_type
-
-    if wrapper.use_tensor_cores:
-        qo_indptr_host = torch.arange(batch_size + 1, dtype=torch.int32, device="cpu")
-        # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
-        if fixed_split_size is None:
-            fixed_split_size = -1
-
-    if wrapper.is_cuda_graph_enabled:
-        if batch_size != wrapper._fixed_batch_size:
-            raise ValueError(
-                "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
-                " mismatches the batch size set during initialization {}".format(
-                    batch_size, wrapper._fixed_batch_size
-                )
-            )
-        if len(indices) > len(wrapper._paged_kv_indices_buf):
-            raise ValueError(
-                "The size of indices should be less than or equal to the allocated buffer"
-            )
-    else:
-        wrapper._paged_kv_indptr_buf = indptr
-        wrapper._paged_kv_indices_buf = indices
-        wrapper._paged_kv_last_page_len_buf = last_page_len
-        if wrapper.use_tensor_cores:
-            wrapper._qo_indptr_buf = qo_indptr_host.to(wrapper.device, non_blocking=non_blocking)
-
-    # Create empty tensors for dtype info if needed
-    empty_q_data = torch.empty(
-        0,
-        dtype=(getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type),
-        device=wrapper.device,
-    )
-
-    empty_kv_cache = torch.empty(
-        0,
-        dtype=(getattr(torch, kv_data_type) if isinstance(kv_data_type, str) else kv_data_type),
-        device=wrapper.device,
-    )
-
-    indptr_host = (
-        global_override_indptr_cpu if global_override_indptr_cpu is not None else indptr.cpu()
-    )
-
-    with torch.cuda.device(wrapper.device):
-        if wrapper.use_tensor_cores:
-            # ALSO convert last_page_len to CPU
-            if page_size == 1:
-                # When page size is 1, last_page_len is always 1.
-                # Directly construct the host tensor rather than executing a device-to-host copy.
-                last_page_len_host = torch.ones((batch_size,), dtype=torch.int32, device="cpu")
-            else:
-                last_page_len_host = last_page_len.cpu()
-
-            kv_lens_arr_host = flashinfer.get_seq_lens(indptr_host, last_page_len_host, page_size)
-
-            try:
-                # Make sure we pass exactly 15 arguments for tensor core version
-                wrapper._plan_info = wrapper._cached_module.plan(
-                    wrapper._float_workspace_buffer,
-                    wrapper._int_workspace_buffer,
-                    wrapper._pin_memory_int_workspace_buffer,
-                    qo_indptr_host,
-                    indptr_host,
-                    kv_lens_arr_host,
-                    batch_size,  # total_num_rows
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    page_size,
-                    wrapper.is_cuda_graph_enabled,
-                    head_dim,
-                    head_dim,
-                    False,  # causal
-                )
-            except Exception as e:
-                raise RuntimeError(f"Error in standard plan: {e}") from e
-        else:
-            try:
-                # Make sure we pass exactly 15 arguments for standard version
-                wrapper._plan_info = wrapper._cached_module.plan(
-                    wrapper._float_workspace_buffer,
-                    wrapper._int_workspace_buffer,
-                    wrapper._pin_memory_int_workspace_buffer,
-                    indptr_host,
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    page_size,
-                    wrapper.is_cuda_graph_enabled,
-                    window_left,
-                    logits_soft_cap,
-                    head_dim,
-                    head_dim,
-                    empty_q_data,
-                    empty_kv_cache,
-                )
-            except Exception as e:
-                raise RuntimeError(f"Error in standard plan: {e}") from e
-
-    wrapper._pos_encoding_mode = pos_encoding_mode
-    wrapper._window_left = window_left
-    wrapper._logits_soft_cap = logits_soft_cap
-    wrapper._sm_scale = sm_scale
-    wrapper._rope_scale = rope_scale
-    wrapper._rope_theta = rope_theta
 
 
 @dataclass
@@ -207,6 +56,9 @@ class _FlashInferPlanner:
     ]
     plan_params_prefill: Optional[PlanParams]
     plan_params_decode: Optional[PlanParams]
+    kv_layout: Literal["NHD", "HND"] = (
+        "NHD"  # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/10966
+    )
 
     def __init__(self):
         self.workspace_buffer = None
@@ -227,36 +79,43 @@ class _FlashInferPlanner:
         if use_cuda_graph:
             return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
-                "NHD",
+                self.kv_layout,
                 use_cuda_graph=True,
                 paged_kv_indptr_buffer=indptr,
                 paged_kv_indices_buffer=indices,
                 paged_kv_last_page_len_buffer=last_page_len,
                 use_tensor_cores=True,
+                backend="fa2" if torch.cuda.get_device_capability(0) == (9, 0) else "auto",
             )
         else:
             return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
-                "NHD",
+                self.kv_layout,
                 use_tensor_cores=True,
+                backend="fa2" if torch.cuda.get_device_capability(0) == (9, 0) else "auto",
             )
 
-    def init_workspace(self, workspace_buffer: torch.Tensor):
+    def reset(self, device: torch.device) -> None:
+        self.plan_params_prefill = None
+        self.plan_params_decode = None
+
+        if isinstance(self.workspace_buffer, torch.Tensor):
+            return
+
         self.__init__()  # reset all state
 
-        self.workspace_buffer = workspace_buffer
+        # NOTE (lucaslie): avoid OOM for many cudagraphs,
+        # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
+        self.workspace_buffer = torch.empty(320 * 1024 * 1024, device=device, dtype=torch.uint8)
+
         # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues
         # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
-            "NHD",
-            backend="fa2",
+            self.kv_layout,
+            backend="fa2" if torch.cuda.get_device_capability(0) == (9, 0) else "auto",
         )
         self.decode_wrapper = self._init_decode_wrapper()
-
-    def reset(self) -> None:
-        self.plan_params_prefill = None
-        self.plan_params_decode = None
 
     def plan_generate_only(
         self,
@@ -268,7 +127,7 @@ class _FlashInferPlanner:
         for plan_params in self.cached_cuda_graph_decode_wrappers:
             if plan_params.num_seq == num_seq:
                 wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
-                fast_decode_plan(
+                flashinfer.decode.fast_decode_plan(
                     wrapper,
                     cu_num_pages,
                     cache_loc,
@@ -396,7 +255,7 @@ def prepare_flashinfer_metadata(
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
 
-    _GlobalFlashInferPlanner.reset()
+    _GlobalFlashInferPlanner.reset(position_ids.device)
 
     qo_indptr = cu_seqlen[: num_seq + 1]
 
@@ -464,8 +323,6 @@ def flashinfer_mha_with_cache(
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    # BUFFERS
-    workspace_buffer: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
     k_scale: float,
@@ -476,9 +333,9 @@ def flashinfer_mha_with_cache(
     q_shape_og = q.shape
     b, s = q_shape_og[:2]
 
-    q = q.reshape(b * s, -1, head_dim)
-    k = k.reshape(b * s, -1, head_dim)
-    v = v.reshape(b * s, -1, head_dim)
+    q = q.reshape(b * s, -1, head_dim).contiguous()
+    k = k.reshape(b * s, -1, head_dim).contiguous()
+    v = v.reshape(b * s, -1, head_dim).contiguous()
 
     # convert to flashinfer-style metadata
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
@@ -606,8 +463,6 @@ def flashinfer_mha_with_cache_fake(
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    # BUFFERS
-    workspace_buffer: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
     k_scale: float,
@@ -621,11 +476,6 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def _get_planner(cls) -> _FlashInferPlanner:
         return _GlobalFlashInferPlanner
-
-    @classmethod
-    def is_paged(cls):
-        """Return if the attention op is paged or not."""
-        return True
 
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
@@ -667,35 +517,25 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         # source op is [bsnd] layout already
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         num_kv_heads = k_fake.shape[2]
         head_dim = k_fake.shape[3]
 
-        def _get_cache(si: SequenceInfo):
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
+        return {
+            "k_cache": PagedResourceHandler(
                 num_kv_heads,
                 head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or k_fake.dtype,
-            )
-
-        return {"k_cache": _get_cache, "v_cache": _get_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        def _init_workspace(si: SequenceInfo) -> torch.Tensor:
-            # NOTE (lucaslie): avoid OOM for many cudagraphs,
-            # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
-            buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
-            cls._get_planner().init_workspace(buffer)
-            return buffer
-
-        return {"workspace_buffer": _init_workspace}
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
+            ),
+            "v_cache": PagedResourceHandler(
+                num_kv_heads,
+                head_dim,
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
+            ),
+        }
 
     @classmethod
     def get_host_prepare_metadata_function(cls) -> Optional[PrepareMetadataHostCallable]:

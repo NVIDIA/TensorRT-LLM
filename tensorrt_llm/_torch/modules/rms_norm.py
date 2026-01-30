@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..utils import Fp4QuantizedTensor
 
 
 class RMSNorm(nn.Module):
@@ -37,11 +38,17 @@ class RMSNorm(nn.Module):
         device: Optional[torch.device] = None,
         has_weights: bool = True,
         use_gemma: bool = False,
+        quantize_type: Optional[str] = None,
     ):
         super().__init__()
 
         if use_gemma and not has_weights:
             raise ValueError("has_weights must be True if use_gemma is True")
+        if quantize_type is not None:
+            if quantize_type != "nvfp4":
+                raise NotImplementedError(
+                    f"Quantize type {quantize_type} not implemented in RMSNorm")
+        self.is_nvfp4 = quantize_type == "nvfp4"
 
         if has_weights:
             if not use_gemma:
@@ -65,11 +72,61 @@ class RMSNorm(nn.Module):
         residual: Union[
             Optional[torch.Tensor],
             _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        return_residual = True
-        if residual is self._ARGUMENT_NOT_SPECIFIED_SENTINEL:
-            return_residual = False
+    ) -> Union[torch.Tensor, Fp4QuantizedTensor, Tuple[Union[
+            torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]]]:
+        has_residual = residual is not self._ARGUMENT_NOT_SPECIFIED_SENTINEL
+        if not has_residual:
             residual = None
+
+        if self.is_nvfp4 and has_residual and not self.use_gemma:
+            nvfp4_scale = getattr(self, "nvfp4_scale", None)
+            if nvfp4_scale is None:
+                raise ValueError(
+                    f"layeridx={getattr(self, 'layer_idx', None)} RMSNorm NVFP4 output requested "
+                    "but no `nvfp4_scale` is attached; ")
+
+            orig_shape = tuple(hidden_states.shape)
+            n = int(orig_shape[-1])
+            hs_2d = hidden_states.reshape(-1, n).contiguous()
+            res_2d = residual.reshape(-1, n)
+            gamma = self.weight
+
+            def _ensure_contiguous_with_dtype(t: torch.Tensor, key: str):
+                if t.dtype != hs_2d.dtype:
+                    raise ValueError(
+                        f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}."
+                    )
+                return t.contiguous()
+
+            res_2d = _ensure_contiguous_with_dtype(res_2d, "residual")
+            gamma = _ensure_contiguous_with_dtype(gamma, "gamma")
+
+            if hs_2d.device != res_2d.device or hs_2d.device != gamma.device:
+                raise RuntimeError(
+                    "RMSNorm NVFP4 fused path requires all tensors on the same device. "
+                    f"Got input={hs_2d.device}, residual={res_2d.device}, gamma={gamma.device}."
+                )
+
+            sf_scale = nvfp4_scale.contiguous()
+
+            normed_fp4_i32, residual_out_2d, sf_fused = torch.ops.trtllm.fused_add_rms_norm_quant(
+                hs_2d,
+                res_2d,
+                gamma,
+                sf_scale,
+                True,
+                eps=self.variance_epsilon,
+            )
+            normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
+            if len(orig_shape) != 2:
+                normed_fp4_u8 = normed_fp4_u8.reshape(*orig_shape[:-1], n // 2)
+                residual_out = residual_out_2d.reshape(orig_shape)
+            else:
+                residual_out = residual_out_2d
+
+            hidden_states_fused = Fp4QuantizedTensor(normed_fp4_u8, sf_fused)
+            return (hidden_states_fused,
+                    residual_out) if has_residual else hidden_states_fused
 
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
@@ -109,7 +166,7 @@ class RMSNorm(nn.Module):
                 hidden_states = (self.weight +
                                  1) * hidden_states.to(input_dtype)
 
-        if return_residual:
+        if has_residual:
             return hidden_states, cast(Optional[torch.Tensor], residual)
         else:
             return hidden_states

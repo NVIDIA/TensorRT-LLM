@@ -288,6 +288,9 @@ public:
 
     void removeNextBlock(BlockKey const& blockKey);
 
+    void freeDescendantsRecursively();
+    void freeBlockAndAllDescendants();
+
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
     //! blockKey.
     //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
@@ -365,6 +368,9 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
+
+    // Mutex for the next blocks
+    mutable std::mutex mNextBlocksMutex;
 };
 
 class GenerationRequest
@@ -1018,7 +1024,7 @@ private:
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
 
     // Mutex for the cached blocks root
-    std::mutex mCachedBlocksRootMutex;
+    mutable std::mutex mCachedBlocksRootMutex;
 
     // Record which sequence is using the block
     std::map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockToSequence;

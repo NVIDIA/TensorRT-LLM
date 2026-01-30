@@ -10,11 +10,12 @@ import torch
 import yaml
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.distributed import MPIDist, TorchDist
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tensorrt_llm._utils import local_mpi_rank, mpi_disabled, mpi_rank, mpi_world_size
+from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
 from tensorrt_llm.logger import logger
-from tensorrt_llm.tools.layer_wise_benchmarks import BalanceMethod, Runner, mark_ranges
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.mark_utils import mark_ranges
+from tensorrt_llm.tools.layer_wise_benchmarks.runner import BalanceMethod, Runner
 
 
 def comma_separated_ints(s):
@@ -80,6 +81,15 @@ parser.add_argument("--seq-len-q", type=comma_separated_ints, dest="seq_len_q_li
 parser.add_argument("--seq-len-kv-cache", type=comma_separated_ints, dest="seq_len_kv_cache_list")
 parser.add_argument("--balance-method", type=str)
 parser.add_argument("--balance-ratio", type=comma_separated_floats, dest="balance_ratio_list")
+# Calibration
+parser.add_argument("--replay-file-path", type=str)
+parser.add_argument("--replay-start-iter", type=int)
+parser.add_argument("--replay-stop-iter", type=int)
+group = parser.add_mutually_exclusive_group()
+group.add_argument("--replay-verify-metadata", action="store_true", dest="replay_verify_metadata")
+group.add_argument(
+    "--no-replay-verify-metadata", action="store_false", dest="replay_verify_metadata"
+)
 # Schedule
 parser.add_argument("--warmup-times", type=int, default=20)
 parser.add_argument("--run-times", type=int, default=100)
@@ -132,6 +142,10 @@ if args.enable_autotuner is None:
     args.enable_autotuner = True
 if args.use_cuda_graph is None:
     args.use_cuda_graph = False
+if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
+    parser.error("Both --replay-start-iter and --replay-stop-iter must be provided or none")
+if args.replay_verify_metadata is None:
+    args.replay_verify_metadata = True
 print(args)
 
 # MPI args
@@ -180,6 +194,27 @@ runner = Runner(
 )
 logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
+calibrator = get_calibrator()
+if args.replay_file_path:
+    calibrator.init(
+        "REPLAY",
+        args.replay_file_path,
+        args.layer_indices,
+        replay_verify_metadata=args.replay_verify_metadata,
+        mapping=mapping,
+    )
+    if args.replay_start_iter is None:
+        replay_start_iter, replay_stop_iter = calibrator.get_replay_iteration_range()
+    else:
+        replay_start_iter, replay_stop_iter = args.replay_start_iter, args.replay_stop_iter
+    logger.info(
+        f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
+    )
+else:
+    calibrator.init("NONE", None, None)
+    replay_start_iter, replay_stop_iter = 1, 1  # To avoid None in mathematics
+calibrator.maybe_wrap_model(runner.model)
+
 # Autotune
 run_pack = runner.create_run_pack(
     args.run_type,
@@ -192,8 +227,7 @@ run_pack = runner.create_run_pack(
 )
 if args.enable_autotuner:
     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
-    dist = TorchDist(mapping=mapping) if mpi_disabled() else MPIDist(mapping=mapping)
-    AutoTuner.get().setup_distributed_state(mapping, dist)
+    AutoTuner.get().setup_distributed_state(mapping)
     with autotune(cache_path=cache_path):
         run_pack()
 else:
@@ -208,7 +242,11 @@ if args.run_type == "GEN":
         max(1, 20480 // ctx_seq_len_q),
     )
     ctx_attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
-    with mock.patch.dict(os.environ, {"TRTLLM_FORCE_ALLTOALL_METHOD": "NotEnabled"}, clear=False):
+    with mock.patch.dict(
+        os.environ,
+        {"TRTLLM_FORCE_ALLTOALL_METHOD": "NotEnabled", "TRTLLM_FORCE_COMM_METHOD": "ALLGATHER"},
+        clear=False,
+    ):
         ctx_runner = Runner(
             args.model,
             mapping,
@@ -318,14 +356,19 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
 
         balance_ratio_str = "" if balance_ratio is None else f" balance={balance_ratio:.2g}"
         nvtx_message = f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} NP{world_size}"
+        calibrator.start()
         for i in range(args.warmup_times + args.run_times):
             events[i].record()
+            replay_iter = replay_start_iter + i % (replay_stop_iter - replay_start_iter + 1)
+            calibrator.pre_step(replay_iter)
             with nvtx.annotate(nvtx_message):
                 if args.use_cuda_graph:
                     g.replay()
                 else:
                     run_pack()
+            calibrator.post_step(replay_iter)
         events[-1].record()
+        calibrator.stop()
     torch.cuda.synchronize()
 
     # Print statistics

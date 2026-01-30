@@ -16,6 +16,7 @@ import torch._dynamo.config
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
+from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.inputs.registry import (create_input_processor,
@@ -35,7 +36,7 @@ from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
-from ..distributed import MPIDist
+from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import with_shared_pool
@@ -44,6 +45,7 @@ from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                    MoeLoadBalancerIterContext)
+from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
@@ -62,7 +64,8 @@ from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
-                               ResourceManager, ResourceManagerType)
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -134,7 +137,7 @@ class PyTorchModelEngine(ModelEngine):
         llm_args: TorchLlmArgs,
         mapping: Optional[Mapping] = None,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
-        dist: Optional[MPIDist] = None,
+        dist: Optional[Distributed] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
@@ -449,6 +452,9 @@ class PyTorchModelEngine(ModelEngine):
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 
+        # Initialize CUDA Graph LoRA manager if LoRA is enabled
+        self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
+
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
         if self.use_beam_search:
@@ -492,6 +498,26 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype),
             swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
+
+    def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
+        """Initialize CUDA Graph LoRA manager with model configuration."""
+        # Get model configuration
+        if self.cuda_graph_runner.enabled:
+            max_lora_size = lora_config.max_loras or 8  # Default fallback
+            max_batch_size = self.batch_size  # Use engine's max batch size
+
+            self.cuda_graph_lora_manager = CudaGraphLoraManager(
+                max_lora_size=max_lora_size,
+                max_batch_size=max_batch_size,
+                max_lora_rank=lora_config.max_lora_rank,
+                model=self.model,
+                lora_model_config=self.lora_model_config,
+                device='cuda')
+
+            logger.info(
+                f"Initialized CUDA Graph LoRA manager, "
+                f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
+            )
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -571,7 +597,40 @@ class PyTorchModelEngine(ModelEngine):
         finally:
             self.cuda_graph_runner.enabled = _run_cuda_graphs
 
+    @staticmethod
+    def warmup_with_kv_cache_cleanup(method):
+        """
+        Decorator for warmup methods that cleans up NaNs/Infs in KV Cache after warmup execution.
+
+        Why this is needed:
+        - Our attention kernel uses multiplication by zero to mask out invalid tokens within
+          the same page. Since NaN/Inf * 0 = NaN, any NaNs/Infs in these invalid KV areas
+          will persist after masking.
+        - These NaNs/Infs propagate to outputs and subsequent KV Cache entries, corrupting
+          future computations with higher probability.
+        - During warmup, we execute with placeholder data rather than actual valid inputs,
+          which can introduce NaNs/Infs into KV Cache pages and cause random, hard-to-debug
+          accuracy issues.
+        """
+
+        @functools.wraps(method)
+        def wrapper(self, resource_manager: ResourceManager, *args, **kwargs):
+            result = method(self, resource_manager, *args, **kwargs)
+            kv_cache_manager = resource_manager.get_resource_manager(
+                self.kv_cache_manager_key)
+            if kv_cache_manager is not None:
+                has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
+                    fill_with_zero=True)
+                if has_invalid_values:
+                    logger.warning(
+                        "NaNs/Infs have been introduced to KVCache during warmup, KVCache was filled with zeros to avoid potential issues"
+                    )
+            return result
+
+        return wrapper
+
     @with_warmup_flag
+    @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
@@ -1013,8 +1072,14 @@ class PyTorchModelEngine(ModelEngine):
         available_tokens = kv_cache_manager.get_num_available_tokens(draft_len)
 
         # Add one dummy request with the maximum possible sequence length.
-        max_seq_len = self.max_seq_len if max_seq_len is None else max_seq_len
-        token_num = max(1, min(available_tokens, max_seq_len - 1))
+        max_seq_len = min(
+            self.max_seq_len if max_seq_len is None else max_seq_len,
+            kv_cache_manager.max_seq_len)
+        token_num = max(
+            1,
+            min(
+                available_tokens, max_seq_len - 1 -
+                get_num_extra_kv_tokens(self.spec_config) - draft_len))
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
@@ -1155,6 +1220,11 @@ class PyTorchModelEngine(ModelEngine):
         release_gc()
 
     def _init_max_seq_len(self):
+        # Allow user to override the inferred max_seq_len with a warning.
+        allow_long_max_model_len = os.getenv(
+            "TLLM_ALLOW_LONG_MAX_MODEL_LEN",
+            "0").lower() in ["1", "true", "yes", "y"]
+
         # For mm_encoder_only mode, infer_max_seq_len() is for LLM decoder models
         if hasattr(self.model, 'infer_max_seq_len'):
             inferred_max_seq_len = self.model.infer_max_seq_len()
@@ -1166,15 +1236,20 @@ class PyTorchModelEngine(ModelEngine):
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
             )
             self.max_seq_len = inferred_max_seq_len
-
         elif inferred_max_seq_len < self.max_seq_len:
-            # NOTE: py_executor_creator makes sure that the executor uses this
-            # smaller value as its max_seq_len too.
-            logger.warning(
-                f"Specified {self.max_seq_len=} is larger than what the model can support "
-                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
-            )
-            self.max_seq_len = inferred_max_seq_len
+            if allow_long_max_model_len:
+                logger.warning(
+                    f"User specified max_seq_len is larger than the config in the model config file "
+                    f"({inferred_max_seq_len}). Setting max_seq_len to user's specified value {self.max_seq_len}. "
+                )
+            else:
+                # NOTE: py_executor_creator makes sure that the executor uses this
+                # smaller value as its max_seq_len too.
+                logger.warning(
+                    f"Specified {self.max_seq_len=} is larger than what the model can support "
+                    f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
+                )
+                self.max_seq_len = inferred_max_seq_len
 
     def _infer_max_seq_len_from_config(self) -> int:
 
@@ -1324,7 +1399,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
-            return list(self.dist.tp_allgather(attn_metadata.num_tokens))
+            return list(self.dist.tp_cp_allgather(attn_metadata.num_tokens))
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
@@ -1536,7 +1611,7 @@ class PyTorchModelEngine(ModelEngine):
             # Handle distributed spec metadata
             if enable_attention_dp:
                 sequence_lengths = spec_metadata.seq_lens
-                all_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
                 spec_metadata.all_rank_num_tokens = [
@@ -1893,7 +1968,8 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection_buffer: Optional[torch.Tensor] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None,
             req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-            resource_manager: Optional[ResourceManager] = None):
+            resource_manager: Optional[ResourceManager] = None,
+            maybe_graph: bool = False):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -2630,8 +2706,10 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
 
+        peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
+            ResourceManagerType.PEFT_CACHE_MANAGER)
         lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+            scheduled_requests, attn_metadata, peft_cache_manager, maybe_graph)
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
@@ -2691,7 +2769,7 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
 
@@ -2856,7 +2934,7 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.tp_allgather([
+                all_rank_num_tokens = self.dist.tp_cp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
@@ -2871,7 +2949,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
-                all_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_cp_allgather(
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
@@ -3099,10 +3177,41 @@ class PyTorchModelEngine(ModelEngine):
             'inputs_embeds': None
         }, gather_ids if is_spec_decode else None
 
-    def _get_lora_params_from_requests(self,
-                                       scheduled_requests: ScheduledRequests,
-                                       attn_metadata: AttentionMetadata):
+    def _get_lora_params_from_requests(
+            self,
+            scheduled_requests: ScheduledRequests,
+            attn_metadata: AttentionMetadata,
+            peft_cache_manager: Optional[PeftCacheManager] = None,
+            maybe_graph: bool = False):
         '''
+        Get LoRA parameters from scheduled requests.
+
+        Uses CUDA Graph compatible mode in decode only batch, otherwise falls back to eager mode.
+
+        Returns:
+            Dictionary containing LoRA parameters, or None if no LoRA requests
+        '''
+        use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
+
+        if use_cuda_graph_mode:
+            return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
+                scheduled_requests, attn_metadata, peft_cache_manager)
+        else:
+            if self.cuda_graph_lora_manager is not None:
+                self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
+                    peft_cache_manager)
+            peft_table = peft_cache_manager.get_and_reset_batch_peft_table(
+            ) if peft_cache_manager is not None else None
+            return peft_table and self._get_eager_lora_params_from_requests(
+                scheduled_requests, attn_metadata, peft_table)
+
+    def _get_eager_lora_params_from_requests(
+            self, scheduled_requests: ScheduledRequests,
+            attn_metadata: AttentionMetadata,
+            peft_table: Dict[int, list[TaskLayerModuleConfig]]):
+        '''
+        Eager mode LoRA parameter preparation logic.
+
         lora_params: dict
         {
             layer_id: dict
@@ -3122,10 +3231,12 @@ class PyTorchModelEngine(ModelEngine):
 
         # trace all requests to get the union set of the lora params
         for request in request_list:
-            if request.py_lora_task_layer_module_configs is None:
+            if request.lora_task_id is None:
                 continue
 
-            for module in request.py_lora_task_layer_module_configs:
+            layer_module_configs = peft_table[request.lora_task_id]
+
+            for module in layer_module_configs:
                 module_id = module.module_id
                 layer_id = module.layer_id
 
@@ -3152,7 +3263,7 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in request_list:
             # Need to set default values for this case
-            if request.py_lora_task_layer_module_configs is None:
+            if request.lora_task_id is None:
                 for layer_id in lora_params:
                     for module_id in lora_params[layer_id]:
                         current_lora_params = lora_params[layer_id][module_id]
@@ -3202,7 +3313,8 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection_buffer: Optional[torch.Tensor] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None,
             req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-            resource_manager: Optional[ResourceManager] = None):
+            resource_manager: Optional[ResourceManager] = None,
+            maybe_graph: bool = False):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -3215,12 +3327,11 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                       attn_metadata, spec_metadata,
-                                       new_tensors_device,
-                                       cache_indirection_buffer,
-                                       num_accepted_tokens_device,
-                                       req_id_to_old_request, resource_manager)
+        return self._prepare_tp_inputs(
+            scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
+            new_tensors_device, cache_indirection_buffer,
+            num_accepted_tokens_device, req_id_to_old_request, resource_manager,
+            maybe_graph)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
@@ -3304,12 +3415,11 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
-
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager)
+                resource_manager, can_run_graph)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
