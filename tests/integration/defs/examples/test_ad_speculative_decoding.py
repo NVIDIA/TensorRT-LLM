@@ -14,14 +14,18 @@
 # limitations under the License.
 
 import os
+import re
+from pathlib import Path
 
 import pytest
+import torch
 from build_and_run_ad import ExperimentConfig, main
 from defs.conftest import llm_models_root
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy.llm import LLM
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 prompts = [
     "What is the capital of France?",
@@ -52,14 +56,14 @@ def get_model_paths():
 
 def make_draft_target_config(spec_model_path: str):
     return DraftTargetDecodingConfig(
-        max_draft_len=DRAFT_TARGET_MAX_DRAFT_LEN, speculative_model_dir=spec_model_path
+        max_draft_len=DRAFT_TARGET_MAX_DRAFT_LEN, speculative_model=spec_model_path
     )
 
 
 def make_eagle3_config(spec_model_path: str):
-    return EagleDecodingConfig(
+    return Eagle3DecodingConfig(
         max_draft_len=EAGLE_MAX_DRAFT_LEN,
-        speculative_model_dir=spec_model_path,
+        speculative_model=spec_model_path,
         eagle3_one_model=False,
         eagle3_layers_to_capture=None,
     )
@@ -214,9 +218,9 @@ def test_autodeploy_eagle3_acceptance_rate():
     max_draft_len = EAGLE_MAX_DRAFT_LEN
 
     # Configure Eagle3 speculative decoding
-    speculative_config = EagleDecodingConfig(
+    speculative_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
-        speculative_model_dir=eagle_model,
+        speculative_model=eagle_model,
         eagle3_one_model=False,
         eagle3_layers_to_capture=None,
     )
@@ -276,3 +280,171 @@ def test_autodeploy_eagle3_acceptance_rate():
     print("\n" + "=" * 80)
     print("SUCCESS! All requests passed acceptance rate threshold")
     print("=" * 80)
+
+
+def load_weights(model_path: Path, model: torch.nn.Module):
+    """Load weights from checkpoint while applying the same _checkpoint_conversion_mapping that the factory uses.
+
+    Returns: tuple of (loaded_keys, missing_keys, unexpected_keys)
+    """
+    # 1. Load checkpoint keys
+    bin_path = model_path / "pytorch_model.bin"
+    safetensors_path = model_path / "model.safetensors"
+
+    if safetensors_path.exists():
+        from safetensors import safe_open
+
+        with safe_open(safetensors_path, framework="pt") as f:
+            checkpoint_keys_original = list(f.keys())
+    elif bin_path.exists():
+        state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+        checkpoint_keys_original = list(state_dict.keys())
+        del state_dict
+    else:
+        raise FileNotFoundError(f"No checkpoint found at {model_path}")
+
+    # 2. Apply _checkpoint_conversion_mapping (same logic as hf.py _remap_param_names_load_hook)
+    # This is the key part - the factory does this exact same thing in lines 496-512 of hf.py
+    conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+    checkpoint_keys_remapped = []
+
+    for key in checkpoint_keys_original:
+        new_key = key
+        if conversion_mapping:
+            for pattern, replacement in conversion_mapping.items():
+                new_key = re.sub(pattern, replacement, new_key)
+        checkpoint_keys_remapped.append(new_key)
+
+    # 3. Get model's expected keys
+    model_keys = set(model.state_dict().keys())
+    checkpoint_keys = set(checkpoint_keys_remapped)
+
+    # 4. Calculate differences
+    loaded_keys = checkpoint_keys & model_keys
+    missing_in_checkpoint = model_keys - checkpoint_keys
+    unexpected_in_checkpoint = checkpoint_keys - model_keys
+
+    return loaded_keys, missing_in_checkpoint, unexpected_in_checkpoint
+
+
+def test_eagle_model_with_weights():
+    """Test EagleModel forward pass with loaded weights using the EagleDrafterFactory.
+
+    This test uses EagleDrafterFactory to initialize the model, which directly
+    builds the Eagle drafter model based on the checkpoint's model_type:
+
+    1. Factory creates config via AutoConfig.from_pretrained
+    2. Factory selects Eagle3DrafterForCausalLM based on model_type="llama"
+    3. Factory creates model via _from_config
+    4. Factory loads weights via load_or_random_init -> _load_checkpoint
+
+    This ensures the test validates the exact initialization path used in production.
+    """
+    print("\n" + "=" * 80)
+    print("Test: EagleModel forward pass with loaded weights (via EagleDrafterFactory)")
+    print("=" * 80)
+
+    _, _, eagle_model_path = get_model_paths()
+    eagle_path = Path(eagle_model_path)
+
+    if not eagle_path.exists():
+        pytest.skip(f"Eagle model not found at {eagle_model_path}")
+
+    # Check for weights
+    bin_path = eagle_path / "pytorch_model.bin"
+    safetensors_path = eagle_path / "model.safetensors"
+    if not bin_path.exists() and not safetensors_path.exists():
+        pytest.skip(f"Weights not found at {eagle_model_path}")
+
+    # 1. Setup Device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 2. Create factory
+    # EagleDrafterFactory directly builds the correct drafter model based on model_type
+    print("Creating EagleDrafterFactory...")
+    factory = EagleDrafterFactory(
+        model=eagle_model_path,
+        skip_loading_weights=False,  # We want to test weight loading
+    )
+
+    # 3. Build model using factory
+    # Factory flow:
+    #   build_model() -> prefetch_checkpoint() -> _build_model()
+    #   _build_model() -> _get_model_config() (gets base LlamaConfig)
+    #   _build_model() -> selects Eagle3DrafterForCausalLM for model_type="llama"
+    #   _build_model() -> Eagle3DrafterForCausalLM._from_config(config)
+    print("Building model via factory.build_model('meta')...")
+    model = factory.build_model("meta")
+    print(f"Model type: {type(model).__name__}")
+    print(f"Model config type: {type(model.config).__name__}")
+
+    # 4. Load weights from checkpoint and compare to model's expected keys
+    print("\n--- Weight Loading Analysis ---")
+    loaded_keys, missing_keys, unexpected_keys = load_weights(eagle_path, model)
+
+    print(f"Total model parameters: {len(loaded_keys) + len(missing_keys)}")
+    print(f"Total checkpoint keys: {len(loaded_keys) + len(unexpected_keys)}")
+    print(f"✅ Weights to be loaded: {len(loaded_keys)}")
+    print(f"⚠️  Missing in checkpoint (will be random init): {len(missing_keys)}")
+    print(f"⚠️  Unexpected in checkpoint (will be ignored): {len(unexpected_keys)}")
+
+    if missing_keys:
+        print("\nMissing keys (model expects but checkpoint doesn't have):")
+        for key in sorted(missing_keys):
+            if "embed_tokens" in key:
+                print(f"  - {key} (expected: shared from target model)")
+            elif "rotary_emb" in key:
+                print(f"  - {key} (expected: computed at runtime)")
+            else:
+                print(f"  - {key}")
+
+    if unexpected_keys:
+        print("\nUnexpected keys (in checkpoint but model doesn't expect):")
+        for key in sorted(unexpected_keys):
+            if "t2d" in key:
+                print(f"  - {key} (expected: not used in Eagle3)")
+            else:
+                print(f"  - {key}")
+
+    if loaded_keys:
+        print(f"\nLoaded keys ({len(loaded_keys)} total):")
+        for key in sorted(loaded_keys)[:10]:
+            print(f"  - {key}")
+        if len(loaded_keys) > 10:
+            print(f"  ... and {len(loaded_keys) - 10} more")
+
+    print("--- End Weight Analysis ---\n")
+
+    # Verify expected missing and unexpected keys
+    # These are the keys we expect based on Eagle3 architecture:
+    # - embed_tokens: shared from target model (not in Eagle checkpoint)
+    # - t2d: target-to-draft mapping, not used in Eagle3 (uses d2t instead)
+    expected_missing_keys = {"model.embed_tokens.weight"}
+    expected_unexpected_keys = {"model.t2d"}
+
+    assert missing_keys == expected_missing_keys, (
+        f"Unexpected missing keys.\n"
+        f"Expected: {expected_missing_keys}\n"
+        f"Got: {missing_keys}\n"
+        f"Extra missing: {missing_keys - expected_missing_keys}\n"
+        f"Not missing (but expected): {expected_missing_keys - missing_keys}"
+    )
+
+    assert unexpected_keys == expected_unexpected_keys, (
+        f"Unexpected keys in checkpoint.\n"
+        f"Expected: {expected_unexpected_keys}\n"
+        f"Got: {unexpected_keys}\n"
+        f"Extra unexpected: {unexpected_keys - expected_unexpected_keys}\n"
+        f"Not unexpected (but expected): {expected_unexpected_keys - unexpected_keys}"
+    )
+
+    print("✅ Weight loading analysis matches expected missing/unexpected keys!")
+
+    # 5. Load weights using factory (mimics actual pipeline)
+    # If tensor shapes do not match with how they are used in the forward() function, we will
+    # get an error.
+    print("Loading weights via factory.load_or_random_init()...")
+    factory.load_or_random_init(model, device)
+    print("Weights loaded successfully via factory interface!")
+
+    model.eval()

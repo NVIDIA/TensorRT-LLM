@@ -8,6 +8,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -485,6 +486,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
+            logprobs_mode: LogprobMode = LogprobMode.RAW,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -531,9 +533,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
-        self.py_lora_task_layer_module_configs: list[
-            tensorrt_llm.bindings.internal.runtime.
-            TaskLayerModuleConfig] | None = None
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
 
@@ -565,6 +564,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
         self.py_stop_words_list = stop_words_list
+
+        self.py_logprobs_mode = LogprobMode(
+            logprobs_mode)  # handle passed a raw string
+        self.py_disaggregated_params = None
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -825,7 +828,14 @@ def executor_request_to_llm_request(
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
-        kv_cache_retention_config=executor_request.kv_cache_retention_config)
+        kv_cache_retention_config=executor_request.kv_cache_retention_config,
+        logprobs_mode=getattr(executor_request, "py_logprobs_mode",
+                              LogprobMode.RAW),
+    )
+
+    llm_request.py_disaggregated_params = getattr(executor_request,
+                                                  "py_disaggregated_params",
+                                                  None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

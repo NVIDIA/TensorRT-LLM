@@ -4,36 +4,15 @@ from typing import Callable, Tuple
 
 import torch
 import torch.nn.functional as F
+from triton_kernels.matmul_ogs import FlexCtx, FnSpecs, FusedActivation, PrecisionConfig, matmul_ogs
+from triton_kernels.numerics import InFlexData
+from triton_kernels.routing import RoutingData, routing
+from triton_kernels.swiglu import swiglu_fn
+from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+from triton_kernels.tensor_details import layout
+from triton_kernels.tensor_details.layout import StridedLayout
 
-IS_TRITON_KERNELS_AVAILABLE = True
-TRITON_KERNELS_UNAVAILABLE_REASON = ""
-
-try:
-    from triton_kernels.matmul_ogs import (
-        FlexCtx,
-        FnSpecs,
-        FusedActivation,
-        PrecisionConfig,
-        matmul_ogs,
-    )
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.routing import RoutingData, routing
-    from triton_kernels.swiglu import swiglu_fn
-    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-    from triton_kernels.tensor_details import layout
-    from triton_kernels.tensor_details.layout import StridedLayout
-
-    from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
-
-except Exception as _e:
-    IS_TRITON_KERNELS_AVAILABLE = False
-    TRITON_KERNELS_UNAVAILABLE_REASON = f"{type(_e).__name__}: {_e}"
-
-    FlexCtx = FnSpecs = FusedActivation = PrecisionConfig = matmul_ogs = None
-    InFlexData = RoutingData = routing = swiglu_fn = None
-    FP4 = convert_layout = wrap_torch_tensor = None
-    layout = StridedLayout = None
-    TritonEPRouter = None
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
 
 
 # copied from transformers.integrations.mxfp4::swizzle_mxfp4 with minor modification

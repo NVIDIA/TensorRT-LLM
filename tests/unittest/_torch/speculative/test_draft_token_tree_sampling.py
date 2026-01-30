@@ -8,7 +8,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.speculative.drafting_loops import \
     TreeDraftingLoopWrapper
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
-from tensorrt_llm.llmapi import EagleDecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -35,10 +35,10 @@ def test_draft_token_static_tree_sampling():
     def run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
                  max_draft_len, eagle_choices, logits, use_cuda_graph,
                  ref_new_tokens):
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             max_total_draft_tokens=max_total_draft_tokens,
-            speculative_model_dir=eagle_model_dir,
+            speculative_model=eagle_model_dir,
             eagle3_one_model=False,
             eagle_choices=eagle_choices,
             use_dynamic_tree=use_dynamic_tree,

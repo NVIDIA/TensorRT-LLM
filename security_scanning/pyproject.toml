@@ -1,86 +1,88 @@
-[tool.poetry]
+[project]
 name = "tensorrt-llm"
 version = "0.1.0"
 description = ""
-authors = ["TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"]
-license = "Apache-2.0"
-readme = "README.md"
-
-[tool.poetry.dependencies]
-python = ">=3.10,<3.13"
-accelerate = ">=1.7.0"
-build = "^1.4.0"
-colored = "^2.3.1"
-cuda-python = ">=13"
-diffusers = ">=0.27.0"
-lark = "^1.3.1"
-mpi4py = "^4.1.1"
-numpy = "<2"
-onnx = ">=1.18.0,<1.20.0"
-onnx-graphsurgeon = ">=0.5.2"
-openai = "^2.15.0"
-polygraphy = "^0.49.26"
-psutil = "^7.2.1"
-nvidia-ml-py = ">=13"
-pulp = "^3.3.0"
-pandas = "^2.3.3"
-h5py = "3.12.1"
-strenum = "^0.4.15"
-sentencepiece = ">=0.1.99"
-tensorrt = ">=10.13.3,<10.14.0"
-torch = ">=2.9.0a0,<=2.9.0"
-nvidia-modelopt = {version = ">=0.37.0,<0.38.0", extras = ["torch"]}
-nvidia-nccl-cu13 = "2.27.7"
-nvidia-cuda-nvrtc = "^13.1.80"
-transformers = "4.57.1"
-prometheus-client = "^0.24.0"
-prometheus-fastapi-instrumentator = "^7.1.0"
-pydantic = ">=2.9.1"
-pydantic-settings = {extras = ["yaml"], version = "^2.12.0"}
-omegaconf = "^2.3.0"
-pillow = "^12.1.0"
-wheel = "<=0.45.1"
-optimum = "^2.1.0"
-datasets = "3.1.0"
-evaluate = "^0.4.6"
-mpmath = ">=1.3.0"
-click = "^8.3.1"
-click-option-group = "^0.5.9"
-aenum = "^3.1.16"
-pyzmq = "^27.1.0"
-fastapi = ">=0.120.1,<=0.121.3"
-starlette = ">=0.49.1"
-uvicorn = "^0.40.0"
-setuptools = "<80"
-ordered-set = "^4.1.0"
-peft = "^0.18.1"
-patchelf = "^0.17.2.4"
-einops = "^0.8.1"
-flashinfer-python = ">=0.3.0,<0.4.0"
-xgrammar = "0.1.25"
-llguidance = "0.7.29"
-jsonschema = "^4.26.0"
-backoff = "^2.2.1"
-nvtx = "^0.2.14"
-matplotlib = "^3.10.8"
-meson = "^1.10.0"
-ninja = "^1.13.0"
-etcd3 = {git = "https://github.com/kragniz/python-etcd3.git", rev = "e58a899579ba416449c4e225b61f039457c8072a"}
-blake3 = "^1.0.8"
-soundfile = "^0.13.1"
-triton = "3.5.0"
-tiktoken = "^0.12.0"
-blobfile = "^3.1.0"
-openai-harmony = "0.0.4"
-nvidia-cutlass-dsl = "4.3.4"
-plotly = "^6.5.1"
-numexpr = "<2.14.0"
-partial-json-parser = "^0.2.1.1.post7"
-torch-c-dlpack-ext = "0.1.3"
-mistral-common = "1.8.6"
-torchao = ">=0.14.1"
+authors = [
+    {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
+]
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "accelerate (>=1.7.0)",
+    "build (>=1.4.0,<2.0.0)",
+    "colored (>=2.3.1,<3.0.0)",
+    "cuda-python (>=13)",
+    "diffusers (>=0.27.0)",
+    "lark (>=1.3.1,<2.0.0)",
+    "mpi4py (>=4.1.1,<5.0.0)",
+    "numpy (<2)",
+    "onnx (>=1.18.0,<1.20.0)",
+    "onnx-graphsurgeon (>=0.5.2)",
+    "openai (>=2.16.0,<3.0.0)",
+    "polygraphy (>=0.49.26,<0.50.0)",
+    "psutil (>=7.2.2,<8.0.0)",
+    "nvidia-ml-py (>=13)",
+    "pulp (>=3.3.0,<4.0.0)",
+    "h5py (==3.12.1)",
+    "strenum (>=0.4.15,<0.5.0)",
+    "sentencepiece (>=0.1.99)",
+    "tensorrt (>=10.14.1,<10.15.0)",
+    "torch (>=2.9.1,<=2.10.0a0)",
+    "nvidia-modelopt[torch] (>=0.37.0,<0.38.0)",
+    "nvidia-nccl-cu13 (>=2.27.7,<=2.28.9)",
+    "nvidia-cuda-nvrtc (>=13.1.115,<14.0.0)",
+    "transformers (==4.57.1)",
+    "prometheus-client (>=0.24.1,<0.25.0)",
+    "prometheus-fastapi-instrumentator (>=7.1.0,<8.0.0)",
+    "pydantic (>=2.9.1)",
+    "pydantic-settings[yaml] (>=2.12.0,<3.0.0)",
+    "omegaconf (>=2.3.0,<3.0.0)",
+    "pillow (>=12.1.0,<13.0.0)",
+    "wheel (<=0.45.1)",
+    "optimum (>=2.1.0,<3.0.0)",
+    "datasets (==3.1.0)",
+    "evaluate (>=0.4.6,<0.5.0)",
+    "mpmath (>=1.3.0)",
+    "click (>=8.3.1,<9.0.0)",
+    "click-option-group (>=0.5.9,<0.6.0)",
+    "aenum (>=3.1.16,<4.0.0)",
+    "pyzmq (>=27.1.0,<28.0.0)",
+    "fastapi (>=0.120.1,<=0.121.3)",
+    "starlette (>=0.49.1)",
+    "uvicorn (>=0.40.0,<0.41.0)",
+    "setuptools (<80)",
+    "ordered-set (>=4.1.0,<5.0.0)",
+    "peft (>=0.18.1,<0.19.0)",
+    "patchelf (>=0.17.2.4,<0.18.0.0)",
+    "einops (>=0.8.2,<0.9.0)",
+    "flashinfer-python (>=0.6.2,<0.7.0)",
+    "xgrammar (==0.1.25)",
+    "llguidance (==0.7.29)",
+    "jsonschema (>=4.26.0,<5.0.0)",
+    "backoff (>=2.2.1,<3.0.0)",
+    "nvtx (>=0.2.14,<0.3.0)",
+    "matplotlib (>=3.10.8,<4.0.0)",
+    "meson (>=1.10.1,<2.0.0)",
+    "ninja (>=1.13.0,<2.0.0)",
+    "etcd3 @ git+https://github.com/kragniz/python-etcd3.git@e58a899579ba416449c4e225b61f039457c8072a",
+    "blake3 (>=1.0.8,<2.0.0)",
+    "soundfile (>=0.13.1,<0.14.0)",
+    "triton (==3.5.1)",
+    "tiktoken (>=0.12.0,<0.13.0)",
+    "blobfile (>=3.1.0,<4.0.0)",
+    "openai-harmony (==0.0.4)",
+    "nvidia-cutlass-dsl (==4.3.4)",
+    "plotly (>=6.5.2,<7.0.0)",
+    "numexpr (<2.14.0)",
+    "partial-json-parser (>=0.2.1.1.post7,<0.3.0.0)",
+    "torch-c-dlpack-ext (==0.1.3)",
+    "mistral-common (==1.8.6)",
+    "torchao (>=0.14.1)",
+    "cuda-core (>=0.5.1,<0.6.0)",
+    "dynamic-path-manager (>=1.0.1,<2.0.0)"
+]
 
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"

@@ -44,7 +44,7 @@ report_head() {
 
 run_benchmark_and_parse() {
     # Run benchmark and parse results in a single Docker container
-    mount=" -v /home/scratch.trt_llm_data:/home/scratch.trt_llm_data:ro -v $output_dir:$output_dir:rw -v $bench_dir:$bench_dir:ro"
+    mount=" -v /home/scratch.trt_llm_data_ci:/home/scratch.trt_llm_data_ci:ro -v $output_dir:$output_dir:rw -v $bench_dir:$bench_dir:ro"
     if [[ -n "$trtllm_dir" && -d "$trtllm_dir" ]]; then
         mount="$mount -v $trtllm_dir:$trtllm_dir:ro"
     fi
@@ -56,7 +56,7 @@ run_benchmark_and_parse() {
         ${IMAGE} \
         bash -c "
             echo 'Running benchmarks...'
-            export LLM_MODELS_ROOT=/home/scratch.trt_llm_data/llm-models
+            export LLM_MODELS_ROOT=/home/scratch.trt_llm_data_ci/llm-models
 
             # Handle trtllm_dir parameter
             if [[ -n \"$trtllm_dir\" && -d \"$trtllm_dir\" ]]; then

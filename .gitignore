@@ -52,6 +52,8 @@ tensorrt_llm/pg_utils_bindings.*.so
 tensorrt_llm/flash_mla/
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
+tensorrt_llm/runtime/kv_cache_manager_v2/**/*.so
+**/*__mypyc*.so
 tensorrt_llm/scripts
 *docs/cpp_docs*
 *docs/source/_cpp_gen*
@@ -72,6 +74,7 @@ ad-test-workspace/
 */tllm_debug/**
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
+examples/disaggregated/slurm/benchmark/logs/
 
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h

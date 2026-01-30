@@ -37,6 +37,8 @@ l0_h100:
   - unittest/disaggregated/test_disagg_utils.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
+  - unittest/disaggregated/test_agent_multi_backends.py
+  - unittest/disaggregated/test_messenger.py
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse
@@ -78,10 +80,6 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format
-  # Waive known failures in https://nvbugs/5774869
-  # - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.0] TIMEOUT (90)
-  # - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.5] TIMEOUT (90)
-  # - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=False-eagle3_one_model=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=True-eagle3_one_model=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=False-eagle3_one_model=True]
@@ -114,17 +112,8 @@ l0_h100:
   - test_e2e.py::test_trtllm_bench_help_sanity[meta-llama/Llama-3.1-8B]
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_responses
+  - test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]
   - test_e2e.py::test_trtllm_benchmark_serving[llama-3.1-model/Meta-Llama-3.1-8B]
-  # ------------- AutoDeploy tests ---------------
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
 - condition:
     ranges:
       system_gpu_count:
@@ -412,6 +401,7 @@ l0_h100:
   - unittest/trt/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
   - unittest/trt/attention/test_gpt_attention_no_cache.py
   - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
+  - unittest/kv_cache_manager_v2_tests/ # 4 min
 - condition:
     ranges:
       system_gpu_count:
@@ -426,3 +416,30 @@ l0_h100:
       backend: fmha
   tests:
   - test_fmha.py::test_fmha TIMEOUT (90)
+# ------------- AutoDeploy Backend Stages ---------------
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: autodeploy
+      orchestrator: mpi
+  tests:
+  - unittest/_torch/auto_deploy/unit/singlegpu
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[flashinfer_ssm-False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16[1]
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
+  - examples/test_ad_speculative_decoding.py::test_eagle_model_with_weights

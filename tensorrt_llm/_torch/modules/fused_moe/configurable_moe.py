@@ -39,6 +39,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import (
     AllGatherReduceScatter,
@@ -167,6 +168,7 @@ class ConfigurableMoE(MoE):
             swiglu_limit=kwargs.get("swiglu_limit"),
             init_load_balancer=False,
             without_comm=True,
+            activation_type=self.activation_type,
         )
 
         self.validate_backend(backend)
@@ -312,7 +314,7 @@ class ConfigurableMoE(MoE):
         2. Validates if current AllToAll strategy can be used for given workload
         3. Falls back to AllGather if current strategy cannot be used (logs info message)
 
-        After calling this method, use _is_using_alltoall() to check which method is active.
+        After calling this method, use enable_alltoall to check which method is active.
 
         Args:
             all_rank_num_tokens: Token counts per rank
@@ -346,23 +348,6 @@ class ConfigurableMoE(MoE):
 
             # Switch to AllGather (always works)
             self.comm = AllGatherReduceScatter(mapping=self.mapping)
-
-    def _is_using_alltoall(self) -> bool:
-        """
-        Check if current communication strategy uses alltoall
-
-        Returns:
-            True: Strategy uses alltoall (NVLINK, DeepEP, etc.)
-            False: Strategy uses allgather (AllGatherReduceScatter or None)
-
-        Note: Can be called anytime. If comm is None, returns False (no alltoall).
-              Typically called after determine_communication_method() to get accurate result.
-        """
-        if self.comm is None:
-            return False  # No strategy means no alltoall
-
-        # AllGather uses allgather, all others use alltoall
-        return not isinstance(self.comm, AllGatherReduceScatter)
 
     def _create_comm_strategy_auto(self) -> Communication:
         """
@@ -605,9 +590,11 @@ class ConfigurableMoE(MoE):
         if self.layer_load_balancer and token_selected_experts is not None:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
 
-            # Update EPLB statistics (method depends on whether using NVLINK two-sided)
-            # Use base class method: ignore_allreduce=True for NVLINK two-sided (uses local stats only)
-            ignore_allreduce = self._is_using_nvlink_two_sided()
+            # Update EPLB statistics (method depends on communication strategy)
+            # Use base class method: ignore_allreduce=True for NVLINK two-sided/one-sided (uses local stats only)
+            ignore_allreduce = (
+                self._is_using_nvlink_two_sided() or self._is_using_nvlink_one_sided()
+            )
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -623,10 +610,16 @@ class ConfigurableMoE(MoE):
         if token_selected_slots is not None:
             ExpertStatistic.set_layer(self.layer_idx)
             ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
+            self.num_slots, token_selected_slots
+        )
 
         # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
         # NVLINK two-sided has a prepare phase to gather EPLB statistics
 
+        local_statistic_tensor_for_dispatch = None
+        eplb_dispatch_kwargs = {}
+        should_update_eplb_after_dispatch = False
         # Only NVLINK two-sided needs prepare_dispatch
         if self._is_using_nvlink_two_sided():
             # Get local statistic info if this is the last call and EPLB is enabled
@@ -644,6 +637,16 @@ class ConfigurableMoE(MoE):
             if gathered_stats is not None:
                 gathered_stats = gathered_stats.view((self.mapping.moe_ep_size, self.num_experts))
                 self._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
+        # TODO: The abstract does not work well as NVLinkTwoSided gathers EPLB stats in prepare_dispatch,
+        # while NVLinkOneSided gathers EPLB stats in dispatch.
+        elif self._is_using_nvlink_one_sided():
+            if self.layer_load_balancer and is_last_call:
+                local_statistic_tensor_for_dispatch = (
+                    self._load_balancer_get_local_statistic_tensor()
+                )
+            if local_statistic_tensor_for_dispatch is not None:
+                eplb_dispatch_kwargs["eplb_local_stats"] = local_statistic_tensor_for_dispatch
+                should_update_eplb_after_dispatch = True
 
         # ========== Step 4 & 5: Quantization and Communication Dispatch ==========
         # Order depends on whether strategy supports post-quant dispatch
@@ -665,11 +668,10 @@ class ConfigurableMoE(MoE):
                 # Step 4b: Dispatch AFTER quantization
                 # Get pre_quant_scale for W4AFP8 if available (only DeepEPLowLatency needs it)
                 # Other strategies will ignore this via **kwargs, so it's safe to pass unconditionally
-                dispatch_kwargs = {}
+                dispatch_kwargs = dict(eplb_dispatch_kwargs)
                 if hasattr(self, "quant_scales") and self.quant_scales is not None:
                     if hasattr(self.quant_scales, "pre_quant_scale_1"):
                         dispatch_kwargs["pre_quant_scale"] = self.quant_scales.pre_quant_scale_1
-
                 x, x_sf, token_selected_slots, token_final_scales = self.comm.dispatch(
                     hidden_states=x,
                     hidden_states_sf=x_sf,
@@ -679,6 +681,9 @@ class ConfigurableMoE(MoE):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
+                if should_update_eplb_after_dispatch:
+                    gathered_stats = self.comm.get_eplb_gathered_statistics()
+                    self._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
             else:
                 # ===== Pre-quant flow: Dispatch → Quantize =====
 
@@ -792,11 +797,7 @@ class ConfigurableMoE(MoE):
 
         Same as original implementation - chunking logic is backend-agnostic
 
-        Note: use_all_to_all is determined internally via _is_using_alltoall()
-
         """
-        # Determine if using alltoall
-        use_all_to_all = self._is_using_alltoall()
         # ========== Chunk preparation ==========
         if self.use_dp:
             # When using DP: need all ranks' token counts for reducescatter
@@ -810,7 +811,7 @@ class ConfigurableMoE(MoE):
             chunk_size_list = all_rank_chunk_size_list[self.rank]
 
             # For alltoall, replace 0 with 1 (avoid empty tensor)
-            if use_all_to_all:
+            if self.enable_alltoall:
                 all_rank_num_tokens_list = [
                     [1 if val == 0 else val for val in val_list]
                     for val_list in all_rank_num_tokens_list
@@ -824,7 +825,7 @@ class ConfigurableMoE(MoE):
         router_logits_list = router_logits.split(chunk_size_list)
 
         # Determine if we need multiple streams for overlapped execution
-        use_multi_stream = not use_all_to_all and self.aux_stream is not None
+        use_multi_stream = not self.enable_alltoall and self.aux_stream is not None
 
         # ========== Setup auxiliary stream ==========
         if use_multi_stream:
@@ -836,6 +837,26 @@ class ConfigurableMoE(MoE):
         workspace_0, workspace_1 = self._prepare_workspaces_for_chunk(
             all_rank_num_tokens_list, chunk_size_list, use_multi_stream
         )
+
+        # ========== Padding empty chunk ==========
+        chunked_used = torch.ones(num_chunks, dtype=torch.bool)
+        if self.use_dp:
+            # For empty chunk, will use chunk 0 instead. The current split heuristic
+            # ensures that if an empty chunk exists, Chunk 0 contains exactly one token.
+            assert x_list[0].numel() != 0, "chunk 0 shouldn't be empty"
+            x_list = list(x_list)
+            router_logits_list = list(router_logits_list)
+            for idx_chunk in range(num_chunks):
+                _x = x_list[idx_chunk]
+                if _x.numel() == 0:
+                    chunked_used[idx_chunk] = False
+                    x_list[idx_chunk] = x_list[0]
+                    router_logits_list[idx_chunk] = router_logits_list[0]
+                    all_rank_num_tokens_list[idx_chunk][self.mapping.tp_rank] = (
+                        all_rank_num_tokens_list[0][self.mapping.tp_rank]
+                    )
+            x_list = tuple(x_list)
+            router_logits_list = tuple(router_logits_list)
 
         # ========== Execute chunking with overlap ==========
         outputs_list = []
@@ -888,7 +909,8 @@ class ConfigurableMoE(MoE):
                     workspace=workspace_0,
                 )
 
-            outputs_list.append(outputs)
+            if chunked_used[idx_chunk]:
+                outputs_list.append(outputs)
 
         # ========== Wait for auxiliary stream to complete ==========
         if use_multi_stream:
@@ -937,6 +959,10 @@ class ConfigurableMoE(MoE):
     def _is_using_nvlink_two_sided(self) -> bool:
         """Check if using NVLinkTwoSided communication strategy"""
         return isinstance(self.comm, NVLinkTwoSided)
+
+    def _is_using_nvlink_one_sided(self) -> bool:
+        """Check if using NVLinkOneSided communication strategy"""
+        return isinstance(self.comm, NVLinkOneSided)
 
     def _get_nvlink_onesided_moe_output(
         self,
@@ -1043,7 +1069,8 @@ class ConfigurableMoE(MoE):
             # Only the non-alltoall case is considered for profiling in the warmup phase.
             # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner
             # should be the same as when not using alltoall.
-            if self._is_using_alltoall():
+            kwargs["enable_alltoall"] = self.enable_alltoall
+            if self.enable_alltoall:
                 if all_rank_num_tokens is not None:
                     kwargs["tuner_num_tokens"] = sum(all_rank_num_tokens)
                 else:
@@ -1051,9 +1078,6 @@ class ConfigurableMoE(MoE):
                         x.shape[0] * self.mapping.tp_size if x is not None else None
                     )
                 kwargs["tuner_top_k"] = self.routing_method.top_k
-            else:
-                kwargs["tuner_num_tokens"] = None
-                kwargs["tuner_top_k"] = None
 
             # Get moe_output for NVLinkOneSided backend
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
@@ -1123,6 +1147,25 @@ class ConfigurableMoE(MoE):
             f"Backend {self.backend.__class__.__name__} must implement post_load_weights()"
         )
         return self.backend.post_load_weights()
+
+    def process_weights_after_loading(self):
+        """
+        Process weights after loading - delegated to backend
+
+        """
+        assert hasattr(self.backend, "process_weights_after_loading"), (
+            f"Backend {self.backend.__class__.__name__} must implement process_weights_after_loading()"
+        )
+        return self.backend.process_weights_after_loading()
+
+    def pre_reload_weights(self):
+        """
+        Pre reload weights - delegated to backend
+        """
+        assert hasattr(self.backend, "pre_reload_weights"), (
+            f"Backend {self.backend.__class__.__name__} must implement pre_reload_weights()"
+        )
+        return self.backend.pre_reload_weights()
 
     # ========== Communication and Quantization Properties ==========
 

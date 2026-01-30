@@ -11,7 +11,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.bindings.executor import FinishReason
-from tensorrt_llm.llmapi import EagleDecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -20,10 +20,10 @@ def run_test(eagle_model_dir, max_seq_len, beam_width, use_dynamic_tree,
              max_new_tokens, max_batch_size, input_request, input_new_tokens,
              draft_layer_id, max_total_draft_tokens, max_draft_len,
              eagle_choices, ref_num_accepted_draft_tokens, ref_mtokens):
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=False,
         eagle_choices=eagle_choices,
         use_dynamic_tree=use_dynamic_tree,

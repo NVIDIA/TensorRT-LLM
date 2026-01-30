@@ -99,9 +99,11 @@ transforms:
     stage: weight_load
     run_per_gm: false
     checkpoint_device: null
+    expect_mem_change: true
   move_inputs_to_device:
     stage: weight_load
     run_per_gm: false
+    expect_mem_change: true
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
@@ -122,18 +124,17 @@ transforms:
     backend: trtllm
   fuse_moe:
     stage: post_load_fusion
-    enabled: true
+    expect_mem_change: true
     backend: trtllm
   fuse_fp8_moe:
     stage: post_load_fusion
-    enabled: true
+    expect_mem_change: true
     backend: trtllm
   fuse_nvfp4_moe:
     stage: post_load_fusion
-    enabled: false
+    expect_mem_change: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
-  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
   fuse_rmsnorm:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer
@@ -175,11 +176,12 @@ transforms:
     backend: cached_residual_add
   initialize_cache:
     stage: cache_init
+    expect_mem_change: true
     run_per_gm: false
   resize_kv_cache:
     stage: cache_init
+    expect_mem_change: true
     run_per_gm: false
-    free_mem_ratio: 0.0
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
@@ -190,6 +192,7 @@ transforms:
     enabled: false
   compile_model:
     stage: compile
+    expect_mem_change: true
     run_per_gm: false
     cuda_graph_batch_sizes: null
     backend: torch-compile

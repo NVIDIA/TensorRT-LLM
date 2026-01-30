@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Literal, Optional, Tuple, Type
@@ -8,9 +9,12 @@ from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.utils import ActivationType
 
+from ...custom_ops.quant import TRTLLM_NVFP4_PACKING_FACTOR, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code, get_attr_by_name
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import (
     BaseTransform,
@@ -112,8 +116,8 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
             # Delete the unstacked weights immediately to save GPU memory
             # This will happen automatically after the graph is canonicalized,
             # but for large models we'll run out of memory during the transformation itself.
-            gm.graph.eliminate_dead_code()
-            gm.delete_all_unused_submodules()
+            eliminate_dead_code(gm)
+            delete_all_unused_submodules(gm)
 
     return fused_key_counter
 
@@ -635,7 +639,7 @@ class MatchMoePattern(BaseTransform):
             graph.erase_node(final_hidden_state_node)
 
             while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
-                gm.graph.eliminate_dead_code()
+                eliminate_dead_code(gm)
 
             num_moe_patterns += 1
 
@@ -1272,14 +1276,14 @@ class MatchBmmMoePattern(BaseTransform):
                 graph.erase_node(output_node)
 
                 # Clean up dead nodes
-                gm.graph.eliminate_dead_code()
+                eliminate_dead_code(gm)
 
                 # Clean up dead inplace nodes in the region
                 while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
-                    gm.graph.eliminate_dead_code()
+                    eliminate_dead_code(gm)
 
                 # Delete unused submodules/parameters
-                gm.delete_all_unused_submodules()
+                delete_all_unused_submodules(gm)
 
                 num_moe_patterns += 1
 
@@ -1287,6 +1291,33 @@ class MatchBmmMoePattern(BaseTransform):
             skipped=False, num_matches=num_moe_patterns, is_clean=False, has_valid_shapes=False
         )
         return gm, info
+
+
+def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> None:
+    """Remove original expert submodules after weights have been stacked.
+
+    This function attempts to free GPU memory by deleting the original expert
+    submodules whose weights have been replaced by fused/stacked versions.
+
+    Args:
+        gm: The GraphModule containing the expert submodules
+        weight_lists: List of weight node lists (e.g., [w1_list, w2_list, w3_list])
+    """
+    # Flatten all weight lists/
+    weight_lists_flat = [w for weights in weight_lists for w in weights]
+
+    for w in weight_lists_flat:
+        w_param = get_attr_by_name(gm, w.target)
+        if w_param is not None:
+            owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
+            owner_param = get_attr_by_name(owner_module, param_name)
+            if owner_param is w_param:
+                gm.delete_submodule(owner_module_path)
+            else:
+                # param w is not owned by owner_module, skip
+                continue
+        else:
+            continue
 
 
 def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
@@ -1512,13 +1543,12 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
-
-    # Clean up after processing all nodes
-    # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
-    # will remove the parameters/buffers that are no longer referenced
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     return fused_key_counter
 
@@ -1626,14 +1656,13 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             "w3_weight",
             "w1_input_scale",
             "w2_input_scale",
-            "w3_input_scale",
             "w1_weight_scale",
             "w2_weight_scale",
             "w3_weight_scale",
             "w1_alpha",
             "w2_alpha",
-            "w3_alpha",
             "is_gated_mlp",
+            "act_fn",
         )
 
     def _stack(param_list, dim=0, device=None, dtype=None):
@@ -1647,13 +1676,10 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
     def _prepare_args_cutlass_format_nvfp4():
         if is_gated_mlp:
             # For gated MLP, concatenate w1 and w3 as [w3, w1]
-            fc1_expert_weights = torch.cat(
-                [w3_stacked, w1_stacked], dim=1
-            ).contiguous()  # [E, 2*I, H]
-            fc1_act_scale = torch.cat(
-                [w3_input_scale_stacked, w1_input_scale_stacked], dim=1
-            ).contiguous()
-            fc1_alpha_stacked = torch.cat([w3_alpha_stacked, w1_alpha_stacked], dim=1).contiguous()
+            fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
+            # Expect w3 input scale and alpha to be the same as w1
+            fc1_act_scale = w1_input_scale_stacked
+            fc1_alpha_stacked = w1_alpha_stacked
             fc1_weight_blockscale_fp8_stacked = torch.cat(
                 [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
             ).contiguous()
@@ -1665,6 +1691,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
 
         fc2_expert_weights = w2_stacked
         fc2_act_scale = w2_input_scale_stacked
+        fc2_weight_blockscale_fp8_stacked = w2_weight_blockscale_fp8_stacked
 
         new_key_fc1_expert_weights = f"nvfp4_moe_w3_w1_stacked_{fused_key_counter}"
         new_key_fc2_expert_weights = f"nvfp4_moe_w2_stacked_{fused_key_counter}"
@@ -1680,13 +1707,57 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         new_key_fc1_alpha = f"nvfp4_moe_w1_alpha_stacked_{fused_key_counter}"
         new_key_fc2_alpha = f"nvfp4_moe_w2_alpha_stacked_{fused_key_counter}"
 
-        weight_dtype = torch.float8_e4m3fn
-        _register_parameter(gm, new_key_fc1_expert_weights, fc1_expert_weights.to(weight_dtype))
-        _register_parameter(gm, new_key_fc2_expert_weights, fc2_expert_weights.to(weight_dtype))
+        # Pad fc1_expert_weights to match the already padded scales
+        fc1_pad_size = fc1_weight_blockscale_fp8_stacked.shape[1] - fc1_expert_weights.shape[1]
+        if fc1_pad_size > 0:
+            fc1_expert_weights = torch.nn.functional.pad(
+                fc1_expert_weights, (0, 0, 0, fc1_pad_size), mode="constant", value=0
+            )
+            # Need to update fc2 scales and weights to match the padded size of fc1,
+            # as they share the same intermediate dimension.
+            target_intermediate = fc1_weight_blockscale_fp8_stacked.shape[1]
+            TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+            TRTLLM_NVFP4_SCALING_BYTES_SIZE = (
+                TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS // TRTLLM_NVFP4_PACKING_FACTOR
+            )
+            target_n_blocks = target_intermediate // TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS
+            padded_target_n_blocks = (
+                math.ceil(target_n_blocks / TRTLLM_NVFP4_SCALING_BYTES_SIZE)
+                * TRTLLM_NVFP4_SCALING_BYTES_SIZE
+            )
+            fc2_blocks_pad = padded_target_n_blocks - fc2_weight_blockscale_fp8_stacked.shape[2]
+
+            if fc2_blocks_pad > 0:
+                # unswizzle fc2 scales
+                fc2_blockscale_shape = list(fc2_weight_blockscale_fp8_stacked.shape)
+                fc2_blockscale_shape[2] = padded_target_n_blocks
+                fc2_weight_blockscale_fp8_stacked = torch.ops.trtllm.block_scale_interleave_reverse(
+                    fc2_weight_blockscale_fp8_stacked.view(torch.uint8)
+                )
+                fc2_weight_blockscale_fp8_stacked = torch.nn.functional.pad(
+                    fc2_weight_blockscale_fp8_stacked, (0, fc2_blocks_pad), mode="constant", value=0
+                )
+                fc2_weight_blockscale_fp8_stacked = (
+                    torch.ops.trtllm.block_scale_interleave(fc2_weight_blockscale_fp8_stacked)
+                    .view(torch.float8_e4m3fn)
+                    .reshape(fc2_blockscale_shape)
+                )
+            fc2_expert_weights = torch.nn.functional.pad(
+                fc2_expert_weights,
+                (0, fc1_pad_size // TRTLLM_NVFP4_PACKING_FACTOR, 0, 0),
+                mode="constant",
+                value=0,
+            ).view(torch.uint8)
+
+        # FP4 weights are already packed as uint8, don't convert dtype
+        _register_parameter(gm, new_key_fc1_expert_weights, fc1_expert_weights)
+        _register_parameter(gm, new_key_fc2_expert_weights, fc2_expert_weights)
         _register_parameter(
             gm, new_key_fc1_weight_blockscale_fp8, fc1_weight_blockscale_fp8_stacked
         )
-        _register_parameter(gm, new_key_fc2_weight_blockscale_fp8, w2_weight_blockscale_fp8_stacked)
+        _register_parameter(
+            gm, new_key_fc2_weight_blockscale_fp8, fc2_weight_blockscale_fp8_stacked
+        )
         _register_parameter(gm, new_key_fc1_act_scale, fc1_act_scale)
         _register_parameter(gm, new_key_fc2_act_scale, fc2_act_scale)
         _register_parameter(gm, new_key_fc1_alpha, fc1_alpha_stacked)
@@ -1706,7 +1777,11 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
                 graph.get_attr(new_key_fc1_alpha),
                 graph.get_attr(new_key_fc2_alpha),
             )
-        return args
+        kwargs = {
+            "is_gated_mlp": is_gated_mlp,
+            "act_fn": act_fn,
+        }
+        return args, kwargs
 
     fused_key_counter = 0
     graph = gm.graph
@@ -1726,14 +1801,13 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             w3_list,
             w1_input_scale,
             w2_input_scale,
-            w3_input_scale,
             w1_weight_scale,
             w2_weight_scale,
             w3_weight_scale,
             w1_alpha,
             w2_alpha,
-            w3_alpha,
             is_gated_mlp,
+            act_fn,
         ) = _extract_op_args(node)
 
         # Stack the actual tensor values (fast, like in quantize_moe.py)
@@ -1745,19 +1819,18 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         # Scales are buffers, not parameters
         w1_input_scale_stacked = _stack(w1_input_scale, dim=0)
         w2_input_scale_stacked = _stack(w2_input_scale, dim=0)
-        w3_input_scale_stacked = _stack(w3_input_scale, dim=0, device=device, dtype=dtype)
 
-        w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).to(torch.float8_e4m3fn)
-        w2_weight_blockscale_fp8_stacked = _stack(w2_weight_scale, dim=0).to(torch.float8_e4m3fn)
+        # Use .view() not .to() to reinterpret bytes as float8, not value conversion
+        w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).view(torch.float8_e4m3fn)
+        w2_weight_blockscale_fp8_stacked = _stack(w2_weight_scale, dim=0).view(torch.float8_e4m3fn)
         w3_weight_blockscale_fp8_stacked = _stack(
             w3_weight_scale, dim=0, device=device, dtype=dtype
-        ).to(torch.float8_e4m3fn)
+        ).view(torch.float8_e4m3fn)
 
         w1_alpha_stacked = _stack(w1_alpha, dim=0)
         w2_alpha_stacked = _stack(w2_alpha, dim=0)
-        w3_alpha_stacked = _stack(w3_alpha, dim=0, device=device, dtype=dtype)
 
-        args = _prepare_args_cutlass_format_nvfp4()
+        args, kwargs = _prepare_args_cutlass_format_nvfp4()
 
         fused_key_counter += 1
 
@@ -1766,7 +1839,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             new_node = graph.call_function(
                 replacement_op,
                 args,
-                kwargs=node.kwargs,
+                kwargs=kwargs,
             )
 
         node.replace_all_uses_with(new_node)
@@ -1775,8 +1848,8 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
     # will remove the parameters/buffers that are no longer referenced
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
     return fused_key_counter
 
 
