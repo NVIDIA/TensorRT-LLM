@@ -87,7 +87,7 @@ Note: if this environment variable is set, it is not necessary to supply the
 ### Using NUMA-aware autoconfiguration
 
 To explicitly enable the NUMA-aware autoconfiguration feature in TensorRT-LLM,
-simply set TLLM_NUMA_AWARE_WORKER_AFFINITY in the launch script (prior to
+simply set `TLLM_NUMA_AWARE_WORKER_AFFINITY` in the launch script (prior to
 `trtllm-bench` or `trtllm-serve`) as follows:
 
 ```bash
