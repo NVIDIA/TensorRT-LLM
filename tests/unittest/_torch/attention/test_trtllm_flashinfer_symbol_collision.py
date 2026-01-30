@@ -1,5 +1,7 @@
 """Unit tests for FlashInfer fused MOE custom op."""
 
+import os
+
 import flashinfer.fused_moe
 import pytest
 import torch
@@ -57,6 +59,8 @@ def test_flashinfer_fused_moe_matches_torch_moe():
     routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
     routing_weights = routing_weights.to(torch.float32)
 
+    # increase FI jit max jobs to 16
+    os.environ["MAX_JOBS"] = "16"
     # FlashInfer fused MOE - call directly
     out_flashinfer = flashinfer.fused_moe.cutlass_fused_moe(
         input=x,
@@ -67,6 +71,7 @@ def test_flashinfer_fused_moe_matches_torch_moe():
         output_dtype=dtype,
         quant_scales=[],
     )
+    os.environ.pop("MAX_JOBS", None)
 
     # Reference Torch MoE (gated_mlp with SwiGLU)
     out_torch = torch.ops.auto_deploy.torch_moe(
