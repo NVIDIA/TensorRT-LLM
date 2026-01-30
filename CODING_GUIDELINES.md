@@ -419,11 +419,13 @@ When defining any user-facing configuration classes (e.g. `LlmArgs` or any class
 - use Literal instead of str when a field should only accept certain values. avoid defining a custom validator on a str field.
 - raise ValueError instead of assertion
 - co-locate model validation logic within the class itself rather than in a parent class, unless it depends on other fields in the parent class (e.g. don't validate cuda_graph_config in BaseLlmArgs; also add example of OK case)
+- don't define manual validate() methods, prefer using model_validator / field_validator
 
 TODO:
 - ask cursor for more antipatterns fixed in this pr
 - unit tests: e.g. for get_llm_args_from_cli_params, other tests you removed, etc
 - tests for all of the above Pydantic best practices
+- test to validate that all llmargs classes have field descriptions for all fields
 - add validator to BaseLlmArgs.__init_subclass__ to check that all subfields are Pydantic
 
 #####  Attributes and Variables

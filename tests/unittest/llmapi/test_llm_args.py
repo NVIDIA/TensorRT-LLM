@@ -3,6 +3,7 @@ import tempfile
 import pydantic_core
 import pytest
 import yaml
+from pydantic import TypeAdapter
 
 import tensorrt_llm.bindings.executor as tle
 from tensorrt_llm import LLM as TorchLLM
@@ -25,7 +26,7 @@ def test_LookaheadDecodingConfig():
     assert config.max_verification_set_size == 4
 
     # from dict
-    config = LookaheadDecodingConfig.from_dict({
+    config = LookaheadDecodingConfig(**{
         "max_window_size": 4,
         "max_ngram_size": 3,
         "max_verification_set_size": 4
@@ -135,10 +136,11 @@ model_kwargs:
 
 
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
-    spec_cfg = DecodingBaseConfig.from_dict(
+    adapter = TypeAdapter(SpeculativeConfig)
+    spec_cfg = adapter.validate_python(
         dict(decoding_type="Eagle3",
              max_draft_len=3,
-             speculative_model_dir="/path/to/draft/model"))
+             speculative_model="/path/to/draft/model"))
     assert isinstance(spec_cfg, Eagle3DecodingConfig)
 
 
@@ -152,12 +154,9 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
 
     monkeypatch.setattr(llm_args_mod.logger, "warning", _capture_warning)
 
-    spec_cfg = DecodingBaseConfig.from_dict(dict(
-        decoding_type="Eagle",
-        max_draft_len=3,
-        speculative_model_dir="/path/to/draft/model"),
-                                            backend="pytorch")
-    assert isinstance(spec_cfg, Eagle3DecodingConfig)
+    spec_cfg = EagleDecodingConfig(decoding_type="Eagle",
+                                   max_draft_len=3,
+                                   speculative_model="/path/to/draft/model")
 
     TorchLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
@@ -167,10 +166,9 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
 
 
 def test_decoding_type_eagle3_errors_on_tensorrt_backend():
-    spec_cfg = DecodingBaseConfig.from_dict(
-        dict(decoding_type="Eagle3",
-             max_draft_len=3,
-             speculative_model_dir="/path/to/draft/model"))
+    spec_cfg = Eagle3DecodingConfig(decoding_type="Eagle3",
+                                    max_draft_len=3,
+                                    speculative_model="/path/to/draft/model")
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)

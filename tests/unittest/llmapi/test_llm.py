@@ -1894,11 +1894,12 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
     [
         # TRT backend test cases
-        (2, None, True, False, "trt"),  # prompt_logprobs with context_logits
-        (None, 2, False, False, "trt"),  # generation logprobs only (top-2)
+        (2, None, True, False, "tensorrt"
+         ),  # prompt_logprobs with context_logits
+        (None, 2, False, False, "tensorrt"),  # generation logprobs only (top-2)
         (2, None, False, False,
-         "trt"),  # prompt_logprobs without context_logits
-        (None, None, False, False, "trt"),  # no logprobs at all
+         "tensorrt"),  # prompt_logprobs without context_logits
+        (None, None, False, False, "tensorrt"),  # no logprobs at all
     ])
 def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                              logprobs: Optional[int],

@@ -126,23 +126,23 @@ class CudaGraphConfig(StrictBaseModel):
         """Validate CUDA graph configuration.
 
         Ensures that:
-        1. If batch_sizes is provided, max_batch_size must be 0
+        1. If batch_sizes is provided, max_batch_size is derived from it
         2. If batch_sizes is not provided, it is generated based on max_batch_size
-        3. If both are provided, batch_sizes must match the generated values
+        3. User should not set both with contradictory values
         """
         if self.batch_sizes:
             self.batch_sizes = sorted(self.batch_sizes)
-            if self.max_batch_size != 0:
-                if self.batch_sizes != CudaGraphConfig._generate_cuda_graph_batch_sizes(
-                        self.max_batch_size, self.enable_padding):
-                    raise ValueError(
-                        "Please don't set both cuda_graph_config.batch_sizes "
-                        "and cuda_graph_config.max_batch_size.\n"
-                        f"cuda_graph_config.batch_sizes: {self.batch_sizes}, "
-                        f"cuda_graph_config.max_batch_size: {self.max_batch_size}"
-                    )
-            else:
-                self.max_batch_size = max(self.batch_sizes)
+            derived_max = max(self.batch_sizes)
+            if self.max_batch_size == 0:
+                # max_batch_size not set, derive from batch_sizes
+                self.max_batch_size = derived_max
+            elif self.max_batch_size != derived_max:
+                # User provided both with contradictory values
+                raise ValueError(
+                    "Please don't set both cuda_graph_config.batch_sizes "
+                    "and cuda_graph_config.max_batch_size.\n"
+                    f"cuda_graph_config.batch_sizes: {self.batch_sizes}, "
+                    f"cuda_graph_config.max_batch_size: {self.max_batch_size}")
         else:
             max_batch_size = self.max_batch_size or 128
             generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
@@ -1009,7 +1009,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     output_directory: str
     write_interval: int = 20
     file_prefix: str = "data"
-    eagle3_layers_to_capture: Set[int] = Field(..., min_length=1)
+    eagle3_layers_to_capture: Optional[Set[int]] = None
 
     max_total_draft_tokens: Optional[int] = Field(default=1, init=False)
     eagle_choices: Optional[List[List[int]]] = Field(default=None, init=False)
@@ -1018,10 +1018,17 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_last_hidden_in_save(self):
+        if self.eagle3_layers_to_capture is None:
+            self._last_hidden_in_save = False
+            return self
+        if len(self.eagle3_layers_to_capture) == 0:
+            raise ValueError(
+                "eagle3_layers_to_capture must be non-empty if provided")
         self._last_hidden_in_save = True
         if -1 not in self.eagle3_layers_to_capture:
             self._last_hidden_in_save = False
             self.eagle3_layers_to_capture.add(-1)
+        return self
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -2509,14 +2516,6 @@ class TrtLlmArgs(BaseLlmArgs):
 
         return self
 
-    @model_validator(mode="after")
-    def set_orchestrator_type_for_mpi_disabled(self):
-        if mpi_disabled():
-            self.orchestrator_type = "ray"
-        elif self.orchestrator_type == "ray":
-            os.environ["TLLM_DISABLE_MPI"] = "1"
-        return self
-
     def _load_config_from_engine(self, engine_dir: Path):
         engine_config = EngineConfig.from_json_file(engine_dir / "config.json")
         self._pretrained_config = engine_config.pretrained_config
@@ -3108,6 +3107,14 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
             )
+        return self
+
+    @model_validator(mode='after')
+    def set_orchestrator_type_for_mpi_disabled(self) -> 'TorchLlmArgs':
+        if mpi_disabled():
+            self.orchestrator_type = "ray"
+        elif self.orchestrator_type == "ray":
+            os.environ["TLLM_DISABLE_MPI"] = "1"
         return self
 
     def get_executor_config(
