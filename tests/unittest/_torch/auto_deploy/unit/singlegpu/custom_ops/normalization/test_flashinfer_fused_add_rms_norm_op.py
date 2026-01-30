@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_fused_add_rms_norm import (
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.flashinfer_fused_add_rms_norm import (
     flashinfer_fused_add_rms_norm,
 )
 

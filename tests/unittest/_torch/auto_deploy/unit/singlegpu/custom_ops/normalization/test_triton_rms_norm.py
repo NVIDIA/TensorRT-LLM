@@ -1,7 +1,7 @@
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.rms_norm import *  # noqa
-from tensorrt_llm._torch.auto_deploy.custom_ops.triton_kernels.rms_norm import rms_norm
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import *  # noqa
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_rms_norm import rms_norm
 
 
 def test_rmsnorm_triton_op():

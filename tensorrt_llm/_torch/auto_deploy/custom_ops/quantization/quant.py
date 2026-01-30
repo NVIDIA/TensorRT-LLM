@@ -7,7 +7,7 @@ import torch
 from flashinfer import bmm_fp8
 from torch import nn
 
-from .torch_libs.float8_python_api import addmm_float8_unwrapped
+from ..torch_libs.float8_python_api import addmm_float8_unwrapped
 
 TRTLLM_FP4_OP_AVAILABLE = True
 

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.quant import (
+from ...custom_ops.quantization.quant import (
     FP4_GLOBAL_SCALE_MAX,
     FP8_MAX,
     TRTLLM_NVFP4_COLUMN_SIZE,

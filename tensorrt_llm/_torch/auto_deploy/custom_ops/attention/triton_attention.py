@@ -9,10 +9,10 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from ....llmapi.llm_args import KvCacheConfig
-from ..utils.logger import ad_logger
-from ..utils.node_utils import extract_op_args
-from .attention_interface import (
+from .....llmapi.llm_args import KvCacheConfig
+from ...utils.logger import ad_logger
+from ...utils.node_utils import extract_op_args
+from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
@@ -21,7 +21,7 @@ from .attention_interface import (
     ResourceHandlerDict,
     UnpagedResourceHandler,
 )
-from .triton_kernels.attention_with_kv_cache import (
+from .triton_attention_with_kv_cache import (
     attention_kv_stage2,
     context_attention_kv_flattened,
     gqa_attention_kv_stage1,

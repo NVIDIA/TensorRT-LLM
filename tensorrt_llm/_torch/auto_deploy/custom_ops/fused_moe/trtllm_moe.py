@@ -15,7 +15,9 @@
 
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+)
 from tensorrt_llm._torch.utils import ActivationType
 
 

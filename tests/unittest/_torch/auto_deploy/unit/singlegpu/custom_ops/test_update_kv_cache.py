@@ -1,6 +1,6 @@
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.torch_attention import update_kv_cache
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_attention import update_kv_cache
 
 
 def test_update_kv_cache():

@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from .triton_kernels.rope import rope_fwd_flattened_kernel, rope_fwd_kernel
+from .triton_rope_kernel import rope_fwd_flattened_kernel, rope_fwd_kernel
 
 
 @torch.library.custom_op("auto_deploy::triton_rope_with_input_pos", mutates_args=())

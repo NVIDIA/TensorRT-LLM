@@ -9,7 +9,10 @@ from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.utils import ActivationType
 
-from ...custom_ops.quant import TRTLLM_NVFP4_PACKING_FACTOR, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from ...custom_ops.quantization.quant import (
+    TRTLLM_NVFP4_PACKING_FACTOR,
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+)
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code, get_attr_by_name
