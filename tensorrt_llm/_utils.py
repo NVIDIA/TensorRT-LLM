@@ -580,10 +580,26 @@ def mpi_world_size():
     return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
+# Module-level variable to store Ray worker's local rank
+# Set by RayWorkerWrapper.__init__, read by local_mpi_rank()
+_ray_local_rank: Optional[int] = None
+
+
+def set_ray_local_rank(rank: int) -> None:
+    global _ray_local_rank
+    _ray_local_rank = rank
+
+
+def get_ray_local_rank() -> Optional[int]:
+    return _ray_local_rank
+
+
 def local_mpi_rank():
     if mpi_disabled():
-        # For Ray/non-MPI: the device was already set during worker init
-        # torch.cuda.current_device() returns the correct local device ID
+        # Check for explicit Ray local rank
+        if _ray_local_rank is not None:
+            return _ray_local_rank
+
         try:
             return torch.cuda.current_device()
         except ValueError:

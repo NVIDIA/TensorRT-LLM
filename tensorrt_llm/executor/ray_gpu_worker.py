@@ -48,7 +48,10 @@ class RayWorkerWrapper:
         self.rank = rank
         # Ray can't pickle TensorRT logger
         global logger
+        # Expose rank for utilities like local_mpi_rank()
+        from tensorrt_llm._utils import set_ray_local_rank
         from tensorrt_llm.logger import logger
+        set_ray_local_rank(rank)
 
         # Expect to see global counts w/ RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
         # unless CUDA_VISIBLE_DEVICES is set.

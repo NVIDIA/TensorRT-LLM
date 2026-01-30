@@ -206,19 +206,21 @@ class BaseLLM:
                     f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
                 )
 
-            logger.info(
-                f'start MpiSession with {self.args.parallel_config.world_size} workers'
-            )
-            if not self.mpi_session:
-                mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
-                if not mpi_process_pre_spawned:
-                    logger_debug(f"LLM create MpiPoolSession\n", "yellow")
-                    self.mpi_session = MpiPoolSession(
-                        n_workers=self.args.parallel_config.world_size)
-                else:
-                    logger_debug(f"LLM create MpiCommSession\n", "yellow")
-                    self.mpi_session = create_mpi_comm_session(
-                        self.args.parallel_config.world_size)
+            if not mpi_disabled():
+                logger.info(
+                    f'start MpiSession with {self.args.parallel_config.world_size} workers'
+                )
+                if not self.mpi_session:
+                    mpi_process_pre_spawned: bool = get_spawn_proxy_process_env(
+                    )
+                    if not mpi_process_pre_spawned:
+                        logger_debug(f"LLM create MpiPoolSession\n", "yellow")
+                        self.mpi_session = MpiPoolSession(
+                            n_workers=self.args.parallel_config.world_size)
+                    else:
+                        logger_debug(f"LLM create MpiCommSession\n", "yellow")
+                        self.mpi_session = create_mpi_comm_session(
+                            self.args.parallel_config.world_size)
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory

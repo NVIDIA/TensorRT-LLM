@@ -674,7 +674,7 @@ class CachedModelLoader:
         *args,
         **kwargs,
     ) -> List[Any]:
-        if self.llm_args.parallel_config.is_multi_gpu:
+        if self.llm_args.parallel_config.is_multi_gpu and self.mpi_session is not None:
             return self.mpi_session.submit_sync(task, *args, **kwargs)
         else:
             return [task(*args, **kwargs)]
