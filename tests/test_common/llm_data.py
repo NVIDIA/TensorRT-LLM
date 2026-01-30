@@ -47,7 +47,7 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
 
 
 def llm_models_root(check: bool = False) -> Optional[Path]:
-    root = Path("/home/scratch.trt_llm_data/llm-models/")
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
 
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ.get("LLM_MODELS_ROOT"))
@@ -57,7 +57,7 @@ def llm_models_root(check: bool = False) -> Optional[Path]:
 
     if check:
         assert root.exists(), (
-            "You must set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
+            "You must set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data_ci to run this test"
         )
 
     return root if root.exists() else None
