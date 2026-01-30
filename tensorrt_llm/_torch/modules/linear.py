@@ -556,6 +556,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        # GEMM ops require 2D matrices
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
             if module.input_scale is not None and not module.force_dynamic_quantization:
@@ -591,6 +598,11 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
             )
+
+        # Reshape output back to original shape (with out_features as last dim)
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+
         if bias is not None:
             output = output + bias
         return output
@@ -975,6 +987,12 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        # GEMM ops require 2D matrices
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         if input.dtype == torch.float8_e4m3fn:
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
@@ -1002,6 +1020,10 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+
+        # Reshape output back to original shape (with out_features as last dim)
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
 
         if bias is not None:
             output = output + bias
@@ -1212,6 +1234,12 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        # GEMM ops require 2D matrices
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         act_fp4, act_sf = self._input_prepare(module, input)
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
@@ -1228,6 +1256,10 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
+
+        # Reshape output back to original shape (with out_features as last dim)
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
 
         if bias is not None:
             output = output + bias

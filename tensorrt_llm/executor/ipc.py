@@ -83,8 +83,7 @@ class ZeroMqQueue:
                 "Server and client should not receive HMAC key when encryption is disabled"
             )
 
-        if (socket_type == zmq.PAIR and self.is_server
-            ) or socket_type == zmq.PULL or socket_type == zmq.ROUTER:
+        if self.should_bind_socket():
             self.socket.bind(
                 self.address_endpoint
             )  # Binds to the address and occupy a port immediately
@@ -100,6 +99,31 @@ class ZeroMqQueue:
                 self.hmac_key = os.urandom(32)
 
             self.address = (self.address_endpoint, self.hmac_key)
+
+    def should_bind_socket(self) -> bool:
+        """
+        Determine if socket should bind vs connect based on type and role.
+
+        ZMQ binding conventions:
+        - PAIR: server binds, client connects (1-to-1 bidirectional)
+        - PULL: server binds to receive from multiple PUSH sockets
+        - PUSH: server binds when acting as message source
+        - ROUTER: always binds to handle multiple clients
+
+        Returns:
+            True if socket should bind, False if it should connect
+        """
+        # Server binds for PAIR, PULL, PUSH patterns
+        if self.is_server and self.socket_type in (zmq.PAIR, zmq.PULL,
+                                                   zmq.PUSH):
+            return True
+
+        # ROUTER always binds (multi-client pattern)
+        if self.socket_type == zmq.ROUTER:
+            return True
+
+        # Client connects for all other cases
+        return False
 
     def setup_lazily(self):
         # Early return if setup is already done

@@ -91,6 +91,17 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/_torch/modeling/test_modeling_exaone4.py::TestEXAONE4::test_llm_load_1_FP8
   - unittest/kv_cache_manager_v2_tests/
+  # ------------- Visual Gen tests ---------------
+  - unittest/_torch/visual_gen/test_fused_qkv.py
+  - unittest/_torch/visual_gen/test_quant_ops.py
+  - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_attention_perf.py
+  - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
+  - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
+  - unittest/_torch/visual_gen/test_wan.py
+  - unittest/_torch/visual_gen/test_wan_i2v.py
+  - unittest/_torch/visual_gen/test_model_loader.py
+  - examples/test_visual_gen.py
 - condition:
     ranges:
       system_gpu_count:

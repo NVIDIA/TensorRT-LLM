@@ -24,6 +24,7 @@ class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
     MM_ENCODER = 2
+    VISUAL_GEN = 3
 
 
 @dataclass

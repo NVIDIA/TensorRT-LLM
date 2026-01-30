@@ -236,16 +236,32 @@ def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
     return Path(hf_folder)
 
 
-def download_hf_pretrained_config(model: str,
-                                  revision: Optional[str] = None) -> Path:
+def download_hf_partial(model: str,
+                        allow_patterns: List[str],
+                        revision: Optional[str] = None) -> Path:
+    """Download a partial model from HuggingFace.
+
+    Args:
+        model: The model name or path.
+        revision: The revision to use for the model.
+        allow_patterns: The patterns to allow for the model.
+
+    Returns:
+        The path to the downloaded model.
+    """
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             revision=revision,
-            allow_patterns=["config.json"],
+            allow_patterns=allow_patterns,
             tqdm_class=DisabledTqdm)
     return Path(hf_folder)
+
+
+def download_hf_pretrained_config(model: str,
+                                  revision: Optional[str] = None) -> Path:
+    return download_hf_partial(model, ["config.json"], revision)
 
 
 def append_docstring(docstring: str):

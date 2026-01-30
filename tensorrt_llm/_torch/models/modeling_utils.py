@@ -68,7 +68,10 @@ class MetaInitMode(TorchDispatchMode):
     should be moved off to cpu or gpu.
     """
     aten = torch.ops.aten
-    init_ops = {aten.empty.memory_format, aten.empty_like.default}
+    init_ops = {
+        aten.empty.memory_format,
+        aten.empty_like.default,
+    }
     random_init_ops = {
         aten.normal_.default,
         aten.uniform_.default,

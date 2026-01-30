@@ -1,6 +1,6 @@
 # Adapt from
 # https://github.com/vllm-project/vllm/blob/2e33fe419186c65a18da6668972d61d7bbc31564/vllm/inputs/data.py
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Sequence, Union
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -67,3 +67,80 @@ def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
             f"Invalid type of inputs for llm.generate: {type(inputs)}")
 
     return prompt_inputs
+
+
+class VisualGenTextPrompt(TypedDict):
+    prompt: str
+    negative_prompt: NotRequired[str]
+
+
+class VisualGenTokensPrompt(TypedDict):
+    prompt_token_ids: List[int]
+    negative_prompt_token_ids: NotRequired[List[int]]
+
+
+VisualGenPromptInputs = Union[
+    str,
+    List[int],
+    VisualGenTextPrompt,
+    VisualGenTokensPrompt,
+]
+
+VisualGenInputs = Union[
+    VisualGenPromptInputs,
+    Sequence[VisualGenPromptInputs],
+]
+
+
+def visual_gen_inputs(
+    inputs: "VisualGenPromptInputs",
+) -> Union["VisualGenTextPrompt", "VisualGenTokensPrompt"]:
+    # str -> text prompt
+    if isinstance(inputs, str):
+        return VisualGenTextPrompt(prompt=inputs)
+
+    # list[int] -> token prompt
+    if isinstance(inputs, list):
+        if len(inputs) == 0:
+            raise ValueError("`inputs` token list cannot be empty.")
+        if not all(isinstance(t, int) for t in inputs):
+            raise TypeError(
+                "`inputs` list must contain only ints when used as token IDs.")
+        return VisualGenTokensPrompt(prompt_token_ids=inputs)
+
+    # dict form
+    if isinstance(inputs, dict):
+        has_prompt = "prompt" in inputs
+        has_prompt_token_ids = "prompt_token_ids" in inputs
+
+        if has_prompt == has_prompt_token_ids:
+            raise ValueError(
+                "VisualGen prompt dict must contain exactly one of "
+                "`prompt` or `prompt_token_ids`.")
+
+        if has_prompt:
+            prompt = inputs.get("prompt")
+            if not isinstance(prompt, str) or prompt == "":
+                raise TypeError("`prompt` must be a non-empty string.")
+            if "negative_prompt" in inputs and not isinstance(
+                    inputs["negative_prompt"], str):
+                raise TypeError("`negative_prompt` must be a string.")
+            return inputs  # VisualGenTextPrompt
+
+        token_ids = inputs.get("prompt_token_ids")
+        if not isinstance(token_ids, list) or len(token_ids) == 0:
+            raise TypeError("`prompt_token_ids` must be a non-empty list[int].")
+        if not all(isinstance(t, int) for t in token_ids):
+            raise TypeError("`prompt_token_ids` must contain only ints.")
+        if "negative_prompt_token_ids" in inputs:
+            neg_ids = inputs["negative_prompt_token_ids"]
+            if not isinstance(neg_ids, list) or not all(
+                    isinstance(t, int) for t in neg_ids):
+                raise TypeError(
+                    "`negative_prompt_token_ids` must be a list[int].")
+        return inputs  # VisualGenTokensPrompt
+
+    raise TypeError(
+        "Invalid `inputs` for VisualGen.generate. "
+        "Expected one of: str, list[int], VisualGenTextPrompt, VisualGenTokensPrompt."
+    )
