@@ -215,7 +215,11 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
                 ${isolateTestCmdLine.join(" ")}
             """
         } catch (InterruptedException e) {
-            throw e
+            echo "Isolated test ${i} (${isolateTestName}) was interrupted. Stopping further isolated tests to allow result upload."
+            // Mark as failed and break instead of throwing immediately
+            // This allows cacheErrorAndUploadResult to collect partial results
+            rerunFailed = true
+            break
         } catch (Exception e) {
             def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}")
             if (isRerunFailed) {
@@ -1593,34 +1597,47 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
     def Boolean stageIsFailed = true
+    def Exception interruptedException = null
     try {
         taskRunner()
         stageIsFailed = false
     } catch (InterruptedException e) {
         stageIsInterrupted = true
-        throw e
+        interruptedException = e
+        // Don't throw immediately - upload results first
     } finally {
         ensureStageResultNotUploaded(stageName + postTag)
-        if (stageIsInterrupted) {
-            echo "Stage is interrupted, skip to upload test result."
-        } else {
-            // Temporarily disable to reduce the log size
-            // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
-            if (noResultIfSuccess && !stageIsFailed) {
-                // Clean up the workspace
-                sh """
-                    env | sort
-                    pwd && ls -alh
-                    rm -rf ./*
-                """
 
-                echo "Finished test stage execution."
-                return
-            }
-            echo "noResultIfSuccess: ${noResultIfSuccess}, stageIsFailed: ${stageIsFailed}"
+        // Temporarily disable to reduce the log size
+        // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
+
+        if (noResultIfSuccess && !stageIsFailed && !stageIsInterrupted) {
+            // Only skip result upload if succeeded and noResultIfSuccess is true (not interrupted)
+            sh """
+                env | sort
+                pwd && ls -alh
+                rm -rf ./*
+            """
+            echo "Finished test stage execution."
+            return
+        }
+
+        echo "noResultIfSuccess: ${noResultIfSuccess}, stageIsFailed: ${stageIsFailed}, stageIsInterrupted: ${stageIsInterrupted}"
+
+        try {
             sh "mkdir -p ${stageName}"
-            finallyRunner()
-            if (stageIsFailed) {
+
+            // Execute finallyRunner, but don't let it block result upload if it fails
+            try {
+                finallyRunner()
+            } catch (InterruptedException e) {
+                echo "WARNING: finallyRunner was interrupted, but continuing with result upload to preserve partial test results"
+                // Don't re-throw - continue with upload
+            } catch (Exception finallyException) {
+                echo "WARNING: finallyRunner encountered an error, but continuing with result upload: ${finallyException.message}"
+                // Continue with XML generation and upload even if finallyRunner fails
+            }
+            if (stageIsFailed || stageIsInterrupted) {
                 def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
                 if (timeoutTestXml != null) {
                     sh """
@@ -1629,9 +1646,11 @@ ${timeoutTestXml}
 EOF_TIMEOUT_XML
                     """
                 }
-                def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
-                if (stageXml != null) {
-                    sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
+                if (stageIsFailed && !stageIsInterrupted) {
+                    def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
+                    if (stageXml != null) {
+                        sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
+                    }
                 }
             }
             sh "STAGE_NAME=${stageName}"
@@ -1642,17 +1661,29 @@ EOF_TIMEOUT_XML
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
-            junit(testResults: "${stageName}/results*.xml")
+            junit(testResults: "${stageName}/results*.xml", allowEmptyResults: true)
+        } catch (Exception uploadException) {
+            echo "WARNING: Failed to upload test results after ${stageIsInterrupted ? 'interruption' : 'failure'}: ${uploadException.message}"
+            // Continue to cleanup and re-throw the original exception if needed
         }
 
         // Clean up the workspace
-        sh """
-            env | sort
-            pwd && ls -alh
-            rm -rf ./*
-        """
+        try {
+            sh """
+                env | sort
+                pwd && ls -alh
+                rm -rf ./*
+            """
+        } catch (Exception cleanupException) {
+            echo "WARNING: Failed to clean up workspace: ${cleanupException.message}"
+        }
 
         echo "Finished test stage execution."
+
+        // Re-throw the interruption exception after uploading results
+        if (interruptedException != null) {
+            throw interruptedException
+        }
     }
 }
 
@@ -2843,6 +2874,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         """
                     }
                 } catch (InterruptedException e) {
+                    echo "Regular pytest was interrupted. Partial results may be available via --periodic-junit-xmlpath"
+                    // Re-throw to let cacheErrorAndUploadResult handle it
+                    // Pytest should have saved partial results via --periodic-save-unfinished-test
                     throw e
                 } catch (Exception e) {
                     def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
