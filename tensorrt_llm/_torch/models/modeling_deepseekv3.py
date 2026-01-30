@@ -1834,62 +1834,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
 
-    @classmethod
-    def get_model_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
-        """
-        Return model-specific LLM API defaults.
-
-        Args:
-            llm_args: Current LlmArgs configuration to adapt defaults based on.
-
-        Returns:
-            Dictionary of model-specific defaults, adapted
-            based on the current configuration.
-        """
-        defaults = {"enable_chunked_prefill": False}
-
-        # Adaptive MTP enablement based on configuration
-        # MTP is beneficial for low-latency scenarios (small batch sizes)
-        # and is incompatible with certain features
-
-        max_batch_size = llm_args.max_batch_size or 2048
-        pipeline_parallel_size = llm_args.pipeline_parallel_size or 1
-        speculative_model = llm_args.speculative_model
-        batched_logits_processor = llm_args.batched_logits_processor
-        cache_transceiver_config = llm_args.cache_transceiver_config
-        disable_overlap_scheduler = llm_args.disable_overlap_scheduler
-
-        # Check for hard blockers
-        has_blockers = (
-            pipeline_parallel_size > 1 or  # MTP + PP not supported
-            speculative_model is not None or  # MTP conflicts with speculation
-            batched_logits_processor is
-            not None  # MTP doesn't support logits processors
-        )
-
-        # Check for known accuracy issues
-        has_disaggregation = cache_transceiver_config is not None
-        has_overlap_scheduler = not disable_overlap_scheduler
-        has_accuracy_issues = has_disaggregation and has_overlap_scheduler
-
-        # Enable MTP adaptively for low-latency scenarios
-        if not has_blockers and not has_accuracy_issues and max_batch_size <= 32:
-            # Determine optimal MTP layers based on batch size
-            if max_batch_size <= 4:
-                num_layers = 3  # Maximum benefit for ultra-low latency
-            elif max_batch_size <= 16:
-                num_layers = 2  # Balanced
-            else:  # 17-32
-                num_layers = 1  # Conservative
-
-            # Set MTP configuration as a dictionary matching MTPDecodingConfig
-            defaults["speculative_config"] = {
-                "num_nextn_predict_layers": num_layers,
-                "num_batch_slots": 64,  # Default batch slots for MTP
-            }
-
-        return defaults
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
