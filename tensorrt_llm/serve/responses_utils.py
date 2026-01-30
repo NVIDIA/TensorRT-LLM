@@ -1540,7 +1540,7 @@ def _generate_streaming_event(
 
     _responses_debug_log(
         repr(
-            f" ---------> delta text: {delta_text}, reasoning delta text: {reasoning_delta_text}, calls: {calls}"
+            f" ---------> delta text: '{delta_text}', reasoning delta text: '{reasoning_delta_text}', calls: '{calls}', is_finished: '{finished_generation}'"
         ))
 
     # Check if we need to send done events for completed sections
@@ -1555,6 +1555,16 @@ def _generate_streaming_event(
         streaming_events_helper=streaming_events_helper,
         finished_generation=finished_generation,
     )
+
+    # Reasoning delta may exist with text delta
+    if reasoning_delta_text:
+        if reasoning_delta_text.strip():
+            if not streaming_events_helper.is_reasoning_sent:
+                streaming_events_helper.is_reasoning_sent = True
+            yield from streaming_events_helper.get_reasoning_output_added_events(
+            )
+        yield streaming_events_helper.get_reasoning_text_delta_event(
+            reasoning_delta_text)
 
     # Send done events if needed
     if should_send_reasoning_done and reasoning_full_content:
@@ -1573,6 +1583,14 @@ def _generate_streaming_event(
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
         streaming_events_helper.is_reasoning_sent = False
+
+    # Send delta events for ongoing content
+    if delta_text:
+        if delta_text.strip():
+            if not streaming_events_helper.is_text_sent:
+                streaming_events_helper.is_text_sent = True
+            yield from streaming_events_helper.get_message_output_added_events()
+        yield streaming_events_helper.get_text_delta_event(delta_text, [])
 
     if should_send_text_done and text_full_content:
         text_content = ResponseOutputText(
@@ -1595,22 +1613,6 @@ def _generate_streaming_event(
         streaming_events_helper.is_output_item_added_sent = False
         streaming_events_helper.is_text_sent = False
 
-    # Send delta events for ongoing content
-    if delta_text:
-        if delta_text.strip():
-            if not streaming_events_helper.is_text_sent:
-                streaming_events_helper.is_text_sent = True
-            yield from streaming_events_helper.get_message_output_added_events()
-        yield streaming_events_helper.get_text_delta_event(delta_text, [])
-    elif reasoning_delta_text:
-        if reasoning_delta_text.strip():
-            if not streaming_events_helper.is_reasoning_sent:
-                streaming_events_helper.is_reasoning_sent = True
-            yield from streaming_events_helper.get_reasoning_output_added_events(
-            )
-        yield streaming_events_helper.get_reasoning_text_delta_event(
-            reasoning_delta_text)
-
 
 def _generate_streaming_event_harmony(
     harmony_adapter: HarmonyAdapter,
@@ -1620,11 +1622,39 @@ def _generate_streaming_event_harmony(
     streaming_events_helper: ResponsesStreamingEventsHelper,
 ):
     tools = [tool.model_dump() for tool in request.tools]
-    messages = harmony_adapter.stateful_stream_harmony_tokens_to_openai_messages(
+    messages, contents = harmony_adapter.stateful_stream_harmony_tokens_to_openai_messages(
         stream_request_id, output.token_ids_diff, tools, request.tool_choice)
     stream_state = harmony_adapter.get_stream_state(stream_request_id)
     assert stream_state is not None
     parser = stream_state.get_parser()
+
+    # send reasoning -> send done -> send text
+    # to prevent interleaved reasoning and done events
+    if ("analysis" in contents and contents["analysis"]
+            and parser.current_recipient is None):
+        if not streaming_events_helper.is_output_item_added_sent:
+            streaming_events_helper.is_output_item_added_sent = True
+
+            reasoning_item = ResponseReasoningItem(
+                id=streaming_events_helper.item_id,
+                type="reasoning",
+                summary=[],
+                status="in_progress",
+            )
+
+            reasoning_content = PartReasoningText(
+                type="reasoning_text",
+                text="",
+            )
+
+            yield streaming_events_helper.get_output_item_added_event(
+                reasoning_item)
+            yield streaming_events_helper.get_content_part_added_event(
+                reasoning_content)
+
+        yield streaming_events_helper.get_reasoning_text_delta_event(
+            contents["analysis"])
+
     if parser.state == StreamState.EXPECT_START:
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
@@ -1674,58 +1704,32 @@ def _generate_streaming_event_harmony(
                 yield streaming_events_helper.get_output_item_done_event(
                     text_item)
 
-    if parser.last_content_delta:
-        if (parser.current_channel == "final"
-                and parser.current_recipient is None):
-            if not streaming_events_helper.is_output_item_added_sent:
-                streaming_events_helper.is_output_item_added_sent = True
+    if ("final" in contents and contents["final"]
+            and parser.current_recipient is None):
+        if not streaming_events_helper.is_output_item_added_sent:
+            streaming_events_helper.is_output_item_added_sent = True
 
-                output_item = ResponseOutputMessage(
-                    id=streaming_events_helper.item_id,
-                    type="message",
-                    role="assistant",
-                    content=[],
-                    status="in_progress",
-                )
+            output_item = ResponseOutputMessage(
+                id=streaming_events_helper.item_id,
+                type="message",
+                role="assistant",
+                content=[],
+                status="in_progress",
+            )
 
-                content_part = ResponseOutputText(
-                    type="output_text",
-                    text="",
-                    annotations=[],
-                    logprobs=[],
-                )
-                yield streaming_events_helper.get_output_item_added_event(
-                    output_item)
-                yield streaming_events_helper.get_content_part_added_event(
-                    content_part)
+            content_part = ResponseOutputText(
+                type="output_text",
+                text="",
+                annotations=[],
+                logprobs=[],
+            )
+            yield streaming_events_helper.get_output_item_added_event(
+                output_item)
+            yield streaming_events_helper.get_content_part_added_event(
+                content_part)
 
-            yield streaming_events_helper.get_text_delta_event(
-                parser.last_content_delta, [])
-
-        elif (parser.current_channel == "analysis"
-              and parser.current_recipient is None):
-            if not streaming_events_helper.is_output_item_added_sent:
-                streaming_events_helper.is_output_item_added_sent = True
-
-                reasoning_item = ResponseReasoningItem(
-                    id=streaming_events_helper.item_id,
-                    type="reasoning",
-                    summary=[],
-                    status="in_progress",
-                )
-
-                reasoning_content = PartReasoningText(
-                    type="reasoning_text",
-                    text="",
-                )
-
-                yield streaming_events_helper.get_output_item_added_event(
-                    reasoning_item)
-                yield streaming_events_helper.get_content_part_added_event(
-                    reasoning_content)
-
-            yield streaming_events_helper.get_reasoning_text_delta_event(
-                parser.last_content_delta)
+        yield streaming_events_helper.get_text_delta_event(
+            contents["final"], [])
 
 
 class ResponsesStreamingProcessor:
