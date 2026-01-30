@@ -1089,6 +1089,18 @@ def stress_stage(model_name,
         request_count = int(stress_request_rate * stress_time)
         test_timeout = stress_config.stress_timeout
 
+    # Cap request count for large MoE models (DeepSeek-V3/R1) to prevent timeout
+    if "DeepSeek-V3" in model_path or "DeepSeek-R1" in model_path:
+        max_sustainable_rate = 3.0  # req/s - conservative estimate
+        max_request_count = int(max_sustainable_rate *
+                                stress_config.stress_time)
+        if request_count > max_request_count:
+            print_info(
+                f"Capping request_count from {request_count} to {max_request_count} "
+                f"for DeepSeek V3/R1 model (sustainable rate: {max_sustainable_rate} req/s)"
+            )
+            request_count = max_request_count
+
     print_info(
         f"Running stress test with concurrency={stress_concurrency}, request_count={request_count}"
     )
