@@ -119,7 +119,7 @@ class KvCacheCreator:
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
-        available_kv_mem = total_gpu_memory * fraction - peak_memory
+        available_kv_mem = (total_gpu_memory - peak_memory) * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
