@@ -7,19 +7,17 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
-from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
+from fla.ops.utils import prepare_chunk_indices
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8] for num_stages in [2, 3, 4]
+    ],
+    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+)
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
     k,
@@ -33,7 +31,7 @@ def recompute_w_u_fwd_kernel(
     chunk_indices,
     T,
     H: tl.constexpr,
-    Hg: tl.constexpr,
+    Hqk: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -85,9 +83,9 @@ def recompute_w_u_fwd_kernel(
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
+            k + (bos * Hqk + i_h // (H // Hqk)) * K,
             (T, K),
-            (Hg * K, 1),
+            (Hqk * K, 1),
             (i_t * BT, i_k * BK),
             (BT, BK),
             (1, 0),
@@ -114,7 +112,7 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, T, Hg, K, V = *k.shape, v.shape[-1]
+    B, T, Hqk, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A.shape[-1]
 
@@ -125,27 +123,23 @@ def recompute_w_u_fwd(
     BV = 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
-    recompute_w_u_fwd_kernel[(NT, B * H)](
-        k=k,
-        v=v,
-        beta=beta,
-        w=w,
-        u=u,
-        A=A,
-        g=g_cumsum,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
-        num_warps=4,
-        num_stages=3,
-    )
+    recompute_w_u_fwd_kernel[(NT, B * H)](k=k,
+                                          v=v,
+                                          beta=beta,
+                                          w=w,
+                                          u=u,
+                                          A=A,
+                                          g=g_cumsum,
+                                          cu_seqlens=cu_seqlens,
+                                          chunk_indices=chunk_indices,
+                                          T=T,
+                                          H=H,
+                                          Hqk=Hqk,
+                                          K=K,
+                                          V=V,
+                                          BT=BT,
+                                          BK=BK,
+                                          BV=BV)
     return w, u
 
 

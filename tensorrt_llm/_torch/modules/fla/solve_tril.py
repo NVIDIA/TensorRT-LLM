@@ -7,20 +7,18 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
-from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
-from tensorrt_llm._torch.modules.fla.utils import input_guard
+from fla.ops.utils import prepare_chunk_indices
+from fla.utils import input_guard
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [1, 2, 4, 8]
-#         for num_stages in [2, 3, 4, 5]
-#     ],
-#     key=["BT"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [1, 2, 4, 8] for num_stages in [2, 3, 4, 5]
+    ],
+    key=["BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def solve_tril_16x16_kernel(
     A,
@@ -70,14 +68,13 @@ def solve_tril_16x16_kernel(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [1, 2, 4, 8]
-#         for num_stages in [2, 3, 4, 5]
-#     ],
-#     key=["H", "BT", "IS_VARLEN"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [1, 2, 4, 8] for num_stages in [2, 3, 4, 5]
+    ],
+    key=["H", "BT", "IS_VARLEN"],
+)
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_32x32_inverse_kernel(
     A,
@@ -142,14 +139,13 @@ def merge_16x16_to_32x32_inverse_kernel(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4, 5]
-#     ],
-#     key=["H", "BT", "IS_VARLEN"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8] for num_stages in [2, 3, 4, 5]
+    ],
+    key=["H", "BT", "IS_VARLEN"],
+)
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_64x64_inverse_kernel(
     A,
@@ -391,17 +387,13 @@ def solve_tril(
     chunk_indices = (prepare_chunk_indices(cu_seqlens, 16)
                      if cu_seqlens is not None else None)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, 16)
-    solve_tril_16x16_kernel[NT, B * H](
-        A=A,
-        Ad=Ad,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        BT=BT,
-        num_warps=1,
-        num_stages=4,
-    )
+    solve_tril_16x16_kernel[NT, B * H](A=A,
+                                       Ad=Ad,
+                                       cu_seqlens=cu_seqlens,
+                                       chunk_indices=chunk_indices,
+                                       T=T,
+                                       H=H,
+                                       BT=BT)
     if BT == 16:
         return Ad
 
@@ -411,16 +403,12 @@ def solve_tril(
     chunk_indices = (prepare_chunk_indices(cu_seqlens, BT)
                      if cu_seqlens is not None else None)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
-    merge_fn[NT, B * H](
-        A=A,
-        Ad=Ad,
-        Ai=Ai,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        BT=BT,
-        num_warps=4,
-        num_stages=3,
-    )
+    merge_fn[NT, B * H](A=A,
+                        Ad=Ad,
+                        Ai=Ai,
+                        cu_seqlens=cu_seqlens,
+                        chunk_indices=chunk_indices,
+                        T=T,
+                        H=H,
+                        BT=BT)
     return Ai
