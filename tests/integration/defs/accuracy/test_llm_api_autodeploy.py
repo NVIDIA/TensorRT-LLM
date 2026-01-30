@@ -339,19 +339,16 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     def test_bf16(self):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
+        print_memory_usage("Before evaluation")
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
                            world_size=4,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
-            print_memory_usage("Before MMLU evaluation")
             task.evaluate(llm, sampling_params=sampling_params)
-            print_memory_usage("After MMLU evaluation")
-
             task = GSM8K(self.MODEL_NAME)
-            print_memory_usage("Before GSM8K evaluation")
             task.evaluate(llm)
-            print_memory_usage("After GSM8K evaluation")
+        print_memory_usage("After evaluation")
 
     @pytest.mark.skip("Skipping FP8 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
