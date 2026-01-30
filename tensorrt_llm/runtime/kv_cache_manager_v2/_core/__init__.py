@@ -15,6 +15,13 @@
 
 from .._common import DEFAULT_BEAM_INDEX, BeamIndex
 from ._kv_cache import _KVCache
-from ._kv_cache_manager import KVCacheManager
+from ._kv_cache_manager import AggregatedPageDesc, BufferSlice, KVCacheManager
 
-__all__ = ["KVCacheManager", "_KVCache", "BeamIndex", "DEFAULT_BEAM_INDEX"]
+__all__ = [
+    "KVCacheManager",
+    "_KVCache",
+    "BeamIndex",
+    "DEFAULT_BEAM_INDEX",
+    "BufferSlice",
+    "AggregatedPageDesc",
+]

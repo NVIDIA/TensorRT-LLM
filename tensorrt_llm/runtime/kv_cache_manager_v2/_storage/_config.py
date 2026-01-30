@@ -21,14 +21,7 @@ from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._core import PoolGroupIndex, PoolIndex
-from .._utils import (
-    HomoTuple,
-    TypedIndexList,
-    filled_list,
-    get_uniform_attribute,
-    is_sorted,
-    typed_range,
-)
+from .._utils import HomoTuple, TypedIndexList, filled_list, get_uniform_attribute, is_sorted
 
 
 class BufferId(NamedTuple):
@@ -135,16 +128,12 @@ class StorageConfig:
                 ret[life_cycle] = page.num_buffers
         return ret
 
-    def layer_to_life_cycle_ids(self) -> TypedIndexList[LayerId, LifeCycleId]:
+    def layer_to_life_cycle_ids(self) -> dict[LayerId, LifeCycleId]:
         map = dict[LayerId, LifeCycleId]()
         for (layer_id, _), attr in self.buffer_attributes().items():
             lc_id = map.setdefault(layer_id, attr.life_cycle_id)
             assert lc_id == attr.life_cycle_id
-        assert len(map) == max(map.keys()) + 1
-        return cast(
-            TypedIndexList[LayerId, LifeCycleId],
-            [map[LayerId(layer_id)] for layer_id in typed_range(len(map))],
-        )
+        return map
 
     def __post_init__(self) -> None:
         groups = [tuple(s.life_cycle_id for s in pg.variants) for pg in self.slot_desc_list]

@@ -36,8 +36,16 @@ from ._config import (
     HostCacheTierConfig,
     KVCacheManagerConfig,
 )
-from ._core import DEFAULT_BEAM_INDEX, BeamIndex, KVCacheManager, _KVCache
+from ._core import (
+    DEFAULT_BEAM_INDEX,
+    AggregatedPageDesc,
+    BeamIndex,
+    BufferSlice,
+    KVCacheManager,
+    _KVCache,
+)
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
+from ._storage import BufferId
 
 __all__ = [
     "LifeCycleId",
@@ -65,4 +73,7 @@ __all__ = [
     "CacheTierConfig",
     "gen_multi_modal_tokens",
     "rawref",
+    "BufferSlice",
+    "AggregatedPageDesc",
+    "BufferId",
 ]

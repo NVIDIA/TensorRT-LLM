@@ -157,11 +157,11 @@ class _KVCache:
     @beam_width.setter
     def beam_width(self, beam_width: BeamIndex) -> None: ...
     def get_page_indices(self, layer_group_id: int, beam_id: BeamIndex = ...) -> IndexSeq: ...
-    def get_all_page_indices(
-        self, beam_id: BeamIndex, buf_ids: Iterable[tuple[LayerId, DataRole]]
-    ) -> Iterator[IndexSeq]: ...
-    def get_slot_indices(
-        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    def get_aggregated_page_indices(
+        self,
+        layer_group_id: LayerGroupId,
+        beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
+        valid_only: bool = False,
     ) -> Iterator[int]: ...
     def resize(self, capacity: int | None, history_length: int | None = None) -> bool: ...
     @property
@@ -204,23 +204,23 @@ class BufferId(NamedTuple):
     role: DataRole
 
 @dataclass(slots=True, frozen=True)
-class CoalescedBuffer:
-    single_buffer_size: int
-    buffer_ids: Sequence[BufferId]
-    @property
-    def size(self) -> int: ...
-    @property
-    def num_buffers(self) -> int: ...
+class BufferSlice:
+    buffer_id: BufferId
+    num_slices: int = 1
+    slice_index: int = 1
 
 @dataclass(slots=True, frozen=True)
-class SlotDescVariant:
-    coalesced_buffers: Sequence[CoalescedBuffer]
-    @property
-    def layer_group_id(self) -> LayerGroupId: ...
+class AggregatedPageDesc:
+    """The data you need would be in the following byte ranges.
 
-@dataclass(slots=True, frozen=True)
-class SlotDesc:
-    variants: Sequence[SlotDescVariant]
+    (base + stride * i + Range(0, size) for i in aggregated_page_indices)
+    """
+
+    base: MemAddress
+    size: int
+    stride: int
+    layer_group_id: LayerGroupId
+    buffers: Sequence[BufferSlice]
 
 # From _core/_kv_cache_manager.py
 class KVCacheManager:
@@ -246,13 +246,16 @@ class KVCacheManager:
     def allow_seq_rebasing(self) -> bool: ...
     @property
     def enable_partial_match(self) -> bool: ...
-    def get_layer_group_id(self, layer_id: LayerId) -> int: ...
+    @property
+    def num_layers(self) -> int: ...
+    @property
+    def layer_ids(self) -> Iterator[LayerId]: ...
+    def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
     @property
-    def num_pool_groups(self) -> PoolGroupIndex: ...
-    def get_gpu_memory_pool_groups(
-        self, pool_group_index: PoolGroupIndex
-    ) -> MemoryPoolGroupDesc: ...
-    def get_slot_desc(self, pool_group_index: PoolGroupIndex) -> SlotDesc: ...
+    def all_buffer_ids(self) -> Iterator[BufferId]: ...
+    def get_aggregated_pages(
+        self, buffers: Iterable[BufferSlice]
+    ) -> Iterator[AggregatedPageDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, model_max_seq_len: int) -> int: ...

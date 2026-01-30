@@ -612,7 +612,7 @@ class SimplePool(Generic[T]):
         if self._max_size is not None and len(self.items) >= self._max_size:
             self._destroy_func(item)
         else:
-            self.items.appendleft(item)
+            self.items.append(item)
 
     @property
     def outstanding_count(self) -> int:
@@ -782,6 +782,9 @@ class CachedCudaStream(ItemHolderBase[CudaStream]):
 
     def __cuda_stream__(self) -> tuple[int, int]:
         return 0, int(self.get())
+
+    def synchronize(self) -> None:
+        _unwrap(drv.cuStreamSynchronize(self.handle))
 
     @property
     def pool(self) -> SimplePool[CudaStream]:

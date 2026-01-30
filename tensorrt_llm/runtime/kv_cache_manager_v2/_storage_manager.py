@@ -158,7 +158,7 @@ class StorageManager:
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
-    _layer_to_life_cycle_ids: TypedIndexList[LayerId, LifeCycleId]
+    _layer_to_life_cycle_ids: dict[LayerId, LifeCycleId]
     _slot_to_page_indices: TypedIndexList[LifeCycleId, int]
     _buffer_attr: dict[BufferId, BufferAttr]
     _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]

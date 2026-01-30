@@ -50,7 +50,6 @@ from .._page import (
     _SharedPageLock,
     batched_lock_to_gpu,
 )
-from .._storage._config import BufferId
 from .._storage_manager import StorageManager
 from .._utils import (
     CachedCudaEvent,
@@ -322,16 +321,11 @@ class _KVCache:
         )
         return indices
 
-    def get_all_page_indices(
-        self, beam_id: BeamIndex, buf_ids: Iterable[BufferId]
-    ) -> Iterator[IndexSeq]:
-        layer_to_lc_ids = self.manager._storage._layer_to_life_cycle_ids
-        for layer_id, _ in buf_ids:
-            lc = layer_to_lc_ids[layer_id]
-            yield self._page_indices[beam_id][lc]
-
-    def get_slot_indices(
-        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    def get_aggregated_page_indices(
+        self,
+        layer_group_id: LayerGroupId,
+        beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
+        valid_only: bool = False,
     ) -> Iterator[int]:
         """
         Get the internal slot indices for the given layer group and beam.
@@ -343,12 +337,15 @@ class _KVCache:
             layer_group_id: Layer group to inspect.
             beam_id: Beam index to read. Defaults to DEFAULT_BEAM_INDEX.
 
-        Yields:
-            Slot indices per block, or BAD_PAGE_INDEX when a holder is missing.
+        Returns:
+            Aggregated page index for each block, or BAD_PAGE_INDEX for invalid blocks.
         """
         for b in self._blocks:
-            holder = b.pages[beam_id][layer_group_id]
-            yield BAD_PAGE_INDEX if holder is None else holder.page.slot_id
+            if (holder := b.pages[beam_id][layer_group_id]) is None:
+                if not valid_only:
+                    yield BAD_PAGE_INDEX
+            else:
+                yield holder.page.slot_id
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
