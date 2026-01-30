@@ -292,7 +292,7 @@ class TrtllmAttentionWrapper:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
-        self.kv_cache = kv_cache  # Actual KV cache tensor
+        self.kv_cache = kv_cache
         self.has_fp4_kv_cache = has_fp4_kv_cache
         self.workspace = workspace
         self.cache_indirection = cache_indirection
@@ -1816,7 +1816,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 )
 
         kv_cache = None
-        if metadata.kv_cache_manager is not None and not self.has_fp4_kv_cache:
+        has_fp4_kv_cache = self.has_fp4_kv_cache if hasattr(
+            self, 'has_fp4_kv_cache') else False
+        if metadata.kv_cache_manager is not None and not has_fp4_kv_cache:
             kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx,
                                                              kv_layout="HND")
 
@@ -1840,7 +1842,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             kv_cache=kv_cache,
-            has_fp4_kv_cache=self.has_fp4_kv_cache,
+            has_fp4_kv_cache=has_fp4_kv_cache,
             block_ids_per_seq=metadata.block_ids_per_seq,
             # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
             workspace=metadata.workspace
