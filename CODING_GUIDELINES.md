@@ -410,6 +410,21 @@ Use the [Google style](https://google.github.io/styleguide/pyguide.html), which 
 
 When defining any user-facing configuration classes (e.g. `LlmArgs` or any class used in its fields), always use Pydantic classes rather than dataclasses or vanilla classes.
 
+- avoid to_dict / from_dict
+- avoid dicts / object as any part of a pydantic class 
+- use discriminated unions
+- prefer (1) positiveint/nonnegativeint/nonnegativefloat/positivefloat, or (2) if not possible, gt/ge/le/lt
+- use min_length to enforce minimum length of a list
+- use pydantic field descriptions instead of comments
+- use Literal instead of str when a field should only accept certain values. avoid defining a custom validator on a str field.
+- raise ValueError instead of assertion
+- co-locate model validation logic within the class itself rather than in a parent class, unless it depends on other fields in the parent class (e.g. don't validate cuda_graph_config in BaseLlmArgs; also add example of OK case)
+
+TODO:
+- ask cursor for more antipatterns fixed in this pr
+- unit tests: e.g. for get_llm_args_from_cli_params, other tests you removed, etc
+- add validator to BaseLlmArgs.__init_subclass__ to check that all subfields are Pydantic
+
 #####  Attributes and Variables
 Attributes and variables can be documented inline. Attribute docstrings will be rendered under the docstring for the class. For example:
 ```python
