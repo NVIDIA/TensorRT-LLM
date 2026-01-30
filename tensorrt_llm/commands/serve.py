@@ -150,7 +150,7 @@ def launch_grpc_server(host: str, port: int, llm_args: BaseLlmArgs):
 
     async def serve_grpc_async():
         logger.info("Initializing TensorRT-LLM gRPC server...")
-        
+
         llm = create_llm_from_llm_args(llm_args)
         logger.info("Model loaded successfully")
 
@@ -158,7 +158,8 @@ def launch_grpc_server(host: str, port: int, llm_args: BaseLlmArgs):
         request_manager = GrpcRequestManager(llm)
 
         # Create servicer
-        servicer = TrtllmServiceServicer(request_manager, model_path=llm_args.model)
+        servicer = TrtllmServiceServicer(request_manager,
+                                         model_path=llm_args.model)
 
         # Create gRPC server
         server = grpc.aio.server(

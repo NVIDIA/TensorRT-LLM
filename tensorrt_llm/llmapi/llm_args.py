@@ -2978,7 +2978,8 @@ class TorchLlmArgs(BaseLlmArgs):
                     "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3—use an Eagle3 draft model."
                 )
                 # Convert EagleDecodingConfig to Eagle3DecodingConfig
-                eagle_data = self.speculative_config.model_dump(exclude={"decoding_type"})
+                eagle_data = self.speculative_config.model_dump(
+                    exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
             if isinstance(self.speculative_config,
