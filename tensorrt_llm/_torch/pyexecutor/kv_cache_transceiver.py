@@ -49,9 +49,12 @@ def create_kv_cache_transceiver(
         else:
             cache_transceiver_config.backend = "UCX"
         # Ordered by priority
-        env_vars = [("TRTLLM_USE_UCX_KVCACHE", "UCX"),
-                    ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
-                    ("TRTLLM_USE_MPI_KVCACHE", "MPI")]
+        env_vars = [
+            ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
+            ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+            ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
+            ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
+        ]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":
                 logger.warning(
@@ -77,6 +80,13 @@ def create_kv_cache_transceiver(
             "Please use UCX or MPI backend for cache transfer with hybrid models."
         )
 
+    if cache_transceiver_config.backend == "V2":
+        from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import \
+            PyNativeCacheTransceiver
+        logger.info("Using PyNativeCacheTransceiver")
+        return PyNativeCacheTransceiver(mapping, dist, kv_cache_manager,
+                                        attention_type,
+                                        cache_transceiver_config)
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config,
                                   mamba_cache_manager)
