@@ -376,13 +376,22 @@ class ExecutorRequestQueue:
     def _fetch_new_requests_attention_dp(
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
-        # Get active request counts across all ranks
+        # Get active request counts across all ranks.
         all_ranks_num_active_requests = []
         all_ranks_num_active_tokens = []
-        num_active_tokens = sum(
-            [req.py_orig_prompt_len for req in activate_requests])
+
+        if self.dist.has_cp_helix:
+            num_active_tokens = sum(
+                [req.total_input_len_cp for req in activate_requests])
+        else:
+            num_active_tokens = sum(
+                [req.py_orig_prompt_len for req in activate_requests])
+
+        # Note: We use tp_allgather even for CP assuming that all CP ranks with the
+        # same dp_rank have the same num_active_tokens and num_active_requests.
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
+
         for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
             all_ranks_num_active_tokens.append(num_active_tokens)
@@ -436,7 +445,7 @@ class ExecutorRequestQueue:
                 return True
             return scheduling_params.attention_dp_relax
 
-        new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
+        new_requests = sorted(new_requests, key=get_relax_value)
 
         # Try to put the requests to the target dp rank until the max_num_active_requests is reached
         remaining_unscheduled = []

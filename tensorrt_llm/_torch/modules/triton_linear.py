@@ -4,20 +4,15 @@ from typing import Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
+from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig, matmul_ogs
+from triton_kernels.numerics import InFlexData
 
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
-# Reuse the common Triton import setup
-from .fused_moe.fused_moe_triton import (IS_TRITON_KERNELS_AVAILABLE,
-                                         maybe_update_stride,
+from .fused_moe.fused_moe_triton import (maybe_update_stride,
                                          swizzle_weight_and_scale)
-
-if IS_TRITON_KERNELS_AVAILABLE:
-    from triton_kernels.matmul_ogs import (FlexCtx, PrecisionConfig, matmul_ogs)
-    from triton_kernels.numerics import InFlexData
-
 from .linear import (Linear, LinearMethodBase, TensorParallelMode,
                      WeightsLoadingConfig, copy_weight, load_weight_shard,
                      load_weights_fused_gate_up_helper,
@@ -383,9 +378,6 @@ class TritonLinear(Linear):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            raise ImportError("Triton kernels are not available. "
-                              "Please install the required dependencies.")
         assert not use_custom_cublas_mm, "TritonLinear does not support custom cublas mm."
 
         super().__init__(

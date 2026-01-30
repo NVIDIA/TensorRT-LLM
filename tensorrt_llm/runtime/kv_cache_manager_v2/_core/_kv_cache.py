@@ -25,6 +25,7 @@ from .. import rawref
 from .._block_radix_tree import Block, RootBlock, UselessBlockError
 from .._common import (
     BAD_PAGE_INDEX,
+    DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
     NDEBUG,
     BeamIndex,
@@ -49,7 +50,6 @@ from .._page import (
     _SharedPageLock,
     batched_lock_to_gpu,
 )
-from .._storage._config import BufferId
 from .._storage_manager import StorageManager
 from .._utils import (
     CachedCudaEvent,
@@ -312,7 +312,7 @@ class _KVCache:
     # Due to constraints of the current kernels, K/V data blocks and the correspondding quant scale blocks
     # share the same indices, so the output for DataRole.KEY_DATA and DataRole.KEY_BLOCK_SCALE are the same.
     def get_page_indices(
-        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = BeamIndex(0)
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq:
         indices = self._page_indices[beam_id][layer_group_id]
         assert NDEBUG or all(
@@ -321,13 +321,31 @@ class _KVCache:
         )
         return indices
 
-    def get_all_page_indices(
-        self, beam_id: BeamIndex, buf_ids: Iterable[BufferId]
-    ) -> Iterator[IndexSeq]:
-        layer_to_lc_ids = self.manager._storage._layer_to_life_cycle_ids
-        for layer_id, _ in buf_ids:
-            lc = layer_to_lc_ids[layer_id]
-            yield self._page_indices[beam_id][lc]
+    def get_aggregated_page_indices(
+        self,
+        layer_group_id: LayerGroupId,
+        beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
+        valid_only: bool = False,
+    ) -> Iterator[int]:
+        """
+        Get the internal slot indices for the given layer group and beam.
+        Each slot is a group of coalesced buffers in one memory pool group.
+        This API exposes internal slot indices, mainly for efficient data transfer.
+        For computation, use get_page_indices() instead.
+
+        Args:
+            layer_group_id: Layer group to inspect.
+            beam_id: Beam index to read. Defaults to DEFAULT_BEAM_INDEX.
+
+        Returns:
+            Aggregated page index for each block, or BAD_PAGE_INDEX for invalid blocks.
+        """
+        for b in self._blocks:
+            if (holder := b.pages[beam_id][layer_group_id]) is None:
+                if not valid_only:
+                    yield BAD_PAGE_INDEX
+            else:
+                yield holder.page.slot_id
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
@@ -608,7 +626,7 @@ class _KVCache:
         )
         seq_block = self._blocks[ordinal]
         assert typed_len(seq_block.pages) == 1, "Must have 1 beam only"
-        beam_idx = BeamIndex(0)
+        beam_idx = DEFAULT_BEAM_INDEX
         beam_block = seq_block.pages[beam_idx]
         tokens_per_block = self.tokens_per_block
         start = ordinal * tokens_per_block
@@ -756,7 +774,7 @@ class _KVCache:
         assert self._blocks[ordinal].is_committed
         ret = unwrap_optional(self._blocks[ordinal].tree_block)
         if not NDEBUG:
-            for b in self._block(ordinal, BeamIndex(0)):
+            for b in self._block(ordinal, DEFAULT_BEAM_INDEX):
                 assert b is None or (isinstance(b.page, CommittedPage) and b.page.block() is ret)
         return ret
 
@@ -925,7 +943,7 @@ class _KVCache:
             ],
         )
 
-        beam_idx = BeamIndex(0)
+        beam_idx = DEFAULT_BEAM_INDEX
         for lc_idx, lc in life_cycles.items():
             stale_start, stale_end = _KVCache._get_stale_range(
                 tokens_per_block, get_num_matched_tokens(matched), lc
@@ -1011,7 +1029,7 @@ class _KVCache:
         return old
 
     def _get_page_indices_ref(
-        self, lc: LifeCycleId, beam_id: BeamIndex = BeamIndex(0)
+        self, lc: LifeCycleId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> Iterator[int | None]:
         assert beam_id < self.beam_width
         assert self.is_active
