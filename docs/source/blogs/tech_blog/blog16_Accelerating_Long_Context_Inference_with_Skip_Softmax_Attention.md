@@ -59,6 +59,7 @@ cat >extra_llm_api_options.yaml <<EOF
 sparse_attention_config:
     algorithm: skip_softmax
     threshold_scale_factor: 1000.0
+EOF
 
 # Additionally, the threshold_scale_factor for prefill and decode could be separately configured.
 cat >extra_llm_api_options.yaml <<EOF
@@ -103,7 +104,7 @@ These results demonstrate that Skip Softmax Attention is safe to use without sig
 
 
 ## Performance Benchmark
-Skip Softmax Attention is supported on both Hopper and Blackwell GPUs, based on the SoTA performance of the TensorRT-LLM's attention kernels. Hopper prefilling is implemented in [fmha_v2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/fmha_v2), Hopper decoding is implemented in [XQA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa), and Blackwell is implemented in [trtllm-gen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels).
+Skip Softmax Attention is supported on both Hopper and Blackwell GPUs and builds on top of the SoTA performance of the TensorRT-LLM's attention kernels. Hopper prefilling is implemented in [fmha_v2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/fmha_v2), Hopper decoding is implemented in [XQA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa), and Blackwell is implemented in [trtllm-gen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels).
 
 ### Kernel Performance
 
