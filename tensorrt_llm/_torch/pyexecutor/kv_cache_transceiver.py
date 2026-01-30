@@ -42,9 +42,12 @@ def create_kv_cache_transceiver(
         # NIXL is the default backend
         cache_transceiver_config.backend = "NIXL"
         # Ordered by priority
-        env_vars = [("TRTLLM_USE_UCX_KVCACHE", "UCX"),
-                    ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
-                    ("TRTLLM_USE_MPI_KVCACHE", "MPI")]
+        env_vars = [
+            ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
+            ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+            ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
+            ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
+        ]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":
                 logger.warning(
@@ -61,7 +64,13 @@ def create_kv_cache_transceiver(
             f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
-
+    if cache_transceiver_config.backend == "V2":
+        from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import \
+            PyNativeCacheTransceiver
+        logger.info("Using PyNativeCacheTransceiver")
+        return PyNativeCacheTransceiver(mapping, dist, kv_cache_manager,
+                                        attention_type,
+                                        cache_transceiver_config)
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config)
 

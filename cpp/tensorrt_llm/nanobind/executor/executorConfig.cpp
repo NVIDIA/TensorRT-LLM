@@ -450,6 +450,7 @@ void initConfigBindings(nb::module_& m)
         .value("UCX", tle::CacheTransceiverConfig::BackendType::UCX)
         .value("NIXL", tle::CacheTransceiverConfig::BackendType::NIXL)
         .value("MOONCAKE", tle::CacheTransceiverConfig::BackendType::MOONCAKE)
+        .value("V2", tle::CacheTransceiverConfig::BackendType::V2)
         .def("from_string",
             [](std::string const& str)
             {
@@ -463,9 +464,10 @@ void initConfigBindings(nb::module_& m)
                     return tle::CacheTransceiverConfig::BackendType::NIXL;
                 if (str == "MOONCAKE" || str == "mooncake")
                     return tle::CacheTransceiverConfig::BackendType::MOONCAKE;
+                if (str == "V2" || str == "v2")
+                    return tle::CacheTransceiverConfig::BackendType::V2;
                 throw std::runtime_error("Invalid backend type: " + str);
             });
-
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
         .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
                  std::optional<int>, std::optional<int>>(),
