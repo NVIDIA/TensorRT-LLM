@@ -185,12 +185,12 @@ class InferenceOptimizer:
             # run transform
             mod = transform(mod, cm, self.factory, self.shared_config)
 
-            # Synchronize CUDA and collect garbage for accurate memory measurement
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+#            # Synchronize CUDA and collect garbage for accurate memory measurement
+#            if torch.cuda.is_available():
+#                torch.cuda.synchronize()
+#            gc.collect()
+#            if torch.cuda.is_available():
+#                torch.cuda.empty_cache()
 
             # Log memory status after transform
             mem_after = _log_memory_status(f"AFTER {t_name}")
@@ -200,8 +200,8 @@ class InferenceOptimizer:
         ############################################################################################
         # RETURN OPTIMIZED MODEL
         ############################################################################################
-        torch.cuda.empty_cache()
-        gc.collect()
+#        torch.cuda.empty_cache()
+#        gc.collect()
 
         # Log final memory status and summary
         final_mem = _log_memory_status("FINAL (after all transforms)")
