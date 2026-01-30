@@ -162,15 +162,29 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
         stream=True,
         extra_body={"top_k": 1},
     )
-    collected_chunks = []
     collected_messages = []
+    first_iteration = True
     async for chunk in response:
-        # Last streaming response will only contains usage info
-        if len(chunk.choices) <= 0:
-            continue
-
-        collected_chunks.append(chunk)
-        collected_messages.append(chunk.choices[0].delta)
+        if chunk.choices:
+            delta = chunk.choices[0].delta
+            if first_iteration:
+                assert delta.role == "assistant", ValueError(
+                    "Expected role 'assistant' for first iteration")
+                collected_messages.append(delta)
+                first_iteration = False
+            else:
+                assert delta.role is None, ValueError(
+                    "Expected no role except for first iteration")
+                collected_messages.append(delta)
+        else:
+            assert hasattr(chunk, "usage"), ValueError(
+                "Expected usage info in last streaming response")
+            assert chunk.usage.prompt_tokens is not None
+            assert chunk.usage.completion_tokens is not None
+            assert chunk.usage.total_tokens is not None
+            assert chunk.usage.prompt_tokens > 0
+            assert chunk.usage.completion_tokens > 0
+            assert chunk.usage.total_tokens > 0
 
     full_response = "".join([
         m.content for m in collected_messages

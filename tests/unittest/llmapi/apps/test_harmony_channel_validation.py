@@ -362,6 +362,7 @@ class TestHandleStreamingResponse:
                     request_id=request_id,
                     done=False,  # Not done yet, still streaming
                     num_prompt_tokens=10,
+                    first_iteration=True,
                 )
 
                 # CRITICAL ASSERTION: result.abort() should be called
@@ -424,6 +425,7 @@ class TestHandleStreamingResponse:
                     request_id=request_id,
                     done=False,
                     num_prompt_tokens=10,
+                    first_iteration=True,
                 )
 
                 # CRITICAL ASSERTION: result.abort() should NOT be called

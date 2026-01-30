@@ -42,6 +42,7 @@
 #include <ATen/cuda/EmptyTensor.h>
 #include <c10/util/irange.h>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -281,7 +282,7 @@ public:
     std::vector<torch::Tensor> run(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
         torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
         torch::optional<torch::Tensor> const& bias, bool trigger_completion_at_end,
-        torch::optional<torch::Tensor> workspace) noexcept
+        torch::optional<torch::Tensor> workspace)
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
@@ -295,7 +296,6 @@ public:
         auto const rank = getRank();
         TLLM_LOG_DEBUG(
             "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
-
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
         {
@@ -508,8 +508,9 @@ private:
             minRegistrationThreshold = static_cast<size_t>(std::atoi(envThreshold)) * input.element_size();
         }
 
-        // Search for existing buffer
         auto& allocator = NCCLWindowAllocator::getInstance();
+
+        // Search for existing buffer
         auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr());
 
         torch::Tensor inputTensor = input;
@@ -532,11 +533,22 @@ private:
                 // Large buffer: create window buffer and copy input (can swap inputTensor reference)
                 auto [symmetricInput, symmetricBuffer0]
                     = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
-                TLLM_CUDA_CHECK(cudaMemcpyAsync(
-                    symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
-                windowBuffer0 = symmetricBuffer0;
-                inputTensor = symmetricInput; // Swap to window-backed tensor
-                inputPtr = windowBuffer0.ptr;
+                if (!symmetricBuffer0.isValid())
+                {
+                    TLLM_LOG_DEBUG(
+                        "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
+                        "falling back to non-symmetric ncclAllReduce (input buffer)");
+                    // inputTensor and inputPtr remain pointing to original input
+                }
+                else
+                {
+                    TLLM_CUDA_CHECK(cudaMemcpyAsync(
+                        symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
+
+                    windowBuffer0 = symmetricBuffer0;
+                    inputTensor = symmetricInput; // Swap to window-backed tensor
+                    inputPtr = windowBuffer0.ptr;
+                }
             }
         }
         else
@@ -547,8 +559,14 @@ private:
 
         // Use window-backed output buffer
         auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
-        torch::Tensor outputTensor = normOut;
-        void* outputPtr = windowBuffer1.ptr;
+        torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
+        void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
+        if (!windowBuffer1.isValid())
+        {
+            TLLM_LOG_DEBUG(
+                "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
+                "using plain CUDA tensor for output");
+        }
 
         // Perform allreduce
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
@@ -564,7 +582,7 @@ private:
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
 #ifdef ENABLE_FP8
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -632,8 +650,7 @@ private:
     std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
-        bool trigger_completion_at_end, torch::optional<torch::Tensor> workspace,
-        AllReduceStrategyType strategy) noexcept
+        bool trigger_completion_at_end, torch::optional<torch::Tensor> workspace, AllReduceStrategyType strategy)
     {
         // Should handle only Lamport implementation
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -1206,7 +1223,7 @@ private:
 
         if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size))
         {
-            return AllReduceStrategyType::NCCL_SYMMETRIC;
+            return AllReduceStrategyType::NCCL;
         }
 
         // This rule based heuristic only chooses between NCCL_SYMMETRIC and MIN_LATENCY strategies.
@@ -1232,7 +1249,8 @@ private:
 
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
-        // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL_SYMMETRIC fallback.
+        // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL fallback.
+        // TODO: Use NCCL_SYMMETRIC once the memory allocation issue is resolved.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
             return true;

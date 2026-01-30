@@ -12,7 +12,14 @@ GPU_RESOURCE_CONFIG = {
         "lock_freq_graphics_mhz": 2062,  # GPU graphics clock lock frequency (MHz)
         "lock_freq_memory_mhz": 3996,  # GPU memory clock lock frequency (MHz)
     },
-    # OCI GB300
+    # Lyris GB200
+    "GB200_LYRIS": {
+        "slurm_extra_args": "",  # GB300 does not require extra args
+        "set_segment": True,
+        "lock_freq_graphics_mhz": None,  # TODO: Set GB300 lock frequency
+        "lock_freq_memory_mhz": None,
+    },
+    # Lyris GB300
     "GB300": {
         "slurm_extra_args": "",  # GB300 does not require extra args
         "set_segment": True,
