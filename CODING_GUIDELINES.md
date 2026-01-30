@@ -423,6 +423,7 @@ When defining any user-facing configuration classes (e.g. `LlmArgs` or any class
 TODO:
 - ask cursor for more antipatterns fixed in this pr
 - unit tests: e.g. for get_llm_args_from_cli_params, other tests you removed, etc
+- tests for all of the above Pydantic best practices
 - add validator to BaseLlmArgs.__init_subclass__ to check that all subfields are Pydantic
 
 #####  Attributes and Variables
