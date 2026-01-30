@@ -1,7 +1,7 @@
 #!/bin/bash
 set -ex
 
-UCX_VERSION="v1.20.x"
+UCX_VERSION="1.20.x"
 GITHUB_URL="https://github.com"
 if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
