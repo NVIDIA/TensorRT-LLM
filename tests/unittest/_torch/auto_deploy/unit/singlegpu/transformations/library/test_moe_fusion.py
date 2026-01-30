@@ -650,3 +650,250 @@ def test_nvfp4_moe_fusion(is_gated_mlp, hidden_size, intermediate_size):
 
     assert not torch.isnan(fused_output).any(), "Fused output contains NaN"
     assert not torch.isinf(fused_output).any(), "Fused output contains Inf"
+
+# =============================================================================
+# HuggingFace FineGrainedFP8 MoE Tests
+# =============================================================================
+
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+class BlockSparseTop2MLPHFFP8(nn.Module):
+    """HuggingFace FineGrainedFP8 expert with per-block weight scales."""
+
+    def __init__(self, ffn_dim, hidden_dim, dtype=torch.bfloat16, device="cuda", block_size=None):
+        super().__init__()
+        self.ffn_dim = ffn_dim
+        self.hidden_dim = hidden_dim
+
+        if block_size is None:
+            block_n = min(128, ffn_dim)
+            block_k = min(128, hidden_dim)
+            block_size = [block_n, block_k]
+        self.block_size = block_size
+
+        # Create FP8 weights with per-block scales
+        self.w1_fp8, self.w1_scale_inv = self._create_fp8_weight(
+            ffn_dim, hidden_dim, block_size, device
+        )
+        self.w3_fp8, self.w3_scale_inv = self._create_fp8_weight(
+            ffn_dim, hidden_dim, block_size, device
+        )
+        # w2 has shape [hidden_dim, ffn_dim]
+        block_size_w2 = [min(128, hidden_dim), min(128, ffn_dim)]
+        self.w2_fp8, self.w2_scale_inv = self._create_fp8_weight(
+            hidden_dim, ffn_dim, block_size_w2, device
+        )
+
+        self.act_fn = F.silu
+
+    def _create_fp8_weight(self, out_features, in_features, block_size, device):
+        """Create FP8 weight with per-block scales."""
+        weight_fp32 = torch.randn(out_features, in_features, device=device) * 0.01
+
+        block_n, block_k = block_size
+        N, K = out_features, in_features
+
+        # Compute per-block scales
+        weight_reshaped = weight_fp32.view(N // block_n, block_n, K // block_k, block_k)
+        amax = weight_reshaped.abs().amax(dim=(1, 3)).to(torch.float32)
+        eps = torch.finfo(torch.float32).tiny
+        weight_scale_inv = torch.clamp(amax / FP8_MAX, min=eps)
+
+        # Quantize weight to FP8
+        weight_fp8 = (
+            weight_fp32.float()
+            / weight_scale_inv.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)
+        ).to(torch.float8_e4m3fn)
+
+        return (
+            nn.Parameter(weight_fp8, requires_grad=False),
+            weight_scale_inv,
+        )
+
+    def forward(self, hidden_states: torch.Tensor):
+        x = hidden_states
+        w1_out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+            x,
+            self.w1_fp8,
+            bias=None,
+            input_scale=[],
+            weight_scale=[self.w1_scale_inv],
+            input_zp=[],
+            weight_zp=[],
+        )
+        w3_out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+            x,
+            self.w3_fp8,
+            bias=None,
+            input_scale=[],
+            weight_scale=[self.w3_scale_inv],
+            input_zp=[],
+            weight_zp=[],
+        )
+        fused = self.act_fn(w1_out) * w3_out
+        out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+            fused,
+            self.w2_fp8,
+            bias=None,
+            input_scale=[],
+            weight_scale=[self.w2_scale_inv],
+            input_zp=[],
+            weight_zp=[],
+        )
+        return out
+
+
+class HFFP8MoEOpModel(nn.Module):
+    """MoE model using HuggingFace FineGrainedFP8 quantized experts with torch_quant_hf_fp8_moe op."""
+
+    def __init__(
+        self, hidden_size=256, intermediate_size=128, num_experts=4, top_k=2, device="cuda"
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        self.gate = nn.Linear(hidden_size, num_experts)
+
+        # Create HF FP8 experts
+        self.experts = nn.ModuleList(
+            [
+                BlockSparseTop2MLPHFFP8(intermediate_size, hidden_size, device=device)
+                for _ in range(num_experts)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        router_logits = self.gate(x)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        # Keep routing_weights as float32 - TRTLLM kernel expects this dtype
+        routing_weights = routing_weights.to(torch.float32)
+
+        # Collect per-expert weights and scales
+        w1_list = [expert.w1_fp8 for expert in self.experts]
+        w2_list = [expert.w2_fp8 for expert in self.experts]
+        w3_list = [expert.w3_fp8 for expert in self.experts]
+        w1_scale_list = [expert.w1_scale_inv for expert in self.experts]
+        w2_scale_list = [expert.w2_scale_inv for expert in self.experts]
+        w3_scale_list = [expert.w3_scale_inv for expert in self.experts]
+
+        out = torch.ops.auto_deploy.torch_quant_hf_fp8_moe(
+            x,
+            selected_experts,
+            routing_weights,
+            w1_list,
+            w2_list,
+            w3_list,
+            w1_scale_list,
+            w2_scale_list,
+            w3_scale_list,
+            is_gated_mlp=True,
+        )
+        return out
+
+    def get_input(self, device, dtype=torch.bfloat16):
+        """
+        fp8_blockscale_gemm_kernel requires expected_m > 64
+        expected_m = (num_tokens x top_k) / num_experts
+        min_num_tokens >=  kernel_threshold * num_experts / top_k
+        """
+        kernel_threshold = 64 * 2  # * 2 for cushion
+        num_tokens = int(kernel_threshold * self.num_experts / self.top_k)
+        return torch.randn(num_tokens, self.hidden_size, device=device, dtype=dtype)
+
+
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires FP8 support")
+@pytest.mark.skipif(not trtllm_ops_available(), reason="Requires TRTLLM ops")
+def test_fuse_hf_fp8_moe():
+    """Test that fuse_hf_fp8_moe transforms torch_quant_hf_fp8_moe to fused op."""
+    device = "cuda"
+    # Use sizes divisible by 128 for block scales
+    model = HFFP8MoEOpModel(
+        hidden_size=512, intermediate_size=1536, num_experts=72, device=device
+    ).to(device=device)
+    model.gate = model.gate.to(dtype=torch.bfloat16)
+
+    x = model.get_input(device=device, dtype=torch.bfloat16)
+
+    with torch.inference_mode():
+        gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+        # Verify initial graph has torch_quant_hf_fp8_moe
+        has_unfused = any(
+            is_op(n, torch.ops.auto_deploy.torch_quant_hf_fp8_moe) for n in gm.graph.nodes
+        )
+        assert has_unfused, "Expected torch_quant_hf_fp8_moe in initial graph"
+
+        # Apply fusion transform
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "fuse_hf_fp8_moe": {
+                    "stage": "post_load_fusion",
+                },
+            },
+        )(None, gm)
+
+        # Verify fused op is present
+        has_fused = any(
+            is_op(n, torch.ops.auto_deploy.trtllm_quant_hf_fp8_block_scale_moe_fused)
+            for n in gm_transformed.graph.nodes
+        )
+        assert has_fused, "Expected trtllm_quant_hf_fp8_block_scale_moe_fused after fusion"
+
+        # Verify unfused op is removed
+        still_has_unfused = any(
+            is_op(n, torch.ops.auto_deploy.torch_quant_hf_fp8_moe)
+            for n in gm_transformed.graph.nodes
+        )
+        assert not still_has_unfused, "torch_quant_hf_fp8_moe should be replaced after fusion"
+
+
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires FP8 support")
+@pytest.mark.skipif(not trtllm_ops_available(), reason="Requires TRTLLM ops")
+def test_trtllm_quant_hf_fp8_block_scale_moe_fused_correctness():
+    """Test functional correctness of fused HF FP8 MoE kernel vs unfused."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(42)
+
+    # Use sizes divisible by 128 for block scales
+    model = HFFP8MoEOpModel(
+        hidden_size=512, intermediate_size=1536, num_experts=72, device=device
+    ).to(device=device)
+    model.gate = model.gate.to(dtype=dtype)
+
+    x = model.get_input(device=device, dtype=dtype)
+
+    with torch.inference_mode():
+        # Get reference output from unfused model
+        ref_output = model(x)
+
+        # Export and apply fusion
+        gm = torch_export_to_gm(model, args=(x,), clone=True)
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "fuse_hf_fp8_moe": {
+                    "stage": "post_load_fusion",
+                },
+            },
+        )(None, gm)
+
+        # Get fused output
+        fused_output = gm_transformed(x)
+
+        # Compare outputs with tolerance for FP8 quantization
+        # FP8 with block scales can have ~5% relative error
+        torch.testing.assert_close(
+            fused_output,
+            ref_output,
+            atol=0.05,
+            rtol=0.05,
+            msg="Fused HF FP8 MoE output differs from unfused reference",
+        )
