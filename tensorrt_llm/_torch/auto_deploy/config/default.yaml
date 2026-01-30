@@ -138,7 +138,6 @@ transforms:
   fuse_rmsnorm:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer
-    enabled: false
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
   fuse_add_rms_norm:
@@ -154,9 +153,9 @@ transforms:
   visualize_namespace:
     stage: visualize
     enabled: false
-  ############################################################################################
+  ###########################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
-  ############################################################################################
+  ###########################################################################################
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer

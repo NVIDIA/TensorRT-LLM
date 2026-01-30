@@ -70,6 +70,11 @@ class InferenceOptimizer:
             # run transform
             mod = transform(mod, cm, self.factory, self.shared_config)
 
+            # if t_name == "compile_model":  # or whichever transform is last before generation
+            #     from tensorrt_llm._torch.auto_deploy.utils.graph_debug_compare import run_comparison
+            #     run_comparison(mod, cm, self.factory, output_dir="debug_scatter_plots")
+            #     breakpoint()  # Optional: pause to inspect results
+
         ############################################################################################
         # RETURN OPTIMIZED MODEL
         ############################################################################################
