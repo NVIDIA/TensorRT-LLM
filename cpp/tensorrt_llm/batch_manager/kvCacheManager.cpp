@@ -1350,7 +1350,10 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mReusedBlocks{0}
     , mReusedUniqueBlocks{0}
     , mMissedBlocks{0}
-    , mKVFactor{mCacheType == CacheType::kSELFKONLY ? 1 : 2}
+    , mKVFactor{(mCacheType == CacheType::kSELFKONLY
+                    || (linearAttentionMetadata.has_value() && linearAttentionMetadata->hasRecurrentStatesCache()))
+              ? 1
+              : 2}
     , mLogPrefix{tensorrt_llm::common::fmtstr("BlockManager[windowSize=%u]", mWindowSize)}
     , mReusedTokens{0.0}
     , mTotalInputTokens{0.0}
@@ -1389,7 +1392,16 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
                 mLayerToPoolIndex[layerIdx] = poolIndex;
             }
         }
-        mPools.emplace_back(numLayers, mKVFactor, numKvHeads, sizePerHead / numEltsPerContainer, tokensPerBlock);
+        if (isRecurrentState())
+        {
+            auto bytesPerElement = common::getDTypeSize(mDataType);
+            mPools.emplace_back(
+                numLayers, mLinearAttentionMetadata->allRecurrentStatesBytes / bytesPerElement, tokensPerBlock);
+        }
+        else
+        {
+            mPools.emplace_back(numLayers, mKVFactor, numKvHeads, sizePerHead / numEltsPerContainer, tokensPerBlock);
+        }
         ++poolIndex;
     }
 
@@ -1705,9 +1717,14 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
         {
             auto constexpr layerIdx = 0;
             auto const offsetIndex = tensorrt_llm::common::flat_index(offsetsShape.d, poolIdx, beamIdx, xIdx, blockIdx);
-            auto const fieldIdx = mCacheType == CacheType::kSELFKONLY ? 0 : xIdx;
-            auto const blockIndex = tk::KVCacheIndex{
-                common::flat_index3(block->getMemoryPoolBlockIndex(), layerIdx, fieldIdx, pool.numLayers, mKVFactor)};
+            auto const fieldIdx = (mCacheType == CacheType::kSELFKONLY || isRecurrentState()) ? 0 : xIdx;
+            auto const blockIndex = block->isPlaceholder()
+                ? tk::KVCacheIndex::nullIndex
+                : tk::KVCacheIndex{common::flat_index3(
+                    block->getMemoryPoolBlockIndex(), layerIdx, fieldIdx, pool.numLayers, mKVFactor)};
+            TLLM_LOG_DEBUG(
+                "setOffsets: offsetIndex=%d, block->getMemoryPoolBlockIndex()=%d, fieldIdx=%d, blockIndex=%d",
+                offsetIndex, block->getMemoryPoolBlockIndex(), fieldIdx, blockIndex.get());
             offsetsPtr[offsetIndex] = blockIndex;
         }
     }
@@ -2223,6 +2240,14 @@ void BlockManager::allocateBlock(GenerationRequest& sequence, SizeType32 windowS
     mWindowBlockManagers.at(windowSize).allocateBlock(sequence, false);
 }
 
+void BlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest)
+{
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        manager.copyLinearAttentionBlock(sequence, llmRequest);
+    }
+}
+
 bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams)
 {
     auto const beamWidth = sequence.getBeamWidth();
@@ -2353,6 +2378,66 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
     {
         TLLM_LOG_DEBUG("%s::allocateBlock - block %d for sequence %lu", mLogPrefix.c_str(), block->getBlockId(),
             sequence.getRequestId());
+    }
+}
+
+void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& request)
+{
+    if (!isRecurrentState())
+    {
+        return;
+    }
+
+    auto const requestId = request.mRequestId;
+
+    // Check if this sequence exists
+    if (mAllocatedBlocksPerSeq.find(requestId) == mAllocatedBlocksPerSeq.end())
+    {
+        TLLM_LOG_WARNING("%s::copyLinearAttentionBlock - Request %lu not found", mLogPrefix.c_str(), requestId);
+        return;
+    }
+
+    // It points to the next token to be processed/generated
+    auto currentPosition = request.isContextFinished() ? request.getNumTokens(0) : request.getContextCurrentPosition();
+    TLLM_CHECK(currentPosition % mTokensPerBlock == 0);
+    auto prevBlockIndex = currentPosition / mTokensPerBlock - 1;
+    std::set<std::pair<KVCacheBlock::IdType, KVCacheBlock::IdType>> onboardedBlocks;
+    for (auto beamIdx = 0; beamIdx < sequence.getBeamWidth(); ++beamIdx)
+    {
+        auto const& beamBlockIds = sequence.getCacheBlockIds(mWindowSize).at(beamIdx);
+        auto prevBlockId = beamBlockIds.at(prevBlockIndex);
+        auto prevBlock = getBlockById(prevBlockId);
+        if (prevBlock->isPlaceholder())
+        {
+            TLLM_LOG_DEBUG(
+                "%s::copyLinearAttentionBlock - Previous block %d is a placeholder, skip. This usually happens when "
+                "chunked context is enabled but reusing is disabled.",
+                mLogPrefix.c_str(), prevBlockId);
+            continue;
+        }
+        auto nextBlockIndex = prevBlockIndex + 1;
+        KVCacheBlock::IdType nextBlockId = -1;
+        BlockPtr nextBlock = nullptr;
+        while (nextBlockIndex < beamBlockIds.size())
+        {
+            nextBlockId = beamBlockIds.at(nextBlockIndex);
+            nextBlock = getBlockById(nextBlockId);
+            if (nextBlock != nullptr && !nextBlock->isPlaceholder())
+            {
+                break;
+            }
+            nextBlockIndex++;
+        }
+        TLLM_CHECK(nextBlockId != -1);
+        if (onboardedBlocks.find({prevBlockId, nextBlockId}) != onboardedBlocks.end())
+        {
+            continue;
+        }
+        mTransferManager->onboard(prevBlock, nextBlock, mPools,
+            mTokensPerBlock, // Size of each current state block is fixed. Passing TokensPerBlock to tell the transfer
+                             // manager to copy the entire block.
+            sequence.getTransferMode(), sequence.getDirectory());
+        onboardedBlocks.insert({prevBlockId, nextBlockId});
     }
 }
 
@@ -3047,6 +3132,12 @@ void KVCacheManager::addToken(RequestIdType requestId)
     auto& sequence = getSequence(requestId);
     sequence.addNewTokens(1);
     mBlockManager.adjustBlocksIfNeeded(sequence);
+}
+
+void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
+{
+    auto& sequence = getSequence(llmRequest.mRequestId);
+    mBlockManager.copyLinearAttentionBlock(sequence, llmRequest);
 }
 
 void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)

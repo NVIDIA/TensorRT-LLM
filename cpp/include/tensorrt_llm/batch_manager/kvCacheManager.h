@@ -904,6 +904,21 @@ public:
         , containsIndexerKCache(containsIndexerKCache)
     {
     }
+
+    KVCacheBlockPool(SizeType32 numLayers, SizeType32 blockSize, SizeType32 tokensPerBlock,
+        runtime::ITensor::SharedPtr primaryPtr = nullptr, runtime::ITensor::SharedPtr secondaryPtr = nullptr)
+        : numLayers(numLayers)
+        , kvFactor(1)
+        , numKvHeads(-1)
+        , sizePerHead(-1)
+        , tokensPerBlock(tokensPerBlock)
+        , blockSize(blockSize)
+        , primaryPtr(std::move(primaryPtr))
+        , secondaryPtr(std::move(secondaryPtr))
+        , containsBlockScales(false)
+        , containsIndexerKCache(false)
+    {
+    }
 };
 
 // The WindowBlockManager manages the metadata of KVCacheBlocks.
@@ -980,6 +995,10 @@ public:
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams);
+
+    //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
+    //! the placeholder block). It should be called after every context chunk is processed.
+    void copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
@@ -1400,6 +1419,10 @@ public:
         GenerationRequest& sequence, SizeType32 numContextBlocks, SizeType32 windowSize, bool isShareLastContextBlock);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
+
+    //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
+    //! the placeholder block). It should be called after every context chunk is processed.
+    void copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
@@ -2145,6 +2168,10 @@ public:
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId) override;
+
+    //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
+    //! the placeholder block). It should be called after every context chunk is processed.
+    void copyLinearAttentionBlock(LlmRequest const& llmRequest);
 
     /// @brief Add new request to the KV cache manager.
     /// @param inputLength Input length for which KV cache need to be allocated.
