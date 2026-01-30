@@ -8,9 +8,9 @@ kernel only (Blackwell architecture: SM100/SM103).
 Architecture Overview:
     1. AttentionConfig - Configuration dataclass for attention parameters
     2. TrtllmGenSupportChecker - Validates if configuration is supported
-    3. BackendRegistry - Manages available attention backends
-    4. FlashInferTrtllmGenBackend - FlashInfer implementation using trtllm-gen
+    4. FlashInferTrtllmGenAttention - FlashInfer implementation using trtllm-gen
     5. trtllm_gen_attention - Main entry point function
+    6. is_supported - Check if configuration is supported
 
 Usage:
     # Check if configuration is supported
@@ -22,9 +22,8 @@ Usage:
 """
 
 import math
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Type
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -34,18 +33,55 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # Alignment for workspace buffers (256 bytes)
 WORKSPACE_ALIGNMENT = 256
 
 # Default KV layout for flashinfer
+# HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
 DEFAULT_KV_LAYOUT = "HND"
 
 # Default backend name for flashinfer
 DEFAULT_BACKEND = "trtllm-gen"
+
+
+def _get_kv_cache_dtype_from_quant_config(
+    quant_config,
+    input_dtype: torch.dtype,
+) -> torch.dtype:
+    """
+    Get KV cache dtype based on quant_config.
+
+    This is a convenience function that wraps AttentionConfig.get_kv_cache_dtype_from_quant_config().
+
+    Args:
+        quant_config: Quantization configuration object (QuantConfig).
+                     Can be None for no quantization.
+        input_dtype: Input data type to fallback to if no quantization.
+
+    Returns:
+        torch.dtype: The KV cache dtype.
+                    - torch.uint8 if has_fp4_kv_cache()
+                    - torch.float8_e4m3fn if has_fp8_kv_cache()
+                    - input_dtype otherwise
+    """
+    # Forward to the static method in AttentionConfig
+    # This is defined after AttentionConfig, so we can't use it directly here
+    # Instead, we'll define it inline for now and update after the class definition
+    if quant_config is None:
+        return input_dtype
+
+    if quant_config.layer_quant_mode.has_fp4_kv_cache():
+        return torch.uint8
+    elif quant_config.layer_quant_mode.has_fp8_kv_cache():
+        return torch.float8_e4m3fn
+    else:
+        return input_dtype
 
 
 @dataclass
@@ -69,12 +105,13 @@ class AttentionConfig:
     max_num_requests: int = 256
     max_context_length: int = 8192
     attention_window_size: int = -1  # -1 means unlimited
-    has_fp4_kv_cache: bool = False
 
     # Data types
     dtype: torch.dtype = torch.float16
-    kv_cache_dtype: Optional[torch.dtype] = None
     out_dtype: Optional[torch.dtype] = None
+
+    # Quantization config
+    quant_config: Optional[QuantConfig] = None
 
     # RoPE parameters
     position_embedding_type: int = 0
@@ -100,15 +137,33 @@ class AttentionConfig:
     is_padded: bool = False
     position_shift_enabled: bool = False
 
-    @property
-    def effective_kv_cache_dtype(self) -> torch.dtype:
-        """Get effective KV cache dtype, defaulting to input dtype."""
-        return self.kv_cache_dtype if self.kv_cache_dtype is not None else self.dtype
+    # Input tensors
+    q: Optional[torch.Tensor] = None
 
     @property
-    def effective_out_dtype(self) -> torch.dtype:
-        """Get effective output dtype, defaulting to input dtype."""
-        return self.out_dtype if self.out_dtype is not None else self.dtype
+    def kv_cache_dtype(self) -> torch.dtype:
+        """
+        Get KV cache dtype based on quant_config.
+
+        Returns:
+            torch.dtype: The KV cache dtype.
+                        - torch.uint8 if has_fp4_kv_cache()
+                        - torch.float8_e4m3fn if has_fp8_kv_cache()
+                        - dtype otherwise
+        """
+        return _get_kv_cache_dtype_from_quant_config(self.quant_config, self.dtype)
+
+    @property
+    def has_fp4_kv_cache(self) -> bool:
+        """
+        Check if FP4 KV cache is enabled.
+
+        Returns:
+            bool: True if FP4 KV cache is enabled via quant_config, False otherwise.
+        """
+        if self.quant_config is not None:
+            return self.quant_config.layer_quant_mode.has_fp4_kv_cache()
+        return self.dtype == torch.uint8
 
     @property
     def heads_ratio(self) -> int:
@@ -139,8 +194,7 @@ class TrtllmGenSupportChecker:
     MIN_TOKENS_PER_BLOCK = 8
 
     # Supported tokens_per_block values for trtllm-gen kernels
-    # TODO: Why flashinfer trtllm-gen kernels doesn't support 128?
-    SUPPORTED_TOKENS_PER_BLOCK = {64}
+    SUPPORTED_TOKENS_PER_BLOCK = {32}
 
     @classmethod
     def check_hardware(cls) -> Tuple[bool, str]:
@@ -362,28 +416,13 @@ class WorkspaceManager:
         alignment = WorkspaceManager.ALIGNMENT
         return ((size + alignment - 1) // alignment) * alignment
 
-    @staticmethod
-    def _get_dtype_size(dtype: torch.dtype) -> int:
-        """Get size in bytes for dtype."""
-        dtype_sizes = {
-            torch.float16: 2,
-            torch.bfloat16: 2,
-            torch.float32: 4,
-            torch.float8_e4m3fn: 1,
-            torch.uint8: 1,
-            torch.int8: 1,
-        }
-        return dtype_sizes.get(dtype, 2)
-
     @classmethod
     def get_context_workspace_size(
         cls,
         dtype: torch.dtype,
         max_num_seq: int,
-        max_context_length: int,
         max_num_tokens: int,
         num_heads: int,
-        num_kv_heads: int,
         head_size: int,
         rotary_embedding_dim: int = 0,
     ) -> int:
@@ -391,7 +430,9 @@ class WorkspaceManager:
         if max_num_tokens == 0:
             return 0
 
-        dtype_size = cls._get_dtype_size(dtype)
+        # Convert torch dtype to binding dtype for get_size_in_bytes
+        binding_dtype = torch_dtype_to_binding(dtype)
+        dtype_size = get_size_in_bytes(dtype=binding_dtype, num_elements=1)
         local_hidden_units_qo = num_heads * head_size
 
         # Q buffer for paged context FMHA
@@ -432,22 +473,24 @@ class WorkspaceManager:
         cls,
         dtype: torch.dtype,
         max_num_seq: int,
-        max_attention_window_size: int,
         max_num_tokens: int,
-        max_blocks_per_sequence: int,
         num_heads: int,
-        num_kv_heads: int,
         head_size: int,
+        multi_processor_count: int,
         rotary_embedding_dim: int = 0,
-        multi_processor_count: int = 132,
     ) -> int:
         """Calculate workspace size for generation (decode) phase."""
         if max_num_tokens == 0:
             return 0
 
-        dtype_size = cls._get_dtype_size(dtype)
+        # Convert torch dtype to binding dtype for get_size_in_bytes
+        binding_dtype = torch_dtype_to_binding(dtype)
+        dtype_size = get_size_in_bytes(dtype=binding_dtype, num_elements=1)
         batch_beam = max_num_seq
 
+        multi_processor_count = torch.cuda.get_device_properties(
+            device=torch.cuda.current_device()
+        ).multi_processor_count
         # Estimate max sequence length tile
         max_seq_len_tile = max(
             1, (multi_processor_count + batch_beam * num_heads - 1) // (batch_beam * num_heads)
@@ -491,7 +534,6 @@ class WorkspaceManager:
         config: AttentionConfig,
         num_tokens: int,
         num_gen_tokens: int,
-        max_blocks_per_sequence: int,
     ) -> int:
         """
         Calculate total workspace size.
@@ -501,424 +543,33 @@ class WorkspaceManager:
         context_size = cls.get_context_workspace_size(
             dtype=config.dtype,
             max_num_seq=config.max_num_requests,
-            max_context_length=config.max_context_length,
             max_num_tokens=num_tokens,
             num_heads=config.num_heads,
-            num_kv_heads=config.num_kv_heads,
             head_size=config.head_size,
             rotary_embedding_dim=config.rotary_embedding_dim,
         )
 
+        device = config.q.device if config.q is not None else torch.cuda.current_device()
+        multi_processor_count = torch.cuda.get_device_properties(
+            device=device
+        ).multi_processor_count
+
         generation_size = cls.get_generation_workspace_size(
             dtype=config.dtype,
             max_num_seq=config.max_num_requests,
-            max_attention_window_size=config.attention_window_size,
             max_num_tokens=num_gen_tokens,
-            max_blocks_per_sequence=max_blocks_per_sequence,
             num_heads=config.num_heads,
-            num_kv_heads=config.num_kv_heads,
             head_size=config.head_size,
+            multi_processor_count=multi_processor_count,
             rotary_embedding_dim=config.rotary_embedding_dim,
         )
 
         return max(context_size, generation_size)
 
 
-class AttentionBackendBase(ABC):
-    """Abstract base class for attention backends."""
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Backend name identifier."""
-        pass
-
-    @abstractmethod
-    def is_supported(self, config: AttentionConfig) -> Tuple[bool, str]:
-        """Check if configuration is supported."""
-        pass
-
-    @abstractmethod
-    def run_context(
-        self,
-        query: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
-        cum_seq_lens_q: torch.Tensor,
-        cum_seq_lens_kv: torch.Tensor,
-        workspace: torch.Tensor,
-        config: AttentionConfig,
-        max_q_len: int,
-        max_kv_len: int,
-        batch_size: int,
-        bmm1_scale: float,
-        bmm2_scale: float,
-        window_left: int = -1,
-    ) -> torch.Tensor:
-        """Execute context (prefill) phase."""
-        pass
-
-    @abstractmethod
-    def run_generation(
-        self,
-        query: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
-        workspace: torch.Tensor,
-        config: AttentionConfig,
-        max_kv_len: int,
-        bmm1_scale: float,
-        bmm2_scale: float,
-        window_left: int = -1,
-    ) -> torch.Tensor:
-        """Execute generation (decode) phase."""
-        pass
-
-
-class BackendRegistry:
+class FlashInferTrtllmGenAttention:
     """
-    Registry for attention backends.
-
-    Manages available backends and provides automatic selection.
-    """
-
-    _backends: Dict[str, Type[AttentionBackendBase]] = {}
-    _instances: Dict[str, AttentionBackendBase] = {}
-    _default: str = DEFAULT_BACKEND
-    # Priority order for backend selection (higher priority first)
-    _priority: List[str] = ["trtllm-gen"]
-
-    @classmethod
-    def register(cls, name: str, priority: Optional[int] = None):
-        """
-        Decorator to register a backend class.
-
-        Usage:
-            @BackendRegistry.register("my-backend")
-            class MyBackend(AttentionBackendBase):
-                ...
-
-            @BackendRegistry.register("high-priority-backend", priority=0)
-            class HighPriorityBackend(AttentionBackendBase):
-                ...
-
-        Args:
-            name: Backend name identifier.
-            priority: Optional priority index (0 = highest). If None, appends to end.
-        """
-
-        def decorator(backend_cls: Type[AttentionBackendBase]):
-            cls._backends[name] = backend_cls
-            if name not in cls._priority:
-                if priority is not None:
-                    cls._priority.insert(priority, name)
-                else:
-                    cls._priority.append(name)
-            return backend_cls
-
-        return decorator
-
-    @classmethod
-    def get(cls, name: str = "auto") -> AttentionBackendBase:
-        """
-        Get backend instance by name.
-
-        Args:
-            name: Backend name or "auto" for automatic selection.
-
-        Returns:
-            Backend instance.
-        """
-        if name == "auto":
-            name = cls._default
-
-        if name not in cls._instances:
-            if name not in cls._backends:
-                raise ValueError(
-                    f"Backend '{name}' not found. Available: {list(cls._backends.keys())}"
-                )
-            cls._instances[name] = cls._backends[name]()
-
-        return cls._instances[name]
-
-    @classmethod
-    def list_backends(cls) -> List[str]:
-        """List all registered backend names in priority order."""
-        return [name for name in cls._priority if name in cls._backends]
-
-    @classmethod
-    def set_default(cls, name: str) -> None:
-        """Set the default backend name."""
-        if name not in cls._backends:
-            raise ValueError(f"Backend '{name}' not found.")
-        cls._default = name
-
-    @classmethod
-    def set_priority(cls, priority_list: List[str]) -> None:
-        """
-        Set the priority order for backend selection.
-
-        Args:
-            priority_list: List of backend names in priority order (highest first).
-        """
-        cls._priority = priority_list
-
-
-class BackendSelector:
-    """
-    Intelligent backend selector for attention computation.
-
-    Provides methods to select the best backend based on configuration,
-    hardware capabilities, and user preferences.
-
-    Usage:
-        selector = BackendSelector()
-
-        # Select best backend for config
-        backend, reason = selector.select(config)
-
-        # Or with fallback handling
-        result = selector.select_with_fallback(config)
-        if result.supported:
-            backend = result.backend
-        else:
-            # Use fallback (e.g., thop.attention)
-    """
-
-    @dataclass
-    class SelectionResult:
-        """Result of backend selection."""
-
-        supported: bool
-        backend: Optional[AttentionBackendBase]
-        backend_name: str
-        reason: str
-        checked_backends: List[Tuple[str, str]]  # [(name, reason), ...]
-
-    def __init__(
-        self,
-        preferred_backend: Optional[str] = None,
-        fallback_enabled: bool = True,
-    ):
-        """
-        Initialize the backend selector.
-
-        Args:
-            preferred_backend: Preferred backend name (None for auto-select).
-            fallback_enabled: Whether to try other backends if preferred fails.
-        """
-        self._preferred = preferred_backend
-        self._fallback_enabled = fallback_enabled
-
-    def select(
-        self,
-        config: AttentionConfig,
-        phase: str = "both",
-    ) -> Tuple[Optional[AttentionBackendBase], str]:
-        """
-        Select the best backend for the given configuration.
-
-        Args:
-            config: Attention configuration.
-            phase: Phase to check ("context", "generation", or "both").
-
-        Returns:
-            Tuple of (backend_or_none, reason_string).
-        """
-        result = self.select_with_details(config, phase)
-        return result.backend, result.reason
-
-    def select_with_details(
-        self,
-        config: AttentionConfig,
-        phase: str = "both",
-    ) -> "BackendSelector.SelectionResult":
-        """
-        Select backend with detailed information about the selection process.
-
-        Args:
-            config: Attention configuration.
-            phase: Phase to check ("context", "generation", or "both").
-
-        Returns:
-            SelectionResult with full details.
-        """
-        checked_backends: List[Tuple[str, str]] = []
-
-        # If preferred backend is specified, try it first
-        if self._preferred is not None:
-            try:
-                backend = BackendRegistry.get(self._preferred)
-                supported, reason = backend.is_supported(config)
-                checked_backends.append((self._preferred, reason if not supported else ""))
-
-                if supported:
-                    return self.SelectionResult(
-                        supported=True,
-                        backend=backend,
-                        backend_name=self._preferred,
-                        reason=f"Using preferred backend: {self._preferred}",
-                        checked_backends=checked_backends,
-                    )
-                elif not self._fallback_enabled:
-                    return self.SelectionResult(
-                        supported=False,
-                        backend=None,
-                        backend_name="",
-                        reason=f"Preferred backend '{self._preferred}' not supported: {reason}",
-                        checked_backends=checked_backends,
-                    )
-            except ValueError as e:
-                checked_backends.append((self._preferred, str(e)))
-                if not self._fallback_enabled:
-                    return self.SelectionResult(
-                        supported=False,
-                        backend=None,
-                        backend_name="",
-                        reason=str(e),
-                        checked_backends=checked_backends,
-                    )
-
-        # Try backends in priority order
-        for name in BackendRegistry.list_backends():
-            if name == self._preferred:
-                continue  # Already tried
-
-            try:
-                backend = BackendRegistry.get(name)
-                supported, reason = backend.is_supported(config)
-                checked_backends.append((name, reason if not supported else ""))
-
-                if supported:
-                    return self.SelectionResult(
-                        supported=True,
-                        backend=backend,
-                        backend_name=name,
-                        reason=f"Auto-selected backend: {name}",
-                        checked_backends=checked_backends,
-                    )
-            except Exception as e:
-                checked_backends.append((name, str(e)))
-
-        # No backend supports this configuration
-        reasons = [f"{name}: {reason}" for name, reason in checked_backends if reason]
-        return self.SelectionResult(
-            supported=False,
-            backend=None,
-            backend_name="",
-            reason="No backend supports this configuration. " + "; ".join(reasons),
-            checked_backends=checked_backends,
-        )
-
-    @classmethod
-    def get_supported_backends(
-        cls,
-        config: AttentionConfig,
-        phase: str = "both",
-    ) -> List[Tuple[str, AttentionBackendBase]]:
-        """
-        Get all backends that support the given configuration.
-
-        Args:
-            config: Attention configuration.
-            phase: Phase to check.
-
-        Returns:
-            List of (name, backend) tuples for supported backends.
-        """
-        supported = []
-        for name in BackendRegistry.list_backends():
-            try:
-                backend = BackendRegistry.get(name)
-                is_supported, _ = backend.is_supported(config)
-                if is_supported:
-                    supported.append((name, backend))
-            except Exception:
-                pass
-        return supported
-
-
-def select_backend(
-    config: AttentionConfig,
-    preferred: Optional[str] = None,
-    phase: str = "both",
-) -> Tuple[Optional[AttentionBackendBase], bool, str]:
-    """
-    Convenience function to select the best backend for a configuration.
-
-    This is the recommended way to select a backend before calling
-    trtllm_gen_attention or deciding to fallback to thop.attention.
-
-    Args:
-        config: Attention configuration.
-        preferred: Preferred backend name (None for auto-select).
-        phase: Phase to check ("context", "generation", or "both").
-
-    Returns:
-        Tuple of (backend_or_none, is_supported, reason).
-
-    Usage:
-        config = AttentionConfig(num_heads=32, num_kv_heads=8, head_size=128, ...)
-        backend, supported, reason = select_backend(config)
-
-        if supported:
-            # Use trtllm_gen_attention with selected backend
-            trtllm_gen_attention(...)
-        else:
-            # Fallback to thop.attention
-            logger.info(f"Falling back to thop.attention: {reason}")
-            thop.attention(...)
-    """
-    selector = BackendSelector(preferred_backend=preferred, fallback_enabled=True)
-    result = selector.select_with_details(config, phase)
-    return result.backend, result.supported, result.reason
-
-
-def select_backend_from_params(
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    dtype: torch.dtype,
-    preferred: Optional[str] = None,
-    **kwargs,
-) -> Tuple[Optional[AttentionBackendBase], bool, str]:
-    """
-    Select backend from individual parameters (convenience wrapper).
-
-    Args:
-        num_heads: Number of query attention heads.
-        num_kv_heads: Number of KV attention heads.
-        head_size: Size of each attention head.
-        dtype: Input data type.
-        preferred: Preferred backend name.
-        **kwargs: Additional AttentionConfig parameters.
-
-    Returns:
-        Tuple of (backend_or_none, is_supported, reason).
-    """
-    config = AttentionConfig(
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        dtype=dtype,
-        **kwargs,
-    )
-    return select_backend(config, preferred=preferred)
-
-
-@BackendRegistry.register("trtllm-gen")
-class FlashInferTrtllmGenBackend(AttentionBackendBase):
-    """
-    FlashInfer backend using trtllm-gen kernels.
-
-    Uses flashinfer's trtllm_batch_context_with_kv_cache and
-    trtllm_batch_decode_with_kv_cache APIs.
-
-    Requirements:
-        - Blackwell architecture (SM100 or SM103)
-        - flashinfer package installed
+    An attention backend using pure trtllm-gen kernels from flashinfer.
     """
 
     def __init__(self):
@@ -926,15 +577,11 @@ class FlashInferTrtllmGenBackend(AttentionBackendBase):
         self._layout = DEFAULT_KV_LAYOUT
 
     @property
-    def name(self) -> str:
-        return "trtllm-gen"
-
-    @property
     def layout(self) -> str:
         """KV cache layout (HND or NHD)."""
         return self._layout
 
-    def is_supported(self, config: AttentionConfig) -> Tuple[bool, str]:
+    def is_supported(self, config: AttentionConfig, phase: str = "both") -> Tuple[bool, str]:
         """Check if configuration is supported by this backend."""
         if not IS_FLASHINFER_AVAILABLE:
             return False, "flashinfer package is not installed."
@@ -985,7 +632,6 @@ class FlashInferTrtllmGenBackend(AttentionBackendBase):
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
         workspace: torch.Tensor,
-        config: AttentionConfig,
         max_q_len: int,
         max_kv_len: int,
         batch_size: int,
@@ -1022,7 +668,6 @@ class FlashInferTrtllmGenBackend(AttentionBackendBase):
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         workspace: torch.Tensor,
-        config: AttentionConfig,
         max_kv_len: int,
         bmm1_scale: float,
         bmm2_scale: float,
@@ -1124,7 +769,6 @@ def is_supported(
     num_kv_heads: int,
     head_size: int,
     dtype: torch.dtype,
-    kv_cache_dtype: Optional[torch.dtype] = None,
     out_dtype: Optional[torch.dtype] = None,
     mask_type: Optional[int] = None,
     has_alibi: bool = False,
@@ -1135,17 +779,12 @@ def is_supported(
     position_shift_enabled: bool = False,
     sink_token_length: int = 0,
     cross_attention: bool = False,
-    cyclic_attention_window_size: Optional[int] = None,
-    max_attention_window_size: Optional[int] = None,
     is_spec_decoding: bool = False,
     is_mla_enable: bool = False,
     is_fused_qkv: bool = True,
     update_kv_cache: bool = True,
-    has_rotary_inv_freq: bool = False,
-    has_rotary_cos_sin: bool = False,
-    has_kv_scale: bool = False,
     has_cross_kv: bool = False,
-    has_fp4_kv_cache: bool = False,
+    quant_config: Optional[QuantConfig] = None,
     phase: str = "both",
 ) -> Tuple[bool, str]:
     """
@@ -1158,7 +797,6 @@ def is_supported(
         num_kv_heads: Number of KV attention heads.
         head_size: Size of each attention head.
         dtype: Input data type.
-        kv_cache_dtype: KV cache data type.
         out_dtype: Output data type.
         mask_type: Attention mask type.
         has_alibi: Whether ALiBi is used.
@@ -1179,19 +817,23 @@ def is_supported(
         has_rotary_cos_sin: Whether rotary_cos_sin is provided.
         has_kv_scale: Whether KV scales are provided.
         has_cross_kv: Whether cross KV is provided.
+        quant_config: Quantization configuration (QuantConfig). If provided and kv_cache_dtype
+                     is None, will automatically determine kv_cache_dtype based on
+                     has_fp8_kv_cache() or has_fp4_kv_cache().
         phase: Phase to check ("context", "generation", or "both").
 
     Returns:
         Tuple of (is_supported, reason_if_not_supported).
     """
     # Build config from parameters
+    # Note: kv_cache_dtype will be auto-calculated in __post_init__ if quant_config is provided
     config = AttentionConfig(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         dtype=dtype,
-        kv_cache_dtype=kv_cache_dtype,
         out_dtype=out_dtype,
+        quant_config=quant_config,
         mask_type=mask_type if mask_type is not None else 1,
         has_alibi=has_alibi,
         is_padded=is_padded,
@@ -1205,93 +847,9 @@ def is_supported(
         is_mla_enable=is_mla_enable,
         is_fused_qkv=is_fused_qkv,
         update_kv_cache=update_kv_cache,
-        has_fp4_kv_cache=has_fp4_kv_cache,
     )
 
-    return TrtllmGenSupportChecker.is_supported(config, phase)
-
-
-# Compatibility aliases for workspace functions
-def get_workspace_size_for_context(
-    dtype: torch.dtype,
-    max_num_seq: int,
-    max_context_length: int,
-    max_num_tokens: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int = 0,
-) -> int:
-    """Calculate workspace size for context phase. (Compatibility function)"""
-    return WorkspaceManager.get_context_workspace_size(
-        dtype=dtype,
-        max_num_seq=max_num_seq,
-        max_context_length=max_context_length,
-        max_num_tokens=max_num_tokens,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        rotary_embedding_dim=rotary_embedding_dim,
-    )
-
-
-def get_workspace_size_for_generation(
-    dtype: torch.dtype,
-    max_num_seq: int,
-    max_attention_window_size: int,
-    max_num_tokens: int,
-    max_blocks_per_sequence: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int = 0,
-    multi_processor_count: int = 132,
-) -> int:
-    """Calculate workspace size for generation phase. (Compatibility function)"""
-    return WorkspaceManager.get_generation_workspace_size(
-        dtype=dtype,
-        max_num_seq=max_num_seq,
-        max_attention_window_size=max_attention_window_size,
-        max_num_tokens=max_num_tokens,
-        max_blocks_per_sequence=max_blocks_per_sequence,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        rotary_embedding_dim=rotary_embedding_dim,
-        multi_processor_count=multi_processor_count,
-    )
-
-
-def get_workspace_size(
-    dtype: torch.dtype,
-    max_num_seq: int,
-    max_context_length: int,
-    max_attention_window_size: int,
-    num_tokens: int,
-    num_gen_tokens: int,
-    max_blocks_per_sequence: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int = 0,
-) -> int:
-    """Calculate total workspace size. (Compatibility function)"""
-    config = AttentionConfig(
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        dtype=dtype,
-        max_num_requests=max_num_seq,
-        max_context_length=max_context_length,
-        attention_window_size=max_attention_window_size,
-        rotary_embedding_dim=rotary_embedding_dim,
-    )
-    return WorkspaceManager.get_workspace_size(
-        config=config,
-        num_tokens=num_tokens,
-        num_gen_tokens=num_gen_tokens,
-        max_blocks_per_sequence=max_blocks_per_sequence,
-    )
+    return FlashInferTrtllmGenAttention().is_supported(config, phase)
 
 
 def trtllm_gen_attention(
@@ -1310,7 +868,6 @@ def trtllm_gen_attention(
     kv_cache_block_offsets: Optional[torch.Tensor],
     host_kv_cache_pool_pointers: Optional[torch.Tensor],
     host_kv_cache_pool_mapping: Optional[torch.Tensor],
-    kv_cache: Optional[torch.Tensor],  # Actual KV cache tensor from kv_cache_manager
     cache_indirection: Optional[torch.Tensor],
     kv_scale_orig_quant: Optional[torch.Tensor],
     kv_scale_quant_orig: Optional[torch.Tensor],
@@ -1374,6 +931,8 @@ def trtllm_gen_attention(
     mla_bmm1_scale: Optional[torch.Tensor],
     mla_bmm2_scale: Optional[torch.Tensor],
     quant_q_buffer: Optional[torch.Tensor],
+    quant_config: Optional[QuantConfig],
+    kv_cache_manager: Optional[KVCacheManager],
 ) -> None:
     """
     TrtLLM-Gen attention using flashinfer backend.
@@ -1469,6 +1028,8 @@ def trtllm_gen_attention(
         mla_bmm1_scale: BMM1 scale for MLA attention.
         mla_bmm2_scale: BMM2 scale for MLA attention.
         quant_q_buffer: Buffer for quantized query tensor.
+        quant_config: Quantization configuration (QuantConfig).
+        kv_cache_manager: KV cache manager (KVCacheManager).
 
     Returns:
         None. Results are written to the output tensor in-place.
@@ -1479,6 +1040,7 @@ def trtllm_gen_attention(
     page_size = tokens_per_block if tokens_per_block is not None else 64
 
     config = AttentionConfig(
+        q=q,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -1501,10 +1063,15 @@ def trtllm_gen_attention(
         is_mla_enable=is_mla_enable,
         is_fused_qkv=is_fused_qkv,
         update_kv_cache=update_kv_cache,
+        quant_config=quant_config,
     )
 
+    kv_cache = None
+    if kv_cache_manager is not None and not config.has_fp4_kv_cache:
+        kv_cache = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+
     # ========== 2. Get Backend ==========
-    backend = BackendRegistry.get(DEFAULT_BACKEND)
+    backend = FlashInferTrtllmGenAttention()
 
     # ========== 3. Parse Request Types ==========
     num_seqs = host_context_lengths.size(0)
@@ -1529,16 +1096,10 @@ def trtllm_gen_attention(
     # trtllm-gen backend needs at least 16MB for counter workspace and scratch
     min_workspace_size = 16 * 1024 * 1024  # 16 MB
 
-    # Calculate required workspace size
-    max_blocks_per_sequence = 0
-    if kv_cache_block_offsets is not None and kv_cache_block_offsets.numel() > 0:
-        max_blocks_per_sequence = kv_cache_block_offsets.size(-1)
-
     required_workspace_size = WorkspaceManager.get_workspace_size(
         config=config,
         num_tokens=num_tokens,
         num_gen_tokens=num_gen_tokens,
-        max_blocks_per_sequence=max_blocks_per_sequence,
     )
     required_workspace_size = max(required_workspace_size, min_workspace_size)
 
@@ -1631,7 +1192,6 @@ def trtllm_gen_attention(
                 cum_seq_lens_q=cum_seq_lens_q,
                 cum_seq_lens_kv=cum_seq_lens_kv,
                 workspace=workspace,
-                config=config,
                 max_q_len=max_q_len,
                 max_kv_len=max_kv_len,
                 batch_size=num_contexts,
@@ -1690,7 +1250,6 @@ def trtllm_gen_attention(
                 block_tables=gen_block_tables,
                 seq_lens=gen_kv_lens_device,
                 workspace=workspace,
-                config=config,
                 max_kv_len=max_kv_len,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,

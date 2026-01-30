@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -93,6 +94,8 @@ class TrtllmAttentionWrapper:
     helix_position_offsets: Optional[torch.Tensor]
     helix_is_inactive_rank: Optional[torch.Tensor]
     attention_input_type: Optional[torch.Tensor]
+    quant_config: Optional[QuantConfig]
+    kv_cache_manager: Optional[KVCacheManager]
     kwargs: dict
 
     def __init__(
@@ -189,8 +192,6 @@ class TrtllmAttentionWrapper:
         kv_cache_block_offsets: Optional[torch.Tensor] = None,
         host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
         host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
-        kv_cache: Optional[torch.Tensor] = None,
-        has_fp4_kv_cache: bool = False,
         block_ids_per_seq: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
         cache_indirection: Optional[torch.Tensor] = None,
@@ -228,6 +229,8 @@ class TrtllmAttentionWrapper:
         skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
         helix_is_inactive_rank: Optional[torch.Tensor] = None,
+        quant_config: Optional[QuantConfig] = None,
+        kv_cache_manager: Optional[KVCacheManager] = None,
         **kwargs,
     ):
         """
@@ -275,6 +278,8 @@ class TrtllmAttentionWrapper:
             skip_softmax_threshold_scale_factor_decode (float): The scale factor for the skip softmax threshold in decode phase.
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             helix_is_inactive_rank (torch.Tensor): For Helix: whether the current rank is inactive, with shape (batch_size) on GPU.
+            quant_config (Optional[QuantConfig]): The quantization configuration.
+            kv_cache_manager (Optional[KVCacheManager]): The KV cache manager.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -292,8 +297,6 @@ class TrtllmAttentionWrapper:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
-        self.kv_cache = kv_cache
-        self.has_fp4_kv_cache = has_fp4_kv_cache
         self.workspace = workspace
         self.cache_indirection = cache_indirection
         self.kv_scale_orig_quant = kv_scale_orig_quant if kv_scales_sf_inv is None else kv_scales_sf_inv
@@ -337,6 +340,8 @@ class TrtllmAttentionWrapper:
         self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
         self.skip_softmax_threshold_scale_factor_prefill = skip_softmax_threshold_scale_factor_prefill
         self.skip_softmax_threshold_scale_factor_decode = skip_softmax_threshold_scale_factor_decode
+        self.quant_config = quant_config
+        self.kv_cache_manager = kv_cache_manager
         self.kwargs.update(kwargs)
 
     def create_output(
@@ -511,8 +516,6 @@ class TrtllmAttentionWrapper:
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 dtype=q.dtype,
-                kv_cache_dtype=k.dtype if k is not None else
-            (v.dtype if v is not None else q.dtype),
                 out_dtype=output.dtype,
                 mask_type=int(mask_type),
                 has_alibi=(self.position_embedding_type == 4
@@ -524,19 +527,13 @@ class TrtllmAttentionWrapper:
                 position_shift_enabled=False,
                 sink_token_length=self.sink_token_length,
                 cross_attention=False,
-                cyclic_attention_window_size=self.attention_window_size,
-                max_attention_window_size=self.attention_window_size,
                 is_spec_decoding=spec_decoding_bool_params[0]
                 if spec_decoding_bool_params else False,
                 is_mla_enable=self.is_mla_enable,
                 is_fused_qkv=is_fused_qkv,
                 update_kv_cache=update_kv_cache,
-                has_rotary_inv_freq=(self.rotary_inv_freq is not None),
-                has_rotary_cos_sin=(self.rotary_cos_sin is not None),
-                has_kv_scale=(self.kv_scale_orig_quant is not None
-                              or self.kv_scale_quant_orig is not None),
                 has_cross_kv=False,
-                has_fp4_kv_cache=self.has_fp4_kv_cache,
+                quant_config=self.quant_config,
         )[0]:
             trtllm_gen_attention(
                 q,
@@ -554,9 +551,6 @@ class TrtllmAttentionWrapper:
                 self.kv_cache_block_offsets,
                 self.host_kv_cache_pool_pointers,
                 self.host_kv_cache_pool_mapping,
-                self.
-                kv_cache,  # Actual KV cache tensor from kv_cache_manager.get_buffers()
-                self.has_fp4_kv_cache,
                 self.cache_indirection,
                 self.kv_scale_orig_quant,
                 self.kv_scale_quant_orig,
@@ -620,6 +614,8 @@ class TrtllmAttentionWrapper:
                 mla_bmm1_scale,
                 mla_bmm2_scale,
                 quant_q_buffer,
+                self.quant_config,
+                self.kv_cache_manager,
             )
         else:
             thop.attention(
@@ -1815,13 +1811,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
 
-        kv_cache = None
-        has_fp4_kv_cache = self.has_fp4_kv_cache if hasattr(
-            self, 'has_fp4_kv_cache') else False
-        if metadata.kv_cache_manager is not None and not has_fp4_kv_cache:
-            kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx,
-                                                             kv_layout="HND")
-
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -1841,8 +1830,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_cache_block_offsets=metadata.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
-            kv_cache=kv_cache,
-            has_fp4_kv_cache=has_fp4_kv_cache,
             block_ids_per_seq=metadata.block_ids_per_seq,
             # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
             workspace=metadata.workspace
@@ -1890,6 +1877,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             skip_softmax_threshold_scale_factor_decode,
             helix_position_offsets=metadata.helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+            quant_config=self.quant_config,
+            kv_cache_manager=metadata.kv_cache_manager,
         )
 
         self.wrapper.run(q,
