@@ -34,7 +34,12 @@ if IS_FLASHINFER_AVAILABLE:
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, torch_dtype_to_binding
+from tensorrt_llm._utils import (
+    get_size_in_bytes,
+    get_sm_version,
+    is_sm_100f,
+    torch_dtype_to_binding,
+)
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -200,7 +205,7 @@ class TrtllmGenSupportChecker:
     def check_hardware(cls) -> Tuple[bool, str]:
         """Check if hardware supports trtllm-gen (Blackwell SM100/SM103)."""
         sm = get_sm_version()
-        if sm not in (100, 103):
+        if not is_sm_100f(sm):
             return (False, f"trtllm-gen requires SM100 or SM103 (Blackwell). Current: SM{sm}.")
         return True, ""
 
@@ -638,13 +643,14 @@ class FlashInferTrtllmGenAttention:
         bmm1_scale: float,
         bmm2_scale: float,
         window_left: int = -1,
-    ) -> torch.Tensor:
+        out: torch.Tensor = None,
+    ):
         """
         Execute context (prefill) phase using flashinfer.
 
         Calls flashinfer.prefill.trtllm_batch_context_with_kv_cache.
         """
-        return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=query,
             kv_cache=kv_cache,
             workspace_buffer=workspace,
@@ -658,6 +664,7 @@ class FlashInferTrtllmGenAttention:
             cum_seq_lens_q=cum_seq_lens_q,
             cum_seq_lens_kv=cum_seq_lens_kv,
             window_left=window_left,
+            out=out,
             kv_layout=self._layout,
         )
 
@@ -672,19 +679,21 @@ class FlashInferTrtllmGenAttention:
         bmm1_scale: float,
         bmm2_scale: float,
         window_left: int = -1,
-    ) -> torch.Tensor:
+        out: torch.Tensor = None,
+    ):
         """
         Execute generation (decode) phase using flashinfer.
 
         Calls flashinfer.decode.trtllm_batch_decode_with_kv_cache.
         """
-        return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=query,
             kv_cache=kv_cache,
             workspace_buffer=workspace,
             block_tables=block_tables,
             seq_lens=seq_lens,
             max_seq_len=max_kv_len,
+            out=out,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=window_left,
@@ -692,21 +701,7 @@ class FlashInferTrtllmGenAttention:
         )
 
 
-def is_sm100_family() -> bool:
-    """
-    Check if SM version is in SM100 family (Blackwell).
-
-    Returns:
-        True if SM is 100 or 103.
-    """
-    sm = get_sm_version()
-    return sm in (100, 103)
-
-
-def _parse_request_types(
-    host_request_types: torch.Tensor,
-    num_seqs: int,
-) -> Tuple[int, int]:
+def _parse_request_types(host_request_types: torch.Tensor) -> Tuple[int, int]:
     """
     Parse request types to count context and generation requests.
 
@@ -717,13 +712,10 @@ def _parse_request_types(
     Returns:
         Tuple of (num_contexts, num_generations).
     """
-    request_types = host_request_types.cpu().numpy()
-    num_contexts = 0
-    for idx in range(num_seqs):
-        if request_types[idx] != 0:  # 0 = context
-            break
-        num_contexts += 1
-    return num_contexts, num_seqs - num_contexts
+
+    num_generations = host_request_types.sum().item()
+    num_contexts = host_request_types.size(0) - num_generations
+    return num_contexts, num_generations
 
 
 def _get_block_tables(
@@ -1074,18 +1066,16 @@ def trtllm_gen_attention(
     backend = FlashInferTrtllmGenAttention()
 
     # ========== 3. Parse Request Types ==========
-    num_seqs = host_context_lengths.size(0)
     num_tokens = q.size(0)
 
     attn_input_type = AttentionInputType.mixed
     if attention_input_type is not None:
         attn_input_type = AttentionInputType(attention_input_type)
 
-    num_contexts, num_generations = _parse_request_types(host_request_types, num_seqs)
+    num_contexts, num_generations = _parse_request_types(host_request_types)
 
     # Calculate token counts
-    # host_context_lengths is already on CPU, use int() instead of .item()
-    host_ctx_lens = host_context_lengths.cpu()
+    host_ctx_lens = host_context_lengths
     num_ctx_tokens = int(host_ctx_lens[:num_contexts].sum()) if num_contexts > 0 else 0
     num_gen_tokens = num_tokens - num_ctx_tokens
 
@@ -1109,7 +1099,7 @@ def trtllm_gen_attention(
     )
 
     if current_workspace_size < required_workspace_size:
-        workspace = torch.zeros(required_workspace_size, dtype=torch.uint8, device=q.device)
+        workspace.resize_(required_workspace_size)
 
     # ========== 6. Reshape Tensors ==========
     # Input q shape: [num_tokens, (num_heads + 2*num_kv_heads) * head_size] for fused QKV
@@ -1146,12 +1136,12 @@ def trtllm_gen_attention(
         # Build cumulative sequence lengths
         ctx_lens = host_ctx_lens[:num_contexts].to(torch.int32)
         cum_seq_lens_q = torch.zeros(num_contexts + 1, dtype=torch.int32, device=q.device)
-        cum_seq_lens_q[1:] = torch.cumsum(ctx_lens.to(q.device), dim=0)
+        torch.cumsum(ctx_lens.to(q.device), dim=0, out=cum_seq_lens_q[1:])
 
         # KV sequence lengths
         ctx_kv_lens = sequence_length[:num_contexts].to(torch.int32)
         cum_seq_lens_kv = torch.zeros(num_contexts + 1, dtype=torch.int32, device=q.device)
-        cum_seq_lens_kv[1:] = torch.cumsum(ctx_kv_lens.to(q.device), dim=0)
+        torch.cumsum(ctx_kv_lens.to(q.device), dim=0, out=cum_seq_lens_kv[1:])
 
         # Use host tensors to avoid device-to-host sync during CUDA graph capture
         # ctx_lens is already on CPU (from host_ctx_lens)
@@ -1184,7 +1174,7 @@ def trtllm_gen_attention(
             ctx_block_tables = ctx_block_tables.clamp(0, max_pages - 1)
 
             # Run context phase
-            ctx_result = backend.run_context(
+            backend.run_context(
                 query=ctx_query,
                 kv_cache=kv_cache,
                 block_tables=ctx_block_tables,
@@ -1198,8 +1188,8 @@ def trtllm_gen_attention(
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 window_left=window_left if window_left > 0 else -1,
+                out=ctx_output,
             )
-            ctx_output.copy_(ctx_result)
 
     # ========== 8. Generation Phase (Decode) ==========
     if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
@@ -1244,7 +1234,7 @@ def trtllm_gen_attention(
             gen_block_tables = gen_block_tables.clamp(0, max_pages - 1)
 
             # Run generation phase
-            gen_result = backend.run_generation(
+            backend.run_generation(
                 query=gen_query,
                 kv_cache=kv_cache,
                 block_tables=gen_block_tables,
@@ -1254,7 +1244,7 @@ def trtllm_gen_attention(
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 window_left=window_left if window_left > 0 else -1,
+                out=gen_output,
             )
-            gen_output.copy_(gen_result.view(num_gen_tokens, num_heads, head_size))
 
     logger.debug(f"trtllm_gen_attention stops at layer {layer_idx}")
