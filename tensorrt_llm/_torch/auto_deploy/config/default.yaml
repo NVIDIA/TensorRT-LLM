@@ -50,6 +50,8 @@ transforms:
     expected_layout: bsnd
   match_rmsnorm_pattern:
     stage: pattern_matcher
+  match_causal_conv:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
