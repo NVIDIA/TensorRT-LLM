@@ -147,7 +147,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
 
         // Optimization: Use warp shuffle for intra-warp neighbor exchange
         // This reduces shared memory traffic by ~97% (only 4/128 threads need smem reads)
-        int const lane_id = tidx & 31;  // tidx % 32
+        int const lane_id = tidx & 31; // tidx % 32
         vec_t my_high = reinterpret_cast<vec_t*>(x_vals_load)[1];
 
         __syncthreads();
@@ -173,7 +173,8 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
 
         // Lane 0 of each warp must use shared memory (cross-warp boundary)
         // For lane 0, the shuffle returns its own value, so we override it
-        if (lane_id == 0) {
+        if (lane_id == 0)
+        {
             neighbor = smem_exchange[tidx > 0 ? tidx - 1 : kNThreads - 1];
         }
         reinterpret_cast<vec_t*>(x_vals_load)[0] = neighbor;

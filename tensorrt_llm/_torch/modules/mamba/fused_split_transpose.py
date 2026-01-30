@@ -164,11 +164,14 @@ def extract_transpose_xbc_prefill_smart(
     Returns:
         Transposed tensor [conv_dim, num_prefill_tokens]
     """
+    # It runs slower than the auto-tuned version, so use this for now.
+    return extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
+
     # For small inputs, fixed block sizes are often more efficient
     # For large inputs, autotuning can find better configurations
-    if use_autotune and num_prefill_tokens * conv_dim >= autotune_threshold:
-        return extract_transpose_xbc_prefill_autotuned(
-            zxbcdt, num_prefill_tokens, d_inner, conv_dim
-        )
-    else:
-        return extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
+    # if use_autotune and num_prefill_tokens * conv_dim >= autotune_threshold:
+    #     return extract_transpose_xbc_prefill_autotuned(
+    #         zxbcdt, num_prefill_tokens, d_inner, conv_dim
+    #     )
+    # else:
+    #     return extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
