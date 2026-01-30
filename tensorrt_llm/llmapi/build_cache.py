@@ -38,7 +38,7 @@ class BuildCacheConfig(BaseModel):
         changed, you should remove the caches manually.
     """
 
-    cache_root: Optional[str] = Field(
+    cache_root: Optional[Path] = Field(
         default=None,
         description=
         "The root directory for the build cache. Falls back to env var if not provided."
@@ -57,7 +57,7 @@ class BuildCacheConfig(BaseModel):
         """Set cache_root from environment variable if not provided."""
         if self.cache_root is None:
             _, default_cache_root = get_build_cache_config_from_env()
-            self.cache_root = default_cache_root
+            self.cache_root = Path(default_cache_root)
         return self
 
 
