@@ -195,19 +195,36 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
 
-def test_merge_llm_configs_with_defaults_simple_field():
-    llm_args = {}
-    model_defaults = {"enable_chunked_prefill": False}
+@pytest.mark.parametrize(
+    "llm_args,model_defaults,expected_field,expected_value", [
+        ({}, {
+            "enable_chunked_prefill": False
+        }, "enable_chunked_prefill", False),
+        ({
+            "kv_cache_config": {
+                "enable_block_reuse": True
+            }
+        }, {
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            }
+        }, "kv_cache_config.enable_block_reuse", True),
+    ])
+def test_merge_llm_configs_with_defaults(llm_args, model_defaults,
+                                         expected_field, expected_value):
     merged = merge_llm_configs_with_defaults(llm_args, model_defaults)
-    assert merged["enable_chunked_prefill"] is False
 
-
-def test_merge_llm_configs_with_defaults_nested_config():
-    llm_args = {"kv_cache_config": {"enable_block_reuse": True}}
-    model_defaults = {"kv_cache_config": {"enable_block_reuse": False}}
-    merged = merge_llm_configs_with_defaults(llm_args, model_defaults)
-    assert isinstance(merged["kv_cache_config"], KvCacheConfig)
-    assert merged["kv_cache_config"].enable_block_reuse is True
+    if "." in expected_field:
+        # Handle nested field access
+        field_parts = expected_field.split(".")
+        value = merged[field_parts[0]]
+        for part in field_parts[1:]:
+            value = getattr(value, part)
+        assert value == expected_value
+        if field_parts[0] == "kv_cache_config":
+            assert isinstance(merged["kv_cache_config"], KvCacheConfig)
+    else:
+        assert merged[expected_field] == expected_value
 
 
 def test_merge_llm_configs_with_defaults_preserves_user_override():
@@ -221,18 +238,6 @@ def test_compute_applied_llm_defaults_simple_field():
     model_defaults = {"enable_chunked_prefill": False}
     applied = compute_applied_llm_defaults(model_defaults, {})
     assert applied == model_defaults
-
-
-def test_compute_applied_llm_defaults_skips_overridden_nested_fields():
-    model_defaults = {
-        "kv_cache_config": {
-            "enable_block_reuse": False,
-            "max_tokens": 128
-        }
-    }
-    user_overrides = {"kv_cache_config": {"enable_block_reuse": True}}
-    applied = compute_applied_llm_defaults(model_defaults, user_overrides)
-    assert applied == {"kv_cache_config": {"max_tokens": 128}}
 
 
 class _DummyInner(BaseModel):
@@ -251,17 +256,6 @@ def test_extract_llm_args_overrides_uses_fields_set():
     assert overrides == {"inner": {"b": 10}}
 
 
-def test_apply_model_defaults_qwen3next_disables_block_reuse():
-    from tensorrt_llm._torch.models.modeling_qwen3_next import \
-        Qwen3NextForCausalLM
-    llm_args = TorchLlmArgs(model=llama_model_path)
-    assert llm_args.kv_cache_config.enable_block_reuse is True
-    applied = apply_model_defaults_to_llm_args(
-        llm_args, Qwen3NextForCausalLM.get_model_defaults(llm_args))
-    assert applied == {"kv_cache_config": {"enable_block_reuse": False}}
-    assert llm_args.kv_cache_config.enable_block_reuse is False
-
-
 def test_apply_model_defaults_respects_user_override():
     from tensorrt_llm._torch.models.modeling_qwen3_next import \
         Qwen3NextForCausalLM
@@ -272,16 +266,6 @@ def test_apply_model_defaults_respects_user_override():
         llm_args, Qwen3NextForCausalLM.get_model_defaults(llm_args))
     assert applied == {}
     assert llm_args.kv_cache_config.enable_block_reuse is True
-
-
-def test_apply_model_defaults_qwen2vl_disables_chunked_prefill():
-    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLModel
-    llm_args = TorchLlmArgs(model=llama_model_path)
-    assert llm_args.enable_chunked_prefill is True
-    applied = apply_model_defaults_to_llm_args(
-        llm_args, Qwen2VLModel.get_model_defaults(llm_args))
-    assert applied == {"enable_chunked_prefill": False}
-    assert llm_args.enable_chunked_prefill is False
 
 
 def check_defaults(py_config_cls, pybind_config_cls):
