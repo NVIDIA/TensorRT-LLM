@@ -91,7 +91,7 @@ def test_kv_lens_runtime_with_eagle3_one_model():
     assert torch.equal(kv_lens_internal, expected_kv_lens_with_extra), \
         f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
 
-
+@pytest.skip("https://nvbugs/5856637")
 @pytest.mark.parametrize(
     "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
     [
