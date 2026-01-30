@@ -762,7 +762,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 copy_weight(
                     module.kv_scales,
                     torch.tensor(
-                        [1.0, max(k_scale), max(v_scale)], dtype=torch.float32))
+                        [1.0, max(k_scales).item(), max(v_scales).item()], dtype=torch.float32))
                 module.inv_kv_scales.data = 1.0 / module.kv_scales
 
         # Clean up temporary attributes
