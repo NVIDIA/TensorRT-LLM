@@ -22,13 +22,58 @@ This file contains model definitions used for executing Eagle3 speculative decod
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
+
+from ...utils._config import deep_merge_dicts
+from ...utils.logger import ad_logger
+
+
+class EagleConfig(PretrainedConfig):
+    """Config for Eagle3 drafter models.
+
+    Extends PretrainedConfig with Eagle-specific parameters while preserving
+    all base model config values.
+
+    Args:
+        config: Base config for the draft model from its config.json.
+        model_type: The base model type (e.g., "llama") used to look up defaults.
+    """
+
+    # Map model_type -> default Eagle config values
+    _drafter_defaults: Dict[str, Dict[str, Any]] = {
+        "llama": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": False,
+            "num_capture_layers": 3,
+        },
+    }
+
+    def __init__(self, config: PretrainedConfig, model_type: str):
+        if model_type not in self._drafter_defaults:
+            raise ValueError(
+                f"Unsupported model_type '{model_type}' for EagleConfig. "
+                f"Supported types: {list(self._drafter_defaults.keys())}"
+            )
+
+        defaults = self._drafter_defaults[model_type]
+        config_dict = config.to_dict()
+
+        # Log when config overrides a default
+        for key, value in defaults.items():
+            if key in config_dict and config_dict[key] != value:
+                ad_logger.info(
+                    f"EagleConfig: config has '{key}={config_dict[key]}', "
+                    f"overriding default '{value}'"
+                )
+
+        merged = deep_merge_dicts(defaults, config_dict)
+        super().__init__(**merged)
 
 
 class LlamaRotaryEmbedding(nn.Module):
