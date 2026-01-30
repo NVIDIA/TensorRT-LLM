@@ -91,7 +91,8 @@ def get_settings_from_engine(
     return runtime_config, llm_args.build_config.model_dump()
 
 
-def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
+def get_settings(params: dict, dataset_metadata: DatasetMetadata,
+                 options: GeneralExecSettings, model: str,
                  model_path: Union[Path, None]) -> RuntimeConfig:
     """Retrieve basic runtime config for pytorch backend path
 
@@ -105,22 +106,27 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
     # TODO: unify CLI parameter naming across trtllm-serve / trtllm-bench to avoid the need to manually
     # specify parameters here
-    llm_args = get_llm_args_from_cli_params(
-        model=model,
-        backend=params.get("backend"),
-        extra_llm_api_options=params.get("extra_llm_api_options"),
-        max_batch_size=params.get("max_batch_size"),
-        max_num_tokens=params.get("max_num_tokens"),
-        max_seq_len=params.get("max_seq_len"),
-        max_input_len=params.get("max_input_len"),
-        max_beam_width=params.get("beam_width"),
-        tensor_parallel_size=params.get("tp"),
-        pipeline_parallel_size=params.get("pp"),
-        moe_expert_parallel_size=params.get("ep"),
-        moe_cluster_parallel_size=params.get("cluster_size"),
-        enable_chunked_prefill=params.get("enable_chunked_context"),
-        skip_tokenizer_init=not params.get("no_skip_tokenizer_init", False),
-    )
+    # Note: max_batch_size and max_num_tokens are only passed if explicitly set (not None), so that
+    # model_fields_set correctly reflects user intent. If not in model_fields_set, the benchmark code
+    # below will compute optimal values via heuristics.
+    llm_args_kwargs = {
+        "backend": params.get("backend"),
+        "extra_llm_api_options": params.get("extra_llm_api_options"),
+        "max_seq_len": params.get("max_seq_len"),
+        "max_input_len": params.get("max_input_len"),
+        "max_beam_width": params.get("beam_width"),
+        "tensor_parallel_size": params.get("tp"),
+        "pipeline_parallel_size": params.get("pp"),
+        "moe_expert_parallel_size": params.get("ep"),
+        "moe_cluster_parallel_size": params.get("cluster_size"),
+        "enable_chunked_prefill": params.get("enable_chunked_context"),
+        "skip_tokenizer_init": not params.get("no_skip_tokenizer_init", False),
+    }
+    for param in ("max_batch_size", "max_num_tokens"):
+        if params.get(param) is not None:
+            llm_args_kwargs[param] = params[param]
+
+    llm_args = get_llm_args_from_cli_params(model=model, **llm_args_kwargs)
 
     tp_size = llm_args.tensor_parallel_size
     pp_size = llm_args.pipeline_parallel_size
@@ -129,8 +135,10 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     if llm_args.max_seq_len is None:
         llm_args.max_seq_len = dataset_metadata.max_sequence_length
 
-    # Check if max_batch_size and max_num_tokens were explicitly set in either CLI params or
-    # config YAML file
+    if options.iteration_log is not None:
+        llm_args.enable_iter_perf_stats = True
+
+    # Check if max_batch_size and max_num_tokens were explicitly set (via CLI or config YAML)
     if {"max_batch_size", "max_num_tokens"}.issubset(llm_args.model_fields_set):
         logger.info("Using user-provided max batch size and max num tokens.")
         max_batch_size, max_num_tokens = llm_args.max_batch_size, llm_args.max_num_tokens
@@ -201,7 +209,7 @@ def get_exec_settings_for_backend(
         if bench_env.checkpoint_path is None:
             snapshot_download(options.model, revision=bench_env.revision)
 
-        exec_settings = get_settings(params, metadata, bench_env.model,
+        exec_settings = get_settings(params, metadata, options, bench_env.model,
                                      bench_env.checkpoint_path)
         return exec_settings
     elif backend == "tensorrt":

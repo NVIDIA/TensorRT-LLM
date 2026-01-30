@@ -13,6 +13,6 @@ class RuntimeConfig(BaseModel):
     engine_dir: Optional[Path] = None
     revision: Optional[str] = None
     sw_version: str
-    backend: Literal["pytorch", "_autodeploy", None] = None
+    backend: Literal["pytorch", "_autodeploy", "tensorrt", None] = None
     iteration_log: Optional[Path] = None
     llm_args: BaseLlmArgs

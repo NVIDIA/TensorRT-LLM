@@ -13,7 +13,7 @@ from typing import (Annotated, Any, Dict, List, Literal, Optional, Set, Tuple,
 
 import torch
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
                       PrivateAttr, field_validator, model_validator)
@@ -652,6 +652,8 @@ class DecodingBaseConfig(StrictBaseModel):
 
     speculative_model: Optional[Union[str, Path]] = Field(
         default=None,
+        validation_alias=AliasChoices("speculative_model",
+                                      "speculative_model_dir"),
         description=
         "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'),"
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
@@ -2430,16 +2432,19 @@ class TrtLlmArgs(BaseLlmArgs):
                 )
         if self.max_seq_len is not None:
             if self.max_seq_len != self.build_config.max_seq_len:
+                self.max_seq_len = self.build_config.max_seq_len
                 logger.warning(
                     f"max_seq_len [{self.max_seq_len}] is overridden by build_config.max_seq_len [{self.build_config.max_seq_len}] in build_config"
                 )
         if self.max_beam_width is not None:
             if self.max_beam_width != self.build_config.max_beam_width:
+                self.max_beam_width = self.build_config.max_beam_width
                 logger.warning(
                     f"max_beam_width [{self.max_beam_width}] is overridden by build_config.max_beam_width [{self.build_config.max_beam_width}] in build_config"
                 )
         if self.max_input_len is not None:
             if self.max_input_len != self.build_config.max_input_len:
+                self.max_input_len = self.build_config.max_input_len
                 logger.warning(
                     f"max_input_len [{self.max_input_len}] is overridden by build_config.max_input_len [{self.build_config.max_input_len}] in build_config"
                 )
@@ -2466,12 +2471,6 @@ class TrtLlmArgs(BaseLlmArgs):
         if hasattr(self,
                    'enable_prompt_adapter') and self.enable_prompt_adapter:
             self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
-
-        if self.max_beam_width is None:
-            if self.build_config:
-                self.max_beam_width = self.build_config.max_beam_width
-            else:
-                self.max_beam_width = 1
 
         return self
 
