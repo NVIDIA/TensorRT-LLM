@@ -1061,14 +1061,14 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.3.4"
+version = "1.3.5"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.9.0"
 groups = ["main"]
 files = [
-    {file = "huggingface_hub-1.3.4-py3-none-any.whl", hash = "sha256:a0c526e76eb316e96a91e8a1a7a93cf66b0dd210be1a17bd5fc5ae53cba76bfd"},
-    {file = "huggingface_hub-1.3.4.tar.gz", hash = "sha256:c20d5484a611b7b7891d272e8fc9f77d5de025b0480bdacfa858efb3780b455f"},
+    {file = "huggingface_hub-1.3.5-py3-none-any.whl", hash = "sha256:fe332d7f86a8af874768452295c22cd3f37730fb2463cf6cc3295e26036f8ef9"},
+    {file = "huggingface_hub-1.3.5.tar.gz", hash = "sha256:8045aca8ddab35d937138f3c386c6d43a275f53437c5c64cdc9aa8408653b4ed"},
 ]
 
 [package.dependencies]
@@ -4186,14 +4186,14 @@ watchmedo = ["PyYAML (>=3.10)"]
 
 [[package]]
 name = "wcwidth"
-version = "0.5.0"
+version = "0.5.2"
 description = "Measures the displayed width of unicode strings in a terminal"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "wcwidth-0.5.0-py3-none-any.whl", hash = "sha256:1efe1361b83b0ff7877b81ba57c8562c99cf812158b778988ce17ec061095695"},
-    {file = "wcwidth-0.5.0.tar.gz", hash = "sha256:f89c103c949a693bf563377b2153082bf58e309919dfb7f27b04d862a0089333"},
+    {file = "wcwidth-0.5.2-py3-none-any.whl", hash = "sha256:46912178a64217749bf3426b21e36e849fbc46e05c949407b3e364d9f7ffcadf"},
+    {file = "wcwidth-0.5.2.tar.gz", hash = "sha256:c022c39a02a0134d1e10810da36d1f984c79648181efcc70a389f4569695f5ae"},
 ]
 
 [[package]]
