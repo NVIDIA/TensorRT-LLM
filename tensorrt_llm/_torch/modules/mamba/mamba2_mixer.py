@@ -31,7 +31,10 @@ from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import \
     causal_conv1d_update as causal_conv1d_update_triton
-from .fused_split_transpose import extract_transpose_xbc_prefill_smart
+from .fused_split_transpose import (
+    extract_transpose_xbc_prefill_smart,
+    fused_split_rearrange_after_conv1d,
+)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
@@ -263,27 +266,27 @@ class Mamba2Mixer(nn.Module):
                 self.tp_d_inner,
                 self.tp_conv_dim,
                 use_autotune=self.use_kernel_autotune)
-            xbc_p = causal_conv1d_fn(xbc_p_t,
-                                     self.conv1d.weight,
-                                     self.conv1d.bias,
-                                     activation="silu",
-                                     conv_states=conv_states,
-                                     has_initial_state=has_initial_states,
-                                     query_start_loc=cu_seqlens,
-                                     cache_indices=state_indices_p).transpose(
-                                         0, 1)
+            # causal_conv1d operates in-place, output is [conv_dim, num_prefill_tokens]
+            xbc_p_conv = causal_conv1d_fn(xbc_p_t,
+                                          self.conv1d.weight,
+                                          self.conv1d.bias,
+                                          activation="silu",
+                                          conv_states=conv_states,
+                                          has_initial_state=has_initial_states,
+                                          query_start_loc=cu_seqlens,
+                                          cache_indices=state_indices_p)
 
-            x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
+            # Use fused kernel to split, transpose, and rearrange in one pass
+            # This avoids expensive .contiguous() calls after split/rearrange
+            x_p, B_p, C_p = fused_split_rearrange_after_conv1d(
+                xbc_p_conv,
                 self.tp_d_inner,
-                self.tp_ngroups * self.d_state,
-                self.tp_ngroups * self.d_state,
-            ],
-                                        dim=-1)
-
-            x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
+                self.tp_ngroups,
+                self.d_state,
+                self.tp_nheads,
+                self.head_dim,
+            )
             dt_p = dt_p.unsqueeze(0)
-            B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
-            C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
             z_p = rearrange(z_p.unsqueeze(0),
                             "b l (h p) -> b l h p",
                             h=self.tp_nheads)
