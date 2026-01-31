@@ -404,29 +404,44 @@ foo.SomeClass()
 1. For interfaces that may be used outside a file, prefer docstrings over comments.
 2. Comments should be reserved for code within a function, or interfaces that are local to a file.
 
+#### Pydantic Guidelines
+
+When defining any user-facing configuration classes (particularly `LlmArgs` or any class used in its fields), always use Pydantic classes rather than dataclasses or vanilla classes.
+
+**Model Structure:**
+- Inherit from `StrictBaseModel` (which sets `extra="forbid"`) to catch typos in field names
+- Use [discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) when a field needs to accept one of several possible config classes (e.g. `speculative_config` accepts any of `EagleDecodingConfig`, `MedusaDecodingConfig`, etc.)
+
+**Field Definitions:**
+- Add descriptions to all user-facing fields via `Field(description="...")`. Avoid using comments for descriptions.
+- Avoid `dict`, `object`, `Any` as field types - use properly typed alternatives
+- Avoid defining mutable defaults directly; use `default_factory` instead.
+  - Good: `Field(default_factory=list)`, `Field(default_factory=dict)`, `Field(default_factory=MyClass)`
+  - Bad: `Field(default=[])`, `Field(default={})`, `Field(default=MyClass())` directly
+- Use `Literal["value1", "value2"]` instead of `str` when a field should only accept certain values
+- Prefer `PositiveInt`, `NonNegativeInt`, `NonNegativeFloat`, `PositiveFloat`, `Field(gt=0)`, `Field(ge=0)`, etc. for numeric constraints instead of defining custom validators
+- Use `Field(min_length=1)` to enforce minimum length of a list
+
+**Validation:**
+- Use `@field_validator` and `@model_validator` instead of manual `validate()` or `is_valid()` methods
+- Raise `ValueError` instead of using assertions
+- Co-locate validation logic within the class itself rather than in a parent class, unless it depends on fields in the parent
+
+**Serialization:**
+- Avoid defining `to_dict()` methods - prefer Pydantic's built-in `model_dump()` to convert to a dictionary.
+  - Note: you can override `model_dump()` to customize its behavior, but avoid doing so unless absolutely necessary.
+  - Good: `MyModel.model_dump()`
+  - Bad: `MyModel.to_dict()`
+- Avoid defining `from_dict()` methods - prefer constructing the class directly from arguments.
+  - Good: `MyModel(**kwargs)`
+  - Bad: `MyModel.from_dict(kwargs)`
+
+TODO:
+- unit tests: e.g. for get_llm_args_from_cli_params, other tests you removed, etc
+
 #### Docstring Syntax
 ##### Classes and Functions
 Use the [Google style](https://google.github.io/styleguide/pyguide.html), which can be parsed by Sphinx.
-
-When defining any user-facing configuration classes (e.g. `LlmArgs` or any class used in its fields), always use Pydantic classes rather than dataclasses or vanilla classes.
-
-- avoid to_dict / from_dict
-- avoid dicts / object as any part of a pydantic class 
-- use discriminated unions
-- prefer (1) positiveint/nonnegativeint/nonnegativefloat/positivefloat, or (2) if not possible, gt/ge/le/lt
-- use min_length to enforce minimum length of a list
-- use pydantic field descriptions instead of comments
-- use Literal instead of str when a field should only accept certain values. avoid defining a custom validator on a str field.
-- raise ValueError instead of assertion
-- co-locate model validation logic within the class itself rather than in a parent class, unless it depends on other fields in the parent class (e.g. don't validate cuda_graph_config in BaseLlmArgs; also add example of OK case)
-- don't define manual validate() methods, prefer using model_validator / field_validator
-
-TODO:
-- ask cursor for more antipatterns fixed in this pr
-- unit tests: e.g. for get_llm_args_from_cli_params, other tests you removed, etc
-- tests for all of the above Pydantic best practices
-- test to validate that all llmargs classes have field descriptions for all fields
-- add validator to BaseLlmArgs.__init_subclass__ to check that all subfields are Pydantic
 
 #####  Attributes and Variables
 Attributes and variables can be documented inline. Attribute docstrings will be rendered under the docstring for the class. For example:
