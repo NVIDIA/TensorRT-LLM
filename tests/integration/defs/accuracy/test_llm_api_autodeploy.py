@@ -236,8 +236,8 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                            world_size=world_size,
                            **kwargs) as llm:
             # Manually set quant_config for FP8 model to get the accuracy threshold
-            llm.args.quant_config.quant_algo = QuantAlgo.FP8
-            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            llm.model_config.quant_config.quant_algo = QuantAlgo.FP8
+            llm.model_config.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             sampling_params = self.get_default_sampling_params()
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -253,8 +253,8 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                            world_size=world_size,
                            **kwargs) as llm:
             # Manually set quant_config for NVFP4 model to get the accuracy threshold
-            llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
-            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            llm.model_config.quant_config.quant_algo = QuantAlgo.NVFP4
+            llm.model_config.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             sampling_params = self.get_default_sampling_params()
 
             task = MMLU(self.MODEL_NAME)
@@ -332,8 +332,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            world_size=world_size,
                            **kwargs) as llm:
             # Manually set quant_config for FP8 model to get the accuracy threshold
-            llm.args.quant_config.quant_algo = QuantAlgo.FP8
-            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            llm.model_config.quant_config.quant_algo = QuantAlgo.FP8
+            llm.model_config.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -353,8 +353,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            world_size=world_size,
                            **kwargs) as llm:
             # Manually set quant_config for FP4 model to get the accuracy threshold
-            llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
-            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            llm.model_config.quant_config.quant_algo = QuantAlgo.NVFP4
+            llm.model_config.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)

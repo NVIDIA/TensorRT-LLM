@@ -3320,7 +3320,7 @@ class PyTorchModelEngine(ModelEngine):
             if CpType.STAR == cp_type:
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
-            elif CpType.HELIX == cp_type:
+            elif cp_type in (CpType.HELIX, CpType.ULYSSES):
                 # Take the usual route of _prepare_tp_inputs.
                 pass
             else:

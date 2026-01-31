@@ -59,21 +59,21 @@ methods:
         default: null
       # Speculative decoding
       speculative_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig, tensorrt_llm.llmapi.llm_args.EagleDecodingConfig,tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig, tensorrt_llm.llmapi.llm_args.MTPDecodingConfig, tensorrt_llm.llmapi.llm_args.NGramDecodingConfig, tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig, tensorrt_llm.llmapi.llm_args.AutoDecodingConfig, tensorrt_llm.llmapi.llm_args.SaveHiddenStatesDecodingConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig, tensorrt_llm.llmapi.llm_args.EagleDecodingConfig, tensorrt_llm.llmapi.llm_args.Eagle3DecodingConfig, tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig, tensorrt_llm.llmapi.llm_args.MTPDecodingConfig, tensorrt_llm.llmapi.llm_args.NGramDecodingConfig, tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig, tensorrt_llm.llmapi.llm_args.AutoDecodingConfig, tensorrt_llm.llmapi.llm_args.SaveHiddenStatesDecodingConfig, NoneType]
         default: null
       # generation constraints
       max_batch_size:
         annotation: Optional[int]
-        default: null
+        default: 2048
       max_input_len:
         annotation: Optional[int]
-        default: null
+        default: 1024
       max_seq_len:
         annotation: Optional[int]
         default: null
       max_beam_width:
         annotation: Optional[int]
-        default: null
+        default: 1
       max_num_tokens:
         annotation: Optional[int]
         default: 8192
@@ -81,9 +81,6 @@ methods:
       load_format:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.LoadFormat]
         default: 0
-      enable_tqdm:
-        annotation: bool
-        default: false
       enable_chunked_prefill:
         annotation: bool
         default: false

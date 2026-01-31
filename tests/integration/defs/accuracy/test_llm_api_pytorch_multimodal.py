@@ -63,7 +63,7 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
             max_num_tokens=self.MAX_NUM_TOKENS,
             kv_cache_config=self.kv_cache_config,
         ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.model_config.quant_config.quant_algo == QuantAlgo.FP8
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
@@ -75,7 +75,7 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
             max_num_tokens=self.MAX_NUM_TOKENS,
             kv_cache_config=self.kv_cache_config,
         ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.model_config.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
@@ -281,7 +281,7 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     def test_nvfp4_prequantized(self):
         model_path = f"{llm_models_root()}/gemma/gemma-3-27b-it-FP4"
         with self._make_llm(model_path) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.model_config.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
@@ -327,7 +327,7 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
     def test_fp8_prequantized(self):
         model_path = f"{llm_models_root()}/gemma/gemma-3-12b-it-fp8"
         with self._make_llm(model_path, self.kv_cache_config_fp8) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.model_config.quant_config.quant_algo == QuantAlgo.FP8
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
@@ -335,7 +335,7 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
     def test_nvfp4_prequantized(self):
         model_path = f"{llm_models_root()}/gemma/gemma-3-12b-it-fp4"
         with self._make_llm(model_path, self.kv_cache_config_fp8) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.model_config.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 

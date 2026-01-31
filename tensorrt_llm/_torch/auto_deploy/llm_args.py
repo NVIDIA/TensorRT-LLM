@@ -185,7 +185,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         " no processes are spawned and the model is run on a single GPU (only for ``demollm``).",
     )
 
-    runtime: Literal["demollm", "trtllm"] = Field(default="trtllm")
+    runtime: Literal["demollm", "trtllm"] = Field(
+        default="trtllm",
+        description="The runtime backend to use. 'trtllm' is a production-grade runtime optimized for "
+        "high-performance inference. 'demollm' is a lightweight runtime for development and testing "
+        "with a simplified scheduler and KV-cache manager for easier debugging.",
+    )
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 

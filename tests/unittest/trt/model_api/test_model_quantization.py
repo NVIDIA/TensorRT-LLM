@@ -31,7 +31,7 @@ def test_int4_awq_quantization():
     cnn_dailymail_path = str(llm_models_root() / "datasets/cnn_dailymail")
 
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
-    quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
     LLaMAForCausalLM.quantize(hf_model_dir,
                               checkpoint_dir,
                               quant_config=quant_config,
@@ -74,7 +74,7 @@ def test_fp8_quantization():
     cnn_dailymail_path = str(llm_models_root() / "datasets/cnn_dailymail")
 
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
-    quant_config = QuantConfig(QuantAlgo.FP8)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     LLaMAForCausalLM.quantize(hf_model_dir,
                               checkpoint_dir,
                               quant_config=quant_config,

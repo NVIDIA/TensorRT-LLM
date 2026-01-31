@@ -25,7 +25,7 @@ import yaml
 
 import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._tensorrt_engine import LLM as TrtLLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi import SamplingParams
@@ -182,7 +182,7 @@ class AccuracyTask:
                                        self.HIGHER_IS_BETTER))
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
+                 llm: Union[TrtLLM, PyTorchLLM, AutoDeployLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
@@ -210,10 +210,18 @@ class AccuracyTask:
             hypothesis_testing_params = HypothesisTestingParams(ref_accuracy=0,
                                                                 num_samples=1)
         else:
+            if hasattr(llm, "model_config") and llm.model_config:
+                quant_config = llm.model_config.quant_config
+            elif hasattr(llm.args, "quant_config"):
+                quant_config = llm.args.quant_config
+            else:
+                quant_config = None
+            quant_algo = quant_config.quant_algo if quant_config else None
+            kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
             hypothesis_testing_params = self.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
-                quant_algo=llm.args.quant_config.quant_algo,
-                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                quant_algo=quant_algo,
+                kv_cache_quant_algo=kv_cache_quant_algo,
                 spec_dec_algo=spec_dec_algo,
                 extra_acc_spec=extra_acc_spec)
 
@@ -567,7 +575,8 @@ class CliFlowAccuracyTestHarness:
             if "quantization_config" in hf_config:
                 is_prequantized = True
 
-        quant_config = QuantConfig(self.quant_algo, self.kv_cache_quant_algo)
+        quant_config = QuantConfig(quant_algo=self.quant_algo,
+                                   kv_cache_quant_algo=self.kv_cache_quant_algo)
         if not is_prequantized and quant_config._requires_modelopt_quantization:
             script = f"{self.llm_root}/examples/quantization/quantize.py"
         else:

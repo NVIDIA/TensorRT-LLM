@@ -149,7 +149,7 @@ def get_llm_args(
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "context_parallel_size": context_parallel_size,
-        "cp_config": cp_config if cp_config is not None else {},
+        "cp_config": cp_config,
         "moe_expert_parallel_size": moe_expert_parallel_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,

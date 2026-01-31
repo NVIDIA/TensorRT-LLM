@@ -24,14 +24,15 @@ from typing import (Any, List, Literal, Optional, Tuple, Union, get_args,
                     get_origin)
 
 import tensorrt as trt
-from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo,
-                      field_validator)
+from pydantic import (ConfigDict, Field, PrivateAttr, ValidationInfo,
+                      field_validator, model_validator)
 
 from .._ipc_utils import IpcMemory, can_access_peer
 from .._utils import get_sm_version
 from ..bindings.internal.runtime import (lamport_initialize,
                                          lamport_initialize_all,
                                          max_workspace_size_lowprecision)
+from ..llmapi.utils import StrictBaseModel
 from ..logger import logger
 from ..mapping import Mapping
 
@@ -85,7 +86,7 @@ DefaultPluginDtype = Literal["auto", "float16", "float32", "bfloat16", "int32",
                              None]
 
 
-class PluginConfig(BaseModel):
+class PluginConfig(StrictBaseModel):
     """The config that manages plugin-related options.
 
     There are two option categories:
@@ -97,7 +98,7 @@ class PluginConfig(BaseModel):
         * True, which means the plugin is enabled;
         * False, which means the plugin is disabled.
     """
-    model_config = ConfigDict(validate_assignment=True, extra="ignore")
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
     dtype: str = Field(default="float16",
                        description="Base dtype for the model and plugins")
@@ -339,7 +340,10 @@ class PluginConfig(BaseModel):
     def from_arguments(cls, args: argparse.Namespace):
         """Create a PluginConfig from argparse arguments."""
         args = vars(args)
-        obj = cls(**args)
+        # Filter to only include fields that are part of PluginConfig
+        valid_fields = set(cls.model_fields.keys())
+        filtered_args = {k: v for k, v in args.items() if k in valid_fields}
+        obj = cls(**filtered_args)
 
         # We want to know if the user explicitly disabled the gemm_plugin
         # because nvfp4 gemm uses plugin by default currently
@@ -364,7 +368,8 @@ class PluginConfig(BaseModel):
                             bool) or field_name == "paged_kv_cache":
                 setattr(self, field_name, False)
 
-    def validate(self):
+    @model_validator(mode="after")
+    def _validate_sm_compatibility(self) -> "PluginConfig":
         unsupported_plugins = {
             # bert_attention_plugin is handled within BertAttention
             100: [
@@ -378,8 +383,9 @@ class PluginConfig(BaseModel):
             for plugin in unsupported_plugins[sm]:
                 val = getattr(self, plugin, None)
                 if val is not None and val != False:
-                    raise NotImplementedError(
+                    raise ValueError(
                         f"{plugin}={val} is not supported on SM {sm}.")
+        return self
 
     @property
     def context_fmha_type(self):

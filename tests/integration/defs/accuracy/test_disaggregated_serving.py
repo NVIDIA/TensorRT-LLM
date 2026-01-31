@@ -8,7 +8,6 @@ import re
 import subprocess
 import tempfile
 import time
-from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union
 
@@ -22,6 +21,7 @@ from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
@@ -46,7 +46,20 @@ class Result(GenerationResultBase):
         return self
 
 
-DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
+class DuckLLM:
+    """Duck-typed LLM that mimics the PyTorchLLM interface for accuracy tests."""
+
+    def __init__(self, args, tokenizer, generate_async, quant_config=None):
+        self.args = args
+        self.tokenizer = tokenizer
+        self.generate_async = generate_async
+        # Mock model_config to match PyTorchLLM interface
+        if quant_config:
+            from types import SimpleNamespace
+            self.model_config = SimpleNamespace(quant_config=quant_config)
+        else:
+            self.model_config = None
+
 
 # Timeout for the entire test
 DEFAULT_TEST_TIMEOUT = 3600
@@ -182,10 +195,11 @@ def launch_disaggregated_llm(
     with open(gen_server_config_path, "w") as f:
         yaml.dump(gen_server_config, f)
 
-    args = LlmArgs.from_kwargs(model=model_name,
-                               tensor_parallel_size=tensor_parallel_size)
+    args = LlmArgs(model=model_name, tensor_parallel_size=tensor_parallel_size)
+
+    quant_config = None
     if "FP4" in model_name:
-        args.quant_config.quant_algo = "NVFP4"
+        quant_config = QuantConfig(quant_algo="NVFP4")
 
     trtllm_serve_path = "trtllm-serve"
     # Common arguments for both servers
@@ -444,7 +458,7 @@ def launch_disaggregated_llm(
 
         tokenizer = load_hf_tokenizer(model_name)
         try:
-            yield DuckLLM(args, tokenizer, generate_async)
+            yield DuckLLM(args, tokenizer, generate_async, quant_config)
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)

@@ -509,7 +509,7 @@ class ModelLoader:
                     dtype=self.llm_args.dtype,
                     mapping=self.mapping,
                     quant_config=self.llm_args.quant_config,
-                    **self.llm_args.calib_config.to_dict(),
+                    **self.llm_args.calib_config.model_dump(),
                     trust_remote_code=self.llm_args.trust_remote_code,
                 )
             if self.llm_args.parallel_config.is_multi_gpu:
@@ -724,14 +724,6 @@ class CachedModelLoader:
 
             self._hf_model_dir = self._download_hf_model_if_needed(
                 self.model_loader.model_obj, revision=self.llm_args.revision)
-
-            if self.llm_args.quant_config.quant_algo is not None:
-                logger.warning(
-                    "QuantConfig for pytorch backend is ignored. You can load"
-                    "quantized model with hf_quant_config.json directly.")
-            # Currently, this is to make updated quant_config visible by llm.args.quant_config
-            # TODO: Unify the logics with those in tensorrt_llm/_torch/model_config.py
-            self.model_loader._update_from_hf_quant_config()
 
             return None, self._hf_model_dir
 
