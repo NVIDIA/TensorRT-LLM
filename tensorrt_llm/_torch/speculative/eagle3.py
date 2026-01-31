@@ -368,7 +368,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         return self.spec_config.max_draft_len
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
-    # @torch.compile(options={"max-autotune": True})
+    @torch.compile(options={"max-autotune": True})
     def forward(self, input_ids, position_ids, hidden_states, logits,
                 attn_metadata, spec_metadata, draft_model):
         batch_size = attn_metadata.num_seqs
@@ -498,6 +498,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             'next_new_tokens': next_new_tokens,
         }
 
+    @torch.compiler.disable
     def sample_and_accept_draft_tokens(
         self,
         logits: torch.Tensor,
