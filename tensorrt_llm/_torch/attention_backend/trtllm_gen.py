@@ -220,8 +220,11 @@ class TrtllmGenSupportChecker:
         if not config.is_fused_qkv:
             return False, "Only fused QKV is supported by trtllm-gen backend."
 
-        if not config.update_kv_cache:
-            return False, "KV cache update must be enabled for trtllm-gen backend."
+        if config.update_kv_cache:
+            # trtllm-gen backend currently does not support KV cache update.
+            # The flashinfer trtllm-gen kernels only read from KV cache, they don't write to it.
+            # Fall back to thop.attention which handles KV cache update atomically.
+            return False, "KV cache update is not yet supported by trtllm-gen backend."
 
         if config.cross_attention:
             return False, "Cross attention is not supported by trtllm-gen backend."
@@ -1172,8 +1175,10 @@ def trtllm_gen_attention(
         # ctx_lens is already on CPU (from host_ctx_lens)
         max_q_len = int(ctx_lens.max())
 
-        # Use max_context_length as upper bound to avoid GPU sync
-        max_kv_len = max_context_length
+        if num_contexts > 0:
+            max_kv_len = int(host_past_key_value_lengths[:num_contexts].max())
+        else:
+            max_kv_len = 0
 
         if has_kv_cache and kv_cache is not None:
             # host_kv_cache_pool_mapping is on CPU, direct indexing is safe
@@ -1185,19 +1190,9 @@ def trtllm_gen_attention(
             # Calculate number of blocks needed per sequence for context
             ctx_kv_lens_device = ctx_kv_lens.to(q.device)
 
-            # Skip block_tables truncation during CUDA graph capture to avoid GPU-to-CPU sync.
-            # The clamp operation below ensures safety anyway.
-            if not torch.cuda.is_current_stream_capturing():
-                num_blocks_per_seq = (ctx_kv_lens_device + page_size - 1) // page_size
-                max_num_blocks = int(num_blocks_per_seq.max()) if num_contexts > 0 else 0
-
-                # Truncate block_tables to only include valid blocks
-                if max_num_blocks > 0 and max_num_blocks < ctx_block_tables.shape[1]:
-                    ctx_block_tables = ctx_block_tables[:, :max_num_blocks].contiguous()
-
-            # Clamp block indices to valid range to prevent illegal memory access
-            max_pages = kv_cache.shape[0]
-            ctx_block_tables = ctx_block_tables.clamp(0, max_pages - 1)
+            # Note: We do NOT clamp block_tables here to match C++ thop.attention behavior.
+            # The flashinfer kernel uses seq_lens to determine valid block range.
+            # Clamping invalid indices to valid range causes attention to read wrong KV data.
 
             # Run context phase
             backend.run_context(
@@ -1229,8 +1224,15 @@ def trtllm_gen_attention(
 
         # KV sequence lengths for generation
         gen_kv_lens = sequence_length[num_contexts : num_contexts + num_generations].to(torch.int32)
-        # Use max_context_length as upper bound to avoid GPU sync during CUDA graph capture
-        max_kv_len = max_context_length
+        # Use CPU lengths to avoid GPU sync and match C++ behavior.
+        # host_past_key_value_lengths already includes cached + input tokens.
+        if num_generations > 0:
+            host_gen_lens = host_past_key_value_lengths[
+                num_contexts : num_contexts + num_generations
+            ]
+            max_kv_len = int(host_gen_lens.max())
+        else:
+            max_kv_len = 0
 
         if has_kv_cache and kv_cache is not None:
             # host_kv_cache_pool_mapping is on CPU, direct indexing is safe
@@ -1245,19 +1247,9 @@ def trtllm_gen_attention(
             # Calculate number of blocks needed per sequence for generation
             gen_kv_lens_device = gen_kv_lens.to(q.device)
 
-            # Skip block_tables truncation during CUDA graph capture to avoid GPU-to-CPU sync.
-            # The clamp operation below ensures safety anyway.
-            if not torch.cuda.is_current_stream_capturing():
-                num_blocks_per_seq = (gen_kv_lens_device + page_size - 1) // page_size
-                max_num_blocks = int(num_blocks_per_seq.max()) if num_generations > 0 else 0
-
-                # Truncate block_tables to only include valid blocks
-                if max_num_blocks > 0 and max_num_blocks < gen_block_tables.shape[1]:
-                    gen_block_tables = gen_block_tables[:, :max_num_blocks].contiguous()
-
-            # Clamp block indices to valid range to prevent illegal memory access
-            max_pages = kv_cache.shape[0]
-            gen_block_tables = gen_block_tables.clamp(0, max_pages - 1)
+            # Note: We do NOT clamp block_tables here to match C++ thop.attention behavior.
+            # The flashinfer kernel uses seq_lens to determine valid block range.
+            # Clamping invalid indices to valid range causes attention to read wrong KV data.
 
             # Run generation phase
             backend.run_generation(
