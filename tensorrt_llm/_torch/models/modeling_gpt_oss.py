@@ -9,6 +9,7 @@ from transformers import GptOssConfig
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.models.convert_utils import get_rope_scaling, get_rope_theta
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
@@ -51,18 +52,19 @@ class AttentionBlock(Attention):
     ):
         pretrained_config = config.pretrained_config
 
+        rope_scaling = get_rope_scaling(pretrained_config)
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.yarn,
             rope=RopeParams(
                 dim=pretrained_config.head_dim,
-                theta=pretrained_config.rope_theta,
+                theta=get_rope_theta(pretrained_config),
                 scale_type=RotaryScalingType.yarn,
-                scale=pretrained_config.rope_scaling['factor'],
+                scale=rope_scaling['factor'],
                 max_positions=pretrained_config.max_position_embeddings,
-                original_max_positions=pretrained_config.
-                rope_scaling['original_max_position_embeddings'],
-                beta_fast=pretrained_config.rope_scaling['beta_fast'],
-                beta_slow=pretrained_config.rope_scaling['beta_slow'],
+                original_max_positions=rope_scaling[
+                    'original_max_position_embeddings'],
+                beta_fast=rope_scaling['beta_fast'],
+                beta_slow=rope_scaling['beta_slow'],
                 duplicate_data=False),
             is_neox=False,
         )

@@ -9,6 +9,7 @@ from transformers import LlamaConfig
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import get_rope_scaling, get_rope_theta
 from tensorrt_llm.models.eagle.config import EagleConfig
 from tensorrt_llm.models.eagle.model import EagleForCausalLM
 from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
@@ -290,8 +291,8 @@ if __name__ == '__main__':
         args.n_kv_head = hf_config.num_key_value_heads
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
-        args.rotary_scaling = hf_config.rope_scaling
-        args.rotary_base = hf_config.rope_theta
+        args.rotary_scaling = get_rope_scaling(hf_config)
+        args.rotary_base = get_rope_theta(hf_config)
         args.n_positions = hf_config.max_position_embeddings
         args.dtype = str(
             hf_config.torch_dtype)[6:] if args.dtype == 'auto' else args.dtype
@@ -363,7 +364,7 @@ if __name__ == '__main__':
     if args.rotary_scaling is not None:
         # assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
         rotary_scaling = {
-            "type": args.rotary_scaling["rope_type"],
+            "type": args.rotary_scaling["type"],
         }
         args.rotary_scaling = rotary_scaling
 
