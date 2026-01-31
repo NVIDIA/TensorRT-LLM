@@ -48,12 +48,13 @@ static_assert(specDecQLen * headGrpSize <= 32, "SPEC_Q_SEQ_LEN macro value is to
 #else
 #define SWAP_AB (!SPEC_DEC)
 #endif
+#define DISABLE_VT_FOR_FP16_NO_SWAP_AB 1
 
 #if SKIP_SOFTMAX_ATTN
 static_assert(SWAP_AB && USE_PAGED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1, "SKIP_SOFTMAX_ATTN is not supported.");
 #endif
 
-#define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !SPEC_DEC && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
+#define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
 
 inline constexpr bool swapAB = SWAP_AB;
 
@@ -180,7 +181,7 @@ struct alignas(128) SharedMem
         {
             XBuffer x;
             VBuffer v;
-#if !SWAP_AB
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
             VTBuffer vt;
 #endif
             // @fixme: also put xColMax and xColSum here
@@ -201,7 +202,7 @@ struct alignas(128) SharedMem
     {
         return reusedXVOutSwizzleBuf[i].xv.v;
     }
-#if !SWAP_AB
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
     __device__ inline VTBuffer& vtBuf(uint32_t i)
     {
         return reusedXVOutSwizzleBuf[i].xv.vt;
@@ -243,7 +244,7 @@ struct alignas(128) SharedMem
     CtaBarrierPair qBar;
     CtaBarrierPair kBar[nbKBuf];
     CtaBarrierPair vBar[nbVBuf];
-#if !SWAP_AB
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
     CtaBarrierPair vtBar[nbVBuf];
 #endif
     CtaBarrierPair xBar[nbXBuf];
@@ -267,7 +268,8 @@ CUBIN_EXPORT __device__ constexpr uint32_t smemSize = sizeof(SharedMem);
 static_assert(smemSize < kMAX_SMEM_SIZE);
 #endif
 
-constexpr uint32_t nbQLdWarps = needInputCvt ? nbIOWarps - 2 : 1;
+// for needInputCvt and fp16 no_swapAB cases, use 2 qLoad warp to reduce reg pressure
+constexpr uint32_t nbQLdWarps = (needInputCvt || (!swapAB && CACHE_ELEM_ENUM == 0)) ? nbIOWarps - 2 : 1;
 constexpr uint32_t nbQLdThrds = warp_size * nbQLdWarps;
 
 #if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 2
@@ -468,6 +470,8 @@ __device__ RegRowWiseVec computeWarpRowSum(Gemm0Acc& src);
 __device__ void storeGemm0AccToShm(
     uint32_t warpRank, uint32_t lane, SharedMem::XBuffer& smemX, CtaBarrier& barConsumed, Gemm0Acc const& acc);
 __device__ RegRowWiseVec loadShmRowWiseVecWithDup(uint32_t warpRank, ShmQWiseVec const& smemVec);
+__device__ RegRowWiseVec loadGmemRowWiseVecCyclically(
+    uint32_t warpRank, ShmQWiseVec const& gmemVec, uint32_t cyclicSize);
 __device__ void storeShmRowWiseVec(uint32_t warpRank, ShmQWiseVec& smemVec, RegRowWiseVec const& regVec);
 #endif
 
@@ -495,8 +499,10 @@ __device__ void rescaleGemm1AccForNewRowMax_sync(uint32_t warpRank, ShmQWiseVec 
     ShmQWiseVec const(&shmXRowSum), ShmQWiseVec& shmAccRowMax, Gemm1Acc& acc, ShmQWiseVec& shmAccRowSum);
 template <typename DstHead>
 __device__ void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst, SharedMem::OutSwizzleBuf& swizzleBuf,
-    Gemm1Acc& acc, float xvoScale, ShmQWiseVec const& accColSum,
-    uint32_t nbKHeads /* only for final result in spec dec. set to 1 for workspace*/, uint32_t ctaNbValidTokens);
+    Gemm1Acc& acc, float xvoScale, ShmQWiseVec const& accColSum, ShmQWiseVec const& accColMax,
+    ShmQWiseVec const* attentionSinksVec,
+    uint32_t nbKHeads /* only for final result in spec dec and attention sinks. set to 1 for workspace*/,
+    uint32_t ctaNbValidTokens);
 #endif
 
 inline constexpr uint32_t ropeNbPairsPerThrdImpl(uint32_t nbThrds)
@@ -663,6 +669,8 @@ CUBIN_EXPORT __global__
 #ifdef NDEBUG
 #if !OPTIMIZE_FOR_LATENCY
     __launch_bounds__(128 * 3, headElems* ctaNbQHeads <= 128 * 16 ? 3 : 2)
+#elif USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+    __launch_bounds__(128 * 3, 2)
 #else
     __launch_bounds__(128 * 3)
 #endif
@@ -686,7 +694,7 @@ CUBIN_EXPORT __global__
 #else
             IOHead const* __restrict__ const q, // [nbReq][beamWidth][nbQHeads],
 #endif
-            float const* attentionSinks, // [headGrpSize]
+            float const* attentionSinks, // [nbKHeads][headGrpSize]
             KVCacheList<usePagedKVCache> const cacheList,
 #if USE_BEAM_SEARCH
             BeamSearchParams const beamSearchParams,
@@ -832,7 +840,7 @@ CUBIN_EXPORT __global__
                 smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
 #endif
 
-#if !SWAP_AB
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
                 smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
 #endif
                 smem.xBar[wid].initialize(gemm0NbThrds + gemm1NbThrds, gemm0NbThrds + gemm1NbThrds);
@@ -864,6 +872,10 @@ CUBIN_EXPORT __global__
 
     if (warpIdx.z == 0)
     {
+#if USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(64));
+#endif
+
 #if SPEC_DEC
         SpecDec const specDec{specDecParams, idxReq, idxInputSubSeq, cacheSeqLen};
 #endif
@@ -1092,12 +1104,15 @@ CUBIN_EXPORT __global__
     }
     else if (warpIdx.z == 1)
     {
+#if USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(104));
+#endif
         // XV GEMM
         for (auto& b : smem.vBar)
         {
             unused(b.consumed.arrive());
         }
-#if !SWAP_AB
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
         for (auto& b : smem.vtBar)
         {
             unused(b.consumed.arrive());
@@ -1152,7 +1167,7 @@ CUBIN_EXPORT __global__
 #endif
             {
                 arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
-#if !SWAP_AB
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
                 CtaBarrierPair& vtBar = smem.vtBar[idxVBuf];
                 auto& vtBuf = smem.vtBuf(idxVBuf);
                 vtBar.consumed.arrive_and_wait();
@@ -1328,10 +1343,12 @@ CUBIN_EXPORT __global__
                     gmma::wait_group<0>();
                 }
 #else
+#if !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
                 auto const descVTBase = gmma::makeMatDesc(
                     nullptr, 0, SharedMem::VTBuffer::rowBytes * 8, gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
                                             .raw();
                 vtBar.produced.arrive_and_wait();
+#endif
 // if (idxIter == 1 && threadIdx.x == 0) {
 //     printf("vtBuf:\n");
 //     dbg::printArray2D<__nv_fp8_e4m3, true>(vtBuf);
@@ -1346,11 +1363,24 @@ CUBIN_EXPORT __global__
                         auto const descX = addAddr(descXBase,
                             &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
                                 gmma::instM * m, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
+#if CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB
+#pragma unroll
+                        for (uint32_t cachePartIdx = 0; cachePartIdx < cacheHeadNbParts; cachePartIdx++)
+                        {
+                            auto const descV = addAddr(
+                                descVBase, &vBuf[cachePartIdx](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
+                            gmma::mma_async_shmA<MathElem, cacheHeadPartElems, false, true>(
+                                reinterpret_cast<float(&)[exactDiv(cacheHeadPartElems, gmma::instNBase)][2][2]>(
+                                    acc(m, cachePartIdx * exactDiv(cacheHeadPartElems, gmma::instNBase))),
+                                descX, descV, true);
+                        }
+#else
                         auto const descVT = addAddr(
                             descVTBase, &vtBuf(0, kOffsetInGrains.template mod<SharedMem::VTBuffer::cols>().get()));
                         gmma::mma_async_shmA<MathElem, headElems>(
                             reinterpret_cast<float(&)[exactDiv(headElems, gmma::instNBase)][2][2]>(acc(m, 0)), descX,
                             descVT, true);
+#endif
                     }
                 }
                 gmma::commit_group();
@@ -1389,7 +1419,7 @@ CUBIN_EXPORT __global__
                         smem.gemm1WarpGrpBar, smem.gemm1AccColSum, smem.gemm1AccColMax, nullptr);
 #else
                     finalizeAndWriteOut_sync(warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
-                        smem.gemm1AccColSum, 1, ctaNbValidTokens);
+                        smem.gemm1AccColSum, smem.gemm1AccColMax, nullptr, 1, ctaNbValidTokens);
 #endif
                 }
                 else
@@ -1408,12 +1438,12 @@ CUBIN_EXPORT __global__
                         nbKHeads);
 #else
                     finalizeAndWriteOut_sync(warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
-                        smem.gemm1AccColSum, nbKHeads, ctaNbValidTokens);
+                        smem.gemm1AccColSum, smem.gemm1AccColMax, attentionSinksVec, nbKHeads, ctaNbValidTokens);
 #endif
                 }
             }
             unused(xBar.consumed.arrive());
-#if SWAP_AB
+#if SWAP_AB || (CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
             unused(vBar.consumed.arrive());
 #else
             unused(vtBar.consumed.arrive());
@@ -1422,6 +1452,9 @@ CUBIN_EXPORT __global__
     }
     else
     {
+#if USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(72));
+#endif
         // IO warps
         static_assert(beamWidth == 1);
 #if ENABLE_PDL
@@ -1660,6 +1693,22 @@ CUBIN_EXPORT __global__
         }
     }
     __syncthreads();
+
+#if USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+    if (warpIdx.z == 0)
+    {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(80));
+    }
+    else if (warpIdx.z == 1)
+    {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(80));
+    }
+    else
+    {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(80));
+    }
+#endif
+
     uint32_t const nbBarriers = &smem.gemm1WarpGrpBar - &smem.qBar.produced + 1;
     uint32_t const tid = threadIdx.x + blockDim.x * threadIdx.y + blockDim.x * blockDim.y * threadIdx.z;
     assert(nbBarriers <= blockDim.x * blockDim.y * blockDim.z);
@@ -1760,11 +1809,11 @@ CUBIN_EXPORT __global__
             // Add the attention sinks.
             if (attentionSinks != nullptr)
             {
+                float const* const attentionSinksHeadGrp = attentionSinks + headGrpSize * idxHeadGrp;
                 for (uint32_t i = 0; i < headsPerWarp; i++)
                 {
                     uint32_t const idxHead = wid + nbMathWarps * i;
-                    float sink = expf(
-                        attentionSinks[mha::min(idxHead, headGrpSize - 1) + idxHeadGrp * headGrpSize] - states[i].max);
+                    float sink = expf(attentionSinksHeadGrp[idxHead % headGrpSize] - states[i].max);
                     states[i].sum += sink;
                 }
             }
@@ -2689,6 +2738,23 @@ __device__ inline RegRowWiseVec loadShmRowWiseVecWithDup(uint32_t warpRank, ShmQ
     return vec;
 }
 
+__device__ inline RegRowWiseVec loadGmemRowWiseVecCyclically(
+    uint32_t warpRank, ShmQWiseVec const& gmemVec, uint32_t cyclicSize)
+{
+    RegRowWiseVec vec;
+    uint32_t const idxQuad = laneId() / 4;
+#pragma unroll
+    for (uint32_t m = 0; m < RegRowWiseVec::size; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < RegRowWiseVec::Elem::size; i++)
+        {
+            vec[m][i] = gmemVec[(gmma::instM * m + gmma::instM / 4 * warpRank + 8 * i + idxQuad) % cyclicSize];
+        }
+    }
+    return vec;
+}
+
 __device__ void storeShmRowWiseVec(uint32_t warpRank, ShmQWiseVec& smemVec, RegRowWiseVec const& regVec)
 {
     uint32_t const lane = laneId();
@@ -2715,6 +2781,29 @@ __device__ void storeShmRowWiseVec(uint32_t warpRank, ShmQWiseVec& smemVec, RegR
 __device__ inline void storeGemm0AccToShm(
     uint32_t warpRank, uint32_t lane, SharedMem::XBuffer& smemX, CtaBarrier& barConsumed, Gemm0Acc const& acc)
 {
+#if CACHE_ELEM_ENUM == 0
+    uint32_t const idxRow = lane % 8;
+    barConsumed.arrive_and_wait();
+#pragma unroll
+    for (uint32_t m = 0; m < Gemm0Acc::rows; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
+        {
+            static_assert(Gemm0Acc::cols % 4 == 0);
+#pragma unroll
+            for (uint32_t nPartIdx = 0; nPartIdx < Gemm0Acc::cols / 4; nPartIdx++)
+            {
+                Vec<CacheElem, 8> f16data{acc(m, 4 * nPartIdx + 0)(i, 0), acc(m, 4 * nPartIdx + 0)(i, 1),
+                    acc(m, 4 * nPartIdx + 1)(i, 0), acc(m, 4 * nPartIdx + 1)(i, 1), acc(m, 4 * nPartIdx + 2)(i, 0),
+                    acc(m, 4 * nPartIdx + 2)(i, 1), acc(m, 4 * nPartIdx + 3)(i, 0), acc(m, 4 * nPartIdx + 3)(i, 1)};
+                auto const dstAddr = &smemX[m].template at<true>(
+                    gmma::instM * m + 16 * warpRank + 8 * i + idxRow, 4 * nPartIdx + lane / 8);
+                stmatrix<false, 4>(dstAddr, reinterpret_cast<Vec<uint32_t, 4> const&>(f16data));
+            }
+        }
+    }
+#else
     uint32_t const idxMat = lane / 8;
     uint32_t const idxRow = lane % 8;
     barConsumed.arrive_and_wait();
@@ -2737,6 +2826,7 @@ __device__ inline void storeGemm0AccToShm(
                 this_warp(), &smemX[m].template at<true>(16 * warpRank + 8 * i + idxRow, idxMat), fp8Data);
         }
     }
+#endif
 }
 #endif
 
@@ -2778,6 +2868,24 @@ __device__ inline Vec<RegMatAFrag, gemm1NbGmmaInstM> loadVTileTransposed(
 __device__ inline void transposeVTile(
     uint32_t warpRank, uint32_t lane, SharedMem::VTBuffer& dst, SharedMem::VBuffer const& src)
 {
+#if CACHE_ELEM_ENUM == 0
+    uint32_t const idxMat = lane / 8; // only for thread 0-7, 8-15
+    uint32_t const idxRow = lane % 8; // only for thread 0-7, 8-15
+    // todo: change to stmatrix_4x
+    for (uint32_t m = 0; m < exactDiv(SharedMem::VTBuffer::rows, gmma::instM); m++)
+    {
+        uint32_t const idxPart = gmma::instM * m / cacheHeadPartElems;
+        for (uint32_t n = 0; n < SharedMem::VTBuffer::cols; n++)
+        {
+            auto const srcAddr
+                = lane < 16 ? &src[idxPart].template at<true>(warpRank * 16 + 8 * idxMat + idxRow, n) : nullptr;
+            Vec<uint32_t, 2> const a = ldmatrix<true, 2>(srcAddr);
+            auto const dstAddr
+                = lane < 16 ? &dst.template at<true>(m * gmma::instM + n * 8 + idxRow, warpRank * 2 + idxMat) : nullptr;
+            stmatrix<false, 2>(dstAddr, a);
+        }
+    }
+#else
     uint32_t const idxMat = lane / 8;
     uint32_t const idxRow = lane % 8;
 #pragma unroll
@@ -2800,6 +2908,7 @@ __device__ inline void transposeVTile(
                 this_warp(), &dst.template at<true>(gmma::instM * m + 16 * warpRank + 8 * i + idxRow, 2 * n + j), b);
         }
     }
+#endif
 }
 #endif
 
@@ -3162,15 +3271,103 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t wa
 #else
 template <typename DstHead>
 __device__ inline void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst, SharedMem::OutSwizzleBuf& swizzleBuf,
-    Gemm1Acc& acc, float xvoScale, ShmQWiseVec const& accRowSum,
-    uint32_t nbKHeads /* for spec dec. set to 1 for workspace*/, uint32_t ctaNbValidTokens)
+    Gemm1Acc& acc, float xvoScale, ShmQWiseVec const& accRowSum, ShmQWiseVec const& accRowMax,
+    ShmQWiseVec const* attentionSinksVec,
+    uint32_t nbKHeads /* for spec dec and attention sinks. set to 1 for workspace*/, uint32_t ctaNbValidTokens)
 {
-    auto const regRowSum = loadShmRowWiseVecWithDup(warpRank, accRowSum);
+    auto regRowSum = loadShmRowWiseVecWithDup(warpRank, accRowSum);
+    if (attentionSinksVec != nullptr)
+    {
+        auto const regRowMax = loadShmRowWiseVecWithDup(warpRank, accRowMax);
+        auto const regAttentionSinks = loadGmemRowWiseVecCyclically(warpRank, attentionSinksVec[0], headGrpSize);
+        auto const regRowSinks = expf(regAttentionSinks - regRowMax);
+        regRowSum = regRowSum + regRowSinks;
+    }
     auto const regOutScale = __frcp_rn(regRowSum) * xvoScale;
     rescaleAcc(acc, regOutScale);
 
     using DstElem = typename DstHead::Elem;
     auto const lane = laneId();
+
+#if CACHE_ELEM_ENUM == 0
+    uint32_t const idxRow = lane % 8;
+#pragma unroll
+    for (uint32_t m = 0; m < Gemm1Acc::rows; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
+        {
+            static_assert(Gemm1Acc::cols % 4 == 0);
+#pragma unroll
+            for (uint32_t nPartIdx = 0; nPartIdx < Gemm1Acc::cols / 4; nPartIdx++)
+            {
+                Vec<DstElem, 8> data = convert<DstElem>(Vec<float, 8>{acc(m, 4 * nPartIdx + 0)(i, 0),
+                    acc(m, 4 * nPartIdx + 0)(i, 1), acc(m, 4 * nPartIdx + 1)(i, 0), acc(m, 4 * nPartIdx + 1)(i, 1),
+                    acc(m, 4 * nPartIdx + 2)(i, 0), acc(m, 4 * nPartIdx + 2)(i, 1), acc(m, 4 * nPartIdx + 3)(i, 0),
+                    acc(m, 4 * nPartIdx + 3)(i, 1)});
+                auto const dstAddr = &swizzleBuf.template at<true>(
+                    gmma::instM * m + 16 * warpRank + 8 * i + idxRow, 4 * nPartIdx + lane / 8);
+                stmatrix<false, 4>(
+                    dstAddr, reinterpret_cast<Vec<uint32_t, exactDiv(sizeof(data), sizeof(uint32_t))> const&>(data));
+            }
+        }
+    }
+    __syncwarp();
+
+#pragma unroll
+    for (uint32_t m = 0; m < Gemm1Acc::rows; m++)
+    {
+        constexpr uint32_t srcHeadBytes = sizeof(DstElem) * headElems;
+        constexpr uint32_t grpSize = exactDiv(srcHeadBytes, grainBytes);
+        constexpr uint32_t nbGrps = exactDiv(warp_size, grpSize);
+        uint32_t const idxGrp = lane / grpSize;
+        constexpr uint32_t grainsPerAtom = exactDiv(sizeof(SharedMem::OutSwizzleBuf::Elem), grainBytes);
+        uint32_t const rowBase = gmma::instM * m + 16 * warpRank;
+        constexpr uint32_t totalNbGrains = grainsPerAtom * Gemm1Acc::cols * 16;
+        uint32_t const nbIters = divUp(totalNbGrains, nbGrps);
+        constexpr bool wholeIters = (totalNbGrains % nbGrps == 0);
+        constexpr bool wholeHeads = (validElemsPerHead == headElems);
+#pragma unroll
+        for (uint32_t iter = 0; iter < nbIters; iter++)
+        {
+            uint32_t const idxGrain = nbGrps * iter + idxGrp;
+            constexpr uint32_t grainsPerSrcHead = exactDiv(srcHeadBytes, grainBytes);
+            uint32_t const r = idxGrain / grainsPerSrcHead;
+            if (!wholeIters && r >= 16)
+            {
+                break;
+            }
+            uint32_t const cGrain = idxGrain % grainsPerSrcHead;
+            uint32_t const cAtom = cGrain / grainsPerAtom;
+            constexpr uint32_t grainsPerDstHead = exactDiv(sizeof(DstHead), grainBytes);
+            uint32_t const glbRow = gmma::instM * m + 16 * warpRank + r;
+            if (ctaNbValidQHeads != ctaNbQHeads && glbRow >= ctaNbValidQHeads)
+            {
+                break;
+            }
+            if (wholeHeads || cGrain < grainsPerDstHead)
+            {
+                uint32_t const srcRow = rowBase + r;
+                auto const data
+                    = reinterpret_cast<LdGrain(&)[grainsPerAtom]>(swizzleBuf.template at<true>(srcRow, cGrain))[0];
+#if SPEC_DEC
+                static_assert(beamWidth == 1);
+                uint32_t const idxToken = srcRow / headGrpSize; // inside CTA
+                if (idxToken >= ctaNbValidTokens)
+                {
+                    break;
+                }
+                uint32_t const tokenPad = headGrpSize * (nbKHeads - 1);
+                uint32_t const dstRow = srcRow + idxToken * tokenPad;
+#else
+                uint32_t const dstRow = srcRow;
+#endif
+                reinterpret_cast<LdGrain(&)[grainsPerDstHead]>(dst[dstRow])[cGrain] = data;
+            }
+        }
+    }
+
+#else
     uint32_t const idxQuad = lane / 4;
     uint32_t const idxInQuad = lane % 4;
     using Atom = Vec<Vec<DstElem, 4>, 4>;
@@ -3253,6 +3450,7 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst,
             }
         }
     }
+#endif
 }
 #endif
 
@@ -3462,7 +3660,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #else
     InputHead const* q,
 #endif
-    float const* attentionSinks, // [headGrpSize]
+    float const* attentionSinks, // [nbKHeads][headGrpSize]
 #if USE_PAGED_KV_CACHE
 #if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
