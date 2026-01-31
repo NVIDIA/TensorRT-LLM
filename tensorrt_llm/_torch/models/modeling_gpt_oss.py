@@ -39,6 +39,8 @@ from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+# Enable TinyGEMM optimization (disabled by default, set ENABLE_TINYGEMM=1 to enable)
+ENABLE_TINYGEMM = os.environ.get('ENABLE_TINYGEMM', '0') == '1'
 
 
 class AttentionBlock(Attention):
@@ -226,7 +228,7 @@ class MLPBlock(torch.nn.Module):
             dtype=pretrained_config.torch_dtype)
 
     def compute_gate_output(self, x: torch.Tensor) -> torch.Tensor:
-        if get_sm_version() in [
+        if ENABLE_TINYGEMM and get_sm_version() in [
                 90, 100, 103
         ] and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
             weight = self.gate.weight
