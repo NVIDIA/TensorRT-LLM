@@ -12,6 +12,11 @@ from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.llm_args import *
+from tensorrt_llm.llmapi.llm_utils import (apply_model_defaults_to_llm_args,
+                                           compute_applied_llm_defaults,
+                                           extract_llm_args_overrides,
+                                           merge_llm_configs_with_defaults,
+                                           validate_model_defaults)
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.plugin import PluginConfig
 
@@ -1095,8 +1100,6 @@ class TestServeDefaults:
             None),
     ])
 def test_model_defaults_validation(defaults_dict, should_raise, error_contains):
-    from tensorrt_llm.llmapi.llm_args import validate_model_defaults
-
     # Use a dummy model path for testing (doesn't need to exist for validation)
     llm_args = TorchLlmArgs(model="/tmp/dummy_model_for_validation_test")
 
