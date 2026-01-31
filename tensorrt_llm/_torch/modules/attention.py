@@ -2,7 +2,7 @@ import functools
 import math
 import os
 import weakref
-from typing import List, Optional, Union, cast
+from typing import List, Optional, Tuple, Union, cast
 
 import torch
 from torch import nn
@@ -2583,6 +2583,96 @@ class MLA(nn.Module):
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
         return output
 
+    def _needs_cp_reduce_scatter(self) -> bool:
+        """Check if we should use CP reduce-scatter instead of AllReduce."""
+        return (self.mapping.has_cp_helix()
+                and self.mapping.enable_attention_dp)
+
+    def _maybe_allgather_input(
+            self, hidden_states: torch.Tensor,
+            attn_metadata: AttentionMetadata) -> torch.Tensor:
+        """AllGather input hidden states from CP group if needed.
+
+        For the first layer (Embed -> Attn), all CP ranks already have the
+        full input, so this is a no-op. For subsequent layers, the previous
+        layer's reduce-scatter left each rank with a portion that must be
+        reconstructed before attention.
+        """
+        if self._needs_cp_reduce_scatter() and self.layer_idx > 0:
+            hidden_states = cp_allgather(hidden_states, self.mapping, dim=0)
+            # Remove padding introduced by reduce-scatter alignment.
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+        return hidden_states
+
+    def _pad_for_cp(self, tensor: torch.Tensor,
+                    num_tokens: int) -> Tuple[torch.Tensor, int]:
+        """Pad tensor along dim-0 so its length is divisible by cp_size.
+
+        Returns the (possibly padded) tensor and the per-rank chunk size.
+        """
+        cp_size = self.mapping.cp_size
+        chunk_size = math.ceil(num_tokens / cp_size)
+        padded_size = chunk_size * cp_size
+
+        if num_tokens < padded_size:
+            pad = tensor.new_zeros(padded_size - num_tokens, tensor.shape[1])
+            tensor = torch.cat([tensor, pad], dim=0)
+
+        return tensor, chunk_size
+
+    def _slice_for_cp(self, tensor: torch.Tensor,
+                      attn_metadata: AttentionMetadata) -> torch.Tensor:
+        """Slice a tensor to this CP rank's chunk, matching post-RS size.
+
+        Used for the first layer's residual: since there is no prior RS to
+        divide it, we manually extract this rank's portion so it aligns with
+        the reduce-scattered attention output.
+        """
+        tensor, chunk_size = self._pad_for_cp(tensor, attn_metadata.num_tokens)
+        start = self.mapping.cp_rank * chunk_size
+        return tensor[start:start + chunk_size]
+
+    def _output_projection(
+        self,
+        attn_output: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply output projection (o_proj) and reduce across parallel ranks.
+
+        With CP reduce-scatter, o_proj produces partial sums (each CP rank
+        contributes from its head partition). Reduce-scatter sums these
+        and divides the result among CP ranks for subsequent MoE processing.
+        Otherwise, o_proj uses the standard AllReduce path.
+
+        The residual is passed through unchanged unless this is the first
+        layer with CP reduce-scatter, in which case it is sliced to match
+        the post-RS token count.
+        """
+        if self._needs_cp_reduce_scatter():
+            # Skip AllReduce in o_proj; use reduce-scatter instead.
+            attn_output = self.o_proj(
+                attn_output,
+                all_reduce_params=AllReduceParams(enable_allreduce=False))
+
+            # Pad to make token count divisible by cp_size for reduce-scatter.
+            attn_output, _ = self._pad_for_cp(attn_output,
+                                              attn_metadata.num_tokens)
+
+            # Reduce-scatter using mapping_o where tp_group = cp_group.
+            attn_output = reducescatter(attn_output, self.mapping_o, dim=0)
+
+            # For the first layer, the residual comes from the embedding and
+            # has not been through a prior RS. Slice it to match.
+            if self.layer_idx == 0:
+                residual = self._slice_for_cp(residual, attn_metadata)
+        else:
+            attn_output = self.o_proj(attn_output,
+                                      all_reduce_params=all_reduce_params)
+
+        return attn_output, residual
+
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2590,7 +2680,11 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        residual: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        hidden_states = self._maybe_allgather_input(hidden_states,
+                                                    attn_metadata)
 
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)

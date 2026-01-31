@@ -239,10 +239,11 @@ class Eagle3DecoderLayer(DecoderLayer):
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
-        hidden_states = self.self_attn(
+        hidden_states, residual = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            residual=residual,
         )
 
         hidden_states, residual = self.post_attention_layernorm(
