@@ -1,7 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import inspect
 import os
 from functools import cached_property
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -10,6 +25,7 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
@@ -60,6 +76,88 @@ class TRTLLMGenFusedMoE(MoE):
     Expert is the concept from model's perspective while slot is the concept from model engine's perspective.
     There should be at lease `num_experts` slots in the model engine. More than that is OK, in that case, some experts may have multiple replicas.
     """
+
+    # Supported quantization algorithms for TRTLLMGenFusedMoE
+    _SUPPORTED_QUANT_ALGOS = {
+        QuantAlgo.NVFP4,
+        QuantAlgo.FP8_BLOCK_SCALES,
+        QuantAlgo.W4A8_NVFP4_FP8,
+        QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    }
+
+    # Quantization algorithms that support gptoss_style
+    _GPTOSS_SUPPORTED_ALGOS = {
+        QuantAlgo.NVFP4,
+        QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    }
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if TRTLLMGenFusedMoE can implement the given quantization algorithm.
+
+        TRTLLMGenFusedMoE only supports SM in {100, 103} and the following quantizations:
+        - NVFP4
+        - FP8_BLOCK_SCALES
+        - W4A8_NVFP4_FP8
+        - W4A16_MXFP4
+        - W4A8_MXFP4_FP8
+        - W4A8_MXFP4_MXFP8
+
+        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation input data type. Only bfloat16 is supported.
+                See: forward_impl() assert x.dtype == torch.bfloat16 (line 722).
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                Only supported for nvfp4 and mxfp4 variants.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        # TRTLLMGenFusedMoE requires SM in {100, 103}
+        if sm_version not in {100, 103}:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
+            )
+
+        # Check dtype_activation: only bfloat16 is supported
+        if dtype_activation != torch.bfloat16:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE only supports bfloat16 activation, got {dtype_activation}"
+            )
+
+        # TRTLLMGenFusedMoE does NOT support unquantized mode
+        if quant_algo is None:
+            return _warn_and_return(
+                "TRTLLMGenFusedMoE does not support unquantized mode")
+
+        # Check if quant_algo is supported
+        if quant_algo not in cls._SUPPORTED_QUANT_ALGOS:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE does not support quant_algo={quant_algo}")
+
+        # Check gptoss_style support: only supported for nvfp4 and mxfp4 variants
+        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE supports gptoss_style (bias/swiglu) only for nvfp4 and mxfp4 variants, "
+                f"got quant_algo={quant_algo}")
+
+        return True, None
 
     def __init__(
         self,

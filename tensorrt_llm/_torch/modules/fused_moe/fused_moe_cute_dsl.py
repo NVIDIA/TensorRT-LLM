@@ -4,7 +4,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
@@ -311,6 +312,69 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
     """
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if CuteDslFusedMoE can implement the given quantization algorithm.
+
+        CuteDslFusedMoE supports:
+        - NVFP4: SM in {100, 103}
+
+        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
+        Does NOT support gptoss_style (bias/swiglu with custom alpha/beta/limit).
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation input data type. Only bfloat16 is supported
+                because output dtype is hardcoded to bfloat16 (input/output dtype must match).
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CuteDslFusedMoE does NOT support gptoss_style.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        # CuteDslFusedMoE requires at least SM90
+        if sm_version < 90:
+            return _warn_and_return(
+                f"CuteDslFusedMoE requires SM >= 90, got SM{sm_version}")
+
+        # Check dtype_activation: output is hardcoded to bfloat16, so input must also be bfloat16
+        # to maintain input/output dtype consistency
+        if dtype_activation != torch.bfloat16:
+            return _warn_and_return(
+                f"CuteDslFusedMoE only supports bfloat16 activation (output is hardcoded to bfloat16), "
+                f"got {dtype_activation}")
+
+        # CuteDslFusedMoE does NOT support unquantized mode
+        if quant_algo is None:
+            return _warn_and_return(
+                "CuteDslFusedMoE does not support unquantized mode")
+
+        # CuteDslFusedMoE does NOT support gptoss_style
+        if gptoss_style:
+            return _warn_and_return(
+                "CuteDslFusedMoE does not support gptoss_style (bias/swiglu with custom alpha/beta/limit)"
+            )
+
+        # NVFP4 - SM in {100, 103}
+        if quant_algo == QuantAlgo.NVFP4:
+            if sm_version not in {100, 103}:
+                return _warn_and_return(
+                    f"NVFP4 requires SM100 or SM103, got SM{sm_version}")
+            return True, None
+
+        return _warn_and_return(
+            f"CuteDslFusedMoE does not support quant_algo={quant_algo}")
 
     def __init__(
         self,

@@ -7,7 +7,30 @@ from typing import Dict, List, Optional, Tuple, Union, final
 import torch
 from torch import nn
 
+from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
+
 from ...distributed.ops import reducescatter
+
+
+def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
+    """
+    Log a warning and return (False, reason) for can_implement() checks.
+
+    This is a common utility function used by all MoE backend implementations
+    to provide consistent logging and return values when a configuration
+    is not supported.
+
+    Args:
+        reason: The reason why the configuration is not supported.
+
+    Returns:
+        Tuple[bool, Optional[str]]: Always returns (False, reason)
+    """
+    logger.warning(reason)
+    return False, reason
+
+
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
@@ -128,6 +151,40 @@ class MoE(nn.Module):
         model_config (ModelConfig): Configuration object for the model.
         aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
     """
+
+    @classmethod
+    @abstractmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if this MoE backend can implement the given quantization algorithm.
+
+        NOTE: This is a TRANSITIONAL interface. In the future, this method will be moved
+        to the MoEBackend interface as part of the backend abstraction layer. During this
+        transition period, it remains in the MoE base class to maintain compatibility.
+
+        This method checks both:
+        1. Whether the backend supports the specified quantization algorithm
+        2. Whether the current platform (SM version) supports the backend and quantization
+
+        Each backend MUST override this method to provide accurate capability information.
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation data type.
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+                - can_implement: True if the backend can implement this configuration
+                - skip_reason: None if can_implement is True, otherwise a string explaining why not
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} must implement can_implement method")
 
     def __init__(
         self,
