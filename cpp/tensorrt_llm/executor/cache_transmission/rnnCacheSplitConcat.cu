@@ -71,13 +71,13 @@ __device__ __forceinline__ void getLayerIdInDomainPPandRankInDomainPP(int layerI
 /**
  * @brief Kernel to split RNN conv state from source TP to destination TP
  *
- * Input:  [numLayers, convDimLocal, dConv-1] per block
+ * Input:  [numLayers, maxBatchSize, convDim, dConv-1] per block
  * Output: Split across different TP ranks based on destCacheState
  */
 template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void splitRnnConvStateKernel(T const** __restrict__ inputConvBlocks, T** __restrict__ outputCaches,
-    int convDimLocal, int dConvMinus1, int numLayers, int inputBlockNum, int domainPPSize, int convDimDomainTP,
-    uint64_t* prefixLayerNumDevPtr)
+    int const slotIdx, int const maxBatchSize, int convDimLocal, int dConvMinus1, int numLayers, int inputBlockNum,
+    int domainPPSize, int convDimDomainTP, uint64_t* prefixLayerNumDevPtr)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
     int const laneId = threadIdx.x % subWarpSize;
@@ -102,7 +102,10 @@ __global__ void splitRnnConvStateKernel(T const** __restrict__ inputConvBlocks, 
             for (int convDimId = subWarpId; convDimId < convDimLocal; convDimId += subWarpNum)
             {
                 T const* inputBlockPtr = inputConvBlocks[blockId];
-                T const* inputPtr = inputBlockPtr + layerId * convDimLocal * dConvMinus1 + convDimId * dConvMinus1;
+                int64_t batchStride = static_cast<int64_t>(convDimLocal) * dConvMinus1;
+                int64_t layerStride = static_cast<int64_t>(batchStride) * maxBatchSize;
+                T const* inputPtr
+                    = inputBlockPtr + layerId * layerStride + slotIdx * batchStride + convDimId * dConvMinus1;
 
                 int outputCacheIdx = convDimId / convDimDomainTP * domainPPSize + rankInDomainPP;
                 T* outputCachePtr = outputCaches[outputCacheIdx];
@@ -128,13 +131,13 @@ __global__ void splitRnnConvStateKernel(T const** __restrict__ inputConvBlocks, 
 /**
  * @brief Kernel to split RNN SSM state from source TP to destination TP
  *
- * Input:  [numLayers, numHeadsLocal, headDim, dState] per block
+ * Input:  [numLayers, maxBatchSize, numHeads, headDim, dState] per block
  * Output: Split across different TP ranks based on destCacheState
  */
 template <typename T, int subWarpSize, int subWarpNumInGroup, int vecSizeByte>
 __global__ void splitRnnSsmStateKernel(T const** __restrict__ inputSsmBlocks, T** __restrict__ outputCaches,
-    int numHeadsLocal, int headDim, int dState, int numLayers, int inputBlockNum, int domainPPSize, int headNumDomainTP,
-    uint64_t* prefixLayerNumDevPtr)
+    int const slotIdx, int const maxBatchSize, int numHeadsLocal, int headDim, int dState, int numLayers,
+    int inputBlockNum, int domainPPSize, int headNumDomainTP, uint64_t* prefixLayerNumDevPtr)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
     int const laneId = threadIdx.x % subWarpSize;
@@ -164,8 +167,10 @@ __global__ void splitRnnSsmStateKernel(T const** __restrict__ inputSsmBlocks, T*
             for (int headId = subWarpGroupId; headId < numHeadsLocal; headId += subWarpGroupNum)
             {
                 T const* inputBlockPtr = inputSsmBlocks[blockId];
+                int64_t batchStride = static_cast<int64_t>(numHeadsLocal) * headDimTimesDState;
+                int64_t layerStride = static_cast<int64_t>(batchStride) * maxBatchSize;
                 T const* inputPtr
-                    = inputBlockPtr + layerId * numHeadsLocal * headDimTimesDState + headId * headDimTimesDState;
+                    = inputBlockPtr + layerId * layerStride + slotIdx * batchStride + headId * headDimTimesDState;
 
                 int outputCacheIdx = headId / headNumDomainTP * domainPPSize + rankInDomainPP;
                 T* outputCachePtr = outputCaches[outputCacheIdx];
@@ -193,12 +198,12 @@ __global__ void splitRnnSsmStateKernel(T const** __restrict__ inputSsmBlocks, T*
  * @brief Kernel to concat RNN conv state from multiple sources to destination TP
  *
  * Input:  Split across different source TP ranks
- * Output: [numLayers, convDimLocal, dConv-1] per block
+ * Output: [numLayers, maxBatchSize, convDimLocal, dConv-1] per block
  */
 template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void concatRnnConvStateKernel(T const** __restrict__ inputCaches, T** __restrict__ outputConvBlocks,
-    int convDimLocal, int dConvMinus1, int numLayers, int outputBlockNum, int domainPPSize, int convDimDomainTP,
-    uint64_t* prefixLayerNumDevPtr)
+    int const slotIdx, int const maxBatchSize, int convDimLocal, int dConvMinus1, int numLayers, int outputBlockNum,
+    int domainPPSize, int convDimDomainTP, uint64_t* prefixLayerNumDevPtr)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
     int const laneId = threadIdx.x % subWarpSize;
@@ -223,7 +228,9 @@ __global__ void concatRnnConvStateKernel(T const** __restrict__ inputCaches, T**
             for (int convDimId = subWarpId; convDimId < convDimLocal; convDimId += subWarpNum)
             {
                 T* outputBlockPtr = outputConvBlocks[blockId];
-                T* outputPtr = outputBlockPtr + layerId * convDimLocal * dConvMinus1 + convDimId * dConvMinus1;
+                int64_t batchStride = static_cast<int64_t>(convDimLocal) * dConvMinus1;
+                int64_t layerStride = static_cast<int64_t>(batchStride) * maxBatchSize;
+                T* outputPtr = outputBlockPtr + layerId * layerStride + slotIdx * batchStride + convDimId * dConvMinus1;
 
                 int inputCacheIdx = convDimId / convDimDomainTP * domainPPSize + rankInDomainPP;
                 int convDimIdInDomainTP = convDimId % convDimDomainTP;
@@ -249,12 +256,12 @@ __global__ void concatRnnConvStateKernel(T const** __restrict__ inputCaches, T**
  * @brief Kernel to concat RNN SSM state from multiple sources to destination TP
  *
  * Input:  Split across different source TP ranks
- * Output: [numLayers, numHeadsLocal, headDim, dState] per block
+ * Output: [numLayers, maxBatchSize, numHeadsLocal, headDim, dState] per block
  */
 template <typename T, int subWarpSize, int subWarpNumInGroup, int vecSizeByte>
 __global__ void concatRnnSsmStateKernel(T const** __restrict__ inputCaches, T** __restrict__ outputSsmBlocks,
-    int numHeadsLocal, int headDim, int dState, int numLayers, int outputBlockNum, int domainPPSize,
-    int headNumDomainTP, uint64_t* prefixLayerNumDevPtr)
+    int const slotIdx, int const maxBatchSize, int numHeadsLocal, int headDim, int dState, int numLayers,
+    int outputBlockNum, int domainPPSize, int headNumDomainTP, uint64_t* prefixLayerNumDevPtr)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
     int const subWarpNum = blockDim.x / subWarpSize;
@@ -283,8 +290,10 @@ __global__ void concatRnnSsmStateKernel(T const** __restrict__ inputCaches, T** 
             for (int headId = subWarpGroupId; headId < numHeadsLocal; headId += subWarpGroupNum)
             {
                 T* outputBlockPtr = outputSsmBlocks[blockId];
+                int64_t batchStride = static_cast<int64_t>(numHeadsLocal) * headDimTimesDState;
+                int64_t layerStride = static_cast<int64_t>(batchStride) * maxBatchSize;
                 T* outputPtr
-                    = outputBlockPtr + layerId * numHeadsLocal * headDimTimesDState + headId * headDimTimesDState;
+                    = outputBlockPtr + layerId * layerStride + slotIdx * batchStride + headId * headDimTimesDState;
 
                 int inputCacheIdx = headId / headNumDomainTP * domainPPSize + rankInDomainPP;
                 int headIdInDomainTP = headId % headNumDomainTP;
@@ -308,7 +317,8 @@ __global__ void concatRnnSsmStateKernel(T const** __restrict__ inputCaches, T** 
 
 template <typename T>
 void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConvBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, rnn_cache::RnnCacheState const& destCacheState,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, rnn_cache::RnnCacheState const& destCacheState,
     rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputConvBlocks.empty());
@@ -403,15 +413,15 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
     case 0:
     {
         splitRnnConvStateKernel<T, subWarpSize, 16><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-            inputConvPtrsDev, outputCachePtrsDev, convDimLocal, dConvMinus1, numLayers, inputBlockNum, domainPPSize,
-            convDimDomainTP, prefixLayerNumDevPtr);
+            inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+            inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
         break;
     }
     case 8:
     {
         splitRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-            inputConvPtrsDev, outputCachePtrsDev, convDimLocal, dConvMinus1, numLayers, inputBlockNum, domainPPSize,
-            convDimDomainTP, prefixLayerNumDevPtr);
+            inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+            inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
         break;
     }
     case 4:
@@ -420,8 +430,8 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
         if constexpr (sizeof(T) <= 4)
         {
             splitRnnConvStateKernel<T, subWarpSize, 4><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-                inputConvPtrsDev, outputCachePtrsDev, convDimLocal, dConvMinus1, numLayers, inputBlockNum, domainPPSize,
-                convDimDomainTP, prefixLayerNumDevPtr);
+                inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+                inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
             break;
         }
     }
@@ -429,8 +439,8 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
     {
         // For 8-byte types or unhandled remainders, use 8-byte vectorization
         splitRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-            inputConvPtrsDev, outputCachePtrsDev, convDimLocal, dConvMinus1, numLayers, inputBlockNum, domainPPSize,
-            convDimDomainTP, prefixLayerNumDevPtr);
+            inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+            inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
         break;
     }
     }
@@ -440,9 +450,9 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
 
 template <typename T>
 void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, size_t convBytesPerLayer,
-    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager)
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
+    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSsmBlocks.empty());
 
@@ -534,16 +544,16 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
     case 0:
     {
         splitRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 16>
-            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev,
-                numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev, slotIdx,
+                maxBatchSize, numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
                 prefixLayerNumDevPtr);
         break;
     }
     case 8:
     {
         splitRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 8>
-            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev,
-                numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev, slotIdx,
+                maxBatchSize, numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
                 prefixLayerNumDevPtr);
         break;
     }
@@ -554,8 +564,8 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
         {
             splitRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 4>
                 <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev,
-                    numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
-                    prefixLayerNumDevPtr);
+                    slotIdx, maxBatchSize, numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize,
+                    headNumDomainTP, prefixLayerNumDevPtr);
             break;
         }
     }
@@ -563,8 +573,8 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
     {
         // For 8-byte types or unhandled remainders, use 8-byte vectorization
         splitRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 8>
-            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev,
-                numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputSsmPtrsDev, outputCachePtrsDev, slotIdx,
+                maxBatchSize, numHeadsLocal, headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP,
                 prefixLayerNumDevPtr);
         break;
     }
@@ -574,8 +584,9 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
 
 template <typename T>
 void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, rnn_cache::RnnCacheState const& destCacheState,
-    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, SizeType32 const slotIdx, SizeType32 const maxBatchSize,
+    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
+    runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
     TLLM_CHECK(!outputConvBlocks.empty());
@@ -654,15 +665,15 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     case 0:
     {
         concatRnnConvStateKernel<T, subWarpSize, 16><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-            inputCachePtrsDev, outputConvPtrsDev, convDimLocal, dConvMinus1, numLayers, outputBlockNum, domainPPSize,
-            convDimDomainTP, prefixLayerNumDevPtr);
+            inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+            outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
         break;
     }
     case 8:
     {
         concatRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-            inputCachePtrsDev, outputConvPtrsDev, convDimLocal, dConvMinus1, numLayers, outputBlockNum, domainPPSize,
-            convDimDomainTP, prefixLayerNumDevPtr);
+            inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+            outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
         break;
     }
     case 4:
@@ -671,8 +682,8 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
         if constexpr (sizeof(T) <= 4)
         {
             concatRnnConvStateKernel<T, subWarpSize, 4><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-                inputCachePtrsDev, outputConvPtrsDev, convDimLocal, dConvMinus1, numLayers, outputBlockNum,
-                domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
+                inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+                outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
             break;
         }
     }
@@ -680,8 +691,8 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     {
         // For 8-byte types or unhandled remainders, use 8-byte vectorization
         concatRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-            inputCachePtrsDev, outputConvPtrsDev, convDimLocal, dConvMinus1, numLayers, outputBlockNum, domainPPSize,
-            convDimDomainTP, prefixLayerNumDevPtr);
+            inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+            outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
         break;
     }
     }
@@ -691,9 +702,9 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
 
 template <typename T>
 void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, size_t convBytesPerLayer,
-    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager)
+    std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, SizeType32 const slotIdx, SizeType32 const maxBatchSize,
+    size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
+    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
     TLLM_CHECK(!outputSsmBlocks.empty());
@@ -784,16 +795,16 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
     case 0:
     {
         concatRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 16>
-            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev,
-                numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev, slotIdx,
+                maxBatchSize, numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
                 prefixLayerNumDevPtr);
         break;
     }
     case 8:
     {
         concatRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 8>
-            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev,
-                numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev, slotIdx,
+                maxBatchSize, numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
                 prefixLayerNumDevPtr);
         break;
     }
@@ -804,8 +815,8 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
         {
             concatRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 4>
                 <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev,
-                    numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
-                    prefixLayerNumDevPtr);
+                    slotIdx, maxBatchSize, numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize,
+                    headNumDomainTP, prefixLayerNumDevPtr);
             break;
         }
     }
@@ -813,8 +824,8 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
     {
         // For 8-byte types or unhandled remainders, use 8-byte vectorization
         concatRnnSsmStateKernel<T, subWarpSize, subWarpNumInGroup, 8>
-            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev,
-                numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputCachePtrsDev, outputSsmPtrsDev, slotIdx,
+                maxBatchSize, numHeadsLocal, headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP,
                 prefixLayerNumDevPtr);
         break;
     }
@@ -824,7 +835,8 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
 }
 
 void splitRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputConvBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, rnn_cache::RnnCacheState const& destCacheState,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, rnn_cache::RnnCacheState const& destCacheState,
     rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputConvBlocks.empty());
@@ -834,29 +846,29 @@ void splitRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& i
     switch (dataSize)
     {
     case 8:
-        splitRnnConvState<int64_t>(
-            inputConvBlocks, outputSplitBlocks, destCacheState, selfCacheState, selfIdx, bufferManager);
+        splitRnnConvState<int64_t>(inputConvBlocks, outputSplitBlocks, slotIdx, maxBatchSize, destCacheState,
+            selfCacheState, selfIdx, bufferManager);
         break;
     case 4:
-        splitRnnConvState<int32_t>(
-            inputConvBlocks, outputSplitBlocks, destCacheState, selfCacheState, selfIdx, bufferManager);
+        splitRnnConvState<int32_t>(inputConvBlocks, outputSplitBlocks, slotIdx, maxBatchSize, destCacheState,
+            selfCacheState, selfIdx, bufferManager);
         break;
     case 2:
-        splitRnnConvState<int16_t>(
-            inputConvBlocks, outputSplitBlocks, destCacheState, selfCacheState, selfIdx, bufferManager);
+        splitRnnConvState<int16_t>(inputConvBlocks, outputSplitBlocks, slotIdx, maxBatchSize, destCacheState,
+            selfCacheState, selfIdx, bufferManager);
         break;
     case 1:
-        splitRnnConvState<int8_t>(
-            inputConvBlocks, outputSplitBlocks, destCacheState, selfCacheState, selfIdx, bufferManager);
+        splitRnnConvState<int8_t>(inputConvBlocks, outputSplitBlocks, slotIdx, maxBatchSize, destCacheState,
+            selfCacheState, selfIdx, bufferManager);
         break;
     default: TLLM_THROW("splitRnnConvStateDispatch: unsupported data type");
     }
 }
 
 void splitRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, size_t convBytesPerLayer,
-    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager)
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
+    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSsmBlocks.empty());
     auto dataType = inputSsmBlocks.front()->getDataType();
@@ -865,27 +877,59 @@ void splitRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& in
     switch (dataSize)
     {
     case 8:
-        splitRnnSsmState<int64_t>(inputSsmBlocks, outputSplitBlocks, convBytesPerLayer, destCacheState, selfCacheState,
-            selfIdx, bufferManager);
+        splitRnnSsmState<int64_t>(inputSsmBlocks, outputSplitBlocks, slotIdx, maxBatchSize, convBytesPerLayer,
+            destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     case 4:
-        splitRnnSsmState<int32_t>(inputSsmBlocks, outputSplitBlocks, convBytesPerLayer, destCacheState, selfCacheState,
-            selfIdx, bufferManager);
+        splitRnnSsmState<int32_t>(inputSsmBlocks, outputSplitBlocks, slotIdx, maxBatchSize, convBytesPerLayer,
+            destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     case 2:
-        splitRnnSsmState<int16_t>(inputSsmBlocks, outputSplitBlocks, convBytesPerLayer, destCacheState, selfCacheState,
-            selfIdx, bufferManager);
+        splitRnnSsmState<int16_t>(inputSsmBlocks, outputSplitBlocks, slotIdx, maxBatchSize, convBytesPerLayer,
+            destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     case 1:
-        splitRnnSsmState<int8_t>(inputSsmBlocks, outputSplitBlocks, convBytesPerLayer, destCacheState, selfCacheState,
-            selfIdx, bufferManager);
+        splitRnnSsmState<int8_t>(inputSsmBlocks, outputSplitBlocks, slotIdx, maxBatchSize, convBytesPerLayer,
+            destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     default: TLLM_THROW("splitRnnSsmStateDispatch: unsupported data type");
     }
 }
 
 void concatRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, rnn_cache::RnnCacheState const& destCacheState,
+    std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, SizeType32 const slotIdx, SizeType32 const maxBatchSize,
+    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
+    runtime::BufferManager const& bufferManager)
+{
+    TLLM_CHECK(!inputSplitBlocks.empty());
+    auto dataType = inputSplitBlocks.front()->getDataType();
+    auto dataSize = tensorrt_llm::common::getDTypeSize(dataType);
+
+    switch (dataSize)
+    {
+    case 8:
+        concatRnnConvState<int64_t>(inputSplitBlocks, outputConvBlocks, slotIdx, maxBatchSize, destCacheState,
+            selfCacheState, selfIdx, bufferManager);
+        break;
+    case 4:
+        concatRnnConvState<int32_t>(inputSplitBlocks, outputConvBlocks, slotIdx, maxBatchSize, destCacheState,
+            selfCacheState, selfIdx, bufferManager);
+        break;
+    case 2:
+        concatRnnConvState<int16_t>(inputSplitBlocks, outputConvBlocks, slotIdx, maxBatchSize, destCacheState,
+            selfCacheState, selfIdx, bufferManager);
+        break;
+    case 1:
+        concatRnnConvState<int8_t>(inputSplitBlocks, outputConvBlocks, slotIdx, maxBatchSize, destCacheState,
+            selfCacheState, selfIdx, bufferManager);
+        break;
+    default: TLLM_THROW("concatRnnConvStateDispatch: unsupported data type");
+    }
+}
+
+void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, SizeType32 const slotIdx, SizeType32 const maxBatchSize,
+    size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
     rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
@@ -895,51 +939,20 @@ void concatRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& 
     switch (dataSize)
     {
     case 8:
-        concatRnnConvState<int64_t>(
-            inputSplitBlocks, outputConvBlocks, destCacheState, selfCacheState, selfIdx, bufferManager);
+        concatRnnSsmState<int64_t>(inputSplitBlocks, outputSsmBlocks, slotIdx, maxBatchSize, convBytesPerLayer,
+            destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     case 4:
-        concatRnnConvState<int32_t>(
-            inputSplitBlocks, outputConvBlocks, destCacheState, selfCacheState, selfIdx, bufferManager);
+        concatRnnSsmState<int32_t>(inputSplitBlocks, outputSsmBlocks, slotIdx, maxBatchSize, convBytesPerLayer,
+            destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     case 2:
-        concatRnnConvState<int16_t>(
-            inputSplitBlocks, outputConvBlocks, destCacheState, selfCacheState, selfIdx, bufferManager);
+        concatRnnSsmState<int16_t>(inputSplitBlocks, outputSsmBlocks, slotIdx, maxBatchSize, convBytesPerLayer,
+            destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     case 1:
-        concatRnnConvState<int8_t>(
-            inputSplitBlocks, outputConvBlocks, destCacheState, selfCacheState, selfIdx, bufferManager);
-        break;
-    default: TLLM_THROW("concatRnnConvStateDispatch: unsupported data type");
-    }
-}
-
-void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, size_t convBytesPerLayer,
-    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager)
-{
-    TLLM_CHECK(!inputSplitBlocks.empty());
-    auto dataType = inputSplitBlocks.front()->getDataType();
-    auto dataSize = tensorrt_llm::common::getDTypeSize(dataType);
-
-    switch (dataSize)
-    {
-    case 8:
-        concatRnnSsmState<int64_t>(inputSplitBlocks, outputSsmBlocks, convBytesPerLayer, destCacheState, selfCacheState,
-            selfIdx, bufferManager);
-        break;
-    case 4:
-        concatRnnSsmState<int32_t>(inputSplitBlocks, outputSsmBlocks, convBytesPerLayer, destCacheState, selfCacheState,
-            selfIdx, bufferManager);
-        break;
-    case 2:
-        concatRnnSsmState<int16_t>(inputSplitBlocks, outputSsmBlocks, convBytesPerLayer, destCacheState, selfCacheState,
-            selfIdx, bufferManager);
-        break;
-    case 1:
-        concatRnnSsmState<int8_t>(inputSplitBlocks, outputSsmBlocks, convBytesPerLayer, destCacheState, selfCacheState,
-            selfIdx, bufferManager);
+        concatRnnSsmState<int8_t>(inputSplitBlocks, outputSsmBlocks, slotIdx, maxBatchSize, convBytesPerLayer,
+            destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     default: TLLM_THROW("concatRnnSsmStateDispatch: unsupported data type");
     }

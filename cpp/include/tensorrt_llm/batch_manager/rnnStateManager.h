@@ -64,15 +64,17 @@ public:
 
     [[nodiscard]] TensorPtr getSsmStates(SizeType32 layerIdx) const;
 
-    [[nodiscard]] TensorPtr getConvStatesForSlot(SizeType32 slotIdx) const;
+    [[nodiscard]] TensorPtr getConvStates() const;
 
-    [[nodiscard]] TensorPtr getSsmStatesForSlot(SizeType32 slotIdx) const;
+    [[nodiscard]] TensorPtr getSsmStates() const;
 
     [[nodiscard]] nvinfer1::DataType getConvStateDataType() const noexcept;
 
     [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const noexcept;
 
     [[nodiscard]] executor::rnn_cache::RnnCacheState::ModelConfig getRnnCacheStateModelConfig() const noexcept;
+
+    [[nodiscard]] SizeType32 getMaxBatchSize() const noexcept;
 
     /// Returns the number of local RNN layers on this PP rank
     [[nodiscard]] SizeType32 getNumLocalLayers() const noexcept;
