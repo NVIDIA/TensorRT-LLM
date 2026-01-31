@@ -531,6 +531,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self,
         num_experts: int,
         top_k: int,
+        num_fused_shared_experts: Optional[int],
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
@@ -542,6 +543,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
         self.num_experts = num_experts
         self.top_k = top_k
+        self.num_fused_shared_experts = num_fused_shared_experts
         self.n_group = n_group
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
@@ -581,10 +583,10 @@ class FP8BlockScaleMoERunner(TunableRunner):
             args.hidden_states_scale, args.gemm1_weights,
             args.gemm1_weights_scale, args.gemm2_weights,
             args.gemm2_weights_scale, self.num_experts, self.top_k,
-            self.n_group, self.topk_group, self.intermediate_size,
-            self.local_expert_offset, self.local_num_experts,
-            self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids)
+            self.num_fused_shared_experts, self.n_group, self.topk_group,
+            self.intermediate_size, self.local_expert_offset,
+            self.local_num_experts, self.routed_scaling_factor,
+            self.routing_method_type, tactic, args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -599,6 +601,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
+            self.num_fused_shared_experts,
             hidden_size,
             self.intermediate_size,
             self.local_num_experts,
@@ -685,6 +688,7 @@ def fp8_block_scale_moe_runner(
         gemm2_weights_scale: torch.Tensor,
         num_experts: int,
         top_k: int,
+        num_fused_shared_experts: Optional[int],
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
@@ -700,6 +704,7 @@ def fp8_block_scale_moe_runner(
         FP8BlockScaleMoERunner(
             num_experts,
             top_k,
+            num_fused_shared_experts,
             n_group,
             topk_group,
             intermediate_size,
@@ -767,6 +772,7 @@ def _(routing_logits: torch.Tensor,
       gemm2_weights_scale: torch.Tensor,
       num_experts: int,
       top_k: int,
+      num_fused_shared_experts: Optional[int],
       n_group: Optional[int],
       topk_group: Optional[int],
       intermediate_size: int,

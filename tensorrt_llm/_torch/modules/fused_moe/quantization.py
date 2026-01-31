@@ -19,6 +19,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ...utils import swizzle_sf, unswizzle_sf
+from ..gated_mlp import GatedMLP
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
 
@@ -704,14 +705,15 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module, n_shared_experts=0):
         weight_dtype = torch.float8_e4m3fn
 
-        w3_w1_weight_shape = (module.expert_size_per_partition,
+        w3_w1_weight_shape = (module.expert_size_per_partition +
+                              n_shared_experts,
                               module.intermediate_size_per_partition * 2,
                               module.hidden_size)
         w2_weight_shape = (
-            module.expert_size_per_partition,
+            module.expert_size_per_partition + n_shared_experts,
             module.hidden_size,
             module.intermediate_size_per_partition,
         )
@@ -720,7 +722,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
         cell_div = lambda x, y: (x + y - 1) // y
         w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
-            (module.expert_size_per_partition,
+            (module.expert_size_per_partition + n_shared_experts,
              cell_div(module.intermediate_size_per_partition, 128) * 2,
              cell_div(w3_w1_weight_shape[2], 128)),
             dtype=torch.float32),
@@ -729,8 +731,9 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                                   w3_w1_weight_scaling_factor)
 
         w2_weight_scaling_factor = nn.Parameter(torch.empty(
-            (module.expert_size_per_partition, cell_div(
-                w2_weight_shape[1], 128), cell_div(w2_weight_shape[2], 128)),
+            (module.expert_size_per_partition + n_shared_experts,
+             cell_div(w2_weight_shape[1], 128), cell_div(
+                 w2_weight_shape[2], 128)),
             dtype=torch.float32),
                                                 requires_grad=False)
         module.register_parameter("w2_weight_scaling_factor",
@@ -874,6 +877,235 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
             module.w2_weight_scaling_factor = nn.Parameter(transfromed_w2_scale,
                                                            requires_grad=False)
             self.setup_quant_scales(module)
+
+
+class DeepSeekFP8TRTLLMGenBlockScalesFusedMoEMethod(
+        DeepSeekFP8BlockScalesFusedMoEMethod):
+
+    # Cache the permute indices during weight loading to avoid recompute
+    # This assumes the same input shape always results in the same permute indices
+    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
+
+    @staticmethod
+    def convert_to_block_layout(input_tensor: torch.Tensor,
+                                blockK: int) -> torch.Tensor:
+        M, K = input_tensor.shape
+        assert K % blockK == 0, "K must be divisible by blockK"
+        return input_tensor.view(M, K // blockK,
+                                 blockK).permute(1, 0,
+                                                 2).contiguous().view(M, K)
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False):
+        # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
+        dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
+        )
+        if not allow_partial_loading:
+            assert w1_weight is not None and w3_weight is not None
+        w1_weight_shard = load_weight_shard(
+            w1_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w1_weight is not None else None
+        w3_weight_shard = load_weight_shard(
+            w3_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w3_weight is not None else None
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 64
+
+        # Keep weights in device buffer
+        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
+            module.intermediate_size_per_partition, dim=0)
+
+        dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+        dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+
+        # Get permute indices
+        # Use w2 shuffling here because w31 one also reorders the for gated act, which is not fused for DS FP8
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w3_w1_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
+            dst_w3_w1_weight_gpu.view(torch.uint8),
+            permute_indices.to(dst_w3_w1_weight_gpu.device))
+
+        # Convert to block row-major layout
+        processed_w31_weight_shard = self.convert_to_block_layout(
+            processed_w31_weight_shard, 128)
+
+        # Copy the result into device buffer
+        dst_w3_w1_weight_gpu.copy_(processed_w31_weight_shard.view(
+            dst_w3_w1_weight_gpu.dtype),
+                                   non_blocking=dst_on_gpu)
+        if not dst_on_gpu:
+            dst_w3_w1_weight.copy_(dst_w3_w1_weight_gpu)
+
+    # Helper function
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False):
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dst_on_gpu = dst_w2_weight.device.type == "cuda"
+        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
+        )
+        if not allow_partial_loading:
+            assert w2_weight is not None
+        w2_weight_shard = load_weight_shard(w2_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 64
+
+        # Keep weights in device buffer
+        dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
+                                non_blocking=dst_on_gpu)
+        # Get permuted indices
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w2_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+            dst_w2_weight_gpu.view(torch.uint8),
+            permute_indices.to(dst_w2_weight_gpu.device))
+
+        # Convert to block row-major layout
+        processed_w2_weight = self.convert_to_block_layout(
+            processed_w2_weight, 128)
+
+        # Copy the result into device buffer
+        dst_w2_weight_gpu.copy_(processed_w2_weight.view(
+            dst_w2_weight_gpu.dtype),
+                                non_blocking=dst_on_gpu)
+
+        if not dst_on_gpu:
+            dst_w2_weight.copy_(dst_w2_weight_gpu)
+
+    def fuse_shared_expert(self, module: torch.nn.Module,
+                           shared_experts: GatedMLP, n_shared_experts: int):
+
+        def fuse_shared_expert_weight(dst_w3_w1_weight, dst_w2_weight,
+                                      w1_weight, w2_weight, w3_weight):
+            # FIXME: this depends on the kernel internals
+            epilogue_tile_m = 64
+
+            # Keep weights in device buffer
+            dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.split(
+                module.intermediate_size_per_partition, dim=0)
+
+            dst_w3_weight.copy_(w3_weight.view(dst_w3_weight.dtype),
+                                non_blocking=True)
+            dst_w1_weight.copy_(w1_weight.view(dst_w1_weight.dtype),
+                                non_blocking=True)
+
+            # Get permute indices
+            permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+                dst_w3_w1_weight, self._cache_permute_indices, epilogue_tile_m)
+
+            # Shuffle the weight according to permute indices
+            processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
+                dst_w3_w1_weight, permute_indices.to(dst_w3_w1_weight.device))
+
+            # Convert to block row-major layout
+            processed_w31_weight_shard = self.convert_to_block_layout(
+                processed_w31_weight_shard, 128)
+
+            # Copy the result into device buffer
+            dst_w3_w1_weight.copy_(processed_w31_weight_shard.view(
+                dst_w3_w1_weight.dtype),
+                                   non_blocking=True)
+
+            # Keep weights in device buffer
+            dst_w2_weight.copy_(w2_weight.view(dst_w2_weight.dtype),
+                                non_blocking=True)
+            # Get permuted indices
+            permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+                dst_w2_weight, self._cache_permute_indices, epilogue_tile_m)
+
+            # Shuffle the weight according to permute indices
+            processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+                dst_w2_weight, permute_indices.to(dst_w2_weight.device))
+
+            # Convert to block row-major layout
+            processed_w2_weight = self.convert_to_block_layout(
+                processed_w2_weight, 128)
+
+            # Copy the result into device buffer
+            dst_w2_weight.copy_(processed_w2_weight.view(dst_w2_weight.dtype),
+                                non_blocking=True)
+
+        def fuse_shared_expert_weight_scale(dst_w3_w1_weight_scale,
+                                            dst_w2_weight_scale,
+                                            w1_weight_scale, w2_weight_scale,
+                                            w3_weight_scale):
+            # Keep weights in device buffer
+            # w3
+            dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale.chunk(
+                2, dim=0)
+            dst_w3_weight_scale.copy_(
+                w3_weight_scale.view(dst_w3_weight_scale.dtype))
+
+            # w1
+            dst_w1_weight_scale.copy_(
+                w1_weight_scale.view(dst_w1_weight_scale.dtype))
+
+            # Keep weights in device buffer
+            dst_w2_weight_scale.copy_(
+                w2_weight_scale.view(dst_w2_weight_scale.dtype))
+
+        w1_weight, w3_weight = shared_experts.gate_up_proj.weight.data.chunk(
+            2, dim=0)
+        w1_weight = w1_weight.view(n_shared_experts,
+                                   module.w3_w1_weight.shape[1] // 2,
+                                   module.w3_w1_weight.shape[2])
+        w3_weight = w3_weight.view(n_shared_experts,
+                                   module.w3_w1_weight.shape[1] // 2,
+                                   module.w3_w1_weight.shape[2])
+        w2_weight = shared_experts.down_proj.weight.view(
+            module.w2_weight.shape[1], n_shared_experts,
+            module.w2_weight.shape[2]).permute(1, 0, 2).contiguous()
+
+        w1_w3_weight_scale = shared_experts.gate_up_proj.weight_scale.data
+        w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(2, dim=0)
+        w1_weight_scale = w1_weight_scale.view(
+            n_shared_experts, module.w3_w1_weight_scaling_factor.shape[1] // 2,
+            module.w3_w1_weight_scaling_factor.shape[2])
+        w3_weight_scale = w3_weight_scale.view(
+            n_shared_experts, module.w3_w1_weight_scaling_factor.shape[1] // 2,
+            module.w3_w1_weight_scaling_factor.shape[2])
+
+        w2_weight_scale = shared_experts.down_proj.weight_scale.data
+        w2_weight_scale = w2_weight_scale.view(
+            n_shared_experts, module.w2_weight_scaling_factor.shape[1],
+            module.w2_weight_scaling_factor.shape[2])
+
+        for i in range(n_shared_experts):
+            fuse_shared_expert_weight(
+                module.w3_w1_weight[module.expert_size_per_partition + i],
+                module.w2_weight[module.expert_size_per_partition + i],
+                w1_weight[i], w2_weight[i], w3_weight[i])
+            fuse_shared_expert_weight_scale(
+                module.w3_w1_weight_scaling_factor[
+                    module.expert_size_per_partition + i],
+                module.w2_weight_scaling_factor[module.expert_size_per_partition
+                                                + i], w1_weight_scale[i],
+                w2_weight_scale[i], w3_weight_scale[i])
 
 
 class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
