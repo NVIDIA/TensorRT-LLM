@@ -804,16 +804,29 @@ def subgraph(
     return subgraph_nodes
 
 
+# Cache for get_weight_shape to avoid repeated expensive extract_weight_nodes calls
+_weight_shape_cache = {}
+
+
 def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[int, List[int]]]:
     """Get the shape of the weight node."""
     if not is_any_lin_op(node):
         return None
-    s = list(shape(extract_weight_nodes(node).weights[0].node))
-    if len(s) == 0:
+
+    # Check cache first
+    if node in _weight_shape_cache:
+        s = _weight_shape_cache[node]
+    else:
+        s = list(shape(extract_weight_nodes(node).weights[0].node))
+        if len(s) == 0:
+            s = None
+        elif is_fp4_op(node):
+            # FP4 weights are packed as uint8 type with 2 FP4 values per element
+            s[-1] *= 2
+        _weight_shape_cache[node] = s
+
+    if s is None:
         return None
-    if is_fp4_op(node):
-        # FP4 weights are packed as uint8 type with 2 FP4 values per element
-        s[-1] *= 2
     if dim is None:
         return s
     else:
