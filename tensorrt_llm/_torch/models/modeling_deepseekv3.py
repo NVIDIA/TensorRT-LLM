@@ -1795,6 +1795,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         return_context_logits: bool = False,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         return super().forward(attn_metadata=attn_metadata,
@@ -1803,6 +1804,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                inputs_embeds=inputs_embeds,
                                spec_metadata=spec_metadata,
                                return_context_logits=return_context_logits,
+                               resource_manager=resource_manager,
                                **kwargs)
 
     def load_weights(self, weights: Dict):
