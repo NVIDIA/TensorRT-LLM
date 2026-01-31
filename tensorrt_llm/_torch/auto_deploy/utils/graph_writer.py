@@ -118,8 +118,14 @@ class GraphWriter(metaclass=Singleton):
             self._logger.info(f"Graph dumping enabled to: {self._dump_dir}")
             self._dump_dir_initialized = True
 
-        if not isinstance(mod, GraphModule):
-            return  # Skip non-GraphModule (e.g., during Factory stage)
+        # Collect all GraphModules (including from submodules)
+        graph_modules = []
+        for name, submod in mod.named_modules():
+            if isinstance(submod, GraphModule):
+                graph_modules.append((name if name else "(root)", submod))
+
+        if not graph_modules:
+            return  # No GraphModules found
 
         self._transform_counter += 1
         filename = f"{self._transform_counter:03d}_{stage}_{transform_name}.txt"
@@ -127,8 +133,14 @@ class GraphWriter(metaclass=Singleton):
 
         with open(filepath, "w") as f:
             f.write(f"# Transform: {transform_name}\n")
-            f.write(f"# Stage: {stage}\n\n")
-            dump_ssa_with_meta(f, mod)
+            f.write(f"# Stage: {stage}\n")
+            f.write(f"# GraphModules found: {len(graph_modules)}\n\n")
+
+            for module_name, gm in graph_modules:
+                f.write(f"\n{'=' * 80}\n")
+                f.write(f"# GraphModule: {module_name}\n")
+                f.write(f"{'=' * 80}\n\n")
+                dump_ssa_with_meta(f, gm)
 
 
 graph_writer = GraphWriter()
