@@ -1,6 +1,7 @@
 """Common utils for torch fx graph transformation."""
 
 import operator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -168,12 +169,59 @@ def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
         raise KeyError(f"Tensor {tensor_name} not found in the graph")
 
 
+# Cache for param_names to avoid repeated expensive named_parameters/named_buffers calls
+_param_names_cache = {}
+
+# Cache for get_weight_shape to avoid repeated expensive extract_weight_nodes calls
+_weight_shape_cache = {}
+
+# Flag to indicate whether caching is enabled (only True inside shape_cache_scope)
+_cache_enabled = False
+
+
+@contextmanager
+def shape_cache_scope():
+    """Context manager to scope node caches lifetime.
+
+    Use this to enable caching within a specific operation scope.
+    Caches are only used when inside this context. Outside of this context,
+    caching functions will compute values directly without caching.
+    Caches are cleared when exiting the context, ensuring no stale
+    data persists after graph modifications.
+
+    Example:
+        with shape_cache_scope():
+            # All calls to get_weight_shape and extract_weight_nodes
+            # within this block use caching
+            layer_subgraphs, _ = get_all_layer_subgraphs(gm)
+        # Caches are cleared here
+    """
+    global _param_names_cache, _weight_shape_cache, _cache_enabled
+    _cache_enabled = True
+    try:
+        yield
+    finally:
+        _cache_enabled = False
+        _param_names_cache.clear()
+        _weight_shape_cache.clear()
+
+
 def extract_weight_nodes(node: Node) -> WeightNodes:
     """Extracts the list of weight node and optional bias node from the given parametrized node"""
     gm = node.graph.owning_module
-    param_names = {name for name, _ in gm.named_parameters()}.union(
-        {name for name, _ in gm.named_buffers()}
-    )
+
+    # Use cached param_names to avoid repeated expensive named_parameters/named_buffers calls
+    # Only use cache if inside shape_cache_scope
+    if _cache_enabled:
+        if gm not in _param_names_cache:
+            _param_names_cache[gm] = {name for name, _ in gm.named_parameters()}.union(
+                {name for name, _ in gm.named_buffers()}
+            )
+        param_names = _param_names_cache[gm]
+    else:
+        param_names = {name for name, _ in gm.named_parameters()}.union(
+            {name for name, _ in gm.named_buffers()}
+        )
 
     def find_get_attr_node(weight_node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
@@ -808,12 +856,22 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
     """Get the shape of the weight node."""
     if not is_any_lin_op(node):
         return None
-    s = list(shape(extract_weight_nodes(node).weights[0].node))
-    if len(s) == 0:
+
+    # Only use cache if inside shape_cache_scope
+    if _cache_enabled and node in _weight_shape_cache:
+        s = _weight_shape_cache[node]
+    else:
+        s = list(shape(extract_weight_nodes(node).weights[0].node))
+        if len(s) == 0:
+            s = None
+        elif is_fp4_op(node):
+            # FP4 weights are packed as uint8 type with 2 FP4 values per element
+            s[-1] *= 2
+        if _cache_enabled:
+            _weight_shape_cache[node] = s
+
+    if s is None:
         return None
-    if is_fp4_op(node):
-        # FP4 weights are packed as uint8 type with 2 FP4 values per element
-        s[-1] *= 2
     if dim is None:
         return s
     else:

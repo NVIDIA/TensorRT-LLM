@@ -52,6 +52,7 @@ from ...utils.node_utils import (
     is_op,
     num_users_of_weight_node,
     shape,
+    shape_cache_scope,
     subgraph,
 )
 from ...utils.quantization_utils import (
@@ -822,35 +823,44 @@ class Sharding(BaseTransform):
             )
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-        for source in config.sharding_source:
-            if source == ShardingSource.FACTORY:
-                if len(config.factory_config) == 0:
-                    ad_logger.debug(
-                        "No factory config found. Skipping sharding from factory config"
+        with shape_cache_scope():
+            for source in config.sharding_source:
+                if source == ShardingSource.FACTORY:
+                    if len(config.factory_config) == 0:
+                        ad_logger.debug(
+                            "No factory config found. Skipping sharding from factory config"
+                        )
+                        continue
+                    ad_logger.info("Applying sharding from factory config")
+                    info += detect_sharding_from_config(
+                        gm, transform_container, ShardingSource.FACTORY
                     )
-                    continue
-                ad_logger.info("Applying sharding from factory config")
-                info += detect_sharding_from_config(gm, transform_container, ShardingSource.FACTORY)
-            elif source == ShardingSource.MANUAL:
-                if len(config.manual_config) == 0:
-                    ad_logger.debug("No manual config found. Skipping sharding from manual config")
-                    continue
-                ad_logger.info("Applying sharding from manual config")
-                info += detect_sharding_from_config(gm, transform_container, ShardingSource.MANUAL)
+                elif source == ShardingSource.MANUAL:
+                    if len(config.manual_config) == 0:
+                        ad_logger.debug(
+                            "No manual config found. Skipping sharding from manual config"
+                        )
+                        continue
+                    ad_logger.info("Applying sharding from manual config")
+                    info += detect_sharding_from_config(
+                        gm, transform_container, ShardingSource.MANUAL
+                    )
 
-            elif source == ShardingSource.HEURISTIC:
-                ad_logger.info(f"Running autodeploy sharding heuristics: {config.sharding_dims}")
-                # run TP sharding across ranks
-                if ShardingDim.TP in config.sharding_dims:
-                    info += detect_column_row_shard(gm, transform_container)
+                elif source == ShardingSource.HEURISTIC:
+                    ad_logger.info(
+                        f"Running autodeploy sharding heuristics: {config.sharding_dims}"
+                    )
+                    # run TP sharding across ranks
+                    if ShardingDim.TP in config.sharding_dims:
+                        info += detect_column_row_shard(gm, transform_container)
 
-                # run EP sharding across ranks
-                if ShardingDim.EP in config.sharding_dims:
-                    info += detect_ep_shard(gm, transform_container)
+                    # run EP sharding across ranks
+                    if ShardingDim.EP in config.sharding_dims:
+                        info += detect_ep_shard(gm, transform_container)
 
-                # run BMM sharding across ranks
-                if ShardingDim.BMM in config.sharding_dims:
-                    info += detect_dp_bmm_shard(gm, transform_container)
+                    # run BMM sharding across ranks
+                    if ShardingDim.BMM in config.sharding_dims:
+                        info += detect_dp_bmm_shard(gm, transform_container)
 
         return gm, info
 
