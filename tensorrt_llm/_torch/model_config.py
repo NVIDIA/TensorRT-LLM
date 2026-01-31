@@ -554,13 +554,7 @@ class ModelConfig(Generic[TConfig]):
                     update_dict: Dictionary with values to update in the config
                 """
                 for key, value_new in update_dict.items():
-                    if not hasattr(config, key):
-                        logger.warning(
-                            f"model_kwargs key '{key}' not found in pretrained_config, ignoring."
-                        )
-                        continue
-
-                    target_value = getattr(config, key)
+                    target_value = getattr(config, key, None)
 
                     # Handle nested PretrainedConfig objects when value is a dict
                     if isinstance(value_new, dict) and isinstance(
