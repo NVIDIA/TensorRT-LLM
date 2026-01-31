@@ -10,7 +10,8 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (TorchLlmArgs,
-                                          apply_model_defaults_to_llm_args)
+                                          apply_model_defaults_to_llm_args,
+                                          validate_model_defaults)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -225,6 +226,8 @@ class ModelLoader:
         if model_cls and hasattr(model_cls, "get_model_defaults"):
             model_defaults = model_cls.get_model_defaults(llm_args)
             if model_defaults:
+                model_defaults = validate_model_defaults(
+                    model_defaults, llm_args)
                 applied_defaults = apply_model_defaults_to_llm_args(
                     llm_args, model_defaults)
                 if applied_defaults:
@@ -277,9 +280,6 @@ class ModelLoader:
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
-            finally:
-                if 'memo' in locals():
-                    del memo
 
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)
@@ -408,13 +408,9 @@ class ModelLoader:
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
 
         # Allow overriding the number of layers via environment variable
-        # Note: This is kept for backward compatibility, but model_kwargs is preferred
         num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",
                                                  "0"))
         if num_layers_override > 0:
-            logger.warning(
-                f"TLLM_OVERRIDE_LAYER_NUM is deprecated. Use model_kwargs instead: "
-                f"model_kwargs={{'num_hidden_layers': {num_layers_override}}}")
             config.pretrained_config.num_hidden_layers = num_layers_override
             for sub_config in ["text_config", "vision_config"]:
                 if hasattr(config.pretrained_config, sub_config):

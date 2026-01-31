@@ -575,8 +575,6 @@ class TestTorchLlmArgs:
             args.invalid_arg = 1
 
     def test_speculative_model_alias(self):
-        """Test that speculative_model_dir is accepted as an alias for speculative_model."""
-
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model_dir="/path/to/model",
@@ -589,7 +587,6 @@ class TestTorchLlmArgs:
 
     @print_traceback_on_error
     def test_model_kwargs_with_num_hidden_layers(self):
-        """Test that model_kwargs can override num_hidden_layers."""
         from tensorrt_llm._torch.model_config import ModelConfig
         config_no_kwargs = ModelConfig.from_pretrained(
             llama_model_path).pretrained_config
@@ -922,10 +919,8 @@ class TestStrictBaseModelArbitraryArgs:
 
 
 class TestServeDefaults:
-    """Test serve.py's parameter filtering and model defaults handling."""
 
     def test_serve_get_llm_args_preserves_model_defaults(self):
-        """Test that serve.py's get_llm_args doesn't block model defaults."""
         from tensorrt_llm.commands.serve import get_llm_args
 
         # Get llm_args with default values (simulating serve.py behavior)
@@ -955,7 +950,6 @@ class TestServeDefaults:
         assert llm_args_with_values.get("tensor_parallel_size") == 4
 
     def test_serve_filters_default_values(self):
-        """Test that serve.py only passes non-default values."""
         from tensorrt_llm.commands.serve import get_llm_args
 
         # Test with all defaults for PyTorch backend
@@ -983,7 +977,6 @@ class TestServeDefaults:
         assert llm_args.get("tensor_parallel_size") == 4
 
     def test_serve_backend_specific_configs(self):
-        """Test that build_config and scheduler_config are conditional on backend."""
         from tensorrt_llm.commands.serve import get_llm_args
 
         # Test PyTorch backend
@@ -999,7 +992,6 @@ class TestServeDefaults:
         assert "scheduler_config" in llm_args_trt
 
     def test_serve_is_non_default_or_required_helper(self):
-        """Test the is_non_default_or_required helper function."""
         from tensorrt_llm.commands.serve import is_non_default_or_required
 
         # Test always_include parameters
@@ -1022,7 +1014,6 @@ class TestServeDefaults:
         assert is_non_default_or_required("max_batch_size", 128, "pytorch")
 
     def test_qwen3next_defaults_work_end_to_end(self):
-        """Verify Qwen3Next disables block_reuse even when default is True."""
         from tensorrt_llm._torch.models.modeling_qwen3_next import \
             Qwen3NextForCausalLM
         from tensorrt_llm.commands.serve import get_llm_args
@@ -1046,7 +1037,6 @@ class TestServeDefaults:
         assert "enable_block_reuse" in applied["kv_cache_config"]
 
     def test_user_overrides_preserved_through_serve(self):
-        """Test that explicit user values override model defaults."""
         from tensorrt_llm._torch.models.modeling_qwen3_next import \
             Qwen3NextForCausalLM
 
@@ -1073,3 +1063,65 @@ class TestServeDefaults:
         assert args.kv_cache_config.enable_block_reuse is True
         # Model default should NOT be applied since user explicitly set it
         assert "enable_block_reuse" not in applied.get("kv_cache_config", {})
+
+
+@pytest.mark.parametrize(
+    "defaults_dict,should_raise,error_contains",
+    [
+        # Invalid field name - this will definitely fail
+        ({
+            "invalid_field_that_does_not_exist": True
+        }, True, "invalid_field_that_does_not_exist"),
+        # Another invalid field name
+        ({
+            "non_existent_parameter": 123
+        }, True, "non_existent_parameter"),
+        # Valid simple field
+        ({
+            "enable_chunked_prefill": False
+        }, False, None),
+        # Valid nested config
+        ({
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            }
+        }, False, None),
+        # Valid with type coercion (Pydantic will convert string to bool)
+        (
+            {
+                "enable_chunked_prefill": "false"
+            },  # String will be coerced to bool
+            False,
+            None),
+    ])
+def test_model_defaults_validation(defaults_dict, should_raise, error_contains):
+    from tensorrt_llm.llmapi.llm_args import validate_model_defaults
+
+    # Use a dummy model path for testing (doesn't need to exist for validation)
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model_for_validation_test")
+
+    if should_raise:
+        # Should raise ValueError with expected message
+        with pytest.raises(ValueError) as exc_info:
+            validate_model_defaults(defaults_dict, llm_args)
+        assert error_contains in str(exc_info.value)
+    else:
+        # Should pass validation
+        validated = validate_model_defaults(defaults_dict, llm_args)
+        assert validated == defaults_dict
+
+        # Verify the defaults can be applied successfully
+        applied = apply_model_defaults_to_llm_args(llm_args, validated)
+
+        # Check that the applied defaults match what we requested
+        # Note: We check 'applied' dict, not llm_args directly, because
+        # some fields may have validators that change values
+        for key in defaults_dict:
+            if key in applied:
+                # The field was applied (not overridden by user)
+                if isinstance(applied[key], dict):
+                    # For nested configs, check they're in the applied dict
+                    assert key in applied
+                else:
+                    # For simple fields, check they're in the applied dict
+                    assert key in applied

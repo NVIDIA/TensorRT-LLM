@@ -38,7 +38,8 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        _ModelWrapper, _ParallelConfig,
                        apply_model_defaults_to_llm_args,
                        update_llm_args_with_extra_dict,
-                       update_llm_args_with_extra_options)
+                       update_llm_args_with_extra_options,
+                       validate_model_defaults)
 # yapf: enable
 from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
@@ -489,14 +490,17 @@ class ModelLoader:
 
         # Apply model-specific defaults if the model class provides them
         if hasattr(model_cls, 'get_model_defaults'):
-            # Pass llm_args directly for model-specific adaptive defaults
             model_defaults = model_cls.get_model_defaults(self.llm_args)
 
-            applied_defaults = apply_model_defaults_to_llm_args(
-                self.llm_args, model_defaults)
-            if applied_defaults:
-                logger.debug("Applied model defaults for %s: %s",
-                             model_cls.__name__, applied_defaults)
+            if model_defaults:
+                model_defaults = validate_model_defaults(
+                    model_defaults, self.llm_args)
+
+                applied_defaults = apply_model_defaults_to_llm_args(
+                    self.llm_args, model_defaults)
+                if applied_defaults:
+                    logger.info("Applied model defaults for %s: %s",
+                                model_cls.__name__, applied_defaults)
 
         prequantized = self._update_from_hf_quant_config()
 

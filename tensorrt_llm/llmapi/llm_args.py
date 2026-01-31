@@ -15,7 +15,8 @@ import torch
 import yaml
 from pydantic import AliasChoices, BaseModel
 from pydantic import Field as PydanticField
-from pydantic import PrivateAttr, field_validator, model_validator
+from pydantic import (PrivateAttr, ValidationError, field_validator,
+                      model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -3441,6 +3442,40 @@ def extract_llm_args_overrides(llm_args) -> Dict:
         else:
             overrides[field] = value
     return overrides
+
+
+def validate_model_defaults(defaults_dict: Dict, llm_args: BaseLlmArgs) -> Dict:
+    """Validate model defaults against LlmArgs schema using setattr.
+
+    Uses Pydantic's built-in validation when setting attributes.
+    Returns the validated defaults dict.
+
+    Args:
+        defaults_dict: Dictionary of model-specific defaults to validate
+        llm_args: The LlmArgs instance to validate against
+
+    Returns:
+        The validated defaults dictionary
+
+    Raises:
+        ValueError: If any field name is invalid or value has wrong type
+    """
+    if not defaults_dict:
+        return defaults_dict
+
+    # Create a temporary copy to test validation
+    temp_args = llm_args.model_copy(deep=True)
+
+    for key, value in defaults_dict.items():
+        try:
+            # This triggers Pydantic validation!
+            setattr(temp_args, key, value)
+        except (ValidationError, AttributeError) as e:
+            raise ValueError(
+                f"Invalid model default field '{key}' with value {value}. Error: {e}"
+            ) from e
+
+    return defaults_dict
 
 
 def apply_model_defaults_to_llm_args(llm_args, model_defaults: Dict) -> Dict:
