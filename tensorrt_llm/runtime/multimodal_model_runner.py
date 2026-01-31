@@ -2739,13 +2739,59 @@ class MultimodalModelRunner:
                 enable_dynamic = False
 
             if enable_dynamic:
-                tiles, _ = _internvl_dynamic_preprocess_pil(
-                    raw_image,
-                    min_num=min_num,
-                    max_num=max_num,
-                    image_size=image_size,
-                    use_thumbnail=use_thumbnail,
-                )
+                # Dynamic tiling is implemented via `_internvl_dynamic_preprocess_pil`,
+                # which expects a *single* PIL image. However, `raw_image` can be a
+                # list/batch depending on how the runner is called.
+                if self.args.batch_size != 1:
+                    raise ValueError(
+                        "[internvl:anyres] enable_dynamic=True currently only supports batch_size==1. "
+                        f"Got batch_size={self.args.batch_size}. "
+                        "When enable_dynamic=True, `raw_image` is passed to `_internvl_dynamic_preprocess_pil`, "
+                        "which expects a single PIL image (not a batch/list).")
+
+                # Detect batched tensor/ndarray inputs early with a clear error.
+                if (not isinstance(raw_image, Image.Image)
+                        and hasattr(raw_image, "shape")):
+                    try:
+                        ndim = int(raw_image.dim()) if hasattr(
+                            raw_image, "dim") else int(len(raw_image.shape))
+                    except Exception:
+                        ndim = None
+                    try:
+                        batch_dim = int(raw_image.shape[0])
+                    except Exception:
+                        batch_dim = None
+                    if (ndim is not None and ndim >= 4 and batch_dim is not None
+                            and batch_dim > 1):
+                        raise ValueError(
+                            "[internvl:anyres] batched `raw_image` is not supported when enable_dynamic=True. "
+                            f"`raw_image.shape` looks batched ({getattr(raw_image, 'shape', None)}), but "
+                            "`_internvl_dynamic_preprocess_pil` expects a single PIL image.")
+
+                # Support multi-image lists only in the batch_size==1 case by
+                # tiling each image independently and concatenating the tiles.
+                images_for_tiling = raw_image if isinstance(
+                    raw_image, (list, tuple)) else [raw_image]
+                if len(images_for_tiling) == 0:
+                    raise ValueError(
+                        "[internvl:anyres] enable_dynamic=True requires a non-empty `raw_image`. "
+                        "Got an empty list/tuple; `_internvl_dynamic_preprocess_pil` requires a single PIL image.")
+
+                tiles = []
+                for img in images_for_tiling:
+                    if not isinstance(img, Image.Image):
+                        raise ValueError(
+                            "[internvl:anyres] `raw_image` must be a PIL.Image.Image (or a list/tuple of PIL images) "
+                            "when enable_dynamic=True so it can be processed by `_internvl_dynamic_preprocess_pil`. "
+                            f"Got element type={type(img)} (raw_image type={type(raw_image)}).")
+                    img_tiles, _ = _internvl_dynamic_preprocess_pil(
+                        img,
+                        min_num=min_num,
+                        max_num=max_num,
+                        image_size=image_size,
+                        use_thumbnail=use_thumbnail,
+                    )
+                    tiles.extend(img_tiles)
 
                 # Best-effort cap by token budget (LLM max_input_len) so we don't
                 # exceed engine limits when too many tiles are produced.
