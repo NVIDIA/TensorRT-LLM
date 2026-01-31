@@ -1,0 +1,30 @@
+# Example configuration for FlashInfer TRT-LLM backend
+# This backend uses FlashInfer's interface to TRT-LLM kernels
+# Benefits:
+# - Much simpler than direct thop.attention (300 vs 1200 lines)
+# - Built-in CUDA graph support
+# - No PT cache backend needed
+# - Unified interface with FlashInfer
+
+model: nvidia/Llama-3.1-8B-Instruct-FP8
+
+# Use FlashInfer TRT-LLM backend
+attn_backend: flashinfer_trtllm
+
+# CUDA graph support
+compile_backend: torch-cudagraph
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32]
+
+# Capacity settings
+max_batch_size: 32
+max_seq_len: 2048
+max_num_tokens: 2048
+
+# Cache settings
+page_size: 64
+
+# Optional: Enable FP8 KV cache
+# kv_cache_dtype: fp8_e4m3
+
+# Performance settings
+enable_chunked_prefill: true
