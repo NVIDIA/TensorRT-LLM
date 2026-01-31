@@ -959,7 +959,6 @@ class Deepseekv3MoE(nn.Module):
         }
 
         # Store config values for perfect routing.
-        self.num_experts = num_experts
         self.model_config = model_config
         self.dtype = dtype
 
