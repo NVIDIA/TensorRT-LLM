@@ -13,23 +13,18 @@ from utils.util import similar
 
 
 # # ============================================================================
-# # Fixture: Force single-worker mode for all tests in this module
+# # Fixture: Force single-worker mode (only for tests that use mocking)
 # # ============================================================================
-@pytest.fixture(scope="module", autouse=True)
-def enforce_single_worker():
-    """Force single-worker mode for all tests in this module."""
-    import os
-
-    os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
+@pytest.fixture(scope="function")
+def enforce_single_worker(monkeypatch):
+    """Mock functions don't work with multiple processes, so we enforce single worker."""
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
-    if "TLLM_WORKER_USE_SINGLE_PROCESS" in os.environ:
-        del os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"]
 
 
 # # ============================================================================
 # # test 1:  Generation correctness check
 # # ============================================================================
-@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5680911")
 @pytest.mark.parametrize(
     "drafter_type,schedule",
     [
@@ -151,8 +146,9 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     ],
 )
 @pytest.mark.high_cuda_memory
-@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5680911")
-def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dict):
+def test_draft_len_schedule_functionality(
+    enforce_single_worker, drafter_type: str, draft_schedule: dict
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
