@@ -1,6 +1,6 @@
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.torch_attention import update_kv_cache
+from tensorrt_llm._torch.auto_deploy.custom_ops.torch_backend_attention import _update_kv_cache
 
 
 def test_update_kv_cache():
@@ -26,7 +26,7 @@ def test_update_kv_cache():
     print("cache_loc: " + str(torch.tensor([0, 1])))
     print("seq_start: " + str(torch.tensor([0, 3])))
 
-    update_kv_cache(
+    _update_kv_cache(
         k.view(batch_size * seq_length, n_heads, K_D_HEAD),
         v.view(batch_size * seq_length, n_heads, V_D_HEAD),
         k_cache,
