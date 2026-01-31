@@ -34,6 +34,9 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+# TODO: why does config need to take precedence over CLI params? you did this for a reason
+
+
 def get_llm_args_from_cli_params(model: str, **params: dict[str, Any]) -> BaseLlmArgs:
     """Construct an instance of LlmArgs from CLI params and optionally a config YAML file.
 
