@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,36 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA-backed cached causal conv1d custom ops and attention descriptor.
+"""Triton-backed cached causal conv1d custom ops and attention descriptor.
 
-This mirrors `torch_backend_causal_conv.py` but reuses existing TRT-LLM CUDA
-operators for performance:
-- Prefill uses `torch.ops.trtllm.causal_conv1d_fwd`
-- Decode uses `torch.ops.trtllm.causal_conv1d_update`
+This mirrors `cuda_backend_causal_conv.py` but uses Triton kernels instead of CUDA:
+- Prefill uses Triton `causal_conv1d_fn`
+- Decode uses Triton `causal_conv1d_update`
 
 The flattened cached op integrates with the auto_deploy attention interface
 and updates a slot-indexed convolution state cache internally.
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
-from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 
 from ..attention_interface import AttentionRegistry, MHACallable
 from .causal_conv_common import BaseCausalConvDescriptor
 
 
-@torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={"input"})
-def _cuda_cached_causal_conv1d(
+@torch.library.custom_op("auto_deploy::triton_cached_causal_conv1d", mutates_args={"input"})
+def _triton_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
     weight: torch.Tensor,  # [c_out, c_in/groups, k] but we expect depthwise use: [c_in, k]
     bias: Optional[torch.Tensor],
     # STANDARD METADATA
     batch_info_host: torch.Tensor,
+    seq_len: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
@@ -58,7 +61,7 @@ def _cuda_cached_causal_conv1d(
     padding_mode: str,
     activation: Optional[str],
 ) -> None:
-    """Flattened cached causal conv that respects slot-indexed state caches (CUDA backend).
+    """Flattened cached causal conv that respects slot-indexed state caches (Triton backend).
 
     Supports two layouts from the attention interface:
     - Generate-only: input is [b, 1, c_in]. We'll gather caches using slot_idx[:b].
@@ -89,15 +92,20 @@ def _cuda_cached_causal_conv1d(
         # x_varlen: (dim, cu_seq_len)
         x_varlen = inp_flat[:num_prefill_tokens].transpose(0, 1).contiguous()
 
+        prefill_cu_seqlen = cu_seqlen[: num_prefill + 1]
+        seq_lens_cpu = seq_len[:num_prefill].tolist()
+
         # Run varlen conv; updates conv_state_cache in-place per cache_indices
+        # Note: Triton kernel returns a new tensor (not in-place like CUDA)
         y_varlen = causal_conv1d_fn(
             x_varlen,
             w2d,
             bias,
-            query_start_loc=cu_seqlen[: num_prefill + 1],
+            conv_state_cache,
+            prefill_cu_seqlen,
+            seq_lens_cpu,
             cache_indices=slot_idx[:num_prefill].to(torch.int32),
             has_initial_state=use_initial_states[:num_prefill],
-            conv_states=conv_state_cache,
             activation=activation,
             pad_slot_id=PAD_SLOT_ID,
         )  # (dim, total_prefill_tokens)
@@ -108,7 +116,9 @@ def _cuda_cached_causal_conv1d(
     if num_decode > 0:
         x_decode = inp_flat[num_prefill_tokens:num_total_tokens]  # [num_decode, C_in]
 
-        causal_conv1d_update(
+        # Note: Triton causal_conv1d_update returns a new tensor (not in-place like CUDA version)
+        # so we need to capture the output and write it back
+        y_decode = causal_conv1d_update(
             x_decode,  # [batch, dim]
             conv_state_cache,
             w2d,
@@ -118,16 +128,18 @@ def _cuda_cached_causal_conv1d(
             conv_state_indices=slot_idx[num_prefill:num_seq].to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
         )
+        inp_flat[num_prefill_tokens:num_total_tokens] = y_decode
 
 
-@_cuda_cached_causal_conv1d.register_fake
-def _cuda_cached_causal_conv1d_fake(
+@_triton_cached_causal_conv1d.register_fake
+def _triton_cached_causal_conv1d_fake(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
     weight: torch.Tensor,  # [c_out, c_in/groups, k] but we expect depthwise use: [c_in, k]
     bias: Optional[torch.Tensor],
     # STANDARD METADATA
     batch_info_host: torch.Tensor,
+    seq_len: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
@@ -146,19 +158,23 @@ def _cuda_cached_causal_conv1d_fake(
     pass
 
 
-def cuda_cached_causal_conv1d_wrapper(input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-    torch.ops.auto_deploy.cuda_cached_causal_conv1d(input, *args, **kwargs)
+def triton_cached_causal_conv1d_wrapper(input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    torch.ops.auto_deploy.triton_cached_causal_conv1d(input, *args, **kwargs)
     return input
 
 
-@AttentionRegistry.register("cuda_causal_conv")
-class CudaBackendCausalConv(BaseCausalConvDescriptor):
-    """CUDA-backed causal conv1d attention descriptor.
+@AttentionRegistry.register("triton_causal_conv")
+class TritonBackendCausalConv(BaseCausalConvDescriptor):
+    """Triton-backed causal conv1d attention descriptor.
 
     Inherits shared methods from BaseCausalConvDescriptor.
-    Only overrides get_cached_attention_op to return the CUDA wrapper.
+    Overrides get_standard_metadata_args to include seq_len (used directly by Triton kernel).
     """
 
     @classmethod
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info_host", "seq_len", "cu_seqlen", "slot_idx", "use_initial_states"]
+
+    @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return cuda_cached_causal_conv1d_wrapper
+        return triton_cached_causal_conv1d_wrapper
