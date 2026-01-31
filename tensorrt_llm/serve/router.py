@@ -211,8 +211,11 @@ class Router(ABC):
             f"Removed server {server}, current server list: {self._servers}")
 
     @abstractmethod
-    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
-        '''Select server by request and return some intermediate information'''
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+        '''Select server by request and return some intermediate information, exclude_server is a server to exclude from the selection'''
 
     @abstractmethod
     async def finish_request(self, request: OpenAIRequest):
@@ -441,15 +444,17 @@ class RoundRobinRouter(Router):
         self._server_idx = 0
 
     def _on_servers_updated(self, old_servers, new_servers):
-        """Reset the index when servers are removed to prevent index out of bounds errors."""
-        if len(new_servers) < len(old_servers):
-            # Servers were removed, reset the index
-            self._server_idx = 0
-        elif self._server_idx >= len(new_servers):
-            # Safety check: ensure index is always within bounds
-            self._server_idx = 0
+        pass
 
-    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+    def _get_next_server(self) -> str:
+        server = self._servers[self._server_idx % len(self._servers)]
+        self._server_idx += 1
+        return server
+
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None) -> tuple[str, dict]:
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
@@ -459,12 +464,13 @@ class RoundRobinRouter(Router):
                 raise ValueError(f"No {self._server_role} servers available")
 
         async with self._lock:
-            # Safety check: ensure index is within bounds
-            if self._server_idx >= len(self._servers):
-                self._server_idx = 0
-
-            server = self._servers[self._server_idx]
-            self._server_idx = (self._server_idx + 1) % len(self._servers)
+            server = self._get_next_server()
+            if exclude_server and server == exclude_server:
+                server = self._get_next_server()
+                if server == exclude_server:
+                    raise ValueError(
+                        f"No available servers after excluding {exclude_server}"
+                    )
         return server, {}
 
     async def finish_request(self, request: OpenAIRequest):
@@ -517,7 +523,10 @@ class LoadBalancingRouter(Router):
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
 
-    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None) -> tuple[str, dict]:
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
@@ -527,8 +536,23 @@ class LoadBalancingRouter(Router):
                 raise ValueError(f"No {self._server_role} servers available")
 
         async with self._lock:
-            server = heapq.heappop(self._server_load_heap)[1]
+            if exclude_server:
+                server_load_heap = [(self._get_server_load(server), server)
+                                    for server in self._servers
+                                    if server != exclude_server]
+                heapq.heapify(server_load_heap)
+            else:
+                server_load_heap = self._server_load_heap
+
+            server = heapq.heappop(server_load_heap)[1]
             await self._server_state[server].increment_load(request)
+            # maintain the member heap
+            if exclude_server:
+                self._server_load_heap = server_load_heap
+                if exclude_server in self._server_state:
+                    heapq.heappush(
+                        self._server_load_heap,
+                        (self._get_server_load(exclude_server), exclude_server))
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
 
@@ -604,9 +628,15 @@ class KvCacheAwareRouter(Router):
         tokenizer = self._tokenizers[request.model]
         return [tokenizer(prompt)["input_ids"] for prompt in prompts]
 
-    async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None) -> tuple[str, dict]:
         async with self._lock:
-            servers = list(self._server_state.keys())
+            servers = list([
+                server for server in self._server_state.keys()
+                if server != exclude_server
+            ])
         token_lists = self._tokenize(request)
         block_hashes: list[list[int]] = []
         for token_list in token_lists:
