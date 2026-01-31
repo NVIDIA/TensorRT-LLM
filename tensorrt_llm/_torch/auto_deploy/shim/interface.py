@@ -217,7 +217,6 @@ class CachedSequenceInterface:
             # we don't rely on free_gpu_memory_fraction inside the KVCacheManager. This is similar
             # to _torch.pyexecutor._util.KVCacheCreator, which explicitly estimates the max_tokens
             # outside of the KVCacheManager.
-            "is_estimating_kv_cache": False,
         }
 
         # update args if we are just doing a dummy cache manager
