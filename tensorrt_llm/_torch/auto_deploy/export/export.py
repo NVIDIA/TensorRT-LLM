@@ -1,5 +1,6 @@
 """Main export functionality with utilities for torch.export."""
 
+import re
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
@@ -188,6 +189,49 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
+def _rename_nodes_with_module_hierarchy(gm: fx.GraphModule) -> None:
+    """Rename call_function nodes to reflect their module hierarchy.
+
+    Uses nn_module_stack metadata to build hierarchical names like:
+    'layers_0_self_attn_linear' instead of 'linear_2'
+    """
+    graph = gm.graph
+
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+
+        meta = getattr(node, "meta", None)
+        if not isinstance(meta, dict):
+            continue
+
+        nn_stack = meta.get("nn_module_stack")
+        if not nn_stack or not isinstance(nn_stack, dict):
+            continue
+
+        # Get innermost module path from the stack
+        # nn_module_stack is OrderedDict: {path: (qualified_name, module_class), ...}
+        module_path = list(nn_stack.keys())[-1] if nn_stack else ""
+        # Strip the "L__self__" prefix that torch.export adds (internal representation)
+        module_path = re.sub(r"^L__self__[._]?", "", module_path)
+
+        # Get op name from target
+        target = node.target
+        if hasattr(target, "__name__"):
+            op_name = target.__name__
+        elif hasattr(target, "_name"):
+            op_name = target._name
+        else:
+            op_name = str(target).split(".")[-1]
+
+        unique_name = graph._graph_namespace.create_name(op_name, node)
+        # Build new name: module_path + op_name (dots -> underscores)
+        if module_path:
+            node.name = f"{module_path}_{unique_name}".replace(".", "_")
+
+    gm.recompile()
+
+
 def _clean_up_assertions_and_guards(gm: fx.GraphModule):
     """This transformations removes shape checks and assertions from the graph."""
     check_ops = {
@@ -340,6 +384,9 @@ def torch_export_to_gm(
 
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
+
+    # Rename nodes to reflect module hierarchy for better debuggability
+    _rename_nodes_with_module_hierarchy(egm)
 
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))
