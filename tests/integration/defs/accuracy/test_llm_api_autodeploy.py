@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import pytest
+import torch
 from defs.conftest import skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
@@ -23,6 +24,34 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root
 from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+
+
+def print_memory_usage(label: str):
+    """Print detailed memory usage for all CUDA devices."""
+    print(f"\n{'=' * 60}")
+    print(f"Memory Usage: {label}")
+    print(f"{'=' * 60}")
+    num_devices = torch.cuda.device_count()
+    for device_id in range(num_devices):
+        allocated = torch.cuda.memory_allocated(device_id) / 1024**3
+        reserved = torch.cuda.memory_reserved(device_id) / 1024**3
+        peak_allocated = torch.cuda.max_memory_allocated(device_id) / 1024**3
+        peak_reserved = torch.cuda.max_memory_reserved(device_id) / 1024**3
+        cached_available = reserved - allocated  # Available in PyTorch's cache
+        free, total = torch.cuda.mem_get_info(device_id)
+        free_gb = free / 1024**3
+        total_gb = total / 1024**3
+        used_gb = total_gb - free_gb
+        print(f"  Device {device_id}:")
+        print(f"    Allocated:       {allocated:.2f} GB")
+        print(f"    Reserved:        {reserved:.2f} GB")
+        print(f"    Peak Allocated:  {peak_allocated:.2f} GB")
+        print(f"    Peak Reserved:   {peak_reserved:.2f} GB")
+        print(
+            f"    Available:       {cached_available:.2f} GB (in PyTorch cache) | {free_gb:.2f} GB (on GPU)"
+        )
+        print(f"    GPU Total:       {used_gb:.2f} / {total_gb:.2f} GB")
+    print(f"{'=' * 60}\n")
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -310,6 +339,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     def test_bf16(self):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
+        print_memory_usage("Before evaluation")
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
                            world_size=4,
@@ -318,6 +348,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+        print_memory_usage("After evaluation")
 
     @pytest.mark.skip("Skipping FP8 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
