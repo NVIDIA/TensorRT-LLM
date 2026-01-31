@@ -317,15 +317,6 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-    # chunk_unit_size may be changed to 64 when using flash mla
-    attn_runtime_features = AttentionRuntimeFeatures(
-        chunked_prefill=enable_chunked_context,
-        cache_reuse=kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
-        chunk_size=max_num_tokens,
-    )
-    logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
-
     mem_monitor = _ExecutorMemoryMonitor()
 
     @contextmanager
@@ -342,6 +333,25 @@ def create_py_executor(
                     vm_pools[stage] = memory_pool
                     yield
 
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader, _construct_checkpoint_loader
+
+    # Apply model-specific defaults before creating AttentionRuntimeFeatures
+    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
+                                                     llm_args.checkpoint_loader,
+                                                     llm_args.checkpoint_format)
+
+    llm_args = ModelLoader.load_config_and_apply_defaults(
+        checkpoint_dir, llm_args, checkpoint_loader)
+
+    enable_chunked_context = llm_args.enable_chunked_prefill
+    kv_cache_config = llm_args.kv_cache_config
+    attn_runtime_features = AttentionRuntimeFeatures(
+        chunked_prefill=enable_chunked_context,
+        cache_reuse=kv_cache_config.enable_block_reuse,
+        has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
+        chunk_size=max_num_tokens,
+    )
+    logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
     with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN,
                           RestoreMode.PINNED):
         model_engine = PyTorchModelEngine(

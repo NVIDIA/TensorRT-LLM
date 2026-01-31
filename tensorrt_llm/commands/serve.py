@@ -29,6 +29,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
@@ -86,6 +87,40 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
+def is_non_default_or_required(param_name, value, backend):
+    """
+    Check if a parameter should be explicitly included in llm_args.
+
+    Returns True if parameter is either:
+    1. Always required (core params that must be present), OR
+    2. Different from its default value in the backend's LlmArgs class
+    """
+    always_include = {
+        "model", "backend", "tokenizer", "custom_tokenizer",
+        "postprocess_tokenizer_dir"
+    }
+
+    if param_name in always_include:
+        return True
+
+    if value is None:
+        return False
+
+    llm_args_class = TrtLlmArgs if backend == "tensorrt" else TorchLlmArgs
+
+    field_info = llm_args_class.model_fields.get(param_name)
+    if not field_info:
+        if param_name in {"fail_fast_on_attention_window_too_large"}:
+            return True
+        return False
+
+    default = field_info.default
+    if callable(default):
+        default = default()
+
+    return value != default
+
+
 def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
@@ -118,21 +153,9 @@ def get_llm_args(
         gpus_per_node = device_count()
         if gpus_per_node == 0:
             raise ValueError("No GPU devices found on the node")
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction, )
 
-    dynamic_batch_config = DynamicBatchConfig(
-        enable_batch_size_tuning=True,
-        enable_max_num_tokens_tuning=False,
-        dynamic_batch_moving_average_window=128)
-    scheduler_config = SchedulerConfig(
-        capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        dynamic_batch_config=dynamic_batch_config,
-    )
+    # TODO: This manual cp_type conversion can be removed once cp_config
+    # is refactored to a typed Pydantic model with enum coercion
     if cp_config is not None and "cp_type" in cp_config:
         cp_config = cp_config.copy()
         try:
@@ -141,33 +164,76 @@ def get_llm_args(
             raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
                              f"Must be one of: {', '.join([t.name for t in CpType])}")
 
-    llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "custom_tokenizer": custom_tokenizer,
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_parallel_size": pipeline_parallel_size,
-        "context_parallel_size": context_parallel_size,
-        "cp_config": cp_config if cp_config is not None else {},
-        "moe_expert_parallel_size": moe_expert_parallel_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "revision": revision,
-        "build_config": build_config,
-        "max_batch_size": max_batch_size,
-        "max_num_tokens": max_num_tokens,
-        "max_beam_width": max_beam_width,
-        "max_seq_len": max_seq_len,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend,
-        "num_postprocess_workers": num_postprocess_workers,
-        "postprocess_tokenizer_dir": tokenizer or model,
-        "reasoning_parser": reasoning_parser,
+    kv_cache_default_fraction = KvCacheConfig.model_fields[
+        'free_gpu_memory_fraction'].default
+
+    cli_maybe_overrides = {
+        "model":
+        model,
+        "backend":
+        backend,
+        "tokenizer":
+        tokenizer,
+        "custom_tokenizer":
+        custom_tokenizer,
+        "postprocess_tokenizer_dir":
+        tokenizer or model,
+        "kv_cache_config":
+        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction)
+        if free_gpu_memory_fraction != kv_cache_default_fraction else None,
+        "cp_config":
+        cp_config if cp_config else {},
+        "build_config":
+        BuildConfig(max_batch_size=max_batch_size,
+                    max_num_tokens=max_num_tokens,
+                    max_beam_width=max_beam_width,
+                    max_seq_len=max_seq_len) if backend == "tensorrt" else None,
+        "scheduler_config":
+        SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
+                        GUARANTEED_NO_EVICT,
+                        dynamic_batch_config=DynamicBatchConfig(
+                            enable_batch_size_tuning=True,
+                            enable_max_num_tokens_tuning=False,
+                            dynamic_batch_moving_average_window=128))
+        if backend == "tensorrt" else None,
+        "max_batch_size":
+        max_batch_size,
+        "max_beam_width":
+        max_beam_width,
+        "tensor_parallel_size":
+        tensor_parallel_size,
+        "pipeline_parallel_size":
+        pipeline_parallel_size,
+        "context_parallel_size":
+        context_parallel_size,
+        "moe_expert_parallel_size":
+        moe_expert_parallel_size,
+        "gpus_per_node":
+        gpus_per_node,
+        "trust_remote_code":
+        trust_remote_code,
+        "max_num_tokens":
+        max_num_tokens,
+        "max_seq_len":
+        max_seq_len,
+        "num_postprocess_workers":
+        num_postprocess_workers,
+        "enable_chunked_prefill":
+        enable_chunked_prefill,
+        "revision":
+        revision,
+        "reasoning_parser":
+        reasoning_parser,
+        "otlp_traces_endpoint":
+        otlp_traces_endpoint,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
-        "otlp_traces_endpoint": otlp_traces_endpoint,
-        "enable_chunked_prefill": enable_chunked_prefill,
+    }
+
+    llm_args = {
+        param: value
+        for param, value in cli_maybe_overrides.items()
+        if is_non_default_or_required(param, value, backend)
     }
 
     return llm_args, llm_args_extra_dict
