@@ -43,13 +43,9 @@ import yaml
 from helpers import (get_input_tensor_by_name, get_output_config_from_request,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
-from mpi4py.futures import MPICommExecutor
-from mpi4py.MPI import COMM_WORLD
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._utils import global_mpi_rank, global_mpi_size
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 
 
 @dataclass
@@ -140,7 +136,8 @@ class TritonPythonModel:
             - `initialize` is called only once when the model is being loaded.
             - Implementing `initialize` function is optional.
         """
-        from tensorrt_llm.llmapi import MpiCommSession
+        from tensorrt_llm.llmapi.llm_utils import \
+            update_llm_args_with_extra_dict
 
         self.model_config = json.loads(args["model_config"])
         triton_config = get_model_config(os.environ.get('LLM_CONFIG_PATH',
@@ -151,11 +148,64 @@ class TritonPythonModel:
         self.params = self.model_config['parameters']
         self.logger = pb_utils.Logger
 
+        # Check instance count from config.pbtxt
+        instance_count = int(
+            self.model_config.get("instance_group", [{}])[0].get("count", 1))
+        use_multi_instance = instance_count > 1
+
+        # Get GPU device IDs from config.pbtxt parameters
+        # Format: "0,1;2,3" means instance 0 gets GPUs 0,1, instance 1 gets GPUs 2,3
+        if use_multi_instance:
+            gpu_device_ids_param = self.params.get("gpu_device_ids",
+                                                   {}).get("string_value", "")
+            if not gpu_device_ids_param:
+                self.logger.log_error(
+                    "[trtllm] gpu_device_ids parameter required for multi-instance mode"
+                )
+                raise ValueError(
+                    "gpu_device_ids parameter required when instance count > 1")
+
+            # Get instance index from instance name (e.g., "tensorrt_llm_0" -> 0)
+            import re
+            instance_name = args.get("model_instance_name", "")
+            instance_idx = 0
+            if instance_name:
+                match = re.search(r'_(\d+)$', instance_name)
+                if match:
+                    instance_idx = int(match.group(1))
+
+            # Parse: split by semicolon for instances, comma for GPUs
+            instance_gpu_lists = gpu_device_ids_param.split(";")
+            if instance_idx >= len(instance_gpu_lists):
+                self.logger.log_error(
+                    f"[trtllm] Instance {instance_idx} requested but gpu_device_ids only has {len(instance_gpu_lists)} entries: '{gpu_device_ids_param}'"
+                )
+                raise ValueError(
+                    f"gpu_device_ids mismatch: instance {instance_idx} >= {len(instance_gpu_lists)} entries"
+                )
+            self._gpu_ids = instance_gpu_lists[instance_idx].strip()
+            self._gpu_id_list = [
+                g.strip() for g in self._gpu_ids.split(",") if g.strip()
+            ]
+
+            self.logger.log_info(
+                f"[trtllm] Instance {instance_idx}: gpu_ids={self._gpu_ids}, instance_count={instance_count}"
+            )
+
         text_output_config = pb_utils.get_output_config_by_name(
             self.model_config, "text_output")
         self.output_dtype = pb_utils.triton_string_to_numpy(
             text_output_config["data_type"])
-        if global_mpi_rank() == 0:
+
+        # For multi-instance mode, each instance is independent (no MPI coordination)
+        # For single-instance mode, use MPI if available
+        if use_multi_instance:
+            is_leader = True  # Each instance is its own leader
+        else:
+            from tensorrt_llm._utils import global_mpi_rank
+            is_leader = global_mpi_rank() == 0
+
+        if is_leader:
             # Initialize engine arguments
             self.llm_engine_args = update_llm_args_with_extra_dict(
                 {},
@@ -163,8 +213,20 @@ class TritonPythonModel:
                                                 'model.yaml'),
                                  exclude_keys=["triton_config"]),
             )
+
+            # For multi-instance deployments, use Ray instead of MPI
+            if use_multi_instance:
+                # Override gpus_per_node based on assigned GPUs
+                self.llm_engine_args["gpus_per_node"] = len(self._gpu_id_list)
+                self.llm_engine_args["orchestrator_type"] = "ray"
+                # Pass CUDA_VISIBLE_DEVICES to Ray workers via env_overrides
+                env_overrides = self.llm_engine_args.get("env_overrides",
+                                                         {}) or {}
+                env_overrides["CUDA_VISIBLE_DEVICES"] = self._gpu_ids
+                self.llm_engine_args["env_overrides"] = env_overrides
+
             self.logger.log_info(
-                f"[trtllm] rank{global_mpi_rank()} is starting trtllm engine with args: {self.llm_engine_args}"
+                f"[trtllm] Starting trtllm engine with args: {self.llm_engine_args}"
             )
 
             triton_config = get_model_config(
@@ -174,10 +236,16 @@ class TritonPythonModel:
                 triton_config["cancellation_check_period_ms"]
             ) if "cancellation_check_period_ms" in triton_config else 100
 
-            if global_mpi_size() > 1:
-                mpi_session = MpiCommSession(comm=COMM_WORLD,
-                                             n_workers=COMM_WORLD.Get_size())
-                self.llm_engine_args["_mpi_session"] = mpi_session
+            # For single-instance mode with MPI, set up MPI session
+            if not use_multi_instance:
+                from tensorrt_llm._utils import global_mpi_size
+                if global_mpi_size() > 1:
+                    from mpi4py.MPI import COMM_WORLD
+
+                    from tensorrt_llm.llmapi import MpiCommSession
+                    mpi_session = MpiCommSession(
+                        comm=COMM_WORLD, n_workers=COMM_WORLD.Get_size())
+                    self.llm_engine_args["_mpi_session"] = mpi_session
 
             # Starting the TRT-LLM engine with LLM API and its event thread running the AsyncIO event loop.
             self._init_engine()
@@ -198,6 +266,10 @@ class TritonPythonModel:
             self.running = True
             self.cancellation_thread.start()
         else:
+            from mpi4py.futures import MPICommExecutor
+            from mpi4py.MPI import COMM_WORLD
+
+            from tensorrt_llm._utils import global_mpi_rank
             self.logger.log_info(
                 f"[trtllm] rank{global_mpi_rank()} is waiting for the leader node..."
             )
