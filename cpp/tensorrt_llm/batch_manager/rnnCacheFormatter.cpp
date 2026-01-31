@@ -128,6 +128,7 @@ void RnnCacheFormatter::format(TransferSession& session)
     // Calculate buffer sizes for each target
     //    Each target gets: conv states + ssm states for overlapping layers
     auto const& modelConfig = selfConfig.getModelConfig();
+    auto const maxBatchSize = mRnnStateManager->getMaxBatchSize();
     SizeType32 convDimLocal = modelConfig.mConvDimSize / selfTPNum;
     SizeType32 numHeadsLocal = modelConfig.mNumHeads / selfTPNum;
 
@@ -158,19 +159,19 @@ void RnnCacheFormatter::format(TransferSession& session)
     std::vector<runtime::ITensor::SharedPtr> inputConvBlocks;
     std::vector<runtime::ITensor::SharedPtr> inputSsmBlocks;
 
-    auto convBlock = mRnnStateManager->getConvStatesForSlot(slotIdx); // [numLocalLayers, convDim, dConv-1]
-    auto ssmBlock = mRnnStateManager->getSsmStatesForSlot(slotIdx);   // [numLocalLayers, numHeads, headDim, dState]
+    auto convStates = mRnnStateManager->getConvStates(); // [numLocalLayers, maxBatchSize, convDim, dConv-1]
+    auto ssmStates = mRnnStateManager->getSsmStates();   // [numLocalLayers, maxBatchSize, numHeads, headDim, dState]
 
     // Check if loop over targetNum is needed
-    inputConvBlocks.push_back(convBlock);
-    inputSsmBlocks.push_back(ssmBlock);
+    inputConvBlocks.push_back(convStates);
+    inputSsmBlocks.push_back(ssmStates);
 
     tensorrt_llm::executor::rnn_cache::splitRnnConvStateDispatch(
-        inputConvBlocks, outputBuffers, destConfig, selfConfig, selfIdx, bufferManager);
+        inputConvBlocks, outputBuffers, slotIdx, maxBatchSize, destConfig, selfConfig, selfIdx, bufferManager);
 
     // Conv and SSM use same output buffer. So need to track convBytesPerLayer to compute offset.
-    tensorrt_llm::executor::rnn_cache::splitRnnSsmStateDispatch(
-        inputSsmBlocks, outputBuffers, convBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
+    tensorrt_llm::executor::rnn_cache::splitRnnSsmStateDispatch(inputSsmBlocks, outputBuffers, slotIdx, maxBatchSize,
+        convBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
 
     bufferManager.getStream().synchronize();
     session.setTime(TransferSession::kTimePreprocess);
@@ -422,17 +423,18 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     std::vector<runtime::ITensor::SharedPtr> outputConvBlocks;
     std::vector<runtime::ITensor::SharedPtr> outputSsmBlocks;
 
-    auto convBlock = mRnnStateManager->getConvStatesForSlot(slotIdx);
-    auto ssmBlock = mRnnStateManager->getSsmStatesForSlot(slotIdx);
+    auto const maxBatchSize = mRnnStateManager->getMaxBatchSize();
+    auto convStates = mRnnStateManager->getConvStates(); // [numLocalLayers, maxBatchSize, convDim, dConv-1]
+    auto ssmStates = mRnnStateManager->getSsmStates();   // [numLocalLayers, maxBatchSize, numHeads, headDim, dState]
 
-    outputConvBlocks.push_back(convBlock);
-    outputSsmBlocks.push_back(ssmBlock);
+    outputConvBlocks.push_back(convStates);
+    outputSsmBlocks.push_back(ssmStates);
 
     tensorrt_llm::executor::rnn_cache::concatRnnConvStateDispatch(
-        recvBuffers, outputConvBlocks, destConfig, selfConfig, selfIdx, bufferManager);
+        recvBuffers, outputConvBlocks, slotIdx, maxBatchSize, destConfig, selfConfig, selfIdx, bufferManager);
 
-    tensorrt_llm::executor::rnn_cache::concatRnnSsmStateDispatch(
-        recvBuffers, outputSsmBlocks, convBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
+    tensorrt_llm::executor::rnn_cache::concatRnnSsmStateDispatch(recvBuffers, outputSsmBlocks, slotIdx, maxBatchSize,
+        convBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
 
     bufferManager.getStream().synchronize();
 

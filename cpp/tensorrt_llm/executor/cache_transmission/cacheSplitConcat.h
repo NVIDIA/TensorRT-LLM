@@ -117,30 +117,32 @@ namespace tensorrt_llm::executor::rnn_cache
  * @brief Dispatch function to split RNN conv state across different TP configurations
  */
 void splitRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputConvBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, rnn_cache::RnnCacheState const& destCacheState,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, rnn_cache::RnnCacheState const& destCacheState,
     rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
 
 /**
  * @brief Dispatch function to split RNN SSM state across different TP configurations
  */
 void splitRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, size_t convBytesPerLayer,
-    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager);
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
+    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
 
 /**
  * @brief Dispatch function to concat RNN conv state from different TP configurations
  */
 void concatRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, rnn_cache::RnnCacheState const& destCacheState,
-    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
+    std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, SizeType32 slotIdx, SizeType32 maxBatchSize,
+    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
+    runtime::BufferManager const& bufferManager);
 
 /**
  * @brief Dispatch function to concat RNN SSM state from different TP configurations
  */
 void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
-    std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, size_t convBytesPerLayer,
-    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager);
+    std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, SizeType32 slotIdx, SizeType32 maxBatchSize,
+    size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
+    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
 
 } // namespace tensorrt_llm::executor::rnn_cache

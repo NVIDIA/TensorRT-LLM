@@ -313,22 +313,14 @@ RnnStateManager::TensorPtr RnnStateManager::getSsmStates(SizeType32 layerIdx) co
     return result;
 }
 
-RnnStateManager::TensorPtr RnnStateManager::getConvStatesForSlot(SizeType32 slotIdx) const
+RnnStateManager::TensorPtr RnnStateManager::getConvStates() const
 {
-    // pagedConvStates shape: [numLocalLayers, maxBatchSize, convDim, dConv-1]
-    // Slice at batch dimension (dim=1) to get all layers for this slot
-    auto result = ITensor::slice(pagedConvStates, {0, slotIdx}, 1);
-    result->squeeze(1);
-    return result; // [numLocalLayers, convDim, dConv-1]
+    return pagedConvStates;
 }
 
-RnnStateManager::TensorPtr RnnStateManager::getSsmStatesForSlot(SizeType32 slotIdx) const
+RnnStateManager::TensorPtr RnnStateManager::getSsmStates() const
 {
-    // pagedRnnStates shape: [numLocalLayers, maxBatchSize, numHeads, headDim, dState]
-    // Slice at batch dimension (dim=1) to get all layers for this slot
-    auto result = ITensor::slice(pagedRnnStates, {0, slotIdx}, 1);
-    result->squeeze(1);
-    return result; //  [numLocalLayers, numHeads, headDim, dState]
+    return pagedRnnStates;
 }
 
 nvinfer1::DataType RnnStateManager::getConvStateDataType() const noexcept
@@ -339,6 +331,11 @@ nvinfer1::DataType RnnStateManager::getConvStateDataType() const noexcept
 nvinfer1::DataType RnnStateManager::getSsmStateDataType() const noexcept
 {
     return mSsmCacheDtype;
+}
+
+RnnStateManager::SizeType32 RnnStateManager::getMaxBatchSize() const noexcept
+{
+    return mMaxNumSequences;
 }
 
 executor::rnn_cache::RnnCacheState::ModelConfig RnnStateManager::getRnnCacheStateModelConfig() const noexcept

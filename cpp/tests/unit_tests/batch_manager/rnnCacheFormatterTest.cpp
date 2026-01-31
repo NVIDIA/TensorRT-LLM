@@ -5,8 +5,11 @@
 
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
+
+#include <random>
 
 namespace texec = tensorrt_llm::executor;
 namespace tbm = tensorrt_llm::batch_manager;
@@ -199,8 +202,7 @@ TEST_F(RnnTargetIRanksTest, inquireSupport)
     // Same TP, different PP -> should be supported
     EXPECT_TRUE(formatter.inquireSupport(state1, state2));
 
-    // Different TP -> should NOT be supported (for now)
-    EXPECT_FALSE(formatter.inquireSupport(state1, state3));
+    EXPECT_TRUE(formatter.inquireSupport(state1, state3));
 }
 
 // Add to rnnCacheFormatterTest.cpp
@@ -310,8 +312,8 @@ TEST_F(HybridModelCounterpartsTest, DifferentPPDistributionKvRnn)
     auto mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{0, 2}));
 
-    // pickRecvConnections should map back correctly
-    auto rnnPickUp = rnnFormatter.pickRecvConnections(
+    // pickRecvConnections should map back correctly (use free function template)
+    auto rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         mergedCounterParts.size(), contextRnnState, contextRank0, genRnnState, mergedCounterParts);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1})); // indices in mergedCounterParts
 }
@@ -375,7 +377,7 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{0, 2, 4, 6}));
 
     // RNN pickRecvConnections: needs ranks {0, 2}, should map to indices {0, 1} in merged
-    auto rnnPickUp = rnnFormatter.pickRecvConnections(
+    auto rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         mergedCounterParts.size(), contextRnnState, contextRank0, genRnnState, mergedCounterParts);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
 
@@ -399,7 +401,7 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{1, 3, 5, 7}));
 
-    rnnPickUp = rnnFormatter.pickRecvConnections(
+    rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         mergedCounterParts.size(), contextRnnState, contextRank1, genRnnState, mergedCounterParts);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1})); // ranks 1,3 at indices 0,1 in merged
 }
@@ -466,7 +468,7 @@ TEST_F(HybridModelCounterpartsTest, DisjointKvRnnCounterparts)
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{4, 6})); // Only RNN ranks
 
     // pickRecvConnections for RNN: ranks {4, 6} at indices {0, 1} in merged
-    auto rnnPickUp = rnnFormatter.pickRecvConnections(
+    auto rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         mergedCounterParts.size(), contextRnnState, contextRank2, genRnnState, mergedCounterParts);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
 }
@@ -679,8 +681,8 @@ TEST_F(HybridModelCounterpartsTest, KvMorePPThanRnn)
     EXPECT_EQ(merged, (std::vector<SizeType32>{0, 2, 4, 6}));
 
     // pickRecvConnections for RNN should correctly map to indices 0, 1 in merged list
-    auto rnnPickUp
-        = rnnFormatter.pickRecvConnections(merged.size(), contextRnnState, contextRank0, genRnnState, merged);
+    auto rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
+        merged.size(), contextRnnState, contextRank0, genRnnState, merged);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
 }
 
