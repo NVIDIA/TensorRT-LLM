@@ -2207,6 +2207,14 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
                 uts.append(pytest.param(case, marks=mark))
                 # Change back id to include timeout information
                 ids.append(f"{case} TIMEOUT {timeout_str}")
+            elif " ISOLATION" in line:
+                # Process for marker ISOLATION
+                case_part, isolation_part = line.split(" ISOLATION", 1)
+                case = case_part.strip()
+                mark = pytest.mark.forked
+                uts.append(pytest.param(case, marks=mark))
+                # Keep ISOLATION in id for traceability
+                ids.append(f"{case} ISOLATION")
             else:
                 uts.append(line.strip())
     metafunc.parametrize("case", uts, ids=lambda x: x)
