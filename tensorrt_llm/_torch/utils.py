@@ -48,6 +48,13 @@ class ActivationType(IntEnum):
     Relu2 = 8
 
 
+# Keep this in sync with the ActType enum in
+# cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
+class ActType_TrtllmGen(IntEnum):
+    SwiGlu = 0
+    Relu2 = 1
+
+
 # IMPORTANT: when adding a new activation type, please update this function.
 # And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
