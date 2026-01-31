@@ -97,7 +97,10 @@ def _internvl_dynamic_preprocess_pil(image: Image.Image,
     target_height = image_size * grid_h
     blocks = grid_w * grid_h
 
-    resized_img = image.resize((target_width, target_height))
+    # Match InternVL2 HF README behavior: bicubic resize.
+    resample = getattr(Image, "Resampling", Image).BICUBIC
+    resized_img = image.resize((target_width, target_height),
+                               resample=resample)
     processed_images = []
     for i in range(blocks):
         box = (
@@ -109,7 +112,8 @@ def _internvl_dynamic_preprocess_pil(image: Image.Image,
         processed_images.append(resized_img.crop(box))
 
     if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
+        thumbnail_img = image.resize((image_size, image_size),
+                                     resample=resample)
         processed_images.append(thumbnail_img)
 
     return processed_images, (grid_h, grid_w)
@@ -445,16 +449,17 @@ class MultimodalModelRunner:
         # Cache vision engine max batch size (used to safely micro-batch InternVL
         # any-res tiling without requiring users to rebuild the vision engine).
         self.vision_max_batch_size = None
-        try:
-            builder_cfg = config.get("builder_config",
-                                     {}) if isinstance(config, dict) else {}
-            if isinstance(builder_cfg,
-                          dict) and builder_cfg.get("max_batch_size",
-                                                    None) is not None:
-                max_bs = int(builder_cfg.get("max_batch_size") or 0)
-                self.vision_max_batch_size = max_bs if max_bs > 0 else None
-        except Exception:
-            self.vision_max_batch_size = None
+        if isinstance(config, dict):
+            builder_cfg = config.get("builder_config", {})
+            if isinstance(builder_cfg, dict):
+                max_bs = builder_cfg.get("max_batch_size", None)
+                if max_bs is not None:
+                    try:
+                        max_bs_int = int(max_bs)
+                    except (TypeError, ValueError):
+                        max_bs_int = 0
+                    if max_bs_int > 0:
+                        self.vision_max_batch_size = max_bs_int
         if 'pretrained_config' in config:
             if config['pretrained_config'][
                     'architecture'] == 'LlavaNextForConditionalGeneration':
@@ -540,13 +545,17 @@ class MultimodalModelRunner:
         # InternVL vision encoder outputs fixed tokens per input image/tile.
         # Keep it for optional token-budgeting of dynamic tiling.
         self.internvl_num_image_tokens = None
-        if self.model_type == "internvl":
-            try:
-                out_shape = config.get("builder_config", {}).get("output_shape", None)
+        if self.model_type == "internvl" and isinstance(config, dict):
+            builder_cfg = config.get("builder_config", {})
+            if isinstance(builder_cfg, dict):
+                out_shape = builder_cfg.get("output_shape", None)
                 if isinstance(out_shape, (list, tuple)) and len(out_shape) >= 2:
-                    self.internvl_num_image_tokens = int(out_shape[1])
-            except Exception:
-                self.internvl_num_image_tokens = None
+                    try:
+                        num_tokens = int(out_shape[1])
+                    except (TypeError, ValueError):
+                        num_tokens = None
+                    if num_tokens is not None and num_tokens > 0:
+                        self.internvl_num_image_tokens = num_tokens
         if self.decoder_llm:
             if not supports_inflight_batching(self.llm_engine_dir):
                 logger.warning(
@@ -854,28 +863,11 @@ class MultimodalModelRunner:
                            device=self.device) as f:
                 for k in f.keys():
                     self.image_newlines[k] = f.get_tensor(k)
-        elif self.model_type == "internvl":
-            # Optional (not required): some downstream code paths may provide
-            # newline vectors, but InternVL2's default behavior is to simply
-            # concatenate tile features (no newline tokens).
-            self.image_newlines = {}
-            image_newlines_path = os.path.join(self.visual_engine_dir,
-                                               'image_newlines.safetensors')
-            try:
-                if os.path.isfile(image_newlines_path):
-                    with safe_open(image_newlines_path,
-                                   framework="pt",
-                                   device=self.device) as f:
-                        for k in f.keys():
-                            self.image_newlines[k] = f.get_tensor(k)
-            except Exception:
-                # Keep optional newlines empty
-                self.image_newlines = {}
 
     def init_audio_encoder(self):
         assert self.model_type == "phi-4-multimodal"
         model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
-                                                     torch_dtype=torch.float16,
+                                                     dtype=torch.float16,
                                                      trust_remote_code=True,
                                                      device_map='cpu')
         self.audio_model = model.model.embed_tokens_extend.audio_embed.to(
@@ -969,7 +961,7 @@ class MultimodalModelRunner:
 
         from transformers import CLIPImageProcessor
         processor = CLIPImageProcessor.from_pretrained(
-            "openai/clip-vit-large-patch14", torch_dtype=torch.bfloat16)
+            "openai/clip-vit-large-patch14", dtype=torch.bfloat16)
         frames = processor.preprocess(frames,
                                       return_tensors="pt")['pixel_values']
         # make dtype consistent with vision encoder
@@ -982,11 +974,9 @@ class MultimodalModelRunner:
         audio = None
         # InternVL any-res: allow passing a list of tiles for native tiling/packing
         internvl_tiles = None
-        internvl_tile_grid = None
-        if isinstance(other_vision_inputs, dict):
-            if 'tiles' in other_vision_inputs and 'internvl' in self.model_type:
-                internvl_tiles = other_vision_inputs.pop('tiles')
-                internvl_tile_grid = other_vision_inputs.pop('tile_grid_hw', None)
+        if 'internvl' in self.model_type and isinstance(other_vision_inputs,
+                                                       dict):
+            internvl_tiles = other_vision_inputs.pop('tiles', None)
         # same prompt for single/multiple image(s)
         n_prompts_n_images = False
         if isinstance(post_prompt,
@@ -1095,59 +1085,58 @@ class MultimodalModelRunner:
 
         profiler.start("Vision encoder")
         visual_features, visual_atts, model_runner_input = None, None, None
-        # Hook: accept precomputed vision embeddings (e.g., any-res tiling) when provided
-        precomputed = None
-        try:
-            if isinstance(other_vision_inputs, dict) and 'precomputed_vision_emb' in other_vision_inputs:
-                precomputed = other_vision_inputs.pop('precomputed_vision_emb')
-        except Exception:
-            precomputed = None
-
         if internvl_tiles is not None:
             # Encode InternVL tiles with the vision engine, then concatenate them
             # into a single long sequence (matching InternVL2 HF behavior).
-            tile_tensors = []
-            for t in internvl_tiles:
-                if isinstance(t, torch.Tensor):
-                    if t.dim() == 3:
-                        tile_tensors.append(t)
-                    elif t.dim() == 4:
-                        tile_tensors.append(t[0])
+            if isinstance(internvl_tiles, (list, tuple)) and all(
+                    isinstance(t, Image.Image) for t in internvl_tiles):
+                tiles_batch = self.processor(images=list(internvl_tiles),
+                                             return_tensors='pt')[
+                                                 'pixel_values']
+            else:
+                tile_tensors = []
+                for t in internvl_tiles:
+                    if isinstance(t, torch.Tensor):
+                        if t.dim() == 3:
+                            tile_tensors.append(t)
+                        elif t.dim() == 4:
+                            # Accept either [1, 3, H, W] or [N, 3, H, W].
+                            if t.shape[0] == 1:
+                                tile_tensors.append(t[0])
+                            else:
+                                tile_tensors.extend(list(t))
+                        else:
+                            raise ValueError(
+                                "[internvl:anyres] unsupported tile tensor shape"
+                            )
                     else:
-                        raise ValueError("[internvl:anyres] unsupported tile tensor shape")
-                else:
-                    # Assume PIL Image
-                    tile_tensor = self.processor(images=t, return_tensors='pt').pixel_values[0]
-                    tile_tensors.append(tile_tensor)
+                        # Assume PIL Image
+                        tile_tensor = self.processor(
+                            images=t,
+                            return_tensors='pt')['pixel_values'][0]
+                        tile_tensors.append(tile_tensor)
+                tiles_batch = torch.stack(tile_tensors, dim=0)
             dtype = str_dtype_to_torch(self.vision_precision)
-            tiles_batch = torch.stack(tile_tensors, dim=0).to(self.device).to(dtype)
+            tiles_batch = tiles_batch.to(self.device).to(dtype)
             # Vision encoder expects [N, 3, H, W]. Micro-batch to respect the
             # vision engine's max batch size (common engines are built with max_bs=1).
-            max_bs = int(getattr(self, "vision_max_batch_size", 0) or 0)
-            if max_bs <= 0:
-                max_bs = tiles_batch.shape[0]
+            max_bs = getattr(self, "vision_max_batch_size", None)
+            if not isinstance(max_bs, int) or max_bs <= 0:
+                # Default to 1 (safest): many deployed vision engines are built with max_bs=1.
+                max_bs = 1
             tile_embeds_chunks = []
             for st in range(0, tiles_batch.shape[0], max_bs):
-                embeds, _ = self.get_visual_features(tiles_batch[st:st + max_bs],
-                                                     {})
+                embeds, _ = self.get_visual_features(
+                    tiles_batch[st:st + max_bs], {})
                 tile_embeds_chunks.append(embeds)
             tile_embeds = torch.cat(tile_embeds_chunks, dim=0)
             # tile_embeds: [num_tiles, tokens_per_tile, hidden]
             tile_embeds = tile_embeds.contiguous()
             packed = tile_embeds.view(-1, tile_embeds.shape[-1])  # [T, hidden]
             visual_features = packed.unsqueeze(0)  # [1, T, hidden]
-            visual_atts = torch.ones(visual_features.size()[:-1], dtype=torch.long, device=visual_features.device)
-            model_runner_input = None
-        elif precomputed is not None and image is None:
-            # precomputed expected shape: [batch, tokens, hidden]
-            if not torch.is_tensor(precomputed):
-                precomputed = torch.as_tensor(precomputed)
-            # Ensure device/dtype compatibility
-            dev = self.device if hasattr(self, 'device') else 'cuda'
-            dt = self.model.dtype if hasattr(self, 'model') and hasattr(self.model, 'dtype') else torch.float16
-            visual_features = precomputed.to(device=dev, dtype=dt)
-            atts_shape = visual_features.shape[:-1]
-            visual_atts = torch.ones(atts_shape, dtype=torch.long, device=visual_features.device)
+            visual_atts = torch.ones(visual_features.size()[:-1],
+                                     dtype=torch.long,
+                                     device=visual_features.device)
             model_runner_input = None
         elif image is not None:
             model_runner_input = torch.stack(
@@ -2672,53 +2661,75 @@ class MultimodalModelRunner:
             # InternVL2 supports dynamic tiling ("any-res") preprocessing. TRT-LLM
             # can optionally enable it to improve detail-sensitive accuracy.
             # Defaults: read from HF config.json if present; allow CLI overrides.
-            enable_dynamic = None
-            min_num = None
-            max_num = None
-            image_size = None
-            use_thumbnail = None
-            try:
-                cfg_path = os.path.join(self.args.hf_model_dir, "config.json")
-                if os.path.isfile(cfg_path):
-                    with open(cfg_path, "r") as f:
+            enable_dynamic = False
+            min_num = 1
+            max_num = 12
+            image_size = 448
+            use_thumbnail = True
+
+            cfg_path = os.path.join(self.args.hf_model_dir, "config.json")
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, "r", encoding="utf-8") as f:
                         cfg = json.load(f)
-                    if isinstance(cfg, dict):
-                        enable_dynamic = bool(cfg.get("dynamic_image_size", False))
-                        min_num = int(cfg.get("min_dynamic_patch", 1))
-                        max_num = int(cfg.get("max_dynamic_patch", 12))
-                        use_thumbnail = bool(cfg.get("use_thumbnail", True))
-                        if cfg.get("force_image_size", None) is not None:
-                            image_size = int(cfg["force_image_size"])
-                        else:
-                            vc = cfg.get("vision_config", {}) or {}
-                            if isinstance(vc, dict) and vc.get("image_size", None) is not None:
+                except (OSError, json.JSONDecodeError):
+                    cfg = None
+                if isinstance(cfg, dict):
+                    enable_dynamic = bool(cfg.get("dynamic_image_size", False))
+                    try:
+                        min_num = int(cfg.get("min_dynamic_patch", min_num))
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        max_num = int(cfg.get("max_dynamic_patch", max_num))
+                    except (TypeError, ValueError):
+                        pass
+                    use_thumbnail = bool(cfg.get("use_thumbnail", use_thumbnail))
+
+                    force_image_size = cfg.get("force_image_size", None)
+                    if force_image_size is not None:
+                        try:
+                            image_size = int(force_image_size)
+                        except (TypeError, ValueError):
+                            pass
+                    else:
+                        vc = cfg.get("vision_config", None)
+                        if isinstance(vc, dict) and vc.get("image_size",
+                                                           None) is not None:
+                            try:
                                 image_size = int(vc["image_size"])
-            except Exception:
-                pass
+                            except (TypeError, ValueError):
+                                pass
 
             # CLI overrides (optional, for backward compatibility)
-            if getattr(self.args, "internvl_dynamic_image_size", None) is not None:
-                enable_dynamic = bool(self.args.internvl_dynamic_image_size)
-            if getattr(self.args, "internvl_min_dynamic_patch", None) is not None:
-                min_num = int(self.args.internvl_min_dynamic_patch)
-            if getattr(self.args, "internvl_max_dynamic_patch", None) is not None:
-                max_num = int(self.args.internvl_max_dynamic_patch)
-            if getattr(self.args, "internvl_use_thumbnail", None) is not None:
-                use_thumbnail = bool(self.args.internvl_use_thumbnail)
-            if getattr(self.args, "internvl_image_size", None) is not None:
-                image_size = int(self.args.internvl_image_size)
+            override = getattr(self.args, "internvl_dynamic_image_size", None)
+            if override is not None:
+                enable_dynamic = bool(override)
+            override = getattr(self.args, "internvl_min_dynamic_patch", None)
+            if override is not None:
+                try:
+                    min_num = int(override)
+                except (TypeError, ValueError):
+                    pass
+            override = getattr(self.args, "internvl_max_dynamic_patch", None)
+            if override is not None:
+                try:
+                    max_num = int(override)
+                except (TypeError, ValueError):
+                    pass
+            override = getattr(self.args, "internvl_use_thumbnail", None)
+            if override is not None:
+                use_thumbnail = bool(override)
+            override = getattr(self.args, "internvl_image_size", None)
+            if override is not None:
+                try:
+                    image_size = int(override)
+                except (TypeError, ValueError):
+                    pass
 
-            # Final defaults
-            if enable_dynamic is None:
-                enable_dynamic = False
-            if min_num is None:
-                min_num = 1
-            if max_num is None:
-                max_num = 12
-            if image_size is None:
-                image_size = 448
-            if use_thumbnail is None:
-                use_thumbnail = True
+            min_num = max(1, min_num)
+            max_num = max(min_num, max_num)
+            image_size = max(1, image_size)
 
             if enable_dynamic and self.cpp_e2e:
                 logger.warning(
@@ -2728,7 +2739,7 @@ class MultimodalModelRunner:
                 enable_dynamic = False
 
             if enable_dynamic:
-                tiles, grid_hw = _internvl_dynamic_preprocess_pil(
+                tiles, _ = _internvl_dynamic_preprocess_pil(
                     raw_image,
                     min_num=min_num,
                     max_num=max_num,
@@ -2738,29 +2749,38 @@ class MultimodalModelRunner:
 
                 # Best-effort cap by token budget (LLM max_input_len) so we don't
                 # exceed engine limits when too many tiles are produced.
-                try:
-                    max_input_len = int(
-                        getattr(self.model, "max_input_len", 0)
-                        or getattr(self.model_config, "max_input_len", 0) or 0)
-                    if max_input_len > 0 and self.internvl_num_image_tokens:
-                        pre_len = int(
-                            self.tokenizer(pre_prompt, return_tensors="pt").input_ids.shape[1])
-                        post_len = int(
-                            self.tokenizer(post_prompt, return_tensors="pt").input_ids.shape[1])
+                tokens_per_tile = self.internvl_num_image_tokens
+                if isinstance(tokens_per_tile, int) and tokens_per_tile > 0:
+                    try:
+                        max_input_len = int(
+                            getattr(self.model, "max_input_len", 0) or
+                            getattr(self.model_config, "max_input_len", 0) or 0)
+                    except (TypeError, ValueError):
+                        max_input_len = 0
+                    if max_input_len > 0:
+                        try:
+                            pre_len = int(
+                                self.tokenizer(
+                                    pre_prompt,
+                                    return_tensors="pt").input_ids.shape[1])
+                            post_len = int(
+                                self.tokenizer(
+                                    post_prompt,
+                                    return_tensors="pt").input_ids.shape[1])
+                        except (AttributeError, TypeError):
+                            pre_len = 0
+                            post_len = 0
                         budget = max_input_len - pre_len - post_len
-                        max_tiles_fit = max(1, int(budget // max(1, self.internvl_num_image_tokens)))
+                        max_tiles_fit = max(
+                            1, int(budget // max(1, tokens_per_tile)))
                         if len(tiles) > max_tiles_fit:
                             logger.warning(
                                 f"[internvl:anyres] Capping tiles from {len(tiles)} to {max_tiles_fit} "
                                 f"(max_input_len={max_input_len}, budget={budget}, "
-                                f"tokens_per_tile={self.internvl_num_image_tokens})."
-                            )
+                                f"tokens_per_tile={tokens_per_tile}).")
                             tiles = tiles[:max_tiles_fit]
-                except Exception:
-                    pass
 
                 other_vision_inputs["tiles"] = tiles
-                other_vision_inputs["tile_grid_hw"] = grid_hw
                 image = None
             else:
                 image = self.processor(images=raw_image,
