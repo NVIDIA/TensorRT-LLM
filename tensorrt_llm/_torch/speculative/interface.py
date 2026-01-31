@@ -109,6 +109,9 @@ class SpeculativeDecodingMode(IntEnum):
     def support_capturable_guided_decoder(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
+    def support_dynamic_draft_len(self):
+        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
 
@@ -241,6 +244,12 @@ class SpecMetadata:
     is_spec_dec_tree: bool = False
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
+
+    # Dynamic draft length support for one-model path.
+    # This is set by the model_engine BEFORE forward() based on batch size,
+    # and read by the spec_worker to determine how many draft iterations to run.
+    # None means "use max_draft_len" (default/unset).
+    effective_draft_len: Optional[int] = None
 
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False
@@ -398,6 +407,7 @@ class SpecWorkerBase(nn.Module, ABC):
         spec_metadata,
         draft_model,
     ):
+        """Skip spec dec for non-last rank (PP). Returns placeholder outputs."""
         batch_size = attn_metadata.num_seqs
         accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
@@ -411,6 +421,60 @@ class SpecWorkerBase(nn.Module, ABC):
         next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
+        return {
+            'logits': logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
+
+    def skip_drafting(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """
+        When effective_draft_len == 0, skip draft iterations but still sample from target model.
+        Used when speculation is disabled for dynamic draft length (e.g., large batch size).
+        """
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        max_draft_len = self.max_draft_len
+
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
+
+        # Sample from target model (must generate valid tokens!)
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
+
+        # Create accepted_tokens with only target tokens (no drafts accepted)
+        accepted_tokens = torch.zeros((batch_size, (max_draft_len + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        accepted_tokens[:, 0] = target_tokens
+
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        # No draft tokens generated (all zeros)
+        next_draft_tokens = torch.zeros((batch_size, max_draft_len),
+                                        dtype=torch.int,
+                                        device=logits.device)
+
+        # Next iteration input: only the accepted target token
+        next_new_tokens = torch.zeros((batch_size, (max_draft_len + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        next_new_tokens[:, 0] = target_tokens
+
         return {
             'logits': logits,
             'new_tokens': accepted_tokens,

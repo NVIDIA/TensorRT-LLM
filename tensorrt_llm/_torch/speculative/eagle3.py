@@ -371,6 +371,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     # @torch.compile(options={"max-autotune": True})
     def forward(self, input_ids, position_ids, hidden_states, logits,
                 attn_metadata, spec_metadata, draft_model):
+
+        # override the draft length if dynamic draft length is enabled
+        effective_draft_len = spec_metadata.effective_draft_len if spec_metadata.effective_draft_len is not None else self.max_draft_len
+        # skip the draft forward if the effective draft length is 0
+        if effective_draft_len == 0:
+            return self.skip_drafting(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model)
+
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -397,13 +406,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata=spec_metadata,
             draft_model=draft_model)
 
-        # Predict draft tokens
+        # Predict draft tokens using effective_draft_len
         next_draft_tokens = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        for i in range(self.max_draft_len):
+        max_draft_len = self.max_draft_len
+        for i in range(effective_draft_len):
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
-                                 (self.max_draft_len + 1)).long()
+                                 (max_draft_len + 1)).long()
                 gather_ids_gen = (start_ids_gen +
                                   num_accepted_tokens[num_contexts:] - 1 +
                                   attn_metadata.num_ctx_tokens)
@@ -463,7 +473,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # update kv_lens_cuda
                 if hasattr(attn_metadata, 'kv_lens_cuda'):
                     attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                        self.max_draft_len - num_accepted_tokens[num_contexts:])
+                        max_draft_len - num_accepted_tokens[num_contexts:])
                     attn_metadata.kv_lens_cuda[:num_contexts] += 1
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
@@ -475,6 +485,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 "attn_metadata": attn_metadata,
                 "spec_metadata": spec_metadata,
             }
+
+        # Pad to max_draft_len if needed for consistent output shapes
+        if effective_draft_len < max_draft_len:
+            padding_tokens = torch.zeros(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+            for _ in range(max_draft_len - effective_draft_len):
+                next_draft_tokens.append(padding_tokens)
+
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn_metadata to support cuda graph
