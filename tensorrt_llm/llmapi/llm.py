@@ -135,6 +135,7 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
+        self._disaggregated_params = {}
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
@@ -266,8 +267,10 @@ class BaseLLM:
     @property
     @set_api_status("beta")
     def disaggregated_params(self) -> dict:
-        return self._executor.get_disaggregated_params(
-        ) if self._executor else {}
+        if self._disaggregated_params is None:
+            self._disaggregated_params = self._executor.get_disaggregated_params(
+            ) if self._executor else {}
+        return self._disaggregated_params
 
     def generate(
         self,
