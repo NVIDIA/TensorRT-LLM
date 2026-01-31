@@ -337,8 +337,8 @@ def torch_fake_quant_int4_gptq_linear(
     - weight_scale[0]: scales [G, N]
     - weight_zp[0]: qzeros [G, N/8] packed int32
     """
-    pack_factor = 8
-    maxq = 15
+    PACK_FACTOR = 8
+    MAXQ = 15
     dequant_dtype = torch.int8
 
     qweight = weight_quantized
@@ -351,7 +351,7 @@ def torch_fake_quant_int4_gptq_linear(
 
     if qweight.dim() != 2:
         raise RuntimeError("qweight must be 2D [K/8, N]")
-    K = qweight.size(0) * pack_factor
+    K = qweight.size(0) * PACK_FACTOR
     N = qweight.size(1)
 
     if scales.dim() != 2 or scales.size(1) != N:
@@ -362,7 +362,7 @@ def torch_fake_quant_int4_gptq_linear(
         raise RuntimeError(f"K ({K}) must be divisible by G ({G})")
     block_size = K // G
 
-    if qzeros.dim() != 2 or qzeros.size(0) != G or qzeros.size(1) * pack_factor != N:
+    if qzeros.dim() != 2 or qzeros.size(0) != G or qzeros.size(1) * PACK_FACTOR != N:
         raise RuntimeError(f"qzeros must be [G={G}, N/8={N // 8}]")
 
     # Reshape input to 2D if needed
@@ -370,22 +370,22 @@ def torch_fake_quant_int4_gptq_linear(
 
     # Build g_idx and shift tables
     g_idx = torch.arange(K, device=dev, dtype=torch.int32) // block_size  # [K]
-    wf = torch.arange(pack_factor, device=dev, dtype=torch.int32) * 4  # [8]
-    wf_unsqueeze_zero = wf.view(1, 1, pack_factor)  # [1,1,8]
-    wf_unsqueeze_neg_one = wf.view(1, pack_factor, 1)  # [1,8,1]
+    wf = torch.arange(PACK_FACTOR, device=dev, dtype=torch.int32) * 4  # [8]
+    wf_unsqueeze_zero = wf.view(1, 1, PACK_FACTOR)  # [1,1,8]
+    wf_unsqueeze_neg_one = wf.view(1, PACK_FACTOR, 1)  # [1,8,1]
 
     zeros = torch.bitwise_right_shift(
-        torch.unsqueeze(qzeros, 2).expand(-1, -1, pack_factor),
+        torch.unsqueeze(qzeros, 2).expand(-1, -1, PACK_FACTOR),
         wf_unsqueeze_zero,
     ).to(dequant_dtype)
-    zeros = torch.bitwise_and(zeros, maxq).reshape(scales.shape)
+    zeros = torch.bitwise_and(zeros, MAXQ).reshape(scales.shape)
 
     weight = torch.bitwise_and(
         torch.bitwise_right_shift(
-            torch.unsqueeze(qweight, 1).expand(-1, pack_factor, -1),
+            torch.unsqueeze(qweight, 1).expand(-1, PACK_FACTOR, -1),
             wf_unsqueeze_neg_one,
         ).to(dequant_dtype),
-        maxq,
+        MAXQ,
     )
     weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 

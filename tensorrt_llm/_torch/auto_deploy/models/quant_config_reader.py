@@ -189,6 +189,17 @@ class HFQuantConfigReader(QuantConfigReader):
         if quant_method not in ["mxfp4", "gptq"]:
             return None
 
+        # Validate GPTQ config: currently only INT4 with group_size=128 is supported
+        if quant_method == "gptq":
+            bits = qconf.get("bits")
+            group_size = qconf.get("group_size")
+            if bits != 4:
+                raise ValueError(f"GPTQ quantization only supports bits=4, got bits={bits}")
+            if group_size != 128:
+                raise ValueError(
+                    f"GPTQ quantization only supports group_size=128, got group_size={group_size}"
+                )
+
         reader = cls()
         extra_model_kwargs = reader.read_config(raw)
         return reader, extra_model_kwargs
