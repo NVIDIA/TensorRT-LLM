@@ -18,7 +18,7 @@ def model_name(request) -> str:
 # yapf: enable
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["tensorrt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -26,7 +26,7 @@ def backend(request):
 @pytest.fixture(scope="module")
 def server(model_name: str, backend: str):
     # Skip specific model/backend combinations
-    if model_name == "Qwen3/Qwen3-0.6B" and backend == "trt":
+    if model_name == "Qwen3/Qwen3-0.6B" and backend == "tensorrt":
         pytest.skip("Qwen3 model not supported with trt backend")
 
     model_path = get_model_path(model_name)

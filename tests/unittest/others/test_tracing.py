@@ -105,7 +105,7 @@ def server(
 ):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
-    if backend == "trt":
+    if backend == "tensorrt":
         args.extend(["--max_beam_width", "4"])
     args.extend(["--extra_llm_api_options", temp_extra_llm_api_options_file])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])

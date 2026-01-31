@@ -131,7 +131,9 @@ def llm_test_harness(model_dir: str,
 
     llm_cls = LLM_torch if backend == "pytorch" else LLM
 
-    with assert_resource_freed(llm_cls, model_dir, tokenizer,
+    with assert_resource_freed(llm_cls,
+                               model_dir,
+                               tokenizer=tokenizer,
                                **llm_kwargs) as llm:
         outputs = llm.generate(inputs, sampling_params=sampling_params)
         print(outputs)
@@ -217,18 +219,18 @@ def test_llm_args_invalid_usage():
     runtime_max_num_tokens = 2
 
     # Update build_config with warning msg if runtime arguments are passed.
-    llm_args = LlmArgs.from_kwargs(model='test-model',
-                                   max_batch_size=runtime_max_batch_size,
-                                   max_num_tokens=runtime_max_num_tokens)
+    llm_args = LlmArgs(model='test-model',
+                       max_batch_size=runtime_max_batch_size,
+                       max_num_tokens=runtime_max_num_tokens)
     assert llm_args.build_config.max_batch_size == runtime_max_batch_size
     assert llm_args.build_config.max_num_tokens == runtime_max_num_tokens
 
     # Conflict between build_config and runtime_params
     build_config = BuildConfig(max_batch_size=5, max_num_tokens=7)
-    llm_args = LlmArgs.from_kwargs(model='test-model',
-                                   build_config=build_config,
-                                   max_batch_size=runtime_max_batch_size,
-                                   max_num_tokens=runtime_max_num_tokens)
+    llm_args = LlmArgs(model='test-model',
+                       build_config=build_config,
+                       max_batch_size=runtime_max_batch_size,
+                       max_num_tokens=runtime_max_num_tokens)
     assert llm_args.build_config.max_batch_size == build_config.max_batch_size
     assert llm_args.build_config.max_num_tokens == build_config.max_num_tokens
 
@@ -1894,11 +1896,12 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
     [
         # TRT backend test cases
-        (2, None, True, False, "trt"),  # prompt_logprobs with context_logits
-        (None, 2, False, False, "trt"),  # generation logprobs only (top-2)
+        (2, None, True, False, "tensorrt"
+         ),  # prompt_logprobs with context_logits
+        (None, 2, False, False, "tensorrt"),  # generation logprobs only (top-2)
         (2, None, False, False,
-         "trt"),  # prompt_logprobs without context_logits
-        (None, None, False, False, "trt"),  # no logprobs at all
+         "tensorrt"),  # prompt_logprobs without context_logits
+        (None, None, False, False, "tensorrt"),  # no logprobs at all
     ])
 def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                              logprobs: Optional[int],

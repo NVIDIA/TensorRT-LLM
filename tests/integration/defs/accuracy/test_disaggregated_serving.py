@@ -182,8 +182,8 @@ def launch_disaggregated_llm(
     with open(gen_server_config_path, "w") as f:
         yaml.dump(gen_server_config, f)
 
-    args = LlmArgs.from_kwargs(model=model_name,
-                               tensor_parallel_size=tensor_parallel_size)
+    args = LlmArgs(model=model_name, tensor_parallel_size=tensor_parallel_size)
+
     if "FP4" in model_name:
         args.quant_config.quant_algo = "NVFP4"
 

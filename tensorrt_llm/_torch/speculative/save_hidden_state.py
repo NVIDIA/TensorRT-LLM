@@ -47,7 +47,7 @@ class SaveHiddenStatesDrafter(Drafter):
                 "input_ids": input_ids,
                 "hidden_state": hidden_states,
             }
-            if len(self.spec_config.eagle3_layers_to_capture) > 1:
+            if self.spec_config.num_capture_layers > 1:
                 if self.spec_config._last_hidden_in_save:
                     out_dict[
                         "aux_hidden_states"] = resource_manager.hidden_states[:num_tokens, :].cpu(

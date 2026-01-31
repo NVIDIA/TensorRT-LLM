@@ -15,7 +15,7 @@ methods:
         default: False
         status: beta
       cp_config:
-        annotation: Optional[dict]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CpConfig]
         default: null
         status: prototype
       pp_partition:
@@ -81,10 +81,6 @@ methods:
       # Misc
       backend:
         annotation: Optional[str]
-        default: null
-        status: deprecated
-      build_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
         default: null
         status: deprecated
       cuda_graph_config:

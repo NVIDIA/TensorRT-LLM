@@ -20,7 +20,7 @@ from unittest.mock import Mock, patch
 import pytest
 import yaml
 
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, update_llm_args_with_extra_dict
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 CONFIG_ROOT = Path(__file__).parents[3] / "examples" / "configs"
 DATABASE_DIR = CONFIG_ROOT / "database"
@@ -54,9 +54,7 @@ def test_config_validates_against_llm_args(config_path: Path):
     with open(config_path) as f:
         config_dict = yaml.safe_load(f) or {}
 
-    base_args = TorchLlmArgs(model="dummy/model", skip_tokenizer_init=True)
-    merged = update_llm_args_with_extra_dict(base_args.model_dump(), config_dict)
-    TorchLlmArgs(**merged)
+    TorchLlmArgs(model="dummy/model", skip_tokenizer_init=True, **config_dict)
 
 
 @pytest.mark.part0

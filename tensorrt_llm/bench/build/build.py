@@ -324,7 +324,7 @@ def build_command(
 
     # Build the LLM engine with the LLMAPI.
     llm = LLM(checkpoint_path,
-              tokenizer,
+              tokenizer=tokenizer,
               dtype=model_config.dtype,
               tensor_parallel_size=tp_size,
               pipeline_parallel_size=pp_size,

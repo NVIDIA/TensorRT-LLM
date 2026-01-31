@@ -1,3 +1,4 @@
+import functools
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Type, Union
@@ -7,6 +8,7 @@ from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ...llmapi.llm_args import (
+    BaseLlmArgs,
     BuildConfig,
     EagleDecodingConfig,
     SamplerType,
@@ -28,16 +30,26 @@ def _get_config_dict() -> SettingsConfigDict:
     )
 
 
-def _check_for_default_value_only(
-    cls: Type[BaseSettings], value: Any, info: ValidationInfo, msg: str
-) -> Any:
-    """Check if the value is the default value for the field.
+@functools.cache
+def _get_dummy_llm_args(llm_args_cls: Type[BaseLlmArgs]) -> BaseLlmArgs:
+    """Create a cached dummy LlmArgs instance to retrieve post-validation default values."""
+    return llm_args_cls(model="dummy")
 
-    If the value is not the default value, raise a ValueError.
+
+def _check_for_default_value_only(
+    llm_args_cls: Type[BaseSettings], value: Any, info: ValidationInfo, msg: str
+) -> Any:
+    """Raise ValueError if value differs from the field's default.
+
+    Compares against both the raw field default and the post-validation default
+    (from a dummy instance) to handle cases where validators modify defaults.
     """
+    dummy_llm_args = _get_dummy_llm_args(llm_args_cls)
     field_name = info.field_name
     assert field_name is not None, "field_name should be set for validated field."
-    if value != cls.model_fields[field_name].get_default(call_default_factory=True):
+    field_default = llm_args_cls.model_fields[field_name].get_default(call_default_factory=True)
+    post_validation_default = getattr(dummy_llm_args, field_name)
+    if value not in {field_default, post_validation_default}:
         raise ValueError(msg)
     return value
 

@@ -14,8 +14,6 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import (EagleDecodingConfig, LookaheadDecodingConfig,
-                                 MedusaDecodingConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_sm_version, llm_models_root, parametrize_with_ids,
@@ -428,7 +426,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
     def test_lookahead(self, mocker):
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
-        self.run(spec_dec_algo=LookaheadDecodingConfig.decoding_type,
+        self.run(spec_dec_algo="Lookahead",
                  extra_build_args=[
                      "--max_draft_len=83",
                      "--speculative_decoding_mode=lookahead_decoding"
@@ -448,7 +446,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
             extra_summarize_args.append("--cuda_graph_mode")
 
         self.run(dtype="float16",
-                 spec_dec_algo=MedusaDecodingConfig.decoding_type,
+                 spec_dec_algo="Medusa",
                  extra_convert_args=[
                      f"--medusa_model_dir={self.MEDUSA_MODEL_PATH}",
                      "--num_medusa_heads=4"
@@ -476,7 +474,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
             extra_summarize_args.extend(
                 ["--eagle_posterior_threshold=0.09", "--temperature=0.7"])
 
-        self.run(spec_dec_algo=EagleDecodingConfig.decoding_type,
+        self.run(spec_dec_algo="Eagle",
                  extra_convert_args=[
                      f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
                      "--max_draft_len=63", "--num_eagle_layers=4",
@@ -503,7 +501,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
         if chunked_context:
             extra_summarize_args.append("--enable_chunked_context")
 
-        self.run(spec_dec_algo=EagleDecodingConfig.decoding_type,
+        self.run(spec_dec_algo="Eagle",
                  extra_convert_args=[
                      f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
                      "--max_draft_len=63", "--num_eagle_layers=4",
@@ -848,7 +846,7 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
             "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [1, 6], [0, 7, 0]]"
         ]
         self.run(dtype="float16",
-                 spec_dec_algo=MedusaDecodingConfig.decoding_type,
+                 spec_dec_algo="Medusa",
                  extra_build_args=["--speculative_decoding_mode=medusa"],
                  extra_summarize_args=extra_summarize_args)
 

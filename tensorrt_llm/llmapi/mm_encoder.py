@@ -4,6 +4,7 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 
 from tensorrt_llm._utils import nvtx_range_debug
+from tensorrt_llm.executor.executor import GenerationExecutor
 from tensorrt_llm.inputs import create_input_processor, prompt_inputs
 from tensorrt_llm.inputs.data import PromptInputs
 from tensorrt_llm.sampling_params import SamplingParams
@@ -13,6 +14,7 @@ from .llm_args import TorchLlmArgs
 from .mpi_session import external_mpi_comm_available
 
 
+# TODO: separate EncoderArgs ?
 class MultimodalEncoder(_TorchLLM):
     """MultimodalEncoder class is the main class for running a multimodal encoder model using PyTorch backend.
 """
@@ -60,7 +62,7 @@ class MultimodalEncoder(_TorchLLM):
         assert isinstance(self.args, TorchLlmArgs)
         self.args.mm_encoder_only = True
 
-        self._executor = self._executor_cls.create(
+        self._executor = GenerationExecutor.create(
             self._engine_dir,
             executor_config=None,
             model_world_size=self.args.parallel_config.world_size,

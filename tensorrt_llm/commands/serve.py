@@ -11,29 +11,24 @@ from typing import Any, Dict, Literal, Mapping, Optional, Sequence
 
 import click
 import torch
-import yaml
 from strenum import StrEnum
 from torch.cuda import device_count
 
-from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig)
+from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
-                                              extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
+from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
+from tensorrt_llm.llmapi.llm_create import (create_llm_from_llm_args,
+                                            get_llm_args_from_cli_params)
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
-from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
@@ -86,106 +81,17 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
-def get_llm_args(
-        model: str,
-        tokenizer: Optional[str] = None,
-        custom_tokenizer: Optional[str] = None,
-        backend: str = "pytorch",
-        max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
-    default,
-        max_batch_size: int = BuildConfig.model_fields["max_batch_size"].
-    default,
-        max_num_tokens: int = BuildConfig.model_fields["max_num_tokens"].
-    default,
-        max_seq_len: int = BuildConfig.model_fields["max_seq_len"].default,
-        tensor_parallel_size: int = 1,
-        pipeline_parallel_size: int = 1,
-        context_parallel_size: int = 1,
-        cp_config: Optional[dict] = None,
-        moe_expert_parallel_size: Optional[int] = None,
-        gpus_per_node: Optional[int] = None,
-        free_gpu_memory_fraction: float = 0.9,
-        num_postprocess_workers: int = 0,
-        trust_remote_code: bool = False,
-        revision: Optional[str] = None,
-        reasoning_parser: Optional[str] = None,
-        fail_fast_on_attention_window_too_large: bool = False,
-        otlp_traces_endpoint: Optional[str] = None,
-        enable_chunked_prefill: bool = False,
-        **llm_args_extra_dict: Any):
-
-    if gpus_per_node is None:
-        gpus_per_node = device_count()
-        if gpus_per_node == 0:
-            raise ValueError("No GPU devices found on the node")
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction, )
-
-    dynamic_batch_config = DynamicBatchConfig(
-        enable_batch_size_tuning=True,
-        enable_max_num_tokens_tuning=False,
-        dynamic_batch_moving_average_window=128)
-    scheduler_config = SchedulerConfig(
-        capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        dynamic_batch_config=dynamic_batch_config,
-    )
-    if cp_config is not None and "cp_type" in cp_config:
-        cp_config = cp_config.copy()
-        try:
-            cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
-        except KeyError:
-            raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
-                             f"Must be one of: {', '.join([t.name for t in CpType])}")
-
-    llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "custom_tokenizer": custom_tokenizer,
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_parallel_size": pipeline_parallel_size,
-        "context_parallel_size": context_parallel_size,
-        "cp_config": cp_config if cp_config is not None else {},
-        "moe_expert_parallel_size": moe_expert_parallel_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "revision": revision,
-        "build_config": build_config,
-        "max_batch_size": max_batch_size,
-        "max_num_tokens": max_num_tokens,
-        "max_beam_width": max_beam_width,
-        "max_seq_len": max_seq_len,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend,
-        "num_postprocess_workers": num_postprocess_workers,
-        "postprocess_tokenizer_dir": tokenizer or model,
-        "reasoning_parser": reasoning_parser,
-        "fail_fast_on_attention_window_too_large":
-        fail_fast_on_attention_window_too_large,
-        "otlp_traces_endpoint": otlp_traces_endpoint,
-        "enable_chunked_prefill": enable_chunked_prefill,
-    }
-
-    return llm_args, llm_args_extra_dict
-
-
 def launch_server(
         host: str,
         port: int,
-        llm_args: dict,
+        llm_args: BaseLlmArgs,
         tool_parser: Optional[str] = None,
         chat_template: Optional[str] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
         multimodal_server_config: Optional[MultimodalServerConfig] = None):
-
-    backend = llm_args["backend"]
-    model = llm_args["model"]
+    model = llm_args.model
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
@@ -200,22 +106,7 @@ def launch_server(
         except OSError as e:
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
-        if backend == 'pytorch':
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        elif backend == 'tensorrt' or backend == 'trt':
-            llm_args.pop("backend")
-            llm = LLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
+        llm = create_llm_from_llm_args(llm_args)
 
         server = OpenAIServer(llm=llm,
                               model=model,
@@ -233,7 +124,7 @@ def launch_server(
         asyncio.run(server(host, port, sockets=[s]))
 
 
-def launch_grpc_server(host: str, port: int, llm_args: dict):
+def launch_grpc_server(host: str, port: int, llm_args: BaseLlmArgs):
     """
     Launch a gRPC server for TensorRT-LLM.
 
@@ -243,7 +134,7 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
     Args:
         host: Host to bind to
         port: Port to bind to
-        llm_args: Arguments for LLM initialization (from get_llm_args)
+        llm_args: Arguments for LLM initialization
     """
     import grpc
 
@@ -260,31 +151,15 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
     async def serve_grpc_async():
         logger.info("Initializing TensorRT-LLM gRPC server...")
 
-        backend = llm_args.get("backend")
-        model_path = llm_args.get("model", "")
-
-        if backend == "pytorch":
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == "_autodeploy":
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        elif backend == "tensorrt" or backend == "trt":
-            llm_args.pop("backend")
-            llm = LLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
-
+        llm = create_llm_from_llm_args(llm_args)
         logger.info("Model loaded successfully")
 
         # Create request manager
         request_manager = GrpcRequestManager(llm)
 
         # Create servicer
-        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
+        servicer = TrtllmServiceServicer(request_manager,
+                                         model_path=llm_args.model)
 
         # Create gRPC server
         server = grpc.aio.server(
@@ -352,12 +227,12 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
 
 
 def launch_mm_encoder_server(
+    model: str,
     host: str,
     port: int,
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
-    model = encoder_args["model"]
     encoder_args.pop("build_config")
     mm_encoder = MultimodalEncoder(**encoder_args)
 
@@ -600,24 +475,13 @@ class ChoiceWithAlias(click.Choice):
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
     "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
-def serve(
-        model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-        host: str, port: int, log_level: str, backend: str, max_beam_width: int,
-        max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-        tensor_parallel_size: int, pipeline_parallel_size: int,
-        context_parallel_size: int, moe_expert_parallel_size: Optional[int],
-        moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
-        free_gpu_memory_fraction: float, num_postprocess_workers: int,
-        trust_remote_code: bool, revision: Optional[str],
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
-        server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str],
-        grpc: bool):
-    """Running an OpenAI API compatible server (or gRPC server with --grpc flag)
+def serve(model: str, host: str, port: int, log_level: str,
+          tool_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str], disagg_cluster_uri: Optional[str],
+          media_io_kwargs: Optional[str], custom_module_dirs: list[Path],
+          chat_template: Optional[str], grpc: bool, **params: dict[str, Any]):
+    """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
@@ -630,49 +494,24 @@ def serve(
             logger.error(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
-    llm_args, _ = get_llm_args(
-        model=model,
-        tokenizer=tokenizer,
-        custom_tokenizer=custom_tokenizer,
-        backend=backend,
-        max_beam_width=max_beam_width,
-        max_batch_size=max_batch_size,
-        max_num_tokens=max_num_tokens,
-        max_seq_len=max_seq_len,
-        tensor_parallel_size=tensor_parallel_size,
-        pipeline_parallel_size=pipeline_parallel_size,
-        context_parallel_size=context_parallel_size,
-        moe_expert_parallel_size=moe_expert_parallel_size,
-        moe_cluster_parallel_size=moe_cluster_parallel_size,
-        gpus_per_node=gpus_per_node,
-        free_gpu_memory_fraction=free_gpu_memory_fraction,
-        num_postprocess_workers=num_postprocess_workers,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        reasoning_parser=reasoning_parser,
-        fail_fast_on_attention_window_too_large=
-        fail_fast_on_attention_window_too_large,
-        otlp_traces_endpoint=otlp_traces_endpoint,
-        enable_chunked_prefill=enable_chunked_prefill)
 
-    llm_args_extra_dict = {}
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_extra_dict = yaml.safe_load(f)
-    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
+    llm_args = get_llm_args_from_cli_params(model=model, **params)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
     # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
     # but disagg_cluster_uri takes precedence over cluster uri in config file
-    disagg_cluster_config = llm_args.pop("disagg_cluster", None)
-    if disagg_cluster_config:
-        disagg_cluster_config = extract_disagg_cluster_config(
-            disagg_cluster_config, disagg_cluster_uri)
-    elif disagg_cluster_uri:
-        disagg_cluster_config = DisaggClusterConfig(
-            cluster_uri=disagg_cluster_uri)
+
+    # TODO: disagg_cluster_config is broken
+    disagg_cluster_config = None
+    # disagg_cluster_config = llm_args.pop("disagg_cluster", None)
+    # if disagg_cluster_config:
+    #     disagg_cluster_config = extract_disagg_cluster_config(
+    #         disagg_cluster_config, disagg_cluster_uri)
+    # elif disagg_cluster_uri:
+    #     disagg_cluster_config = DisaggClusterConfig(
+    #         cluster_uri=disagg_cluster_uri)
 
     if metadata_server_cfg is not None or disagg_cluster_config is not None:
         assert (
@@ -762,34 +601,24 @@ def serve(
               default=None,
               help="Path to metadata server config file")
 def serve_encoder(model: str, host: str, port: int, log_level: str,
-                  max_batch_size: int, max_num_tokens: int,
-                  gpus_per_node: Optional[int], trust_remote_code: bool,
-                  extra_encoder_options: Optional[str],
-                  metadata_server_config_file: Optional[str]):
+                  metadata_server_config_file: Optional[str],
+                  **params: dict[str, Any]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
 
-    # TODO: expose more argument progressivly
-    llm_args, _ = get_llm_args(model=model,
-                               max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               gpus_per_node=gpus_per_node,
-                               trust_remote_code=trust_remote_code)
-
-    encoder_args_extra_dict = {}
-    if extra_encoder_options is not None:
-        with open(extra_encoder_options, 'r') as f:
-            encoder_args_extra_dict = yaml.safe_load(f)
-    encoder_args = update_llm_args_with_extra_dict(llm_args,
-                                                   encoder_args_extra_dict)
+    # TODO: encoder args should have its own subclass of LlmArgs, which would eliminate the need to convert
+    # to a dict here
+    encoder_args = get_llm_args_from_cli_params(model=model,
+                                                **params).model_dump()
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
+    launch_mm_encoder_server(model, host, port, encoder_args,
+                             metadata_server_cfg)
 
 
 @click.command("disaggregated")
@@ -919,12 +748,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
-
-        # Ignore the non-LLM args
-        llm_args.pop("router", None)
+        # TODO: this might be a misnomer because other_args is not actually CLI params
+        llm_args = get_llm_args_from_cli_params(**server_cfg.other_args)
         _launch_disaggregated_server(config_file, llm_args)
         return
 
@@ -944,9 +769,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             instance_idx)
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        # TODO: this might be a misnomer because other_args is not actually CLI params
+        llm_args = get_llm_args_from_cli_params(**server_cfg.other_args)
 
         _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
                                      log_level)
@@ -964,7 +788,8 @@ class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
 
 
-def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
+def _launch_disaggregated_server(disagg_config_file: str,
+                                 llm_args: BaseLlmArgs):
     # Launching the server
     instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"

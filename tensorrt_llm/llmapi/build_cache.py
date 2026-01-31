@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 import filelock
+from pydantic import BaseModel, Field, model_validator
 
 import tensorrt_llm
 from tensorrt_llm.builder import BuildConfig
@@ -28,41 +29,36 @@ def get_build_cache_config_from_env() -> tuple[bool, str]:
     return build_cache_enabled, build_cache_root
 
 
-class BuildCacheConfig:
+class BuildCacheConfig(BaseModel):
     """
     Configuration for the build cache.
-
-    Attributes:
-        cache_root (str): The root directory for the build cache.
-        max_records (int): The maximum number of records to store in the cache.
-        max_cache_storage_gb (float): The maximum amount of storage (in GB) to use for the cache.
 
     Note:
         The build-cache assumes the weights of the model are not changed during the execution. If the weights are
         changed, you should remove the caches manually.
     """
 
-    def __init__(self,
-                 cache_root: Optional[Path] = None,
-                 max_records: int = 10,
-                 max_cache_storage_gb: float = 256):
-        self._cache_root = cache_root
-        self._max_records = max_records
-        self._max_cache_storage_gb = max_cache_storage_gb
+    cache_root: Optional[Path] = Field(
+        default=None,
+        description=
+        "The root directory for the build cache. Falls back to env var if not provided."
+    )
+    max_records: int = Field(
+        default=10,
+        gt=0,
+        description="The maximum number of records to store in the cache.")
+    max_cache_storage_gb: float = Field(
+        default=256.0,
+        description="The maximum amount of storage (in GB) to use for the cache."
+    )
 
-    @property
-    def cache_root(self) -> Path:
-        _build_cache_enabled, _build_cache_root = get_build_cache_config_from_env(
-        )
-        return self._cache_root or Path(_build_cache_root)
-
-    @property
-    def max_records(self) -> int:
-        return self._max_records
-
-    @property
-    def max_cache_storage_gb(self) -> float:
-        return self._max_cache_storage_gb
+    @model_validator(mode="after")
+    def set_default_cache_root(self) -> "BuildCacheConfig":
+        """Set cache_root from environment variable if not provided."""
+        if self.cache_root is None:
+            _, default_cache_root = get_build_cache_config_from_env()
+            self.cache_root = Path(default_cache_root)
+        return self
 
 
 class BuildCache:
@@ -76,16 +72,10 @@ class BuildCache:
     CACHE_VERSION = 0
 
     def __init__(self, config: Optional[BuildCacheConfig] = None):
-
-        _, default_cache_root = get_build_cache_config_from_env()
         config = config or BuildCacheConfig()
-
-        self.cache_root = config.cache_root or Path(default_cache_root)
+        self.cache_root = config.cache_root
         self.max_records = config.max_records
         self.max_cache_storage_gb = config.max_cache_storage_gb
-
-        if config.max_records < 1:
-            raise ValueError("max_records should be greater than 0")
 
     def free_storage_in_gb(self) -> float:
         ''' Get the free storage capacity of the cache. '''
