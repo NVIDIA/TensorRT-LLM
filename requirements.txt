@@ -82,3 +82,5 @@ mistral-common==1.8.6
 torchao>=0.14.1
 cuda-core
 llist
+cuda-tile>=1.0.1
+nvidia-cuda-tileiras>=13.1
