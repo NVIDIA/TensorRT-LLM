@@ -1,7 +1,7 @@
 """Transform for multi-stream execution of MoE layers that have shared experts and routed experts."""
 
 from threading import RLock
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.fx import GraphModule
@@ -127,6 +127,10 @@ def trtllm_moe_fused_aux(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    # Sharding configuration (only used when enable_alltoall=True) - see MappingSerializer
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     device = torch.cuda.current_device()
     with torch.cuda.stream(
@@ -139,8 +143,11 @@ def trtllm_moe_fused_aux(
             routing_weights,
             w3_w1_stacked_weight,
             w2_stacked_weight,
-            is_gated_mlp,
-            act_fn,
+            is_gated_mlp=is_gated_mlp,
+            act_fn=act_fn,
+            apply_routing_on_input=apply_routing_on_input,
+            enable_alltoall=enable_alltoall,
+            mapping_config=mapping_config,
         )
         torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
     torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -156,6 +163,9 @@ def trtllm_moe_fused_aux_fake(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -210,6 +220,10 @@ def trtllm_quant_fp8_moe_fused_aux(
     fc2_dequant_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    # Additional kwargs for consistency with trtllm_quant_fp8_moe_fused
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     device = torch.cuda.current_device()
     with torch.cuda.stream(
@@ -226,8 +240,11 @@ def trtllm_quant_fp8_moe_fused_aux(
             fc1_dequant_scale,
             fc2_act_scale_reciprocal,
             fc2_dequant_scale,
-            is_gated_mlp,
-            act_fn,
+            is_gated_mlp=is_gated_mlp,
+            act_fn=act_fn,
+            apply_routing_on_input=apply_routing_on_input,
+            enable_alltoall=enable_alltoall,
+            mapping_config=mapping_config,
         )
         torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
     torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -247,6 +264,9 @@ def trtllm_quant_fp8_moe_fused_aux_fake(
     fc2_dequant_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

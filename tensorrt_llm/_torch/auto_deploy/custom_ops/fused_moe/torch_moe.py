@@ -1,4 +1,4 @@
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -97,6 +97,9 @@ def torch_moe(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    # Sharding configuration (only used when enable_alltoall=True) - see MappingSerializer
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
@@ -160,6 +163,8 @@ def torch_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -246,6 +251,10 @@ def torch_quant_fp8_moe(
     w3_weight_scale: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    # Sharding configuration (only used when enable_alltoall=True) - see MappingSerializer
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
     FP8 MoE op using quantized linear operations. Computes a Mixture-of-Experts layer similar to the reference
@@ -354,6 +363,9 @@ def torch_quant_fp8_moe_fake(
     w3_weight_scale: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -377,6 +389,10 @@ def torch_quant_nvfp4_moe(
     w3_alpha: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    # Sharding configuration (only used when enable_alltoall=True) - see MappingSerializer
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -501,6 +517,9 @@ def torch_quant_nvfp4_moe_fake(
     w3_alpha: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

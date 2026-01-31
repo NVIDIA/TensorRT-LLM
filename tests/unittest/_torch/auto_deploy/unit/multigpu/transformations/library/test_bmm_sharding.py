@@ -70,8 +70,8 @@ def _run_job(
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
-                "sharding_dims": ["bmm"],
+                "TP_sharding_source": ["heuristic"],
+                "sharding_dims": ["EP"],
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -138,7 +138,7 @@ def _run_pattern_detection_job(
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
+                "TP_sharding_source": ["heuristic"],
             },
         },
     )

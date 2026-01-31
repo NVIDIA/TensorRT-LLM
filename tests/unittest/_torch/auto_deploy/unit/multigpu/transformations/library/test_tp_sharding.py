@@ -333,7 +333,7 @@ def _run_sharding_execution_job(
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": from_config,
+                "TP_sharding_source": ["heuristic"],
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -623,7 +623,7 @@ def _run_pattern_detection_job(
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": from_config,
+                "TP_sharding_source": ["heuristic"],
             },
         },
     )

@@ -13,7 +13,6 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     EPShardingInfo,
     FP8EPShardingInfo,
-    MLPType,
     NVFP4EPShardingInfo,
     ShardingTransformConfig,
 )
@@ -23,7 +22,9 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.functional import AllReduceStrategy
 
 
-def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
+def _run_ep_shard_job(
+    num_experts: int, rank: int, world_size: int, enable_attention_dp: bool
+) -> None:
     device = "cuda"
     hidden_size = 32
     intermediate_size = 16
@@ -50,8 +51,9 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
-                "sharding_dims": ["ep"],
+                "TP_sharding_source": ["heuristic"],
+                "sharding_dims": ["EP"],
+                "enable_attention_dp": enable_attention_dp,
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -59,7 +61,10 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         },
     )(None, gm)
 
-    op_expected = torch.ops.auto_deploy.torch_dist_all_reduce
+    if enable_attention_dp:
+        op_expected = torch.ops.auto_deploy.torch_dist_all_to_all
+    else:
+        op_expected = torch.ops.auto_deploy.torch_dist_all_reduce
 
     run_test_transformed_gm(
         model,
@@ -99,7 +104,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
@@ -107,7 +111,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     FP8EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_moe):
@@ -115,7 +118,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     NVFP4EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
 
@@ -125,7 +127,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
+                "TP_sharding_source": ["heuristic"],
             },
         },
     )
@@ -140,7 +142,8 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
 
 @pytest.mark.parametrize("device_count", get_device_counts([2, 8]))
 @pytest.mark.parametrize("num_experts", [3, 8])
-def test_ep_shard(device_count: int, num_experts: int):
+@pytest.mark.parametrize("enable_attention_dp", [True, False])
+def test_ep_shard(device_count: int, num_experts: int, enable_attention_dp: bool):
     if device_count > num_experts:
         pytest.skip(f"world_size {device_count} > num_experts {num_experts}")
     dist_common.spawn_multiprocess_job(
@@ -198,7 +201,7 @@ def test_llama4_stacked_moe_pattern_detection():
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
+                "TP_sharding_source": ["heuristic"],
             },
         },
     )

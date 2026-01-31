@@ -10,7 +10,7 @@ import torch
 
 # use trtllm distributed ops to improve TP performance if possible
 from ....mapping import Mapping
-from ...distributed import AllReduce, allgather
+from ...distributed import AllReduce, allgather, reducescatter
 from ...modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
 from ..distributed.common import ReduceOp, get_rank_world_size, get_world_size, is_ompi
 
@@ -24,6 +24,12 @@ def trtllm_allgather(tensor, dim, sizes=None):
     rank, world_size = get_rank_world_size()
     p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
     return allgather(tensor, p_config, dim=dim, sizes=sizes)
+
+
+def trtllm_reducescatter(tensor, dim, sizes=None):
+    rank, world_size = get_rank_world_size()
+    p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+    return reducescatter(tensor, p_config, dim=dim, sizes=sizes)
 
 
 def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
@@ -89,6 +95,43 @@ def trtllm_dist_all_reduce(t: torch.Tensor, strategy: str) -> torch.Tensor:
 @trtllm_dist_all_reduce.register_fake
 def trtllm_dist_all_reduce_fake(tensor, strategy):
     return torch.empty_like(tensor)
+
+
+@torch.library.custom_op(
+    "auto_deploy::trtllm_dist_reduce_scatter", mutates_args=(), device_types="cuda"
+)
+def trtllm_dist_reduce_scatter(
+    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
+) -> torch.Tensor:
+    """Reduce-scatter using TRT-LLM optimized backend.
+
+    This op performs a reduce-scatter: reduces across ranks and scatters the result.
+    Each rank receives 1/world_size of the reduced tensor.
+
+    Args:
+        tensor: Input tensor to reduce and scatter
+        dim: Dimension along which to split the result (default: 0)
+        sizes: Optional per-rank sizes. If None, splits evenly.
+
+    Returns:
+        Tensor with dim reduced by world_size (or according to sizes)
+    """
+    return trtllm_reducescatter(tensor, dim=dim, sizes=sizes)
+
+
+@trtllm_dist_reduce_scatter.register_fake
+def trtllm_dist_reduce_scatter_fake(tensor, dim=0, sizes=None):
+    world_size = get_world_size()
+    if sizes is None:
+        output_size = tensor.shape[dim] // world_size
+    else:
+        from ..distributed.common import get_rank
+
+        rank = get_rank()
+        output_size = sizes[rank]
+    output_shape = list(tensor.shape)
+    output_shape[dim] = output_size
+    return torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
 
 
 # TRT-LLM fused op (atomic - always uses TRT-LLM backend)

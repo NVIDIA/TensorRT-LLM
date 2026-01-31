@@ -179,7 +179,7 @@ Example: If both `manual` and `heuristic` try to apply sharding to layer L, only
 
 When `true`, allows partial sharding configurations where not all layers need to be specified in the manual or factory config. Layers not explicitly configured will be handled by heuristic sharding or left unsharded. When `false`, the configuration must specify all layers or it will be invalidated and skipped.
 
-#### `sharding_dims` (list, default: `['tp', 'ep', 'bmm']`)
+#### `sharding_dims` (list, default: `['TP', 'EP']`)
 
 Specifies which sharding dimensions to apply during heuristic sharding. The available dimensions are:
 

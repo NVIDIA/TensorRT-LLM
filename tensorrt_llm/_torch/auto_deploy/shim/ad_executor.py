@@ -72,6 +72,7 @@ from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
+from ..utils.mapping_utils import MappingSerializer
 from .interface import CachedSequenceInterface, GetInferenceModel
 
 
@@ -453,7 +454,9 @@ class ADEngine(ModelEngine):
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
+        build_and_optimize = InferenceOptimizer(
+            factory=factory, config=ad_config.transforms, mapping=mapping
+        )
 
         # construct engine
         return cls(
@@ -1027,15 +1030,10 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize process groups
     world_size = mpi_world_size()
     rank = mpi_rank()
-    enable_attention_dp = ad_config.transforms.get("detect_sharding", {}).get(
-        "enable_attention_dp", False
-    )
-    dist_mapping = Mapping(
-        rank=rank,
-        world_size=world_size,
-        tp_size=world_size,
-        enable_attention_dp=enable_attention_dp,
-    )
+
+    # Initialize Mapping from config
+    dist_mapping = MappingSerializer.from_config(ad_config, world_size, rank)
+
     dist = Distributed.get(dist_mapping)
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
