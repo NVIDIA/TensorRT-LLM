@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -23,7 +23,7 @@ from transformers import AutoConfig, PretrainedConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.utils import ActivationType, relu2
+from tensorrt_llm._torch.utils import ActivationType, Fp4QuantizedTensor, relu2
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce
@@ -37,6 +37,7 @@ from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..modules.fused_add_rmsnorm import fused_add_add_rmsnorm
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType
 from .modeling_deepseekv3 import DeepseekV3MTPHead
@@ -283,13 +284,19 @@ class NemotronHMOE(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream_shared)
 
-        final_hidden_states = shared_output + routed_output
-
-        # Perform all-reduce after combining outputs for multi-GPU support.
+        # Perform all-reduce on each output separately for multi-GPU support.
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
-            final_hidden_states = self.allreduce(final_hidden_states)
+            routed_output = self.allreduce(routed_output)
+            if not isinstance(shared_output, int):
+                shared_output = self.allreduce(shared_output)
 
-        return final_hidden_states.view(orig_shape)
+        # Return separate outputs for fused_add_add_rmsnorm optimization
+        # The next layer will fuse: norm(residual + shared + routed)
+        if not isinstance(shared_output, int):
+            return routed_output.view(orig_shape), shared_output.view(orig_shape)
+        else:
+            # No shared experts, return combined
+            return routed_output.view(orig_shape), None
 
 
 class NemotronHLayer(DecoderLayer):
@@ -311,11 +318,28 @@ class NemotronHLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
+        # Check if NVFP4 is enabled for this layer
+        quant_config = model_config.get_quant_config()
+        self.is_nvfp4 = (quant_config is not None
+                         and quant_config.layer_quant_mode.has_nvfp4())
+
+        # Determine if this layer can use fused RMSNorm + Add + Quantize
+        # Mamba layers (M) have BF16 in_proj (excluded from FP4), cannot be fused
+        # MLP (-) and Attention (*) layers have FP4 first linear, can be fused
+        # MoE (E) layers need BF16 for gate and have different scales for shared/routed,
+        # so input-side fusion doesn't provide net benefit (would require dequantization)
+        self.is_nvfp4_fusable = self.is_nvfp4 and layer_type in ["-", "*"]
+
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
         )
+
+        # Enable NVFP4 mode on RMSNorm for fusable layers
+        # This allows the fused_add_rms_norm_quant kernel to be used
+        if self.is_nvfp4_fusable:
+            self.norm.is_nvfp4 = True
 
         if layer_type == "M":
             self.mixer = Mamba2Mixer(d_model=config.hidden_size,
@@ -344,25 +368,66 @@ class NemotronHLayer(DecoderLayer):
         else:
             raise ValueError(f"{layer_type} is not supported")
 
+        # Cache reference to the module containing input_scale for NVFP4 fusion
+        # This avoids repeated hasattr/getattr lookups in forward()
+        self._nvfp4_input_scale_source = None
+        if self.is_nvfp4_fusable:
+            if hasattr(self.mixer, 'up_proj'):
+                # MLP layers (-): first linear is up_proj
+                self._nvfp4_input_scale_source = self.mixer.up_proj
+            elif hasattr(self.mixer, 'qkv_proj'):
+                # Attention layers (*): first linear is qkv_proj
+                self._nvfp4_input_scale_source = self.mixer.qkv_proj
+
     def forward(
         self,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = None,
+        moe_separate_outputs: Optional[Tuple[torch.Tensor,
+                                             torch.Tensor]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        residual = hidden_states
+        # Set up NVFP4 fusion if this layer is fusable
+        # This enables fused RMSNorm + Add + Quantize kernel
+        if self._nvfp4_input_scale_source is not None:
+            input_scale = getattr(self._nvfp4_input_scale_source, 'input_scale',
+                                  None)
+            if input_scale is not None:
+                self.norm.nvfp4_scale = input_scale
 
-        hidden_states = self.norm(hidden_states)
-        hidden_states = self.mixer(hidden_states,
-                                   attn_metadata,
-                                   spec_metadata=spec_metadata,
-                                   **kwargs)
-        hidden_states = torch.add(hidden_states, residual)
+        if moe_separate_outputs is not None:
+            # Previous layer was MOE - use fused add+add+rmsnorm
+            routed, shared = moe_separate_outputs
+            if shared is not None:
+                hidden_states = fused_add_add_rmsnorm(
+                    residual, routed, shared, self.norm.weight,
+                    self.norm.variance_epsilon)
+                residual = residual + routed + shared
+            else:
+                # No shared experts, fall back to normal path
+                hidden_states, residual = self.norm(routed, residual)
+        elif residual is None:
+            # First layer: no residual from previous layer
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
 
-        return hidden_states
+        mixer_out = self.mixer(hidden_states,
+                               attn_metadata,
+                               spec_metadata=spec_metadata,
+                               **kwargs)
+
+        # Check if mixer is MOE (returns tuple)
+        if isinstance(mixer_out, tuple):
+            # MOE returns (routed, shared) for next layer's fused norm
+            return mixer_out, residual
+        else:
+            return mixer_out, residual
 
 
 class NemotronHModel(DecoderModel):
@@ -446,13 +511,35 @@ class NemotronHModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-
+        # For each layer, the pattern is norm -> mixer -> add residual.
+        # Need to handle the first layer without residual and the last layer with explicit redisual addition.
+        # When MOE layer outputs (routed, shared) separately, next layer uses fused_add_add_rmsnorm.
+        residual = None
+        moe_separate_outputs = None
         for layer in self.layers[:self.num_hidden_layers]:
-            hidden_states = layer(position_ids,
-                                  hidden_states,
-                                  attn_metadata,
-                                  spec_metadata=spec_metadata,
-                                  mamba_metadata=self.mamba_metadata)
+            hidden_states, residual = layer(position_ids,
+                                            hidden_states,
+                                            attn_metadata,
+                                            residual=residual,
+                                            moe_separate_outputs=moe_separate_outputs,
+                                            spec_metadata=spec_metadata,
+                                            mamba_metadata=self.mamba_metadata)
+            # Check if layer returned MOE separate outputs (tuple of routed, shared)
+            if isinstance(hidden_states, tuple):
+                moe_separate_outputs = hidden_states
+                hidden_states = None  # Will be computed by next layer's fused norm
+            else:
+                moe_separate_outputs = None
+
+        # Handle final residual addition
+        if moe_separate_outputs is not None:
+            routed, shared = moe_separate_outputs
+            if shared is not None:
+                hidden_states = residual + routed + shared
+            else:
+                hidden_states = residual + routed
+        else:
+            hidden_states = torch.add(hidden_states, residual)
 
         hidden_states = self.norm_f(hidden_states)
 

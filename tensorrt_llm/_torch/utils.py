@@ -403,7 +403,10 @@ def split(x: torch.Tensor,
 
 
 def relu2(x: torch.Tensor) -> torch.Tensor:
-    return torch.square(F.relu(x))
+    # Use fused Triton kernel for better performance
+    # This avoids two separate kernel launches (relu + square)
+    from tensorrt_llm._torch.modules.fused_activations import fused_relu2
+    return fused_relu2(x)
 
 
 @maybe_compile
