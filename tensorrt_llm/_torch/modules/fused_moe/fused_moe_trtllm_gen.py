@@ -167,9 +167,9 @@ class TRTLLMGenFusedMoE(MoE):
             self.moe_a2a = None
 
         self._weights_created = False
+        self.num_fused_shared_expert = 0
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
-        self.num_fused_shared_expert = 0
         self.layer_idx = layer_idx
 
         if model_config.mapping.dp_size == 1 and self.quant_config.layer_quant_mode.has_fp8_block_scales(
@@ -250,7 +250,10 @@ class TRTLLMGenFusedMoE(MoE):
             return
 
         self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self, self.num_fused_shared_expert)
+        if self.quant_config.layer_quant_mode.has_fp8_block_scales():
+            self.quant_method.create_weights(self, self.num_fused_shared_expert)
+        else:
+            self.quant_method.create_weights(self)
 
         self._weights_created = True
         self._check_configs()
