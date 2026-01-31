@@ -69,6 +69,9 @@ class RequestData:
     computed_position: int
     # The number of scheduled tokens for the upcoming forward pass.
     num_scheduled_tokens: int
+    # The retention priorities for each new block (same length as new_block_ids).
+    # Used for priority-based offload filtering. None means use default priority.
+    priorities: Optional[List[int]] = None
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -314,8 +317,17 @@ class KvCacheConnectorSchedulerOutputRequest:
             num_scheduled_tokens = 1 + get_draft_token_length(
                 req)  # Specdec with draft tokens is not supported yet.
 
+        # Get retention priority for each new block only if retention config is provided
+        # (for priority-based offload filtering)
+        priorities = None
+        if req.kv_cache_retention_config is not None:
+            priorities = [
+                kv_cache_manager.get_priority_by_block_id(block_id)
+                for block_id in new_block_ids
+            ]
+
         return RequestData(req.request_id, new_tokens, new_block_ids,
-                           computed_position, num_scheduled_tokens)
+                           computed_position, num_scheduled_tokens, priorities)
 
 
 class KvCacheConnectorSchedulerOutputManager:

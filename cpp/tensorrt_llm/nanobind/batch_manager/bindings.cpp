@@ -198,6 +198,7 @@ void initBindings(nb::module_& m)
         .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
         .def_prop_ro("is_child", &GenLlmReq::isChild)
         .def_prop_ro("cache_salt_id", &GenLlmReq::getCacheSaltID)
+        .def_prop_ro("kv_cache_retention_config", &GenLlmReq::getKvCacheRetentionConfig)
         .def_prop_ro("multimodal_hashes",
             [](GenLlmReq& self)
             {
