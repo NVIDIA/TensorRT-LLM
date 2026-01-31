@@ -6,7 +6,7 @@ It provides a drop-in replacement for thop.attention() with support for trtllm-g
 kernel only (Blackwell architecture: SM100/SM103).
 
 Architecture Overview:
-    1. AttentionConfig - Configuration dataclass for attention parameters
+    1. TrtllmGenAttentionConfig - Configuration dataclass for attention parameters
     2. TrtllmGenSupportChecker - Validates if configuration is supported
     4. FlashInferTrtllmGenAttention - FlashInfer implementation using trtllm-gen
     5. trtllm_gen_attention - Main entry point function
@@ -55,48 +55,17 @@ DEFAULT_KV_LAYOUT = "HND"
 DEFAULT_BACKEND = "trtllm-gen"
 
 
-def _get_kv_cache_dtype_from_quant_config(
-    quant_config,
-    input_dtype: torch.dtype,
-) -> torch.dtype:
-    """
-    Get KV cache dtype based on quant_config.
-
-    This is a convenience function that wraps AttentionConfig.get_kv_cache_dtype_from_quant_config().
-
-    Args:
-        quant_config: Quantization configuration object (QuantConfig).
-                     Can be None for no quantization.
-        input_dtype: Input data type to fallback to if no quantization.
-
-    Returns:
-        torch.dtype: The KV cache dtype.
-                    - torch.uint8 if has_fp4_kv_cache()
-                    - torch.float8_e4m3fn if has_fp8_kv_cache()
-                    - input_dtype otherwise
-    """
-    # Forward to the static method in AttentionConfig
-    # This is defined after AttentionConfig, so we can't use it directly here
-    # Instead, we'll define it inline for now and update after the class definition
-    if quant_config is None:
-        return input_dtype
-
-    if quant_config.layer_quant_mode.has_fp4_kv_cache():
-        return torch.uint8
-    elif quant_config.layer_quant_mode.has_fp8_kv_cache():
-        return torch.float8_e4m3fn
-    else:
-        return input_dtype
-
-
 @dataclass
-class AttentionConfig:
+class TrtllmGenAttentionConfig:
     """
     Configuration for attention computation.
 
     Encapsulates all parameters needed for attention to enable
     clean parameter passing and validation.
     """
+
+    # Input tensors
+    q: torch.Tensor
 
     # Basic attention parameters
     num_heads: int
@@ -110,9 +79,9 @@ class AttentionConfig:
     max_num_requests: int = 256
     max_context_length: int = 8192
     attention_window_size: int = -1  # -1 means unlimited
+    kv_cache_manager: Optional[KVCacheManager] = None
 
     # Data types
-    dtype: torch.dtype = torch.float16
     out_dtype: Optional[torch.dtype] = None
 
     # Quantization config
@@ -142,21 +111,22 @@ class AttentionConfig:
     is_padded: bool = False
     position_shift_enabled: bool = False
 
-    # Input tensors
-    q: Optional[torch.Tensor] = None
+    @property
+    def kv_cache(self) -> torch.Tensor:
+        """
+        Get KV cache tensor from kv_cache_manager.
+        """
+        if self.kv_cache_manager is not None:
+            return self.kv_cache_manager.get_buffers(self.layer_idx, kv_layout=DEFAULT_KV_LAYOUT)
+        return None
 
     @property
     def kv_cache_dtype(self) -> torch.dtype:
-        """
-        Get KV cache dtype based on quant_config.
+        return self.kv_cache.dtype
 
-        Returns:
-            torch.dtype: The KV cache dtype.
-                        - torch.uint8 if has_fp4_kv_cache()
-                        - torch.float8_e4m3fn if has_fp8_kv_cache()
-                        - dtype otherwise
-        """
-        return _get_kv_cache_dtype_from_quant_config(self.quant_config, self.dtype)
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.q.dtype
 
     @property
     def has_fp4_kv_cache(self) -> bool:
@@ -168,7 +138,7 @@ class AttentionConfig:
         """
         if self.quant_config is not None:
             return self.quant_config.layer_quant_mode.has_fp4_kv_cache()
-        return self.dtype == torch.uint8
+        return self.kv_cache_dtype == torch.uint8
 
     @property
     def heads_ratio(self) -> int:
@@ -188,6 +158,38 @@ class TrtllmGenSupportChecker:
     SUPPORTED_INPUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     SUPPORTED_KV_CACHE_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     SUPPORTED_OUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+
+    # Supported Q:KV:O dtype combinations for trtllm-gen kernels
+    # Format: (q_dtype, kv_dtype, o_dtype)
+    # Context phase supported combinations
+    SUPPORTED_DTYPE_COMBOS_CONTEXT = {
+        # e4m3:e4m3:e4m3
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e4m3fn),
+        # e4m3:e4m3:e2m1 (FP4 output not directly representable, skip)
+        # fp16:fp16:fp16
+        (torch.float16, torch.float16, torch.float16),
+        # bf16:bf16:bf16
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+        # e4m3:e4m3:fp16
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float16),
+        # e4m3:e4m3:bf16
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.bfloat16),
+    }
+
+    # Generation phase supported combinations (includes context + additional)
+    SUPPORTED_DTYPE_COMBOS_GENERATION = {
+        # All context combinations
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float16, torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.bfloat16),
+        # Additional generation-only combinations
+        # bf16:e4m3:bf16
+        (torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16),
+        # fp16:e4m3:fp16
+        (torch.float16, torch.float8_e4m3fn, torch.float16),
+    }
 
     # Unsupported head sizes for context FMHA
     UNSUPPORTED_HEAD_SIZES_CONTEXT = {72, 80}
@@ -210,7 +212,7 @@ class TrtllmGenSupportChecker:
         return True, ""
 
     @classmethod
-    def check_basic_features(cls, config: AttentionConfig) -> Tuple[bool, str]:
+    def check_basic_features(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
         """Check basic feature requirements."""
         if config.is_mla_enable:
             return False, "MLA is not supported by trtllm-gen backend."
@@ -230,7 +232,7 @@ class TrtllmGenSupportChecker:
         return True, ""
 
     @classmethod
-    def check_dtypes(cls, config: AttentionConfig) -> Tuple[bool, str]:
+    def check_dtypes(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
         """Check if data types are supported."""
 
         if config.has_fp4_kv_cache:
@@ -259,7 +261,7 @@ class TrtllmGenSupportChecker:
         return True, ""
 
     @classmethod
-    def check_head_config(cls, config: AttentionConfig) -> Tuple[bool, str]:
+    def check_head_config(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
         """Check head configuration validity."""
         assert config.num_heads > 0, "num_heads must be positive."
         assert config.num_kv_heads > 0, "num_kv_heads must be positive."
@@ -274,7 +276,7 @@ class TrtllmGenSupportChecker:
         return True, ""
 
     @classmethod
-    def check_context_phase(cls, config: AttentionConfig) -> Tuple[bool, str]:
+    def check_context_phase(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
         """Check context (prefill) phase specific requirements."""
         if config.head_size in cls.UNSUPPORTED_HEAD_SIZES_CONTEXT:
             return (False, f"[Context] Head size {config.head_size} is not supported.")
@@ -292,10 +294,24 @@ class TrtllmGenSupportChecker:
         if config.is_padded:
             return False, "[Context] Padded input is not supported."
 
+        # Check dtype combination for context phase
+        q_dtype = config.dtype
+        kv_dtype = config.kv_cache_dtype
+        o_dtype = config.out_dtype if config.out_dtype is not None else config.dtype
+        dtype_combo = (q_dtype, kv_dtype, o_dtype)
+
+        if dtype_combo not in cls.SUPPORTED_DTYPE_COMBOS_CONTEXT:
+            return (
+                False,
+                f"[Context] Unsupported dtype combination: Q={q_dtype}, KV={kv_dtype}, O={o_dtype}. "
+                f"Supported context combinations: fp16:fp16:fp16, bf16:bf16:bf16, "
+                f"e4m3:e4m3:e4m3, e4m3:e4m3:fp16, e4m3:e4m3:bf16.",
+            )
+
         return True, ""
 
     @classmethod
-    def check_generation_phase(cls, config: AttentionConfig) -> Tuple[bool, str]:
+    def check_generation_phase(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
         """Check generation (decode) phase specific requirements."""
         if config.beam_width != 1:
             return (
@@ -331,10 +347,24 @@ class TrtllmGenSupportChecker:
         if config.has_alibi:
             return False, "[Generation] ALiBi is not supported."
 
+        # Check dtype combination for generation phase
+        q_dtype = config.dtype
+        kv_dtype = config.kv_cache_dtype
+        o_dtype = config.out_dtype if config.out_dtype is not None else config.dtype
+        dtype_combo = (q_dtype, kv_dtype, o_dtype)
+
+        if dtype_combo not in cls.SUPPORTED_DTYPE_COMBOS_GENERATION:
+            return (
+                False,
+                f"[Generation] Unsupported dtype combination: Q={q_dtype}, KV={kv_dtype}, O={o_dtype}. "
+                f"Supported generation combinations: fp16:fp16:fp16, bf16:bf16:bf16, "
+                f"e4m3:e4m3:e4m3, e4m3:e4m3:fp16, e4m3:e4m3:bf16, bf16:e4m3:bf16, fp16:e4m3:fp16.",
+            )
+
         return True, ""
 
     @classmethod
-    def check_paged_kv_cache(cls, config: AttentionConfig) -> Tuple[bool, str]:
+    def check_paged_kv_cache(cls, config: TrtllmGenAttentionConfig) -> Tuple[bool, str]:
         """Check paged KV cache configuration."""
         if config.use_paged_kv_cache:
             if config.tokens_per_block <= 0:
@@ -355,7 +385,9 @@ class TrtllmGenSupportChecker:
         return True, ""
 
     @classmethod
-    def is_supported(cls, config: AttentionConfig, phase: str = "both") -> Tuple[bool, str]:
+    def is_supported(
+        cls, config: TrtllmGenAttentionConfig, phase: str = "both"
+    ) -> Tuple[bool, str]:
         """
         Comprehensive check if configuration is supported.
 
@@ -532,7 +564,7 @@ class WorkspaceManager:
     @classmethod
     def get_workspace_size(
         cls,
-        config: AttentionConfig,
+        config: TrtllmGenAttentionConfig,
         num_tokens: int,
         num_gen_tokens: int,
     ) -> int:
@@ -582,7 +614,9 @@ class FlashInferTrtllmGenAttention:
         """KV cache layout."""
         return self._layout
 
-    def is_supported(self, config: AttentionConfig, phase: str = "both") -> Tuple[bool, str]:
+    def is_supported(
+        self, config: TrtllmGenAttentionConfig, phase: str = "both"
+    ) -> Tuple[bool, str]:
         """Check if configuration is supported by this backend."""
         if not IS_FLASHINFER_AVAILABLE:
             return False, "flashinfer package is not installed."
@@ -590,7 +624,7 @@ class FlashInferTrtllmGenAttention:
 
     def _compute_scales(
         self,
-        config: AttentionConfig,
+        config: TrtllmGenAttentionConfig,
         kv_scale_quant_orig: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float]:
         """
@@ -753,10 +787,10 @@ def _get_block_tables(
 
 
 def is_supported(
+    q: torch.Tensor,
     num_heads: int,
     num_kv_heads: int,
     head_size: int,
-    dtype: torch.dtype,
     out_dtype: Optional[torch.dtype] = None,
     mask_type: Optional[int] = None,
     has_alibi: bool = False,
@@ -773,6 +807,7 @@ def is_supported(
     update_kv_cache: bool = True,
     has_cross_kv: bool = False,
     quant_config: Optional[QuantConfig] = None,
+    kv_cache_manager: Optional[KVCacheManager] = None,
     phase: str = "both",
 ) -> Tuple[bool, str]:
     """
@@ -781,10 +816,10 @@ def is_supported(
     This is the compatibility function that wraps TrtllmGenSupportChecker.
 
     Args:
+        q: Query tensor.
         num_heads: Number of query attention heads.
         num_kv_heads: Number of KV attention heads.
         head_size: Size of each attention head.
-        dtype: Input data type.
         out_dtype: Output data type.
         mask_type: Attention mask type.
         has_alibi: Whether ALiBi is used.
@@ -803,6 +838,7 @@ def is_supported(
         quant_config: Quantization configuration (QuantConfig). If provided,
                      will automatically determine kv_cache_dtype based on
                      has_fp8_kv_cache() or has_fp4_kv_cache().
+        kv_cache_manager: KV cache manager.
         phase: Phase to check ("context", "generation", or "both").
 
     Returns:
@@ -810,11 +846,11 @@ def is_supported(
     """
     # Build config from parameters
     # Note: kv_cache_dtype will be auto-calculated in __post_init__ if quant_config is provided
-    config = AttentionConfig(
+    config = TrtllmGenAttentionConfig(
+        q=q,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
-        dtype=dtype,
         out_dtype=out_dtype,
         quant_config=quant_config,
         mask_type=mask_type if mask_type is not None else 1,
@@ -830,6 +866,7 @@ def is_supported(
         is_mla_enable=is_mla_enable,
         is_fused_qkv=is_fused_qkv,
         update_kv_cache=update_kv_cache,
+        kv_cache_manager=kv_cache_manager,
     )
 
     return FlashInferTrtllmGenAttention().is_supported(config, phase)
@@ -1022,13 +1059,12 @@ def trtllm_gen_attention(
     # ========== 1. Build Configuration ==========
     page_size = tokens_per_block if tokens_per_block is not None else 64
 
-    config = AttentionConfig(
+    config = TrtllmGenAttentionConfig(
         q=q,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         layer_idx=layer_idx,
-        dtype=q.dtype,
         tokens_per_block=page_size,
         max_num_requests=max_num_requests,
         max_context_length=max_context_length,
@@ -1047,11 +1083,10 @@ def trtllm_gen_attention(
         is_fused_qkv=is_fused_qkv,
         update_kv_cache=update_kv_cache,
         quant_config=quant_config,
+        kv_cache_manager=kv_cache_manager,
     )
 
-    kv_cache = None
-    if kv_cache_manager is not None and not config.has_fp4_kv_cache:
-        kv_cache = kv_cache_manager.get_buffers(layer_idx, kv_layout=DEFAULT_KV_LAYOUT)
+    kv_cache = config.kv_cache
 
     # ========== 2. Get Backend ==========
     backend = FlashInferTrtllmGenAttention()
@@ -1125,18 +1160,18 @@ def trtllm_gen_attention(
         ctx_output = out_tensor[:num_ctx_tokens]
 
         # Build cumulative sequence lengths
-        ctx_lens = host_ctx_lens[:num_contexts].to(dtype=torch.int32, device=q.device)
+        ctx_lens = host_ctx_lens[:num_contexts].to(dtype=torch.int32)
         cum_seq_lens_q = torch.zeros(num_contexts + 1, dtype=torch.int32, device=q.device)
-        torch.cumsum(ctx_lens, dim=0, out=cum_seq_lens_q[1:])
+        torch.cumsum(ctx_lens.to(q.device), dim=0, out=cum_seq_lens_q[1:])
 
         # KV sequence lengths
-        ctx_kv_lens = sequence_length[:num_contexts].to(dtype=torch.int32, device=q.device)
+        ctx_kv_lens = sequence_length[:num_contexts].to(dtype=torch.int32)
         cum_seq_lens_kv = torch.zeros(num_contexts + 1, dtype=torch.int32, device=q.device)
-        torch.cumsum(ctx_kv_lens, dim=0, out=cum_seq_lens_kv[1:])
+        torch.cumsum(ctx_kv_lens.to(q.device), dim=0, out=cum_seq_lens_kv[1:])
 
-        # Use host tensors to avoid device-to-host sync during CUDA graph capture
         # ctx_lens is already on CPU (from host_ctx_lens)
         max_q_len = int(ctx_lens.max())
+
         # Use max_context_length as upper bound to avoid GPU sync
         max_kv_len = max_context_length
 
