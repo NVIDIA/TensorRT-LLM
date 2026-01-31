@@ -48,10 +48,29 @@ namespace tensorrt_llm::executor
 {
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
-// Mmkey is used in KVCacheBlock when multimodal data presents in a block.
-// Type alias for hash array + start offset at per-block granularity.
-// This differs from the per-request level multimodal hash in MultimodalInput.
-using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
+
+// MmKey is used in KVCacheBlock when multimodal data presents in a block.
+// Hash is a 32-byte array; startOffset is the per-block token offset; uuid is optional.
+struct MmKey
+{
+    std::array<uint8_t, 32> hash;
+    SizeType32 startOffset{};
+    std::optional<std::string> uuid{std::nullopt};
+
+    MmKey() = default;
+
+    MmKey(std::array<uint8_t, 32> hash, SizeType32 startOffset, std::optional<std::string> uuid = std::nullopt)
+        : hash(std::move(hash))
+        , startOffset(startOffset)
+        , uuid(std::move(uuid))
+    {
+    }
+
+    bool operator==(MmKey const& other) const noexcept
+    {
+        return hash == other.hash && startOffset == other.startOffset && uuid == other.uuid;
+    }
+};
 
 /// @brief Version of TRT-LLM
 char const* version() noexcept;
@@ -301,11 +320,13 @@ class MultimodalInput
 {
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
-        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths);
+        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
+    [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
 
 private:
     friend class Serialization;
@@ -315,6 +336,9 @@ private:
     std::vector<SizeType32> mMultimodalPositions;
     /// @brief The multimodal lengths
     std::vector<SizeType32> mMultimodalLengths;
+    /// @brief Optional user-provided UUIDs for multimodal items.
+    /// When provided, these are returned in KV cache events instead of content hashes.
+    std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
 };
 
 /// @brief Configuration for mrope

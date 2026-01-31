@@ -170,6 +170,7 @@ static_assert(hasSerializedSize<KVCacheRemovedData>(size_t()));
 static_assert(hasSerializedSize<KVCacheEventDiff<SizeType32>>(size_t()));
 static_assert(hasSerializedSize<KVCacheUpdatedData>(size_t()));
 static_assert(hasSerializedSize<tensorrt_llm::runtime::UniqueToken>(size_t()));
+static_assert(hasSerializedSize<MmKey>(size_t()));
 
 template <typename T>
 size_t serializedSize(T const& data)
@@ -290,6 +291,7 @@ static_assert(hasSerialize<KVCacheRemovedData>(nullptr));
 static_assert(hasSerialize<KVCacheEventDiff<SizeType32>>(nullptr));
 static_assert(hasSerialize<KVCacheUpdatedData>(nullptr));
 static_assert(hasSerialize<tensorrt_llm::runtime::UniqueToken>(nullptr));
+static_assert(hasSerialize<MmKey>(nullptr));
 
 template <typename T>
 void serialize(T const& data, std::ostream& os)
@@ -475,6 +477,10 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::ContextPhaseParams>)
     {
         return Serialization::deserializeContextPhaseParams(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::MmKey>)
+    {
+        return Serialization::deserializeMmKey(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::Request>)
     {
