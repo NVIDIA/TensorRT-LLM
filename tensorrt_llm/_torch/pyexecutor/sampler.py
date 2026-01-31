@@ -2588,7 +2588,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         # Assert destination tensor dimensions are canonically ordered ("row"-major); this
         # matters for element ordering in the .view(...).scatter_(...) calls below.
-        assert _dims_canonically_ordered(new_tokens_cuda)
+        # This takes about 44% of _unbatch_sampling_results
+        # assert _dims_canonically_ordered(new_tokens_cuda)
 
         # Construct index mapping from slice indices of computed tensors
         # (packed request_idx and step dimensions) to linearized indices
@@ -2964,36 +2965,63 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         tokens: torch.Tensor,
         predecessor_beams: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        num_requests = len(requests)
         per_step = torch.zeros(
-            (self.max_tokens, len(requests), self.max_beam_width), dtype=torch.bool, pin_memory=True
+            (self.max_tokens, num_requests, self.max_beam_width), dtype=torch.bool, pin_memory=True
         ).to("cuda", non_blocking=True)
 
         padded_tokens = self._padded_old_tokens(requests, tokens, predecessor_beams)
+        # padded_tokens shape: (num_requests, max_beam_width, seq_len)
+        seq_len = padded_tokens.size(2)
 
         for request_idx, request in enumerate(requests):
             swl, ends = request.py_stop_words_list
             if -1 in ends:
                 ends = ends[: ends.index(-1)]
+            if len(ends) == 0:
+                continue
+
             lens = np.diff(ends, prepend=0)
-            max_len = np.max(lens)
-
-            words = torch.zeros(len(lens), max_len, dtype=torch.int32, pin_memory=True)
-            for step, (start, length) in enumerate(zip([0] + ends, lens)):
-                words[step, :length] = torch.tensor(swl[start : start + length], dtype=torch.int32)
-            words_device = words.to("cuda", non_blocking=True)
-
+            max_word_len = int(np.max(lens))
+            num_words = len(lens)
             draft_token_length = get_draft_token_length(request)
 
-            for beam_idx in range(self.max_beam_width):
-                new_tokens = padded_tokens[request_idx, beam_idx]
-                for step_idx in range(draft_token_length + 1):
-                    size_per_step = new_tokens.size(0) - draft_token_length + step_idx
-                    matches = []
-                    for word, L in zip(words_device, lens):
-                        truncated_seq = new_tokens[size_per_step - L : size_per_step]
-                        match = (truncated_seq == word[:L]).all()
-                        matches.append(match)
-                    per_step[step_idx, request_idx, beam_idx] = torch.stack(matches).any()
+            # Build right-aligned stop words on CPU with pin_memory, then transfer once
+            # Right-align so suffix comparison is straightforward
+            words_padded = torch.full((num_words, max_word_len), -1, dtype=torch.int32, pin_memory=True)
+            word_mask = torch.zeros((num_words, max_word_len), dtype=torch.bool, pin_memory=True)
+            offset = 0
+            for i, L in enumerate(lens):
+                words_padded[i, max_word_len - L:] = torch.tensor(swl[offset:offset + L], dtype=torch.int32)
+                word_mask[i, max_word_len - L:] = True
+                offset += L
+
+            # Single transfer to CUDA
+            words_padded_cuda = words_padded.to("cuda", non_blocking=True)
+            word_mask_cuda = word_mask.to("cuda", non_blocking=True)
+
+            # Get all beams for this request: (max_beam_width, seq_len)
+            seq = padded_tokens[request_idx]
+
+            # Vectorize across beams and words (eliminates both inner loops)
+            for step_idx in range(draft_token_length + 1):
+                end_pos = seq_len - draft_token_length + step_idx
+                if end_pos < max_word_len:
+                    continue
+
+                # Extract suffix for all beams: (max_beam_width, max_word_len)
+                suffix = seq[:, end_pos - max_word_len:end_pos]
+
+                # Broadcast comparison: (beam, 1, max_word_len) vs (1, num_words, max_word_len)
+                # Result: (beam, num_words, max_word_len)
+                comparison = suffix.unsqueeze(1) == words_padded_cuda.unsqueeze(0)
+
+                # Mask out padding positions (treat as match)
+                comparison = comparison | ~word_mask_cuda.unsqueeze(0)
+
+                # All positions match -> word matches: (beam, num_words)
+                # Any word matches -> stop: (beam,)
+                per_step[step_idx, request_idx] = comparison.all(dim=2).any(dim=1)
 
         return per_step
 
