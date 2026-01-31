@@ -168,6 +168,59 @@ def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
         raise KeyError(f"Tensor {tensor_name} not found in the graph")
 
 
+def get_tensor_from_node(gm: GraphModule, node: Node) -> torch.Tensor:
+    """Extract tensor value from an fx node, handling both get_attr and call_function nodes.
+
+    This function recursively evaluates nodes to extract the actual tensor values.
+    It handles:
+    - get_attr nodes: Returns the parameter/buffer directly from the GraphModule
+    - call_function nodes: Recursively evaluates the operation (e.g., transpose, view)
+      by getting input tensors and applying the operation
+
+    This is useful when weights in the graph go through intermediate operations
+    (like transpose) before being used, rather than being direct parameter references.
+
+    Args:
+        gm: The GraphModule containing the node
+        node: The fx node to extract tensor from
+
+    Returns:
+        The tensor value represented by the node
+    """
+    if node.op == "get_attr":
+        # Direct parameter/buffer reference
+        target = node.target
+        if hasattr(gm, target):
+            return getattr(gm, target)
+        # Handle nested attributes (e.g., "submodule.weight")
+        parts = target.split(".")
+        obj = gm
+        for part in parts:
+            obj = getattr(obj, part)
+        return obj
+    elif node.op == "call_function":
+        # Operation node - evaluate by recursively getting input tensors
+        args = []
+        for arg in node.args:
+            if isinstance(arg, Node):
+                args.append(get_tensor_from_node(gm, arg))
+            else:
+                args.append(arg)
+        kwargs = {}
+        for k, v in (node.kwargs or {}).items():
+            if isinstance(v, Node):
+                kwargs[k] = get_tensor_from_node(gm, v)
+            else:
+                kwargs[k] = v
+        # Execute the operation
+        return node.target(*args, **kwargs)
+    else:
+        raise ValueError(
+            f"Unsupported node op for tensor extraction: {node.op}. "
+            f"Expected 'get_attr' or 'call_function', got '{node.op}' for node {node}"
+        )
+
+
 def extract_weight_nodes(node: Node) -> WeightNodes:
     """Extracts the list of weight node and optional bias node from the given parametrized node"""
     gm = node.graph.owning_module

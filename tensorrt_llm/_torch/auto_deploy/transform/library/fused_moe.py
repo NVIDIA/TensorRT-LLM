@@ -14,7 +14,13 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
-from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
+from ...utils.node_utils import (
+    bfs,
+    extract_op_args,
+    get_tensor_from_node,
+    identify_regions_between_residuals,
+    is_op,
+)
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -107,7 +113,7 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
                 "Triton backend only supports mlp style."
             )
             _process_moe_node(
-                gm, graph, node, replacement_op, is_gated_mlp, act_fn, fused_key_counter
+                gm, graph, node, replacement_op, is_gated_mlp, act_fn, fused_key_counter, backend
             )
 
             fused_key_counter += 1
@@ -129,11 +135,16 @@ def _process_moe_node(
     is_gated_mlp: bool,
     act_fn: ActivationType,
     fused_key_counter: int,
+    backend: str = "trtllm",
 ) -> None:
     """Process a single torch_moe node with per-expert weight lists.
 
     Stacks weight parameters and creates a fused MoE node.
     The kernel applies routing weights to the output.
+
+    Supports GPT-OSS style MoE with:
+    - SwigluBias activation (alpha=1.702, beta=1.0, limit=7.0)
+    - Per-expert biases for gate, up, and down projections
     """
     (
         hidden_states,
@@ -143,6 +154,9 @@ def _process_moe_node(
         w2_list,
         w3_list,
         apply_routing_on_input,
+        w1_bias_stacked,
+        w2_bias_stacked,
+        w3_bias_stacked,
     ) = extract_op_args(
         node,
         "x",
@@ -152,6 +166,9 @@ def _process_moe_node(
         "w2_weight",
         "w3_weight",
         "apply_routing_on_input",
+        "w1_bias_stacked",
+        "w2_bias_stacked",
+        "w3_bias_stacked",
     )
 
     # Stack weights based on MLP style
@@ -160,7 +177,7 @@ def _process_moe_node(
         fused_w_up_experts = torch.stack(
             [
                 torch.cat(
-                    [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)],
+                    [get_tensor_from_node(gm, w3_node), get_tensor_from_node(gm, w1_node)],
                     dim=-2,
                 )
                 for w1_node, w3_node in zip(w1_list, w3_list)
@@ -170,11 +187,11 @@ def _process_moe_node(
         new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
     else:
         # For regular MLP, just stack w1
-        fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
+        fused_w_up_experts = torch.stack([get_tensor_from_node(gm, n) for n in w1_list], dim=0)
         new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
 
     # Stack w2/down weights
-    fused_w_down_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
+    fused_w_down_experts = torch.stack([get_tensor_from_node(gm, n) for n in w2_list], dim=0)
     new_key_w_down = f"fused_moe_w2_stacked_{fused_key_counter}"
 
     # Register the stacked weights as parameters
@@ -183,6 +200,67 @@ def _process_moe_node(
 
     param_w_down = torch.nn.Parameter(fused_w_down_experts)
     gm.register_parameter(new_key_w_down, param_w_down)
+
+    # Handle biases if present
+    # w1_bias_stacked, w2_bias_stacked, w3_bias_stacked are tensors (not lists) of shape [E, ...]
+    has_bias = w1_bias_stacked is not None and isinstance(w1_bias_stacked, Node)
+    fused_w_up_bias = None
+    fused_w_down_bias = None
+    new_key_w_up_bias = None
+    new_key_w_down_bias = None
+
+    if has_bias:
+        # Get the bias tensors from the graph
+        w1_bias_tensor = get_tensor_from_node(gm, w1_bias_stacked)  # [E, I]
+        w2_bias_tensor = get_tensor_from_node(gm, w2_bias_stacked)  # [E, H]
+
+        if is_gated_mlp and w3_bias_stacked is not None:
+            w3_bias_tensor = get_tensor_from_node(gm, w3_bias_stacked)  # [E, I]
+            # Concatenate w3 and w1 biases to match weight stacking order
+            fused_w_up_bias = torch.cat([w3_bias_tensor, w1_bias_tensor], dim=-1)  # [E, 2*I]
+        else:
+            fused_w_up_bias = w1_bias_tensor
+
+        fused_w_down_bias = w2_bias_tensor
+
+        # Register biases as parameters
+        new_key_w_up_bias = f"fused_moe_w3_w1_bias_stacked_{fused_key_counter}"
+        new_key_w_down_bias = f"fused_moe_w2_bias_stacked_{fused_key_counter}"
+        gm.register_parameter(new_key_w_up_bias, torch.nn.Parameter(fused_w_up_bias))
+        gm.register_parameter(new_key_w_down_bias, torch.nn.Parameter(fused_w_down_bias))
+
+    # Handle SwigluBias activation (GPT-OSS style)
+    # SwigluBias: (up + beta) * (gate * sigmoid(alpha * gate)) with clamping
+    swiglu_alpha = None
+    swiglu_beta = None
+    swiglu_limit = None
+    new_key_swiglu_alpha = None
+    new_key_swiglu_beta = None
+    new_key_swiglu_limit = None
+
+    if act_fn == ActivationType.SwigluBias:
+        num_experts = fused_w_up_experts.shape[0]
+        device = fused_w_up_experts.device
+
+        # GPT-OSS fixed parameters
+        swiglu_alpha = torch.tensor([1.702] * num_experts, dtype=torch.float32, device=device)
+        swiglu_beta = torch.tensor([1.0] * num_experts, dtype=torch.float32, device=device)
+        swiglu_limit = torch.tensor([7.0] * num_experts, dtype=torch.float32, device=device)
+
+        # Register swiglu parameters
+        new_key_swiglu_alpha = f"fused_moe_swiglu_alpha_{fused_key_counter}"
+        new_key_swiglu_beta = f"fused_moe_swiglu_beta_{fused_key_counter}"
+        new_key_swiglu_limit = f"fused_moe_swiglu_limit_{fused_key_counter}"
+
+        gm.register_parameter(
+            new_key_swiglu_alpha, torch.nn.Parameter(swiglu_alpha, requires_grad=False)
+        )
+        gm.register_parameter(
+            new_key_swiglu_beta, torch.nn.Parameter(swiglu_beta, requires_grad=False)
+        )
+        gm.register_parameter(
+            new_key_swiglu_limit, torch.nn.Parameter(swiglu_limit, requires_grad=False)
+        )
 
     # Create fused MoE node - kernel applies routing to output
     with graph.inserting_before(node):
@@ -210,13 +288,27 @@ def _process_moe_node(
             args=(hidden_states, weight_dtype),
         )
 
+        # Build kwargs for fused MoE op
+        kwargs = {
+            "is_gated_mlp": is_gated_mlp,
+            "act_fn": act_fn,
+        }
+
+        # Add bias arguments if present (only supported by trtllm backend)
+        if has_bias and backend in ["auto", "trtllm"]:
+            kwargs["w3_w1_stacked_bias"] = graph.get_attr(new_key_w_up_bias)
+            kwargs["w2_stacked_bias"] = graph.get_attr(new_key_w_down_bias)
+
+        # Add SwigluBias parameters if present (only supported by trtllm backend)
+        if act_fn == ActivationType.SwigluBias and backend in ["auto", "trtllm"]:
+            kwargs["swiglu_alpha"] = graph.get_attr(new_key_swiglu_alpha)
+            kwargs["swiglu_beta"] = graph.get_attr(new_key_swiglu_beta)
+            kwargs["swiglu_limit"] = graph.get_attr(new_key_swiglu_limit)
+
         new_node = graph.call_function(
             replacement_op,
             args=(hidden_states, selected_experts, routing_weights, w_up_arg, w_down_arg),
-            kwargs={
-                "is_gated_mlp": is_gated_mlp,
-                "act_fn": act_fn,
-            },
+            kwargs=kwargs,
         )
 
     node.replace_all_uses_with(new_node)

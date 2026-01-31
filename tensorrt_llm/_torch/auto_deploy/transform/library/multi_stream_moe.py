@@ -1,7 +1,7 @@
 """Transform for multi-stream execution of MoE layers that have shared experts and routed experts."""
 
 from threading import RLock
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.fx import GraphModule
@@ -127,6 +127,11 @@ def trtllm_moe_fused_aux(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    w3_w1_stacked_bias: Optional[torch.Tensor] = None,
+    w2_stacked_bias: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = torch.cuda.current_device()
     with torch.cuda.stream(
@@ -141,6 +146,11 @@ def trtllm_moe_fused_aux(
             w2_stacked_weight,
             is_gated_mlp,
             act_fn,
+            w3_w1_stacked_bias,
+            w2_stacked_bias,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
         )
         torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
     torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -156,6 +166,11 @@ def trtllm_moe_fused_aux_fake(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    w3_w1_stacked_bias: Optional[torch.Tensor] = None,
+    w2_stacked_bias: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

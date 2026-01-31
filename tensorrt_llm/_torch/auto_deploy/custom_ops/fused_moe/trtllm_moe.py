@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
@@ -28,7 +30,35 @@ def trtllm_moe_fused(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    w3_w1_stacked_bias: Optional[torch.Tensor] = None,
+    w2_stacked_bias: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """TensorRT-LLM fused MoE operator.
+
+    This op supports both standard Swiglu and GPT-OSS style SwigluBias activations:
+    - Swiglu (default): silu(gate) * up
+    - SwigluBias (GPT-OSS): (up + beta) * (gate * sigmoid(alpha * gate)) with clamping
+
+    Parameters:
+        x: Input tensor of shape (B, H) or (B, S, H)
+        selected_experts: Expert indices (B*S, TOP_K)
+        routing_weights: Routing weights (B*S, TOP_K)
+        w3_w1_stacked_weight: Stacked gate+up weights [E, 2*I, H] for gated MLP
+        w2_stacked_weight: Stacked down weights [E, H, I]
+        is_gated_mlp: True for gated MLP (default), False for simple MLP
+        act_fn: Activation type (Silu/Swiglu, SwigluBias, or Relu2)
+        w3_w1_stacked_bias: Optional stacked bias for gate+up projections [E, 2*I]
+        w2_stacked_bias: Optional stacked bias for down projection [E, H]
+        swiglu_alpha: Optional alpha parameter for SwigluBias [E] (GPT-OSS: 1.702)
+        swiglu_beta: Optional beta parameter for SwigluBias [E] (GPT-OSS: 1.0)
+        swiglu_limit: Optional limit parameter for SwigluBias [E] (GPT-OSS: 7.0)
+
+    Returns:
+        Output tensor of shape (B, H) or (B, S, H)
+    """
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
 
@@ -37,15 +67,16 @@ def trtllm_moe_fused(
     quant_scales = []
 
     # Determine activation type
-
-    activation_type = ActivationType.Swiglu
     if is_gated_mlp:
-        # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
-        if act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
+        if act_fn == ActivationType.SwigluBias:
+            # GPT-OSS style: (up + beta) * (gate * sigmoid(alpha * gate))
+            activation_type = ActivationType.SwigluBias
+        elif act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
             activation_type = ActivationType.Swiglu
         else:
             raise ValueError(
-                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. Use 'silu'."
+                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. "
+                f"Use 'silu', 'swiglu', or 'swiglu_bias'."
             )
     else:
         # For non-gated MLP with ReLU^2
@@ -61,12 +92,15 @@ def trtllm_moe_fused(
         selected_experts,
         routing_weights,
         fc1_expert_weights=w3_w1_stacked_weight,
-        fc1_expert_biases=None,
+        fc1_expert_biases=w3_w1_stacked_bias,
         fc2_expert_weights=w2_stacked_weight,
-        fc2_expert_biases=None,
+        fc2_expert_biases=w2_stacked_bias,
         output_dtype=x.dtype,
         quant_scales=quant_scales,
         activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )[0].view(x_shape)
 
 
@@ -79,6 +113,11 @@ def trtllm_moe_fused_fake(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    w3_w1_stacked_bias: Optional[torch.Tensor] = None,
+    w2_stacked_bias: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
