@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,8 @@ from utils.util import getSMVersion, isSM100Family
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 @pytest.mark.skipif(
@@ -88,7 +90,6 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     b = torch.randn((n, k), device='cuda', dtype=dtype) / k
 
     if getSMVersion() == 120:
-        act_a_fp8, act_a_sf = fp8_utils.per_token_quant_and_transform(a)
         act_b_fp8, act_b_sf = fp8_utils.per_block_cast_to_fp8_e8m0(b)
         act_b_sf = fp8_utils.transform_sf_into_required_layout(
             act_b_sf,
@@ -97,16 +98,151 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
             recipe=(1, 128, 128),
             is_sfa=False)
     else:
-        act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
         act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
 
     output_expected = a @ b.t()
 
-    output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8, act_b_fp8,
-                                                     act_a_sf, act_b_sf)
+    output = torch.ops.trtllm.fp8_block_scaling_gemm(a, act_b_fp8, act_b_sf)
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+     (2048, 7168), (1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128, 4096],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
+
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+
+    output_expected = a @ b.t()
+
+    with autotune():
+        cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+            a, act_b_fp8, act_b_sf)
+
+    # test Cute DSL kernel
+    cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+        a, act_b_fp8, act_b_sf)
+
+    diff = calc_diff(cute_dsl_output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(cute_dsl_output,
+                               output_expected,
+                               atol=1e-3,
+                               rtol=1e-3)
+
+
+@pytest.mark.skipif(not isSM100Family(),
+                    reason="The test is for Blackwell only. Current SM is %d." %
+                    getSMVersion())
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+     (2048, 7168), (1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128, 4096],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_fp8_block_scale_gemm_unified(dtype, m, k, n):
+
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    # Test unified API with CUTLASS/TRTLLMGEN (SM 100 only) and CuteDSL backends
+    # Note: Uses Float32 scales (per_block_cast_to_fp8) - compatible with these backends
+    # DeepGEMM backend is excluded as it requires UE8M0 scale format
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+
+    output_expected = a @ b.t()
+
+    output = torch.ops.trtllm.fp8_block_scaling_gemm_unified(
+        a, act_b_fp8, act_b_sf, allowed_backends="cutlass/trtllmgen,cutedsl")
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not isSM100Family(),
+                    reason="The test is for Blackwell only. Current SM is %d." %
+                    getSMVersion())
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+     (2048, 7168), (1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128, 4096],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_fp8_block_scale_linear(dtype, m, k, n):
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    # Quantize weight to FP8 with Float32 block scales
+    b_fp8, b_sf = per_block_cast_to_fp8(b)
+
+    # Create FP8 Linear module
+    qc = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    linear_fp8 = Linear(in_features=k,
+                        out_features=n,
+                        bias=False,
+                        dtype=dtype,
+                        quant_config=qc,
+                        fp8_block_scaling_allowed_backends=[
+                            "deepgemm", "cutlass/trtllmgen", "cutedsl"
+                        ])
+
+    # Load FP8 weights (Float32 scales - compatible with CUTLASS/CuteDSL)
+    linear_fp8.load_weights([{
+        'weight': b_fp8.cpu(),
+        'weight_scale': b_sf.cpu()
+    }])
+    linear_fp8 = linear_fp8.cuda()
+
+    # Verify weights loaded correctly
+    torch.testing.assert_close(linear_fp8.weight, b_fp8)
+    torch.testing.assert_close(linear_fp8.weight_scale, b_sf)
+
+    # Reference output
+    output_expected = a @ b.t()
+
+    # Test forward pass with unified API
+    with torch.inference_mode(), autotune():
+        output = linear_fp8.forward(a)
+
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-2
+    torch.testing.assert_close(output, output_expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(
@@ -166,6 +302,57 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
     torch.ops.trtllm.fp8_block_scaling_bmm_out(a_fp8, b_fp8, a_scales, b_scales,
                                                output)
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (512, 32768), (16384, 7168), (2048, 7168)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128],
+)
+@pytest.mark.parametrize(
+    "num_groups",
+    [4, 8, 16],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
+
+    torch.random.manual_seed(0)
+    a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+
+    b = torch.randn((num_groups, n, k), device='cuda', dtype=dtype) / k
+    b_fp8 = torch.zeros_like(b, device='cuda', dtype=torch.float8_e4m3fn)
+    b_scales = torch.zeros((num_groups, (n + 127) // 128, (k + 127) // 128),
+                           device='cuda',
+                           dtype=torch.float)
+
+    for i in range(num_groups):
+        b_fp8[i], b_scales[i] = per_block_cast_to_fp8(b[i])
+
+    output_expected = torch.einsum('mgk,gnk->gmn', a, b)
+    output = torch.empty((num_groups, m, n),
+                         device='cuda',
+                         dtype=torch.bfloat16)
+    # tune
+    with autotune():
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
+                                                    b_scales, output)
+    # run the tuned kernel
+    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
+                                                b_scales, output)
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)

@@ -7,7 +7,7 @@ import triton  # type: ignore[import]
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
@@ -24,8 +24,8 @@ from ..utils import (ActivationType, fp4_scale_infer_shape,
                      last_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellLinear
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLFP8BlackwellLinear, CuteDSLNVFP4BlackwellLinear)
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -1563,7 +1563,12 @@ class Fp8BlockScalingGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: int = -1,
     ) -> torch.Tensor:
-        a, b, a_scale, b_scale = inputs
+        a_bf16, b, b_scale = inputs
+        assert a_bf16.dtype == torch.bfloat16
+        if get_sm_version() == 120:
+            a, a_scale = fp8_utils.per_token_quant_and_transform(a_bf16)
+        else:
+            a, a_scale = torch.ops.trtllm.fp8_quantize_1x128(a_bf16)
         return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
             a, b, a_scale, b_scale)
 
@@ -1585,7 +1590,6 @@ def get_fp8_block_scaling_gemm_constraint_spec():
 def fp8_block_scaling_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_scale: torch.Tensor,
     b_scale: torch.Tensor,
     tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
@@ -1600,10 +1604,10 @@ def fp8_block_scaling_gemm(
         "trtllm::fp8_block_scaling_gemm",
         [fp8_block_scaling_gemm_runner],
         Fp8BlockScalingGemmRunner.tuning_config,
-        [a, b, a_scale, b_scale],
+        [a, b, b_scale],
     )
     return fp8_block_scaling_gemm_runner(
-        inputs=[a, b, a_scale, b_scale],
+        inputs=[a, b, b_scale],
         tactic=best_tactic,
     )
 
@@ -1613,6 +1617,234 @@ def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
     m = a.shape[0]
     n = b.shape[0]
     return a.new_empty((m, n), dtype=torch.bfloat16)
+
+
+class FP8BlockScalingGemmUnifiedRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+    )
+
+    def __init__(self, output_dtype: torch.dtype, allowed_backends: List[str]):
+        super().__init__()
+        self.output_dtype = output_dtype
+        self.allowed_backends = allowed_backends
+
+    def unique_id(self):
+        """Include allowed_backends in cache key."""
+        allowed_tuple = tuple(self.allowed_backends)
+        return (self.output_dtype, allowed_tuple)
+
+    def _is_backend_allowed(self, backend_name: str) -> bool:
+        return backend_name in self.allowed_backends
+
+    def _is_only_backend(self, backend_name: str) -> bool:
+        return self.allowed_backends == [backend_name]
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[Tuple[str, int]]:
+        """Return valid tactics from all allowed backends."""
+        tactics = []
+        input_tensor, weight, weight_scale = inputs
+        m, k = input_tensor.shape
+        n = weight.shape[0]
+        sm_version = get_sm_version()
+
+        # Add DeepGEMM SwapAB tactic if available
+        if self._is_backend_allowed("deepgemm"):
+            if is_sm_100f(sm_version):
+                deepgemm_runner = fp8SwapABGemmRunner(
+                    output_dtype=self.output_dtype, disable_ue8m0_cast=True)
+                # Deep GEMM uses raw input (not pre-quantized)
+                deepgemm_tactics = deepgemm_runner.get_valid_tactics(
+                    inputs, profile)
+                tactics.extend([("deepgemm", tactic)
+                                for tactic in deepgemm_tactics])
+            elif self._is_only_backend("deepgemm"):
+                error_msg = f"Deep GEMM fp8SwapABGemmRunner requires SM100f, but got SM {sm_version}. "
+                error_msg += "Please add other backends to allowed_backends."
+                raise ValueError(error_msg)
+
+        # Add CuteDSL tactic if available
+        if self._is_backend_allowed("cutedsl"):
+            if is_sm_100f(sm_version):
+                cutedsl_runner = CuteDSLFP8BlackwellLinear()
+                cutedsl_tactics = cutedsl_runner.get_valid_tactics(
+                    inputs, profile)
+                if cutedsl_tactics:
+                    tactics.extend([("cutedsl", tactic)
+                                    for tactic in cutedsl_tactics])
+                else:
+                    error_msg = f"CuteDSL FP8 blockscale gemm does not support shape M={m}, N={n}, K={k}. "
+                    error_msg += "Please add other backends to allowed_backends."
+                    raise ValueError(error_msg)
+            elif self._is_only_backend("cutedsl"):
+                raise ValueError(
+                    f"CuteDSL FP8 backend requires SM100f, but got SM {sm_version}. "
+                    "Please add other backends to allowed_backends.")
+
+        # Add CUTLASS/TRTLLMGEN tactic if available
+        if self._is_backend_allowed("cutlass/trtllmgen"):
+            if sm_version >= 89:
+                cutlass_trtllmgen_runner = Fp8BlockScalingGemmRunner()
+                cutlass_trtllmgen_tactics = cutlass_trtllmgen_runner.get_valid_tactics(
+                    inputs, profile)
+                tactics.extend([("cutlass/trtllmgen", tactic)
+                                for tactic in cutlass_trtllmgen_tactics])
+            elif self._is_only_backend("cutlass/trtllmgen"):
+                raise ValueError(
+                    f"CUTLASS FP8 backend requires SM >= 89, but got SM {sm_version}."
+                )
+
+        return tactics
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: Union[Tuple[str, int], int] = -1,
+                **kwargs) -> torch.Tensor:
+        """Execute GEMM with selected backend."""
+        # Handle cache miss fallback
+        if tactic == -1:
+            # Default fallback order: deepgemm > cutlass/trtllmgen > cutedsl
+            if "deepgemm" in self.allowed_backends:
+                tactic = ("deepgemm", -1)
+            elif "cutlass/trtllmgen" in self.allowed_backends:
+                tactic = ("cutlass/trtllmgen", -1)
+            else:
+                tactic = (self.allowed_backends[0], -1)
+
+        backend, sub_tactic = tactic
+
+        sm_version = get_sm_version()
+
+        if backend == "deepgemm" or (backend == "cutlass/trtllmgen"
+                                     and sm_version == 120):
+            if not hasattr(self, '_resmoothed_weight_cache'):
+                self._resmoothed_weight_cache = {}
+
+            input, weight, weight_scale = inputs[0], inputs[1], inputs[2]
+            cache_key = (backend, id(weight)
+                         )  # backend + weight tensor ID as key
+            if cache_key not in self._resmoothed_weight_cache:
+                weight_ue8m0, scale_ue8m0 = fp8_utils.resmooth_to_fp8_e8m0(
+                    weight, weight_scale)
+                scale_ue8m0 = fp8_utils.transform_sf_into_required_layout(
+                    scale_ue8m0,
+                    mn=weight.shape[0],
+                    k=weight.shape[1],
+                    recipe=(1, 128, 128),
+                    is_sfa=False)
+                self._resmoothed_weight_cache[cache_key] = (weight_ue8m0,
+                                                            scale_ue8m0)
+
+            weight_ue8m0, scale_ue8m0 = self._resmoothed_weight_cache[cache_key]
+            inputs = [input, weight_ue8m0, scale_ue8m0]
+
+        if backend == "deepgemm":
+            return fp8SwapABGemmRunner(output_dtype=self.output_dtype,
+                                       disable_ue8m0_cast=True)(
+                                           inputs, tactic=sub_tactic)
+
+        elif backend == "cutlass/trtllmgen":
+            return Fp8BlockScalingGemmRunner()(inputs, tactic=sub_tactic)
+
+        elif backend == "cutedsl":
+            return CuteDSLFP8BlackwellLinear()(inputs, tactic=sub_tactic)
+
+        else:
+            raise ValueError(f"Invalid backend: {backend}")
+
+
+@torch.library.custom_op("trtllm::fp8_block_scaling_gemm_unified",
+                         mutates_args=())
+def fp8_block_scaling_gemm_unified(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    allowed_backends: str = "deepgemm,cutlass/trtllmgen",
+) -> torch.Tensor:
+    """Unified FP8 block-scaling GEMM with automatic backend selection.
+
+    This function automatically chooses the best backend from the allowed list:
+    - CUTLASS/TRTLLMGEN: Mature baseline, works on all Ada/Hopper/Blackwell (SM >= 89)
+    - Deep GEMM: Dynamic JIT compilation, good default for Blackwell (SM 100/103)
+    - CuteDSL: Hand-optimized persistent kernels for Blackwell (SM 100/103)
+
+    Args:
+        input: Input activation tensor [m, k] in bf16
+        weight: Weight tensor [n, k] in fp8
+        weight_scale: Weight scale factors
+        output_dtype: Output data type
+        allowed_backends: Comma-separated list of backends to consider.
+            Default: "deepgemm,cutlass/trtllmgen" (excludes cutedsl for faster build)
+            Add 'cutedsl' for extreme performance at the cost of longer build time.
+            Valid backends: 'cutlass/trtllmgen', 'deepgemm', 'cutedsl'.
+
+    Returns:
+        Output tensor [m, n] with dtype=output_dtype
+
+    Raises:
+        ValueError: If backend is invalid/unavailable
+    """
+
+    valid_backends = {'cutlass/trtllmgen', 'deepgemm', 'cutedsl'}
+
+    # Parse backends
+    backends_list = [
+        b.strip() for b in allowed_backends.split(',') if b.strip()
+    ]
+    invalid = set(backends_list) - valid_backends
+    if invalid:
+        raise ValueError(f"Invalid backends: {invalid}. "
+                         f"Valid backends are: {sorted(valid_backends)}.")
+    if not backends_list:
+        raise ValueError(
+            f"allowed_backends cannot be empty. "
+            f"Valid backends are: {sorted(valid_individual_backends)}.")
+
+    # Create unified runner
+    runner = FP8BlockScalingGemmUnifiedRunner(output_dtype, backends_list)
+
+    # Auto-tune and execute
+    tuner = AutoTuner.get()
+
+    try:
+        _, best_tactic = tuner.choose_one(
+            "trtllm::fp8_block_scaling_gemm_unified::gemm",
+            [runner],
+            FP8BlockScalingGemmUnifiedRunner.tuning_config,
+            [input, weight, weight_scale],
+        )
+    except IndexError as e:
+        logger.error(
+            f"shapes: M={input.shape[0]}, K={input.shape[1]}, N={weight.shape[0]}"
+        )
+        raise RuntimeError(
+            f"AutoTuner failed to find valid (runner, tactic) pair. "
+            f"Shape: M={input.shape[0]}, K={input.shape[1]}, N={weight.shape[0]}"
+        ) from e
+
+    return runner(
+        inputs=[input, weight, weight_scale],
+        tactic=best_tactic,
+    )
+
+
+@fp8_block_scaling_gemm_unified.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    allowed_backends: str = "cutlass/trtllmgen,deepgemm",
+) -> torch.Tensor:
+    """Fake implementation for torch.compile support."""
+    return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
 @torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())
