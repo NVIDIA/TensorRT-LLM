@@ -826,20 +826,28 @@ class PyTorchModelEngine(ModelEngine):
         draft_lengths = sorted(set(draft_lengths), reverse=True)
 
         # Create CUDA graphs for short and long sequences separately for sparse attention.
+        # self.max_seq_len is the global max sequence length. For Helix CP each
+        # rank only holds max_seq_len / cp_size tokens, so scale accordingly to
+        # avoid creating warmup requests whose position_ids exceed the RoPE
+        # table (max_position_embeddings).
+        effective_max_seq_len = self.max_seq_len
+        if self.mapping is not None and self.mapping.has_cp_helix():
+            effective_max_seq_len = self.max_seq_len // self.mapping.cp_size
+
         sparse_config = self.sparse_attention_config
         if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(
         ):
             # For short sequences, use the (seq_len_threshold - max_draft_len - 1) as the maximum sequence length
             # to make sure all of the past and current input tokens are within the sequence length threshold.
-            # For long sequences, use the default maximum sequence length (self.max_seq_len).
+            # For long sequences, use the default maximum sequence length.
             max_seq_len = sparse_config.seq_len_threshold - (
                 self.max_draft_len + 1)
-            if max_seq_len < self.max_seq_len:
-                max_seq_len_list = [self.max_seq_len, max_seq_len]
+            if max_seq_len < effective_max_seq_len:
+                max_seq_len_list = [effective_max_seq_len, max_seq_len]
             else:
-                max_seq_len_list = [self.max_seq_len]
+                max_seq_len_list = [effective_max_seq_len]
         else:
-            max_seq_len_list = [self.max_seq_len]
+            max_seq_len_list = [effective_max_seq_len]
 
         for bs in cuda_graph_batch_sizes:
             if bs > self.batch_size:
