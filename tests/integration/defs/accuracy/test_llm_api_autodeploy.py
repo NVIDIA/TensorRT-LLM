@@ -371,14 +371,14 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "compile_backend": "torch-simple",
-            "max_batch_size": 64,
+            "max_batch_size": 16,
             "max_seq_len": self.MAX_SEQ_LEN,
             "max_num_tokens": self.MAX_NUM_TOKENS,
             "skip_loading_weights": False,
             "disable_overlap_scheduler": True,
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.7
+                "free_gpu_memory_fraction": 0.88
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16"
