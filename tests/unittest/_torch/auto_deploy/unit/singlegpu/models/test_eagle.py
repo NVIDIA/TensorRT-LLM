@@ -25,8 +25,9 @@ from build_and_run_ad import ExperimentConfig, main
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3DrafterForCausalLM,
     Eagle3DraftOutput,
+    EagleConfig,
 )
-from tensorrt_llm._torch.auto_deploy.models.eagle import EagleConfigInfo, EagleDrafterFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tests.test_common.llm_data import hf_id_to_local_model_dir
 
@@ -39,6 +40,22 @@ EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 # In production speculative decoding, real hidden states come from the target model.
 # For testing, MockEagle3ModelForCausalLM generates random hidden states.
 ###############################################################################
+
+
+class MockEagleConfig(EagleConfig):
+    """Config for standalone Eagle testing with embedding/lm_head loaded from checkpoint.
+
+    In production, Eagle shares embedding/lm_head with the target model.
+    For standalone testing, we need to load these from the checkpoint.
+    """
+
+    _drafter_defaults = {
+        "llama": {
+            "load_embedding_from_target": False,
+            "load_lm_head_from_target": False,
+            "num_capture_layers": 1,
+        },
+    }
 
 
 class MockEagle3ModelForCausalLM(Eagle3DrafterForCausalLM):
@@ -80,20 +97,31 @@ class MockEagle3ModelForCausalLM(Eagle3DrafterForCausalLM):
 class MockEagleDrafterFactory(EagleDrafterFactory):
     """Test factory that uses MockEagle3ModelForCausalLM for standalone Eagle testing.
 
-    This factory overrides the drafter mapping to use the mock model class which
-    generates random hidden states, enabling testing without a target model.
+    This factory directly builds MockEagle3ModelForCausalLM with MockEagleConfig,
+    which loads embedding/lm_head from checkpoint for standalone testing.
     """
 
-    _drafter_mapping = {
-        "llama": EagleConfigInfo(
-            config_class=MockEagle3ModelForCausalLM,
-            eagle_config_defaults={
-                "load_embedding_from_target": False,
-                "load_lm_head_from_target": False,
-                "num_capture_layers": 1,
-            },
-        ),
-    }
+    def _build_model(self, device):
+        from contextlib import nullcontext
+
+        from accelerate import init_empty_weights
+
+        model_config, unused_kwargs = self._get_model_config()
+        model_config = MockEagleConfig(model_config, model_config.model_type)
+
+        with (init_empty_weights if device == "meta" else nullcontext)():
+            model = MockEagle3ModelForCausalLM._from_config(model_config, **unused_kwargs)
+
+        if device == "meta":
+            if hasattr(model, "post_init"):
+                model.post_init()
+        else:
+            model.to(device)
+
+        self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+        model.eval()
+
+        return model
 
 
 @pytest.fixture
