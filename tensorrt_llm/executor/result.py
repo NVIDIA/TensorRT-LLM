@@ -448,8 +448,6 @@ class GenerationResultBase:
             if hasattr(response_result, 'mm_embedding_handle'
                        ) and response_result.mm_embedding_handle is not None:
                 self._mm_embedding_handle = response_result.mm_embedding_handle
-                mrope_position_ids_handle = response_result.mrope_position_ids_handle
-                mrope_position_deltas_handle = response_result.mrope_position_deltas_handle
                 if self.disaggregated_params is not None:
                     self.disaggregated_params.multimodal_embedding_handles = [
                         response_result.mm_embedding_handle
@@ -461,8 +459,17 @@ class GenerationResultBase:
                             response_result.mm_embedding_handle
                         ],
                         multimodal_hashes=self._multimodal_hashes)
-                self.disaggregated_params.mrope_position_ids_handle = mrope_position_ids_handle
-                self.disaggregated_params.mrope_position_deltas_handle = mrope_position_deltas_handle
+
+            # Handle mrope handles for both:
+            # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
+            # 2. Prefill-only EPD requests (mm_embedding_handle is None because embeddings
+            #    were already computed in encode phase, but mrope still needs forwarding)
+            if (getattr(response_result, "mrope_position_ids_handle", None)
+                    is not None and self.disaggregated_params is not None):
+                self.disaggregated_params.mrope_position_ids_handle = (
+                    response_result.mrope_position_ids_handle)
+                self.disaggregated_params.mrope_position_deltas_handle = (
+                    response_result.mrope_position_deltas_handle)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
