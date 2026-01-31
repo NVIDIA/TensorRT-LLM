@@ -146,6 +146,7 @@ class AccuracyTask:
             self.reference: List[dict] = yaml.safe_load(f).get(model_name, [])
 
     def get_hypothesis_testing_params(self,
+                                      num_samples: Optional[int] = None,
                                       **acc_specs) -> HypothesisTestingParams:
         """Get hypothesis testing parameters via accuracy specifications.
 
@@ -177,7 +178,8 @@ class AccuracyTask:
             alpha=entry.get("alpha", self.ALPHA),
             beta=entry.get("beta", self.BETA),
             sigma=entry.get("sigma", self.SIGMA),
-            num_samples=entry.get("num_samples", self.NUM_SAMPLES),
+            num_samples=num_samples
+            or entry.get("num_samples", self.NUM_SAMPLES),
             higher_is_better=entry.get("higher_is_better",
                                        self.HIGHER_IS_BETTER))
 
@@ -187,7 +189,8 @@ class AccuracyTask:
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 is_integration_test: bool = False):
+                 is_integration_test: bool = False,
+                 num_samples: Optional[int] = None) -> float:
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
@@ -211,6 +214,7 @@ class AccuracyTask:
                                                                 num_samples=1)
         else:
             hypothesis_testing_params = self.get_hypothesis_testing_params(
+                num_samples=num_samples,
                 dtype=llm.args.dtype,
                 quant_algo=llm.args.quant_config.quant_algo,
                 kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
