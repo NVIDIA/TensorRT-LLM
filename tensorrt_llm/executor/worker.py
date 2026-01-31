@@ -180,6 +180,8 @@ def worker_main(
         # unless we update it explicitly here.
         os.environ.update(llm_args.env_overrides)
 
+    # increase fi jit compile jobs
+    os.environ["MAX_JOBS"] = str(os.cpu_count() or 16)
     if llm_args is not None and llm_args.trust_remote_code:
         _init_hf_modules()
 
