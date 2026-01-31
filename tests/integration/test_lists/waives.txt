@@ -346,7 +346,7 @@ cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (h
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass-auto] SKIP (https://nvbugs/5838211)
 test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct] SKIP (https://nvbugs/5843112)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] SKIP (https://nvbugs/5839028)
-unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestNoBatching::test_naive_0 SKIP (https://nvbugs/5841954)
+full:A10/unittest/kv_cache_manager_v2_tests/ SKIP (https://nvbugs/5841954)
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP] SKIP (https://nvbugs/5841976)
 unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_cuda_graph_overlap_scheduler SKIP (https://nvbugs/5843316)
 examples/test_mistral.py::test_mistral_with_bf16_lora_torch[mistral-7b-v0.1] SKIP (https://nvbugs/5846178)
