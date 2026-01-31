@@ -541,7 +541,7 @@ class LoadBalancingRouter(Router):
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
 
-    async def _get_next_server(
+    async def get_next_server(
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:

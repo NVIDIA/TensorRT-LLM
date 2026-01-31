@@ -195,9 +195,10 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
-            request.disaggregated_params = request.disaggregated_params.model_copy(
-                update=disaggregated_params
-            )
+            if disaggregated_params:
+                request.disaggregated_params = request.disaggregated_params.model_copy(
+                    update=disaggregated_params
+                )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
         return request
