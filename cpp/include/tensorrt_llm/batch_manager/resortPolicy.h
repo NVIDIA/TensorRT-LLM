@@ -35,7 +35,18 @@ public:
     /// @brief Reorders the given requests according to the policy.
     /// @param requests The vector of requests to be reordered.
     /// @return The reordered vector of requests.
-    virtual RequestVector resortRequests(RequestVector const& requests) const = 0;
+    [[nodiscard]] virtual RequestVector resortRequests(RequestVector const& requests) const = 0;
+
+    /// @brief Reorders the given requests (RequestList version).
+    /// @param requests The list of requests to be reordered.
+    /// @return The reordered list of requests.
+    /// @note This is a convenience overload that converts to/from RequestVector internally.
+    [[nodiscard]] RequestList resortRequests(RequestList const& requests) const
+    {
+        RequestVector requestsVec(requests.begin(), requests.end());
+        RequestVector resortedVec = resortRequests(requestsVec);
+        return RequestList(resortedVec.begin(), resortedVec.end());
+    }
 };
 
 } // namespace tensorrt_llm::batch_manager
