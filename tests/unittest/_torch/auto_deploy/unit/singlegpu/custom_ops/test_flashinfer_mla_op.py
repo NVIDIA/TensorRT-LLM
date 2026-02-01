@@ -51,23 +51,39 @@ def _create_mla_inputs(
     """
     kv_head_dim = qk_nope_head_dim + v_head_dim
 
+    # Scale factor for Xavier-like initialization to keep values bounded
+    # This helps reduce numerical differences by keeping output magnitudes smaller
+    q_scale = 1.0 / (qk_nope_head_dim**0.5)
+    kv_scale = 1.0 / (kv_lora_rank**0.5)
+
     # q_nope: [B, S, N, qk_nope_head_dim]
-    q_nope = torch.randn(
-        batch_size, seq_len, num_heads, qk_nope_head_dim, dtype=dtype, device=device
+    q_nope = (
+        torch.randn(batch_size, seq_len, num_heads, qk_nope_head_dim, dtype=dtype, device=device)
+        * q_scale
     )
 
     # q_pe: [B, S, N, qk_rope_head_dim]
-    q_pe = torch.randn(batch_size, seq_len, num_heads, qk_rope_head_dim, dtype=dtype, device=device)
+    q_pe = (
+        torch.randn(batch_size, seq_len, num_heads, qk_rope_head_dim, dtype=dtype, device=device)
+        * q_scale
+    )
 
     # compressed_kv: [B, S, kv_lora_rank]
-    compressed_kv = torch.randn(batch_size, seq_len, kv_lora_rank, dtype=dtype, device=device)
+    compressed_kv = (
+        torch.randn(batch_size, seq_len, kv_lora_rank, dtype=dtype, device=device) * kv_scale
+    )
 
     # kpe: [B, S, 1, qk_rope_head_dim]
-    kpe = torch.randn(batch_size, seq_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
+    kpe = (
+        torch.randn(batch_size, seq_len, 1, qk_rope_head_dim, dtype=dtype, device=device) * q_scale
+    )
 
     # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
-    kv_b_proj_weight = torch.randn(
-        num_heads * kv_head_dim, kv_lora_rank, dtype=dtype, device=device
+    # Xavier initialization for the projection weight
+    weight_scale = 1.0 / (kv_lora_rank**0.5)
+    kv_b_proj_weight = (
+        torch.randn(num_heads * kv_head_dim, kv_lora_rank, dtype=dtype, device=device)
+        * weight_scale
     )
 
     return {
@@ -294,7 +310,7 @@ def _copy_unpaged_to_paged_cache(
 @pytest.mark.parametrize("seq_length", [32, 128])
 @pytest.mark.parametrize("num_heads", [1])
 @pytest.mark.parametrize("batch_size", [8, 64])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
 def test_flashinfer_mla_op_context(seq_length, num_heads, batch_size, dtype, device):
     """Test FlashInfer MLA context (prefill) phase.
@@ -429,17 +445,13 @@ def test_flashinfer_mla_op_context(seq_length, num_heads, batch_size, dtype, dev
         batch_size, seq_length, num_heads, v_head_dim
     )
 
-    # Use larger tolerance for float16 attention operations with optimized kernels.
     # FlashInfer uses fused kernels with different computation order/precision than the
-    # torch reference which processes each sequence in a loop. With batch_size=64 and
-    # longer sequences (seq_length=128), numerical differences can accumulate to ~2-3%
-    # relative error due to softmax over longer sequences and more attention computations.
-    # Using atol=2.0 allows for max diff up to 2.0 (about 2-3% of typical output magnitudes).
+    # torch reference. With bfloat16 and scaled inputs, tighter tolerances are achievable.
     assert torch.allclose(
         flashinfer_output_reshaped.cpu().to(torch.float32),
         torch_output_reshaped.cpu().to(torch.float32),
-        atol=2.0,
-        rtol=0.1,
+        atol=0.05,
+        rtol=0.02,
     ), (
         f"FlashInfer MLA context output doesn't match torch backend. "
         f"Max diff: {(flashinfer_output_reshaped - torch_output_reshaped).abs().max():.6f}"
@@ -449,7 +461,7 @@ def test_flashinfer_mla_op_context(seq_length, num_heads, batch_size, dtype, dev
 @pytest.mark.parametrize("prefill_seq_length", [64, 128])
 @pytest.mark.parametrize("num_heads", [1])
 @pytest.mark.parametrize("batch_size", [4, 64])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
 def test_flashinfer_mla_op_decode(prefill_seq_length, num_heads, batch_size, dtype, device):
     """Test FlashInfer MLA decode (generate) phase.
@@ -598,15 +610,13 @@ def test_flashinfer_mla_op_decode(prefill_seq_length, num_heads, batch_size, dty
     # =========================================================================
     # Compare outputs
     # =========================================================================
-    # Use larger tolerance for float16 attention operations with optimized kernels.
     # FlashInfer uses fused kernels with different computation order/precision than the
-    # torch reference which processes each sequence in a loop. With large batch_size
-    # and seq_length, numerical differences can accumulate.
+    # torch reference. With bfloat16 and scaled inputs, tighter tolerances are achievable.
     assert torch.allclose(
         flashinfer_output.cpu().to(torch.float32),
         torch_output.cpu().to(torch.float32),
-        atol=2.0,  # Use larger tolerance for float16 attention with fused kernels
-        rtol=0.1,
+        atol=0.05,
+        rtol=0.02,
     ), (
         f"FlashInfer MLA decode output doesn't match torch backend. "
         f"Max diff: {(flashinfer_output - torch_output).abs().max():.6f}"
@@ -616,7 +626,7 @@ def test_flashinfer_mla_op_decode(prefill_seq_length, num_heads, batch_size, dty
 @pytest.mark.parametrize("prefill_seq_length", [16, 64, 128])
 @pytest.mark.parametrize("num_heads", [1])
 @pytest.mark.parametrize("batch_size", [4, 64])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
 def test_flashinfer_mla_context_and_generate(
     prefill_seq_length, num_heads, batch_size, dtype, device
@@ -753,8 +763,8 @@ def test_flashinfer_mla_context_and_generate(
     assert torch.allclose(
         flashinfer_output_context_reshaped.cpu().to(torch.float32),
         torch_output_context_reshaped.cpu().to(torch.float32),
-        atol=2.0,  # Use larger tolerance for float16 attention with fused kernels
-        rtol=0.1,
+        atol=0.05,
+        rtol=0.02,
     ), "Context phase outputs don't match"
 
     # =========================================================================
@@ -862,8 +872,8 @@ def test_flashinfer_mla_context_and_generate(
     assert torch.allclose(
         flashinfer_output_gen.cpu().to(torch.float32),
         torch_output_gen.cpu().to(torch.float32),
-        atol=2.0,  # Use larger tolerance for float16 attention with fused kernels
-        rtol=0.1,
+        atol=0.05,
+        rtol=0.02,
     ), (
         f"Generate phase outputs don't match. "
         f"Max diff: {(flashinfer_output_gen - torch_output_gen).abs().max():.6f}"
@@ -879,7 +889,7 @@ def test_flashinfer_mla_context_and_generate(
     ],
 )
 @pytest.mark.parametrize("num_heads", [8])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
 def test_flashinfer_mla_with_variable_seq_lengths(seq_lengths, num_heads, dtype, device):
     """Test FlashInfer MLA with variable sequence lengths in a batch.
