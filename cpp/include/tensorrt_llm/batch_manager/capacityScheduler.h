@@ -18,9 +18,11 @@
 
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/resortPolicy.h"
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
+#include <memory>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager
@@ -168,10 +170,20 @@ public:
         OptionalRef<BasePeftCacheManager const> peftCacheManager = std::nullopt,
         OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;
 
+    /// @brief Sets the resort policy to use AgentTreePolicy with the given configuration.
+    /// @param agentPercentage The ratio of agent requests to schedule (0.0-1.0, -1.0 for random).
+    /// @param agentTypes The list of agent types to schedule.
+    /// @param agentInflightSeqNum The maximum number of inflight sequences for agent requests.
+    void setAgentTreeResortPolicy(
+        float agentPercentage, std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum);
+
 private:
     std::variant<std::monostate, MaxRequestsScheduler, MaxUtilizationScheduler, GuaranteedNoEvictScheduler,
         StaticBatchScheduler>
         mScheduler;
+
+    /// Optional resort policy for reordering requests before scheduling.
+    std::unique_ptr<ResortPolicy> mResortPolicy;
 };
 
 } // namespace tensorrt_llm::batch_manager

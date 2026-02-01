@@ -1350,7 +1350,7 @@ def create_py_executor_instance(
 
         if resort_policy_config is not None:
             assert resort_policy_config.policy_name == "AgentTree", "Resort policy only supports AgentTree for now"
-            mb_scheduler.impl.set_agent_tree_resort_policy(
+            capacity_scheduler.impl.set_agent_tree_resort_policy(
                 resort_policy_config.policy_args["agent_percentage"],
                 resort_policy_config.policy_args["agent_types"],
                 resort_policy_config.policy_args["agent_inflight_seq_num"])
