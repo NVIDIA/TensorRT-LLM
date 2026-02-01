@@ -11,14 +11,16 @@ from tensorrt_llm.scaffolding import (
     TaskTimer,
     TRTOpenaiWorker,
 )
-from tensorrt_llm.scaffolding.contrib.DeepResearch import create_open_deep_research_scaffolding_llm
+from tensorrt_llm.scaffolding.contrib.open_deep_research import (
+    create_open_deep_research_scaffolding_llm,
+)
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--openai_api_key", type=str, default="tensorrt_llm")
     parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1")
-    parser.add_argument("--model", type=str, default="gpt-oss-20b")
+    parser.add_argument("--model", type=str, default="Qwen3/Qwen3-30B-A3B")
     parser.add_argument("--enable_statistics", action="store_true")
     parser.add_argument("--enable_query_collector", action="store_true")
     return parser.parse_args()
