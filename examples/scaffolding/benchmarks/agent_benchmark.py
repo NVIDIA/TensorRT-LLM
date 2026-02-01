@@ -7,7 +7,9 @@ from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import MCPWorker, QueryCollector, TRTOpenaiWorker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
-from tensorrt_llm.scaffolding.contrib.DeepResearch import create_open_deep_research_scaffolding_llm
+from tensorrt_llm.scaffolding.contrib.open_deep_research import (
+    create_open_deep_research_scaffolding_llm,
+)
 from tensorrt_llm.scaffolding.load_generation_strategy import (
     ConcurrentStrategy,
     PoissonWarmupStrategy,
