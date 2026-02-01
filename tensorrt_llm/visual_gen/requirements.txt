@@ -14,4 +14,4 @@ einops
 termcolor
 ninja
 pre-commit
-nvidia-cutlass-dsl==4.3.0.dev0
+nvidia-cutlass-dsl==4.3.0
