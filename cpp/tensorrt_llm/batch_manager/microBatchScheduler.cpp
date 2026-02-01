@@ -16,7 +16,6 @@
  */
 
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
-#include "tensorrt_llm/batch_manager/agentTree.h"
 #include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
@@ -35,17 +34,6 @@ MicroBatchScheduler::MicroBatchScheduler(std::optional<batch_scheduler::ContextC
     , mNoScheduleUntilState(noScheduleUntilState)
     , mNoScheduleAfterState(noScheduleAfterState)
 {
-}
-
-void MicroBatchScheduler::setAgentTreeResortPolicy(
-    float agentPercentage, std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum)
-{
-    batch_scheduler::AgentTreeConfig config;
-    config.agentPercentage = agentPercentage;
-    config.agentTypes = std::move(agentTypes);
-    config.agentInflightSeqNum = agentInflightSeqNum;
-
-    mResortPolicy = std::make_unique<agent_tree::AgentTreePolicy>(std::move(config));
 }
 
 void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
@@ -197,11 +185,6 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     RequestVector contextsToBeChunked;
     SizeType32 numChunkedTokens{0};
     bool allContextRequestsFit{true};
-
-    if (mResortPolicy)
-    {
-        activeRequests = mResortPolicy->resortRequests(activeRequests);
-    }
 
     // 1. Select the generation phase requests that meet the criteria of total token size.
     //    If there is any remaining space, include the context requests and divide them into chunks.
