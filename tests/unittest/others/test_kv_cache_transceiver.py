@@ -1,4 +1,5 @@
 import time
+import uuid
 
 import pytest
 import torch
@@ -68,9 +69,11 @@ def ctx_gen_kv_cache_dtype(request):
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
                          ids=["mha", "mla"])
-@pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
+@pytest.mark.parametrize("backend", ["NIXL", "UCX", "V2"],
+                         ids=["NIXL", "UCX", "V2"])
 def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
                                              attention_type, backend):
+    tensorrt_llm.logger.set_level("info")
     # Init kv_cache manager and cache transceiver
     mapping = Mapping(world_size=1, rank=0)
     ctx_kv_cache_dtype, gen_kv_cache_dtype = ctx_gen_kv_cache_dtype
@@ -101,6 +104,12 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
+    if (backend == "V2"):
+        disaggregated_params = tensorrt_llm.DisaggregatedParams(
+            request_type="context_only",
+            disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
+        ctx_request.py_disaggregated_params = disaggregated_params
+
     kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
                                            ctx_request.prompt_len, 1,
                                            ctx_request)
@@ -117,6 +126,20 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         context_phase_params=ctx_request.context_phase_params)
+
+    if (backend == "V2"):
+        disaggregated_params = tensorrt_llm.DisaggregatedParams(
+            request_type="generation_only",
+            disagg_request_id=ctx_request.py_disaggregated_params.
+            disagg_request_id,
+            ctx_request_id=ctx_request.request_id,
+            ctx_dp_rank=ctx_request.context_phase_params.ctx_dp_rank,
+            ctx_info_endpoint=ctx_request.context_phase_params.
+            disagg_info_endpoint,
+            first_gen_tokens=ctx_request.context_phase_params.first_gen_tokens,
+            draft_tokens=ctx_request.context_phase_params.draft_tokens)
+
+        gen_request.py_disaggregated_params = disaggregated_params
 
     kv_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
                                            gen_request.prompt_len, 1,
