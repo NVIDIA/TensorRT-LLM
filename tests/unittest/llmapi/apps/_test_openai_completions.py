@@ -19,7 +19,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["tensorrt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -56,7 +56,7 @@ def server(model_name: str, backend: str, num_postprocess_workers: int,
     args.extend(["--kv_cache_free_gpu_memory_fraction",
                  "0.2"])  # for co-existence with other servers
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
-    if backend == "trt":
+    if backend == "tensorrt":
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])
     with RemoteOpenAIServer(model_path, args) as remote_server:
@@ -459,7 +459,7 @@ async def test_completion_with_invalid_logit_bias(
 def test_completion_logprobs(client: openai.OpenAI, model_name: str,
                              backend: str, num_postprocess_workers: int):
     """Test completion with logprobs enabled (non-streaming)."""
-    if backend == "trt" and num_postprocess_workers > 0:
+    if backend == "tensorrt" and num_postprocess_workers > 0:
         pytest.skip("Logprobs is not supported in TRT processpool mode")
 
     prompt = "Hello, my name is"
@@ -505,7 +505,7 @@ async def test_completion_logprobs_streaming(async_client: openai.AsyncOpenAI,
                                              backend: str, model_name: str,
                                              num_postprocess_workers: int):
     """Test completion with logprobs enabled (streaming)."""
-    if backend == "trt" and num_postprocess_workers > 0:
+    if backend == "tensorrt" and num_postprocess_workers > 0:
         pytest.skip("Logprobs is not supported in TRT processpool mode")
 
     prompt = "Hello, my name is"
@@ -559,7 +559,7 @@ async def test_completion_logprobs_streaming(async_client: openai.AsyncOpenAI,
 
 def test_completion_cached_tokens(client: openai.OpenAI, model_name: str,
                                   backend: str):
-    if backend == "trt":
+    if backend == "tensorrt":
         pytest.skip("Cached tokens is not supported in trt backend yet")
 
     prompt = "This is a test prompt"
@@ -588,7 +588,7 @@ def test_completion_cached_tokens(client: openai.OpenAI, model_name: str,
 @pytest.mark.asyncio(loop_scope="module")
 async def test_completion_cached_tokens_stream(async_client: openai.AsyncOpenAI,
                                                model_name: str, backend: str):
-    if backend == "trt":
+    if backend == "tensorrt":
         pytest.skip("Cached tokens is not supported in trt backend yet")
 
     prompt = "This is a test prompt"

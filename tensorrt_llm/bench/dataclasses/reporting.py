@@ -19,7 +19,6 @@ from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
-from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -186,7 +185,6 @@ class ReportUtility:
                  dataset_metadata: DatasetMetadata,
                  rt_cfg: RuntimeConfig,
                  logger: Logger,
-                 kwargs: Dict[str, Any],
                  streaming: bool = False) -> None:
         """Initialize the ReportingController.
 
@@ -200,7 +198,7 @@ class ReportUtility:
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
         self.logger = logger
-        self.kwargs = kwargs
+        self.llm_args = rt_cfg.llm_args
         self.raw_statistics = statistics
         self.statistics = statistics.generate_statistics_summary(
             self.get_max_draft_len())
@@ -311,7 +309,7 @@ class ReportUtility:
         """
         stats_dict = {
             "engine": {
-                "model": self.rt_cfg.model,
+                "model": self.llm_args.model,
                 "model_path": str(self.rt_cfg.model_path),
                 "engine_dir": str(self.rt_cfg.engine_dir),
                 "revision": self.rt_cfg.revision,
@@ -323,20 +321,9 @@ class ReportUtility:
         stats_dict["machine"] = self._query_gpu_info()
 
         # Retrieve KV cache information.
-        kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
-        if isinstance(kv_cache_config, KvCacheConfig):
-            kv_cache_dtype = kv_cache_config.dtype
-            kv_cache_mem_percent = kv_cache_config.free_gpu_memory_fraction
-        elif isinstance(kv_cache_config, dict):
-            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
-            kv_cache_mem_percent = kv_cache_config.get(
-                "free_gpu_memory_fraction")
-        else:
-            raise ValueError(
-                f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
-
-        kv_cache_mem_percent = kv_cache_mem_percent \
-            if kv_cache_mem_percent is not None else None
+        kv_cache_config = self.llm_args.kv_cache_config
+        kv_cache_dtype = kv_cache_config.dtype
+        kv_cache_mem_percent = kv_cache_config.free_gpu_memory_fraction
 
         # Engine/Backend details
         if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
@@ -364,7 +351,7 @@ class ReportUtility:
             from tensorrt_llm._torch.model_config import ModelConfig
             from tensorrt_llm._utils import torch_dtype_to_str
 
-            model = self.rt_cfg.model_path or self.rt_cfg.model
+            model = self.rt_cfg.model_path or self.llm_args.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
 
@@ -384,16 +371,26 @@ class ReportUtility:
             }
 
         # World and runtime info
+        world_size = self.llm_args.tensor_parallel_size * self.llm_args.pipeline_parallel_size
         stats_dict["world_info"] = {
-            "tp_size": self.rt_cfg.mapping["tp_size"],
-            "pp_size": self.rt_cfg.mapping["pp_size"],
-            "ep_size": self.rt_cfg.mapping["moe_ep_size"],
-            "world_size": self.rt_cfg.mapping["world_size"],
-            "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
-            "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
-            "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
-            "kv_cache_percentage": kv_cache_mem_percent,
-            "issue_rate": self.convert_rate_to_s(self.statistics.issue_rate_ns)
+            "tp_size":
+            self.llm_args.tensor_parallel_size,
+            "pp_size":
+            self.llm_args.pipeline_parallel_size,
+            "ep_size":
+            self.llm_args.moe_expert_parallel_size,
+            "world_size":
+            world_size,
+            "max_batch_size":
+            self.llm_args.max_batch_size,
+            "max_num_tokens":
+            self.llm_args.max_num_tokens,
+            "scheduling_policy":
+            self.llm_args.scheduler_config.capacity_scheduler_policy.value,
+            "kv_cache_percentage":
+            kv_cache_mem_percent,
+            "issue_rate":
+            self.convert_rate_to_s(self.statistics.issue_rate_ns)
         }
 
         # Request details
@@ -429,7 +426,7 @@ class ReportUtility:
             self.per_user_output_throughput_tok_s,
             # Output throughput per GPU (total throughput / world size)
             "output_throughput_per_gpu_tok_s":
-            self.output_throughput_tok_s / self.rt_cfg.mapping["world_size"],
+            self.output_throughput_tok_s / world_size,
             # Request latency percentiles
             "request_latency_percentiles_ms":
             self.statistics.request_latency_percentiles.model_dump(
@@ -481,17 +478,16 @@ class ReportUtility:
             }
 
         spec_decoding, decoding_mode = False, None
-        if (self.rt_cfg.decoding_config
-                and self.rt_cfg.decoding_config.decoding_mode
+        if (self.llm_args.decoding_config
+                and self.llm_args.decoding_config.decoding_mode
                 != SpeculativeDecodingMode.NONE):
             # cpp decoding
             spec_decoding = True
             decoding_mode = self.rt_cfg.decoding_config.decoding_mode.values[1]
-        elif ("speculative_config" in self.kwargs
-              and self.kwargs["speculative_config"] is not None):
+        elif (self.llm_args.speculative_config is not None):
             # pytorch speculative decoding
             spec_decoding = True
-            decoding_mode = self.kwargs["speculative_config"].decoding_type
+            decoding_mode = self.llm_args.speculative_config.decoding_type
         if (spec_decoding):
             stats_dict["decoding_stats"] = {
                 "mode":
@@ -741,9 +737,7 @@ class ReportUtility:
 
     def get_max_draft_len(self) -> int:
         """Get max_draft_len from speculative_config."""
-        # Try to get from speculative_config
-        if ("speculative_config" in self.kwargs
-                and self.kwargs["speculative_config"] is not None):
-            return self.kwargs["speculative_config"].max_draft_len or 0
+        if self.llm_args.speculative_config is not None:
+            return self.llm_args.speculative_config.max_draft_len or 0
 
         return 0

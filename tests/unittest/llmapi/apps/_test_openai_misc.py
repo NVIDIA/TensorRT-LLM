@@ -10,7 +10,7 @@ from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["tensorrt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -20,7 +20,7 @@ def model_name(backend):
     # Note: TRT backend does not support Qwen3-0.6B-Base,
     # and PyTorch backend does not support going over the limit of "max_position_embeddings" tokens
     # of TinyLlama.
-    if backend == "trt":
+    if backend == "tensorrt":
         return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
     else:
         return "Qwen3/Qwen3-0.6B-Base"
