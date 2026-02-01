@@ -82,6 +82,8 @@ class DisaggServerConfig():
     node_id: int = uuid.getnode(
     ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
     # If this causes collisions, users can set node_id manually within range [0, 1023] in config
+    schedule_style: Literal['context_first',
+                            'generation_first'] = 'context_first'
 
 
 @dataclass
