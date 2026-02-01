@@ -21,7 +21,9 @@ from test_common.llm_data import with_mocked_hf_download
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 
-@pytest.mark.skip_less_device_memory(40000)
+@pytest.mark.skip(
+    reason="OOM on A30 GPUs on CI - speculative model loading does not support model_kwargs reduction"
+)
 @pytest.mark.parametrize("use_hf_speculative_model", [False])
 @with_mocked_hf_download
 def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
