@@ -2626,10 +2626,12 @@ class PyTorchModelEngine(ModelEngine):
             # `_create_dummy_context_requests` from `kv_cache_creater` makes an exception that I can not add multimodal_data to the dummy_request
             # so that we only replace position_ids with mrope_position_ids when it is not a dummy request and for models who is using mrope.
             mrope_position_ids = torch.cat(mrope_position_ids, dim=-1)
+            total_num_mtokens = mrope_position_ids.shape[-1]
+            # assert mrope_position_ids.shape[-1] >= total_num_tokens
             if mrope_position_ids.device.type == "cpu":
                 mrope_position_ids = mrope_position_ids.pin_memory()
-            self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
-                mrope_position_ids[:, :, :total_num_tokens], non_blocking=True)
+            self.mrope_position_ids_cuda[:, :, :total_num_mtokens].copy_(
+                mrope_position_ids[:, :, :total_num_mtokens], non_blocking=True)
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
         else:
