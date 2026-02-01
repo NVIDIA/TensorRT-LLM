@@ -1,5 +1,5 @@
 import concurrent
-import datetime
+import os
 import queue
 import threading
 import weakref
@@ -47,6 +47,10 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
+
+# Environment variable to control the number of threads for task queue processing
+# Default is 1 (single-threaded, original behavior)
+KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
 
 @dataclass
@@ -509,13 +513,23 @@ class Sender:
 
         self._dealers = {}
         self._tx_sessions = {}  # unique_rid -> TxSession
+        self._sessions_lock = threading.Lock()  # Protects _tx_sessions access
         logger.info(f" Sender init end with endpoint: {self._messenger.endpoint}")
         self._closed = False
         self._instance_rank = self._kv_map._ri.instance_rank
 
-        self._send_task_queue = queue.Queue()
-        self._background_thread = threading.Thread(target=self._process_task_queue, daemon=True)
-        self._background_thread.start()
+        # Multi-threaded task queue support
+        self._num_threads = KV_TRANSFER_NUM_THREADS
+        self._send_task_queues: List[queue.Queue] = [
+            queue.Queue() for _ in range(self._num_threads)
+        ]
+        self._worker_threads: List[threading.Thread] = [
+            threading.Thread(target=self._process_task_queue, args=(i,), daemon=True)
+            for i in range(self._num_threads)
+        ]
+        for t in self._worker_threads:
+            t.start()
+        logger.info(f"Sender started with {self._num_threads} worker thread(s)")
 
     @property
     def endpoint(self):
@@ -523,7 +537,8 @@ class Sender:
 
     def setup_session(self, tx_session: TxSessionBase):
         unique_rid = tx_session._base_args.params.disagg_request_id
-        self._tx_sessions[unique_rid] = weakref.ref(tx_session)
+        with self._sessions_lock:
+            self._tx_sessions[unique_rid] = weakref.ref(tx_session)
 
         req_info = self._peer_reqs.get_first_req_info(unique_rid)
 
@@ -550,15 +565,26 @@ class Sender:
         return session
 
     def submit_task(self, agent_args: WriteMeta):
-        self._send_task_queue.put(agent_args)
+        # Distribute tasks to threads by unique_rid to ensure same session's tasks
+        # are processed by the same thread in order
+        thread_idx = agent_args.unique_rid % self._num_threads
+        self._send_task_queues[thread_idx].put(agent_args)
 
-    def _process_task_queue(self):
+    def _process_task_queue(self, thread_idx: int):
+        """Process tasks from the queue assigned to this thread.
+
+        Args:
+            thread_idx: Index of the worker thread (0 to num_threads-1)
+        """
+        task_queue = self._send_task_queues[thread_idx]
         while True:
-            agent_args = self._send_task_queue.get()
+            agent_args = task_queue.get()
             if agent_args is None:
                 break
             if agent_args.is_only_aux:
-                logger.debug(f"_process_task_queue: delivering aux task to agent: {agent_args}")
+                logger.debug(
+                    f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {agent_args}"
+                )
                 self._deliver_aux_to_agent(agent_args)
             else:
                 self._deliver_kv_to_agent(agent_args)
@@ -786,18 +812,14 @@ class Sender:
         # 3. the tx_session send is called after getting some req_infos and before getting the other req_infos.
         # response_with_kv and function tx_session send both may trigger the submit task,
         # use session.lock to serialize the submit task in both functions to avoid duplication.
+        # use self._sessions_lock to ensure the session will not be inserted between
+        # self._save_peer_req_info and get_tx_session
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
-        if perf_log_manager.enabled:
-            now = datetime.datetime.now()
-            ts = now.strftime("%H:%M:%S") + f".{now.microsecond // 1000:03d}"
-            logger.info(
-                f"[RECV_REQ] rid={info.unique_rid}, self={self._instance_rank}, "
-                f"peer={info.instance_rank}, ts={ts}"
-            )
-        session = self._get_tx_session(info.unique_rid)
-        if session is None:
-            self._save_peer_req_info(info)
-            return
+        with self._sessions_lock:
+            session = self._get_tx_session(info.unique_rid)
+            if session is None:
+                self._save_peer_req_info(info)
+                return
         with session._lock:
             self._save_peer_req_info(info)
 
@@ -831,16 +853,29 @@ class Sender:
                 if session.state.status == SessionStatus.INIT:
                     session.state.status = SessionStatus.READY
 
+    def clear_session(self, unique_rid: int):
+        """Clear session-related resources from Sender.
+
+        Args:
+            unique_rid: The unique request ID of the session to clear
+        """
+        with self._sessions_lock:
+            if unique_rid in self._tx_sessions:
+                del self._tx_sessions[unique_rid]
+        self._peer_reqs.remove_req_info(unique_rid)
+
     def shutdown(self):
         if self._closed:
             return
         self._closed = True
 
-        # Stop the _process_task_queue thread if it exists
-        if hasattr(self, "_send_task_queue"):
-            self._send_task_queue.put(None)
-            if hasattr(self, "_background_thread"):
-                self._background_thread.join(timeout=5)
+        # Stop all worker threads by sending None to each queue
+        if hasattr(self, "_send_task_queues"):
+            for q in self._send_task_queues:
+                q.put(None)
+            if hasattr(self, "_worker_threads"):
+                for t in self._worker_threads:
+                    t.join(timeout=5)
 
         self._messenger.stop()
 
@@ -908,6 +943,10 @@ class TxSession(TxSessionBase):
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        # Clear session resources from Sender
+        if self._sender is not None:
+            unique_rid = self._base_args.params.disagg_request_id
+            self._sender.clear_session(unique_rid)
         self._kv_tasks = None
         self._aux_task = None
         self._sender = None
@@ -1041,6 +1080,15 @@ class Receiver:
         self._closed = True
         self._messenger.stop()
 
+    def clear_session(self, unique_rid: int):
+        """Clear session-related resources from Receiver.
+
+        Args:
+            unique_rid: The unique request ID of the session to clear
+        """
+        if unique_rid in self._rx_sessions:
+            del self._rx_sessions[unique_rid]
+
     def setup_session(self, rx_session: RxSessionBase):
         self._rx_sessions[rx_session._base_args.params.disagg_request_id] = weakref.ref(rx_session)
 
@@ -1067,13 +1115,6 @@ class Receiver:
         session = self._get_rx_session(agent_args.unique_rid)
         session._kv_tasks[agent_args.slice_id].status = TaskStatus.TRANSFERRING
         for rank in agent_args.target_ranks:
-            if perf_log_manager.enabled:
-                now = datetime.datetime.now()
-                ts = now.strftime("%H:%M:%S") + f".{now.microsecond // 1000:03d}"
-                logger.info(
-                    f"[SEND_REQ] rid={receiver_req.unique_rid}, self={self._kv_map._ri.instance_rank}, "
-                    f"peer={rank}, ts={ts}"
-                )
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
             self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req)
@@ -1257,6 +1298,10 @@ class RxSession(RxSessionBase):
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        # Clear session resources from Receiver
+        if self._receiver is not None:
+            unique_rid = self._base_args.params.disagg_request_id
+            self._receiver.clear_session(unique_rid)
         self._receiver = None
         self._kv_tasks = None
         self._last_slice_counts = 0
