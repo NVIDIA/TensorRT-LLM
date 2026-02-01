@@ -87,7 +87,7 @@ def run_with_autodeploy(model, speculative_config, batch_size):
 
     # Configure KV cache
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.01,
+        free_gpu_memory_fraction=0.6,
     )
 
     # Configure AutoDeploy LLM arguments
@@ -227,7 +227,7 @@ def test_autodeploy_eagle3_acceptance_rate():
 
     # Configure KV cache
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.01,
+        free_gpu_memory_fraction=0.6,
     )
 
     # Create AutoDeploy LLM with Eagle3 speculative decoding

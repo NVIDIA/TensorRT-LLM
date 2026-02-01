@@ -87,7 +87,7 @@ class TestOutOfTree:
                             match=".*Executor worker returned error.*")) as ctx:
             with LLM(
                     model=str(model_dir),
-                    kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.2),
+                    kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
                     max_num_tokens=max_num_tokens,
             ) as llm:
                 outputs = llm.generate(prompts, sampling_params=sampling_params)

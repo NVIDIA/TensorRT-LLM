@@ -56,7 +56,7 @@ def test_placement_env_vars(setup_ray_cluster, monkeypatch):
         )(LLM).remote(
             model=os.path.join(llm_models_root(), "llama-models-v2",
                                "TinyLlama-1.1B-Chat-v1.0"),
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
             tensor_parallel_size=2,
             orchestrator_type="ray",
         )
@@ -95,7 +95,7 @@ def test_placement_api(setup_ray_cluster, monkeypatch, n_gpus, bundle_indices):
         llm = LLM(
             model=os.path.join(llm_models_root(), "llama-models-v2",
                                "TinyLlama-1.1B-Chat-v1.0"),
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
             tensor_parallel_size=tp_size,
             orchestrator_type="ray",
             ray_placement_config=RayPlacementConfig(

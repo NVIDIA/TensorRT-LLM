@@ -18,7 +18,7 @@ def main():
     )
     args = parser.parse_args()
     # Configure KV cache memory usage fraction.
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                     max_tokens=4096,
                                     enable_block_reuse=True)
 

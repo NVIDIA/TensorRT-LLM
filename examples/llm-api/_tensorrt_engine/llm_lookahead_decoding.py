@@ -15,7 +15,7 @@ def main():
                                                max_ngram_size=4,
                                                max_verification_set_size=4)
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               kv_cache_config=kv_cache_config,
               build_config=build_config,

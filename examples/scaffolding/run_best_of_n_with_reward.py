@@ -32,13 +32,13 @@ def main():
         backend="pytorch",
         max_batch_size=args.sample_num,
         max_num_tokens=8192,
-        kv_cache_free_gpu_memory_fraction=0.1)
+        kv_cache_free_gpu_memory_fraction=0.6)
     reward_worker = TRTLLMWorker.init_with_new_llm(
         args.reward_model,
         backend="pytorch",
         max_batch_size=args.sample_num,
         max_num_tokens=8192,
-        kv_cache_free_gpu_memory_fraction=0.2,
+        kv_cache_free_gpu_memory_fraction=0.6,
         disable_overlap_scheduler=True)
     workers[NativeGenerationController.WorkerTag.GENERATION] = gen_worker
     workers[PRMController.WorkerTag.REWARD] = reward_worker

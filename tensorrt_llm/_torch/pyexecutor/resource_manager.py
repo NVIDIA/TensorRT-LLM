@@ -266,6 +266,24 @@ class KVCacheManager(BaseResourceManager):
         # Determine if this is VSWA (Variable Sliding Window Attention)
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
+        self.blocks_in_primary_pool = int(kv_cache_config.max_tokens //
+                                          tokens_per_block)
+
+        host_cache_size = kv_cache_config.host_cache_size if kv_cache_config.host_cache_size else 0
+        max_tokens_secondary = host_cache_size // self.get_cache_bytes_per_token(
+        )
+        self.blocks_in_secondary_pool = int(max_tokens_secondary //
+                                            tokens_per_block)
+
+        blocks_per_window = {
+            window_size:
+            (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
+            for window_size in set(self.max_attention_window_vec)
+        }
+        logger.info(
+            f"[kv cache manager] Primary/secondary blocks for window sizes set to {blocks_per_window} for estimation dry run"
+        )
+
         # Calculate kv cache blocks for each window size
         # FIXME: flashinfer.py accesses kv_cache_manager.blocks_in_primary_pool
         # This dependency should be adjusted as it only covers the single window

@@ -111,7 +111,7 @@ def test_llm_draft_target_model_1gpu(batch_size, data_type, draft_len,
         f"--tokenizer_dir={draft_target_model_roots[1]}",
         "--max_output_len=64",
         "--kv_cache_enable_block_reuse",
-        "--kv_cache_free_gpu_memory_fraction=0.25",
+        "--kv_cache_free_gpu_memory_fraction=0.6",
     ]
     if streaming:
         common_run_cmd.extend(["--streaming", "--streaming_interval=1"])
@@ -225,7 +225,7 @@ def test_llm_draft_target_llama_1gpu(llama_example_root, llm_venv, cmodel_dir,
         f"--engine_dir={target_engine_dir}",
         "--draft_target_model_config=[4,[0],[0],True]", "--max_output_len=256",
         "--kv_cache_enable_block_reuse",
-        "--kv_cache_free_gpu_memory_fraction=0.4",
+        "--kv_cache_free_gpu_memory_fraction=0.6",
         f"--input_text='how does draft-sampling work'"
     ]
 
@@ -325,7 +325,7 @@ def test_llm_draft_target_llama_fp8_2gpu(llama_example_root, llm_venv,
         "--draft_target_model_config=[3,[0,1],[0,1],False]",
         "--max_output_len=800",
         "--kv_cache_enable_block_reuse",
-        "--kv_cache_free_gpu_memory_fraction=0.3",
+        "--kv_cache_free_gpu_memory_fraction=0.6",
         "--run_profiling",
     ]
 

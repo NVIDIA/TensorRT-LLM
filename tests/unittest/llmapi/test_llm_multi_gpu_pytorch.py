@@ -17,7 +17,7 @@ from .test_llm import (_test_llm_capture_request_error, llama_model_path,
                        tinyllama_logits_processor_test_harness)
 from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
 
-global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
 
 @pytest.mark.gpu2
@@ -79,7 +79,7 @@ def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1(
 @pytest.mark.gpu2
 def test_llm_rpc_tp2():
     with LLM(model=llama_model_path,
-             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
              orchestrator_type="rpc",
              tensor_parallel_size=2) as llm:
         assert isinstance(llm._executor, GenerationExecutorRpcProxy)
@@ -98,7 +98,7 @@ def test_llm_rpc_tp2():
 @pytest.mark.asyncio
 async def test_llm_rpc_streaming_tp2():
     with LLM(model=llama_model_path,
-             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
              orchestrator_type="rpc",
              tensor_parallel_size=2) as llm:
         assert isinstance(llm._executor, GenerationExecutorRpcProxy)

@@ -703,7 +703,7 @@ class TestResourceManager(unittest.TestCase):
 
     def test_kv_cache_reset_reuse_state(self):
 
-        global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                               event_buffer_max_size=1024,
                                               enable_block_reuse=True,
                                               onboard_blocks=True,
@@ -772,7 +772,7 @@ class TestResourceManager(unittest.TestCase):
         execution_stream = torch.cuda.Stream()
 
         kv_cache_config = KvCacheConfig(
-            free_gpu_memory_fraction=0.1,
+            free_gpu_memory_fraction=0.7,
             max_tokens=256,
         )
 
@@ -805,7 +805,7 @@ class TestResourceManager(unittest.TestCase):
         This verifies backward compatibility.
         """
         kv_cache_config = KvCacheConfig(
-            free_gpu_memory_fraction=0.1,
+            free_gpu_memory_fraction=0.7,
             max_tokens=256,
         )
 

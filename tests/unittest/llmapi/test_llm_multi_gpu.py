@@ -39,12 +39,12 @@ from utils.util import (skip_gpu_memory_less_than, skip_single_gpu, skip_ray,
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 # shrink the kv_cache_config to avoid OOM in CI
-global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
 # python api does not seem to support extra tokens needed for prompt tuning + reuse.
 # disable block reuse for those tests.
 # TODO: Add extra tokens to prompt tuning unit tests.
-global_kv_cache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
+global_kv_cache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                                 enable_block_reuse=False)
 
 

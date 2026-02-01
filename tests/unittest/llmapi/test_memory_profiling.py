@@ -92,7 +92,7 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
     MODEL_PATH = get_model_path(MODEL)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    free_gpu_memory_fraction=0.5)
+                                    free_gpu_memory_fraction=0.6)
 
     build_config = BuildConfig(max_beam_width=1, max_num_tokens=4096)
     scheduler_config = SchedulerConfig(

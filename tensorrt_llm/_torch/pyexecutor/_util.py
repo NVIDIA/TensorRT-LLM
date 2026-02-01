@@ -119,7 +119,7 @@ class KvCacheCreator:
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
-        available_kv_mem = total_gpu_memory * fraction - peak_memory
+        available_kv_mem = (total_gpu_memory - peak_memory) * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
@@ -230,8 +230,8 @@ class KvCacheCreator:
         return kv_cache_manager
 
     def build_managers(self, resources: Dict) -> None:
-        self.configure_kv_cache_capacity()
         """Construct KV caches for model and draft model (if applicable)."""
+        self.configure_kv_cache_capacity()
         kv_cache_manager = self._create_kv_cache_manager(self._model_engine, )
 
         if self._kv_connector_manager is not None and self._draft_model_engine is not None:

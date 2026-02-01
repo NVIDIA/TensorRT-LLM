@@ -1220,7 +1220,7 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.1,
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                     max_tokens=1000,
                                     enable_block_reuse=False)
     llm = LLM(

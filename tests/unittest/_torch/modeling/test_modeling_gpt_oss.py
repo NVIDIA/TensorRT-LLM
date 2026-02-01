@@ -85,7 +85,7 @@ def test_gpt_oss_trtllmgen(moe_backend):
               moe_tensor_parallel_size=-1,
               enable_attention_dp=False,
               kv_cache_config=KvCacheConfig(enable_block_reuse=False,
-                                            free_gpu_memory_fraction=0.4))
+                                            free_gpu_memory_fraction=0.7))
 
     sampling_params = SamplingParams(max_tokens=20)
     llm.generate(prompts, sampling_params)

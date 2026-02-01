@@ -21,7 +21,7 @@ class TestLlmDefaultBackend:
         # Keep the complete example code here
         from tensorrt_llm.llmapi import LLM, KvCacheConfig, TorchLlmArgs
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         llm = LLM(model=model_path, kv_cache_config=kv_cache_config)
 
         # The default backend should be PyTorch
@@ -36,7 +36,7 @@ class TestLlmDefaultBackend:
         from tensorrt_llm._tensorrt_engine import LLM
         from tensorrt_llm.llmapi import KvCacheConfig, TrtLlmArgs
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
         llm = LLM(model=model_path, kv_cache_config=kv_cache_config)
 

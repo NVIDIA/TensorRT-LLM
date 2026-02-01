@@ -17,7 +17,7 @@ from tensorrt_llm.llmapi.llm_args import *
 
 
 def test_ModelLoader():
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
     # Test with HF model
     temp_dir = tempfile.TemporaryDirectory()
@@ -43,7 +43,7 @@ def test_CachedModelLoader():
     # CachedModelLoader enables engine caching and multi-gpu building
     args = TrtLlmArgs(
         model=llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
         enable_build_cache=True)
     stats = LlmBuildStats()
     model_loader = CachedModelLoader(args, llm_build_stats=stats)

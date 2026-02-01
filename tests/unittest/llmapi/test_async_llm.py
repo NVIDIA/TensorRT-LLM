@@ -115,7 +115,7 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
             model=os.path.join(
                 str(llm_models_root()), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"
             ),
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
             tensor_parallel_size=tp_size,
             placement_groups=[pg],
             placement_bundle_indices=[bundle_indices],

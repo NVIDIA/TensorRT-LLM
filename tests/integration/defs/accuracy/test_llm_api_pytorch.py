@@ -427,7 +427,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             CudaGraphConfig(batch_sizes=[1, 32, 64], enable_padding=True)
         }
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.5)
+                                        free_gpu_memory_fraction=0.7)
         spec_config = AutoDecodingConfig()
         with LLM(model=self.MODEL_PATH,
                  **pytorch_config,
@@ -469,7 +469,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         with LLM(
                 model=self.MODEL_PATH,
-                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
+                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
                 max_batch_size=max_beam_width,
                 max_seq_len=2048,
                 max_beam_width=max_beam_width,
@@ -514,7 +514,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         llm = LLM(
             model=model_path,
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
             max_batch_size=max_beam_width,
             max_seq_len=2048,
             max_beam_width=max_beam_width,
@@ -656,7 +656,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     def test_fp8_tp4(self, torch_compile):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         with LLM(model_path,
                  tensor_parallel_size=4,
@@ -683,7 +683,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     def test_nvfp4_tp4(self, torch_compile):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         with LLM(model_path,
                  tensor_parallel_size=4,
@@ -710,7 +710,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     def test_fp4_tp2pp2(self, enable_gemm_allreduce_fusion, torch_compile):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
 
         with (mock.patch.dict(
@@ -1052,7 +1052,7 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             enable_partial_reuse=False,
-            free_gpu_memory_fraction=0.5,
+            free_gpu_memory_fraction=0.7,
         )
         # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
         # So, testing with it here.
@@ -1179,7 +1179,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             enable_block_reuse=False,
             enable_partial_reuse=False,
             max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
+            free_gpu_memory_fraction=0.6,
         )
 
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
@@ -1256,7 +1256,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             enable_block_reuse=True,
             enable_partial_reuse=False,
             max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
+            free_gpu_memory_fraction=0.6,
         )
 
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
@@ -1271,7 +1271,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             enable_block_reuse=True,
             enable_partial_reuse=True,
             max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
+            free_gpu_memory_fraction=0.6,
         )
 
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
@@ -1399,7 +1399,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
@@ -4178,7 +4178,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         enable_block_reuse=not eagle3)
         spec_config = None
         if eagle3:
@@ -4226,7 +4226,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         enable_block_reuse=not eagle3)
         spec_config = None
         if eagle3:
@@ -4482,7 +4482,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype)
 
         llm = LLM(self.MODEL_PATH,
@@ -4660,7 +4660,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           {"scores_filter": "exact_match,flexible-extract"})
         monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype)
 
         llm = LLM(self.MODEL_PATH,
@@ -4702,7 +4702,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype)
 
         llm = LLM(self.MODEL_PATH,
@@ -4740,7 +4740,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto")
 
         llm = LLM("./nvfp4ckpt",
@@ -4858,7 +4858,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
@@ -4922,7 +4922,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto",
                                         enable_block_reuse=True,
                                         max_attention_window=[128, 32768])
@@ -4988,7 +4988,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
@@ -5044,7 +5044,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             max_batch_size=8,
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
@@ -5112,7 +5112,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype)
 
         # Configure online expert parallel load balancer
@@ -5160,7 +5160,7 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.skip_less_device(4)
     def test_auto_dtype_tp4(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
         with LLM(self.MODEL_PATH,
                  max_num_tokens=16384,
@@ -5326,7 +5326,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             pytest.skip(f"Model directory {model_dir} does not exist")
 
         # Configure model settings
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         enable_block_reuse=True,
                                         enable_partial_reuse=False,
                                         dtype="fp8")
@@ -5527,7 +5527,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         enable_block_reuse=not eagle3)
         spec_config = None
         if eagle3:
@@ -5578,7 +5578,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         enable_block_reuse=not eagle3)
         spec_config = None
         if eagle3:
@@ -5716,7 +5716,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
-                    free_gpu_memory_fraction=0.5,
+                    free_gpu_memory_fraction=0.7,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=4,
@@ -5758,7 +5758,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
-                    free_gpu_memory_fraction=0.5,
+                    free_gpu_memory_fraction=0.7,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=8,
@@ -5793,7 +5793,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
-                    free_gpu_memory_fraction=0.5,
+                    free_gpu_memory_fraction=0.7,
                 ),
                 max_batch_size=128,
                 tensor_parallel_size=8,

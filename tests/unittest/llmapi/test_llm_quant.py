@@ -69,7 +69,7 @@ def test_llm_fp8_quantization_modelOpt_ckpt():
     llama_fp8_model_path = get_model_path(
         "llama-3.1-model/Llama-3.1-8B-Instruct-FP8")
     llm = LLM(llama_fp8_model_path,
-              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7))
     sampling_params = SamplingParams(max_tokens=6)
     for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)

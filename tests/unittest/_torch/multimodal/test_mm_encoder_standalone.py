@@ -115,7 +115,7 @@ def pd_disagg(request) -> bool:
 def llms(model_dir: Path,
          pd_disagg: bool) -> Generator[tuple[LLM, LLM | None], None, None]:
     """Get LLM for prefill and, if disagg, separate LLM for decode."""
-    free_gpu_memory_fraction = 0.2
+    free_gpu_memory_fraction = 0.3
     disable_overlap_scheduler = pd_disagg
     cache_transceiver_cfg = CacheTransceiverConfig(
         backend="DEFAULT") if pd_disagg else None
@@ -132,6 +132,12 @@ def llms(model_dir: Path,
         cache_transceiver_config=cache_transceiver_cfg,
         disable_overlap_scheduler=disable_overlap_scheduler,
         max_batch_size=1,  # fix batch size to reduce non-determinism in tests
+    )
+
+    free_gpu_memory_fraction = 0.8
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,  # Disable for output 1:1 matching check
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
     )
     with llm:
         if pd_disagg:
@@ -186,6 +192,10 @@ def test_single_image_chat(
     results to standard llm generation (pass raw image) by comparing outputs.
     """
     llm, llm_decode = llms
+
+    print(f"====================================== test starts to print stack")
+    import traceback
+    traceback.print_stack()
 
     # Test configuration
     max_tokens = 64

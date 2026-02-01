@@ -25,11 +25,11 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
         llm = TorchLLM(
             model_dir,
             tensor_parallel_size=tp_size,
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7))
     else:
         llm = LLM(model_dir,
                   tensor_parallel_size=tp_size,
-                  kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+                  kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7))
 
     if engine_dir is not None and os.path.abspath(
             engine_dir) != os.path.abspath(model_dir):

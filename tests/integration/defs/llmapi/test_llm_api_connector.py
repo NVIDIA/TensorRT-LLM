@@ -49,7 +49,7 @@ def model_with_connector():
                 "backend": "pytorch",
                 "kv_connector_config": kv_connector_config,
                 "cuda_graph_config": None,
-                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1)
+                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.7)
             }
 
             return LLM(*args, **{**default_kwargs, **kwargs})

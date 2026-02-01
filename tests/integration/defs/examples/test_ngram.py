@@ -96,7 +96,7 @@ def test_llm_ngram_1gpu(batch_size, data_type, max_draft_len,
         f"--tokenizer_dir={ngram_root}",
         f"--max_output_len=64",
         f"--kv_cache_enable_block_reuse",
-        f"--kv_cache_free_gpu_memory_fraction=0.25",
+        f"--kv_cache_free_gpu_memory_fraction=0.6",
     ]
     if streaming:
         common_run_cmd.extend(["--streaming", "--streaming_interval=1"])
@@ -157,7 +157,7 @@ def test_llm_ngram_1gpu(batch_size, data_type, max_draft_len,
         "--kv_cache_enable_block_reuse",
         f"--ngram_config={ngram_config}",
         "--tensorrt_llm_rouge1_threshold=20",
-        f"--kv_cache_free_gpu_memory_fraction=0.25",
+        f"--kv_cache_free_gpu_memory_fraction=0.6",
     ]
 
     venv_check_call(llm_venv, run_cmd)

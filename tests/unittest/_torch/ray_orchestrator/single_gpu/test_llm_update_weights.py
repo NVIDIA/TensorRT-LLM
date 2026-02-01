@@ -132,6 +132,7 @@ def run_generate(
 )
 def test_llm_update_weights(model_dir):
     model_dir = str(llm_models_root() / model_dir)
+<<<<<<< HEAD
     num_hidden_layers = 1
     hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
@@ -145,6 +146,22 @@ def test_llm_update_weights(model_dir):
         kv_cache_config=kv_cache_config,
         model_kwargs={"num_hidden_layers": num_hidden_layers},
     )
+=======
+    with TemporaryDirectory() as tmp_model_dir:
+        num_hidden_layers = 1
+        process_and_copy_folder(model_dir, tmp_model_dir, num_hidden_layers=num_hidden_layers)
+        hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.6)
+        llm = LLM(
+            model=tmp_model_dir,
+            ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+            tensor_parallel_size=1,
+            load_format="dummy",
+            pipeline_parallel_size=1,
+            kv_cache_config=kv_cache_config,
+        )
+>>>>>>> d5bab4f6d (Change fraction value in test cases)
 
     # Generate texts from the prompts.
     prompts_texts = [
@@ -180,10 +197,12 @@ def test_llm_update_weights(model_dir):
 )
 def test_llm_partial_update_weights(model_dir):
     model_dir = str(llm_models_root() / model_dir)
-    num_hidden_layers = 1
-    hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+    with TemporaryDirectory() as tmp_model_dir:
+        num_hidden_layers = 1
+        process_and_copy_folder(model_dir, tmp_model_dir, num_hidden_layers=num_hidden_layers)
+        hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.6)
 
     llm = LLM(
         model=model_dir,

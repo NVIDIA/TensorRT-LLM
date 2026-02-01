@@ -169,12 +169,12 @@ alpaca_chinese_path = str(llm_models_root() / "datasets" / "silk-road" /
                           "alpaca-data-gpt4-chinese")
 
 prompts = ["A B C"]
-global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
 # python api does not seem to support extra tokens needed for prompt tuning + reuse.
 # disable block reuse for those tests.
 # TODO: Add extra tokens to prompt tuning unit tests.
-global_kvcache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
+global_kvcache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                                enable_block_reuse=False)
 
 
@@ -1036,7 +1036,7 @@ def test_generate_with_embedding_bias():
         llama_model_path,
         prompts, ["Z Z Z Z Z Z"],
         sampling_params=sampling_params,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7))
 
 
 @force_ampere
@@ -1153,7 +1153,7 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
         llama_model_path,
         prompts, ["Z Z Z Z Z Z"],
         sampling_params=sampling_params,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
         backend=backend,
         **llm_kwargs)
 
@@ -1189,7 +1189,7 @@ def tinyllama_logits_processor_batched_test_harness(**llm_kwargs):
         llama_model_path,
         prompts, ["Z Z Z Z Z Z"],
         sampling_params=sampling_params,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
         batched_logits_processor=MyBatchedLogitsProcessor(biased_word_id),
         **llm_kwargs)
 
@@ -1629,7 +1629,7 @@ def test_generate_block_reuse():
     build_config.plugin_config._use_paged_context_fmha = True
     build_config.plugin_config._paged_kv_cache = True
     llm = LLM(model=llama_model_path,
-              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7,
                                             enable_block_reuse=True),
               build_config=build_config,
               fast_build=True)
@@ -1738,7 +1738,7 @@ def check_llm_return_context_logits(tp_size=1):
     llm = LLM(
         llama_model_path,
         tensor_parallel_size=tp_size,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
         build_config=build_config,
         fast_build=True,
     )
@@ -1761,7 +1761,7 @@ def check_llm_return_generation_logits(tp_size=1):
     llm = LLM(
         llama_model_path,
         tensor_parallel_size=tp_size,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
         gather_generation_logits=True,
         fast_build=True,
     )
@@ -1811,7 +1811,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
 
     llm = LLM_CLASS(
         llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7,
                                       **kv_cache_args_extra),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,

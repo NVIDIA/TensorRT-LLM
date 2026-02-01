@@ -116,7 +116,7 @@ class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
         stop="<|endoftext|>",
     )
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
 
     def test_auto_dtype(self):
         with LLM(
@@ -141,7 +141,7 @@ class TestNVILA_8B(LlmapiAccuracyTestHarness):
     )
 
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.6,
+        free_gpu_memory_fraction=0.8,
         # NOTE: VILA models do not support block reuse.
         enable_block_reuse=False,
     )
@@ -169,7 +169,7 @@ class TestVILA1_5_3B(LlmapiAccuracyTestHarness):
     )
 
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.6,
+        free_gpu_memory_fraction=0.8,
         # NOTE: VILA models do not support block reuse.
         enable_block_reuse=False,
     )
@@ -256,7 +256,7 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=False,
         enable_partial_reuse=False,
-        free_gpu_memory_fraction=0.4,
+        free_gpu_memory_fraction=0.8,
         dtype="fp8",
     )
 
@@ -402,7 +402,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend=moe_backend),
         )
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
 
         with LLM(
             self.MODEL_PATH,
