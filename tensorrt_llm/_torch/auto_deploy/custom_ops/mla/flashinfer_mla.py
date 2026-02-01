@@ -110,27 +110,12 @@ class _FlashInferMLAPlanner:
     def _init_decode_wrapper(
         self,
         use_cuda_graph: bool = False,
-        qo_indptr: Optional[torch.Tensor] = None,
-        kv_indptr: Optional[torch.Tensor] = None,
-        kv_indices: Optional[torch.Tensor] = None,
-        last_page_len: Optional[torch.Tensor] = None,
     ):
         assert self.workspace_buffer is not None
-        if use_cuda_graph:
-            return flashinfer.mla.BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                self.kv_layout,
-                use_cuda_graph=use_cuda_graph,
-                qo_indptr_buf=qo_indptr,
-                kv_indptr_buf=kv_indptr,
-                kv_indices_buf=kv_indices,
-                kv_last_page_len_buf=last_page_len,
-            )
-        else:
-            return flashinfer.mla.BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                use_cuda_graph=use_cuda_graph,
-            )
+        return flashinfer.mla.BatchMLAPagedAttentionWrapper(
+            self.workspace_buffer,
+            use_cuda_graph=use_cuda_graph,
+        )
 
     def reset(self, device: torch.device) -> None:
         self.plan_params_prefill = None
@@ -223,24 +208,17 @@ class _FlashInferMLAPlanner:
                 sm_scale=plan_params.sm_scale,
             )
 
-        # Plan during warm-up of cuda graph capture
+        # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
         if (
             cuda_graph_state.in_warm_up()
             and plan_params not in self.cached_cuda_graph_decode_wrappers
         ):
-            wrapper = self._init_decode_wrapper(
-                use_cuda_graph=True,
-                qo_indptr=torch.arange(
-                    kv_page_indptr.shape[0], device=kv_page_indptr.device, dtype=torch.int32
-                ),
-                kv_indptr=kv_page_indptr,
-                kv_indices=kv_page_indices,
-                last_page_len=kv_last_page_len,
-            )
+            # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
+            wrapper = self._init_decode_wrapper()
             self.cached_cuda_graph_decode_wrappers[plan_params] = wrapper
             _plan_decode(self.cached_cuda_graph_decode_wrappers[plan_params])
 
-        # Return pre-cached decode wrapper during cuda graph capture
+        # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
             return wrapper
@@ -250,6 +228,7 @@ class _FlashInferMLAPlanner:
             _plan_decode(self.decode_wrapper)
             self.plan_params_decode = plan_params
 
+        # return decode wrapper
         return self.decode_wrapper
 
 

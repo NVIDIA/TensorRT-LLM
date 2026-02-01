@@ -162,7 +162,7 @@ transforms:
   insert_cached_mla_attention:
     stage: cache_init
     requires_shape_prop: true
-    backend: torch_mla
+    backend: flashinfer_mla
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm
