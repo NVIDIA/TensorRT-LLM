@@ -35,7 +35,9 @@
 #include <ATen/core/TensorBody.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/list.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 #include <torch/extension.h>
@@ -57,6 +59,8 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
         .def("__call__", &CapacityScheduler::operator(), nb::arg("active_requests"),
             nb::arg("kv_cache_manager") = nullptr, nb::arg("peft_cache_manager") = nullptr,
             nb::arg("cross_kv_cache_manager") = nullptr)
+        .def("set_agent_tree_resort_policy", &CapacityScheduler::setAgentTreeResortPolicy, nb::arg("agent_percentage"),
+            nb::arg("agent_types"), nb::arg("agent_inflight_seq_num"))
         .def("name", [](CapacityScheduler const&) { return CapacityScheduler::name; });
 
     nb::class_<MicroBatchScheduler>(m, MicroBatchScheduler::name)
