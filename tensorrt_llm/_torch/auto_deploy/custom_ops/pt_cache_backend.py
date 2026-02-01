@@ -328,6 +328,20 @@ class PTCacheBackend(CacheBackend):
             f"sequence_length={self._sequence_length.shape}"
         )
 
+        # Pre-allocate GPU work tensors for _fill_block_offsets_from_cache_loc
+        # This avoids creating tensors and H2D transfers every iteration
+        max_total_pages = sequence_info.num_pages
+        self._gpu_page_positions = torch.arange(max_total_pages, dtype=torch.long, device=device)
+        self._gpu_seq_idx = torch.empty(max_total_pages, dtype=torch.long, device=device)
+        self._gpu_page_idx = torch.empty(max_total_pages, dtype=torch.long, device=device)
+        self._gpu_cu_pages = torch.empty(max_batch + 1, dtype=torch.long, device=device)
+        self._gpu_base_offset = torch.empty(max_total_pages, dtype=torch.int32, device=device)
+
+        # Pre-allocate CPU work tensors for _prepare_trtllm_metadata
+        self._cpu_input_seq_lens = torch.empty(max_batch, dtype=torch.int32, pin_memory=True)
+        self._cpu_seq_len_with_cache = torch.empty(max_batch, dtype=torch.int32, pin_memory=True)
+        self._cpu_past_kv_lens = torch.empty(max_batch, dtype=torch.int32, pin_memory=True)
+
     def get_cache(self, cache_name: str, layer_idx: int) -> torch.Tensor:
         """Get cache tensor view for a layer from the unified pool.
 
@@ -708,6 +722,23 @@ class PTCacheBackend(CacheBackend):
             if hasattr(self, "_interleaved_pool_pointers"):
                 self._interleaved_pool_pointers = None
 
+            # Resize GPU work tensors if needed
+            if hasattr(self, "_gpu_page_positions") and new_num_pages > len(
+                self._gpu_page_positions
+            ):
+                self._gpu_page_positions = torch.arange(
+                    new_num_pages, dtype=torch.long, device=self._device
+                )
+                self._gpu_seq_idx = torch.empty(
+                    new_num_pages, dtype=torch.long, device=self._device
+                )
+                self._gpu_page_idx = torch.empty(
+                    new_num_pages, dtype=torch.long, device=self._device
+                )
+                self._gpu_base_offset = torch.empty(
+                    new_num_pages, dtype=torch.int32, device=self._device
+                )
+
             return True
 
         except Exception as e:
@@ -784,10 +815,22 @@ class PTCacheBackend(CacheBackend):
 
             is_capturing = torch.cuda.is_current_stream_capturing()
 
-            # Compute input sequence lengths from cumulative sums (CPU for host tensors)
-            input_seq_lens_host = (cu_seqlen_host[1 : num_seq + 1] - cu_seqlen_host[:num_seq]).int()
-            seq_len_with_cache_slice = seq_len_with_cache_host[:num_seq].int()
-            past_kv_lens = seq_len_with_cache_slice - input_seq_lens_host
+            # Compute input sequence lengths using pre-allocated buffers
+            # input_seq_lens = cu_seqlen[1:num_seq+1] - cu_seqlen[0:num_seq]
+            input_seq_lens_host = self._cpu_input_seq_lens[:num_seq]
+            torch.sub(
+                cu_seqlen_host[1 : num_seq + 1],
+                cu_seqlen_host[:num_seq],
+                out=input_seq_lens_host,
+            )
+
+            # seq_len_with_cache_slice = seq_len_with_cache_host[:num_seq]
+            seq_len_with_cache_slice = self._cpu_seq_len_with_cache[:num_seq]
+            seq_len_with_cache_slice.copy_(seq_len_with_cache_host[:num_seq])
+
+            # past_kv_lens = seq_len_with_cache - input_seq_lens
+            past_kv_lens = self._cpu_past_kv_lens[:num_seq]
+            torch.sub(seq_len_with_cache_slice, input_seq_lens_host, out=past_kv_lens)
 
             # CUDA GRAPH FIX: Set host tensors to max values during capture
             if is_capturing:
@@ -820,13 +863,9 @@ class PTCacheBackend(CacheBackend):
 
             # Device operations
             if not skip_device_ops:
-                # H2D copy for device tensors
-                self._sequence_length[:num_seq].copy_(
-                    seq_len_with_cache_slice.to(self._device), non_blocking=True
-                )
-                self._context_lengths[:num_seq].copy_(
-                    input_seq_lens_host.to(self._device), non_blocking=True
-                )
+                # H2D copy for device tensors (copy_ handles H2D directly, no intermediate)
+                self._sequence_length[:num_seq].copy_(seq_len_with_cache_slice, non_blocking=True)
+                self._context_lengths[:num_seq].copy_(input_seq_lens_host, non_blocking=True)
 
                 # Fill block offsets (optimized GPU version)
                 self._fill_block_offsets_from_cache_loc(cache_loc, cu_num_pages_host, num_seq)
@@ -850,7 +889,6 @@ class PTCacheBackend(CacheBackend):
         # Get the relevant slice of block_offsets
         block_offsets = self._kv_cache_block_offsets
         max_batch = block_offsets.shape[1]
-        device = block_offsets.device
 
         # Bounds check
         if num_seq > max_batch:
@@ -867,27 +905,33 @@ class PTCacheBackend(CacheBackend):
         # Zero only the sequences we're updating
         block_offsets[:, :num_seq, :, :].zero_()
 
-        # VECTORIZED: Create sequence indices for each page
-        # Using searchsorted: for cu_pages=[0,2,5,7], page positions 0-6
-        # gives seq_idx=[0,0,1,1,1,2,2]
-        page_positions = torch.arange(total_pages, dtype=torch.long)
-        seq_idx = torch.searchsorted(cu_pages[1:], page_positions, right=True)
+        # OPTIMIZED: Do all computation on GPU to avoid H2D transfers
+        # 1. Copy cu_pages to GPU (small tensor, num_seq+1 elements)
+        # NOTE: Must be blocking since we use it immediately in searchsorted
+        self._gpu_cu_pages[: num_seq + 1].copy_(cu_pages)
+        cu_pages_gpu = self._gpu_cu_pages[: num_seq + 1]
 
-        # VECTORIZED: Create within-sequence page indices
-        # page_idx[i] = page_positions[i] - cu_pages[seq_idx[i]]
-        page_idx = page_positions - cu_pages[seq_idx]
+        # 2. page_positions is pre-allocated on GPU, just slice
+        page_positions = self._gpu_page_positions[:total_pages]
 
-        # Get cache_loc values and move indices to device
-        cache_loc_slice = cache_loc[:total_pages]
-        cache_loc_vals = cache_loc_slice.int().to(device)
-        seq_idx_dev = seq_idx.to(device)
-        page_idx_dev = page_idx.to(device)
+        # 3. searchsorted on GPU into pre-allocated buffer
+        torch.searchsorted(
+            cu_pages_gpu[1:], page_positions, right=True, out=self._gpu_seq_idx[:total_pages]
+        )
+        seq_idx_dev = self._gpu_seq_idx[:total_pages]
 
-        # Use advanced indexing to scatter values (no loop)
+        # 4. page_idx computed on GPU into pre-allocated buffer
+        torch.sub(page_positions, cu_pages_gpu[seq_idx_dev], out=self._gpu_page_idx[:total_pages])
+        page_idx_dev = self._gpu_page_idx[:total_pages]
+
+        # cache_loc is already on GPU - compute base_offset into pre-allocated buffer
         # K and V use DIFFERENT block indices to index into the multi-layer pool
         num_layers = self._config.num_layers
         kv_factor = 2
-        base_offset = cache_loc_vals * num_layers * kv_factor
+        multiplier = num_layers * kv_factor
+        # Use pre-allocated buffer: base_offset = cache_loc * multiplier
+        base_offset = self._gpu_base_offset[:total_pages]
+        torch.mul(cache_loc[:total_pages], multiplier, out=base_offset)
 
         # Pool 0, K cache (dim 2 = 0)
         block_offsets[0, seq_idx_dev, 0, page_idx_dev] = base_offset
