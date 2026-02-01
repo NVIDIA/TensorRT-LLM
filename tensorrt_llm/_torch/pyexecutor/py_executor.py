@@ -429,7 +429,6 @@ class PyExecutor:
         self.executor_request_queue = ExecutorRequestQueue(
             dist=self.dist,
             max_batch_size=max_batch_size,
-            max_beam_width=self.max_beam_width,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
         )
@@ -2156,9 +2155,11 @@ class PyExecutor:
 
         # 5. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
-            all_ranks_new_requests = self._schedule_attention_dp_requests(
-                new_requests, all_ranks_num_active_requests,
-                all_ranks_num_active_tokens)
+            all_ranks_new_requests, self.expected_num_active_requests = \
+                schedule_attention_dp_requests(
+                    new_requests, all_ranks_num_active_requests,
+                    all_ranks_num_active_tokens, self.dist.tp_size,
+                    self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             # Update counters for DP
@@ -2174,19 +2175,6 @@ class PyExecutor:
                               cp_size=self.dist.cp_size,
                               exclude_last_generation_logits=self.
                               _should_exclude_last_generation_logits())
-
-    def _schedule_attention_dp_requests(
-        self, new_requests: List[RequestQueueItem],
-        all_ranks_num_active_requests: List[int],
-        all_ranks_num_active_tokens: List[int]
-    ) -> Dict[int, List[RequestQueueItem]]:
-        """Schedule attention dp requests."""
-        all_ranks_new_requests, self.expected_num_active_requests = \
-            schedule_attention_dp_requests(
-                new_requests, all_ranks_num_active_requests,
-                all_ranks_num_active_tokens, self.dist.tp_size,
-                self.max_num_active_requests)
-        return all_ranks_new_requests
 
     def _handle_special_queue_items(
             self,
@@ -2222,8 +2210,6 @@ class PyExecutor:
 
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits
-
-    # ========== End of request fetching and processing methods ==========
 
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 

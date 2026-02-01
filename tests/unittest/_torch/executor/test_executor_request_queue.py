@@ -44,7 +44,6 @@ def executor_queue(mock_dist):
     """Create an ExecutorRequestQueue instance for testing."""
     return ExecutorRequestQueue(dist=mock_dist,
                                 max_batch_size=8,
-                                max_beam_width=1,
                                 enable_iter_perf_stats=True,
                                 batch_wait_timeout_ms=0.0)
 
@@ -54,7 +53,6 @@ def integration_queue(mock_dist):
     """Create an ExecutorRequestQueue instance for integration testing."""
     return ExecutorRequestQueue(dist=mock_dist,
                                 max_batch_size=4,
-                                max_beam_width=2,
                                 enable_iter_perf_stats=True,
                                 batch_wait_timeout_ms=0.0)
 
@@ -62,7 +60,6 @@ def integration_queue(mock_dist):
 def test_executor_queue_init(executor_queue, mock_dist):
     """Test ExecutorRequestQueue initialization."""
     assert executor_queue.dist == mock_dist
-    assert executor_queue.max_beam_width == 1
     assert executor_queue.next_request_id == 8
     assert executor_queue.enable_iter_perf_stats
     assert executor_queue.active
