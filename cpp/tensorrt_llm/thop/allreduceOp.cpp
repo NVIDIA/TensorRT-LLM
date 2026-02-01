@@ -54,6 +54,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <unordered_set>
 
@@ -897,91 +898,181 @@ private:
         cache[mGroup] = {mIsNVLINKSupported, mIsP2PSupported, mIsMNNVLSupported};
     }
 
-    bool checkMNNVLSupport(int device_id)
+    // Structure to hold MNNVL fabric info for comparison across ranks
+    struct MNNVLFabricInfo
     {
+        char clusterUuid[NVML_GPU_FABRIC_UUID_LEN];
+        unsigned int cliqueId;
+        bool isValid;
+
+        MNNVLFabricInfo()
+            : cliqueId(0)
+            , isValid(false)
+        {
+            std::memset(clusterUuid, 0, NVML_GPU_FABRIC_UUID_LEN);
+        }
+
+        bool operator==(MNNVLFabricInfo const& other) const
+        {
+            if (!isValid || !other.isValid)
+            {
+                return false;
+            }
+            return std::memcmp(clusterUuid, other.clusterUuid, NVML_GPU_FABRIC_UUID_LEN) == 0
+                && cliqueId == other.cliqueId;
+        }
+
+        bool operator!=(MNNVLFabricInfo const& other) const
+        {
+            return !(*this == other);
+        }
+
+        // Format cluster UUID as hex string for logging
+        std::string getClusterUuidString() const
+        {
+            std::string result;
+            result.reserve(NVML_GPU_FABRIC_UUID_LEN * 2);
+            for (int i = 0; i < NVML_GPU_FABRIC_UUID_LEN; ++i)
+            {
+                char buf[3];
+                std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned char>(clusterUuid[i]));
+                result += buf;
+            }
+            return result;
+        }
+    };
+
+    // Get MNNVL fabric info from a device. Returns fabric info with isValid=true if device supports MNNVL.
+    MNNVLFabricInfo getMNNVLFabricInfo(int deviceId)
+    {
+        MNNVLFabricInfo info;
+
 #if ENABLE_MULTI_DEVICE
         // 1. Check CUDA driver version (needs >= 12.0.10)
-        int cuda_driver_version = -1;
-        TLLM_CUDA_CHECK(cudaDriverGetVersion(&cuda_driver_version));
-        if (cuda_driver_version < 12010)
+        int cudaDriverVersion = -1;
+        TLLM_CUDA_CHECK(cudaDriverGetVersion(&cudaDriverVersion));
+        if (cudaDriverVersion < 12010)
         {
-            TLLM_LOG_DEBUG("MNNVL check: CUDA Driver version %d < 12010", cuda_driver_version);
-            return false;
+            TLLM_LOG_DEBUG("MNNVL check: CUDA Driver version %d < 12010", cudaDriverVersion);
+            return info;
         }
 
         // 2. Check multicast support
-        CUdevice cu_device;
-        TLLM_CU_CHECK(cuDeviceGet(&cu_device, device_id));
-        auto cuda_driver = tensorrt_llm::common::CUDADriverWrapper::getInstance();
+        CUdevice cuDevice;
+        TLLM_CU_CHECK(cuDeviceGet(&cuDevice, deviceId));
+        auto cudaDriver = tensorrt_llm::common::CUDADriverWrapper::getInstance();
 
-        int multicast_supported = 0;
-        TLLM_CU_CHECK(cuda_driver->cuDeviceGetAttribute(
-            &multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cu_device));
-        if (!multicast_supported)
+        int multicastSupported = 0;
+        TLLM_CU_CHECK(
+            cudaDriver->cuDeviceGetAttribute(&multicastSupported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cuDevice));
+        if (!multicastSupported)
         {
-            TLLM_LOG_DEBUG("MNNVL check: Device %d does not support multicast", device_id);
-            return false;
+            TLLM_LOG_DEBUG("MNNVL check: Device %d does not support multicast", deviceId);
+            return info;
         }
 
         // 3. Check fabric handle support
-        int fabric_handle_supported = 0;
-        TLLM_CU_CHECK(cuda_driver->cuDeviceGetAttribute(
-            &fabric_handle_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cu_device));
-        if (!fabric_handle_supported)
+        int fabricHandleSupported = 0;
+        TLLM_CU_CHECK(cudaDriver->cuDeviceGetAttribute(
+            &fabricHandleSupported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice));
+        if (!fabricHandleSupported)
         {
-            TLLM_LOG_DEBUG("MNNVL check: Device %d does not support fabric handles", device_id);
-            return false;
+            TLLM_LOG_DEBUG("MNNVL check: Device %d does not support fabric handles", deviceId);
+            return info;
         }
 
-        // 4. Check NVML GPU Fabric Info
-        nvmlDevice_t nvml_device;
-        NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(device_id, &nvml_device));
+        // 4. Check NVML GPU Fabric Info using versioned API
+        nvmlDevice_t nvmlDevice;
+        nvmlReturn_t nvmlResult = nvmlDeviceGetHandleByIndex(deviceId, &nvmlDevice);
+        if (nvmlResult != NVML_SUCCESS)
+        {
+            TLLM_LOG_DEBUG("MNNVL check: Failed to get NVML device handle for device %d - error=%d", deviceId,
+                static_cast<int>(nvmlResult));
+            return info;
+        }
 
-        nvmlGpuFabricInfo_t fabric_info;
-        NVML_CHECK_THROW(nvmlDeviceGetGpuFabricInfo(nvml_device, &fabric_info));
-
-        // Check if fabric is fully initialized
-        if (fabric_info.state != NVML_GPU_FABRIC_STATE_COMPLETED || fabric_info.status != NVML_SUCCESS)
+        nvmlGpuFabricInfoV_t fabricInfoV;
+        std::memset(&fabricInfoV, 0, sizeof(fabricInfoV));
+        fabricInfoV.version = NVML_STRUCT_VERSION(GpuFabricInfo, 3);
+        nvmlResult = nvmlDeviceGetGpuFabricInfoV(nvmlDevice, &fabricInfoV);
+        if (nvmlResult != NVML_SUCCESS)
         {
             TLLM_LOG_DEBUG(
-                "MNNVL check: Fabric state not complete - state=%u status=%u", fabric_info.state, fabric_info.status);
-            return false;
+                "MNNVL check: nvmlDeviceGetGpuFabricInfoV failed for device %d - error=%d (not supported or "
+                "no fabric manager)",
+                deviceId, static_cast<int>(nvmlResult));
+            return info;
+        }
+
+        // Check if fabric is fully initialized
+        if (fabricInfoV.state != NVML_GPU_FABRIC_STATE_COMPLETED || fabricInfoV.status != NVML_SUCCESS)
+        {
+            TLLM_LOG_DEBUG(
+                "MNNVL check: Fabric state not complete - state=%u status=%u", fabricInfoV.state, fabricInfoV.status);
+            return info;
+        }
+
+        // Check if clusterUuid is valid (not all zeros)
+        // If clusterUuid is all zeros, the GPU is not actually part of an NVLink fabric
+        bool clusterUuidValid = false;
+        for (int i = 0; i < NVML_GPU_FABRIC_UUID_LEN; ++i)
+        {
+            if (fabricInfoV.clusterUuid[i] != 0)
+            {
+                clusterUuidValid = true;
+                break;
+            }
+        }
+        if (!clusterUuidValid)
+        {
+            TLLM_LOG_DEBUG(
+                "MNNVL check: Device %d has invalid (all-zero) clusterUuid - not part of NVLink fabric", deviceId);
+            return info;
         }
 
         // 5. Check NVLink links are active (similar to Python support_nvlink(True))
-        unsigned int active_links = 0;
-        unsigned int available_links = 0;
+        unsigned int activeLinks = 0;
+        unsigned int availableLinks = 0;
 
         for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; link++)
         {
-            unsigned int cap_p2p = 0;
-            nvmlReturn_t cap_result
-                = nvmlDeviceGetNvLinkCapability(nvml_device, link, NVML_NVLINK_CAP_P2P_SUPPORTED, &cap_p2p);
-            if (cap_result == NVML_SUCCESS && cap_p2p)
+            unsigned int capP2p = 0;
+            nvmlReturn_t capResult
+                = nvmlDeviceGetNvLinkCapability(nvmlDevice, link, NVML_NVLINK_CAP_P2P_SUPPORTED, &capP2p);
+            if (capResult == NVML_SUCCESS && capP2p)
             {
-                available_links++;
-                nvmlEnableState_t link_state;
-                if (nvmlDeviceGetNvLinkState(nvml_device, link, &link_state) == NVML_SUCCESS
-                    && link_state == NVML_FEATURE_ENABLED)
+                availableLinks++;
+                nvmlEnableState_t linkState;
+                if (nvmlDeviceGetNvLinkState(nvmlDevice, link, &linkState) == NVML_SUCCESS
+                    && linkState == NVML_FEATURE_ENABLED)
                 {
-                    active_links++;
+                    activeLinks++;
                 }
             }
         }
 
-        bool all_links_up = (active_links == available_links && available_links > 0);
-        if (!all_links_up)
+        bool allLinksUp = (activeLinks == availableLinks && availableLinks > 0);
+        if (!allLinksUp)
         {
             TLLM_LOG_DEBUG(
-                "MNNVL check: Not all NVLink links active - active=%u available=%u", active_links, available_links);
-            return false;
+                "MNNVL check: Not all NVLink links active - active=%u available=%u", activeLinks, availableLinks);
+            return info;
         }
 
-        TLLM_LOG_INFO("MNNVL check: Device %d supports MNNVL (fabric_clique=%u)", device_id, fabric_info.cliqueId);
-        return true;
-#else
-        return false;
+        // Device supports MNNVL - copy fabric info
+        std::memcpy(info.clusterUuid, fabricInfoV.clusterUuid, NVML_GPU_FABRIC_UUID_LEN);
+        info.cliqueId = fabricInfoV.cliqueId;
+        info.isValid = true;
+
+        TLLM_LOG_INFO("MNNVL check: Device %d supports MNNVL (clusterUuid=%s, cliqueId=%u)", deviceId,
+            info.getClusterUuidString().c_str(), fabricInfoV.cliqueId);
 #endif
+        return info;
+    }
+
+    bool checkMNNVLSupport(int deviceId)
+    {
+        return getMNNVLFabricInfo(deviceId).isValid;
     }
 
     void setGroupTopology()
@@ -1094,84 +1185,131 @@ private:
             }
         }
 
-        // For inter-node groups, check MNNVL support
+        // For inter-node groups, check MNNVL support by comparing fabric info (cluster UUID and clique ID)
+        // Two GPUs are connected via NVLink in MNNVL if they share the same cluster UUID and clique ID.
+        // See: http://docs.nvidia.com/deploy/nvml-api/index.html#structnvmlGpuFabricInfo__v2__t
         if (is_inter_node)
         {
-            TLLM_LOG_INFO("Found inter-node TP group for rank %d, checking MNNVL support", rank);
+            TLLM_LOG_INFO("Found inter-node TP group for rank %d, checking MNNVL support via fabric info", rank);
 
-            // Check MNNVL support on local device(s)
-            bool local_mnnvl_supported = false;
+            // Get MNNVL fabric info on local device
+            MNNVLFabricInfo localFabricInfo;
             if (!local_group.empty())
             {
-                // Check MNNVL on first device in local group (all devices on same node should have same MNNVL status)
-                int check_device = *local_group.begin();
-                local_mnnvl_supported = checkMNNVLSupport(check_device);
+                // Get fabric info from first device in local group
+                int checkDevice = *local_group.begin();
+                localFabricInfo = getMNNVLFabricInfo(checkDevice);
             }
 
-            // Gather MNNVL status from all ranks in the group
-            int local_mnnvl_status = local_mnnvl_supported ? 1 : 0;
-            std::vector<int> all_mnnvl_status(mGroup.size());
+            // Gather fabric info from all ranks in the group
+            // We need to share: isValid (1 byte), clusterUuid (16 bytes), cliqueId (4 bytes) = 21 bytes
+            // Pack into a structure for transmission
+            constexpr size_t kFabricInfoPackedSize = 1 + NVML_GPU_FABRIC_UUID_LEN + sizeof(unsigned int);
+            std::vector<char> localPackedInfo(kFabricInfoPackedSize);
+            localPackedInfo[0] = localFabricInfo.isValid ? 1 : 0;
+            std::memcpy(&localPackedInfo[1], localFabricInfo.clusterUuid, NVML_GPU_FABRIC_UUID_LEN);
+            std::memcpy(
+                &localPackedInfo[1 + NVML_GPU_FABRIC_UUID_LEN], &localFabricInfo.cliqueId, sizeof(unsigned int));
 
-            std::visit(overloaded{[&](std::shared_ptr<ncclComm_t>& comm_ptr)
+            std::vector<char> allPackedInfo(kFabricInfoPackedSize * mGroup.size());
+
+            std::visit(overloaded{[&](std::shared_ptr<ncclComm_t>& commPtr)
                            {
-                               // For NCCL comm, use MPI to gather status
-                               // Use MPI allgather to collect MNNVL status
-                               // Create a sub-communicator for the group
-                               std::vector<int> group_ranks(mGroup.begin(), mGroup.end());
-                               MPI_Group world_group, new_group;
-                               MPI_Comm group_comm;
-                               MPI_Comm_group(COMM_SESSION, &world_group);
-                               MPI_Group_incl(world_group, group_ranks.size(), group_ranks.data(), &new_group);
-                               MPI_Comm_create_group(COMM_SESSION, new_group, 0, &group_comm);
+                               // For NCCL comm, use MPI to gather fabric info
+                               std::vector<int> groupRanks(mGroup.begin(), mGroup.end());
+                               MPI_Group worldGroup, newGroup;
+                               MPI_Comm groupComm;
+                               MPI_Comm_group(COMM_SESSION, &worldGroup);
+                               MPI_Group_incl(worldGroup, groupRanks.size(), groupRanks.data(), &newGroup);
+                               MPI_Comm_create_group(COMM_SESSION, newGroup, 0, &groupComm);
 
-                               if (group_comm != MPI_COMM_NULL)
+                               if (groupComm != MPI_COMM_NULL)
                                {
-                                   MPI_Allgather(&local_mnnvl_status, 1, MPI_INT, all_mnnvl_status.data(), 1, MPI_INT,
-                                       group_comm);
-                                   MPI_Comm_free(&group_comm);
+                                   MPI_Allgather(localPackedInfo.data(), kFabricInfoPackedSize, MPI_CHAR,
+                                       allPackedInfo.data(), kFabricInfoPackedSize, MPI_CHAR, groupComm);
+                                   MPI_Comm_free(&groupComm);
                                }
-                               MPI_Group_free(&new_group);
-                               MPI_Group_free(&world_group);
+                               MPI_Group_free(&newGroup);
+                               MPI_Group_free(&worldGroup);
                            },
                            [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
                            {
-                               // For ProcessGroup, use allgather directly
-                               // Note: This assumes the ProcessGroup is already set up for the correct group
-                               std::vector<torch::Tensor> input_tensors
-                                   = {torch::tensor({local_mnnvl_status}, torch::kInt32)};
-                               std::vector<std::vector<torch::Tensor>> output_tensors(1);
-                               output_tensors[0].resize(mGroup.size());
-                               auto work = torchPg->allgather(output_tensors, input_tensors);
+                               // For ProcessGroup, use allgather with byte tensor
+                               auto inputTensor = torch::from_blob(
+                                   localPackedInfo.data(), {static_cast<int64_t>(kFabricInfoPackedSize)}, torch::kUInt8)
+                                                      .clone();
+                               std::vector<torch::Tensor> inputTensors = {inputTensor};
+                               std::vector<std::vector<torch::Tensor>> outputTensors(1);
+                               outputTensors[0].resize(mGroup.size());
+                               for (size_t i = 0; i < mGroup.size(); ++i)
+                               {
+                                   outputTensors[0][i]
+                                       = torch::empty({static_cast<int64_t>(kFabricInfoPackedSize)}, torch::kUInt8);
+                               }
+                               auto work = torchPg->allgather(outputTensors, inputTensors);
                                if (work)
                                {
                                    work->wait();
                                    for (size_t i = 0; i < mGroup.size(); ++i)
                                    {
-                                       all_mnnvl_status[i] = output_tensors[0][i].item<int>();
+                                       std::memcpy(&allPackedInfo[i * kFabricInfoPackedSize],
+                                           outputTensors[0][i].data_ptr(), kFabricInfoPackedSize);
                                    }
                                }
                            }},
                 mNcclComm);
 
-            // Check if all ranks support MNNVL
-            bool all_ranks_support_mnnvl = true;
-            for (int status : all_mnnvl_status)
+            // Unpack and compare fabric info from all ranks
+            // All ranks must have valid fabric info AND share the same cluster UUID and clique ID
+            bool allRanksMnnvlConnected = true;
+            MNNVLFabricInfo referenceFabricInfo;
+            bool haveReference = false;
+
+            for (size_t i = 0; i < mGroup.size(); ++i)
             {
-                if (status == 0)
+                MNNVLFabricInfo rankFabricInfo;
+                rankFabricInfo.isValid = allPackedInfo[i * kFabricInfoPackedSize] != 0;
+                std::memcpy(rankFabricInfo.clusterUuid, &allPackedInfo[i * kFabricInfoPackedSize + 1],
+                    NVML_GPU_FABRIC_UUID_LEN);
+                std::memcpy(&rankFabricInfo.cliqueId,
+                    &allPackedInfo[i * kFabricInfoPackedSize + 1 + NVML_GPU_FABRIC_UUID_LEN], sizeof(unsigned int));
+
+                if (!rankFabricInfo.isValid)
                 {
-                    all_ranks_support_mnnvl = false;
+                    TLLM_LOG_DEBUG("MNNVL check: Rank %zu does not have valid fabric info", i);
+                    allRanksMnnvlConnected = false;
+                    break;
+                }
+
+                if (!haveReference)
+                {
+                    referenceFabricInfo = rankFabricInfo;
+                    haveReference = true;
+                }
+                else if (rankFabricInfo != referenceFabricInfo)
+                {
+                    // Fabric info mismatch - ranks are not in the same NVLink fabric
+                    TLLM_LOG_DEBUG("MNNVL check: Rank %zu has different fabric info (clique=%u vs reference clique=%u)",
+                        i, rankFabricInfo.cliqueId, referenceFabricInfo.cliqueId);
+                    allRanksMnnvlConnected = false;
                     break;
                 }
             }
 
-            // For inter-node: MNNVL support means all nodes have MNNVL
-            // Also need local NVLink for optimal performance
-            mIsMNNVLSupported = mIsNVLINKSupported && all_ranks_support_mnnvl;
+            // For inter-node: MNNVL support requires all ranks to be in the same fabric (same cluster UUID and clique
+            // ID) Also need local NVLink for optimal performance
+            mIsMNNVLSupported = mIsNVLINKSupported && allRanksMnnvlConnected;
             mIsP2PSupported = false; // P2P doesn't work across nodes
 
-            TLLM_LOG_INFO("Inter-node topology: local_NVLink=%d, local_MNNVL=%d, all_ranks_MNNVL=%d, final_MNNVL=%d",
-                mIsNVLINKSupported ? 1 : 0, local_mnnvl_status, all_ranks_support_mnnvl ? 1 : 0,
+            TLLM_LOG_INFO(
+                "Inter-node topology: localNVLink=%d, localFabricValid=%d, allRanksSameFabric=%d, finalMNNVL=%d",
+                mIsNVLINKSupported ? 1 : 0, localFabricInfo.isValid ? 1 : 0, allRanksMnnvlConnected ? 1 : 0,
                 mIsMNNVLSupported ? 1 : 0);
+            if (mIsMNNVLSupported && haveReference)
+            {
+                TLLM_LOG_INFO("MNNVL enabled: All ranks share fabric (clusterUuid=%s, cliqueId=%u)",
+                    referenceFabricInfo.getClusterUuidString().c_str(), referenceFabricInfo.cliqueId);
+            }
         }
         else
         {
@@ -1206,7 +1344,7 @@ private:
 
         if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size))
         {
-            return AllReduceStrategyType::NCCL_SYMMETRIC;
+            return AllReduceStrategyType::NCCL;
         }
 
         // This rule based heuristic only chooses between NCCL_SYMMETRIC and MIN_LATENCY strategies.
