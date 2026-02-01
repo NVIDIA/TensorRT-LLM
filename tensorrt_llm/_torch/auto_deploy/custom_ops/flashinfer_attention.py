@@ -17,8 +17,8 @@ from .attention_interface import (
     AttentionLayout,
     AttentionRegistry,
     Constant,
+    KVPagedResourceHandler,
     MHACallable,
-    PagedResourceHandler,
     PrepareMetadataCallable,
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
@@ -56,9 +56,7 @@ class _FlashInferPlanner:
     ]
     plan_params_prefill: Optional[PlanParams]
     plan_params_decode: Optional[PlanParams]
-    kv_layout: Literal["NHD", "HND"] = (
-        "NHD"  # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/10966
-    )
+    kv_layout: Literal["NHD", "HND"] = "HND"
 
     def __init__(self):
         self.workspace_buffer = None
@@ -320,16 +318,16 @@ def flashinfer_mha_with_cache(
     # EXTRA METADATA
     flashinfer_batch_indices: torch.Tensor,
     flashinfer_positions: torch.Tensor,
-    # CACHES
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    # CACHES - combined KV cache with shape [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]
+    kv_cache: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor:
-    # reshape to standard [b*s, n_heads, head_dim] layout
-    head_dim = k_cache.shape[-1]
+    # kv_cache shape: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
+    head_dim = kv_cache.shape[-1]
+    page_size = kv_cache.shape[3]  # tokens_per_block
     q_shape_og = q.shape
     b, s = q_shape_og[:2]
 
@@ -348,7 +346,7 @@ def flashinfer_mha_with_cache(
     # Assuming k_scale = v_scale = 1.0
     k_scale, v_scale = 1.0, 1.0
     # k = (k / k_scale).to(torch.float8_e4m3fn) if k_scale != 1.0, same for v
-    if k_cache.dtype == torch.float8_e4m3fn:
+    if kv_cache.dtype == torch.float8_e4m3fn:
         k = k.to(torch.float8_e4m3fn)
         v = v.to(torch.float8_e4m3fn)
 
@@ -357,10 +355,11 @@ def flashinfer_mha_with_cache(
         append_value=v,
         batch_indices=flashinfer_batch_indices,
         positions=flashinfer_positions,
-        paged_kv_cache=(k_cache, v_cache),
+        paged_kv_cache=kv_cache,
         kv_indices=cache_loc,
         kv_indptr=cu_num_pages[: num_seq + 1],
         kv_last_page_len=last_page_len[:num_seq],
+        kv_layout=_GlobalFlashInferPlanner.kv_layout,
     )
 
     # check if we need to re-combine outputs
@@ -378,9 +377,9 @@ def flashinfer_mha_with_cache(
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             num_seq=num_prefill,
-            page_size=k_cache.shape[1],
+            page_size=page_size,
             q_dtype=q_prefill.dtype,
-            kv_dtype=k_cache.dtype,
+            kv_dtype=kv_cache.dtype,
             sm_scale=scale,
         )
 
@@ -395,7 +394,7 @@ def flashinfer_mha_with_cache(
 
         y_prefill = wrapper_prefill.run(
             q_prefill,
-            (k_cache, v_cache),
+            kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
@@ -413,9 +412,9 @@ def flashinfer_mha_with_cache(
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             num_seq=num_decode,
-            page_size=k_cache.shape[1],
+            page_size=page_size,
             q_dtype=q_decode.dtype,
-            kv_dtype=k_cache.dtype,
+            kv_dtype=kv_cache.dtype,
             sm_scale=scale,
         )
 
@@ -429,7 +428,7 @@ def flashinfer_mha_with_cache(
 
         y_decode = wrapper_decode.run(
             q_decode,
-            (k_cache, v_cache),
+            kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
@@ -460,9 +459,8 @@ def flashinfer_mha_with_cache_fake(
     # EXTRA METADATA
     flashinfer_batch_indices: torch.Tensor,
     flashinfer_positions: torch.Tensor,
-    # CACHES
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    # CACHES - combined KV cache
+    kv_cache: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
     k_scale: float,
@@ -525,16 +523,13 @@ class FlashInferAttention(AttentionDescriptor):
         head_dim = k_fake.shape[3]
 
         return {
-            "k_cache": PagedResourceHandler(
+            "kv_cache": KVPagedResourceHandler(
                 num_kv_heads,
                 head_dim,
                 dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
-            ),
-            "v_cache": PagedResourceHandler(
-                num_kv_heads,
-                head_dim,
-                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
-            ),
+                kv_factor=2,
+                kv_layout=_GlobalFlashInferPlanner.kv_layout,
+            )
         }
 
     @classmethod
