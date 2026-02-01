@@ -35,6 +35,7 @@
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
@@ -311,7 +312,8 @@ void initBindings(nb::module_& m)
                 std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
                 std::optional<executor::ContextPhaseParams> context_phase_params,
                 std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
-                std::optional<tb::LlmRequest::TimePoint> arrival_time)
+                std::optional<tb::LlmRequest::TimePoint> arrival_time,
+                std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                 {
@@ -352,7 +354,7 @@ void initBindings(nb::module_& m)
                     encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
                     guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
-                    arrival_time};
+                    arrival_time, std::move(agent_hierarchy)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
@@ -378,7 +380,7 @@ void initBindings(nb::module_& m)
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
             nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
-            nb::arg("arrival_time") = std::nullopt)
+            nb::arg("arrival_time") = std::nullopt, nb::arg("agent_hierarchy") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
