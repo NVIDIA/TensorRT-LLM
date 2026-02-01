@@ -116,7 +116,7 @@ def setup_parallel_config(**parallel_config) -> None:
 
     init_dist(device_type="cuda")
 
-    is_parallel = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    is_parallel = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1
 
     logger.debug(f"Parallel configuration: {parallel_config}")
 
