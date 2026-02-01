@@ -21,6 +21,9 @@ from test_common.llm_data import with_mocked_hf_download
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 
+@pytest.mark.skip(
+    reason="Skipping test_ad_speculative_decoding_smoke due to issues on CI for A30s."
+)
 @pytest.mark.parametrize("use_hf_speculative_model", [False])
 @with_mocked_hf_download
 def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
