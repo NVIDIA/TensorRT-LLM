@@ -132,24 +132,23 @@ def _torch_mla_generate_with_absorption(
         q_absorbed = torch.einsum("nd,ndk->nk", q_nope_i, w_k_nope)
 
         # Attention scores from absorbed Q and compressed KV
+        # Compute in fp32 to match FlashInfer's use_fp16_qk_reduction=False
         # q_absorbed: [N, kv_lora_rank], compressed_kv_cached: [seq_len, kv_lora_rank]
         # scores_nope: [N, seq_len]
-        scores_nope = torch.matmul(q_absorbed, compressed_kv_cached.t())
+        scores_nope = torch.matmul(q_absorbed.float(), compressed_kv_cached.float().t())
 
         # =====================================================================
         # Q_pe part - standard attention with kpe
         # =====================================================================
         # q_pe_i: [N, qk_rope_head_dim], kpe_cached: [seq_len, qk_rope_head_dim]
         # scores_pe: [N, seq_len]
-        scores_pe = torch.matmul(q_pe_i, kpe_cached.t())
+        scores_pe = torch.matmul(q_pe_i.float(), kpe_cached.float().t())
 
-        # Combined attention scores
+        # Combined attention scores (already in fp32)
         attn_scores = (scores_nope + scores_pe) * scale  # [N, seq_len]
 
-        # Softmax
-        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(
-            q_nope.dtype
-        )  # [N, seq_len]
+        # Softmax (already in fp32, convert back to input dtype)
+        attn_weights = torch.softmax(attn_scores, dim=-1).to(q_nope.dtype)  # [N, seq_len]
 
         # =====================================================================
         # Compute output with absorbed value projection
@@ -261,10 +260,11 @@ def _torch_mla_context_with_expansion(
         query_t = query_full.transpose(0, 1).unsqueeze(0)  # [1, N, seq_len_i, qk_head_dim]
         key_t = key_full.transpose(0, 1).unsqueeze(0)  # [1, N, kv_seq_len, qk_head_dim]
 
-        # Compute attention scores
+        # Compute attention scores in fp32 to match FlashInfer's use_fp16_qk_reduction=False
+        # FlashInfer uses fp32 accumulation for QK^T, so we do the same for numerical consistency
         attn_scores = (
-            torch.matmul(query_t, key_t.transpose(-2, -1)) * scale
-        )  # [1, N, seq_len_i, kv_seq_len]
+            torch.matmul(query_t.float(), key_t.float().transpose(-2, -1)) * scale
+        )  # [1, N, seq_len_i, kv_seq_len] in fp32
 
         # Apply causal mask
         causal_mask = torch.triu(
@@ -273,8 +273,8 @@ def _torch_mla_context_with_expansion(
         )
         attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-        # Softmax
-        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q_nope.dtype)
+        # Softmax (already in fp32, convert back to input dtype)
+        attn_weights = torch.softmax(attn_scores, dim=-1).to(q_nope.dtype)
 
         # Value: [1, N, kv_seq_len, v_head_dim]
         v_t = v_expanded.transpose(0, 1).unsqueeze(0)

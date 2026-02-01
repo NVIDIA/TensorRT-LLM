@@ -74,7 +74,6 @@ class MLAPrefillPlanParams:
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
     sm_scale: Optional[float] = None
-    causal: bool = True
 
     def __hash__(self):
         """Convert all fields to a string representation and concatenate them."""
@@ -147,8 +146,12 @@ class _FlashInferMLAPlanner:
 
         For MLA prefill, we expand compressed_kv to get full K, V tensors
         and use standard ragged KV cache attention.
+
+        Args:
+            qo_indptr_host: Cumulative query/output lengths on host.
+            kv_indptr_host: Cumulative key/value lengths on host.
+            plan_params: Parameters for planning (hashable, no tensors).
         """
-        # check for re-planning
         if plan_params != self.plan_params_prefill:
             self.prefill_wrapper.plan(
                 qo_indptr_host,
@@ -158,7 +161,7 @@ class _FlashInferMLAPlanner:
                 plan_params.head_dim_qk,
                 head_dim_vo=plan_params.head_dim_vo,
                 use_fp16_qk_reduction=False,
-                causal=plan_params.causal,
+                causal=True,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
@@ -231,6 +234,52 @@ class _FlashInferMLAPlanner:
         # return decode wrapper
         return self.decode_wrapper
 
+    def plan_generate_only(
+        self,
+        num_seq: int,
+        cu_num_pages: torch.Tensor,
+        cache_loc: torch.Tensor,
+        last_page_len: torch.Tensor,
+    ):
+        """Plan decode-only batches for cached CUDA graph wrappers.
+
+        This is called from the host-side preparation function to plan
+        the decode wrappers for decode-only batches before the actual
+        attention op is invoked.
+
+        Args:
+            num_seq: Number of sequences in the decode batch.
+            cu_num_pages: Cumulative page counts, already sliced to [: num_seq + 1].
+            cache_loc: Page indices for the KV cache.
+            last_page_len: Length of the last page per sequence, already sliced to [:num_seq].
+        """
+        for plan_params in self.cached_cuda_graph_decode_wrappers:
+            if plan_params.num_seq == num_seq:
+                wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
+
+                # For a pure decode batch, qo_indptr is just [0, 1, 2, ..., batch_size]
+                qo_indptr = torch.arange(num_seq + 1, device=cu_num_pages.device, dtype=torch.int32)
+
+                # Compute actual KV lengths from paging metadata:
+                # kv_len = (num_pages - 1) * page_size + last_page_len
+                num_pages_per_seq = cu_num_pages[1:] - cu_num_pages[:-1]
+                kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + last_page_len
+
+                wrapper.plan(
+                    qo_indptr,
+                    cu_num_pages,  # kv_page_indptr
+                    cache_loc,  # kv_page_indices
+                    kv_len_arr,
+                    plan_params.num_heads,
+                    plan_params.kv_lora_rank,  # head_dim_ckv
+                    plan_params.qk_rope_head_dim,  # head_dim_kpe
+                    plan_params.page_size,
+                    causal=True,
+                    q_data_type=plan_params.q_dtype,
+                    kv_data_type=plan_params.kv_dtype,
+                    sm_scale=plan_params.sm_scale,
+                )
+
 
 _GlobalFlashInferMLAPlanner = _FlashInferMLAPlanner()
 
@@ -286,15 +335,18 @@ def prepare_flashinfer_mla_metadata_host(
 ) -> None:
     """Host-side preparation for FlashInfer MLA attention.
 
-    Note: Unlike standard FlashInfer attention which uses flashinfer.decode.fast_decode_plan
-    for decode-only batches, FlashInfer MLA does not currently have an equivalent fast
-    planning function. All MLA planning happens in the cached op itself.
+    For decode-only batches, this function pre-plans the cached CUDA graph
+    wrappers to avoid planning during graph capture/replay.
     """
-    # TODO: Add fast planning for MLA when FlashInfer supports it
-    # For reference, standard attention uses:
-    #   flashinfer.decode.fast_decode_plan(wrapper, cu_num_pages, cache_loc, ...)
-    # MLA would need a similar function with MLA-specific parameters
-    pass
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+
+    if num_prefill == 0:
+        _GlobalFlashInferMLAPlanner.plan_generate_only(
+            num_decode,
+            cu_num_pages_host[: num_decode + 1],
+            cache_loc_host,
+            last_page_len_host[:num_decode],
+        )
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_mla_with_cache", mutates_args=())
