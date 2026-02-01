@@ -567,8 +567,8 @@ def trtllm_mha_with_cache(
             host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
             host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
             None,  # cache_indirection (beam search)
-            None,  # kv_scale_orig_quant
-            None,  # kv_scale_quant_orig
+            _trtllm_config._kv_scale_orig_quant,  # kv_scale_orig_quant (FP8 KV cache)
+            _trtllm_config._kv_scale_quant_orig,  # kv_scale_quant_orig (FP8 KV cache)
             None,  # out_scale
             None,  # rotary_inv_freq
             None,  # rotary_cos_sin
@@ -590,7 +590,7 @@ def trtllm_mha_with_cache(
             0,  # sink_token_length
             1,  # beam_width
             int(AttentionMaskType.causal),  # mask_type
-            0,  # quant_mode
+            _trtllm_config._quant_mode,  # quant_mode (128 for FP8 KV cache, 0 otherwise)
             1.0,  # q_scaling (scaling factor applied to Q, typically 1.0)
             0,  # position_embedding_type (none - RoPE applied outside)
             0,  # rotary_embedding_dim
@@ -739,6 +739,11 @@ class TrtllmAttentionConfig:
         self._head_dim: int = 0
         self._dtype: torch.dtype = torch.float16
 
+        # FP8 KV cache support
+        self._kv_scale_orig_quant: Optional[torch.Tensor] = None
+        self._kv_scale_quant_orig: Optional[torch.Tensor] = None
+        self._quant_mode: int = 0
+
     def configure(self, si: SequenceInfo):
         """Configure from SequenceInfo."""
         self.page_size = si.page_size
@@ -773,6 +778,22 @@ class TrtllmAttentionConfig:
         self._num_kv_heads_per_layer = num_kv_heads_per_layer
         self._head_dim = head_dim
         self._dtype = dtype
+
+        # Initialize FP8 KV cache support if dtype is FP8
+        if dtype == torch.float8_e4m3fn:
+            # FP8_KV_CACHE quant mode = 128 (from tensorrt_llm.quantization.mode.QuantMode)
+            self._quant_mode = 128
+            # Default KV scales (1.0) - for FP8 models, scale is typically 1.0
+            # These tensors must be on GPU for thop.attention
+            self._kv_scale_orig_quant = torch.ones(1, dtype=torch.float32, device="cuda")
+            self._kv_scale_quant_orig = torch.ones(1, dtype=torch.float32, device="cuda")
+            ad_logger.info(
+                f"[TRT-LLM] Enabled FP8 KV cache: quant_mode={self._quant_mode}, kv_scale=1.0"
+            )
+        else:
+            self._quant_mode = 0
+            self._kv_scale_orig_quant = None
+            self._kv_scale_quant_orig = None
 
     def get_or_create_pt_cache_backend(self, si: SequenceInfo) -> Optional["PTCacheBackend"]:
         """Get or create the PTCacheBackend instance.
@@ -989,12 +1010,17 @@ class TrtllmAttention(AttentionDescriptor):
                 _trtllm_config.configure(si)
 
             # Set model config before creating backend
+            # IMPORTANT: Use cache_config.dtype (from kv_cache_dtype setting) instead of
+            # cls._dtype (from k_fake.dtype). The cache dtype may differ from activation dtype
+            # (e.g., model activations are BF16 but cache can be FP8 for efficiency).
+            # NOTE: cache_config is captured from get_cache_initializers closure, not from si
             if _trtllm_config._num_layers == 0:
+                cache_dtype = cache_config.dtype if cache_config.dtype is not None else cls._dtype
                 _trtllm_config.set_model_config(
                     num_layers=len(cls._num_kv_heads_per_layer),
                     num_kv_heads_per_layer=cls._num_kv_heads_per_layer,
                     head_dim=cls._head_dim,
-                    dtype=cls._dtype,
+                    dtype=cache_dtype,
                 )
 
             # Get or create PT backend

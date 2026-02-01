@@ -306,6 +306,45 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         self.update_transforms_with_shortcuts()
         return self
 
+    @model_validator(mode="after")
+    def update_kv_cache_dtype_in_transforms(self):
+        """Update kv_cache_dtype in transforms config if explicitly set.
+
+        When kv_cache_dtype is not "auto", set the dtype string in the
+        insert_cached_attention transform's cache_config. CacheConfig will
+        convert the string to torch.dtype via its _coerce_dtype validator.
+        """
+        if self.kv_cache_dtype != "auto":
+            # Map user-friendly dtype names to torch attribute names
+            # These strings will be converted by CacheConfig._coerce_dtype
+            dtype_str_map = {
+                "fp8": "float8_e4m3fn",
+                "float8": "float8_e4m3fn",
+                "float8_e4m3fn": "float8_e4m3fn",
+                "fp16": "float16",
+                "float16": "float16",
+                "bf16": "bfloat16",
+                "bfloat16": "bfloat16",
+            }
+            dtype_str = dtype_str_map.get(self.kv_cache_dtype.lower())
+            if dtype_str is None:
+                ad_logger.warning(
+                    f"Unknown kv_cache_dtype '{self.kv_cache_dtype}'. "
+                    f"Supported values: {list(dtype_str_map.keys())}. Using model default."
+                )
+            else:
+                # Set in transforms config for insert_cached_attention
+                # Store as string to allow YAML serialization; CacheConfig will convert
+                if "insert_cached_attention" not in self.transforms:
+                    self.transforms["insert_cached_attention"] = {}
+                if "cache_config" not in self.transforms["insert_cached_attention"]:
+                    self.transforms["insert_cached_attention"]["cache_config"] = {}
+                self.transforms["insert_cached_attention"]["cache_config"]["dtype"] = dtype_str
+                ad_logger.info(
+                    f"Set KV cache dtype to {dtype_str} from kv_cache_dtype='{self.kv_cache_dtype}'"
+                )
+        return self
+
     @field_validator("kv_cache_config", mode="after")
     @classmethod
     def validate_kv_cache_config(cls, kv_cache_config: KvCacheConfig) -> KvCacheConfig:
