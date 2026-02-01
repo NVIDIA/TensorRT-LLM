@@ -5215,18 +5215,21 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp",
         [
-            (4, 1, 4, True, True),
+            (4, 1, 4, True, True, False),
+            (4, 1, 4, True, True, True),
         ],
         ids=[
-            "tp4ep4_cudagraph_overlap",
+            "tp4ep4_cudagraph_overlap_adp_off",
+            "tp4ep4_cudagraph_overlap_adp_on",
         ],
     )
     def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
-                       overlap_scheduler, mocker):
+                       overlap_scheduler, attention_dp, mocker):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -5239,9 +5242,11 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                 model_path,
                 tensor_parallel_size=tp_size,
                 max_num_tokens=16384,
+                moe_config=MoeConfig(backend="CUTLASS"),
                 pipeline_parallel_size=pp_size,
                 moe_expert_parallel_size=ep_size,
                 kv_cache_config=kv_cache_config,
+                enable_attention_dp=attention_dp,
                 **pytorch_config,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -5257,19 +5262,26 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"],
                              ids=["cutlass", "trtllm"])
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
-        [(1, 1, 1, True, True), (4, 1, 1, True, True), (4, 1, 4, True, True),
-         (4, 1, 4, False, False)],
-        ids=["tp1", "tp4ep1", "tp4ep4", "no_cuda_graph_overlap"])
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp", [
+            (1, 1, 1, True, True, False),
+            (4, 1, 1, True, True, False),
+            (4, 1, 4, True, True, True),
+            (4, 1, 4, True, True, False),
+            (4, 1, 4, False, False, False),
+        ],
+        ids=[
+            "tp1", "tp4ep1", "tp4ep4_adp_on", "tp4ep4_adp_off",
+            "no_cuda_graph_overlap"
+        ])
     def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
-                   overlap_scheduler, mocker):
+                   overlap_scheduler, attention_dp, mocker):
         model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512, enable_padding=True)
+                                  max_batch_size=512, enable_padding=False)
                               if cuda_graph else None)
         moe_config = MoeConfig(backend=moe_backend)
 
@@ -5279,6 +5291,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
+                 enable_attention_dp=attention_dp,
                  **pytorch_config,
                  moe_config=moe_config) as llm:
             task = MMLU(self.MODEL_NAME)
