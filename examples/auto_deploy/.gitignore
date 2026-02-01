@@ -7,3 +7,4 @@ benchmark_results.json
 !nano_v3.yaml
 !nemotron_flash.yaml
 !model_registry/configs/*.yaml
+!deepseek_mini.yaml
