@@ -47,6 +47,78 @@ if PYTHON_BINDINGS:
     from .model_runner_cpp import ModelRunnerCpp
 
 
+def _internvl_find_closest_aspect_ratio(aspect_ratio, target_ratios, width,
+                                       height, image_size):
+    """InternVL2 dynamic tiling helper (ported from InternVL2 HF README)."""
+    best_ratio_diff = float("inf")
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            # Prefer larger effective resolution
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+
+def _internvl_dynamic_preprocess_pil(image: Image.Image,
+                                     min_num: int = 1,
+                                     max_num: int = 12,
+                                     image_size: int = 448,
+                                     use_thumbnail: bool = True):
+    """Return (tiles, tile_grid_hw) where tiles are PIL 448x448 crops.
+
+    Notes:
+    - This matches InternVL2's "dynamic_preprocess" behavior: choose a grid that
+      best matches aspect ratio, split into fixed-size tiles, and optionally append
+      a 1x thumbnail tile when more than 1 tile exists.
+    - tile_grid_hw corresponds to the *grid tiles only* (excluding the optional thumbnail).
+    """
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / max(1, orig_height)
+
+    target_ratios = {
+        (i, j)
+        for n in range(min_num, max_num + 1) for i in range(1, n + 1)
+        for j in range(1, n + 1) if i * j <= max_num and i * j >= min_num
+    }
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+    target_aspect_ratio = _internvl_find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    grid_w = int(target_aspect_ratio[0])
+    grid_h = int(target_aspect_ratio[1])
+    target_width = image_size * grid_w
+    target_height = image_size * grid_h
+    blocks = grid_w * grid_h
+
+    # Match InternVL2 HF README behavior: bicubic resize.
+    resample = getattr(Image, "Resampling", Image).BICUBIC
+    resized_img = image.resize((target_width, target_height),
+                               resample=resample)
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size,
+        )
+        processed_images.append(resized_img.crop(box))
+
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size),
+                                     resample=resample)
+        processed_images.append(thumbnail_img)
+
+    return processed_images, (grid_h, grid_w)
+
+
 class LlavaNextUtils:
     # https://github.com/haotian-liu/LLaVA/blob/main/llava/mm_utils.py
 
@@ -374,6 +446,20 @@ class MultimodalModelRunner:
         with open(os.path.join(self.visual_engine_dir, "config.json"),
                   "r") as f:
             config = json.load(f)
+        # Cache vision engine max batch size (used to safely micro-batch InternVL
+        # any-res tiling without requiring users to rebuild the vision engine).
+        self.vision_max_batch_size = None
+        if isinstance(config, dict):
+            builder_cfg = config.get("builder_config", {})
+            if isinstance(builder_cfg, dict):
+                max_bs = builder_cfg.get("max_batch_size", None)
+                if max_bs is not None:
+                    try:
+                        max_bs_int = int(max_bs)
+                    except (TypeError, ValueError):
+                        max_bs_int = 0
+                    if max_bs_int > 0:
+                        self.vision_max_batch_size = max_bs_int
         if 'pretrained_config' in config:
             if config['pretrained_config'][
                     'architecture'] == 'LlavaNextForConditionalGeneration':
@@ -456,6 +542,20 @@ class MultimodalModelRunner:
         if self.cpp_e2e:
             self.visual_output_shape = config['builder_config'].get(
                 'output_shape', None)
+        # InternVL vision encoder outputs fixed tokens per input image/tile.
+        # Keep it for optional token-budgeting of dynamic tiling.
+        self.internvl_num_image_tokens = None
+        if self.model_type == "internvl" and isinstance(config, dict):
+            builder_cfg = config.get("builder_config", {})
+            if isinstance(builder_cfg, dict):
+                out_shape = builder_cfg.get("output_shape", None)
+                if isinstance(out_shape, (list, tuple)) and len(out_shape) >= 2:
+                    try:
+                        num_tokens = int(out_shape[1])
+                    except (TypeError, ValueError):
+                        num_tokens = None
+                    if num_tokens is not None and num_tokens > 0:
+                        self.internvl_num_image_tokens = num_tokens
         if self.decoder_llm:
             if not supports_inflight_batching(self.llm_engine_dir):
                 logger.warning(
@@ -648,7 +748,11 @@ class MultimodalModelRunner:
             from transformers import CLIPImageProcessor
             self.processor = CLIPImageProcessor.from_pretrained(
                 'OpenGVLab/InternViT-300M-448px'
-            )  # You can change the InternViT model type according to your InternVL type
+            )
+            logger.info(f"[internvl] resize/crop cfg: size={self.processor.size}, "
+                        f"crop_size={getattr(self.processor, 'crop_size', None)}, "
+                        f"do_resize={self.processor.do_resize}, "
+                        f"do_center_crop={self.processor.do_center_crop}")
 
         elif self.model_type == "neva":
             image_size = 384
@@ -868,6 +972,11 @@ class MultimodalModelRunner:
     def preprocess(self, pre_prompt, post_prompt, image, other_vision_inputs,
                    other_audio_inputs):
         audio = None
+        # InternVL any-res: allow passing a list of tiles for native tiling/packing
+        internvl_tiles = None
+        if 'internvl' in self.model_type and isinstance(other_vision_inputs,
+                                                       dict):
+            internvl_tiles = other_vision_inputs.pop('tiles', None)
         # same prompt for single/multiple image(s)
         n_prompts_n_images = False
         if isinstance(post_prompt,
@@ -976,7 +1085,60 @@ class MultimodalModelRunner:
 
         profiler.start("Vision encoder")
         visual_features, visual_atts, model_runner_input = None, None, None
-        if image is not None:
+        if internvl_tiles is not None:
+            # Encode InternVL tiles with the vision engine, then concatenate them
+            # into a single long sequence (matching InternVL2 HF behavior).
+            if isinstance(internvl_tiles, (list, tuple)) and all(
+                    isinstance(t, Image.Image) for t in internvl_tiles):
+                tiles_batch = self.processor(images=list(internvl_tiles),
+                                             return_tensors='pt')[
+                                                 'pixel_values']
+            else:
+                tile_tensors = []
+                for t in internvl_tiles:
+                    if isinstance(t, torch.Tensor):
+                        if t.dim() == 3:
+                            tile_tensors.append(t)
+                        elif t.dim() == 4:
+                            # Accept either [1, 3, H, W] or [N, 3, H, W].
+                            if t.shape[0] == 1:
+                                tile_tensors.append(t[0])
+                            else:
+                                tile_tensors.extend(list(t))
+                        else:
+                            raise ValueError(
+                                "[internvl:anyres] unsupported tile tensor shape"
+                            )
+                    else:
+                        # Assume PIL Image
+                        tile_tensor = self.processor(
+                            images=t,
+                            return_tensors='pt')['pixel_values'][0]
+                        tile_tensors.append(tile_tensor)
+                tiles_batch = torch.stack(tile_tensors, dim=0)
+            dtype = str_dtype_to_torch(self.vision_precision)
+            tiles_batch = tiles_batch.to(self.device).to(dtype)
+            # Vision encoder expects [N, 3, H, W]. Micro-batch to respect the
+            # vision engine's max batch size (common engines are built with max_bs=1).
+            max_bs = getattr(self, "vision_max_batch_size", None)
+            if not isinstance(max_bs, int) or max_bs <= 0:
+                # Default to 1 (safest): many deployed vision engines are built with max_bs=1.
+                max_bs = 1
+            tile_embeds_chunks = []
+            for st in range(0, tiles_batch.shape[0], max_bs):
+                embeds, _ = self.get_visual_features(
+                    tiles_batch[st:st + max_bs], {})
+                tile_embeds_chunks.append(embeds)
+            tile_embeds = torch.cat(tile_embeds_chunks, dim=0)
+            # tile_embeds: [num_tiles, tokens_per_tile, hidden]
+            tile_embeds = tile_embeds.contiguous()
+            packed = tile_embeds.view(-1, tile_embeds.shape[-1])  # [T, hidden]
+            visual_features = packed.unsqueeze(0)  # [1, T, hidden]
+            visual_atts = torch.ones(visual_features.size()[:-1],
+                                     dtype=torch.long,
+                                     device=visual_features.device)
+            model_runner_input = None
+        elif image is not None:
             model_runner_input = torch.stack(
                 image['image_patches'],
                 dim=0) if self.model_type == 'fuyu' else image
@@ -1252,6 +1414,9 @@ class MultimodalModelRunner:
                     length = pre_input_ids.shape[1] + post_input_ids.shape[
                         1] + visual_atts.shape[2] * visual_atts.shape[1]
                 elif self.model_type == 'internvl':
+                    # InternVL flattens visual tokens into a single sequence.
+                    # visual_atts can be [num_tiles, tokens_per_tile] (unpacked)
+                    # or [1, total_tokens] (packed any-res path).
                     length = pre_input_ids.shape[1] + post_input_ids.shape[
                         1] + visual_atts.shape[0] * visual_atts.shape[1]
                 else:
@@ -2493,8 +2658,179 @@ class MultimodalModelRunner:
                 input_text = "Please describe the image shortly."
             post_prompt = input_text + "<|end|><|assistant|>\n"
             prompt = pre_prompt + post_prompt
-            image = self.processor(images=raw_image,
-                                   return_tensors='pt').pixel_values
+            # InternVL2 supports dynamic tiling ("any-res") preprocessing. TRT-LLM
+            # can optionally enable it to improve detail-sensitive accuracy.
+            # Defaults: read from HF config.json if present; allow CLI overrides.
+            enable_dynamic = False
+            min_num = 1
+            max_num = 12
+            image_size = 448
+            use_thumbnail = True
+
+            cfg_path = os.path.join(self.args.hf_model_dir, "config.json")
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    cfg = None
+                if isinstance(cfg, dict):
+                    enable_dynamic = bool(cfg.get("dynamic_image_size", False))
+                    try:
+                        min_num = int(cfg.get("min_dynamic_patch", min_num))
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        max_num = int(cfg.get("max_dynamic_patch", max_num))
+                    except (TypeError, ValueError):
+                        pass
+                    use_thumbnail = bool(cfg.get("use_thumbnail", use_thumbnail))
+
+                    force_image_size = cfg.get("force_image_size", None)
+                    if force_image_size is not None:
+                        try:
+                            image_size = int(force_image_size)
+                        except (TypeError, ValueError):
+                            pass
+                    else:
+                        vc = cfg.get("vision_config", None)
+                        if isinstance(vc, dict) and vc.get("image_size",
+                                                           None) is not None:
+                            try:
+                                image_size = int(vc["image_size"])
+                            except (TypeError, ValueError):
+                                pass
+
+            # CLI overrides (optional, for backward compatibility)
+            override = getattr(self.args, "internvl_dynamic_image_size", None)
+            if override is not None:
+                enable_dynamic = bool(override)
+            override = getattr(self.args, "internvl_min_dynamic_patch", None)
+            if override is not None:
+                try:
+                    min_num = int(override)
+                except (TypeError, ValueError):
+                    pass
+            override = getattr(self.args, "internvl_max_dynamic_patch", None)
+            if override is not None:
+                try:
+                    max_num = int(override)
+                except (TypeError, ValueError):
+                    pass
+            override = getattr(self.args, "internvl_use_thumbnail", None)
+            if override is not None:
+                use_thumbnail = bool(override)
+            override = getattr(self.args, "internvl_image_size", None)
+            if override is not None:
+                try:
+                    image_size = int(override)
+                except (TypeError, ValueError):
+                    pass
+
+            min_num = max(1, min_num)
+            max_num = max(min_num, max_num)
+            image_size = max(1, image_size)
+
+            if enable_dynamic and self.cpp_e2e:
+                logger.warning(
+                    "[internvl:anyres] dynamic_image_size is not supported in --session cpp (C++ E2E). "
+                    "Falling back to single-image preprocessing. Use --session cpp_llm_only or --session python to enable tiling."
+                )
+                enable_dynamic = False
+
+            if enable_dynamic:
+                # Dynamic tiling is implemented via `_internvl_dynamic_preprocess_pil`,
+                # which expects a *single* PIL image. However, `raw_image` can be a
+                # list/batch depending on how the runner is called.
+                if self.args.batch_size != 1:
+                    raise ValueError(
+                        "[internvl:anyres] enable_dynamic=True currently only supports batch_size==1. "
+                        f"Got batch_size={self.args.batch_size}. "
+                        "When enable_dynamic=True, `raw_image` is passed to `_internvl_dynamic_preprocess_pil`, "
+                        "which expects a single PIL image (not a batch/list).")
+
+                # Detect batched tensor/ndarray inputs early with a clear error.
+                if (not isinstance(raw_image, Image.Image)
+                        and hasattr(raw_image, "shape")):
+                    try:
+                        ndim = int(raw_image.dim()) if hasattr(
+                            raw_image, "dim") else int(len(raw_image.shape))
+                    except Exception:
+                        ndim = None
+                    try:
+                        batch_dim = int(raw_image.shape[0])
+                    except Exception:
+                        batch_dim = None
+                    if (ndim is not None and ndim >= 4 and batch_dim is not None
+                            and batch_dim > 1):
+                        raise ValueError(
+                            "[internvl:anyres] batched `raw_image` is not supported when enable_dynamic=True. "
+                            f"`raw_image.shape` looks batched ({getattr(raw_image, 'shape', None)}), but "
+                            "`_internvl_dynamic_preprocess_pil` expects a single PIL image.")
+
+                # Support multi-image lists only in the batch_size==1 case by
+                # tiling each image independently and concatenating the tiles.
+                images_for_tiling = raw_image if isinstance(
+                    raw_image, (list, tuple)) else [raw_image]
+                if len(images_for_tiling) == 0:
+                    raise ValueError(
+                        "[internvl:anyres] enable_dynamic=True requires a non-empty `raw_image`. "
+                        "Got an empty list/tuple; `_internvl_dynamic_preprocess_pil` requires a single PIL image.")
+
+                tiles = []
+                for img in images_for_tiling:
+                    if not isinstance(img, Image.Image):
+                        raise ValueError(
+                            "[internvl:anyres] `raw_image` must be a PIL.Image.Image (or a list/tuple of PIL images) "
+                            "when enable_dynamic=True so it can be processed by `_internvl_dynamic_preprocess_pil`. "
+                            f"Got element type={type(img)} (raw_image type={type(raw_image)}).")
+                    img_tiles, _ = _internvl_dynamic_preprocess_pil(
+                        img,
+                        min_num=min_num,
+                        max_num=max_num,
+                        image_size=image_size,
+                        use_thumbnail=use_thumbnail,
+                    )
+                    tiles.extend(img_tiles)
+
+                # Best-effort cap by token budget (LLM max_input_len) so we don't
+                # exceed engine limits when too many tiles are produced.
+                tokens_per_tile = self.internvl_num_image_tokens
+                if isinstance(tokens_per_tile, int) and tokens_per_tile > 0:
+                    try:
+                        max_input_len = int(
+                            getattr(self.model, "max_input_len", 0) or
+                            getattr(self.model_config, "max_input_len", 0) or 0)
+                    except (TypeError, ValueError):
+                        max_input_len = 0
+                    if max_input_len > 0:
+                        try:
+                            pre_len = int(
+                                self.tokenizer(
+                                    pre_prompt,
+                                    return_tensors="pt").input_ids.shape[1])
+                            post_len = int(
+                                self.tokenizer(
+                                    post_prompt,
+                                    return_tensors="pt").input_ids.shape[1])
+                        except (AttributeError, TypeError):
+                            pre_len = 0
+                            post_len = 0
+                        budget = max_input_len - pre_len - post_len
+                        max_tiles_fit = max(
+                            1, int(budget // max(1, tokens_per_tile)))
+                        if len(tiles) > max_tiles_fit:
+                            logger.warning(
+                                f"[internvl:anyres] Capping tiles from {len(tiles)} to {max_tiles_fit} "
+                                f"(max_input_len={max_input_len}, budget={budget}, "
+                                f"tokens_per_tile={tokens_per_tile}).")
+                            tiles = tiles[:max_tiles_fit]
+
+                other_vision_inputs["tiles"] = tiles
+                image = None
+            else:
+                image = self.processor(images=raw_image,
+                                       return_tensors='pt').pixel_values
 
         elif self.model_type == "pix2struct":
             if input_text is None:
