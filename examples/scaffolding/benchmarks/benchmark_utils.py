@@ -38,7 +38,7 @@ def load_prompts_from_json(num_prompts: int) -> List[str]:
         List[str]: List of prompts with index prefixes
     """
     script_dir = Path(__file__).parent
-    data_dir = script_dir.parent / "contrib" / "DeepResearch" / "data"
+    data_dir = script_dir.parent / "contrib" / "open_deep_research" / "data"
 
     prompts = []
 
@@ -46,7 +46,7 @@ def load_prompts_from_json(num_prompts: int) -> List[str]:
         print(f"Warning: Data directory {data_dir} does not exist")
     else:
         try:
-            json_files = ["open_deepresearch_bench.json"]
+            json_files = ["open_deep_research_bench.json"]
 
             # Sort to ensure consistent order across runs
             for json_file in sorted(json_files):

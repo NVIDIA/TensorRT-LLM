@@ -612,7 +612,8 @@ class ChoiceWithAlias(click.Choice):
     "--agent_types",
     type=str,
     default=None,
-    help="Types of agents to schedule. Now Only Support DeepResearchAgent.")
+    help=
+    "Types of agents to schedule. Now Only Support Open Deep Research agent.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
