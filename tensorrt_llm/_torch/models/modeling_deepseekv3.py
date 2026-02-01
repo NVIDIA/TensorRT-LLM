@@ -968,10 +968,21 @@ class Deepseekv3MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
+        shared_quant_config = self._get_shared_experts_quant_config(
+            model_config, layer_idx)
+        shared_model_config = model_config
+        if shared_quant_config is not model_config.quant_config:
+            shared_model_config = copy.copy(model_config)
+            shared_model_config._frozen = False
+            shared_model_config.quant_config = shared_quant_config
+            shared_model_config._frozen = True
+
+        # For shared experts, use the block size implied by their quant config.
         block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
-            block_size = model_config.quant_config.group_size
+        if (shared_quant_config is not None
+                and shared_quant_config.quant_algo is not None
+                and shared_quant_config.group_size is not None):
+            block_size = shared_quant_config.group_size
 
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size)
@@ -981,11 +992,14 @@ class Deepseekv3MoE(nn.Module):
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
-            config=model_config,
+            config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
         )
+        self.shared_experts_use_fp4 = (
+            shared_quant_config is not None
+            and shared_quant_config.layer_quant_mode.has_nvfp4())
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
@@ -1071,6 +1085,39 @@ class Deepseekv3MoE(nn.Module):
             device=device,
             dtype=self.dtype)
 
+    @staticmethod
+    def _get_shared_experts_quant_config(model_config,
+                                         layer_idx: int) -> QuantConfig:
+        # Prefer explicit per-layer quant config if provided.
+        if getattr(model_config, "quant_config_dict", None) is not None:
+            base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+            qcfg = model_config.quant_config_dict.get(base_name, None)
+            if qcfg is not None:
+                return qcfg
+            for name, qcfg in model_config.quant_config_dict.items():
+                if name.startswith(base_name + "."):
+                    return qcfg
+
+        quant_config = model_config.quant_config
+        if quant_config is None or quant_config.exclude_modules is None:
+            return quant_config
+
+        base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+        candidates = [
+            base_name,
+            f"{base_name}.gate_up_proj",
+            f"{base_name}.down_proj",
+            f"{base_name}.gate_proj",
+            f"{base_name}.up_proj",
+        ]
+        if any(
+                quant_config.is_module_excluded_from_quantization(name)
+                for name in candidates):
+            return QuantConfig(
+                quant_algo=None,
+                kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+        return quant_config
+
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, do_finalize):
         # max-throughput
@@ -1123,9 +1170,11 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            shared_output = self.shared_experts(
-                hidden_states_fp4
-                if hidden_states_fp4 is not None else hidden_states)
+            shared_input = (hidden_states_fp4 if
+                            (hidden_states_fp4 is not None
+                             and self.shared_experts_use_fp4) else
+                            hidden_states)
+            shared_output = self.shared_experts(shared_input)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
