@@ -524,6 +524,52 @@ class CachedSequenceInterface:
         self._kv_cache_config_tuned = kv_cache_config
         self.info.estimate_cache_loc_capacity(self._kv_cache_manager.blocks_in_primary_pool)
 
+        # 4.5. Set pool info for TRT-LLM attention (if available)
+        # This allows TRT-LLM to use AD's KVCacheManager pool directly
+        print("[DEBUG CachedSequenceInterface._init_kv_cache_manager]")
+        print(
+            f"  hasattr kv_cache_pool_pointers: {hasattr(self._kv_cache_manager, 'kv_cache_pool_pointers')}"
+        )
+        if hasattr(self._kv_cache_manager, "kv_cache_pool_pointers"):
+            pool_ptrs = self._kv_cache_manager.kv_cache_pool_pointers
+            pool_map = self._kv_cache_manager.kv_cache_pool_mapping
+            print(f"  kv_cache_pool_pointers: {pool_ptrs}")
+            print(
+                f"  kv_cache_pool_mapping.shape: {pool_map.shape if pool_map is not None else None}"
+            )
+
+            self.info.set_kv_cache_pool_info(pool_ptrs, pool_map)
+            print("  Set pool info on SequenceInfo")
+            print(f"  self.info.kv_cache_pool_pointers: {self.info.kv_cache_pool_pointers}")
+
+            # Also configure TRT-LLM attention if it's being used
+            try:
+                from ..custom_ops.trtllm_attention import _trtllm_config
+
+                print(f"  _trtllm_config.is_configured: {_trtllm_config.is_configured}")
+                if not _trtllm_config.is_configured:
+                    _trtllm_config.configure(self.info)
+                    print("  Configured _trtllm_config with SequenceInfo")
+                    print(f"  _trtllm_config._sequence_info: {_trtllm_config._sequence_info}")
+
+                # Set model config for FP8 KV cache support (only if we have kv_ref info)
+                # kv_ref and kv_managed are in scope from _create_kv_cache_manager
+                if _trtllm_config._num_layers == 0 and kv_ref is not None:
+                    num_kv_heads_list = [h.num_kv_heads for h in kv_managed.values()]
+                    _trtllm_config.set_model_config(
+                        num_layers=len(kv_managed),
+                        num_kv_heads_per_layer=num_kv_heads_list,
+                        head_dim=kv_ref.head_dim,
+                        dtype=kv_ref.dtype,
+                    )
+                    print(
+                        f"  Set model config: num_layers={len(kv_managed)}, "
+                        f"dtype={kv_ref.dtype}, quant_mode={_trtllm_config._quant_mode}"
+                    )
+            except ImportError:
+                print("  TRT-LLM attention import failed")
+                pass  # TRT-LLM attention not available
+
         # 5. Assign KV views
         self._assign_kv_cache_views(kv_managed)
 
@@ -714,6 +760,46 @@ class CachedSequenceInterface:
         if self._kv_cache_manager is not None:
             self._kv_cache_manager.shutdown()
         self._clear_caches()
+
+    def _try_resize_pt_cache_backend(self, new_num_pages: int) -> bool:
+        """Try to resize using PTCacheBackend if available.
+
+        Returns True if PTCacheBackend handled the resize, False otherwise.
+        """
+        try:
+            from ..custom_ops.trtllm_attention import get_pt_cache_backend
+
+            pt_backend = get_pt_cache_backend()
+            if pt_backend is not None:
+                return pt_backend.resize(new_num_pages)
+        except ImportError:
+            pass
+        return False
+
+    def _regenerate_cache_views(self):
+        """Regenerate cache tensors after pool reallocation.
+
+        This is called after PTCacheBackend reallocates its pool.
+        It re-invokes cache initializers to get new views into the pool.
+        """
+        regenerated = 0
+        # Only regenerate k_cache and v_cache (KV caches that are views)
+        for name in list(self._caches.keys()):
+            if "k_cache" in name or "v_cache" in name:
+                if name in self._cache_initializers:
+                    old_ptr = self._caches[name].data_ptr()
+                    # Re-invoke initializer to get new view
+                    self._caches[name] = self._cache_initializers[name](self.info)
+                    new_ptr = self._caches[name].data_ptr()
+                    regenerated += 1
+                    if regenerated <= 2:  # Only log first 2
+                        ad_logger.info(
+                            f"[CachedSequenceInterface] Regenerated {name}: "
+                            f"old_ptr=0x{old_ptr:x}, new_ptr=0x{new_ptr:x}, "
+                            f"shape={self._caches[name].shape}"
+                        )
+
+        ad_logger.info(f"[CachedSequenceInterface] Regenerated {regenerated} cache views")
 
 
 GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]

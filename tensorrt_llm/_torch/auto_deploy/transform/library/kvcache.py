@@ -28,13 +28,16 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionRegistry,
+    CacheConfig,
     Constant,
     PrepareMetadataCallable,
 )
+from ...custom_ops.trtllm_attention import enable_pt_cache_backend
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info
+from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ..interface import (
     BaseTransform,
@@ -49,6 +52,17 @@ class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
     backend: Optional[str] = Field(default=None, description="The attention backend to use.")
+    cache_config: CacheConfig = Field(
+        default_factory=CacheConfig, description="The custom cache configuration to use."
+    )
+    use_pt_cache_backend: bool = Field(
+        default=False,
+        description=(
+            "Use PT's KVCacheManager for efficient metadata preparation (TRT-LLM backend only). "
+            "This provides ~50% faster metadata preparation via C++ code paths and "
+            "pre-allocated tensors for CUDA graph compatibility."
+        ),
+    )
 
 
 class _InsertCachedOperator(BaseTransform):
@@ -170,6 +184,17 @@ class _InsertCachedOperator(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Replace uncached source attention node with corresponding cached attn node."""
+        # Enable PT cache backend if configured (must be before attn_descriptor is used)
+        if self.config.use_pt_cache_backend and self.config.backend == "trtllm":
+            enable_pt_cache_backend(True)
+            self._log_info("Enabled PTCacheBackend for TRT-LLM attention (CUDA graph compatible)")
+        elif self.config.backend == "trtllm" and not self.config.use_pt_cache_backend:
+            ad_logger.warning(
+                "[TRT-LLM] Backend without PTCacheBackend may have limited CUDA graph support. "
+                "For optimal performance and full CUDA graph compatibility, "
+                "set use_pt_cache_backend=True in your config."
+            )
+
         attn_descriptor = self.attn_descriptor
 
         # Get all attention nodes and their info objects
