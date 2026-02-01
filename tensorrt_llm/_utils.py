@@ -186,6 +186,17 @@ _str_to_binding_dtype_dict = dict(
 )
 _binding_to_str_dtype = {v: k for k, v in _str_to_binding_dtype_dict.items()}
 
+_torch_dtype_to_binding_dict = {
+    torch.bfloat16: DataType.BF16,
+    torch.float16: DataType.HALF,
+    torch.float32: DataType.FLOAT,
+    torch.int64: DataType.INT64,
+    torch.int32: DataType.INT32,
+    torch.int8: DataType.INT8,
+    torch.bool: DataType.BOOL,
+    torch.float8_e4m3fn: DataType.FP8,
+}
+
 _binding_dtype_bits = {
     DataType.INT64: 64,
     DataType.FLOAT: 32,
@@ -223,6 +234,12 @@ def get_size_in_bytes(num_elements: int, dtype: DataType):
 def str_dtype_to_binding(dtype):
     ret = _str_to_binding_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
+def torch_dtype_to_binding(dtype):
+    ret = _torch_dtype_to_binding_dict.get(dtype)
+    assert ret is not None, f'Unsupported torch dtype: {dtype}'
     return ret
 
 
