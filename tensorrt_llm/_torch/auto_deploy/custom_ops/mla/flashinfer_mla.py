@@ -141,6 +141,7 @@ class _FlashInferMLAPlanner:
         qo_indptr_host: torch.Tensor,
         kv_indptr_host: torch.Tensor,
         plan_params: MLAPrefillPlanParams,
+        custom_mask: Optional[torch.Tensor] = None,
     ) -> flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper:
         """Plan prefill using BatchPrefillWithRaggedKVCacheWrapper.
 
@@ -151,20 +152,36 @@ class _FlashInferMLAPlanner:
             qo_indptr_host: Cumulative query/output lengths on host.
             kv_indptr_host: Cumulative key/value lengths on host.
             plan_params: Parameters for planning (hashable, no tensors).
+            custom_mask: Optional custom attention mask tensor on CUDA.
         """
-        if plan_params != self.plan_params_prefill:
+        # Always re-plan when custom_mask is provided since the mask changes per batch
+        needs_replan = (plan_params != self.plan_params_prefill) or (custom_mask is not None)
+
+        if needs_replan:
+            # Use causal=True as fallback when no custom_mask is provided
+            use_causal = custom_mask is None
+
+            # When using custom_mask, FlashInfer expects indptr tensors on CUDA
+            if custom_mask is not None:
+                qo_indptr = qo_indptr_host.to(custom_mask.device)
+                kv_indptr = kv_indptr_host.to(custom_mask.device)
+            else:
+                qo_indptr = qo_indptr_host
+                kv_indptr = kv_indptr_host
+
             self.prefill_wrapper.plan(
-                qo_indptr_host,
-                kv_indptr_host,
+                qo_indptr,
+                kv_indptr,
                 plan_params.num_heads,
                 plan_params.num_kv_heads,
                 plan_params.head_dim_qk,
                 head_dim_vo=plan_params.head_dim_vo,
                 use_fp16_qk_reduction=False,
-                causal=True,
+                causal=use_causal,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
+                custom_mask=custom_mask,
             )
             self.plan_params_prefill = plan_params
 
@@ -282,6 +299,61 @@ class _FlashInferMLAPlanner:
 
 
 _GlobalFlashInferMLAPlanner = _FlashInferMLAPlanner()
+
+
+def _compute_ragged_causal_mask(
+    cu_seqlen_host: torch.Tensor,
+    num_seq: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute a causal mask for FlashInfer ragged prefill (fully GPU-vectorized).
+
+    For ragged attention with multiple sequences, this function creates a
+    causal mask where each sequence has its own lower triangular (causal) mask.
+    The masks are flattened and concatenated into a single 1D tensor.
+
+    This implementation is fully vectorized on GPU with no Python loops.
+
+    Args:
+        cu_seqlen_host: Cumulative sequence lengths on host [num_seq + 1].
+                        seq_len[i] = cu_seqlen_host[i+1] - cu_seqlen_host[i]
+        num_seq: Number of sequences in the batch.
+        device: Device to create the mask on.
+
+    Returns:
+        A flattened boolean mask tensor where True = attend, False = mask out.
+        Shape: (sum(seq_len[i] * seq_len[i] for i in range(num_seq)),)
+    """
+    # Move sequence lengths to GPU for vectorized computation
+    seq_lens = (cu_seqlen_host[1 : num_seq + 1] - cu_seqlen_host[:num_seq]).to(device)
+
+    # Compute squared lengths (mask size per sequence) and total
+    sq_lens = seq_lens * seq_lens
+    total_mask_size = sq_lens.sum().item()
+
+    # Cumulative squared lengths (offsets into flattened mask)
+    cu_sq_lens = torch.zeros(num_seq + 1, device=device, dtype=seq_lens.dtype)
+    cu_sq_lens[1:] = torch.cumsum(sq_lens, dim=0)
+
+    # Create position indices for the entire mask
+    positions = torch.arange(total_mask_size, device=device)
+
+    # Find which sequence each position belongs to using searchsorted
+    # right=True ensures positions at boundaries map to the next sequence
+    seq_ids = torch.searchsorted(cu_sq_lens[1:], positions, right=True)
+
+    # Compute local position within each sequence's mask
+    local_pos = positions - cu_sq_lens[seq_ids]
+
+    # Get sequence length for each position
+    seq_len_per_pos = seq_lens[seq_ids]
+
+    # Compute row and column within each sequence's 2D mask
+    row = local_pos // seq_len_per_pos
+    col = local_pos % seq_len_per_pos
+
+    # Causal mask: attend if row >= col (lower triangular)
+    return row >= col
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_mla_prepare_metadata", mutates_args=())
@@ -487,6 +559,13 @@ def flashinfer_mla_with_cache(
         # K: [tokens, N, qk_head_dim]
         k_prefill = torch.cat([k_nope_prefill, kpe_expanded], dim=-1).contiguous()
 
+        # Compute the causal mask for ragged prefill
+        custom_mask = _compute_ragged_causal_mask(
+            cu_seqlen_host=cu_seqlen_host,
+            num_seq=num_prefill,
+            device=q_nope.device,
+        )
+
         pp_prefill = MLAPrefillPlanParams(
             num_heads=num_heads,
             num_kv_heads=num_heads,  # For MLA with expanded KV, same as num_heads
@@ -502,6 +581,7 @@ def flashinfer_mla_with_cache(
             qo_indptr_host=cu_seqlen_host[: num_prefill + 1],
             kv_indptr_host=cu_seqlen_host[: num_prefill + 1],  # Same as qo for self-attention
             plan_params=pp_prefill,
+            custom_mask=custom_mask,
         )
 
         y_prefill = wrapper_prefill.run(
