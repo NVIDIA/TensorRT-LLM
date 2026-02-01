@@ -22,14 +22,14 @@ Eagle drafter implementations.
 """
 
 from contextlib import nullcontext
-from typing import Dict, Type
+from typing import Dict
 
 import torch.nn as nn
 from accelerate import init_empty_weights
 from torch._prims_common import DeviceLikeType
-from transformers import PreTrainedModel
 
-from .custom.modeling_eagle import Eagle3DrafterForCausalLM
+from ..utils.logger import ad_logger
+from .custom.modeling_eagle import Eagle3DrafterForCausalLM, EagleConfig
 from .factory import ModelFactoryRegistry
 from .hf import AutoModelForCausalLMFactory
 
@@ -47,23 +47,28 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
     (e.g., "llama") along with Eagle-specific fields like draft_vocab_size.
     """
 
-    # Map config model_type -> Eagle drafter model class
-    _drafter_model_mapping: Dict[str, Type[PreTrainedModel]] = {
+    _drafter_classes: Dict[str, type] = {
         "llama": Eagle3DrafterForCausalLM,
     }
 
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         model_config, unused_kwargs = self._get_model_config()
 
-        # Select the appropriate drafter class based on the base model type
-        match model_config.model_type:
-            case "llama":
-                drafter_cls = self._drafter_model_mapping["llama"]
-            case _:
-                raise ValueError(
-                    f"Unsupported model_type '{model_config.model_type}' for Eagle drafter. "
-                    f"Supported types: {list(self._drafter_model_mapping.keys())}"
-                )
+        # Select the appropriate drafter class and config based on the base model type
+        model_type = model_config.model_type
+        if model_type not in self._drafter_classes:
+            raise ValueError(
+                f"Unsupported model_type '{model_type}' for Eagle drafter. "
+                f"Supported types: {list(self._drafter_classes.keys())}"
+            )
+        drafter_cls = self._drafter_classes[model_type]
+        ad_logger.info(
+            f"EagleDrafterFactory: model_type='{model_type}' -> drafter_cls={drafter_cls.__name__}"
+        )
+
+        # Convert base config to EagleConfig, preserving existing values
+        # and applying model-specific defaults based on model_type
+        model_config = EagleConfig(model_config, model_type)
 
         # Build the model (same pattern as parent's _build_model)
         with (init_empty_weights if device == "meta" else nullcontext)():
@@ -83,7 +88,7 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
         return model
 
-    def build_and_load_model(self, device: DeviceLikeType) -> nn.Module:
+    def build_and_load_model(self, _device: DeviceLikeType) -> nn.Module:
         raise NotImplementedError(
             "EagleDrafterFactory does not support build_and_load_model(). "
             "Use build_model() + load_or_random_init() instead."
