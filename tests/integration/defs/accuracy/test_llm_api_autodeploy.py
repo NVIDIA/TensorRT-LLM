@@ -370,12 +370,13 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
         return {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "compile_backend": "torch-simple",
-            "max_batch_size": 16,
+            "compile_backend": "torch-cudagraph",
+            "max_batch_size": 128,
             "max_seq_len": self.MAX_SEQ_LEN,
             "max_num_tokens": self.MAX_NUM_TOKENS,
             "skip_loading_weights": False,
-            "disable_overlap_scheduler": True,
+            "disable_overlap_scheduler": False,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.88

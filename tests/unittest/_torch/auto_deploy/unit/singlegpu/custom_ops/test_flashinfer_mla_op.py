@@ -623,9 +623,9 @@ def test_flashinfer_mla_op_decode(prefill_seq_length, num_heads, batch_size, dty
     )
 
 
-@pytest.mark.parametrize("prefill_seq_length", [16, 64, 128])
-@pytest.mark.parametrize("num_heads", [1])
-@pytest.mark.parametrize("batch_size", [4, 64])
+@pytest.mark.parametrize("prefill_seq_length", [16, 128, 1024])
+@pytest.mark.parametrize("num_heads", [1, 8])
+@pytest.mark.parametrize("batch_size", [4, 64, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
 def test_flashinfer_mla_context_and_generate(
@@ -642,11 +642,10 @@ def test_flashinfer_mla_context_and_generate(
     qk_rope_head_dim = 64  # Must be 64 for FlashInfer MLA.
     kv_lora_rank = 512  # Must be 512 for FlashInfer MLA.
     v_head_dim = 128
-    # Use page_size > prefill_seq_length to avoid page overflow during generate.
-    # This ensures context and generate phases use the same page assignments.
-    page_size = prefill_seq_length + 16
+    # Use a fixed page_size of 64 for FlashInfer MLA.
+    page_size = 64
 
-    max_seq_len = 256
+    max_seq_len = 2048
     max_num_pages = batch_size * (max_seq_len // page_size + 1)
 
     # =========================================================================
@@ -763,8 +762,8 @@ def test_flashinfer_mla_context_and_generate(
     assert torch.allclose(
         flashinfer_output_context_reshaped.cpu().to(torch.float32),
         torch_output_context_reshaped.cpu().to(torch.float32),
-        atol=0.05,
-        rtol=0.02,
+        atol=0.01,
+        rtol=0.01,
     ), "Context phase outputs don't match"
 
     # =========================================================================
@@ -1008,3 +1007,299 @@ def test_flashinfer_mla_with_variable_seq_lengths(seq_lengths, num_heads, dtype,
 
     # Verify output is finite
     assert torch.isfinite(flashinfer_output).all(), "Output contains NaN or Inf values"
+
+
+@pytest.mark.parametrize(
+    "seq_lengths",
+    [
+        [8, 16, 32],
+        [12, 24, 48, 64],
+        [16, 32, 64, 96, 128],
+    ],
+)
+@pytest.mark.parametrize("num_decode_steps", [3, 5])
+@pytest.mark.parametrize("num_heads", [8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_mla_variable_seq_multi_decode(
+    seq_lengths, num_decode_steps, num_heads, dtype, device
+):
+    """Test FlashInfer MLA with variable sequence lengths and multiple decode steps.
+
+    This test verifies the full workflow with variable sequence lengths:
+    1. Context phase: Process initial sequences with different lengths
+    2. Multiple decode steps: Generate multiple tokens, updating the cache each step
+
+    Compares torch_backend_mla_with_cache against flashinfer_mla_with_cache.
+    """
+    batch_size = len(seq_lengths)
+
+    # MLA dimensions
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64  # Must be 64 for FlashInfer MLA.
+    kv_lora_rank = 512  # Must be 512 for FlashInfer MLA.
+    v_head_dim = 128
+    page_size = 64
+
+    max_seq_len = max(seq_lengths) + num_decode_steps + 128  # Extra headroom
+    max_num_pages = batch_size * (max_seq_len // page_size + 2)
+
+    # Create individual inputs for each sequence (context phase)
+    total_tokens = sum(seq_lengths)
+
+    q_nope_list = []
+    q_pe_list = []
+    compressed_kv_list = []
+    kpe_list = []
+
+    for seq_len in seq_lengths:
+        inputs = _create_mla_inputs(
+            1,  # Single sequence
+            seq_len,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
+            dtype,
+            device,
+        )
+        q_nope_list.append(inputs["q_nope"].squeeze(0))
+        q_pe_list.append(inputs["q_pe"].squeeze(0))
+        compressed_kv_list.append(inputs["compressed_kv"].squeeze(0))
+        kpe_list.append(inputs["kpe"].squeeze(0))
+
+    # Concatenate into flattened format for context phase
+    q_nope_flat = torch.cat(q_nope_list, dim=0).unsqueeze(0)  # [1, total_tokens, N, D]
+    q_pe_flat = torch.cat(q_pe_list, dim=0).unsqueeze(0)
+    compressed_kv_flat = torch.cat(compressed_kv_list, dim=0).unsqueeze(0)
+    kpe_flat = torch.cat(kpe_list, dim=0).unsqueeze(0)
+
+    # Common kv_b_proj_weight
+    kv_head_dim = qk_nope_head_dim + v_head_dim
+    weight_scale = 1.0 / (kv_lora_rank**0.5)
+    kv_b_proj_weight = (
+        torch.randn(num_heads * kv_head_dim, kv_lora_rank, dtype=dtype, device=device)
+        * weight_scale
+    )
+
+    input_positions_context = [0] * batch_size
+
+    # =========================================================================
+    # Context phase - Setup both backends
+    # =========================================================================
+
+    # Create torch unpaged cache
+    torch_meta = _create_unpaged_cache_and_metadata(
+        batch_size,
+        max_seq_len,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        seq_lengths,
+        input_positions_context,
+    )
+
+    # Create flashinfer paged cache
+    flashinfer_meta = _create_paged_cache_and_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        seq_lengths,
+        input_positions_context,
+    )
+
+    # Run torch backend context
+    torch_output_context = torch.ops.auto_deploy.torch_cached_mla_with_cache(
+        q_nope_flat,
+        q_pe_flat,
+        compressed_kv_flat,
+        kpe_flat,
+        kv_b_proj_weight,
+        torch_meta["batch_info_host"],
+        torch_meta["seq_len"],
+        torch_meta["input_pos"],
+        torch_meta["slot_idx"],
+        torch_meta["cu_seqlen"],
+        torch_meta["mla_cache"],
+        None,
+        kv_lora_rank,
+    )
+
+    # Run FlashInfer context
+    _GlobalFlashInferMLAPlanner.reset(torch.device(device))
+
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    qo_indptr[1:] = torch.cumsum(torch.tensor(seq_lengths, device=device), dim=0).int()
+
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            flashinfer_meta["cu_num_pages"],
+            flashinfer_meta["last_page_len"],
+            page_size=page_size,
+        ),
+        total_tokens,
+    )
+
+    flashinfer_output_context = torch.ops.auto_deploy.flashinfer_mla_with_cache(
+        q_nope_flat,
+        q_pe_flat,
+        compressed_kv_flat,
+        kpe_flat,
+        kv_b_proj_weight,
+        flashinfer_meta["batch_info_host"],
+        flashinfer_meta["cu_seqlen_host"],
+        flashinfer_meta["cu_num_pages"],
+        flashinfer_meta["cu_num_pages_host"],
+        flashinfer_meta["cache_loc"],
+        flashinfer_meta["last_page_len"],
+        flashinfer_meta["last_page_len_host"],
+        flashinfer_meta["seq_len_with_cache_host"],
+        batch_indices,
+        positions,
+        flashinfer_meta["mla_cache"],
+        None,
+        kv_lora_rank,
+    )
+
+    # Verify context outputs match
+    assert torch.allclose(
+        flashinfer_output_context.cpu().to(torch.float32),
+        torch_output_context.cpu().to(torch.float32),
+        atol=0.05,
+        rtol=0.02,
+    ), (
+        f"Context phase outputs don't match. "
+        f"Max diff: {(flashinfer_output_context - torch_output_context).abs().max():.6f}"
+    )
+
+    # =========================================================================
+    # Multiple decode steps
+    # =========================================================================
+    current_positions = list(seq_lengths)  # Track current position for each sequence
+
+    for decode_step in range(num_decode_steps):
+        # Create decode inputs for this step
+        inputs_decode = _create_mla_inputs(
+            batch_size,
+            1,  # seq_length = 1 for decode
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
+            dtype,
+            device,
+        )
+
+        seq_lengths_decode = [1] * batch_size
+        input_positions_decode = current_positions.copy()
+
+        # Update torch metadata for decode
+        torch_meta_decode = _create_unpaged_cache_and_metadata(
+            batch_size,
+            max_seq_len,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype,
+            device,
+            seq_lengths_decode,
+            input_positions_decode,
+        )
+        # Use the same cache (accumulated from context and previous decode steps)
+        torch_meta_decode["mla_cache"] = torch_meta["mla_cache"]
+
+        # Update flashinfer metadata for decode
+        flashinfer_meta_decode = _create_paged_cache_and_metadata(
+            batch_size,
+            max_num_pages,
+            page_size,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype,
+            device,
+            seq_lengths_decode,
+            input_positions_decode,
+        )
+        # Use the same cache
+        flashinfer_meta_decode["mla_cache"] = flashinfer_meta["mla_cache"]
+
+        # Run torch backend decode
+        torch_output_decode = torch.ops.auto_deploy.torch_cached_mla_with_cache(
+            inputs_decode["q_nope"],
+            inputs_decode["q_pe"],
+            inputs_decode["compressed_kv"],
+            inputs_decode["kpe"],
+            kv_b_proj_weight,
+            torch_meta_decode["batch_info_host"],
+            torch_meta_decode["seq_len"],
+            torch_meta_decode["input_pos"],
+            torch_meta_decode["slot_idx"],
+            torch_meta_decode["cu_seqlen"],
+            torch_meta_decode["mla_cache"],
+            None,
+            kv_lora_rank,
+        )
+
+        # Run FlashInfer decode
+        _GlobalFlashInferMLAPlanner.reset(torch.device(device))
+
+        qo_indptr_decode = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        qo_indptr_decode[1:] = torch.cumsum(
+            torch.tensor(seq_lengths_decode, device=device), dim=0
+        ).int()
+
+        batch_indices_decode, positions_decode = flashinfer.get_batch_indices_positions(
+            qo_indptr_decode,
+            flashinfer.get_seq_lens(
+                flashinfer_meta_decode["cu_num_pages"],
+                flashinfer_meta_decode["last_page_len"],
+                page_size=page_size,
+            ),
+            batch_size,
+        )
+
+        flashinfer_output_decode = torch.ops.auto_deploy.flashinfer_mla_with_cache(
+            inputs_decode["q_nope"],
+            inputs_decode["q_pe"],
+            inputs_decode["compressed_kv"],
+            inputs_decode["kpe"],
+            kv_b_proj_weight,
+            flashinfer_meta_decode["batch_info_host"],
+            flashinfer_meta_decode["cu_seqlen_host"],
+            flashinfer_meta_decode["cu_num_pages"],
+            flashinfer_meta_decode["cu_num_pages_host"],
+            flashinfer_meta_decode["cache_loc"],
+            flashinfer_meta_decode["last_page_len"],
+            flashinfer_meta_decode["last_page_len_host"],
+            flashinfer_meta_decode["seq_len_with_cache_host"],
+            batch_indices_decode,
+            positions_decode,
+            flashinfer_meta_decode["mla_cache"],
+            None,
+            kv_lora_rank,
+        )
+
+        # Verify decode outputs match
+        assert torch.allclose(
+            flashinfer_output_decode.cpu().to(torch.float32),
+            torch_output_decode.cpu().to(torch.float32),
+            atol=0.05,
+            rtol=0.02,
+        ), (
+            f"Decode step {decode_step + 1} outputs don't match. "
+            f"Max diff: {(flashinfer_output_decode - torch_output_decode).abs().max():.6f}"
+        )
+        # Update positions for next decode step
+        current_positions = [pos + 1 for pos in current_positions]
+
+    # Final verification: all outputs should be finite
+    assert torch.isfinite(flashinfer_output_decode).all(), (
+        "Final decode output contains NaN or Inf values"
+    )

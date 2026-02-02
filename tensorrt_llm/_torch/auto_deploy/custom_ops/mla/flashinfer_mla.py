@@ -495,7 +495,11 @@ def flashinfer_mla_with_cache(
 
     page_size = mla_cache.shape[1]
 
-    # Slice the combined cache into ckv and kpe portions (zero-copy views)
+    # Slice the combined cache into ckv and kpe portions (zero-copy views).
+    # NOTE: These slices are NON-CONTIGUOUS because they share the underlying storage
+    # with different stride patterns. FlashInfer's MLA decode kernel requires contiguous
+    # tensors, so we call .contiguous() when passing to wrapper.run() in the decode path.
+    # See the TODO comment in the decode section for performance improvement ideas.
     ckv_cache = mla_cache[:, :, :kv_lora_rank]
     kpe_cache = mla_cache[:, :, kv_lora_rank:]
 
@@ -599,8 +603,8 @@ def flashinfer_mla_with_cache(
     # DECODE phase: Use BatchMLAPagedAttentionWrapper with paged compressed KV
     # =========================================================================
     if num_decode > 0:
-        q_nope_decode = q_nope_flat[num_prefill_tokens:num_total_tokens]
-        q_pe_decode = q_pe_flat[num_prefill_tokens:num_total_tokens]
+        q_nope_decode = q_nope_flat[num_prefill_tokens:num_total_tokens].contiguous()
+        q_pe_decode = q_pe_flat[num_prefill_tokens:num_total_tokens].contiguous()
 
         # FlashInfer MLA operates in the compressed latent space.
         # We need to:
@@ -623,7 +627,7 @@ def flashinfer_mla_with_cache(
         # q_nope_decode: [num_decode, N, qk_nope_head_dim]
         # w_kn: [N, qk_nope_head_dim, kv_lora_rank]
         # q_nope_absorbed: [num_decode, N, kv_lora_rank]
-        q_nope_absorbed = torch.einsum("bnd,ndk->bnk", q_nope_decode, w_kn)
+        q_nope_absorbed = torch.einsum("bnd,ndk->bnk", q_nope_decode, w_kn).contiguous()
 
         pp_decode = MLADecodePlanParams(
             num_heads=num_heads,
@@ -647,11 +651,21 @@ def flashinfer_mla_with_cache(
 
         # Run attention in compressed space
         # y_decode_compressed: [num_decode, N, kv_lora_rank]
+        #
+        # IMPORTANT: ckv_cache and kpe_cache are non-contiguous slices of the combined
+        # mla_cache tensor (sliced on the last dimension). FlashInfer's MLA kernel does
+        # not correctly handle these non-contiguous stride patterns, causing incorrect
+        # memory access and wrong attention outputs.
+        #
+        # TODO(perf): The .contiguous() calls here copy the entire KV cache each decode
+        # step, which is expensive. A better solution would be to store ckv and kpe as
+        # separate contiguous tensors from the start, avoiding the copy. This requires
+        # changes to the cache allocation in FlashInferMLAAttention.get_cache_cls().
         y_decode_compressed = wrapper_decode.run(
             q_nope_absorbed,
             q_pe_decode,
-            ckv_cache,
-            kpe_cache,
+            ckv_cache.contiguous(),
+            kpe_cache.contiguous(),
         )
 
         # Project output back from latent space to v_head_dim
