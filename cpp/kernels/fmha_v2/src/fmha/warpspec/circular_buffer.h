@@ -465,7 +465,7 @@ public:
         // Make sure barrier is not moving around
         if (_id == 0)
         {
-            named_barrier_wait(_barrier_id, 256);
+            named_barrier_arrive_unaligned(_barrier_id, 256);
         }
     }
 
@@ -474,7 +474,7 @@ public:
         // Make sure barrier is not moving around
         if (_id == 1)
         {
-            named_barrier_wait(_barrier_id, 256);
+            named_barrier_wait_unaligned(_barrier_id, 256);
         }
         // Softmax starts
         // ...
