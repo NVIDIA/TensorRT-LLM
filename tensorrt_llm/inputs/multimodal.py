@@ -581,43 +581,23 @@ def serialize_item(obj: object) -> bytes:
     raise ValueError(f"Unsupported object type: {type(obj)}")
 
 
-def uuid_to_hash(uuid_str: str, hash_lib=default_hasher) -> str:
-    """Convert a UUID string to a 64-character hex hash.
-
-    If the UUID string is 32 bytes or less, it is zero-padded to 32 bytes
-    and converted to hex. If longer than 32 bytes, the string is hashed
-    to produce a 32-byte digest.
-
-    Args:
-        uuid_str: The UUID string to convert
-        hash_lib: Hash function to use (default: blake3)
-
-    Returns:
-        A 64-character hexadecimal string representing the 32-byte hash
-    """
-    uuid_bytes = uuid_str.encode('utf-8')
-    if len(uuid_bytes) <= 32:
-        # Pad with zeros to 32 bytes and convert to hex
-        padded = uuid_bytes.ljust(32, b'\x00')
-        return padded.hex()
-    else:
-        # Hash the UUID to get 32 bytes
-        hasher = hash_lib()
-        hasher.update(uuid_bytes)
-        return hasher.hexdigest()
-
-
 def apply_mm_hashes(
     mm_data: Dict[str, Any],
     mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
     hash_lib=default_hasher
 ) -> Tuple[Dict[str, List[str]], Optional[List[Optional[str]]]]:
-    """Apply hashing to multimodal data items, using UUIDs when provided.
+    """Apply hashing to multimodal data items, combining UUID with content when provided.
+
+    When a UUID is provided for an item, the hash is computed from both the UUID
+    and the content together: BLAKE3(UUID || Content). This ensures:
+    - Cache correctness: Different content always produces different hashes
+    - User isolation: Same content with different UUIDs produces different hashes
+    - The original UUID string is preserved and returned in KV cache events
 
     Args:
         mm_data: Dictionary of modality -> data items
         mm_uuids: Optional dictionary of modality -> list of UUID strings.
-                  Use None for items that should use content-based hashing.
+                  Use None for items that should use content-based hashing only.
         hash_lib: Hash function to use (default: blake3)
 
     Returns:
@@ -626,30 +606,52 @@ def apply_mm_hashes(
         - Flattened list of original UUID strings (or None for content-hashed items)
     """
 
-    def _hash_image(image):
-        # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
-        hasher = hash_lib()
-        if isinstance(image, torch.Tensor):
+    def _hash_content(hasher, item):
+        """Hash the content of a multimodal item into the provided hasher."""
+        if isinstance(item, torch.Tensor):
             # Ensure tensor is on CPU and contiguous for consistent hashing
-            image = image.detach().cpu().contiguous()
-            hasher.update(serialize_item(image))
-        elif isinstance(image, list):
+            item = item.detach().cpu().contiguous()
+            hasher.update(serialize_item(item))
+        elif isinstance(item, list):
             # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
-            for frame in image:
+            for frame in item:
                 hasher.update(b"<frame>")
                 if isinstance(frame, torch.Tensor):
                     frame = frame.detach().cpu().contiguous()
                 hasher.update(serialize_item(frame))
-        elif isinstance(image, tensorrt_llm.inputs.utils.VideoData):
-            frames = image.frames
+        elif isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+            frames = item.frames
             for frame in frames:
                 hasher.update(b"<frame>")
                 if isinstance(frame, torch.Tensor):
                     frame = frame.detach().cpu().contiguous()
                 hasher.update(serialize_item(frame))
         else:
-            hasher.update(serialize_item(image))
+            hasher.update(serialize_item(item))
 
+    def _hash_item(item):
+        """Hash only the content of a multimodal item (no UUID)."""
+        # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
+        hasher = hash_lib()
+        _hash_content(hasher, item)
+        return hasher.hexdigest()
+
+    def _hash_item_with_uuid(item, uuid: str):
+        """Hash UUID and content together: BLAKE3(UUID || Content).
+
+        This creates a unique hash that incorporates both the user-provided
+        identifier and the actual content, ensuring cache correctness while
+        supporting user-defined cache isolation.
+        """
+        hasher = hash_lib()
+        # Hash UUID first with delimiters to prevent length-extension ambiguity
+        hasher.update(b"<uuid>")
+        hasher.update(uuid.encode('utf-8'))
+        hasher.update(b"</uuid>")
+        # Then hash the content
+        hasher.update(b"<content>")
+        _hash_content(hasher, item)
+        hasher.update(b"</content>")
         return hasher.hexdigest()
 
     mm_items = {
@@ -677,12 +679,12 @@ def apply_mm_hashes(
         for i, item in enumerate(items):
             uuid = modality_uuids[i] if modality_uuids else None
             if uuid is not None:
-                # Use UUID-based hash
-                hashes.append(uuid_to_hash(uuid, hash_lib))
+                # Hash UUID + content together for cache correctness
+                hashes.append(_hash_item_with_uuid(item, uuid))
                 all_uuids.append(uuid)  # Store original UUID
             else:
-                # Fall back to content-based hashing
-                hashes.append(_hash_image(item))
+                # Fall back to content-only hashing
+                hashes.append(_hash_item(item))
                 all_uuids.append(None)
 
         mm_hashes[modality] = hashes

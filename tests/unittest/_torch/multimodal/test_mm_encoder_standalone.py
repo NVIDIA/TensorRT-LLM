@@ -240,17 +240,16 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
         for inp in inputs:
             _ = llm.generate([inp], sampling_params=sampling_params)
 
+        # Wait for KV cache events to be dispatched asynchronously
         time.sleep(0.5)
-        events = llm.get_kv_cache_events(10)
+        events = llm.get_kv_cache_events(50)
 
     # Extract mm_keys from stored events
     mm_keys_found = []
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
-                if block.get("mm_keys"):
-                    for mm_key in block["mm_keys"]:
-                        mm_keys_found.append(mm_key)
+                mm_keys_found.extend(block.get("mm_keys", []))
 
     # Verify mm_keys were found (multimodal model should have them)
     assert len(mm_keys_found) > 0, "Expected mm_keys in stored events"
@@ -266,11 +265,8 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
             # Should be a 64-char hex string
             assert len(hash_value) == 64, (
                 f"Expected 64-char hex hash, got {len(hash_value)} chars")
-            # Verify it's valid hex
-            try:
-                bytes.fromhex(hash_value)
-            except ValueError:
-                pytest.fail(f"Hash '{hash_value}' is not valid hex")
+            # Verify it's valid hex (fromhex will raise ValueError if invalid)
+            bytes.fromhex(hash_value)
 
 
 def _load_inputs_with_uuids(llm: LLM, prompts, media, uuids):
@@ -349,19 +345,18 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
     with llm:
         _ = llm.generate([inp], sampling_params=sampling_params)
 
+        # Wait for KV cache events to be dispatched asynchronously
         time.sleep(0.5)
-        events = llm.get_kv_cache_events(20)
+        events = llm.get_kv_cache_events(50)
 
     # Collect all unique mm_key hashes from stored events
-    mm_key_hashes = []
+    mm_key_hashes = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
-                        hash_val = mm_key["hash"]
-                        if hash_val not in mm_key_hashes:
-                            mm_key_hashes.append(hash_val)
+                        mm_key_hashes.add(mm_key["hash"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
@@ -427,8 +422,9 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
         for inp in inputs:
             _ = llm.generate([inp], sampling_params=sampling_params)
 
+        # Wait for KV cache events to be dispatched asynchronously
         time.sleep(0.5)
-        events = llm.get_kv_cache_events(30)
+        events = llm.get_kv_cache_events(50)
 
     # Collect all unique mm_key hashes from stored events
     mm_key_hashes = set()
@@ -512,19 +508,18 @@ def test_kv_event_mm_keys_with_very_long_uuid():
     with llm:
         _ = llm.generate([inp], sampling_params=sampling_params)
 
+        # Wait for KV cache events to be dispatched asynchronously
         time.sleep(0.5)
-        events = llm.get_kv_cache_events(30)
+        events = llm.get_kv_cache_events(50)
 
     # Collect all unique mm_key hashes from stored events
-    mm_key_hashes = []
+    mm_key_hashes = set()
     for event in events:
         if event and event.get("data", {}).get("type") == "stored":
             for block in event["data"].get("blocks", []):
                 if block.get("mm_keys"):
                     for mm_key in block["mm_keys"]:
-                        hash_val = mm_key["hash"]
-                        if hash_val not in mm_key_hashes:
-                            mm_key_hashes.append(hash_val)
+                        mm_key_hashes.add(mm_key["hash"])
 
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"

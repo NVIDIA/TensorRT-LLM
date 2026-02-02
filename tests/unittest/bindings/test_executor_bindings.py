@@ -1018,46 +1018,36 @@ def test_multimodal_input():
     assert config.multimodal_uuids is None
 
 
-def test_multimodal_input_with_uuids():
+@pytest.mark.parametrize(
+    "multimodal_uuids,expected_uuids",
+    [
+        # Test with all UUIDs provided
+        (["sku-image-001", "sku-image-002"], ["sku-image-001", "sku-image-002"]
+         ),
+        # Test with partial UUIDs (some None)
+        (["sku-image-001", None], ["sku-image-001", None]),
+        # Test with empty list of UUIDs
+        ([], []),
+        # Test with None (default)
+        (None, None),
+    ],
+    ids=["all_uuids", "partial_uuids", "empty_list", "none_default"])
+def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
     """Test MultimodalInput with user-provided UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
     multimodal_positions = [10, 100]
     multimodal_lengths = [50, 60]
 
-    # Test with all UUIDs provided
-    multimodal_uuids = ["sku-image-001", "sku-image-002"]
     config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
                                     multimodal_lengths, multimodal_uuids)
     assert config.multimodal_hashes == multimodal_hashes
     assert config.multimodal_positions == multimodal_positions
     assert config.multimodal_lengths == multimodal_lengths
-    assert config.multimodal_uuids == multimodal_uuids
-
-    # Test with partial UUIDs (some None)
-    multimodal_uuids_partial = ["sku-image-001", None]
-    config_partial = trtllm.MultimodalInput(multimodal_hashes,
-                                            multimodal_positions,
-                                            multimodal_lengths,
-                                            multimodal_uuids_partial)
-    assert config_partial.multimodal_uuids == multimodal_uuids_partial
-
-    # Test with empty list of UUIDs
-    config_empty = trtllm.MultimodalInput(multimodal_hashes,
-                                          multimodal_positions,
-                                          multimodal_lengths, [])
-    assert config_empty.multimodal_uuids == []
-
-    # Test with None (default)
-    config_none = trtllm.MultimodalInput(multimodal_hashes,
-                                         multimodal_positions,
-                                         multimodal_lengths, None)
-    assert config_none.multimodal_uuids is None
+    assert config.multimodal_uuids == expected_uuids
 
 
 def test_multimodal_input_pickle_with_uuids():
     """Test pickling and unpickling of MultimodalInput with UUIDs."""
-    import pickle
-
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
     multimodal_positions = [10, 100]
     multimodal_lengths = [50, 60]
