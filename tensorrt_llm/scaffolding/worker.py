@@ -174,7 +174,6 @@ class OpenaiWorker(Worker):
         task.output_tokens = response.choices[0].token_ids
         task.finish_reason = response.choices[0].finish_reason
         task.logprobs = response.choices[0].logprobs
-        task.perf_metrics = response.perf_metrics
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         params = self.convert_task_params(task)
@@ -201,7 +200,6 @@ class OpenaiWorker(Worker):
         try:
             response = await self.async_client.chat.completions.create(**params)
             task.finish_reason = response.choices[0].finish_reason
-            task.perf_metrics = response.perf_metrics
             content = response.choices[0].message.content
             reasoning = response.choices[0].message.reasoning
             reasoning_content = response.choices[0].message.reasoning_content
