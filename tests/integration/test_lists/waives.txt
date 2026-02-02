@@ -357,3 +357,5 @@ unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_gptoss_style_nvfp4[lim
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] SKIP (https://nvbugs/5839155)
 disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf] SKIP (https://nvbugs/5839137)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=4] SKIP (https://nvbugs/5845943)
+accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph SKIP (https://nvbugs/5860520)
+unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_online_eplb288_topk_input[RoutingDSv3-1024-1024-256] SKIP (https://nvbugs/5859881)
