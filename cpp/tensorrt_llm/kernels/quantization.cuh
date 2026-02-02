@@ -778,6 +778,7 @@ quantize_with_block_size(
 
     // Get the global scaling factor, which will be applied to the SF.
     // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+    // This value is prepared by model, no need to be protected by ACKBULK
     float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
     // Is it swizzled layout?

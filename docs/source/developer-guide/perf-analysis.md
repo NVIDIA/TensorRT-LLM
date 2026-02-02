@@ -175,3 +175,4 @@ The perfect router logits are specifically designed for `RenormalizeMoeRoutingMe
 
 Currently supported:
 - GPT-OSS (uses `RenormalizeMoeRoutingMethod`)
+- DeepSeek-V3 / DeepSeek-R1 (uses `DeepSeekV3MoeRoutingMethod`)

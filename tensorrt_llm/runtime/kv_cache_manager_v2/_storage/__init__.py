@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ._config import BufferId
 from ._core import CacheLevelStorage
 
 # These are re-exported for external use
-__all__ = ["CacheLevelStorage"]
+__all__ = ["CacheLevelStorage", "BufferId"]

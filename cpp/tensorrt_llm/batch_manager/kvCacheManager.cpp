@@ -482,7 +482,6 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 
 void KVCacheBlock::freeDescendantsRecursively(std::shared_ptr<BaseEvictionPolicy> evictionPolicy)
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     bool hasChildren = !mNextBlocks.empty();
     if (hasChildren)
     {
