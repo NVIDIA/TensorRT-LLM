@@ -115,18 +115,12 @@ def with_mocked_hf_download(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        original_offline = os.environ.get("HF_HUB_OFFLINE")
-        os.environ["HF_HUB_OFFLINE"] = "1"
-
-        try:
-            with patch(
+        with (
+            patch.dict(os.environ, {"HF_HUB_OFFLINE": "1"}),
+            patch(
                 "tensorrt_llm.llmapi.utils.snapshot_download", side_effect=mock_snapshot_download
-            ):
-                return func(*args, **kwargs)
-        finally:
-            if original_offline is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = original_offline
+            ),
+        ):
+            return func(*args, **kwargs)
 
     return wrapper
