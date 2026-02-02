@@ -64,13 +64,26 @@ def create_kv_cache_transceiver(
             f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
-    if cache_transceiver_config.backend == "V2":
+
+    # Select transceiver implementation based on transceiver_runtime
+    # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
+    # transceiver_runtime == "PYTHON" -> use Python transceiver
+    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+        # Python transceiver currently only supports NIXL and DEFAULT backend
+        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+            raise ValueError(
+                f"Python transceiver currently only supports NIXL or DEFAULT backend, "
+                f"got {cache_transceiver_config.backend}. "
+                f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
+            )
         from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import \
             PyNativeCacheTransceiver
         logger.info("Using PyNativeCacheTransceiver")
         return PyNativeCacheTransceiver(mapping, dist, kv_cache_manager,
                                         attention_type,
                                         cache_transceiver_config)
+
+    # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config)
 

@@ -1413,8 +1413,20 @@ class TransferWorker:
             self._instance_info_server = None
         self._peer_registrar = PeerRegistrar(self._rank_info, self._instance_info)
         self._peer_kv_map = KVMapperFactory(self._peer_registrar, self._kv_cache_manager)
+
+        # NixlTransferAgent configuration from environment variables
+        # num_threads: number of dedicated threads for large batch transfers
+        # split_batch_size: batch size threshold to use dedicated threads (default 1024)
+        nixl_num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
+        nixl_agent_kwargs = {}
+        if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
+            nixl_agent_kwargs["split_batch_size"] = int(os.environ["TRTLLM_NIXL_SPLIT_BATCH_SIZE"])
+
         self._agent = NixlTransferAgent(
-            self._rank_info.instance_name + str(self._rank_info.instance_rank), True, num_threads=8
+            self._rank_info.instance_name + str(self._rank_info.instance_rank),
+            True,
+            num_threads=nixl_num_threads,
+            **nixl_agent_kwargs,
         )
         self._registered_mem = []
         self._register_kv_cache()
