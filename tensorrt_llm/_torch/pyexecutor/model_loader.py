@@ -222,7 +222,8 @@ class ModelLoader:
         if checkpoint_loader is None:
             return llm_args
 
-        config = checkpoint_loader.load_config(checkpoint_dir)
+        config = checkpoint_loader.load_config(checkpoint_dir,
+                                               trust_remote_code=True)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
 
