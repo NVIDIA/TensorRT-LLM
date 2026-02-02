@@ -386,82 +386,91 @@ class ModelLoader:
             return True
 
         hf_config_path = f"{self._model_dir}/config.json"
+        hf_quant_config = None
         if os.path.exists(hf_config_path):
             with open(hf_config_path, "r") as f:
                 hf_config = json.load(f)
                 hf_quant_config = hf_config.get("quantization_config", None)
+                if hf_quant_config is not None:
+                    logger.info(
+                        f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
+                    )
+        if self.llm_args.model_kwargs is not None and "quantization_config" in self.llm_args.model_kwargs:
+            logger.info(
+                f"Update hf_quant_config from model_kwargs: quantization_config={self.llm_args.model_kwargs['quantization_config']} (previous value: {hf_quant_config})"
+            )
+            hf_quant_config = self.llm_args.model_kwargs["quantization_config"]
+        elif hf_quant_config is not None:
+            logger.info(
+                f"Use quantization_config from {hf_config_path}: quantization_config={hf_quant_config}"
+            )
 
-            if hf_quant_config is not None:
-                logger.info(
-                    f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
-                )
-                # DeepSeek V3 FP8 ckpt
-                if hf_quant_config.get(
-                        "quant_method") == "fp8" and hf_quant_config.get(
-                            "weight_block_size"):
-                    quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                    quant_config.exclude_modules = ["*eh_proj"]
-                elif hf_quant_config.get("quant_method") == "mxfp4":
-                    from .._torch.model_config import ModelConfig
-                    quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                        self.llm_args.moe_config.backend)
-                    quant_config.group_size = 32
-                    quant_config.exclude_modules = [
-                        'block.*.attn.out', 'block.*.mlp.gate',
-                        'block.*.attn.qkv', 'embedding', 'unembedding'
-                    ]
-                # NOTE: This is for llm-compressor's quantized checkpoints.
-                elif hf_quant_config.get(
-                        "quant_method") == "compressed-tensors":
-                    config_groups = hf_quant_config.get("config_groups")
-                    if config_groups is None:
-                        raise ValueError(
-                            f"config_groups is not set in {hf_quant_config}.")
+        if hf_quant_config is not None:
+            # DeepSeek V3 FP8 ckpt
+            if hf_quant_config.get(
+                    "quant_method") == "fp8" and hf_quant_config.get(
+                        "weight_block_size"):
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.exclude_modules = ["*eh_proj"]
+            elif hf_quant_config.get("quant_method") == "mxfp4":
+                from .._torch.model_config import ModelConfig
+                quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                    self.llm_args.moe_config.backend)
+                quant_config.group_size = 32
+                quant_config.exclude_modules = [
+                    'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
+                    'embedding', 'unembedding'
+                ]
+            # NOTE: This is for llm-compressor's quantized checkpoints.
+            elif hf_quant_config.get("quant_method") == "compressed-tensors":
+                config_groups = hf_quant_config.get("config_groups")
+                if config_groups is None:
+                    raise ValueError(
+                        f"config_groups is not set in {hf_quant_config}.")
 
-                    weights_quant_config = config_groups["group_0"]["weights"]
-                    inputs_quant_config = config_groups["group_0"][
-                        "input_activations"]
-                    weights_quant_strategy = weights_quant_config["strategy"]
-                    inputs_quant_strategy = inputs_quant_config["strategy"]
+                weights_quant_config = config_groups["group_0"]["weights"]
+                inputs_quant_config = config_groups["group_0"][
+                    "input_activations"]
+                weights_quant_strategy = weights_quant_config["strategy"]
+                inputs_quant_strategy = inputs_quant_config["strategy"]
 
-                    if weights_quant_config["num_bits"] == 8:
-                        if weights_quant_strategy == "channel":
-                            if inputs_quant_strategy != "token":
-                                raise ValueError(
-                                    f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
-                                )
-                            quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-                        elif weights_quant_strategy == "block":
-                            if inputs_quant_strategy != "group":
-                                raise ValueError(
-                                    f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
-                                )
-                            quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                            group_size = inputs_quant_config["group_size"]
-
-                            # NOTE: TRT-LLM only supports group_size=128 for FP8_BLOCK_SCALES.
-                            if group_size != 128:
-                                raise ValueError(
-                                    f"Unsupported group_size: {group_size}. Supported: 128."
-                                )
-                            quant_config.group_size = group_size
-
-                        else:
+                if weights_quant_config["num_bits"] == 8:
+                    if weights_quant_strategy == "channel":
+                        if inputs_quant_strategy != "token":
                             raise ValueError(
-                                f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
-                                "Supported strategies: 'channel', 'block'.")
+                                f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
+                            )
+                        quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+                    elif weights_quant_strategy == "block":
+                        if inputs_quant_strategy != "group":
+                            raise ValueError(
+                                f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
+                            )
+                        quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                        group_size = inputs_quant_config["group_size"]
+
+                        # NOTE: TRT-LLM only supports group_size=128 for FP8_BLOCK_SCALES.
+                        if group_size != 128:
+                            raise ValueError(
+                                f"Unsupported group_size: {group_size}. Supported: 128."
+                            )
+                        quant_config.group_size = group_size
+
                     else:
                         raise ValueError(
-                            f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
-                            "Supported: 8.")
-
-                    quant_config.exclude_modules = hf_quant_config.get(
-                        "ignore", [])
+                            f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
+                            "Supported strategies: 'channel', 'block'.")
                 else:
-                    raise NotImplementedError(
-                        f"Unsupported quantization_config: {hf_quant_config}.")
+                    raise ValueError(
+                        f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
+                        "Supported: 8.")
 
-                return True
+                quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+            else:
+                raise NotImplementedError(
+                    f"Unsupported quantization_config: {hf_quant_config}.")
+
+            return True
 
         return False
 

@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include <cassert>
 #include <cstdio>
 #include <cuda.h>
@@ -24,6 +25,9 @@
 #include <memory>
 #include <unistd.h>
 #include <vector>
+
+namespace tc = tensorrt_llm::common;
+using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -158,6 +162,78 @@ CUresult copyHostToHost(std::vector<Task<MemAddress, MemAddress>> tasks, ssize_t
     using Data = UserData<MemAddress, MemAddress>;
     auto data = std::make_unique<Data>(Data{std::move(tasks), numBytes});
     return cuLaunchHostFunc(stream, hostFnHostToHostCopy, data.release());
+}
+
+SizeType32 IndexMapper::addNewSequence(LlmRequest::RequestIdType requestId)
+{
+    TLLM_CHECK(indexMap_.find(requestId) == indexMap_.end());
+    auto iter = freeIndices_.begin();
+    TLLM_CHECK_WITH_INFO(iter != freeIndices_.end(), "No free index found");
+    auto index = *iter;
+    freeIndices_.erase(iter);
+    indexMap_[requestId] = index;
+    return index;
+}
+
+SizeType32 IndexMapper::getIndex(LlmRequest::RequestIdType requestId)
+{
+    auto iter = indexMap_.find(requestId);
+    TLLM_CHECK_WITH_INFO(iter != indexMap_.end(), "Request ID not found in IndexMapper");
+    return iter->second;
+}
+
+void IndexMapper::removeSequence(LlmRequest::RequestIdType requestId)
+{
+    auto iter = indexMap_.find(requestId);
+    TLLM_CHECK(iter != indexMap_.end());
+    auto index = iter->second;
+    freeIndices_.insert(index);
+    indexMap_.erase(iter);
+}
+
+at::Tensor IndexMapper::getCopyIndex(
+    std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext, SizeType32 beamWidth)
+{
+    int numSeqs = numContext + beamWidth * (requestIds.size() - numContext);
+    SizeType32 batchSize = static_cast<SizeType32>(requestIds.size());
+    SizeType32 idx = 0;
+    for (SizeType32 i = 0; i < batchSize; i++)
+    {
+        if (i < numContext)
+        {
+            copyIndex_[idx++] = this->getIndex(requestIds[i]) * maxBeamWidth_;
+        }
+        else
+        {
+            for (SizeType32 j = 0; j < beamWidth; j++)
+            {
+                copyIndex_[idx++] = this->getIndex(requestIds[i]) * maxBeamWidth_ + j;
+            }
+        }
+    }
+
+    TLLM_CHECK_WITH_INFO(idx == numSeqs, "Index mapper failed to generate copy index");
+
+    return copyIndex_.slice(0, 0, numSeqs);
+}
+
+IndexMapper::IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth)
+    : maxBeamWidth_(maxBeamWidth)
+{
+    indexMap_.reserve(maxBatchSize);
+    for (SizeType32 i = 0; i < maxBatchSize; i++)
+    {
+        freeIndices_.insert(i);
+    }
+    // Allocate copyIndex_ memory as pinned (page-locked) host memory
+    copyIndex_
+        = at::empty({maxBatchSize * maxBeamWidth}, at::TensorOptions().dtype(at::ScalarType::Int).pinned_memory(true));
+}
+
+IndexMapper::~IndexMapper()
+{
+    indexMap_.clear();
+    freeIndices_.clear();
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

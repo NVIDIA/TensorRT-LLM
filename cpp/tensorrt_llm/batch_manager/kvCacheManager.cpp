@@ -485,7 +485,6 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 
 void KVCacheBlock::freeDescendantsRecursively()
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     bool hasChildren = !mNextBlocks.empty();
     if (hasChildren)
     {
