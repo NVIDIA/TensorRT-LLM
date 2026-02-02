@@ -47,5 +47,3 @@ transforms:
     enabled: true
   insert_cached_ssm_attention:
     backend: flashinfer_ssm
-    cache_config:
-      mamba_dtype: bfloat16
