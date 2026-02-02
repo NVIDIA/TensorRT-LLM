@@ -421,7 +421,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         return fetched_dir
 
-    def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
+    def _load_checkpoint(
+        self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
+    ):
         """Load the checkpoint into the model."""
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
@@ -436,16 +438,11 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # Ensure it's the first one.
         model._state_dict_hooks.move_to_end(key=get_handle.id, last=False)
 
-        # Choose loading method based on environment variable
-        # Default behavior: preload checkpoint files to CPU
-        # Set AUTO_DEPLOY_DEBUG_DISABLE_PRELOAD=1 to use accelerate's load_checkpoint_in_model (no CPU preload)
-        disable_preload = os.environ.get("AUTO_DEPLPY_DEBUG_DISABLE_PRELOAD", "0") == "1"
-
         try:
             if disable_preload:
                 # Load checkpoint directly to GPU using accelerate's load_checkpoint_in_model (no CPU preload)
                 ad_logger.info(
-                    "AUTO_DEPLOY_DEBUG_DISABLE_PRELOAD=1: Using accelerate's load_checkpoint_in_model (no CPU preload)"
+                    "disable_preload=True: Using accelerate's load_checkpoint_in_model (no CPU preload)"
                 )
                 with hf_load_state_dict_with_device(device):
                     load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
@@ -460,14 +457,10 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     def _load_checkpoint_with_preload(
         self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
     ):
-        ad_logger.info("Preloading full checkpoint to CPU memory...")
         all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
 
         ad_logger.info(f"Loading weights into model (device: {device})...")
         model.load_state_dict(all_weights, strict=False)
-
-        # Free CPU memory
-        del all_weights
 
         ad_logger.info("Checkpoint loading completed")
 
