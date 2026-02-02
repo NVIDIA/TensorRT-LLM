@@ -21,6 +21,7 @@ def enforce_single_worker(monkeypatch):
     yield
 
 
+@pytest.mark.skip("https://nvbugs/5758449")
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.high_cuda_memory
 def test_dynamic_spec_decode(enforce_single_worker,

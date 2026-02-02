@@ -284,8 +284,8 @@ class DeltaNet(nn.Module):
             beta = beta * 2.0
 
         if self.qk_norm == "l2":
-            q = torch.ops.auto_deploy.fla_l2norm(q)
-            k = torch.ops.auto_deploy.fla_l2norm(k)
+            q = torch.ops.auto_deploy.torch_l2norm(q)
+            k = torch.ops.auto_deploy.torch_l2norm(k)
         elif self.qk_norm == "sum":
             q = sum_norm(q).to(q)
             k = sum_norm(k).to(k)
