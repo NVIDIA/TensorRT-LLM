@@ -1452,6 +1452,7 @@ async def test_llm_disagg_streaming_gen_cancelled():
 
     try:
         num_iterations = 10
+        num_concurrent_requests = 20
         prev_after_free_num_blocks = 0
         for iter in range(num_iterations):
 
@@ -1460,60 +1461,74 @@ async def test_llm_disagg_streaming_gen_cancelled():
             disaggregated_params = DisaggregatedParams(
                 request_type="context_only")
 
-            prompt = [
+            prompts = [
                 "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua "
-                * random.randint(5, 15)
+                * random.randint(5, 15) for _ in range(num_concurrent_requests)
             ]
-            # Send context-only request
+            # Send context-only requests
             ctx_outputs = []
-            for output in llm_ctx.generate(
-                    prompt,
-                    sampling_params=sampling_params,
-                    disaggregated_params=disaggregated_params):
-                ctx_outputs.append(output)
+            for prompt in prompts:
+                for output in llm_ctx.generate(
+                    [prompt],
+                        sampling_params=sampling_params,
+                        disaggregated_params=disaggregated_params):
+                    ctx_outputs.append(output)
 
-            assert len(ctx_outputs) == 1
+            assert len(ctx_outputs) == num_concurrent_requests
 
             max_tokens = 300
             sampling_params = SamplingParams(max_tokens=max_tokens,
                                              ignore_eos=True)
-            disaggregated_params = ctx_outputs[0].disaggregated_params
-            disaggregated_params.request_type = "generation_only"
 
-            # Send gen-only request
-            tokens_out = 0
-            stop_after_tokens = random.randint(10, max_tokens)
-            finished_reason = None
-            async for gen_output in llm_gen.generate_async(
-                    prompt[0],
-                    sampling_params=sampling_params,
-                    disaggregated_params=disaggregated_params,
-                    streaming=True):
-                tokens_out += 1
-                finished_reason = gen_output.outputs[0].finish_reason
-                if tokens_out == stop_after_tokens:
-                    gen_output.abort()
+            # Send multiple gen-only requests concurrently
+            async def process_request(idx):
+                disagg_params = ctx_outputs[idx].disaggregated_params
+                disagg_params.request_type = "generation_only"
 
-            assert finished_reason is not None
-            assert finished_reason == "cancelled"
-            # Num check that the number of free/used blocks is as expected
+                tokens_out = 0
+                # Ensure we always cancel early to avoid race conditions
+                stop_after_tokens = random.randint(10, 50)
+                finished_reason = None
+                async for gen_output in llm_gen.generate_async(
+                        prompts[idx],
+                        sampling_params=sampling_params,
+                        disaggregated_params=disagg_params,
+                        streaming=True):
+                    tokens_out += 1
+                    finished_reason = gen_output.outputs[0].finish_reason
+                    if tokens_out == stop_after_tokens:
+                        gen_output.abort()
+
+                return finished_reason, stop_after_tokens
+
+            # Launch all requests concurrently
+            import asyncio
+            results = await asyncio.gather(
+                *[process_request(i) for i in range(num_concurrent_requests)])
+
+            # Verify all requests were cancelled
+            for finished_reason, stop_after_tokens in results:
+                assert finished_reason is not None
+                assert finished_reason == "cancelled"
+
+            # Check that the number of free/used blocks is as expected
             time.sleep(1.)
             max_retries = 10
             for _ in range(max_retries):
-                results = llm_gen.get_stats(2)
-                print("len(results):", len(results))
-                if len(results) > stop_after_tokens:
+                stats_results = llm_gen.get_stats(2)
+                print("len(stats_results):", len(stats_results))
+                if len(stats_results) > 0:
                     break
                 time.sleep(1)
             else:
-                pytest.fail(
-                    f"Failed to get stats with len=={stop_after_tokens} after {max_retries} retries"
-                )
+                pytest.fail(f"Failed to get stats after {max_retries} retries")
 
-            after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
+            after_used_num_blocks = stats_results[-1]["kvCacheStats"][
+                "usedNumBlocks"]
             assert after_used_num_blocks == 0
 
-            after_free_num_blocks = results[-1]["kvCacheStats"]["freeNumBlocks"]
+            after_free_num_blocks = stats_results[-1]["kvCacheStats"][
+                "freeNumBlocks"]
             # Check that number of free blocks stays the same
             if iter > 0:
                 assert after_free_num_blocks == prev_after_free_num_blocks
