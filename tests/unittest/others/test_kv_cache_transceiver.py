@@ -11,8 +11,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
     create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -197,6 +199,243 @@ def test_cancel_request_in_transmission(attention_type):
                                            gen_request)
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
+
+    # Block the main thread due to the async operation
+    time.sleep(2)
+    assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+def create_hybrid_cache_manager(mapping, dtype):
+    """
+    Create a MambaHybridCacheManager for testing hybrid models.
+    This manager handles both KV cache (attention layers) and Mamba cache (RNN layers).
+    """
+    num_mamba_layers = 1
+    num_attention_layers = 1
+
+    # Attention at layer 0, Mamba at layer 1
+    attention_layer_mask = [True, False]
+    mamba_layer_mask = [False, True]
+
+    return MambaHybridCacheManager(
+        # Mamba cache parameters
+        mamba_d_state=16,
+        mamba_d_conv=4,
+        mamba_num_heads=4,
+        mamba_n_groups=1,
+        mamba_head_dim=64,
+        mamba_num_layers=num_mamba_layers,
+        mamba_layer_mask=mamba_layer_mask,
+        mamba_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=torch.float16,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=256,
+            enable_block_reuse=False,
+        ),
+        kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.
+        SELF,
+        num_layers=num_attention_layers,
+        layer_mask=attention_layer_mask,
+        num_kv_heads=1,
+        head_dim=1,
+        tokens_per_block=8,
+        max_seq_len=256,
+        max_batch_size=1,
+        mapping=mapping,
+        dtype=dtype,
+    )
+
+
+def fill_hybrid_cache_buffers(hybrid_cache_manager):
+    """Fill both KV and Mamba cache buffers with random values for testing."""
+    with torch.no_grad():
+        kv_buffer = hybrid_cache_manager.get_buffers(0)
+        random_kv = torch.rand(kv_buffer.shape,
+                               dtype=torch.float32,
+                               device=kv_buffer.device)
+        kv_buffer.copy_(random_kv)
+
+        conv_buffer = hybrid_cache_manager.get_conv_states(1)
+        random_conv = torch.rand(conv_buffer.shape,
+                                 dtype=conv_buffer.dtype,
+                                 device=conv_buffer.device)
+        conv_buffer.copy_(random_conv)
+
+        ssm_buffer = hybrid_cache_manager.get_ssm_states(1)
+        random_ssm = torch.rand(ssm_buffer.shape,
+                                dtype=ssm_buffer.dtype,
+                                device=ssm_buffer.device)
+        ssm_buffer.copy_(random_ssm)
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("backend", ["UCX"], ids=["UCX"])
+def test_hybrid_cache_transceiver_single_process(backend):
+    mapping = Mapping(world_size=1, rank=0)
+    dtype = DataType.HALF
+
+    # Create hybrid cache managers (combines KV + Mamba) for context and generation
+    hybrid_cache_manager_ctx = create_hybrid_cache_manager(mapping, dtype)
+    hybrid_cache_manager_gen = create_hybrid_cache_manager(mapping, dtype)
+
+    cache_transceiver_config = CacheTransceiverConfig(backend=backend,
+                                                      max_tokens_in_buffer=512)
+    dist = Distributed.get(mapping)
+
+    # Create transceivers - MambaHybridCacheManager serves as both kv_cache_manager and mamba_cache_manager
+    cache_transceiver_ctx = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        hybrid_cache_manager_ctx,
+        AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config,
+        mamba_cache_manager=hybrid_cache_manager_ctx)
+
+    cache_transceiver_gen = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        hybrid_cache_manager_gen,
+        AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config,
+        mamba_cache_manager=hybrid_cache_manager_gen)
+
+    # Fill both KV and Mamba cache buffers with random data
+    fill_hybrid_cache_buffers(hybrid_cache_manager_ctx)
+
+    # Init ctx request
+    sampling_params = SamplingParams()
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+
+    # Add sequence to hybrid manager (handles both KV and Mamba)
+    hybrid_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
+                                               ctx_request.prompt_len, 1,
+                                               ctx_request)
+    hybrid_cache_manager_ctx.mamba_impl.allocate_cache_blocks(
+        [ctx_request.py_request_id])
+
+    # Send ctx request (sends both KV and Mamba states)
+    cache_transceiver_ctx.respond_and_send_async(ctx_request)
+
+    # Init gen request
+    gen_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=ctx_request.context_phase_params)
+
+    # Add sequence to hybrid manager on gen side
+    hybrid_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
+                                               gen_request.prompt_len, 1,
+                                               gen_request)
+    hybrid_cache_manager_gen.mamba_impl.allocate_cache_blocks(
+        [gen_request.py_request_id])
+
+    cache_transceiver_gen.request_and_receive_async(gen_request)
+
+    cache_transceiver_ctx.check_context_transfer_status(1)
+    cache_transceiver_gen.check_gen_transfer_status(1)
+
+    assert torch.equal(
+        hybrid_cache_manager_gen.get_buffers(0),
+        hybrid_cache_manager_ctx.get_buffers(0)), "different kv-cache values"
+
+    assert torch.equal(hybrid_cache_manager_gen.get_conv_states(1),
+                       hybrid_cache_manager_ctx.get_conv_states(
+                           1)), "different mamba conv states"
+
+    assert torch.equal(hybrid_cache_manager_gen.get_ssm_states(1),
+                       hybrid_cache_manager_ctx.get_ssm_states(
+                           1)), "different mamba ssm states"
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("backend", ["UCX"], ids=["UCX"])
+def test_hybrid_cache_transceiver_cancel_request(backend):
+    mapping = Mapping(world_size=1, rank=0)
+    dtype = DataType.HALF
+
+    hybrid_cache_manager_ctx = create_hybrid_cache_manager(mapping, dtype)
+    hybrid_cache_manager_gen = create_hybrid_cache_manager(mapping, dtype)
+
+    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      max_tokens_in_buffer=512)
+    dist = Distributed.get(mapping)
+
+    cache_transceiver_ctx = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        hybrid_cache_manager_ctx,
+        AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config,
+        mamba_cache_manager=hybrid_cache_manager_ctx)
+
+    cache_transceiver_gen = create_kv_cache_transceiver(
+        mapping,
+        dist,
+        hybrid_cache_manager_gen,
+        AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config,
+        mamba_cache_manager=hybrid_cache_manager_gen)
+
+    fill_hybrid_cache_buffers(hybrid_cache_manager_ctx)
+
+    # Init ctx request
+    sampling_params = SamplingParams()
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+
+    hybrid_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
+                                               ctx_request.prompt_len, 1,
+                                               ctx_request)
+    hybrid_cache_manager_ctx.mamba_impl.allocate_cache_blocks(
+        [ctx_request.py_request_id])
+
+    # Send ctx request
+    cache_transceiver_ctx.respond_and_send_async(ctx_request)
+
+    # Wait for ctx request to be sent
+    time.sleep(2)
+
+    # Cancel ctx request
+    is_cancelled = cache_transceiver_ctx.cancel_request(ctx_request)
+    assert is_cancelled
+
+    # Init gen request
+    gen_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=ctx_request.context_phase_params)
+
+    hybrid_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
+                                               gen_request.prompt_len, 1,
+                                               gen_request)
+    hybrid_cache_manager_gen.mamba_impl.allocate_cache_blocks(
+        [gen_request.py_request_id])
+
+    # Try to receive gen request
+    cache_transceiver_gen.request_and_receive_async(gen_request)
 
     # Block the main thread due to the async operation
     time.sleep(2)

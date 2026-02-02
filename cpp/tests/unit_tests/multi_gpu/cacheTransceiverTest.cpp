@@ -1373,8 +1373,7 @@ protected:
         // Set up buffer managers
         int maxNumTokens = 2048;
         mCacheTransBufferManagers.clear();
-        mCacheTransBufferManagers.emplace_back(
-            std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens));
+        mCacheTransBufferManagers.emplace_back(std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens));
         std::vector<CacheTransBufferManager*> bufferManagers;
         bufferManagers.push_back(mCacheTransBufferManagers.back().get());
 
@@ -1391,23 +1390,21 @@ protected:
         std::unique_ptr<RnnCacheFormatter> rnnFormatter;
         if (mRnnStateManager && mRnnCacheTransBufferManager)
         {
-            rnnFormatter = std::make_unique<RnnCacheFormatter>(
-                mRnnStateManager.get(), mRnnCacheTransBufferManager.get());
+            rnnFormatter
+                = std::make_unique<RnnCacheFormatter>(mRnnStateManager.get(), mRnnCacheTransBufferManager.get());
         }
 
         if (mIsContext)
         {
             // Pass RNN state and formatter to sender
-            mSender = std::make_unique<CacheSender>(
-                mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter(),
-                mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt,
+            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mRankInInstance,
+                makeFormatter(), mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt,
                 std::move(rnnFormatter));
         }
         else
         {
-            mRequester = std::make_unique<CacheReceiver>(
-                mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter(),
-                mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt,
+            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mRankInInstance,
+                makeFormatter(), mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt,
                 std::move(rnnFormatter));
         }
     }
@@ -2778,12 +2775,9 @@ TEST_P(HybridModelCacheTest, HybridKvRnnTransfer)
             std::vector<std::future<void>> contextFutures;
             for (auto&& request : requests)
             {
-                // Fill both KV and RNN data
+                // Fill both KV and RNN data with deterministic patterns
                 fillRnnStateData(request);
                 contextFutures.push_back(addRequestAndTransportCacheForContext(request));
-
-                // Also send RNN state (would need integration with CacheSender)
-                // For now, this tests the infrastructure is set up correctly
             }
             mComm->barrier();
             for (auto&& cfuture : contextFutures)
@@ -2793,6 +2787,16 @@ TEST_P(HybridModelCacheTest, HybridKvRnnTransfer)
         }
         else
         {
+            // Allocate RNN slots on generation side before receiving
+            for (auto&& request : requests)
+            {
+                if (mRnnStateManager)
+                {
+                    std::vector<LlmRequest::RequestIdType> requestIds = {request->mLlmRequest->mRequestId};
+                    mRnnStateManager->allocateCacheBlocks(requestIds);
+                }
+            }
+
             std::vector<std::future<void>> generationFutures;
             mComm->barrier();
             for (auto&& request : requests)
@@ -2805,14 +2809,15 @@ TEST_P(HybridModelCacheTest, HybridKvRnnTransfer)
                 gfuture.get();
             }
 
-            // Verify KV cache
             for (auto&& request : requests)
             {
                 generationVerifyKVCache(request);
             }
 
-            // Verify RNN state (would need integration with CacheReceiver)
-            // For now, this validates the infrastructure
+            for (auto&& request : requests)
+            {
+                verifyRnnStateData(request);
+            }
         }
 
         for (auto&& request : requests)
@@ -2823,30 +2828,6 @@ TEST_P(HybridModelCacheTest, HybridKvRnnTransfer)
     }
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
-
-// Parameterized test cases for hybrid models
-// These focus on PP distribution since that's where KV and RNN can differ
-INSTANTIATE_TEST_CASE_P(HybridModelBasic, HybridModelCacheTest,
-    testing::Combine(
-        /*contextTp*/ testing::Values(2),
-        /*contextPp*/ testing::Values(1, 2),
-        /*contextCp*/ testing::Values(1),
-        /*genTp*/ testing::Values(2),
-        /*genPp*/ testing::Values(1, 2),
-        /*genCp*/ testing::Values(1),
-        /*numKvLayers*/ testing::Values(8),
-        /*numHeads*/ testing::Values(4),
-        /*sizePerHead*/ testing::Values(64),
-        /*tokensPerBlock*/ testing::Values(16),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT),
-        /*kvFactor*/ testing::Values(2),
-        /*isMLA*/ testing::Values(false),
-        /*contextDP*/ testing::Values(false),
-        /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false),
-        /*isIndexerKCache*/ testing::Values(false),
-        /*indexerDimPerHead*/ testing::Values(0),
-        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Test case: Context PP=1, Gen PP=4 (typical disagg with RNN)
 INSTANTIATE_TEST_CASE_P(HybridModelAsymmetricPP, HybridModelCacheTest,
@@ -2871,20 +2852,43 @@ INSTANTIATE_TEST_CASE_P(HybridModelAsymmetricPP, HybridModelCacheTest,
         /*indexerDimPerHead*/ testing::Values(0),
         /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
-// Test case: Gen PP=1, Context PP=4 (reverse direction)
-INSTANTIATE_TEST_CASE_P(HybridModelReversePP, HybridModelCacheTest,
+// Test case: Same PP, different TP (TP scaling)
+INSTANTIATE_TEST_CASE_P(HybridModelDifferentTP, HybridModelCacheTest,
     testing::Combine(
         /*contextTp*/ testing::Values(2),
-        /*contextPp*/ testing::Values(4),
+        /*contextPp*/ testing::Values(2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(4),
+        /*genPp*/ testing::Values(2),
+        /*genCp*/ testing::Values(1),
+        /*numKvLayers*/ testing::Values(8),
+        /*numHeads*/ testing::Values(8),
+        /*sizePerHead*/ testing::Values(64),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(false),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(false),
+        /*indexerDimPerHead*/ testing::Values(0),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
+
+// Test case: Half precision data types for hybrid model
+INSTANTIATE_TEST_CASE_P(HybridModelHalfPrecision, HybridModelCacheTest,
+    testing::Combine(
+        /*contextTp*/ testing::Values(2),
+        /*contextPp*/ testing::Values(1),
         /*contextCp*/ testing::Values(1),
         /*genTp*/ testing::Values(2),
-        /*genPp*/ testing::Values(1),
+        /*genPp*/ testing::Values(2),
         /*genCp*/ testing::Values(1),
         /*numKvLayers*/ testing::Values(8),
         /*numHeads*/ testing::Values(4),
         /*sizePerHead*/ testing::Values(64),
         /*tokensPerBlock*/ testing::Values(16),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kHALF),
         /*kvFactor*/ testing::Values(2),
         /*isMLA*/ testing::Values(false),
         /*contextDP*/ testing::Values(false),

@@ -202,6 +202,7 @@ TEST_F(RnnTargetIRanksTest, inquireSupport)
     // Same TP, different PP -> should be supported
     EXPECT_TRUE(formatter.inquireSupport(state1, state2));
 
+    // Different TP is also supported for RNN cache transfer (only model config and data types are checked)
     EXPECT_TRUE(formatter.inquireSupport(state1, state3));
 }
 
@@ -306,7 +307,8 @@ TEST_F(HybridModelCounterpartsTest, DifferentPPDistributionKvRnn)
     auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
 
     // Both should need the same ranks (0, 2) in this symmetric case
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{0, 2}));
+    // Note: targetIRanks returns std::vector<int>, getCounterparts returns std::vector<SizeType32>
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2}));
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 2}));
 
     auto mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
@@ -364,7 +366,7 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     //   Gen PP2 (layers 4-5) at TP=0 -> rank 4
     //   Gen PP3 (layers 6-7) at TP=0 -> rank 6
     auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{0, 2, 4, 6}));
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2, 4, 6}));
 
     // RNN: Needs 4 layers from Gen (only PP0 and PP1 have RNN layers)
     //   Gen PP0 (layers 0-1) at TP=0 -> rank 0
@@ -390,7 +392,7 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     //   Gen PP2 at TP=1 -> rank 5
     //   Gen PP3 at TP=1 -> rank 7
     kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank1).mIRanks;
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{1, 3, 5, 7}));
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{1, 3, 5, 7}));
 
     // RNN:
     //   Gen PP0 at TP=1 -> rank 1
@@ -442,7 +444,7 @@ TEST_F(HybridModelCounterpartsTest, DisjointKvRnnCounterparts)
 
     // KV counterparts: needs layers 0-3 from Gen PP0 (rank 0) and PP1 (rank 2)
     auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{0, 2}));
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2}));
 
     // RNN counterparts: Context PP=0 has 0 RNN layers, should need nothing from Gen
     // But targetIRanks for RNN should still work correctly
@@ -611,7 +613,7 @@ TEST_F(HybridModelCounterpartsTest, InterleavedLayers)
     auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
     auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
 
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{0, 2}));
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2}));
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 2}));
 
     // Merged should be same as individual (no new ranks)
@@ -639,7 +641,7 @@ TEST_F(HybridModelCounterpartsTest, RnnMorePPThanKv)
 
     // KV needs ranks 0, 2 (from Gen PP0, PP1)
     auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{0, 2}));
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2}));
 
     // RNN needs ranks 0, 2, 4, 6 (from Gen PP0, PP1, PP2, PP3)
     auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
@@ -670,7 +672,7 @@ TEST_F(HybridModelCounterpartsTest, KvMorePPThanRnn)
 
     // KV needs ranks 0, 2, 4, 6 (from Gen PP0, PP1, PP2, PP3)
     auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{0, 2, 4, 6}));
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2, 4, 6}));
 
     // RNN needs ranks 0, 2 only (from Gen PP0, PP1 - PP2,PP3 have 0 RNN layers)
     auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
@@ -712,7 +714,7 @@ TEST_F(HybridModelCounterpartsTest, RnnOnlyModel)
     auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 2}));
 
-    // Merged is just RNN
+    // Merged is just RNN (kvCounterParts is empty)
     auto merged = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(merged, (std::vector<SizeType32>{0, 2}));
 }
@@ -741,7 +743,7 @@ TEST_F(HybridModelCounterpartsTest, LargeScaleMixedLayers)
 
     // KV needs all 4 Gen PP stages at TP=0: ranks 0, 4, 8, 12
     auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{0, 4, 8, 12}));
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 4, 8, 12}));
 
     // RNN needs only first 2 Gen PP stages at TP=0: ranks 0, 4
     auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
@@ -755,7 +757,7 @@ TEST_F(HybridModelCounterpartsTest, LargeScaleMixedLayers)
     SizeType32 contextRank3 = 3;
 
     kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank3).mIRanks;
-    EXPECT_EQ(kvCounterParts, (std::vector<SizeType32>{3, 7, 11, 15}));
+    EXPECT_EQ(kvCounterParts, (std::vector<int>{3, 7, 11, 15}));
 
     rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank3, genRnnState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{3, 7}));
@@ -797,7 +799,7 @@ TEST_F(HybridModelCounterpartsTest, ContextPPGreaterThanGenPP)
     SizeType32 contextRank0 = 0;
 
     auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    EXPECT_EQ(kvCounterParts, std::vector<SizeType32>({0}));
+    EXPECT_EQ(kvCounterParts, std::vector<int>({0}));
 
     auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
     EXPECT_EQ(rnnCounterParts, std::vector<SizeType32>({0}));
@@ -811,7 +813,7 @@ TEST_F(HybridModelCounterpartsTest, ContextPPGreaterThanGenPP)
     SizeType32 contextRank4 = 4;
 
     kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank4).mIRanks;
-    EXPECT_EQ(kvCounterParts, std::vector<SizeType32>({0}));
+    EXPECT_EQ(kvCounterParts, std::vector<int>({0}));
 
     rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank4, genRnnState);
     EXPECT_EQ(rnnCounterParts, std::vector<SizeType32>({0}));
@@ -821,7 +823,7 @@ TEST_F(HybridModelCounterpartsTest, ContextPPGreaterThanGenPP)
     SizeType32 contextRank1 = 1;
 
     kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank1).mIRanks;
-    EXPECT_EQ(kvCounterParts, std::vector<SizeType32>({1}));
+    EXPECT_EQ(kvCounterParts, std::vector<int>({1}));
 
     rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank1, genRnnState);
     EXPECT_EQ(rnnCounterParts, std::vector<SizeType32>({1}));
@@ -855,7 +857,7 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricContextPPGreaterThanGenPP)
 
     // KV: Context PP0 has layers 0-3, Gen PP0 has 0-3 -> rank 0
     auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    EXPECT_EQ(kvCounterParts, std::vector<SizeType32>({0}));
+    EXPECT_EQ(kvCounterParts, std::vector<int>({0}));
 
     // RNN: Context PP0 has 0 RNN layers
     auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
