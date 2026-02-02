@@ -50,8 +50,7 @@ from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
-from ..speculative.eagle3 import (Eagle3OneModelSpecMetadata,
-                                  Eagle3ResourceManager, Eagle3SpecMetadata)
+from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
@@ -2784,9 +2783,9 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
-            if isinstance(spec_metadata, Eagle3OneModelSpecMetadata):
-                spec_metadata.populate_sampling_params_for_one_model(
-                    scheduled_requests.all_requests())
+            # No-op for non 1-model
+            spec_metadata.populate_sampling_params_for_one_model(
+                scheduled_requests.all_requests())
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -3380,9 +3379,13 @@ class PyTorchModelEngine(ModelEngine):
                                                        no_cache=kv_cache_manager
                                                        is None)
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
+            enable_mla = is_mla(self.model.model_config.pretrained_config)
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
-                spec_resource_manager, self.is_draft_model, self.attn_backend,
-                self.model_is_wrapped)
+                spec_resource_manager,
+                self.is_draft_model,
+                self.attn_backend,
+                self.model_is_wrapped,
+                is_mla=enable_mla)
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
