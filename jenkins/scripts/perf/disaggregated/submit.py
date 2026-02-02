@@ -56,6 +56,12 @@ def get_hardware_config(config, benchmark_mode):
         "gpus_per_node_per_gen_server": gpus_per_node_per_gen_server,
         "total_nodes": total_nodes,
         "total_gpus": total_gpus,
+        "ctx_tp": ctx_tp,
+        "ctx_pp": ctx_pp,
+        "ctx_cp": ctx_cp,
+        "gen_tp": gen_tp,
+        "gen_pp": gen_pp,
+        "gen_cp": gen_cp,
     }
 
 
@@ -353,6 +359,7 @@ def main():
             f'export pytestCommandBenchmark="{env_config["benchmark_env_var"]} $partialPytestCommandBenchmark"',
             f"export runScript={args.run_sh}",
             f"export installScript={install_script}",
+            f"export configYamlPath={config_yaml}",
             f"export numCtxServers={hardware_config['num_ctx_servers']}",
             f"export numGenServers={hardware_config['num_gen_servers']}",
             f"export gpusPerNode={hardware_config['gpus_per_node']}",
@@ -364,6 +371,12 @@ def main():
             f"export gpusPerfNodePerfGenServer={hardware_config['gpus_per_node_per_gen_server']}",
             f"export totalNodes={hardware_config['total_nodes']}",
             f"export totalGpus={hardware_config['total_gpus']}",
+            f"export ctxTp={hardware_config['ctx_tp']}",
+            f"export ctxPp={hardware_config['ctx_pp']}",
+            f"export ctxCp={hardware_config['ctx_cp']}",
+            f"export genTp={hardware_config['gen_tp']}",
+            f"export genPp={hardware_config['gen_pp']}",
+            f"export genCp={hardware_config['gen_cp']}",
         ]
     )
 
