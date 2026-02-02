@@ -4510,6 +4510,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm, is_integration_test=True)
 
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("torch_compile", [False, True],
+                             ids=["eager", "torch_compile"])
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
@@ -4531,7 +4533,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              if x == 0 else "enable_configurable_moe")
     def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
-                      enable_configurable_moe, mocker):
+                      enable_configurable_moe, torch_compile, mocker):
         # Handle ENABLE_CONFIGURABLE_MOE environment variable
         if enable_configurable_moe == 1 and moe_backend not in [
                 "TRTLLM", "CUTLASS"
@@ -4557,10 +4559,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
+        torch_compile_config = _get_default_torch_compile_config(torch_compile)
+
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_config=MoeConfig(backend=moe_backend))
+            moe_config=MoeConfig(backend=moe_backend),
+            torch_compile_config=torch_compile_config)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype)
