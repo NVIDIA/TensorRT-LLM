@@ -19,8 +19,6 @@
 #include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
-#include <algorithm>
-
 namespace tensorrt_llm::batch_manager
 {
 
