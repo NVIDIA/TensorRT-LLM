@@ -108,13 +108,25 @@ def with_mocked_hf_download(func):
     NOTE: We must patch snapshot_download at the location where it's actually imported
     with 'from huggingface_hub import snapshot_download', since that creates a
     local binding that won't be affected by patching huggingface_hub.snapshot_download.
+
+    Additionally sets HF_HUB_OFFLINE=1 to ensure no network requests are made to
+    HuggingFace.
     """
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with patch(
-            "tensorrt_llm.llmapi.utils.snapshot_download", side_effect=mock_snapshot_download
-        ):
-            return func(*args, **kwargs)
+        original_offline = os.environ.get("HF_HUB_OFFLINE")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+
+        try:
+            with patch(
+                "tensorrt_llm.llmapi.utils.snapshot_download", side_effect=mock_snapshot_download
+            ):
+                return func(*args, **kwargs)
+        finally:
+            if original_offline is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = original_offline
 
     return wrapper
