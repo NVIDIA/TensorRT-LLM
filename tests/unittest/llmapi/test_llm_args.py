@@ -1128,3 +1128,100 @@ def test_model_defaults_validation(defaults_dict, should_raise, error_contains):
                 else:
                     # For simple fields, check they're in the applied dict
                     assert key in applied
+
+
+class TestPyTorchBackendModelDefaults:
+
+    def get_tinyllama_path(self):
+        from utils.llm_data import llm_models_root
+        return str(llm_models_root() /
+                   "llm-models/llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch, tmp_path):
+        self.get_model_defaults_called = False
+        self.tmp_path = tmp_path
+
+        def mock_get_model_defaults(cls, llm_args):
+            self.get_model_defaults_called = True
+            return {
+                "enable_chunked_prefill": True,
+                "max_batch_size": 999,
+                "max_input_len": 12345,
+                "kv_cache_config": {
+                    "enable_block_reuse": False,
+                    "free_gpu_memory_fraction": 0.75,
+                }
+            }
+
+        from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+
+        self.original_get_model_defaults = getattr(LlamaForCausalLM,
+                                                   'get_model_defaults', None)
+        setattr(LlamaForCausalLM, 'get_model_defaults',
+                classmethod(mock_get_model_defaults))
+
+        yield
+
+        if self.original_get_model_defaults is None:
+            delattr(LlamaForCausalLM, 'get_model_defaults')
+        else:
+            setattr(LlamaForCausalLM, 'get_model_defaults',
+                    self.original_get_model_defaults)
+
+    @pytest.mark.part0
+    def test_model_defaults_application(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.enable_chunked_prefill == True
+            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
+
+    @pytest.mark.part0
+    def test_user_overrides_respected(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                enable_chunked_prefill=False,
+                max_batch_size=42,
+                max_input_len=256,
+                kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.enable_chunked_prefill == False
+            assert modified_args.max_batch_size == 42
+            assert modified_args.max_input_len == 256
+            assert modified_args.kv_cache_config.enable_block_reuse == True
+
+    @pytest.mark.part0
+    def test_partial_user_override(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                max_batch_size=42,
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.max_batch_size == 42
+            assert modified_args.enable_chunked_prefill == True
+            assert modified_args.kv_cache_config.enable_block_reuse == False

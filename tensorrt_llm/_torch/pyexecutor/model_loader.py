@@ -219,6 +219,9 @@ class ModelLoader:
             checkpoint_dir: str, llm_args: TorchLlmArgs,
             checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
         """Load model config and apply model-specific defaults to llm_args."""
+        if checkpoint_loader is None:
+            return llm_args
+
         config = checkpoint_loader.load_config(checkpoint_dir)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
