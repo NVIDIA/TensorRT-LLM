@@ -268,3 +268,31 @@ def test_trtllm_chunked_attention(chunked_attention_size, input_layout):
             -chunked-attention-size {chunked_attention_size} -paged-kv",
             shell=True,
             check=True)
+
+
+# The test cases for sliding window attention.
+@pytest.mark.parametrize(
+    'sliding_window_size', [64, 127, 128, 129, 256, 1024],
+    ids=[
+        "sliding-window-size-64", "sliding-window-size-127",
+        "sliding-window-size-128", "sliding-window-size-129",
+        "sliding-window-size-256", "sliding-window-size-1024"
+    ])
+@pytest.mark.parametrize(
+    'mask_type',
+    ["-sliding-or-chunked-causal-mask", "-bidirectional-sliding-window-mask"])
+def test_trtllm_sliding_window_attention(sliding_window_size, mask_type):
+    if mask_type == "-bidirectional-sliding-window-mask":
+        sliding_window_size *= 2
+
+    subprocess.run(
+        f"bin/fmha.exe -d 128 -b 4 -h 5 -bf16 -s 8192 -min-s 4096 -bf16 \
+        -sliding-window-size {sliding_window_size} {mask_type}",
+        shell=True,
+        check=True)
+
+    subprocess.run(
+        f"bin/fmha.exe -d 64 -b 4 -h 5 -bf16 -s 8192 -min-s 4096 -bf16 \
+        -sliding-window-size {sliding_window_size} {mask_type}",
+        shell=True,
+        check=True)
