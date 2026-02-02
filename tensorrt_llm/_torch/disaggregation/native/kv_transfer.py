@@ -590,6 +590,7 @@ class Sender:
                 self._deliver_kv_to_agent(agent_args)
 
     @staticmethod
+    @nvtx_range("_make_agent_request")
     def _make_agent_request(agent_args: WriteMeta, is_aux: bool, device_id: int):
         if is_aux:
             assert agent_args.src_aux_ptrs is not None and agent_args.dst_aux_ptrs is not None
