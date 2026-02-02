@@ -460,7 +460,7 @@ def submit_job(config, log_dir, dry_run):
     container_name = "disaggr-test"
     start_server_cmds = []
     container_mount_str = env_config['container_mount']
-    # container_mount_str += f",{script_dir}:{script_dir}"
+    container_mount_str += f",{script_dir}:{script_dir}"
 
     # Pre-define server-type-specific configurations
     server_configs = {
