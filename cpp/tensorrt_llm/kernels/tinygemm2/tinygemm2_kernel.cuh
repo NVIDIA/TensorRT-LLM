@@ -410,6 +410,8 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
 
         __syncthreads();
 
+        cudaTriggerProgrammaticLaunchCompletion();
+
         if (warp_id == 0)
         {
 
@@ -440,10 +442,8 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
 
             if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0)
                 profile[blockIdx.x].complete = gclock64();
-
-            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
-                cudaTriggerProgrammaticLaunchCompletion();
         }
+        __syncthreads();
     }
 #endif // end if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 }
