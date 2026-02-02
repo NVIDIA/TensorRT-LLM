@@ -2998,6 +2998,13 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
         sh "bash -c 'pip3 show tensorrt || true'"
     }
 
+    // Print attribution files
+    sh "cat tensorrt_llm/cpp/build/attribution/missing_files.json || true"
+    sh "cat tensorrt_llm/cpp/build/attribution/import_payload.json || true"
+    sh "cat tensorrt_llm/cpp/build/attribution/file_mappings.json || true"
+    sh "cat tensorrt_llm/cpp/build/attribution/ATTRIBUTIONS.md || true"
+    sh "cat tensorrt_llm/cpp/build/attribution/SBOM.json || true"
+
     return wheelName
 }
 

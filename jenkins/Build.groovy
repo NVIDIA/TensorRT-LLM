@@ -434,6 +434,13 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
     }
 
+    // Print attribution files
+    sh "cat ${LLM_ROOT}/cpp/build/attribution/missing_files.json || true"
+    sh "cat ${LLM_ROOT}/cpp/build/attribution/import_payload.json || true"
+    sh "cat ${LLM_ROOT}/cpp/build/attribution/file_mappings.json || true"
+    sh "cat ${LLM_ROOT}/cpp/build/attribution/ATTRIBUTIONS.md || true"
+    sh "cat ${LLM_ROOT}/cpp/build/attribution/SBOM.json || true"
+
     // Build tritonserver artifacts
     def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
     // TODO: Remove after the cmake version is upgraded to 3.31.8
