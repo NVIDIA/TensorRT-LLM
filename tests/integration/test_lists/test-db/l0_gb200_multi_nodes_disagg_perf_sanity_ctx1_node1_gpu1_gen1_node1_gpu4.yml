@@ -1,8 +1,9 @@
 version: 0.0.1
-l0_gb200_multi_nodes_disagg_perf_sanity_1ctx_1gpu_1gen_4gpu:
+l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4:
 - condition:
     ranges:
-      # 2 nodes with each node has 4 GPUs
+      # 1 ctx worker with each 1 node and 1 GPU
+      # 1 gen worker with each 1 node and 4 GPUs
       system_gpu_count:
         gte: 8
         lte: 8

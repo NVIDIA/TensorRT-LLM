@@ -1,5 +1,5 @@
 version: 0.0.1
-l0_dgx_b200_multi_nodes_disagg_perf_sanity_1ctx_1gen:
+l0_dgx_b200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8:
 - condition:
     ranges:
       # 2 nodes with each node has 8 GPUs
