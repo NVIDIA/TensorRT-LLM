@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <limits>
-
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/algorithm.h"
@@ -40,8 +38,6 @@ struct ContextChunkingConfig
     /// When set to null, it indicates that the context chunk is disabled.
     tensorrt_llm::runtime::SizeType32 chunkUnitSize;
 };
-
-// AgentTreeConfig is defined in agentTree.h
 
 } // namespace batch_scheduler
 
