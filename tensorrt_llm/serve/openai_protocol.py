@@ -97,45 +97,6 @@ class UsageInfo(OpenAIBaseModel):
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
-class TimingMetrics(OpenAIBaseModel):
-    """Timing metrics for request performance."""
-    arrival_time: Optional[float] = None
-    first_scheduled_time: Optional[float] = None
-    first_token_time: Optional[float] = None
-    last_token_time: Optional[float] = None
-    kv_cache_transfer_start: Optional[float] = None
-    kv_cache_transfer_end: Optional[float] = None
-    kv_cache_size: Optional[int] = None
-
-
-class KvCacheMetrics(OpenAIBaseModel):
-    """KV cache metrics for request performance."""
-    num_total_allocated_blocks: Optional[int] = None
-    num_new_allocated_blocks: Optional[int] = None
-    num_reused_blocks: Optional[int] = None
-    num_missed_blocks: Optional[int] = None
-    max_num_blocks: Optional[int] = None
-    used_num_blocks: Optional[int] = None
-    free_num_blocks: Optional[int] = None
-    utilization: Optional[float] = None
-
-
-class SpeculativeDecodingMetrics(OpenAIBaseModel):
-    """Speculative decoding metrics for request performance."""
-    acceptance_rate: Optional[float] = None
-    total_accepted_draft_tokens: Optional[int] = None
-    total_draft_tokens: Optional[int] = None
-
-
-class PerfMetrics(OpenAIBaseModel):
-    """Performance metrics for a request."""
-    first_iter: Optional[int] = None
-    last_iter: Optional[int] = None
-    timing_metrics: Optional[TimingMetrics] = None
-    kv_cache_metrics: Optional[KvCacheMetrics] = None
-    speculative_decoding: Optional[SpeculativeDecodingMetrics] = None
-
-
 class ModelCard(OpenAIBaseModel):
     id: str
     object: str = "model"
@@ -213,8 +174,6 @@ class CompletionResponse(OpenAIBaseModel):
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # Performance metrics for the request
-    perf_metrics: Optional[PerfMetrics] = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
@@ -240,8 +199,6 @@ class CompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
-    # Performance metrics for the request (only included in final chunk)
-    perf_metrics: Optional[PerfMetrics] = None
 
 
 def _response_format_to_guided_decoding_params(
@@ -622,8 +579,6 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
-    # Performance metrics for the request
-    perf_metrics: Optional[PerfMetrics] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -651,8 +606,6 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
-    # Performance metrics for the request (only included in final chunk)
-    perf_metrics: Optional[PerfMetrics] = None
 
 
 class FunctionDefinition(OpenAIBaseModel):

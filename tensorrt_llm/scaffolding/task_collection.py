@@ -195,10 +195,10 @@ class QueryCollector(TaskCollection):
 class TaskMetricsCollector(TaskCollection):
     """
     Task profiler that captures tasks at yield points, avoiding duplicate counting.
-    Records token usage, execution time, and perf_metrics for each task.
+    Records token usage and execution time for each task.
 
     Supports filtering by task types and captures additional fields for ChatTask
-    including perf_metrics, finish_reason, unique_id, and optionally message content.
+    including finish_reason, unique_id, and optionally message content.
 
     When capture_messages is enabled, also captures comprehensive trace information
     including messages, new_messages added during the yield, and sub_request_markers.
@@ -286,7 +286,6 @@ class TaskMetricsCollector(TaskCollection):
                 task_info['unique_id'] = getattr(task, 'unique_id', None)
                 task_info['sub_request_markers'] = getattr(
                     task, 'sub_request_markers', [])
-                task_info['perf_metrics'] = getattr(task, 'perf_metrics', None)
 
                 # Capture messages if enabled
                 if self.capture_messages:
@@ -344,12 +343,6 @@ class TaskMetricsCollector(TaskCollection):
                              f"reasoning={task_info['reasoning_tokens']} "
                              f"total={task_info['total_tokens']}")
 
-        if task_info.get('perf_metrics'):
-            perf_str = ", ".join(
-                f"{k}={v:.2f}" if isinstance(v, float) else f"{k}={v}"
-                for k, v in task_info['perf_metrics'].items())
-            log_parts.append(f"📊 {perf_str}")
-
         print(" | ".join(log_parts))
 
         # Print message details if capture_messages is enabled
@@ -401,7 +394,6 @@ class TaskMetricsCollector(TaskCollection):
 
             # Group by task type
             task_type_data: Dict[str, Dict[str, List[float]]] = {}
-            perf_metrics_agg: Dict[str, Dict[str, List[float]]] = {}
 
             for task_info in task_list:
                 task_type = task_info['task_type']
@@ -413,7 +405,6 @@ class TaskMetricsCollector(TaskCollection):
                         'reasoning_tokens': [],
                         'total_tokens': [],
                     }
-                    perf_metrics_agg[task_type] = {}
 
                 data = task_type_data[task_type]
                 data['duration_ms'].append(task_info['duration_ms'])
@@ -423,15 +414,6 @@ class TaskMetricsCollector(TaskCollection):
                 data['reasoning_tokens'].append(
                     task_info.get('reasoning_tokens', 0))
                 data['total_tokens'].append(task_info.get('total_tokens', 0))
-
-                # Aggregate perf_metrics
-                if task_info.get('perf_metrics'):
-                    for key, value in task_info['perf_metrics'].items():
-                        if isinstance(value, (int, float)):
-                            if key not in perf_metrics_agg[task_type]:
-                                perf_metrics_agg[task_type][key] = []
-                            perf_metrics_agg[task_type][key].append(
-                                float(value))
 
             # Print statistics for each task type
             for task_type, data in task_type_data.items():
@@ -483,18 +465,6 @@ class TaskMetricsCollector(TaskCollection):
                         f"median={total_stats['median']:.1f}, "
                         f"min={total_stats['min']:.0f}, max={total_stats['max']:.0f}"
                     )
-
-                # Perf metrics stats
-                if perf_metrics_agg[task_type]:
-                    print("\n    Perf Metrics:")
-                    for metric_name, values in sorted(
-                            perf_metrics_agg[task_type].items()):
-                        stats = TaskMetricsCollector._compute_stats(values)
-                        print(f"      {metric_name}: sum={stats['sum']:.2f}, "
-                              f"avg={stats['avg']:.2f}, "
-                              f"median={stats['median']:.2f}, "
-                              f"min={stats['min']:.2f}, "
-                              f"max={stats['max']:.2f}")
 
         print("\n" + "=" * 80 + "\n")
 
