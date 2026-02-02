@@ -5767,7 +5767,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    @pytest.mark.skip(reason="Skip MTP test due to no model path file in CI")
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_nvfp4_8gpus_mtp(self):
