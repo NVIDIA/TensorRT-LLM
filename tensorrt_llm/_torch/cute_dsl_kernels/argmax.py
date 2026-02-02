@@ -618,8 +618,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         out_tensor = convert_from_dlpack(out)
         current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        # Detect compute capability: use redux instructions only on Blackwell (sm_100+)
-        # redux.sync.max.f32 is only supported on sm_100+
+        # Detect compute capability: use redux instructions only on Blackwell
+        # redux.sync.max.f32 is only supported on 100 <= sm_version < 120
         from ..._utils import get_sm_version
 
         sm_version = get_sm_version()
