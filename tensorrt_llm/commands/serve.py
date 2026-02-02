@@ -133,7 +133,6 @@ def get_llm_args(
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
-
     if cp_config is not None and "cp_type" in cp_config:
         cp_config = cp_config.copy()
         try:

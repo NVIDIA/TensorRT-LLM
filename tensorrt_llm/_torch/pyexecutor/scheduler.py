@@ -1,5 +1,4 @@
 import dataclasses
-import os
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
@@ -225,19 +224,8 @@ class SimpleScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
             active_requests)
 
-        # Debug printing controlled by environment variable DEBUG_AGENT_HIERARCHY
-        if os.environ.get('DEBUG_AGENT_HIERARCHY') == '1':
-            print(
-                f"has {len(active_requests)} reqs, capacity scheduler only scheduled {len(fitting_requests)} reqs"
-            )
-
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)
-
-        if os.environ.get('DEBUG_AGENT_HIERARCHY') == '1':
-            print(
-                f"has {len(fitting_requests)} reqs, micro batch scheduler only scheduled total {len(context_requests) + len(generation_requests)} requests, which is {len(context_requests)} context reqs and {len(generation_requests)} generation reqs"
-            )
         # Convert from binding type RequestVector to list[LlmRequest],
         # so Python fields on LlmRequest won't be stripped away
         return SchedulerOutput(list(context_requests),
