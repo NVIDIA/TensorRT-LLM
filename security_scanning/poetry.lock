@@ -1257,22 +1257,6 @@ files = [
 ]
 
 [[package]]
-name = "dynamic-path-manager"
-version = "1.0.1"
-description = "A Python context manager for temporarily adding and removing paths from sys.path"
-optional = false
-python-versions = ">=3.7"
-groups = ["main"]
-files = [
-    {file = "dynamic_path_manager-1.0.1-py3-none-any.whl", hash = "sha256:bfb15bd7df1ce932798d9a6acb1784efe040888202d8613c4356ddee5b00dc91"},
-    {file = "dynamic_path_manager-1.0.1.tar.gz", hash = "sha256:efd1b16aabaa0c14b8a8b6756c9bea80c82ccff7fd87b3cdc7528bb1ee88088c"},
-]
-
-[package.extras]
-dev = ["black (>=21.0)", "flake8 (>=3.8)", "isort (>=5.0)", "mypy (>=0.800)", "pytest (>=6.0)", "pytest-cov (>=2.0)"]
-docs = ["sphinx (>=4.0)", "sphinx-rtd-theme (>=1.0)"]
-
-[[package]]
 name = "einops"
 version = "0.8.2"
 description = "A new flavour of deep learning operations"
@@ -1677,6 +1661,23 @@ test = ["aiohttp (!=4.0.0a0,!=4.0.0a1)", "numpy", "pytest", "pytest-asyncio (!=0
 test-downstream = ["aiobotocore (>=2.5.4,<3.0.0)", "dask-expr", "dask[dataframe,test]", "moto[server] (>4,<5)", "pytest-timeout", "xarray"]
 test-full = ["adlfs", "aiohttp (!=4.0.0a0,!=4.0.0a1)", "cloudpickle", "dask", "distributed", "dropbox", "dropboxdrivefs", "fastparquet", "fusepy", "gcsfs", "jinja2", "kerchunk", "libarchive-c", "lz4", "notebook", "numpy", "ocifs", "pandas", "panel", "paramiko", "pyarrow", "pyarrow (>=1)", "pyftpdlib", "pygit2", "pytest", "pytest-asyncio (!=0.22.0)", "pytest-benchmark", "pytest-cov", "pytest-mock", "pytest-recording", "pytest-rerunfailures", "python-snappy", "requests", "smbprotocol", "tqdm", "urllib3", "zarr", "zstandard"]
 tqdm = ["tqdm"]
+
+[[package]]
+name = "graphviz"
+version = "0.21"
+description = "Simple Python interface for Graphviz"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "graphviz-0.21-py3-none-any.whl", hash = "sha256:54f33de9f4f911d7e84e4191749cac8cc5653f815b06738c54db9a15ab8b1e42"},
+    {file = "graphviz-0.21.tar.gz", hash = "sha256:20743e7183be82aaaa8ad6c93f8893c923bd6658a04c32ee115edb3c8a835f78"},
+]
+
+[package.extras]
+dev = ["Flake8-pyproject", "build", "flake8", "pep8-naming", "tox (>=3)", "twine", "wheel"]
+docs = ["sphinx (>=5,<7)", "sphinx-autodoc-typehints", "sphinx-rtd-theme (>=0.2.5)"]
+test = ["coverage", "pytest (>=7,<8.1)", "pytest-cov", "pytest-mock (>=3)"]
 
 [[package]]
 name = "grpcio"
@@ -3790,6 +3791,44 @@ files = [
 [package.dependencies]
 numpy = "*"
 onnx = ">=1.14.0"
+
+[[package]]
+name = "onnx-ir"
+version = "0.1.15"
+description = "Efficient in-memory representation for ONNX"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "onnx_ir-0.1.15-py3-none-any.whl", hash = "sha256:c6df0eabd732671e9272275cf7693797497658610c00688d5e05132cbb4e2495"},
+    {file = "onnx_ir-0.1.15.tar.gz", hash = "sha256:edec4db6c502856835e8f46f2d9f5dd8079fbd930170e418eda4203c599fb74a"},
+]
+
+[package.dependencies]
+ml_dtypes = ">=0.5.0"
+numpy = "*"
+onnx = ">=1.16"
+typing_extensions = ">=4.10"
+
+[[package]]
+name = "onnxscript"
+version = "0.5.4"
+description = "Naturally author ONNX functions and models using a subset of Python"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "onnxscript-0.5.4-py3-none-any.whl", hash = "sha256:640d2aa55364b9b0d66c280cc4b22cd2c918fde9a1a72c2460d2fbe24b9181dc"},
+    {file = "onnxscript-0.5.4.tar.gz", hash = "sha256:311e08ce513484a1fadfc19f3ad28f83ed41a8ce73eca4d038cd3623f6f52104"},
+]
+
+[package.dependencies]
+ml_dtypes = "*"
+numpy = "*"
+onnx = ">=1.16"
+onnx_ir = ">=0.1.10,<2"
+packaging = "*"
+typing_extensions = ">=4.10"
 
 [[package]]
 name = "openai"
@@ -6341,14 +6380,14 @@ scipy = ["scipy"]
 
 [[package]]
 name = "tqdm"
-version = "4.67.1"
+version = "4.67.2"
 description = "Fast, Extensible Progress Meter"
 optional = false
 python-versions = ">=3.7"
 groups = ["main"]
 files = [
-    {file = "tqdm-4.67.1-py3-none-any.whl", hash = "sha256:26445eca388f82e72884e0d580d5464cd801a3ea01e63e5601bdff9ba6a48de2"},
-    {file = "tqdm-4.67.1.tar.gz", hash = "sha256:f8aef9c52c08c13a65f30ea34f4e5aac3fd1a34959879d7e59e63027286627f2"},
+    {file = "tqdm-4.67.2-py3-none-any.whl", hash = "sha256:9a12abcbbff58b6036b2167d9d3853042b9d436fe7330f06ae047867f2f8e0a7"},
+    {file = "tqdm-4.67.2.tar.gz", hash = "sha256:649aac53964b2cb8dec76a14b405a4c0d13612cb8933aae547dd144eacc99653"},
 ]
 
 [package.dependencies]
@@ -6923,4 +6962,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "14775ed85031a29940d6ddab624bcce99bd87f5f342ac5e4b2b30387e57bab51"
+content-hash = "beda8572091a5bfc16bc361549fc77117634e462a62359401dc0475c9e8fb6cf"

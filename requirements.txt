@@ -10,6 +10,8 @@ mpi4py
 numpy<2
 onnx>=1.18.0,<1.20.0
 onnx_graphsurgeon>=0.5.2
+onnxscript==0.5.4
+graphviz
 openai
 polygraphy
 psutil
@@ -80,4 +82,3 @@ mistral-common==1.8.6
 torchao>=0.14.1
 cuda-core
 llist
-dynamic_path_manager

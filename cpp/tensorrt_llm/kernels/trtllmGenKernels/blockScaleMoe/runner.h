@@ -197,6 +197,7 @@ private:
     batchedGemm::trtllm::gen::Dtype mDtypeAct;
     batchedGemm::trtllm::gen::Dtype mDtypeWeights;
     int32_t mTileTokensDim;
+    ActType mActType;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
 } // namespace PermuteGemm1
@@ -391,6 +392,7 @@ private:
 private:
     PermuteGemm1::Runner mPermuteGemm1;
     Gemm2::Runner mGemm2;
+    ActType mActType;
 
     // This will be the cartesian product of the passing configs for gemm1 and gemm2
     // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2 separately

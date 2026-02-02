@@ -176,6 +176,7 @@ def create_moe_backend(
             swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
     elif moe_cls == CutlassFusedMoE:
         return moe_cls(

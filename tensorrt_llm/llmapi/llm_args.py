@@ -444,10 +444,13 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA",
-                     "TRITON"] = Field(default='CUTLASS',
-                                       description="MoE backend to use.")
+    backend: Literal[
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
+        "TRITON"] = Field(
+            default='AUTO',
+            description="MoE backend to use. "
+            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+        )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -2179,6 +2182,12 @@ class BaseLlmArgs(StrictBaseModel):
                                       description="Return perf metrics.",
                                       status="prototype")
 
+    perf_metrics_max_requests: int = Field(
+        default=0,
+        description=
+        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
+        status="prototype")
+
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
         default=None,
         description=
@@ -2894,12 +2903,6 @@ class TorchLlmArgs(BaseLlmArgs):
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
-
-    perf_metrics_max_requests: int = Field(
-        default=0,
-        description=
-        "The maximum number of requests for perf metrics. Must also set request_perf_metrics to true to get perf metrics.",
-        status="prototype")
 
     batch_wait_timeout_ms: float = Field(
         default=0,

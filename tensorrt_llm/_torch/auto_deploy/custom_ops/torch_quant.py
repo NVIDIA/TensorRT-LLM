@@ -319,3 +319,98 @@ def _fake(
     N_half = weight_quantized.shape[-2]
     N = N_half * 2
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("auto_deploy::torch_fake_quant_int4_gptq_linear", mutates_args=())
+def torch_fake_quant_int4_gptq_linear(
+    input: torch.Tensor,  # [..., K]
+    weight_quantized: torch.Tensor,  # qweight [K/8, N] int32 (packed)
+    bias: Optional[torch.Tensor],  # [N] or None
+    input_scale: List[torch.Tensor],  # unused for GPTQ
+    weight_scale: List[torch.Tensor],  # GPTQ scales [G, N]
+    input_zp: List[torch.Tensor],  # unused for GPTQ
+    weight_zp: List[torch.Tensor],  # GPTQ qzeros [G, N/8] int32
+) -> torch.Tensor:
+    """
+    GPTQ INT4 linear with compatible signature to other quant ops.
+    - weight_quantized: qweight [K/8, N] packed int32
+    - weight_scale[0]: scales [G, N]
+    - weight_zp[0]: qzeros [G, N/8] packed int32
+    """
+    PACK_FACTOR = 8
+    MAXQ = 15
+    dequant_dtype = torch.int8
+
+    qweight = weight_quantized
+    scales = _expect_single_scale(weight_scale, "weight_scale")
+    qzeros = _expect_single_scale(weight_zp, "weight_zp")
+
+    dev = qweight.device
+    input_shape = input.shape
+    in_features = input_shape[-1]
+
+    if qweight.dim() != 2:
+        raise RuntimeError("qweight must be 2D [K/8, N]")
+    K = qweight.size(0) * PACK_FACTOR
+    N = qweight.size(1)
+
+    if scales.dim() != 2 or scales.size(1) != N:
+        raise RuntimeError(f"scales must be [G, N={N}]")
+    G = scales.size(0)
+
+    if K % G != 0:
+        raise RuntimeError(f"K ({K}) must be divisible by G ({G})")
+    block_size = K // G
+
+    if qzeros.dim() != 2 or qzeros.size(0) != G or qzeros.size(1) * PACK_FACTOR != N:
+        raise RuntimeError(f"qzeros must be [G={G}, N/8={N // 8}]")
+
+    # Reshape input to 2D if needed
+    x_2d = input.reshape(-1, in_features)
+
+    # Build g_idx and shift tables
+    g_idx = torch.arange(K, device=dev, dtype=torch.int32) // block_size  # [K]
+    wf = torch.arange(PACK_FACTOR, device=dev, dtype=torch.int32) * 4  # [8]
+    wf_unsqueeze_zero = wf.view(1, 1, PACK_FACTOR)  # [1,1,8]
+    wf_unsqueeze_neg_one = wf.view(1, PACK_FACTOR, 1)  # [1,8,1]
+
+    zeros = torch.bitwise_right_shift(
+        torch.unsqueeze(qzeros, 2).expand(-1, -1, PACK_FACTOR),
+        wf_unsqueeze_zero,
+    ).to(dequant_dtype)
+    zeros = torch.bitwise_and(zeros, MAXQ).reshape(scales.shape)
+
+    weight = torch.bitwise_and(
+        torch.bitwise_right_shift(
+            torch.unsqueeze(qweight, 1).expand(-1, PACK_FACTOR, -1),
+            wf_unsqueeze_neg_one,
+        ).to(dequant_dtype),
+        MAXQ,
+    )
+    weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
+
+    weights = (scales[g_idx.long()] * (weight - zeros[g_idx.long()])).to(input.dtype)
+
+    out = torch.matmul(x_2d, weights)
+
+    if bias is not None:
+        out = out + bias
+
+    # Reshape output back to match input batch dimensions
+    out = out.reshape(*input_shape[:-1], N)
+
+    return out
+
+
+@torch_fake_quant_int4_gptq_linear.register_fake
+def torch_fake_quant_int4_gptq_linear_fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+) -> torch.Tensor:
+    N = weight_quantized.size(1)
+    return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)

@@ -5741,6 +5741,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"],
+                             ids=["trtllm", "cutlass"])
     @pytest.mark.parametrize(
         "attention_dp",
         [
@@ -5752,7 +5754,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             "attention_dp_on",
         ],
     )
-    def test_nvfp4_8gpus(self, attention_dp):
+    def test_nvfp4_8gpus(self, attention_dp, moe_backend):
         # Use this test to track the best performance config.
         # The optimized config is still under investigation.
         # Adding this test as placeholder.
@@ -5771,7 +5773,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
-                moe_config=MoeConfig(backend="CUTLASS"),
+                moe_config=MoeConfig(backend=moe_backend),
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
