@@ -42,7 +42,7 @@ from ...utils.node_utils import (
     extract_weight_name,
     filtered_nodes,
     get_all_layer_subgraphs,
-    get_all_weight_infos_fast,
+    get_all_weight_infos,
     get_all_weights_in_subgraph,
     is_any_attention_op,
     is_any_lin_op,
@@ -1308,7 +1308,7 @@ def _shard_parameter_node(
         return
 
     # Shard weight using the unified function (also updates the parameter)
-    all_weight_infos = get_all_weight_infos_fast(node)
+    all_weight_infos = get_all_weight_infos(node)
     # Parametrized nodes must have at least one weight (for debugging)
     assert len(all_weight_infos.weights) > 0, (
         f"Node {node.name} has no weights - weight mapping may be incorrect"

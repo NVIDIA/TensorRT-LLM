@@ -161,7 +161,7 @@ def extract_weight_name(node: Node) -> Union[str, bool]:
     Returns:
         Weight parameter name (str), or False if no weight exists.
     """
-    weight_node = get_weight_node_fast(node)
+    weight_node = get_weight_node(node)
     if weight_node is None:
         return False
     return weight_node.target
@@ -265,7 +265,7 @@ def num_users_of_weight_node(node: Node) -> int:
     Returns:
         Number of users of the primary weight node, or 0 if no weight exists.
     """
-    weight_node = get_weight_node_fast(node)
+    weight_node = get_weight_node(node)
     return len(weight_node.users) if weight_node is not None else 0
 
 
@@ -565,21 +565,21 @@ def _ensure_weight_mapping(node: Node) -> None:
         precompute_weight_node_mapping(gm)
 
 
-def get_weight_node_fast(node: Node) -> Optional[Node]:
-    """Get the primary weight node for a compute node (linear, MoE, SSM, etc.)."""
+def get_weight_node(node: Node) -> Optional[Node]:
+    """Get the primary weight node for a compute node"""
     _ensure_weight_mapping(node)
     weight_nodes = node.meta.get("weight_nodes", [])
     return weight_nodes[0] if weight_nodes else None
 
 
-def get_weight_nodes_fast(node: Node) -> List[Node]:
-    """Get all weight nodes for a compute node (linear, MoE, SSM, etc.)."""
+def get_weight_nodes(node: Node) -> List[Node]:
+    """Get all weight nodes for a compute node"""
     _ensure_weight_mapping(node)
     return node.meta.get("weight_nodes", [])
 
 
-def get_bias_nodes_fast(node: Node) -> List[Node]:
-    """Get all bias nodes for a compute node (linear, MoE, SSM, etc.)."""
+def get_bias_nodes(node: Node) -> List[Node]:
+    """Get all bias nodes for a compute node"""
     _ensure_weight_mapping(node)
     return node.meta.get("bias_nodes", [])
 
@@ -602,9 +602,9 @@ def _weight_node_to_info(weight_node: Node, gm: GraphModule) -> WeightInfo:
     return WeightInfo(node=weight_node, node_key=node_key, tensor=tensor, submod=submod)
 
 
-def get_weight_info_fast(node: Node) -> Optional[WeightInfo]:
+def get_weight_info(node: Node) -> Optional[WeightInfo]:
     """Extract weight info for the primary weight of a compute node."""
-    weight_node = get_weight_node_fast(node)
+    weight_node = get_weight_node(node)
     if weight_node is None:
         return None
     return _weight_node_to_info(weight_node, node.graph.owning_module)
@@ -618,11 +618,11 @@ class AllWeightInfos:
     biases: List[WeightInfo]
 
 
-def get_all_weight_infos_fast(node: Node) -> AllWeightInfos:
+def get_all_weight_infos(node: Node) -> AllWeightInfos:
     """Extract all weight and bias infos for a compute node."""
     gm = node.graph.owning_module
-    weight_nodes = get_weight_nodes_fast(node)
-    bias_nodes = get_bias_nodes_fast(node)
+    weight_nodes = get_weight_nodes(node)
+    bias_nodes = get_bias_nodes(node)
 
     return AllWeightInfos(
         weights=[_weight_node_to_info(wn, gm) for wn in weight_nodes],
@@ -1010,7 +1010,7 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
     if not is_any_lin_op(node):
         return None
 
-    weight_node = get_weight_node_fast(node)
+    weight_node = get_weight_node(node)
     if weight_node is None:
         return None
 
@@ -1255,7 +1255,7 @@ def shape(node: Node) -> Tuple[int, ...]:
 
 def get_weight_tensor(node: Node) -> torch.Tensor:
     """Extract the weight tensor from a compute node."""
-    weight_node = get_weight_node_fast(node)
+    weight_node = get_weight_node(node)
     if weight_node is None:
         raise ValueError(f"Node {node.name} has no weight")
 
