@@ -3396,7 +3396,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-12_GPUs-3_Nodes-PyTorch-PerfSanity-Disagg-1_CTXNode-2_GENNode-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_disagg_perf_sanity_1ctx_2gen",
-        7,
+        6,
         12,
         3
     )
