@@ -2305,9 +2305,13 @@ def detect_sharding_from_config(
     # and check the validity of the sharding transform
     layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 
-    for lin_node in linear_nodes:
+    for i, lin_node in enumerate(linear_nodes):
         # use node's weight name to get the module name
         weight_name = extract_weight_name(lin_node)
+
+        ad_logger.info(
+            f"Processing linear node {i}/{len(linear_nodes)} with weight name {weight_name}"
+        )
         # get the parent layer_subgraph
         layer_subgraph = [
             layer

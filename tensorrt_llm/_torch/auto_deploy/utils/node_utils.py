@@ -576,6 +576,12 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
             )
             layer_subgraphs.append(layer_subgraph)
         last_lin_index = terminating_indices[-1] + 1
+    #  ad_logger.info(
+    #      f"Subgraph with {len(layer_subgraph.opening_nodes)} opening nodes,
+    # {len(layer_subgraph.subgraph_nodes)} subgraph nodes, and {len(layer_subgraph.terminating_node)}
+    # terminating node. Current state: num layers: {len(layer_subgraphs)},
+    # terminating_indices: {terminating_indices}, len(lin_nodes): {len(linear_nodes)}"
+    #  )
 
     # unprocessed linear nodes can be "simple sharded".
     return layer_subgraphs, unprocessed_linear_nodes
