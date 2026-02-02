@@ -24,7 +24,7 @@ from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 @pytest.mark.skip(
     reason="OOM on A30 GPUs on CI - speculative model loading does not support model_kwargs reduction"
 )
-@pytest.mark.parametrize("use_hf_speculative_model", [False])
+@pytest.mark.parametrize("use_hf_speculative_model", [False, True])
 @with_mocked_hf_download
 def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
     """Test speculative decoding with AutoDeploy using the build_and_run_ad main()."""
