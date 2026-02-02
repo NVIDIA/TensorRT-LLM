@@ -108,10 +108,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
-        reserved_gen_server = None
-        reserved_ctx_server = None
+        ctx_server = None
         # reserve a gen_server if conditional disagg is needed
-        reserved_gen_server, need_ctx = await self._check_conditional_disagg(request)
+        gen_server, need_ctx = await self._check_conditional_disagg(request)
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
@@ -119,15 +118,20 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
+            ctx_server, _ = await self._ctx_router.get_next_server(
+                ctx_req, exclude_server=gen_server
+            )
             ctx_response = await self._ctx_client.send_request(
-                ctx_req, server=reserved_ctx_server, hooks=hooks
+                ctx_req, server=ctx_server, hooks=hooks
             )
             await self._verify_ctx_response(ctx_response)
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
         if ctx_response is None or self._need_gen(ctx_response):
-            return await self._gen_client.send_request(
-                gen_req, server=reserved_gen_server, hooks=hooks
-            )
+            if not gen_server:
+                gen_server, _ = await self._gen_router.get_next_server(
+                    gen_req, exclude_server=ctx_server
+                )
+            return await self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
         else:
             if request.stream:
                 # ctx client will never return a generator when streaming is requested

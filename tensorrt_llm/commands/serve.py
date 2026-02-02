@@ -233,6 +233,124 @@ def launch_server(
         asyncio.run(server(host, port, sockets=[s]))
 
 
+def launch_grpc_server(host: str, port: int, llm_args: dict):
+    """
+    Launch a gRPC server for TensorRT-LLM.
+
+    This provides a high-performance gRPC interface designed for external routers
+    (e.g., sgl-router) using pre-tokenized input and raw token ID output.
+
+    Args:
+        host: Host to bind to
+        port: Port to bind to
+        llm_args: Arguments for LLM initialization (from get_llm_args)
+    """
+    import grpc
+
+    try:
+        from grpc_reflection.v1alpha import reflection
+        REFLECTION_AVAILABLE = True
+    except ImportError:
+        REFLECTION_AVAILABLE = False
+
+    from tensorrt_llm.grpc import trtllm_service_pb2, trtllm_service_pb2_grpc
+    from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
+    from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
+
+    async def serve_grpc_async():
+        logger.info("Initializing TensorRT-LLM gRPC server...")
+
+        backend = llm_args.get("backend")
+        model_path = llm_args.get("model", "")
+
+        if backend == "pytorch":
+            llm_args.pop("build_config", None)
+            llm = PyTorchLLM(**llm_args)
+        elif backend == "_autodeploy":
+            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+            llm_args.pop("build_config", None)
+            llm = AutoDeployLLM(**llm_args)
+        elif backend == "tensorrt" or backend == "trt":
+            llm_args.pop("backend")
+            llm = LLM(**llm_args)
+        else:
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
+
+        logger.info("Model loaded successfully")
+
+        # Create request manager
+        request_manager = GrpcRequestManager(llm)
+
+        # Create servicer
+        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
+
+        # Create gRPC server
+        server = grpc.aio.server(
+            options=[
+                ("grpc.max_send_message_length", -1),  # Unlimited
+                ("grpc.max_receive_message_length", -1),  # Unlimited
+                ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
+                ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
+            ], )
+
+        # Add servicer to server
+        trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(
+            servicer, server)
+
+        # Enable reflection for grpcurl and other tools
+        if REFLECTION_AVAILABLE:
+            service_names = (
+                trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
+                full_name,
+                reflection.SERVICE_NAME,
+            )
+            reflection.enable_server_reflection(service_names, server)
+            logger.info("gRPC reflection enabled")
+
+        # Bind to address
+        address = f"{host}:{port}"
+        server.add_insecure_port(address)
+
+        # Start server
+        await server.start()
+        logger.info(f"TensorRT-LLM gRPC server started on {address}")
+        logger.info("Server is ready to accept requests")
+
+        # Handle shutdown signals
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def signal_handler():
+            logger.info("Received shutdown signal")
+            stop_event.set()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+
+        # Serve until shutdown signal
+        try:
+            await stop_event.wait()
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        finally:
+            logger.info("Shutting down TensorRT-LLM gRPC server...")
+
+            # Stop gRPC server
+            await server.stop(grace=5.0)
+            logger.info("gRPC server stopped")
+
+            # Shutdown LLM
+            if hasattr(llm, "shutdown"):
+                llm.shutdown()
+            logger.info("LLM engine stopped")
+
+            logger.info("Shutdown complete")
+
+    asyncio.run(serve_grpc_async())
+
+
 def launch_mm_encoder_server(
     host: str,
     port: int,
@@ -476,6 +594,12 @@ class ChoiceWithAlias(click.Choice):
                   "Specify a custom chat template. "
                   "Can be a file path or one-liner template string",
                   "prototype"))
+@click.option(
+    "--grpc",
+    is_flag=True,
+    default=False,
+    help="Run gRPC server instead of OpenAI HTTP server. "
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
@@ -491,8 +615,9 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str]):
-    """Running an OpenAI API compatible server
+        custom_module_dirs: list[Path], chat_template: Optional[str],
+        grpc: bool):
+    """Running an OpenAI API compatible server (or gRPC server with --grpc flag)
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
@@ -569,9 +694,29 @@ def serve(
 
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, tool_parser, chat_template,
-                  metadata_server_cfg, server_role, disagg_cluster_config,
-                  multimodal_server_config)
+
+    if grpc:
+        # gRPC mode: launch gRPC server instead of OpenAI HTTP server
+        # Check for unsupported arguments that are silently ignored in gRPC mode
+        unsupported_args = {
+            "tool_parser": tool_parser,
+            "chat_template": chat_template,
+            "metadata_server_config_file": metadata_server_config_file,
+            "server_role": server_role,
+            "disagg_cluster_config": disagg_cluster_config,
+        }
+        for name, value in unsupported_args.items():
+            if value is not None:
+                raise ValueError(
+                    f"Argument '{name}' is not supported when running in gRPC mode. "
+                    f"The gRPC server is designed for use with external routers that handle "
+                    f"these features (e.g., tool parsing, chat templates).")
+        launch_grpc_server(host, port, llm_args)
+    else:
+        # Default: launch OpenAI HTTP server
+        launch_server(host, port, llm_args, tool_parser, chat_template,
+                      metadata_server_cfg, server_role, disagg_cluster_config,
+                      multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")

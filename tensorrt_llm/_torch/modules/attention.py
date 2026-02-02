@@ -433,6 +433,7 @@ class Attention(nn.Module):
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        has_lora: bool = False,
     ):
         num_tokens = attn_metadata.num_tokens
 
@@ -446,7 +447,8 @@ class Attention(nn.Module):
         out_scale_sf = None
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
         # and keeps attention output in BF16 for better precision when applying pre_quant_scale
-        if self._use_quantize_output():
+        # Also don't set out_scale if LoRA is active - LoRA grouped_gemm doesn't support FP8
+        if self._use_quantize_output() and not has_lora:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
@@ -499,6 +501,7 @@ class Attention(nn.Module):
         attention_mask_data: Optional[torch.Tensor],
         mrope_config: Optional[dict],
         attention_sinks: Optional[torch.Tensor] = None,
+        has_lora: bool = False,
     ):
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
@@ -544,7 +547,8 @@ class Attention(nn.Module):
                                                 mrope_position_deltas,
                                                 attention_window_size,
                                                 attention_mask_data,
-                                                attention_sinks=attention_sinks)
+                                                attention_sinks=attention_sinks,
+                                                has_lora=has_lora)
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
 
@@ -619,7 +623,8 @@ class Attention(nn.Module):
                                         attention_window_size,
                                         attention_mask_data,
                                         mrope_config=mrope_config,
-                                        attention_sinks=attention_sinks)
+                                        attention_sinks=attention_sinks,
+                                        has_lora=bool(lora_params))
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -811,7 +816,9 @@ class MLA(nn.Module):
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
+        dp_size = 1
         if self.mapping.enable_attention_dp:
+            dp_size = tp_size
             tp_size = 1
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
@@ -820,9 +827,9 @@ class MLA(nn.Module):
             ), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
-            world_size=tp_size * pp_size * cp_size,
+            world_size=pp_size * dp_size * tp_size * cp_size,
             tp_size=tp_size,
-            pp_size=pp_size,
+            pp_size=pp_size * dp_size,
             cp_size=cp_size,
             cp_config=self.mapping.cp_config,
             rank=self.mapping.rank,
@@ -921,9 +928,9 @@ class MLA(nn.Module):
         )
 
         mapping_o = Mapping(
-            world_size=tp_size * pp_size * cp_size,
+            world_size=pp_size * dp_size * tp_size * cp_size,
             tp_size=tp_size * cp_size,
-            pp_size=pp_size,
+            pp_size=pp_size * dp_size,
             cp_size=1,
             rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,
