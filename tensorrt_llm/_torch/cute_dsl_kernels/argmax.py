@@ -219,7 +219,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @cute.jit
     def warp_argmax_redux(current_max: Float32, current_argmax: Int32):
-        """Redux-based warp argmax - only works on sm_100+ (Blackwell)."""
+        """Redux-based warp argmax - only works on sm_100f (Blackwell)."""
         warp_max = ptx_redux_sync_max_f32(current_max)
         candidate_idx = ptx_select_argmax_candidate(current_max, warp_max, current_argmax)
         winning_idx = ptx_redux_sync_min_u32(candidate_idx)
@@ -324,7 +324,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class ArgmaxKernel(ReductionBase):
         def __init__(self, dtype: Type[cutlass.Numeric], N: int, use_redux: bool = False):
             super().__init__(dtype, N, stage=1, reduction_dtype=cutlass.Float32)
-            # use_redux=True for Blackwell (sm_100+), False for Hopper (sm_90)
+            # use_redux=True for Blackwell (sm_100f), False for Hopper (sm_90)
             self.use_redux = use_redux
 
         def _calculate_threads_per_row(self):
