@@ -375,3 +375,6 @@ unittest/_torch/auto_deploy/unit/singlegpu/test_ad_speculative_decoding.py::test
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_autotune_fp8_fp4[RoutingDSlite-384-1024-1] SKIP (https://nvbugs/5859881)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[disable_skip_indexer] SKIP (https://nvbugs/5859886)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-tp4-cutlass-fp8] SKIP (https://nvbugs/5651865)
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-triton-auto] SKIP (https://nvbugs/5843112)
+test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b] SKIP (https://nvbugs/5836829)
+test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b] SKIP (https://nvbugs/5836829)
