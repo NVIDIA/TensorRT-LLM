@@ -11,11 +11,6 @@ numa_bind=${5}
 log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
-gpu_ids=${9}
-
-# Set CUDA_VISIBLE_DEVICES from passed gpu_ids argument
-export CUDA_VISIBLE_DEVICES=${gpu_ids}
-unset UCX_TLS
 
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"

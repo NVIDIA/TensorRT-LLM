@@ -173,7 +173,7 @@ def replace_env_in_file(log_dir, file_path, env_var):
 
 
 def build_worker_environment(worker_config, env_config, role, benchmark_mode,
-                             nsys_on, profile_range, concurrency):
+                             nsys_on, profile_range, concurrency, gpu_ids):
     """Build complete environment dictionary for worker processes.
 
     Args:
@@ -184,6 +184,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         nsys_on: Whether nsys profiling is enabled
         profile_range: Profile range string (e.g., "10-30")
         concurrency: Concurrency level
+        gpu_ids: List of GPU IDs assigned to this worker
 
     Returns:
         Dictionary of environment variables
@@ -194,7 +195,11 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
     """
     env = {}
 
-    # 1. Parse user-defined worker env vars from config
+    # 1. Use gpu_ids to set CUDA_VISIBLE_DEVICES
+    cuda_devices = ','.join(map(str, gpu_ids))
+    env["CUDA_VISIBLE_DEVICES"] = cuda_devices
+
+    # 2. Parse user-defined worker env vars from config
     worker_env_var = env_config.get('worker_env_var', '')
     for var_string in worker_env_var.split():
         if '=' in var_string:
@@ -226,6 +231,9 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         env["TLLM_NVTX_DEBUG"] = "1"
         env["NSYS_MPI_STORE_TEAMS_PER_RANK"] = "1"
         env["TLLM_PROFILE_START_STOP"] = profile_range
+
+    # 6. Clear UCX_TLS for specific clusters
+    env["UCX_TLS"] = ""
 
     return env
 
@@ -276,7 +284,7 @@ def format_export_string(env_dict):
     for k, v in env_dict.items():
         # srun cannot handle values that contain commas
         if ',' in v:
-            raise ValueError("srun cannot handle env vars that contain commas.")
+            export_list.append(f"'{k}={v}'")
         else:
             export_list.append(f"{k}={v}")
     return ",".join(export_list)
@@ -485,7 +493,6 @@ def submit_job(config, log_dir, dry_run):
             # Get GPU IDs for this server from allocation
             # When multi-node, all nodes have same device list, so use first node [0]
             gpu_ids = list(allocation["nodes"].values())[0]
-            gpu_ids_str = ','.join(map(str, gpu_ids))
 
             # Build environment for this worker
             worker_env = build_worker_environment(
@@ -496,6 +503,7 @@ def submit_job(config, log_dir, dry_run):
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
                 concurrency=benchmark_config['concurrency_list'].split(',')[0],
+                gpu_ids=gpu_ids,
             )
             export_str = format_export_string(worker_env)
 
@@ -506,7 +514,7 @@ def submit_job(config, log_dir, dry_run):
                 f"-N {len(allocation['nodes'])}",
                 f"--ntasks {server_cfg['world_size']}",
                 f"--ntasks-per-node {gpus_per_node}",
-                f"--export={export_str}",
+                f"--export=\"{export_str}\"",
                 f"--container-image {env_config['container_image']}",
                 f"--container-name {container_name}",
                 f"--container-mounts {container_mount_str}",
@@ -520,7 +528,6 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
-                f"'{gpu_ids_str}'",  # Pass GPU IDs as argument
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))
@@ -533,7 +540,7 @@ def submit_job(config, log_dir, dry_run):
         "srun -l",
         f"--nodelist {disagg_server_hostname}",
         f"--container-name={container_name}",
-        f"--export={export_str}",
+        f"--export=\"{export_str}\"",
         f"--container-image={env_config['container_image']}",
         f"--container-mounts={container_mount_str}",
         f"--no-container-mount-home --mpi=pmix --overlap -N 1 -n 1",
