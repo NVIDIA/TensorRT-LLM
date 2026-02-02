@@ -50,7 +50,6 @@ from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            update_spec_config_from_model_config)
-from ..speculative.draft_target import DraftTargetOneModelSpecMetadata
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.mtp import SampleStateTensorsMTP
@@ -1674,20 +1673,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.request_accepted_path = request_accepted_path
 
             spec_metadata.num_tokens = total_num_tokens
-            # Populate is_last_context_chunk flags for DraftTarget
-            # Note: request_ids must be available in spec_metadata or attn_metadata
-            if isinstance(spec_metadata, DraftTargetOneModelSpecMetadata):
-                # Get request_ids from spec_metadata if available, otherwise from attn_metadata
-                request_ids = spec_metadata.request_ids if spec_metadata.request_ids is not None else attn_metadata.request_ids
-                if request_ids is not None:
-                    all_requests = scheduled_requests.all_requests()
-                    request_map = {req.py_request_id: req for req in all_requests}
-                    for i, req_id in enumerate(request_ids):
-                        req = request_map.get(req_id)
-                        if req is not None and req.is_context_init_state:
-                            spec_metadata.is_last_context_chunk[i] = req.is_last_context_chunk
-                        else:
-                            spec_metadata.is_last_context_chunk[i] = False
             spec_metadata.prepare()
 
             # Handle distributed spec metadata
@@ -2869,19 +2854,6 @@ class PyTorchModelEngine(ModelEngine):
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
-            # Populate is_last_context_chunk flags for DraftTarget
-            if isinstance(spec_metadata, DraftTargetOneModelSpecMetadata):
-                # Build mapping from request_id to request object for efficient lookup
-                all_requests = scheduled_requests.all_requests()
-                request_map = {req.py_request_id: req for req in all_requests}
-                # Populate flags based on request_ids order
-                for i, req_id in enumerate(request_ids):
-                    req = request_map.get(req_id)
-                    if req is not None and req.is_context_init_state:
-                        spec_metadata.is_last_context_chunk[i] = req.is_last_context_chunk
-                    else:
-                        # Generation requests or missing requests -> not a context chunk
-                        spec_metadata.is_last_context_chunk[i] = False
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -3047,16 +3019,6 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
             spec_metadata.seq_lens = sequence_lengths
-            # Populate is_last_context_chunk flags for DraftTarget
-            if isinstance(spec_metadata, DraftTargetOneModelSpecMetadata):
-                all_requests = scheduled_requests.all_requests()
-                request_map = {req.py_request_id: req for req in all_requests}
-                for i, req_id in enumerate(request_ids):
-                    req = request_map.get(req_id)
-                    if req is not None and req.is_context_init_state:
-                        spec_metadata.is_last_context_chunk[i] = req.is_last_context_chunk
-                    else:
-                        spec_metadata.is_last_context_chunk[i] = False
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 

@@ -244,7 +244,8 @@ def get_spec_worker(spec_config,
         return Eagle3OneModelWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
     if spec_dec_mode.is_draft_target_one_model():
-        return DraftTargetOneModelWorker(spec_config, mapping)
+        return DraftTargetOneModelWorker(spec_config, mapping,
+                                         use_separate_draft_kv_cache)
     return None
 
 
