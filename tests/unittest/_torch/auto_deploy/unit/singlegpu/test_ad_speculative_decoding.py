@@ -43,7 +43,7 @@ def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
 
     # Configure KV cache
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.6,
+        free_gpu_memory_fraction=0.5,
     )
 
     experiment_config["args"]["runtime"] = "trtllm"

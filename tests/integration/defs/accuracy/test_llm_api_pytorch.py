@@ -1399,7 +1399,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
@@ -2280,7 +2280,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.55)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
