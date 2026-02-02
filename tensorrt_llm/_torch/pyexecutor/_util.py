@@ -1347,7 +1347,6 @@ def create_py_executor_instance(
                                                ctx_chunk_config)
 
         resort_policy_config = llm_args.resort_policy_config
-
         if resort_policy_config is not None:
             assert resort_policy_config.policy_name == "AgentTree", "Resort policy only supports AgentTree for now"
             capacity_scheduler.impl.set_agent_tree_resort_policy(
