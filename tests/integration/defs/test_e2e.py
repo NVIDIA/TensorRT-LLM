@@ -516,6 +516,7 @@ class BenchRunner:
             str(self.num_requests),
         ]
         print(f"Running command: {' '.join(command)}")
+        subprocess.run(command, check=True, env=self.llm_venv._new_env)
 
     def build_engine(self):
         if self.skip_engine_build:
@@ -629,11 +630,8 @@ def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
                          ids=["llama3_1-8b"])
 @pytest.mark.parametrize("model_subdir", ["llama-3.1-model/Meta-Llama-3.1-8B"],
                          ids=["llama_v3_1"])
-@pytest.mark.parametrize("use_pytorch_backend", [False], ids=["trt_backend"])
-def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir,
-                                 use_pytorch_backend):
+def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir):
     "run bench mark in MIG mode, check if the throughput is increasing by concurrency"
-    skip_engine_build = False
     results = {}
     concurrency_list = [1, 32, 64, 128]
 
@@ -644,19 +642,17 @@ def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir,
                              model_name=model_name,
                              model_subdir=model_subdir,
                              streaming=False,
-                             use_pytorch_backend=use_pytorch_backend,
+                             use_pytorch_backend=True,
                              use_mpirun=False,
                              tp_size=1,
                              concurrency=concurrency,
-                             num_requests=num_requests,
-                             skip_engine_build=skip_engine_build)
+                             num_requests=num_requests)
 
         output = runner()
         results[concurrency] = output
 
     print(f"\n=== Benchmark Results Comparison ===")
     print(f"Model: {model_name}")
-    print(f"Backend: {'PyTorch' if use_pytorch_backend else 'TensorRT'}")
     print(
         f"{'Concurrency':<15} {'Throughput':<15} {'Latency':<15} {'Num Requests':<15}"
     )
