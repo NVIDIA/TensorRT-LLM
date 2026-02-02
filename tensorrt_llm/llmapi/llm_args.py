@@ -1879,10 +1879,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """
 
     backend: Optional[Literal[
-        "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI", "V2"]] = Field(
+        "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
             default=None,
             description=
             "The communication backend type to use for the cache transceiver.")
+
+    transceiver_runtime: Optional[Literal["CPP", "PYTHON"]] = Field(
+        default=None,
+        description=
+        "The runtime implementation. 'CPP' for C++ transceiver (default when not set), 'PYTHON' for Python transceiver."
+    )
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
