@@ -793,6 +793,12 @@ class DecodingBaseConfig(StrictBaseModel):
             spec_cfg._decoding_type_alias = "Eagle"
             return spec_cfg
 
+        if decoding_type == "DraftTarget" and backend == "_autodeploy":
+            data = dict(data)
+            data.pop("decoding_type")
+            data["_draft_target_one_model"] = False
+            return DraftTargetDecodingConfig(**data)
+
         config_class = config_classes.get(decoding_type)
         if config_class is None:
             raise ValueError(f"Invalid decoding type: {decoding_type}")
@@ -1147,8 +1153,8 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
-    draft_target_one_model: bool = False
     num_draft_layers: Optional[int] = None
+    _draft_target_one_model: bool = True
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1167,7 +1173,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.draft_target_one_model:
+        if self._draft_target_one_model:
             return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
         return TorchSpeculativeDecodingMode.DRAFT_TARGET
 
@@ -3175,6 +3181,10 @@ class TorchLlmArgs(BaseLlmArgs):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
+                if self.backend == "_autodeploy":
+                    self.speculative_config._draft_target_one_model = False
+                    # Invalidate cached spec_dec_mode in case it was already accessed
+                    self.speculative_config.__dict__.pop('spec_dec_mode', None)
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 assert self.speculative_config.num_nextn_predict_layers > 0
                 self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers
