@@ -465,7 +465,10 @@ public:
         // Make sure barrier is not moving around
         if (_id == 0)
         {
-            named_barrier_arrive_unaligned(_barrier_id, 256);
+            // This is a *rendezvous* between the two compute warpgroups (256 threads total).
+            // Use the unaligned variant to avoid synccheck false positives when the two
+            // warpgroups reach this barrier from different control-flow paths / PCs.
+            named_barrier_wait_unaligned(_barrier_id, 256);
         }
     }
 
