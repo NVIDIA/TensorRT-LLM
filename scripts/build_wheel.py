@@ -671,9 +671,11 @@ def main(*,
             print(cmake_configure_command)
             build_run(cmake_configure_command)
 
+        maybe_keep_depfile = " -- -d keepdepfile" if generator == "Ninja" else ""
         cmake_build_command = (
             f'cmake --build . --config {build_type} --parallel {job_count} '
-            f'--target build_wheel_targets {" ".join(extra_make_targets)}')
+            f'--target build_wheel_targets {" ".join(extra_make_targets)}{maybe_keep_depfile}'
+        )
         print("CMake Build command: ")
         print(cmake_build_command)
         build_run(cmake_build_command)
