@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
 #include <dirent.h>
@@ -29,6 +30,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <nixl_types.h>
+#include <numeric>
 #include <set>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -320,6 +322,96 @@ NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
     TLLM_CHECK(mHandle);
 }
 
+[[nodiscard]] std::pair<MemoryDescs, MemoryDescs> NixlHelper::coalesceTransferDescs(
+    TransferDescs const& srcDescs, TransferDescs const& dstDescs)
+{
+    auto const& srcVec = srcDescs.getDescs();
+    auto const& dstVec = dstDescs.getDescs();
+
+    // If sizes don't match or empty, return as-is
+    if (srcVec.size() != dstVec.size() || srcVec.empty())
+    {
+        return {srcDescs, dstDescs};
+    }
+
+    size_t const numDescs = srcVec.size();
+
+    // Create index array and sort by src address
+    // This allows us to find contiguous regions even if the original order is scattered
+    std::vector<size_t> sortedIndices(numDescs);
+    std::iota(sortedIndices.begin(), sortedIndices.end(), 0);
+
+    std::sort(sortedIndices.begin(), sortedIndices.end(),
+        [&srcVec](size_t lhs, size_t rhs)
+        {
+            // Sort by deviceId first, then by address
+            if (srcVec[lhs].getDeviceId() != srcVec[rhs].getDeviceId())
+            {
+                return srcVec[lhs].getDeviceId() < srcVec[rhs].getDeviceId();
+            }
+            return srcVec[lhs].getAddr() < srcVec[rhs].getAddr();
+        });
+
+    std::vector<MemoryDesc> coalescedSrc;
+    std::vector<MemoryDesc> coalescedDst;
+    coalescedSrc.reserve(numDescs);
+    coalescedDst.reserve(numDescs);
+
+    // Start with the first entry (using sorted order)
+    size_t firstIdx = sortedIndices[0];
+    uintptr_t currentSrcAddr = srcVec[firstIdx].getAddr();
+    size_t currentSrcLen = srcVec[firstIdx].getLen();
+    uint32_t currentSrcDeviceId = srcVec[firstIdx].getDeviceId();
+
+    uintptr_t currentDstAddr = dstVec[firstIdx].getAddr();
+    size_t currentDstLen = dstVec[firstIdx].getLen();
+    uint32_t currentDstDeviceId = dstVec[firstIdx].getDeviceId();
+
+    for (size_t idx = 1; idx < numDescs; ++idx)
+    {
+        size_t sortedIdx = sortedIndices[idx];
+        auto const& src = srcVec[sortedIdx];
+        auto const& dst = dstVec[sortedIdx];
+
+        // Check if current src and dst can be coalesced with previous
+        bool srcContiguous
+            = (currentSrcAddr + currentSrcLen == src.getAddr()) && (currentSrcDeviceId == src.getDeviceId());
+        bool dstContiguous
+            = (currentDstAddr + currentDstLen == dst.getAddr()) && (currentDstDeviceId == dst.getDeviceId());
+
+        if (srcContiguous && dstContiguous)
+        {
+            // Coalesce: extend the current region
+            currentSrcLen += src.getLen();
+            currentDstLen += dst.getLen();
+        }
+        else
+        {
+            // Cannot coalesce: save the current region and start a new one
+            coalescedSrc.emplace_back(currentSrcAddr, currentSrcLen, currentSrcDeviceId);
+            coalescedDst.emplace_back(currentDstAddr, currentDstLen, currentDstDeviceId);
+
+            currentSrcAddr = src.getAddr();
+            currentSrcLen = src.getLen();
+            currentSrcDeviceId = src.getDeviceId();
+
+            currentDstAddr = dst.getAddr();
+            currentDstLen = dst.getLen();
+            currentDstDeviceId = dst.getDeviceId();
+        }
+    }
+
+    // Don't forget to add the last region
+    coalescedSrc.emplace_back(currentSrcAddr, currentSrcLen, currentSrcDeviceId);
+    coalescedDst.emplace_back(currentDstAddr, currentDstLen, currentDstDeviceId);
+
+    TLLM_LOG_DEBUG(
+        "NixlHelper::coalesceTransferDescs: coalesced %zu -> %zu transfer entries", srcVec.size(), coalescedSrc.size());
+
+    return {MemoryDescs{srcDescs.getType(), std::move(coalescedSrc)},
+        MemoryDescs{dstDescs.getType(), std::move(coalescedDst)}};
+}
+
 TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 {
     auto startTime = std::chrono::steady_clock::now();
@@ -492,12 +584,28 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // UCX AM with desc list is faster than listener thread can recv/load MD with sockets
     // Will be deprecated with ETCD or callbacks
 
-    // do
-    // {
-    status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
-        NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
-        request.getRemoteName(), handle, &mExtraParams);
-    // } while (status == NIXL_ERR_NOT_FOUND);
+    // Coalesce contiguous memory regions to reduce transfer count (enabled by default)
+    // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
+    if (common::getEnvNixlDisableCoalesce())
+    {
+        // do
+        // {
+        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
+            NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
+            request.getRemoteName(), handle, &mExtraParams);
+        // } while (status == NIXL_ERR_NOT_FOUND);
+    }
+    else
+    {
+        auto [coalescedSrc, coalescedDst]
+            = NixlHelper::coalesceTransferDescs(request.getSrcDescs(), request.getDstDescs());
+        // do
+        // {
+        status
+            = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
+                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &mExtraParams);
+        // } while (status == NIXL_ERR_NOT_FOUND);
+    }
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
         " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s",
