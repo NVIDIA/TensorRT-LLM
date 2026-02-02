@@ -2903,7 +2903,8 @@ class PyExecutor:
                     f'Send first token response for request {req.py_request_id}'
                 )
                 response = req.create_response(False, self.dist.rank)
-                new_responses.append((req.py_request_id, response))
+                if response:
+                    new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
 

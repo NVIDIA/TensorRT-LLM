@@ -66,6 +66,9 @@ cache_transceiver_config:
 disable_overlap_scheduler: true
 # Ray executor configuration
 orchestrator_type: "ray"
+max_batch_size: 1
+max_num_tokens: 512
+max_seq_len: 128
 EOF
 else
     cat > extra_llm_config.yaml << EOF
@@ -75,6 +78,10 @@ cache_transceiver_config:
     max_tokens_in_buffer: 2048
 disable_overlap_scheduler: true
 # Using default executor MPI (no orchestrator_type specified)
+# Memory-saving parameters
+max_batch_size: 1
+max_num_tokens: 512
+max_seq_len: 128
 EOF
 fi
 
@@ -91,6 +98,9 @@ context_servers:
   num_instances: 1
   tensor_parallel_size: $TP_SIZE
   pipeline_parallel_size: 1
+  max_batch_size: 1
+  max_num_tokens: 512
+  max_seq_len: 128
   kv_cache_config:
     free_gpu_memory_fraction: 0.2
   cache_transceiver_config:
@@ -101,6 +111,9 @@ generation_servers:
   num_instances: 1
   tensor_parallel_size: $TP_SIZE
   pipeline_parallel_size: 1
+  max_batch_size: 1
+  max_num_tokens: 512
+  max_seq_len: 128
   cache_transceiver_config:
     backend: "UCX"
   urls:
@@ -125,18 +138,31 @@ fi
 
 # Launching context servers
 echo "Launching context servers..."
-if [[ "$BACKEND" == "mpi" ]]; then
-    export CUDA_VISIBLE_DEVICES=0
-fi
+CTX_GPUS=$(seq -s, 0 $((TP_SIZE - 1)))
+echo "Context server using GPUs: $CTX_GPUS (via CUDA_VISIBLE_DEVICES)"
+(
+    if [[ "$BACKEND" == "mpi" ]]; then
+        export CUDA_VISIBLE_DEVICES=$CTX_GPUS
+    fi
 
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
+    trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
+) &> output_ctx0 &
+CTX_PID=$!
+echo "Context server started with PID: $CTX_PID"
 
-if [[ "$BACKEND" == "mpi" ]]; then
-    export CUDA_VISIBLE_DEVICES=1
-fi
 # Launching generation servers
 echo "Launching generation servers..."
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_gen0 &
+GEN_GPUS=$(seq -s, $TP_SIZE $((2 * TP_SIZE - 1)))
+echo "Generation server using GPUs: $GEN_GPUS (via CUDA_VISIBLE_DEVICES)"
+(
+    if [[ "$BACKEND" == "mpi" ]]; then
+        export CUDA_VISIBLE_DEVICES=$GEN_GPUS
+    fi
+
+    trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
+) &> output_gen0 &
+GEN_PID=$!
+echo "Generation server started with PID: $GEN_PID"
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."

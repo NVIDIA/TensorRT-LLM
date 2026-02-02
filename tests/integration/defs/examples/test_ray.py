@@ -62,8 +62,6 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
-    if tp_size == 1:
-        pytest.skip("https://nvbugs/5682551")
 
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
@@ -101,8 +99,8 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
                 stderr=subprocess.PIPE,
                 env=env_copy,
         ):
-            assert wait_for_server("localhost", 8000, timeout_seconds=180), \
-                "Disaggregated server failed to start within 3 minutes"
+            assert wait_for_server("localhost", 8000, timeout_seconds=300), \
+                "Disaggregated server failed to start within 5 minutes"
 
             result = subprocess.run([
                 "curl", "-sS", "-w", "\n%{http_code}",
@@ -112,7 +110,7 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
             ],
                                     capture_output=True,
                                     text=True,
-                                    timeout=30)
+                                    timeout=60)
 
             *body_lines, status_line = result.stdout.strip().splitlines()
             body = "\n".join(body_lines)
