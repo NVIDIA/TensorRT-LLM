@@ -345,7 +345,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=torch_compile,
         )
         pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="nvfp4")
-        with LLM(f"{llm_models_root()}/Llama-3_1-8B-Instruct_nvfp4_fp8_hf",
+        with LLM(f"{llm_models_root()}/Llama-3_1-8B-Instruct_fp8_kv_nvfp4",
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
