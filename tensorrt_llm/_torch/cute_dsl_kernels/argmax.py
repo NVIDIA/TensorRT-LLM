@@ -622,7 +622,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # redux.sync.max.f32 is only supported on sm_100+
         from ..._utils import get_sm_version
 
-        use_redux = get_sm_version() >= 100  # sm_100+ (Blackwell)
+        sm_version = get_sm_version()
+        use_redux = sm_version >= 100 and sm_version < 120
 
         compile_key = (dtype, N, use_redux)
         if compile_key not in _argmax_compile_cache:
