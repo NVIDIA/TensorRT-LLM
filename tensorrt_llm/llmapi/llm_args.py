@@ -1132,6 +1132,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = kwargs[
                 'num_nextn_predict_layers']  # Current MTP only support linear tree
 
+        if not self.mtp_eagle_one_model:
+            logger.warning(
+                "2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing "
+                "in release 1.3. After that, the flag will be removed entirely."
+            )
+
     @classmethod
     def from_dict(cls, data: dict):
         out = cls(**data)
