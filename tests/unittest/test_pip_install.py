@@ -113,11 +113,6 @@ def install_tensorrt_llm():
     """
     print("##########  Install tensorrt_llm package  ##########")
 
-    # Upgrade wheel to user space to avoid conflict with system package
-    print("Upgrading wheel package to avoid debian package conflict...")
-    subprocess.check_call("pip3 install --upgrade --user 'wheel>=0.46.2'",
-                          shell=True)
-
     install_command = "pip3 install tensorrt_llm-*.whl"
 
     # Always check for an existing torch installation, regardless of OS.
@@ -188,8 +183,10 @@ def test_pip_install():
 
     subprocess.check_call("apt-get -y install libzmq3-dev", shell=True)
     subprocess.check_call("apt-get -y install python3-pip", shell=True)
-    subprocess.check_call("pip3 install --upgrade pip || true", shell=True)
+    subprocess.check_call("pip3 install --ignore-installed pip || true", shell=True)
     subprocess.check_call("pip3 install --upgrade setuptools || true",
+                          shell=True)
+    subprocess.check_call("pip3 install --ignore-installed wheel || true",
                           shell=True)
 
     download_wheel(args)
