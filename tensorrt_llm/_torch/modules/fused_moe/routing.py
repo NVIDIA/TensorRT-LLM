@@ -2,7 +2,7 @@ import math
 import threading
 import warnings
 from enum import IntEnum
-from typing import Callable, Dict, Optional, Type
+from typing import Callable, Dict, List, Optional, Type
 
 import torch
 import torch.nn.functional as F
