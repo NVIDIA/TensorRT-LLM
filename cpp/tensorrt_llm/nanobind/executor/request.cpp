@@ -796,18 +796,17 @@ void initRequestBindings(nb::module_& m)
     auto kvCacheMetricsGetstate = [](tle::RequestPerfMetrics::KvCacheMetrics const& self)
     {
         return nb::make_tuple(self.numTotalAllocatedBlocks, self.numNewAllocatedBlocks, self.numReusedBlocks,
-            self.numMissedBlocks, self.kvCacheHitRate, self.maxNumBlocks, self.usedNumBlocks, self.freeNumBlocks);
+            self.numMissedBlocks, self.kvCacheHitRate);
     };
     auto kvCacheMetricsSetstate = [](tle::RequestPerfMetrics::KvCacheMetrics& kvCacheMetrics, nb::tuple const& state)
     {
-        if (state.size() != 8)
+        if (state.size() != 5)
         {
             throw std::runtime_error("Invalid KvCacheMetrics state!");
         }
         new (&kvCacheMetrics)
             tle::RequestPerfMetrics::KvCacheMetrics{nb::cast<SizeType32>(state[0]), nb::cast<SizeType32>(state[1]),
-                nb::cast<SizeType32>(state[2]), nb::cast<SizeType32>(state[3]), nb::cast<float>(state[4]),
-                nb::cast<SizeType32>(state[5]), nb::cast<SizeType32>(state[6]), nb::cast<SizeType32>(state[7])};
+                nb::cast<SizeType32>(state[2]), nb::cast<SizeType32>(state[3]), nb::cast<float>(state[4])};
     };
     nb::class_<tle::RequestPerfMetrics::KvCacheMetrics>(m, "KvCacheMetrics")
         .def(nb::init<>())
@@ -816,9 +815,6 @@ void initRequestBindings(nb::module_& m)
         .def_rw("num_reused_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numReusedBlocks)
         .def_rw("num_missed_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numMissedBlocks)
         .def_rw("kv_cache_hit_rate", &tle::RequestPerfMetrics::KvCacheMetrics::kvCacheHitRate)
-        .def_rw("max_num_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::maxNumBlocks)
-        .def_rw("used_num_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::usedNumBlocks)
-        .def_rw("free_num_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::freeNumBlocks)
         .def("__getstate__", kvCacheMetricsGetstate)
         .def("__setstate__", kvCacheMetricsSetstate);
 

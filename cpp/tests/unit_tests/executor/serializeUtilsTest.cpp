@@ -47,9 +47,6 @@ void compareRequestPerfMetrics(texec::RequestPerfMetrics const& lh, texec::Reque
     EXPECT_EQ(lh.kvCacheMetrics.numReusedBlocks, rh.kvCacheMetrics.numReusedBlocks);
     EXPECT_EQ(lh.kvCacheMetrics.numMissedBlocks, rh.kvCacheMetrics.numMissedBlocks);
     EXPECT_EQ(lh.kvCacheMetrics.kvCacheHitRate, rh.kvCacheMetrics.kvCacheHitRate);
-    EXPECT_EQ(lh.kvCacheMetrics.maxNumBlocks, rh.kvCacheMetrics.maxNumBlocks);
-    EXPECT_EQ(lh.kvCacheMetrics.usedNumBlocks, rh.kvCacheMetrics.usedNumBlocks);
-    EXPECT_EQ(lh.kvCacheMetrics.freeNumBlocks, rh.kvCacheMetrics.freeNumBlocks);
 
     EXPECT_EQ(lh.speculativeDecoding.acceptanceRate, rh.speculativeDecoding.acceptanceRate);
     EXPECT_EQ(lh.speculativeDecoding.totalAcceptedDraftTokens, rh.speculativeDecoding.totalAcceptedDraftTokens);
