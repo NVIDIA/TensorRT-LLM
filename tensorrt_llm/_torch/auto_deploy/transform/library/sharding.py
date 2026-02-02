@@ -45,6 +45,7 @@ from ...utils.node_utils import (
     get_all_layer_subgraphs,
     get_all_weights_in_subgraph,
     get_layer_after_linear_node,
+    get_tensor_from_node,
     is_any_attention_op,
     is_any_lin_op,
     is_any_moe_op,
@@ -190,7 +191,7 @@ class ShardingTransformConfig(TransformConfig):
                 # They require hybrid EP+TP and/or SP support.
                 # "sequence_parallel", # sequence parallelism
                 # "local_colwise",
-                # "local_rowwise",
+                "local_rowwise",  # Support for local row-wise sharding (e.g., sinks)
                 # "local_packed_rowwise",
                 # "local",
             }
@@ -1321,6 +1322,7 @@ def _insert_sharded_moe(
     ep_size = config.process_grid[ShardingDim.EP]["w"]
     tp_rank = config.process_grid[ShardingDim.TP]["p"]
     tp_size = config.process_grid[ShardingDim.TP]["w"]
+
     allreduce_strategy = config.allreduce_strategy.name
     args = list(node.args)
     if allreduce_strategy is None:
@@ -1380,40 +1382,113 @@ def _insert_sharded_moe(
     w_down_list_sharded, w_down_list_to_remove = get_partition(args[4], ep_size, ep_rank)
     w_gate_list_sharded, w_gate_list_to_remove = get_partition(args[5], ep_size, ep_rank)
 
+    # Counter for unique parameter names
+    _tp_shard_counter = [0]
+
+    # Helper to shard weight node - handles both get_attr and call_function nodes
+    def _shard_weight_node(weight_node: Node, dim: SplitDimension) -> Node:
+        """Shard a weight node, handling both get_attr and call_function (e.g., transpose) nodes.
+
+        Returns the (possibly replaced) node to use in the weight list.
+        """
+        if weight_node.op == "get_attr":
+            # Standard case: direct parameter reference
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=gm.get_parameter(weight_node.target),
+                param_key=weight_node.target,
+                dim=dim,
+                rank=tp_rank,
+                world_size=tp_size,
+            )
+            return weight_node
+        elif weight_node.op == "call_function":
+            # Weight goes through an operation (e.g., transpose) - GPT-OSS style
+            # Evaluate the tensor, shard it, and create a new parameter
+            weight_tensor = get_tensor_from_node(gm, weight_node)
+            sharded_tensor = torch.tensor_split(weight_tensor, tp_size, dim=dim.value)[tp_rank]
+
+            # Register as a new parameter
+            param_name = f"ep_tp_sharded_weight_{_tp_shard_counter[0]}_{ep_rank}_{tp_rank}"
+            _tp_shard_counter[0] += 1
+            gm.register_parameter(
+                param_name, nn.Parameter(sharded_tensor.clone(), requires_grad=False)
+            )
+
+            # Create a new get_attr node for the sharded parameter
+            with gm.graph.inserting_before(node):
+                new_weight_node = gm.graph.get_attr(param_name)
+
+            ad_logger.debug(
+                f"TP-sharded call_function weight {weight_node.name} -> {param_name} "
+                f"(shape {weight_tensor.shape} -> {sharded_tensor.shape})"
+            )
+            return new_weight_node
+        else:
+            ad_logger.warning(
+                f"Unexpected weight node type {weight_node.op} for {weight_node.name}. "
+                "Skipping TP sharding."
+            )
+            return weight_node
+
     # if tp_size > 1, we do 2D EP+TP sharding.
     # we add TP sharding of all expert weights.
-    for w_up in w_up_list_sharded + w_gate_list_sharded:
-        shard_weight_tensor(
-            gm=gm,
-            weight_tensor=gm.get_parameter(w_up.target),
-            param_key=w_up.target,
-            dim=SplitDimension.COLUMN,
-            rank=tp_rank,
-            world_size=tp_size,
-        )
-    # here we don't need to add all-reduce: it's enough to have
-    # just one all-reduce after the whole EP+TP sharded MoE node.
-    for w_down in w_down_list_sharded:
-        shard_weight_tensor(
-            gm=gm,
-            weight_tensor=gm.get_parameter(w_down.target),
-            param_key=w_down.target,
-            dim=SplitDimension.ROW,
-            rank=tp_rank,
-            world_size=tp_size,
-        )
+    if tp_size > 1:
+        w_up_list_sharded = [
+            _shard_weight_node(w, SplitDimension.COLUMN) for w in w_up_list_sharded
+        ]
+        w_gate_list_sharded = [
+            _shard_weight_node(w, SplitDimension.COLUMN) for w in w_gate_list_sharded
+        ]
+        # here we don't need to add all-reduce: it's enough to have
+        # just one all-reduce after the whole EP+TP sharded MoE node.
+        w_down_list_sharded = [
+            _shard_weight_node(w, SplitDimension.ROW) for w in w_down_list_sharded
+        ]
 
     # -- Update args --
     args[3] = w_up_list_sharded
     args[4] = w_down_list_sharded
     args[5] = w_gate_list_sharded
 
+    # -- Handle optional bias arguments (GPT-OSS style MoE) --
+    # torch_moe signature: x, selected_experts, routing_weights, w1, w2, w3,
+    #                      is_gated_mlp, act_fn, apply_routing_on_input,
+    #                      w1_bias_stacked, w2_bias_stacked, w3_bias_stacked
+    # Bias indices: 9 (w1_bias), 10 (w2_bias), 11 (w3_bias)
+    # NOTE: For GPT-OSS, biases need to be handled by slicing along expert dimension
+    # But we can't use get_tensor_from_node here as it evaluates nodes which may
+    # corrupt graph state. Instead, we use aten.slice to slice at runtime.
+    bias_indices = [9, 10, 11]  # w1_bias, w2_bias, w3_bias
+    for bias_idx in bias_indices:
+        if bias_idx < len(args) and args[bias_idx] is not None:
+            bias_node = args[bias_idx]
+            if isinstance(bias_node, Node):
+                # Bias is stacked [E, ...] - slice along expert dimension using graph ops
+                # This avoids evaluating nodes which can corrupt graph state
+                lo = (num_experts // ep_size) * ep_rank
+                hi = num_experts if ep_rank == ep_size - 1 else lo + (num_experts // ep_size)
+
+                # Create slice node to slice bias at runtime instead of during graph construction
+                with gm.graph.inserting_before(node):
+                    sliced_bias_node = gm.graph.call_function(
+                        torch.ops.aten.slice.Tensor,
+                        args=(bias_node, 0, lo, hi, 1),  # slice dim 0 from lo to hi
+                    )
+                args[bias_idx] = sliced_bias_node
+
     # Shard scales for quantized ops
     scales_to_remove = []
+    # Calculate starting index for scales (after biases if present, or after apply_routing_on_input)
+    scale_start_idx = 6  # Default: right after w3_weight
+    if len(args) > 9 and args[9] is not None:
+        scale_start_idx = 12  # After biases
     for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
-        sharded, to_remove = get_partition(args[6 + i], ep_size, ep_rank)
-        args[6 + i] = sharded
-        scales_to_remove.extend(to_remove)
+        arg_idx = scale_start_idx + i
+        if arg_idx < len(args):
+            sharded, to_remove = get_partition(args[arg_idx], ep_size, ep_rank)
+            args[arg_idx] = sharded
+            scales_to_remove.extend(to_remove)
 
     ad_logger.debug(
         f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
@@ -1957,6 +2032,66 @@ def _process_column_sharding(
 ########################################################
 
 
+def _shard_standalone_local_rowwise_params(
+    gm: GraphModule,
+    transform_container: "ShardingTransformContainer",
+    tp_plan: Dict[str, str],
+) -> int:
+    """Handle standalone parameters that need local_rowwise sharding.
+
+    This handles parameters like attention sinks that are not weights
+    of linear layers but still need to be TP-sharded along the head dimension.
+    """
+    count = 0
+    config = transform_container.config
+    tp_rank = config.rank
+    tp_size = config.world_size
+
+    if tp_size <= 1:
+        return 0
+
+    # Check for local_rowwise configs in tp_plan
+    local_rowwise_patterns = [key for key, val in tp_plan.items() if val == "local_rowwise"]
+
+    if not local_rowwise_patterns:
+        return 0
+
+    # Find get_attr nodes that match the patterns
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":
+            param_key = node.target
+            # Check if this parameter matches any local_rowwise pattern
+            for pattern in local_rowwise_patterns:
+                # Convert pattern to regex (handle wildcards)
+                pattern_string = "*" + pattern + "*"
+                pattern_string = pattern_string.replace("*", "@")
+                pattern_regex = re.escape(pattern_string).replace("@", ".*")
+
+                if re.match(pattern_regex, param_key):
+                    try:
+                        param = gm.get_parameter(param_key)
+                        if param.dim() >= 1:  # Must have at least 1 dimension
+                            # Shard along dim 0 (typically head dimension for sinks)
+                            shard_weight_tensor(
+                                gm=gm,
+                                weight_tensor=param,
+                                param_key=param_key,
+                                dim=0,
+                                rank=tp_rank,
+                                world_size=tp_size,
+                                min_local_shape=1,
+                            )
+                            ad_logger.debug(
+                                f"TP-sharded standalone param with local_rowwise: {param_key}"
+                            )
+                            count += 1
+                    except Exception as e:
+                        ad_logger.warning(f"Failed to shard standalone param {param_key}: {e}")
+                    break  # Only match once per param
+
+    return count
+
+
 def detect_sharding_from_config(
     gm: GraphModule,
     transform_container: ShardingTransformContainer,
@@ -2110,9 +2245,25 @@ def detect_sharding_from_config(
                                 num_row_col_shards += 1
                         else:
                             ad_logger.warning(f"Unsupported sharding action {config}. Skipping.")
+                    elif config == "local_rowwise":
+                        # Local row-wise sharding: split along the last/first dim without all-reduce
+                        # Used for parameters like attention sinks that are head-distributed
+                        if transform_container.add(
+                            WeightShardingInfo.from_node(
+                                lin_node,
+                                split_dim=SplitDimension.ROW,
+                                config=transform_container.config,
+                                dist_op=None,  # No distribution op - each rank keeps its shard
+                                min_local_shape=1,
+                                layer_type=layer_type,
+                            )
+                        ):
+                            num_row_col_shards += 1
                     else:
-                        # TODO: local refers to hybrid EP+TP parallelism. Not supported yet.
-                        ad_logger.warning("Local EP+TP sharding is not supported yet. Skipping.")
+                        # TODO: other local modes refer to hybrid EP+TP parallelism. Not supported yet.
+                        ad_logger.warning(
+                            f"Local sharding mode {config} is not supported yet. Skipping."
+                        )
 
                 elif "gather" in config:
                     # Simple shard (row + all_gather)
@@ -2135,7 +2286,10 @@ def detect_sharding_from_config(
                 # after successful match, break the loop
                 break
 
-    num_shards = num_simple_shards + num_row_col_shards
+    # Handle standalone parameters like sinks that need local_rowwise sharding
+    # These are not weights of linear layers but standalone parameters
+    num_sinks_sharded = _shard_standalone_local_rowwise_params(gm, transform_container, tp_plan)
+    num_shards = num_simple_shards + num_row_col_shards + num_sinks_sharded
     ad_logger.info(
         f"Applied {num_shards} TP shards from config. Simple: {num_simple_shards}, "
         f"row-col: {num_row_col_shards} (including: ssm: {num_ssm_shards}, attention: {num_attention_shards})"

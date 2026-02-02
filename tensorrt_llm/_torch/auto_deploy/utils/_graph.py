@@ -283,8 +283,19 @@ def _run_shape_prop_single_gm(
                 for inp, arg in zip(inps, args_static)
             ]
 
+    # WAR: skip shape propagation for MoE graphs with CUDA params to avoid device mismatch
+    _has_cuda_params = any(
+        "cuda" in str(getattr(p, "device", "")) for _, p in gm.named_parameters()
+    )
+    _has_moe = any("torch_moe" in n.name or "moe" in n.name.lower() for n in gm.graph.nodes)
+    _skip_shape_prop = _has_cuda_params and _has_moe
+
     # run shape propagation if we have all the fake tensors
-    if all(inp is not _NO_VAL for inp in inps):
+    if _skip_shape_prop:
+        ad_logger.debug(
+            "Skipping shape_prop for MoE graph with CUDA params to avoid device mismatch"
+        )
+    elif all(inp is not _NO_VAL for inp in inps):
         with enable_python_dispatcher():
             FakeTensorProp(gm, fake_mode).propagate(*inps)
     else:
