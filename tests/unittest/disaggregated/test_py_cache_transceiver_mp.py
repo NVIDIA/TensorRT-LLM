@@ -371,7 +371,9 @@ def worker_fn(
         )
 
         # Create cache transceiver config
-        cache_transceiver_config = CacheTransceiverConfig(backend="V2", max_tokens_in_buffer=512)
+        cache_transceiver_config = CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+        )
 
         # Create PyNativeCacheTransceiver
         attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
@@ -437,7 +439,9 @@ def worker_fn(
         )
 
         # Create cache transceiver config
-        cache_transceiver_config = CacheTransceiverConfig(backend="V2", max_tokens_in_buffer=512)
+        cache_transceiver_config = CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+        )
 
         # Create PyNativeCacheTransceiver
         attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT

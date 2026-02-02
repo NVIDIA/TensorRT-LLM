@@ -405,15 +405,19 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent using NIXL backend: %s", nixlBackend.c_str());
 
+    // Get default plugin params first, then override with user-provided backendParams
+    // NOTE: getPluginParams overwrites init1, so we must call it BEFORE setting user params
     nixl_b_params_t init1;
+    nixl_mem_list_t mems1;
+    status = mRawAgent->getPluginParams(nixlBackend.c_str(), mems1, init1);
+    TLLM_CHECK(status == NIXL_SUCCESS);
+
+    // Override default params with user-provided backendParams
     for (auto const& [key, value] : config.backendParams)
     {
         init1[key] = value;
         TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent backendParams: %s: %s", key.c_str(), value.c_str());
     }
-    nixl_mem_list_t mems1;
-    status = mRawAgent->getPluginParams(nixlBackend.c_str(), mems1, init1);
-    TLLM_CHECK(status == NIXL_SUCCESS);
 
     status = mRawAgent->createBackend(nixlBackend.c_str(), init1, mRawBackend);
     if (status != NIXL_SUCCESS || !mRawBackend)
