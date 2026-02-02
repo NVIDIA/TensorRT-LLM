@@ -129,11 +129,13 @@ void RnnCacheFormatter::format(TransferSession& session)
     //    Each target gets: conv states + ssm states for overlapping layers
     auto const& modelConfig = selfConfig.getModelConfig();
     auto const maxBatchSize = mRnnStateManager->getMaxBatchSize();
-    SizeType32 convDimLocal = modelConfig.mConvDimSize / selfTPNum;
-    SizeType32 numHeadsLocal = modelConfig.mNumHeads / selfTPNum;
+    int const selfTPSizePerDPGroup = selfConfig.getParallelConfig().mEnableAttentionDP ? selfTPNum / selfConfig.getParallelConfig().mDPsize : selfTPNum;
+    SizeType32 convDimLocal = modelConfig.mConvDimSize / selfTPSizePerDPGroup;
+    SizeType32 numHeadsLocal = modelConfig.mNumHeads / selfTPSizePerDPGroup;
 
     size_t convBytesPerLayer
         = convDimLocal * (modelConfig.mDConv - 1) * common::getDTypeSize(selfConfig.getConvStateDataType());
+    convBytesPerLayer = (convBytesPerLayer + 15) & ~static_cast<size_t>(15);
     size_t ssmBytesPerLayer = numHeadsLocal * modelConfig.mHeadDim * modelConfig.mDState
         * common::getDTypeSize(selfConfig.getSsmStateDataType());
 
@@ -144,8 +146,8 @@ void RnnCacheFormatter::format(TransferSession& session)
 
     for (size_t i = 0; i < targetNum; i++)
     {
-        SizeType32 layersForTarget = targetInfo.mPeerLayerNumInDomainPP[i];
-        bufferSizesPerTarget[i] = layersForTarget * (convBytesPerLayer + ssmBytesPerLayer) * peerDuplicateHeadFactor;
+        SizeType32 layersForTarget = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
+        bufferSizesPerTarget[i] = layersForTarget * (convBytesPerLayer + ssmBytesPerLayer) * peerDuplicateHeadFactor / targetInfo.mDomainTPSize;
     }
 
     auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
@@ -153,7 +155,6 @@ void RnnCacheFormatter::format(TransferSession& session)
         = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
 
-    TLLM_CHECK(outputBuffers.size() == targetNum);
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
 
     std::vector<runtime::ITensor::SharedPtr> inputConvBlocks;
@@ -282,19 +283,26 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
     // Calculate buffer sizes
     auto const& modelConfig = selfConfig.getModelConfig();
-    SizeType32 convDimLocal = modelConfig.mConvDimSize / selfTPNum;
-    SizeType32 numHeadsLocal = modelConfig.mNumHeads / selfTPNum;
+    int const selfTPSizePerDPGroup = selfParallel.mEnableAttentionDP ? selfTPNum / selfParallel.mDPsize : selfTPNum;
+    SizeType32 selfConvDimLocal = modelConfig.mConvDimSize / selfTPSizePerDPGroup;
+    int const selfNumHeadsLocal = modelConfig.mNumHeads / selfTPSizePerDPGroup;
 
     size_t convBytesPerLayer
-        = convDimLocal * (modelConfig.mDConv - 1) * common::getDTypeSize(selfConfig.getConvStateDataType());
-    size_t ssmBytesPerLayer = numHeadsLocal * modelConfig.mHeadDim * modelConfig.mDState
+        = selfConvDimLocal * (modelConfig.mDConv - 1) * common::getDTypeSize(selfConfig.getConvStateDataType());
+    convBytesPerLayer = (convBytesPerLayer + 15) & ~static_cast<size_t>(15);
+    size_t ssmBytesPerLayer = selfNumHeadsLocal * modelConfig.mHeadDim * modelConfig.mDState
         * common::getDTypeSize(selfConfig.getSsmStateDataType());
-
+    
     std::vector<size_t> bufferSizesPerSource(sourceNum, 0);
+    size_t validTpSources = sourceNum / sourceInfo.mDomainPPSize;
+        
+    // Compute source conv bytes for SSM offset
+    size_t sourceConvBytesPerLayer = convBytesPerLayer / validTpSources;
+    
     for (size_t i = 0; i < sourceNum; i++)
     {
-        SizeType32 layersFromSource = sourceInfo.mPeerLayerNumInDomainPP[i];
-        bufferSizesPerSource[i] = layersFromSource * (convBytesPerLayer + ssmBytesPerLayer);
+        SizeType32 layersFromSource = sourceInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
+        bufferSizesPerSource[i] = layersFromSource * (convBytesPerLayer + ssmBytesPerLayer) / validTpSources;
     }
 
     // Allocate receive buffers
@@ -309,7 +317,6 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     bufferCoverSourceNum = bufferCoverSourceNumTmp;
     remainNoCoverSourceNum = sourceNum > bufferCoverSourceNum ? sourceNum - bufferCoverSourceNum : 0;
 
-    TLLM_CHECK(recvBuffers.size() == sourceNum);
     bufferManager.getStream().synchronize();
     session.setTime(TransferSession::kTimePreprocess);
 
@@ -434,7 +441,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
         recvBuffers, outputConvBlocks, slotIdx, maxBatchSize, destConfig, selfConfig, selfIdx, bufferManager);
 
     tensorrt_llm::executor::rnn_cache::concatRnnSsmStateDispatch(recvBuffers, outputSsmBlocks, slotIdx, maxBatchSize,
-        convBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
+        sourceConvBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
 
     bufferManager.getStream().synchronize();
 

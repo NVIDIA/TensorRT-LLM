@@ -314,7 +314,10 @@ TargetRanksInfo targetIRanks(
 TargetRanksInfo targetIRanks(
     rnn_cache::RnnCacheState const& peerCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfRank)
 {
-    return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
+    auto targetInfo = TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
+    targetInfo.mDupHeadFactor = 1; 
+    targetInfo.mPeerDupHeadFactor = 1; // RNN cache does not have head duplication.
+    return targetInfo;
 }
 
 template <typename T>

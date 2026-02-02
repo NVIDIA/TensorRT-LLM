@@ -346,14 +346,12 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
     // Collect input block pointers
     for (auto const& convBlock : inputConvBlocks)
     {
-        TLLM_CHECK(convBlock->getDataType() == cacheDataType);
         cachePtrs.push_back(reinterpret_cast<uint64_t>(convBlock->data()));
     }
 
     // Collect output block pointers
     for (auto const& outputBlock : outputSplitBlocks)
     {
-        TLLM_CHECK_WITH_INFO(outputBlock->getDataType() == cacheDataType, "outputSplitBlock data type mismatch");
         cachePtrs.push_back(reinterpret_cast<uint64_t>(outputBlock->data()));
     }
 
@@ -377,11 +375,13 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
     auto const& selfModelConfig = selfCacheState.getModelConfig();
 
     int const selfTPNum = selfParallelConfig.mTensorParallelism;
+    int const selfDPSize = selfParallelConfig.mDPsize;
+    int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
     int const selfPPRank = selfIdx / selfTPNum;
     int const numLayers = selfParallelConfig.mRnnLayerNumPerPP.at(selfPPRank);
 
     // Calculate conv dimensions
-    int const convDimLocal = selfModelConfig.mConvDimSize / selfTPNum;
+    int const convDimLocal = selfModelConfig.mConvDimSize / selfTPSizePerDPGroup;
     int const dConvMinus1 = selfModelConfig.mDConv - 1;
 
     // Calculate domain parameters
@@ -393,8 +393,10 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
 
     TLLM_LOG_DEBUG(
         "splitRnnConvState - numLayers: %d, convDimLocal: %d, dConvMinus1: %d, "
-        "domainPPSize: %d, domainTPSize: %d, convDimDomainTP: %d",
-        numLayers, convDimLocal, dConvMinus1, domainPPSize, domainTPSize, convDimDomainTP);
+        "domainPPSize: %d, domainTPSize: %d, convDimDomainTP: %d, "
+        "outputCacheNum: %zu, inputBlockNum: %zu, peerDupHeadFactor: %d",
+        numLayers, convDimLocal, dConvMinus1, domainPPSize, domainTPSize, convDimDomainTP,
+        outputSplitBlocks.size(), inputBlockNum, targetRankInfo.mPeerDupHeadFactor);
 
     // Set up device pointers
     T const** inputConvPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
@@ -406,43 +408,41 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
     constexpr int blockDimx = 128;
     dim3 gridDim(numLayers, inputBlockNum);
     dim3 blockDim(blockDimx);
-    int const remainder = dConvMinus1 * sizeof(T) % 16;
 
-    switch (remainder)
+    int const rowStrideBytes = dConvMinus1 * sizeof(T);
+    int vecSizeByte = 16;
+    while (vecSizeByte > static_cast<int>(sizeof(T)) && (rowStrideBytes % vecSizeByte) != 0)
     {
-    case 0:
+        vecSizeByte /= 2;
+    }
+
+    if (vecSizeByte == 16)
     {
         splitRnnConvStateKernel<T, subWarpSize, 16><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
             inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
             inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
-        break;
     }
-    case 8:
+    else if (vecSizeByte == 8)
     {
         splitRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
             inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
             inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
-        break;
     }
-    case 4:
-    case 12:
+    else if constexpr (sizeof(T) <= 4)
     {
-        if constexpr (sizeof(T) <= 4)
+        if (vecSizeByte == 4)
         {
             splitRnnConvStateKernel<T, subWarpSize, 4><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
                 inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
                 inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
-            break;
         }
-    }
-    default:
-    {
-        // For 8-byte types or unhandled remainders, use 8-byte vectorization
-        splitRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-            inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
-            inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
-        break;
-    }
+        else if constexpr (sizeof(T) <= 2)
+        {
+            // vecSizeByte == 2, only valid for 1 or 2 byte types
+            splitRnnConvStateKernel<T, subWarpSize, 2><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
+                inputConvPtrsDev, outputCachePtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+                inputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
+        }
     }
 
     TLLM_CUDA_CHECK(cudaGetLastError());
@@ -472,23 +472,19 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
 
     for (auto const& ssmBlock : inputSsmBlocks)
     {
-        TLLM_CHECK(ssmBlock->getDataType() == cacheDataType);
         cachePtrs.push_back(reinterpret_cast<uint64_t>(ssmBlock->data()));
     }
 
     for (size_t i = 0; i < outputSplitBlocks.size(); i++)
     {
         // Calculate offset for this specific target
-        SizeType32 layersForThisTarget = targetRankInfo.mPeerLayerNumInDomainPP[i];
-        size_t ssmOffset = layersForThisTarget * convBytesPerLayer;
+        SizeType32 layersForThisTarget = targetRankInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
+        size_t ssmOffset = layersForThisTarget * convBytesPerLayer / targetRankInfo.mDomainTPSize;
 
         // Apply offset to UINT8 buffer
         uint8_t* basePtr = static_cast<uint8_t*>(outputSplitBlocks[i]->data());
         T* typedPtr = reinterpret_cast<T*>(basePtr + ssmOffset);
 
-        TLLM_CHECK_WITH_INFO(outputSplitBlocks[i]->getDataType() == cacheDataType
-                || outputSplitBlocks[i]->getDataType() == nvinfer1::DataType::kUINT8,
-            "outputSplitBlock data type mismatch");
         cachePtrs.push_back(reinterpret_cast<uint64_t>(typedPtr));
     }
 
@@ -509,11 +505,13 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
     auto const& selfModelConfig = selfCacheState.getModelConfig();
 
     int const selfTPNum = selfParallelConfig.mTensorParallelism;
+    int const selfDPSize = selfParallelConfig.mDPsize;
+    int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
     int const selfPPRank = selfIdx / selfTPNum;
     int const numLayers = selfParallelConfig.mRnnLayerNumPerPP.at(selfPPRank);
 
     // Note: mNumHeads is GLOBAL, need to divide by TP
-    int const numHeadsLocal = selfModelConfig.mNumHeads / selfTPNum;
+    int const numHeadsLocal = selfModelConfig.mNumHeads / selfTPSizePerDPGroup;
     int const headDim = selfModelConfig.mHeadDim;
     int const dState = selfModelConfig.mDState;
 
@@ -523,8 +521,10 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
 
     TLLM_LOG_DEBUG(
         "splitRnnSsmState - numLayers: %d, numHeadsLocal: %d, headDim: %d, dState: %d, "
-        "domainPPSize: %d, domainTPSize: %d, headNumDomainTP: %d",
-        numLayers, numHeadsLocal, headDim, dState, domainPPSize, domainTPSize, headNumDomainTP);
+        "domainPPSize: %d, domainTPSize: %d, headNumDomainTP: %d, "
+        "outputCacheNum: %zu, peerDupHeadFactor: %d",
+        numLayers, numHeadsLocal, headDim, dState, domainPPSize, domainTPSize, headNumDomainTP,
+        outputSplitBlocks.size(), targetRankInfo.mPeerDupHeadFactor);
 
     T const** inputSsmPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
     T** outputCachePtrsDev = static_cast<T**>(PtrsDeviceBuffer->data()) + inputBlockNum;
@@ -608,13 +608,11 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
 
     for (auto const& outputBlock : outputConvBlocks)
     {
-        TLLM_CHECK(outputBlock->getDataType() == cacheDataType);
         cachePtrs.push_back(reinterpret_cast<uint64_t>(outputBlock->data()));
     }
 
     for (auto const& inputBlock : inputSplitBlocks)
     {
-        TLLM_CHECK_WITH_INFO(inputBlock->getDataType() == cacheDataType, "inputSplitBlock data type mismatch");
         cachePtrs.push_back(reinterpret_cast<uint64_t>(inputBlock->data()));
     }
 
@@ -635,9 +633,11 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     auto const& selfModelConfig = selfCacheState.getModelConfig();
 
     int const selfTPNum = selfParallelConfig.mTensorParallelism;
+    int const selfDPSize = selfParallelConfig.mDPsize;
+    int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
     int const selfPPRank = selfIdx / selfTPNum;
     int const numLayers = selfParallelConfig.mRnnLayerNumPerPP.at(selfPPRank);
-    int const convDimLocal = selfModelConfig.mConvDimSize / selfTPNum;
+    int const convDimLocal = selfModelConfig.mConvDimSize / selfTPSizePerDPGroup;
     int const dConvMinus1 = selfModelConfig.mDConv - 1;
 
     int const domainPPSize = targetRankInfo.mDomainPPSize;
@@ -658,43 +658,41 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     constexpr int blockDimx = 128;
     dim3 gridDim(numLayers, outputBlockNum);
     dim3 blockDim(blockDimx);
-    int const remainder = dConvMinus1 * sizeof(T) % 16;
-
-    switch (remainder)
+    
+    int const rowStrideBytes = dConvMinus1 * sizeof(T);
+    int vecSizeByte = 16;
+    while (vecSizeByte > static_cast<int>(sizeof(T)) && (rowStrideBytes % vecSizeByte) != 0)
     {
-    case 0:
+        vecSizeByte /= 2;
+    }
+
+    if (vecSizeByte == 16)
     {
         concatRnnConvStateKernel<T, subWarpSize, 16><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
             inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
             outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
-        break;
     }
-    case 8:
+    else if (vecSizeByte == 8)
     {
         concatRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
             inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
             outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
-        break;
     }
-    case 4:
-    case 12:
+    else if constexpr (sizeof(T) <= 4)
     {
-        if constexpr (sizeof(T) <= 4)
+        if (vecSizeByte == 4)
         {
             concatRnnConvStateKernel<T, subWarpSize, 4><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
                 inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
                 outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
-            break;
         }
-    }
-    default:
-    {
-        // For 8-byte types or unhandled remainders, use 8-byte vectorization
-        concatRnnConvStateKernel<T, subWarpSize, 8><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
-            inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
-            outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
-        break;
-    }
+        else if constexpr (sizeof(T) <= 2)
+        {
+            // vecSizeByte == 2, only valid for 1 or 2 byte types
+            concatRnnConvStateKernel<T, subWarpSize, 2><<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(
+                inputCachePtrsDev, outputConvPtrsDev, slotIdx, maxBatchSize, convDimLocal, dConvMinus1, numLayers,
+                outputBlockNum, domainPPSize, convDimDomainTP, prefixLayerNumDevPtr);
+        }
     }
 
     TLLM_CUDA_CHECK(cudaGetLastError());
@@ -726,23 +724,17 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
 
     for (auto const& outputBlock : outputSsmBlocks)
     {
-        TLLM_CHECK(outputBlock->getDataType() == cacheDataType);
         cachePtrs.push_back(reinterpret_cast<uint64_t>(outputBlock->data()));
     }
 
     for (size_t i = 0; i < inputSplitBlocks.size(); i++)
     {
-        // Calculate offset for this specific source
-        SizeType32 layersFromThisSource = targetRankInfo.mPeerLayerNumInDomainPP[i];
+        SizeType32 layersFromThisSource = targetRankInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
         size_t ssmOffset = layersFromThisSource * convBytesPerLayer;
 
-        // Apply offset to UINT8 buffer
         uint8_t* basePtr = static_cast<uint8_t*>(inputSplitBlocks[i]->data());
         T* typedPtr = reinterpret_cast<T*>(basePtr + ssmOffset);
 
-        TLLM_CHECK_WITH_INFO(inputSplitBlocks[i]->getDataType() == cacheDataType
-                || inputSplitBlocks[i]->getDataType() == nvinfer1::DataType::kUINT8,
-            "inputSplitBlock data type mismatch");
         cachePtrs.push_back(reinterpret_cast<uint64_t>(typedPtr));
     }
 
@@ -763,9 +755,11 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
     auto const& selfModelConfig = selfCacheState.getModelConfig();
 
     int const selfTPNum = selfParallelConfig.mTensorParallelism;
+    int const selfDPSize = selfParallelConfig.mDPsize;
+    int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
     int const selfPPRank = selfIdx / selfTPNum;
     int const numLayers = selfParallelConfig.mRnnLayerNumPerPP.at(selfPPRank);
-    int const numHeadsLocal = selfModelConfig.mNumHeads / selfTPNum;
+    int const numHeadsLocal = selfModelConfig.mNumHeads / selfTPSizePerDPGroup;
     int const headDim = selfModelConfig.mHeadDim;
     int const dState = selfModelConfig.mDState;
 
@@ -775,8 +769,10 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
 
     TLLM_LOG_DEBUG(
         "concatRnnSsmState - numLayers: %d, numHeadsLocal: %d, headDim: %d, dState: %d, "
-        "domainPPSize: %d, domainTPSize: %d, headNumDomainTP: %d",
-        numLayers, numHeadsLocal, headDim, dState, domainPPSize, domainTPSize, headNumDomainTP);
+        "domainPPSize: %d, domainTPSize: %d, headNumDomainTP: %d, "
+        "inputCacheNum: %zu, peerDupHeadFactor: %d",
+        numLayers, numHeadsLocal, headDim, dState, domainPPSize, domainTPSize, headNumDomainTP,
+        inputSplitBlocks.size(), targetRankInfo.mPeerDupHeadFactor);
 
     T** outputSsmPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
     T const** inputCachePtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data()) + outputBlockNum;
@@ -902,7 +898,7 @@ void concatRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& 
     runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
-    auto dataType = inputSplitBlocks.front()->getDataType();
+    auto dataType = outputConvBlocks.front()->getDataType();
     auto dataSize = tensorrt_llm::common::getDTypeSize(dataType);
 
     switch (dataSize)
@@ -933,7 +929,7 @@ void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& i
     rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
-    auto dataType = inputSplitBlocks.front()->getDataType();
+    auto dataType = outputSsmBlocks.front()->getDataType();
     auto dataSize = tensorrt_llm::common::getDTypeSize(dataType);
 
     switch (dataSize)
