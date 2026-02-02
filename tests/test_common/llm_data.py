@@ -99,7 +99,7 @@ def mock_snapshot_download(repo_id: str, **kwargs) -> str:
     return local_path
 
 
-def with_mocked_hf_download(func):
+def with_mocked_hf_download_for_single_gpu(func):
     """Decorator to mock huggingface_hub.snapshot_download for tests.
 
     When applied, any calls to snapshot_download will be redirected to use
@@ -111,6 +111,9 @@ def with_mocked_hf_download(func):
 
     Additionally sets HF_HUB_OFFLINE=1 to ensure no network requests are made to
     HuggingFace.
+
+    WARNING: This decorator only works for single-GPU tests. For multi-GPU tests, the
+    mock won't be applied in MPI worker processes.
     """
 
     @wraps(func)
