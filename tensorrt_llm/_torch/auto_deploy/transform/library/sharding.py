@@ -40,9 +40,9 @@ from ...utils.node_utils import (
     LayerType,
     bfs,
     extract_weight_name,
-    extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
+    get_all_weight_infos_fast,
     get_all_weights_in_subgraph,
     is_any_attention_op,
     is_any_lin_op,
@@ -1295,6 +1295,11 @@ def _shard_parameter_node(
     rank, world_size = config.rank, config.world_size
     allreduce_strategy = config.allreduce_strategy.name
 
+    if "sharded" in node.meta and node.meta["sharded"]:
+        # Node was already sharded, skip
+        return
+    node.meta["sharded"] = True
+
     num_users = num_users_of_weight_node(node)
     if num_users > 1 or num_users == 0:
         ad_logger.warning(
@@ -1303,12 +1308,17 @@ def _shard_parameter_node(
         return
 
     # Shard weight using the unified function (also updates the parameter)
-    weight_nodes = extract_weight_nodes(node)
-    for weight_node in weight_nodes.weights:
+    all_weight_infos = get_all_weight_infos_fast(node)
+    # Parametrized nodes must have at least one weight (for debugging)
+    assert len(all_weight_infos.weights) > 0, (
+        f"Node {node.name} has no weights - weight mapping may be incorrect"
+    )
+
+    for weight_info in all_weight_infos.weights:
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
-            weight_tensor=weight_node.tensor,
-            param_key=weight_node.node_key,
+            weight_tensor=weight_info.tensor,
+            param_key=weight_info.node_key,
             dim=dim,
             rank=rank,
             world_size=world_size,
@@ -1318,29 +1328,29 @@ def _shard_parameter_node(
         if quantization_cb is not None:
             quantization_cb(
                 gm=gm,
-                submod=weight_node.submod,
+                submod=weight_info.submod,
                 node=node,
-                weight_key=weight_node.node_key,
+                weight_key=weight_info.node_key,
                 weight_new_shape=weight_new_shape,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
             )
 
-    for bias_node in weight_nodes.biases:
+    for bias_info in all_weight_infos.biases:
         if dim == 0:
             # update bias for dim 0 --> we can handle it like the weight
             shard_weight_tensor(
                 gm=gm,
-                weight_tensor=bias_node.tensor,
-                param_key=bias_node.node_key,
+                weight_tensor=bias_info.tensor,
+                param_key=bias_info.node_key,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_weight_dims,
             )
-        elif bias_node is not None and rank != world_size - 1:
+        elif rank != world_size - 1:
             # update the bias for dim 1 --> in this case only the last rank gets the bias to avoid
             # double counting it. For all other we will delete the bias.
             args = list(node.args)
@@ -1348,10 +1358,10 @@ def _shard_parameter_node(
             args[2] = None
             node.args = tuple(args)
             gm.graph.erase_node(node_bias)
-            bias_param_name = bias_node.node_key.rpartition(".")[-1]
-            setattr(bias_node.submod, bias_param_name, None)
+            bias_param_name = bias_info.node_key.rpartition(".")[-1]
+            setattr(bias_info.submod, bias_param_name, None)
             gm._register_load_state_dict_pre_hook(
-                partial(_load_hook_remove, param_key=bias_node.node_key)
+                partial(_load_hook_remove, param_key=bias_info.node_key)
             )
 
     # # # column shard with no gather: the output is sharded
@@ -2305,13 +2315,9 @@ def detect_sharding_from_config(
     # and check the validity of the sharding transform
     layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 
-    for i, lin_node in enumerate(linear_nodes):
+    for lin_node in linear_nodes:
         # use node's weight name to get the module name
         weight_name = extract_weight_name(lin_node)
-
-        ad_logger.info(
-            f"Processing linear node {i}/{len(linear_nodes)} with weight name {weight_name}"
-        )
         # get the parent layer_subgraph
         layer_subgraph = [
             layer
