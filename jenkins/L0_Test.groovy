@@ -3315,16 +3315,6 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["b200-x8-lbd", "l0_dgx_b200_perf_sanity", 2, 3, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["b200-x8-lbd", "l0_dgx_b200_perf_sanity", 3, 3, 8, 1, true],
     ]
-    // PerfSanity post-merge disagg tests
-    x86SlurmTestConfigs += buildStageConfigs(
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-PerfSanity-Disagg-1_CTXNode-1_GENNode-Post-Merge",
-        "b200-x8-lbd",
-        "l0_dgx_b200_multi_nodes_disagg_perf_sanity_1ctx_1gen",
-        6,
-        16,
-        2,
-        true
-    )
     fullSet += x86SlurmTestConfigs.keySet()
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), {
@@ -3376,70 +3366,54 @@ def launchTestJobs(pipeline, testFilter)
     ]
     // PerfSanity post-merge aggr tests
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge",
+        "GB200-8_GPUs-2_Nodes-PyTorch-AGGR-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes",
+        "l0_gb200_multi_nodes_aggr_perf_sanity_node2_gpu8",
         5,
         8,
         2
     )
     // PerfSanity post-merge disagg tests
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Disagg-1_CTXNode-1_GENNode-Post-Merge",
+        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_disagg_perf_sanity_1ctx_1gen",
-        4,
+        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
+        1,
         8,
         2
     )
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-12_GPUs-3_Nodes-PyTorch-PerfSanity-Disagg-1_CTXNode-2_GENNode-Post-Merge",
+        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_disagg_perf_sanity_1ctx_2gen",
-        6,
+        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
+        1,
+        8,
+        2
+    )
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
+        3,
+        8,
+        2
+    )
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
+        5,
         12,
         3
     )
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB200-20_GPUs-5_Nodes-PyTorch-PerfSanity-Disagg-1_CTXNode-4_GENNode-Post-Merge",
-    //     "auto:gb200-flex",
-    //     "l0_gb200_multi_nodes_disagg_perf_sanity_1ctx_4gen",
-    //     2,
-    //     20,
-    //     5
-    // )
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB200-36_GPUs-9_Nodes-PyTorch-PerfSanity-Disagg-1_CTXNode-8_GENNode-Post-Merge",
-    //     "auto:gb200-flex",
-    //     "l0_gb200_multi_nodes_disagg_perf_sanity_1ctx_8gen",
-    //     9,
-    //     36,
-    //     9
-    // )
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-16_GPUs-4_Nodes-PyTorch-PerfSanity-Disagg-2_CTXNode-2_GENNode-Post-Merge",
+        "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_disagg_perf_sanity_2ctx_2gen",
+        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
         1,
         16,
         4
     )
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB200-24_GPUs-6_Nodes-PyTorch-PerfSanity-Disagg-2_CTXNode-4_GENNode-Post-Merge",
-    //     "auto:gb200-flex",
-    //     "l0_gb200_multi_nodes_disagg_perf_sanity_2ctx_4gen",
-    //     1,
-    //     24,
-    //     6
-    // )
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB200-40_GPUs-10_Nodes-PyTorch-PerfSanity-Disagg-2_CTXNode-8_GENNode-Post-Merge",
-    //     "auto:gb200-flex",
-    //     "l0_gb200_multi_nodes_disagg_perf_sanity_2ctx_8gen",
-    //     1,
-    //     40,
-    //     10
-    // )
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {

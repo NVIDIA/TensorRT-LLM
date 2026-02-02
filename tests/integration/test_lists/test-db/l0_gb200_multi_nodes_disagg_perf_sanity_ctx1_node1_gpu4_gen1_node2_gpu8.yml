@@ -21,4 +21,3 @@ l0_gb200_multi_nodes_disagg_perf_sanity_1ctx_2gen:
   # - perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-deepseek-v32-fp4_8k1k_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-kimi-k2-thinking-fp4_1k1k_ctx1_dep4_gen1_dep8_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-kimi-k2-thinking-fp4_8k1k_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] TIMEOUT (120)
-  - perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-qwen3-235b-fp4_8k1k_ctx1_tp1_gen1_dep8_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
