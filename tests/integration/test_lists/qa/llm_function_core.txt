@@ -561,3 +561,4 @@ llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
 
 # AutoDeploy text generation accuracy tests
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[4]

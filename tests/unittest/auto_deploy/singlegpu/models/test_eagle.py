@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,9 +23,9 @@ from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
-    Eagle3DrafterForCausalLM,
     Eagle3DraftOutput,
     EagleConfig,
+    EagleDrafterForCausalLM,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
@@ -58,7 +58,7 @@ class MockEagleConfig(EagleConfig):
     }
 
 
-class MockEagle3ModelForCausalLM(Eagle3DrafterForCausalLM):
+class MockEagle3ModelForCausalLM(EagleDrafterForCausalLM):
     """Test wrapper that provides random hidden states for standalone Eagle testing.
 
     In production speculative decoding, real hidden states come from the target model.
@@ -186,7 +186,7 @@ def test_eagle_model_torch_export():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16
 
-    # Create model via EagleDrafterFactory (creates Eagle3DrafterForCausalLM)
+    # Create model via EagleDrafterFactory (creates EagleDrafterForCausalLM)
     factory = EagleDrafterFactory(model=str(eagle_path), skip_loading_weights=True)
     model = factory.build_model(device)
     config = model.config

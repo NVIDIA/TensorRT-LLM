@@ -343,3 +343,4 @@ l0_dgx_b200:
   tests:
   # ------------- AutoDeploy Perf Sanity ---------------
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws4_1k1k] TIMEOUT (120)
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[4]
