@@ -641,10 +641,7 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoE
         self,
         model_config: ModelConfig[ExaoneMoEConfig],
     ):
-        if (
-            model_config.spec_config is not None
-            and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
-        ):
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp():
             # NOTE: K-EXAONE does not contain the 'num_nextn_predict_layers' field,
             # which should be equal to 1. Manually set the value here if not present.
             if not hasattr(model_config.pretrained_config, "num_nextn_predict_layers"):
@@ -655,10 +652,7 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoE
             model_config=model_config,
         )
 
-        if (
-            model_config.spec_config is not None
-            and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
-        ):
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp():
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
