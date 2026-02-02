@@ -50,6 +50,8 @@ transforms:
     expected_layout: bsnd
   match_rmsnorm_pattern:
     stage: pattern_matcher
+  match_l2norm_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -60,6 +62,8 @@ transforms:
   optimize_rope:
     stage: pattern_matcher
   quantize_int4_linear_from_config:
+    stage: pattern_matcher
+  quantize_int4_gptq_linear_from_config:
     stage: pattern_matcher
   quantize_fp8_linear_from_config:
     stage: pattern_matcher
@@ -140,6 +144,9 @@ transforms:
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  fuse_l2norm:
+    stage: post_load_fusion
+    backend: fla
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true

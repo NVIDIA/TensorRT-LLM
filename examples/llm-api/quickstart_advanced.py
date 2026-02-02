@@ -55,13 +55,17 @@ def add_llm_args(parser):
                             'VANILLA', 'TRTLLM', 'FLASHINFER',
                             'FLASHINFER_STAR_ATTENTION'
                         ])
-    parser.add_argument('--moe_backend',
-                        type=str,
-                        default='CUTLASS',
-                        choices=[
-                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
-                        ])
+    parser.add_argument(
+        '--moe_backend',
+        type=str,
+        default='AUTO',
+        choices=[
+            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP', 'DEEPGEMM',
+            'CUTEDSL', 'TRITON'
+        ],
+        help=
+        'MoE backend to use. AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.'
+    )
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
@@ -105,6 +109,12 @@ def add_llm_args(parser):
     parser.add_argument('--log_kv_cache_events',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--use_kv_cache_manager_v2',
+        default=False,
+        action='store_true',
+        help='Use KVCacheManagerV2 for KV cache management (PyTorch backend).',
+    )
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
@@ -210,6 +220,7 @@ def setup_llm(args, **kwargs):
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
         tokens_per_block=args.tokens_per_block,
+        use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         event_buffer_max_size=1024 if args.log_kv_cache_events else 0)
 

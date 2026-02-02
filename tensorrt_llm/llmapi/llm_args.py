@@ -444,10 +444,13 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA",
-                     "TRITON"] = Field(default='CUTLASS',
-                                       description="MoE backend to use.")
+    backend: Literal[
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
+        "TRITON"] = Field(
+            default='AUTO',
+            description="MoE backend to use. "
+            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+        )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -1757,6 +1760,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    use_kv_cache_manager_v2: bool = Field(
+        default=False,
+        status="prototype",
+        description="Whether to use the KV cache manager v2 (experimental).")
+
+    max_util_for_resume: float = Field(
+        default=0.95,
+        status="prototype",
+        description=
+        "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
+    )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1815,6 +1830,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive"
                 )
+        return v
+
+    @field_validator('max_util_for_resume')
+    @classmethod
+    def validate_max_util_for_resume(cls, v: float):
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
 
@@ -2178,6 +2201,12 @@ class BaseLlmArgs(StrictBaseModel):
     return_perf_metrics: bool = Field(default=False,
                                       description="Return perf metrics.",
                                       status="prototype")
+
+    perf_metrics_max_requests: int = Field(
+        default=0,
+        description=
+        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
+        status="prototype")
 
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
         default=None,
@@ -2894,12 +2923,6 @@ class TorchLlmArgs(BaseLlmArgs):
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
-
-    perf_metrics_max_requests: int = Field(
-        default=0,
-        description=
-        "The maximum number of requests for perf metrics. Must also set request_perf_metrics to true to get perf metrics.",
-        status="prototype")
 
     batch_wait_timeout_ms: float = Field(
         default=0,
