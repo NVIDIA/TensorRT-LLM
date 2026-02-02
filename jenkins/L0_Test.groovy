@@ -2063,14 +2063,14 @@ def getSSHConnectionPorts(portConfigFile, stageName)
 }
 
 // Return true means the test rerun also fails. Return false otherwise.
-def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular") {
+def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
         echo "There is no ${resultFileName} file, skip the rerun step"
         return true
     }
 
     // Create rerun directory structure to avoid conflicts
-    def rerunDir = "${WORKSPACE}/${stageName}/rerun/${testType}"
+    def rerunDir = "${WORKSPACE}/${stageName}/rerun
     sh "mkdir -p ${rerunDir}"
 
     // Generate rerun test lists
@@ -2101,15 +2101,15 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                 script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
                 returnStdout: true
             ).trim().toInteger()
-            echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
+            echo "Found ${count} tests to rerun ${times} time(s)"
             validLineCount += count
         }
     }
     if (validLineCount > 5) {
-        echo "There are more than 5 failed ${testType} tests, skip the rerun step."
+        echo "There are more than 5 failed tests, skip the rerun step."
         return true
     } else if (validLineCount == 0) {
-        echo "No failed ${testType} tests need to be rerun, skip the rerun step."
+        echo "No failed tests need to be rerun, skip the rerun step."
         return true
     }
 
@@ -2118,7 +2118,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
         if (!fileExists(currentRerunTestList)) {
-            echo "No failed ${testType} tests need to be rerun ${times} time(s)"
+            echo "No failed tests need to be rerun ${times} time(s)"
             continue
         }
         sh "cat ${currentRerunTestList}"
@@ -2144,15 +2144,15 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             throw e
         } catch (Exception e) {
             if (!fileExists(xmlFile)) {
-                echo "The ${testType} tests crashed when rerun attempt."
+                echo "The tests crashed when rerun attempt."
                 throw e
             }
-            echo "The ${testType} tests still failed after rerun attempt."
+            echo "The tests still failed after rerun attempt."
             isRerunFailed = true
         }
     }
 
-    echo "isRerunFailed for ${testType}: ${isRerunFailed}"
+    echo "isRerunFailed: ${isRerunFailed}"
     return isRerunFailed
 }
 
@@ -2437,8 +2437,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
     stage ("[${stageName}] Run Pytest")
     {
-        def noRegularTests = false
-        def noIsolateTests = false
         def rerunFailed = false
         def testDBList = renderTestDB(testList, llmSrc, stageName)
 
@@ -2513,10 +2511,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
-                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
+                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml")
                     if (isRerunFailed) {
                         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                            error "Regular tests failed after rerun attempt"
+                            error "Tests failed after rerun attempt"
                         }
                         rerunFailed = true
                     }
