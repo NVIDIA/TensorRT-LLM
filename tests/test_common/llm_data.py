@@ -104,11 +104,17 @@ def with_mocked_hf_download(func):
 
     When applied, any calls to snapshot_download will be redirected to use
     local model paths from LLM_MODELS_ROOT instead of downloading from HuggingFace.
+
+    NOTE: We must patch snapshot_download at the location where it's actually imported
+    with 'from huggingface_hub import snapshot_download', since that creates a
+    local binding that won't be affected by patching huggingface_hub.snapshot_download.
     """
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with patch("huggingface_hub.snapshot_download", side_effect=mock_snapshot_download):
+        with patch(
+            "tensorrt_llm.llmapi.utils.snapshot_download", side_effect=mock_snapshot_download
+        ):
             return func(*args, **kwargs)
 
     return wrapper
