@@ -334,7 +334,7 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True-False-True] SKIP (https://nvbugs/5823587)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-cutlass-auto] SKIP (https://nvbugs/5836828)
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True-True-True] SKIP (https://nvbugs/5823587)
-examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2] SKIP (https://nvbugs/5781731)
+accuracy/test_llm_api_pytorch.py::TestQwen3_4B::test_eagle3 SKIP (https://nvbugs/5836592)
 test_e2e.py::test_openai_chat_harmony SKIP (https://nvbugs/5819444)
 accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8 SKIP (https://nvbugs/5819452)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5800646)
