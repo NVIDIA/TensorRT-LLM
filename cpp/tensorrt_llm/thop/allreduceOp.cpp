@@ -1455,6 +1455,8 @@ void preallocateNCCLWindowBuffer(torch::List<int64_t> const& group, int64_t size
     ncclComm_t comm = *comm_ptr;
 
     auto const size = static_cast<size_t>(size_bytes);
+    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) of %zu bytes for comm %p",
+        buffers_per_size, size, static_cast<void*>(comm));
     for (int64_t i = 0; i < buffers_per_size; ++i)
     {
         try
@@ -1462,6 +1464,9 @@ void preallocateNCCLWindowBuffer(torch::List<int64_t> const& group, int64_t size
             NCCLWindowBuffer buffer = allocator.requestBuffer(comm, size);
             if (buffer.isValid())
             {
+                TLLM_LOG_DEBUG(
+                    "[preallocateNCCLWindowBuffer] Allocated buffer %ld/%ld: handle=%d ptr=%p size=%zu window=%p",
+                    i + 1, buffers_per_size, buffer.handle, buffer.ptr, buffer.size, buffer.window);
                 allocator.releaseBuffer(comm, buffer.ptr);
             }
         }

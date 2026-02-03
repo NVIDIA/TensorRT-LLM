@@ -1786,6 +1786,10 @@ def tunable_allreduce(
                 element_size = input.element_size()
                 for tokens in sorted([int(v) for v in opt_shapes if v > 0]):
                     size_bytes = int(tokens * elements_per_token * element_size)
+                    logger.debug(
+                        "[tunable_allreduce] Pre-allocating NCCL window buffers: "
+                        "tokens=%d size_bytes=%d group=%s", tokens, size_bytes,
+                        list(group))
                     torch.ops.trtllm.preallocate_nccl_window_buffer(
                         group, size_bytes, 2)
 
