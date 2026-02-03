@@ -2070,7 +2070,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
     }
 
     // Create rerun directory structure to avoid conflicts
-    def rerunDir = "${WORKSPACE}/${stageName}/rerun
+    def rerunDir = "${WORKSPACE}/${stageName}/rerun"
     sh "mkdir -p ${rerunDir}"
 
     // Generate rerun test lists
