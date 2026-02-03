@@ -232,9 +232,6 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         env["NSYS_MPI_STORE_TEAMS_PER_RANK"] = "1"
         env["TLLM_PROFILE_START_STOP"] = profile_range
 
-    # 6. Clear UCX_TLS for specific clusters
-    env["UCX_TLS"] = ""
-
     return env
 
 

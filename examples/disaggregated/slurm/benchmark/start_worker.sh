@@ -12,6 +12,9 @@ log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
 
+# Clear UCX_TLS for specific clusters
+unset UCX_TLS
+
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 
