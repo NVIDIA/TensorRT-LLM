@@ -187,6 +187,10 @@ class DynamicLinearWeightLoader:
         module_quant_config = getattr(module, "quant_config", None)
         if module_quant_config is not None:
             quant_algo = module_quant_config.quant_algo
+        elif hasattr(module, "quant_config"):
+            # Module explicitly has quant_config=None (e.g., x_embedder with
+            # in_channels < 128). Respect the opt-out — don't quantize.
+            quant_algo = None
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
 

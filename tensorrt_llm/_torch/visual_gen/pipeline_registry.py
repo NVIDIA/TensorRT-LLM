@@ -2,7 +2,7 @@
 
 Follows: DiffusionArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
 
-All pipelines (Wan, Flux2, LTX2) register via @register_pipeline decorator.
+All pipelines (Wan, Flux, Flux2, LTX2) register via @register_pipeline decorator.
 """
 
 import json
@@ -83,10 +83,23 @@ class AutoPipeline:
             # Generic Wan (T2V)
             if "Wan" in class_name:
                 return "WanPipeline"
+            # Check FLUX.2 before FLUX.1 (more specific match first)
+            if "Flux2" in class_name:
+                return "Flux2Pipeline"
             if "Flux" in class_name:
                 return "FluxPipeline"
             if "LTX" in class_name or "Ltx" in class_name:
                 return "LTX2Pipeline"
+
+            # Also check transformer type in model_index
+            transformer_info = index.get("transformer", [])
+            if len(transformer_info) >= 2:
+                transformer_class = transformer_info[1]
+                if "Flux2" in transformer_class:
+                    return "Flux2Pipeline"
+                if "Flux" in transformer_class:
+                    return "FluxPipeline"
+
 
         raise ValueError(
             f"Cannot detect pipeline type for {checkpoint_dir}\n"

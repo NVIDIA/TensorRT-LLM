@@ -47,11 +47,16 @@ def get_visual_gen_attention_backend(
     Returns:
         Diffusion attention backend class
 
-    Backend Selection Guide:
-        - "VANILLA": Full support for cross-attention (different Q/KV seq lengths)
-                     Uses torch SDPA backend
-        - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths)
-                    Better performance but requires fused QKV
+    Backend Selection Guide (per AIGV Design Doc):
+        - "VANILLA" (recommended for FLUX/Cosmos): Uses torch SDPA with cuDNN
+          flash attention. Optimized for full self-attention patterns where all
+          tokens attend to all tokens. Best for diffusion models.
+
+        - "TRTLLM" (for Wan cross-attention only): Uses TRT-LLM fmha_v2 kernel
+          optimized for LLM workloads (short query, long KV cache). NOT recommended
+          for FLUX/Cosmos full self-attention - will be ~30% slower than VANILLA.
+
+    Profiling shows cuDNN SDPA outperforms fmha_v2 for diffusion attention patterns.
     """
     # Lazy imports to avoid circular dependency
     from .trtllm import TrtllmAttention
@@ -87,7 +92,9 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM")
+        backend: Backend identifier. Use "VANILLA" for FLUX/Cosmos (full self-attention),
+            "TRTLLM" only for Wan cross-attention. See get_visual_gen_attention_backend()
+            for detailed guidance.
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
