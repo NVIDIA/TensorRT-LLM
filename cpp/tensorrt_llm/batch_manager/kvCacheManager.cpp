@@ -1233,7 +1233,7 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
 
 SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
     GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
-    executor::KvCacheTransferMode mode, std::string const& directory)
+    executor::KvCacheTransferMode mode, std::string const& directory, bool isEnableBlockReuse)
 {
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     SizeType32 numMatchedTokens{0};
@@ -1247,7 +1247,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
     auto blockItr = blockKeys.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
-        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr && blockItr != blockKeys.end()
+        auto [partialMatch, numMatched, matchingBlock]
+            = searchRoot != nullptr && blockItr != blockKeys.end() && isEnableBlockReuse
             ? searchRoot->findMatchingBlock(*blockItr, mEnablePartialReuse, mCopyOnPartialReuse)
             : std::make_tuple(false, 0, nullptr);
         if (matchingBlock != nullptr && numMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
@@ -1395,18 +1396,15 @@ void WindowBlockManager::refreshBlocks()
     mTransferManager->syncTransfers();
 }
 
-// There are two versions of BlockManager::addSequence function.
-// This is called when block reuse is enabled.
 void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-    LlmRequest& llmRequest, SizeType32 windowSize)
+    LlmRequest& llmRequest, SizeType32 windowSize, bool isEnableBlockReuse)
 {
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
+    mWindowBlockManagers.at(windowSize)
+        .addSequence(sequence, inputLength, numContextBlocks, llmRequest, isEnableBlockReuse);
 }
 
-// There are two versions of WindowBlockManager::addSequence function.
-// This is called when block reuse is enabled.
-void WindowBlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
+void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
+    LlmRequest& llmRequest, bool isEnableBlockReuse)
 {
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1444,8 +1442,8 @@ void WindowBlockManager::addSequence(
 
     TLLM_CHECK(perBlockRetentions.size() == (size_t) numContextBlocks);
 
-    auto const prepopulatedPromptLen
-        = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions, mode, directory);
+    auto const prepopulatedPromptLen = loadOrAllocateBlocks(
+        blockKeys, numContextBlocks, sequence, perBlockRetentions, mode, directory, isEnableBlockReuse);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
 
@@ -1488,38 +1486,6 @@ void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
         allocateBlock(sequence, /*shareAmongBeams=*/sequence.getBeamWidth() == 1);
         updateLastCacheBlockOffsets(sequence);
     }
-}
-
-// There are two versions of BlockManager::addSequence function.
-// This is called when block reuse is disabled.
-void BlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 numContextBlocks, SizeType32 windowSize, bool isShareLastContextBlock)
-{
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, numContextBlocks, isShareLastContextBlock);
-}
-
-// There are two versions of WindowBlockManager::addSequence function.
-// This is called when block reuse is disabled.
-void WindowBlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 numContextBlocks, bool isShareLastContextBlock)
-{
-    if (mKvCacheConnectorManager)
-    {
-        TLLM_LOG_WARNING(
-            "KV Cache Connector specified when block reuse is disabled. The KV Cache Connector will be "
-            "ignored.");
-    }
-
-    auto const requestId = sequence.getRequestId();
-    auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
-    TLLM_CHECK(emplaceDone);
-
-    TLLM_CHECK_WITH_INFO(numContextBlocks > 0, "numContextBlocks must be greater than 0");
-    for (SizeType32 bi = 0; bi < numContextBlocks - 1; ++bi)
-    {
-        allocateBlock(sequence, /*shareAmongBeams=*/true);
-    }
-    allocateBlock(sequence, /*shareAmongBeams=*/isShareLastContextBlock);
 }
 
 void WindowBlockManager::addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx)
@@ -2458,24 +2424,8 @@ void KVCacheManager::addSequence(
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
-        if (mEnableBlockReuse)
-        {
-            mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
-        }
-        else
-        {
-            if (!mEnableBlockReuse && llmRequest && llmRequest->getKvCacheRetentionConfig().has_value())
-            {
-                TLLM_LOG_WARNING(
-                    "Request %d has a retention configuration set, but block reuse is disabled. The retention "
-                    "config "
-                    "will "
-                    "have no effect.",
-                    llmRequest->mRequestId);
-            }
-            bool isShareLastContextBlock = isCrossKv() || effectiveInputLength % getTokensPerBlock() == 0;
-            mBlockManager.addSequence(sequence, numContextBlocks, windowSize, isShareLastContextBlock);
-        }
+        mBlockManager.addSequence(
+            sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize, mEnableBlockReuse);
         mBlockManager.updateSequenceCacheBlockOffsets(sequence, windowSize);
     }
 
