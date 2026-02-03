@@ -482,7 +482,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
 
         def cleanupCommands = [
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
-            // "rm -rf ${jobWorkspace} || true",
+            "rm -rf ${jobWorkspace} || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -3073,7 +3073,7 @@ def checkStageNameSet(stageNames, jobKeys, paramName) {
     invalidStageName = stageNames.findAll { !(it in jobKeys) }
     if (invalidStageName) {
         def sortedJobKeys = jobKeys.sort()
-        throw new Exception("Cannot find the stage names:\n${invalidStageName.collect { "    ${it}" }.join('\n')}\nfrom the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
+        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
