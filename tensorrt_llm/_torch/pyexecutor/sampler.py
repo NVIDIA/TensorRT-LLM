@@ -326,7 +326,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
                     f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
                 )
 
-            request.py_result.append_mm_embeddings(mm_embedding)
+            request.py_result.append_mm_embeddings(mm_embedding, request.multimodal_lengths)
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:

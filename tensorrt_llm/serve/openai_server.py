@@ -630,14 +630,28 @@ class OpenAIServer:
 
         async def create_mm_embedding_response(promise: RequestOutput):
             await promise.aresult()
-            # TODO: Replace mm_embedding_handle with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
-            mm_embedding_handle = getattr(promise, "mm_embedding_handle", None)
-            if not mm_embedding_handle or "tensor_size" not in mm_embedding_handle:
+            # TODO: Replace mm_embedding_handles with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
+            mm_embedding_handles = (
+                promise.disaggregated_params.multimodal_embedding_handles
+                if promise.disaggregated_params
+                else None
+            )
+            if not mm_embedding_handles:
                 return self.create_error_response(
                     message="Multimodal embedding handle missing in response",
                     err_type="InternalServerError",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-            num_tokens = int(mm_embedding_handle["tensor_size"][0])
+            if any("tensor_size" not in h for h in mm_embedding_handles):
+                return self.create_error_response(
+                    message="Multimodal embedding handle missing tensor_size",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            mm_embedding_handle = (
+                mm_embedding_handles[0]
+                if len(mm_embedding_handles) == 1
+                else mm_embedding_handles
+            )
+            num_tokens = sum(int(h["tensor_size"][0]) for h in mm_embedding_handles)
             return ChatCompletionResponse(
                 id=str(promise.request_id),
                 model=self.model,
