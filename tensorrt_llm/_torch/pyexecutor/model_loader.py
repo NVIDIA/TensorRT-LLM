@@ -231,7 +231,7 @@ class ModelLoader:
 
         # Add mapping if available
         if hasattr(llm_args, 'parallel_config') and llm_args.parallel_config:
-            config_kwargs['mapping'] = llm_args.parallel_config.mapping
+            config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
 
         # Add spec_config if available
         if hasattr(llm_args, 'decoding_config') and llm_args.decoding_config:
