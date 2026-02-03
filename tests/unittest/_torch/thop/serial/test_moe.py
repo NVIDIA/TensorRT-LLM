@@ -132,6 +132,14 @@ class moe_args_dequant:
         self.act_type = act_type
 
 
+def convert_to_block_layout(input_tensor: torch.Tensor,
+                            blockK: int) -> torch.Tensor:
+    M, K = input_tensor.shape
+    assert K % blockK == 0, "K must be divisible by blockK"
+    return input_tensor.view(M, K // blockK,
+                             blockK).permute(1, 0, 2).contiguous().view(M, K)
+
+
 def routing_reference(expertLogits, topK, padding):
     originalDevice = expertLogits.device
     expertLogits = expertLogits.cpu()
@@ -949,6 +957,32 @@ class TestMoeFP8:
                         None, scores, gemm1_weights, gemm1_scales, None,
                         gemm2_weights, gemm2_scales, None, permute_info, False)
 
+        #
+        # Run the reference implementations
+        #
+        output_dequant_reference, _ = run_moe_reference_dsfp8(args)
+
+        epilogue_tile_m = 64
+        # Shuffle weights and scaling factors for transposed mma output
+        gemm1_weights_fp8_shuffled_array = []
+        gemm2_weights_fp8_shuffled_array = []
+        for i in range(num_experts):
+            gemm1_weights_fp8_shuffled = shuffle_matrix_a(
+                gemm1_weights[i].view(torch.uint8), epilogue_tile_m)
+            gemm2_weights_fp8_shuffled = shuffle_matrix_a(
+                gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
+
+            gemm1_weights_fp8_shuffled_array.append(
+                convert_to_block_layout(gemm1_weights_fp8_shuffled, 128))
+            gemm2_weights_fp8_shuffled_array.append(
+                convert_to_block_layout(gemm2_weights_fp8_shuffled, 128))
+
+        # Stack weights for all experts
+        gemm1_weights_fp8_shuffled = torch.stack(
+            gemm1_weights_fp8_shuffled_array).view(torch.float8_e4m3fn)
+        gemm2_weights_fp8_shuffled = torch.stack(
+            gemm2_weights_fp8_shuffled_array).view(torch.float8_e4m3fn)
+
         if use_topk_as_input:
             topk_ids = permute_info["topKIndices"].to(torch.int32)
             topk_weights = permute_info["topKLogits"].to(torch.bfloat16)
@@ -961,16 +995,12 @@ class TestMoeFP8:
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 expert_logits, routing_bias, hidden_states, hidden_states_scale,
-                gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
-                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                0, num_experts, routed_scaling, routing_method_type,
-                topk_weights, topk_ids)
+                gemm1_weights_fp8_shuffled, gemm1_scales,
+                gemm2_weights_fp8_shuffled, gemm2_scales, num_experts, top_k,
+                n_groups, top_k_groups, intermediate_size, 0, num_experts,
+                routed_scaling, routing_method_type, topk_weights, topk_ids)
         torch.cuda.synchronize()
         output_dequant_actual = output.to(torch.float)
-        #
-        # Run the reference implementations
-        #
-        output_dequant_reference, _ = run_moe_reference_dsfp8(args)
 
         check_accuracy(output_dequant_reference,
                        output_dequant_actual,

@@ -30,7 +30,7 @@
             "epilogueTileM": 128,
             "numStagesMma": 1,
             "transposeMmaOutput": true,
-            "useShuffledMatrixA": true,
+            "useShuffledMatrix": true,
             "useDeepSeekFp8": false
         },
 
@@ -86,7 +86,7 @@
             "epilogueTileM": 64,
             "clusterDimX": 1,
             "transposeMmaOutput": true,
-            "useShuffledMatrixA": false,
+            "useShuffledMatrix": false,
             "useDeepSeekFp8": true,
             "numStagesMmaWithinWorkTile": 2,
             "hoistMmaTaskTryWaits": true,
@@ -194,7 +194,7 @@
             "numExperts": 2,
             "numStagesMma": 2,
             "tileScheduler": "static",
-            "useShuffledMatrixA": false,
+            "useShuffledMatrix": false,
             "layoutA": "T"
         },
         {
@@ -356,19 +356,19 @@
             "useUnrollLoop2xForMma": [true, false],
             "numRegsPerThreadNonEpilogueWarp": 80,
             "dtypeC": "e4m3",
-            "mmaN,tileN,epilogueTileN,numStages,numWarpsLoadB,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp": [
-                [8, 8, 8, 8, 2, 160, 48],
-                [16, 16, 16, 6, 2, 160, 48],
-                [32, 32, 32, 6, 2, 160, 48],
-                [64, 64, 64, 6, 4, 160, 48],
-                [128, 128, 128, 5, 4, 152, 80]
+            "mmaN,tileN,epilogueTileN,numStages,numWarpsLoadB,numRegsPerThreadEpilogueWarp": [
+                [8, 8, 8, 8, 2, 160],
+                [16, 16, 16, 6, 2, 160],
+                [32, 32, 32, 6, 2, 160],
+                [64, 64, 64, 6, 4, 160],
+                [128, 128, 128, 5, 4, 152]
             ],
             "tileScheduler,numStagesMma": [
                 ["static", 2],
                 ["persistent", 4]
             ],
-            "useShuffledMatrixA": false,
-            "layoutA": "T"
+            "useShuffledMatrix": true,
+            "layoutA": "B"
         },
         {
             "_comment": "DS_FP8_FC2",
@@ -377,19 +377,19 @@
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
-            "mmaN,tileN,epilogueTileN,numStages,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp": [
-                [8, 8, 8, 8, 160, 48],
-                [16, 16, 16, 6, 160, 48],
-                [32, 32, 32, 6, 160, 48],
-                [64, 64, 64, 6, 160, 48],
-                [128, 128, 128, 5, 160, 64]
+            "mmaN,tileN,epilogueTileN,numStages,numRegsPerThreadEpilogueWarp": [
+                [8, 8, 8, 8, 160],
+                [16, 16, 16, 6, 160],
+                [32, 32, 32, 6, 160],
+                [64, 64, 64, 6, 160],
+                [128, 128, 128, 5, 160]
             ],
             "tileScheduler,numStagesMma": [
                 ["static", 2],
                 ["persistent", 4]
             ],
-            "useShuffledMatrixA": false,
-            "layoutA": "T"
+            "useShuffledMatrix": true,
+            "layoutA": "B"
         },
         {
             "_comment": "PerTensor_FP8_FC1_LowLatency",
@@ -662,6 +662,7 @@
             "routeAct": "ldgsts",
             "fusedAct": true,
             "sfLayoutB": "linear",
+            "mmaK": 32,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "e4m3",
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
@@ -681,6 +682,7 @@
             "_template": "BatchedGemmE2m1E4m3LowLatency",
             "routeAct": false,
             "fusedAct": false,
+            "mmaK": 32,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
