@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
-from tests.unittest._torch.auto_deploy.unit.singlegpu.custom_ops.test_triton_mamba_cached_op import (
+from tests.unittest._torch.auto_deploy.unit.singlegpu.custom_ops.mamba.test_triton_mamba_cached_op import (
     _random_params,
 )
 

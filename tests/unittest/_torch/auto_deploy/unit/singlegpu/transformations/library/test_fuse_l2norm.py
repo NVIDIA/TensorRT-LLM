@@ -3,7 +3,7 @@ import torch
 from _graph_test_helpers import run_test_transformed_gm
 from torch.export import Dim
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.l2norm import *  # noqa
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.l2norm import *  # noqa
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
