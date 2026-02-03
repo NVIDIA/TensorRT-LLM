@@ -1150,6 +1150,17 @@ using Kernel_traits_sliding_or_chunked_causal = {kernel_traits}<
                                            4,
                                            {kernel_flags}>;
 
+using Kernel_traits_bidirectional_sliding_window = {kernel_traits}<
+                                           Traits_p,
+                                           Traits_o,
+                                           {seq_len},
+                                           {head_size},
+                                           {loop_step},
+                                           {warps_m},
+                                           {warps_n},
+                                           5,
+                                           {kernel_flags}>;
+
 #if {use_tma} // use_tma
 
 #if {padding_mask} // padding_mask
@@ -1182,6 +1193,16 @@ void {sliding_or_chunked_causal_kernel_name}(const __grid_constant__ {params_typ
 
 #endif // sliding_or_chunked_causal_mask
 
+#if {bidirectional_sliding_window_mask} // bidirectional_sliding_window_mask
+
+extern "C"
+__global__
+void {bidirectional_sliding_window_kernel_name}(const __grid_constant__ {params_type} params){{
+  fused_multihead_attention::device_{kernel_variant}_tma<Kernel_traits_bidirectional_sliding_window>(params);
+}}
+
+#endif // bidirectional_sliding_window_mask
+
 #else
 
 #if {padding_mask}
@@ -1211,9 +1232,20 @@ __global__
 void {sliding_or_chunked_causal_kernel_name}(const __grid_constant__ {params_type} params){{
   fused_multihead_attention::device_{kernel_variant}<Kernel_traits_sliding_or_chunked_causal>(params);
 }}
-#endif
 
 #endif // sliding_or_chunked_causal_mask
+
+#if {bidirectional_sliding_window_mask} // bidirectional_sliding_window_mask
+
+extern "C"
+__global__
+void {bidirectional_sliding_window_kernel_name}(const __grid_constant__ {params_type} params){{
+  fused_multihead_attention::device_{kernel_variant}<Kernel_traits_bidirectional_sliding_window>(params);
+}}
+
+#endif // bidirectional_sliding_window_mask
+
+#endif
 
 void {launcher_name}({fused_multihead_attention_params_v2_str} &params,
     const Launch_params &launch_params, cudaStream_t stream){{
@@ -1326,6 +1358,15 @@ void {launcher_name}({fused_multihead_attention_params_v2_str} &params,
     }}
     {sliding_or_chunked_causal_kernel_name}<<<grid, Kernel_traits::THREADS, Kernel_traits::BYTES_PER_SMEM, stream>>>({params_str});
 #endif // sliding_or_chunked_causal_mask
+  }} else if( launch_params.attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW ) {{
+#if {bidirectional_sliding_window_mask} // bidirectional_sliding_window_mask
+    if( smem_size >= 48*1024 ) {{
+       FMHA_CHECK_CUDA(cudaFuncSetAttribute({bidirectional_sliding_window_kernel_name},
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        smem_size));
+    }}
+    {bidirectional_sliding_window_kernel_name}<<<grid, Kernel_traits::THREADS, Kernel_traits::BYTES_PER_SMEM, stream>>>({params_str});
+#endif // bidirectional_sliding_window_mask
   }} else {{
 #if {padding_mask} // padding_mask
     constexpr int smem_size = Kernel_traits::BYTES_PER_SMEM;
@@ -1375,6 +1416,17 @@ using Kernel_traits_sliding_or_chunked_causal_nl = {kernel_traits}<
                                               4,
                                               {kernel_flags}>;
 
+using Kernel_traits_bidirectional_sliding_window_nl = {kernel_traits}<
+                                              Traits_p,
+                                              Traits_o,
+                                              {seq_len},
+                                              {head_size},
+                                              {noloop_step},
+                                              {warps_m},
+                                              {warps_n},
+                                              5,
+                                              {kernel_flags}>;
+
 #if {padding_mask} // padding_mask
 
 extern "C"
@@ -1405,6 +1457,16 @@ void {sliding_or_chunked_causal_kernel_name}_nl({params_type} params){{
 
 #endif // sliding_or_chunked_causal_mask
 
+#if {bidirectional_sliding_window_mask} // bidirectional_sliding_window_mask
+
+extern "C"
+__global__
+void {bidirectional_sliding_window_kernel_name}_nl({params_type} params){{
+  fused_multihead_attention::device_{kernel_variant}_nl<Kernel_traits_bidirectional_sliding_window_nl>(params);
+}}
+
+#endif // bidirectional_sliding_window_mask
+
 void {launcher_name}_nl({fused_multihead_attention_params_v2_str} &params,
     const Launch_params& launch_params, cudaStream_t stream){{
   constexpr int loop_iters = {seq_len} / {noloop_step};
@@ -1431,6 +1493,15 @@ void {launcher_name}_nl({fused_multihead_attention_params_v2_str} &params,
     }}
     {sliding_or_chunked_causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
 #endif // sliding_or_chunked_causal_mask
+  }} else if( launch_params.attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW ) {{
+#if {bidirectional_sliding_window_mask} // bidirectional_sliding_window_mask
+    if( smem_size >= 48*1024 ) {{
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({bidirectional_sliding_window_kernel_name}_nl,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         smem_size));
+    }}
+    {bidirectional_sliding_window_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
+#endif // bidirectional_sliding_window_mask
   }} else {{
 #if {padding_mask} // padding_mask
     if( smem_size >= 48*1024 ) {{
@@ -1554,6 +1625,27 @@ using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       {enable_skip_softmax_flag},
                                       {output_dtype_}>;
 
+using Ktraits_bidirectional_sliding_window = {kernel_traits_header}
+                                      {loop_step},
+                                      {kv_loop_step},
+                                      {head_size},
+                                      {head_size_v},
+                                      {q_tile_buffers},
+                                      {kv_tile_buffers},
+                                      NUM_COMPUTE_GROUPS,
+                                      DMA2COMPUTE_DEPTH,
+                                      3,
+                                      {heads_interleaved_flag},
+                                      {has_alibi},
+                                      {enable_mutex_flag},
+                                      {scheduling_mode},
+                                      {input_layout_flag},
+                                      USE_TMA_STORE && false,
+                                      {enable_attn_logit_softcapping_flag},
+                                      {return_softmax_stats_flag},
+                                      {enable_skip_softmax_flag},
+                                      {output_dtype_}>;
+
 using Ktraits_custom_mask = {kernel_traits_header}
                             {loop_step},
                             {kv_loop_step},
@@ -1563,7 +1655,7 @@ using Ktraits_custom_mask = {kernel_traits_header}
                             {kv_tile_buffers},
                             NUM_COMPUTE_GROUPS,
                             DMA2COMPUTE_DEPTH,
-                            3,
+                            4,
                             {heads_interleaved_flag},
                             {has_alibi},
                             {enable_mutex_flag},
@@ -1725,6 +1817,56 @@ void {sliding_or_chunked_causal_kernel_name}(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if {bidirectional_sliding_window_mask} // bidirectional_sliding_window_mask
+
+using Shared_bidirectional_sliding_window = typename Ktraits_bidirectional_sliding_window::Shared;
+
+extern "C"
+__global__ __launch_bounds__(Ktraits_bidirectional_sliding_window::THREADS, 1)
+void {bidirectional_sliding_window_kernel_name}(
+    const __grid_constant__ {params_type} params){{
+
+    extern __shared__ char smem_[];
+    char *smem_aligned = fmha::align_1024(smem_);
+
+    Shared_bidirectional_sliding_window *shared =
+        reinterpret_cast<Shared_bidirectional_sliding_window *>(&smem_aligned[0]);
+    shared->init(threadIdx.x == 0);
+    __syncthreads();
+
+    // special trick to avoid warp_sync (leads to illegal instruction)
+    int warp_group = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
+    int tidx = threadIdx.x % 128;
+
+    if( warp_group == NUM_COMPUTE_GROUPS ) {{  // dma + sched
+
+        {setmaxnreg_dma_str}
+        uint32_t elect_one = tidx == 0;
+
+        // Need all threads involved when the dam group needs to transpose the v tile explicltly.
+        if constexpr ( Ktraits_bidirectional_sliding_window::DMA_GROUP_TRANSPOSE_V ) {{
+            fmha::ws::DMA<Ktraits_bidirectional_sliding_window>::Device dma_device(elect_one);
+            dma_device.{run_fct_name}(params, shared);
+        }} else {{
+            fmha::ws::DMA<Ktraits_bidirectional_sliding_window>::Device dma_device(elect_one);
+            if( tidx < 32 ) {{
+                dma_device.{run_fct_name}(params, shared);
+            }}
+        }}
+
+    }} else {{  // math
+
+        {setmaxnreg_compute_str}
+
+        fmha::ws::Compute<fmha::{instruction_traits}, Ktraits_bidirectional_sliding_window> compute;
+        compute.run(warp_group, tidx, shared, params);
+    }}
+}}
+
+#endif // bidirectional_sliding_window_mask
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 #if {custom_mask} // custom_mask
 
 using Shared_custom_mask = typename Ktraits_custom_mask::Shared;
@@ -1851,6 +1993,15 @@ void {launcher_name}(
         {sliding_or_chunked_causal_kernel_name}
             <<<block_size, Ktraits::THREADS, SMEM_BYTES, stream>>>({params_str});
 #endif // sliding_or_chunked_causal_mask
+    }} else if( launch_params.attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW ) {{
+#if {bidirectional_sliding_window_mask} // bidirectional_sliding_window_mask
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({bidirectional_sliding_window_kernel_name},
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         SMEM_BYTES));
+
+        {bidirectional_sliding_window_kernel_name}
+            <<<block_size, Ktraits::THREADS, SMEM_BYTES, stream>>>({params_str});
+#endif // bidirectional_sliding_window_mask
     }} else if( launch_params.attention_mask_type == Attention_mask_type::CUSTOM_MASK ) {{
 #if {custom_mask} // custom_mask
         FMHA_CHECK_CUDA(cudaFuncSetAttribute({custom_mask_kernel_name},
@@ -2080,6 +2231,9 @@ def selected_mask_types(kspec):
         if kspec.enable_attn_logit_softcapping:
             padding_mask = '0'
             custom_mask = '0'
+
+        if kspec.head_size not in [32, 64, 128]:
+            bidirectional_sliding_window_mask = '0'
 
     return padding_mask, causal_mask, sliding_or_chunked_causal_mask, bidirectional_sliding_window_mask, custom_mask
 
@@ -2969,6 +3123,11 @@ def get_kernel_traits_code(specs_names):
             snippet_flash_nl_tiled_sliding_or_chunked_causal = snippet_flash_nl_template.replace(
                 '__placeholder__',
                 '_sliding_or_chunked_causal').replace('_nl', '_nl_tiled')
+            snippet_flash_nl_bidirectional_sliding_window = snippet_flash_nl_template.replace(
+                '__placeholder__', '_bidirectional_sliding_window')
+            snippet_flash_nl_tiled_bidirectional_sliding_window = snippet_flash_nl_template.replace(
+                '__placeholder__',
+                '_bidirectional_sliding_window').replace('_nl', '_nl_tiled')
             snippet_flash_nl_custom_mask = snippet_flash_nl_template.replace(
                 '__placeholder__', '_custom_mask')
             snippet_flash_nl_tiled_custom_mask = snippet_flash_nl_template.replace(
@@ -3015,6 +3174,10 @@ def get_kernel_traits_code(specs_names):
             snippet_ws_sliding_or_chunked_causal = \
                 snippet_ws_template.replace('__placeholder__', '_sliding_or_chunked_causal').\
                                        replace('mask_type', '2').\
+                                       replace('__use_tma_store__', 'false')
+            snippet_ws_bidirectional_sliding_window = \
+                snippet_ws_template.replace('__placeholder__', '_bidirectional_sliding_window').\
+                                       replace('mask_type', '3').\
                                        replace('__use_tma_store__', 'false')
             snippet_ws_custom_mask = \
                 snippet_ws_template.replace('__placeholder__', '_custom_mask').\
@@ -3082,7 +3245,8 @@ def get_kernel_traits_code(specs_names):
         padding_mask = int(selected_types[0])
         causal_mask = int(selected_types[1])
         sliding_or_chunked_causal_mask = int(selected_types[2])
-        custom_mask = int(selected_types[3])
+        bidirectional_sliding_window_mask = int(selected_types[3])
+        custom_mask = int(selected_types[4])
 
         if not padding_mask:
             snippet = None
@@ -3102,6 +3266,10 @@ def get_kernel_traits_code(specs_names):
             snippet_ws_sliding_or_chunked_causal = None
             snippet_flash_nl_sliding_or_chunked_causal = None
             snippet_flash_nl_tiled_sliding_or_chunked_causal = None
+        if not bidirectional_sliding_window_mask:
+            snippet_ws_bidirectional_sliding_window = None
+            snippet_flash_nl_bidirectional_sliding_window = None
+            snippet_flash_nl_tiled_bidirectional_sliding_window = None
         if not custom_mask:
             snippet_ws_custom_mask = None
             snippet_flash_nl_custom_mask = None
@@ -3122,12 +3290,16 @@ def get_kernel_traits_code(specs_names):
                 print_kernel_specs.append(snippet_flash_nl_tiled_causal)
                 print_kernel_specs.append(
                     snippet_flash_nl_tiled_sliding_or_chunked_causal)
+                print_kernel_specs.append(
+                    snippet_flash_nl_tiled_bidirectional_sliding_window)
                 print_kernel_specs.append(snippet_flash_nl_tiled_custom_mask)
             elif kspec.flash_attention and kspec.tiled == 0:
                 print_kernel_specs.append(snippet_flash_nl)
                 print_kernel_specs.append(snippet_flash_nl_causal)
                 print_kernel_specs.append(
                     snippet_flash_nl_sliding_or_chunked_causal)
+                print_kernel_specs.append(
+                    snippet_flash_nl_bidirectional_sliding_window)
                 print_kernel_specs.append(snippet_flash_nl_custom_mask)
             else:
                 print_kernel_specs.append(snippet_nl)
@@ -3141,6 +3313,7 @@ def get_kernel_traits_code(specs_names):
             print_kernel_specs.append(snippet_ws)
             print_kernel_specs.append(snippet_ws_causal)
             print_kernel_specs.append(snippet_ws_sliding_or_chunked_causal)
+            print_kernel_specs.append(snippet_ws_bidirectional_sliding_window)
             print_kernel_specs.append(snippet_ws_custom_mask)
     # remove none.
     print_kernel_specs = [
@@ -3282,11 +3455,13 @@ def get_cubin_header(kernel_traits, specs_names):
         is_tiled = pythonBoolean2cpp['_tiled' in kname]
 
         # Attention mask type:
-        # padding (0), causal_mask (1), sliding_or_chunked_causal_mask (2), custom_mask (3).
+        # padding (0), causal_mask (1), sliding_or_chunked_causal_mask (2), bidirectional_sliding_window_mask (3), custom_mask (4).
         if '_custom_mask' in kname:
             attention_mask_type = AttentionMaskType.CUSTOM_MASK
         elif '_sliding_or_chunked_causal' in kname:
             attention_mask_type = AttentionMaskType.SLIDING_OR_CHUNKED_CAUSAL
+        elif '_bidirectional_sliding_window' in kname:
+            attention_mask_type = AttentionMaskType.BIDIRECTIONAL_SLIDING_WINDOW
         elif '_causal' in kname:
             attention_mask_type = AttentionMaskType.CAUSAL
 
