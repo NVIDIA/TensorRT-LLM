@@ -1,9 +1,11 @@
+import copy
 import dataclasses
+import itertools
 from abc import ABC, abstractmethod
-from collections import namedtuple
-from dataclasses import dataclass
+from collections import deque, namedtuple
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
 from strenum import StrEnum
 
@@ -16,10 +18,47 @@ from .llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
 
+# Standard scheduler output (used by both SimpleScheduler and SimpleUnifiedScheduler)
 SchedulerOutput = namedtuple("SchedulerOutput", [
     "context_requests", "generation_requests", "paused_requests",
     "fitting_disagg_gen_init_requests", "num_fitting_requests"
 ])
+
+
+@dataclass
+class UnifiedSchedulerOutput:
+    """
+    Extended scheduler output for SimpleUnifiedScheduler with global coordination.
+
+    Includes standard scheduling fields plus updated_active_requests for attention_dp mode.
+    """
+    context_requests: RequestList
+    generation_requests: RequestList
+    paused_requests: RequestList
+    fitting_disagg_gen_init_requests: RequestList
+    num_fitting_requests: int
+
+    # Optional: Only populated when global coordination is used (attention_dp)
+    updated_active_requests: Optional[RequestList] = None
+
+    def to_scheduler_output(self) -> SchedulerOutput:
+        """Convert to standard SchedulerOutput (for backward compatibility)."""
+        return SchedulerOutput(
+            context_requests=self.context_requests,
+            generation_requests=self.generation_requests,
+            paused_requests=self.paused_requests,
+            fitting_disagg_gen_init_requests=self.
+            fitting_disagg_gen_init_requests,
+            num_fitting_requests=self.num_fitting_requests,
+        )
+
+    def to_scheduled_requests(self) -> 'ScheduledRequests':
+        """Convert to ScheduledRequests (used by PyExecutor)."""
+        return ScheduledRequests.from_lists(
+            context_requests=self.context_requests,
+            generation_requests=self.generation_requests,
+            paused_requests=self.paused_requests,
+        )
 
 
 class ScheduledRequests:
@@ -28,6 +67,22 @@ class ScheduledRequests:
         self.context_requests: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+
+    @staticmethod
+    def from_lists(
+        context_requests: RequestList,
+        generation_requests: RequestList,
+        paused_requests: RequestList,
+        disagg_gen_init_requests: Optional[RequestList] = None,
+    ) -> 'ScheduledRequests':
+        """Factory method to create ScheduledRequests from lists."""
+        scheduled = ScheduledRequests()
+        scheduled.context_requests = context_requests
+        scheduled.generation_requests = generation_requests
+        scheduled.paused_requests = paused_requests
+        if disagg_gen_init_requests is not None:
+            scheduled.disagg_gen_init_requests = disagg_gen_init_requests
+        return scheduled
 
     @property
     def is_generation_only(self) -> bool:
@@ -122,6 +177,36 @@ class SerializableSchedulerOutput:
             for req_id in self.fitting_disagg_gen_init_requests
         ]
         return scheduled_requests, fitting_disagg_gen_init_requests, self.num_fitting_requests
+
+
+@dataclass
+class RankResourceState:
+    """
+    Snapshot of a single rank's resources for global coordination.
+
+    This dataclass captures all information needed to simulate resource
+    allocation decisions without actually allocating resources.
+    Used by SimpleUnifiedScheduler for attention_dp global scheduling.
+    """
+
+    rank_id: int
+
+    # === Constraints (Safety) ===
+    free_kv_blocks: int  # From CapacityScheduler.get_kv_cache_stats()
+    max_kv_blocks: int  # Total KV cache capacity
+    current_batch_tokens: int  # Current token load
+    max_token_budget: float  # From MicroBatchScheduler.max_num_tokens (can be float('inf'))
+    current_batch_size: int  # Number of active requests
+    max_batch_size: int  # From MicroBatchScheduler.max_batch_size
+
+    # === Load Metrics (Balancing) ===
+    num_active_gen_reqs: int  # Generation requests in progress
+    num_active_ctx_reqs: int  # Context requests in progress
+
+    # === PEFT/LoRA (Optional - reserved for future use) ===
+    active_lora_task_ids: Set[int] = field(
+        default_factory=set)  # For LoRA co-location
+    available_peft_pages: int = 0  # PEFT cache capacity
 
 
 class CapacityScheduler(ABC):
@@ -656,6 +741,72 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     logger.debug(f"Discarding {draft_discard} draft tokens")
                     if hasattr(req, "discard_draft_tokens"):
                         req.discard_draft_tokens(draft_discard)
+
+    def get_token_budget_snapshot(self) -> dict:
+        """
+        Get current token budget state for global coordination.
+        Read-only: Does not modify any state.
+
+        Returns:
+            dict with keys:
+                - max_num_tokens: int or float('inf')
+                - max_batch_size: int
+        """
+        return {
+            'max_num_tokens':
+            self.max_num_tokens if self.max_num_tokens else float('inf'),
+            'max_batch_size':
+            self.max_batch_size,
+        }
+
+    def estimate_tokens_needed(self, request: LlmRequest) -> int:
+        """
+        Estimate how many tokens this request will consume in the next step.
+        Read-only: Does not modify any state.
+
+        Based on MicroBatchScheduler schedule() logic (lines 392-466).
+
+        Args:
+            request: The request to estimate for
+
+        Returns:
+            int: Number of tokens needed for next iteration
+        """
+        state_value = request.state_value
+
+        # Encoder tokens
+        if state_value == self._encoder_init_state_value:
+            return request.encoder_output_len
+
+        # Context tokens
+        elif state_value == self._context_init_state_value:
+            base_tokens = request.get_num_tokens(0)
+            draft_tokens = request.num_draft_tokens if request.has_draft_tokens else 0
+            return base_tokens + draft_tokens
+
+        # Generation tokens
+        else:
+            beam_width = request.get_beam_width_by_iter(
+                for_next_iteration=False)
+            draft_tokens = request.num_draft_tokens if request.has_draft_tokens else 0
+            return beam_width + draft_tokens
+
+    def calculate_current_token_load(self, active_requests: RequestList) -> int:
+        """
+        Calculate total tokens consumed by current active requests.
+        Read-only: Does not modify any state.
+
+        Args:
+            active_requests: List of currently active requests
+
+        Returns:
+            int: Total token count
+        """
+        total_tokens = 0
+        for req in active_requests:
+            if self._can_be_scheduled(req):
+                total_tokens += self.estimate_tokens_needed(req)
+        return total_tokens
 
 
 class SchedulerPolicyBase(ABC):
@@ -1290,20 +1441,97 @@ class PyCapacityScheduler:
                 fitting_requests.append(req)
         return fitting_requests, fitting_disagg_gen_init_requests
 
+    def get_resource_snapshot(self) -> dict:
+        """
+        Get current KV cache state for global coordination.
+        Read-only: Does not modify any state.
+
+        Returns:
+            dict with keys:
+                - free_kv_blocks: int (primary window size free blocks)
+                - max_kv_blocks: int (total capacity)
+                - num_free_blocks_per_window_size: dict (for VSWA)
+        """
+        if self.kv_cache_manager is None:
+            return {
+                'free_kv_blocks': 0,
+                'max_kv_blocks': 0,
+                'num_free_blocks_per_window_size': {},
+            }
+
+        stats = self.kv_cache_manager.get_kv_cache_stats()
+
+        # For VSWA (Variable Sliding Window), we track per window size
+        # Get num_free_blocks_per_window_size if available
+        if hasattr(stats, 'num_free_blocks_per_window_size'):
+            free_blocks_per_ws = dict(stats.num_free_blocks_per_window_size)
+            # Use the primary window size (0 or first key) for the simplified view
+            primary_ws = 0 if 0 in free_blocks_per_ws else next(
+                iter(free_blocks_per_ws), 0)
+            free_blocks = free_blocks_per_ws.get(primary_ws, 0)
+        else:
+            # Fallback for non-VSWA: use free_num_blocks if available
+            free_blocks = getattr(stats, 'free_num_blocks', 0)
+            free_blocks_per_ws = {0: free_blocks}
+
+        max_blocks = getattr(self.kv_cache_manager, 'max_num_blocks', 0)
+
+        return {
+            'free_kv_blocks': free_blocks,
+            'max_kv_blocks': max_blocks,
+            'num_free_blocks_per_window_size': free_blocks_per_ws,
+        }
+
+    def estimate_blocks_needed(self, request: LlmRequest) -> int:
+        """
+        Estimate how many KV cache blocks this request will consume in the next step.
+        Read-only: Does not allocate blocks.
+
+        For VSWA, returns worst-case across all window sizes.
+
+        Args:
+            request: The request to estimate for
+
+        Returns:
+            int: Number of blocks needed
+        """
+        if self.kv_cache_manager is None:
+            return 0
+
+        # Use default window size (0) for simplicity in non-VSWA cases
+        # For VSWA, this would need to check all window sizes, but for a conservative
+        # estimate we use window_size=0 (which typically represents the primary/max window)
+        window_size = 0
+        return self.kv_cache_manager.get_needed_blocks_one_step(
+            request, lookahead=False, window_size=window_size)
+
 
 class SimpleUnifiedScheduler(RequestScheduler):
+    """
+    Unified scheduler combining capacity and micro-batch scheduling.
+
+    Supports two modes:
+    1. Standard TP mode: Local scheduling on this rank only
+    2. Attention DP mode: Global coordination across all TP ranks
+       - Reduces tp_allgather calls from 3+ to 1 per scheduling step
+       - Proactive architecture: Sync State → Global Simulation → Commit locally
+       - Token-based load balancing
+    """
 
     def __init__(
-        self,
-        max_batch_size: int,
-        max_num_tokens: int,
-        kv_cache_manager,
-        peft_cache_manager,
-        scheduler_policy: CapacitySchedulerPolicy,
-        ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
-        cross_kv_cache_manager=None,
-        two_step_lookahead: bool = False,
-        scheduler_capacity: Optional[int] = None,
+            self,
+            max_batch_size: int,
+            max_num_tokens: int,
+            kv_cache_manager,
+            peft_cache_manager,
+            scheduler_policy: CapacitySchedulerPolicy,
+            ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
+            cross_kv_cache_manager=None,
+            two_step_lookahead: bool = False,
+            scheduler_capacity: Optional[int] = None,
+            dist=None,  # Optional: Enable global scheduling for attention_dp
+            max_num_active_requests: Optional[
+                int] = None,  # Required for global coordination
     ):
         # Use scheduler_capacity if provided, otherwise fall back to max_batch_size
         # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
@@ -1340,24 +1568,555 @@ class SimpleUnifiedScheduler(RequestScheduler):
             max_num_tokens=max_num_tokens,
             ctx_chunk_config=py_chunk_config)
 
-    def schedule_request(self, active_requests: RequestList,
-                         inflight_request_ids: set[int]) -> SchedulerOutput:
-        # Step 1: Capacity Check (Who fits in memory?)
+        # 3. Global scheduling support for attention_dp
+        # When enabled, coordinates scheduling across all TP ranks with single allgather
+        self.dist = dist
+        self.max_num_active_requests = max_num_active_requests
+        self.enable_global_scheduling = dist is not None and max_num_active_requests is not None
+
+        # 4. Attention DP balancing/batching state (for global scheduling mode)
+        # These track the waiting logic to ensure all ranks have context requests
+        self.attention_dp_enable_balance = False  # Set by PyExecutor if needed
+        self.attention_dp_time_out_iters = 0
+        self.attention_dp_batching_wait_iters = 0
+        self.adp_ctx_waiting_iters_count = 0
+        self.adp_ctx_batching_wait_iters_count = 0
+
+    def activate_new_requests(
+        self,
+        active_requests: RequestList,
+        waiting_queue: Optional[deque] = None,
+    ) -> tuple[RequestList, int]:
+        """
+        Activate new requests from waiting queue.
+
+        For attention_dp mode, uses global coordination to assign requests across ranks.
+        For regular TP mode, returns active_requests unchanged (activation happens in executor).
+
+        Args:
+            active_requests: Currently active requests
+            waiting_queue: Optional queue of waiting requests
+
+        Returns:
+            Tuple of (updated_active_requests, expected_num_active_requests)
+            - updated_active_requests: Updated list of active requests (may be same as input for TP mode)
+            - expected_num_active_requests: Maximum number of active requests across all ranks
+        """
+        # Check if we need global coordination
+        if not self.enable_global_scheduling or waiting_queue is None or len(
+                waiting_queue) == 0:
+            # TP mode: No activation here (executor handles it)
+            return active_requests, len(active_requests)
+
+        # Calculate how many new candidates we can accept
+        total_capacity = self.dist.tp_size * self.max_num_active_requests
+        num_new_candidates = max(
+            0, min(total_capacity - len(active_requests), len(waiting_queue)))
+
+        if num_new_candidates == 0:
+            return active_requests, len(active_requests)
+
+        # Attention DP mode: Use global coordination to assign requests
+        return self._activate_with_global_coordination(active_requests,
+                                                       waiting_queue,
+                                                       num_new_candidates)
+
+    def schedule_request(
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+    ) -> UnifiedSchedulerOutput:
+        """
+        Schedule requests for execution.
+
+        This method handles capacity scheduling (KV cache allocation) and
+        micro-batch scheduling (token budget + chunking).
+
+        Note: For SimpleUnifiedScheduler with attention_dp, call activate_new_requests()
+        first to update active_requests before scheduling.
+
+        Args:
+            active_requests: Currently active requests
+            inflight_request_ids: Set of inflight request IDs
+
+        Returns:
+            UnifiedSchedulerOutput with scheduled requests
+        """
+        # Capacity scheduling (KV cache allocation)
         fitting_requests, fitting_disagg_gen_init, paused_requests = \
             self.capacity_scheduler.schedule_request(active_requests)
 
-        # Step 2: MicroBatch Check (Who fits in token budget? + Chunking)
+        # Micro-batch scheduling (token budget + chunking)
         context_requests, generation_requests = \
             self.micro_batch_scheduler.schedule(fitting_requests, inflight_request_ids)
 
-        return SchedulerOutput(
+        # Return results
+        return UnifiedSchedulerOutput(
             context_requests=context_requests,
             generation_requests=generation_requests,
             paused_requests=paused_requests,
             fitting_disagg_gen_init_requests=fitting_disagg_gen_init,
-            num_fitting_requests=len(fitting_requests))
+            num_fitting_requests=len(fitting_requests),
+            updated_active_requests=None,  # Activation is now separate
+        )
 
     def can_schedule(self, requests: RequestList) -> bool:
         # Dry run capacity check
         fitting, _, _ = self.capacity_scheduler.schedule_request(requests)
         return len(fitting) == len(requests)
+
+    def _activate_with_global_coordination(
+        self,
+        active_requests: RequestList,
+        waiting_queue: deque,
+        num_new_candidates: int,
+    ) -> tuple[RequestList, int]:
+        """
+        Activate new requests using global coordination (attention_dp).
+
+        This performs the full GATHER → SIMULATE → COMMIT flow to assign
+        new requests to ranks, then extracts assigned requests from waiting_queue.
+
+        Args:
+            active_requests: Currently active requests
+            waiting_queue: Queue of waiting requests
+            num_new_candidates: Number of candidates to consider
+
+        Returns:
+            Tuple of (updated_active_requests, expected_num_active_requests)
+        """
+        # Extract candidate requests
+        candidate_requests = list(
+            itertools.islice(waiting_queue, num_new_candidates))
+
+        # === PHASE 1: GATHER ===
+        local_state = self._build_local_state(active_requests)
+        all_rank_states = self._gather_all_states(local_state)
+
+        # === PHASE 2: SIMULATE ===
+        assignments = self._simulate_global_schedule(candidate_requests,
+                                                     all_rank_states)
+
+        # === PHASE 2.5: BATCHING CHECK ===
+        assignments = self._apply_batching_filter(assignments,
+                                                  candidate_requests)
+
+        # Calculate expected_num_active_requests (max across all ranks after assignment)
+        # This uses data we already have from the allgather, no extra communication needed
+        expected_num_active_requests = max(
+            all_rank_states[rank_id].current_batch_size +
+            len(assignments[rank_id])
+            for rank_id in range(len(all_rank_states)))
+
+        # === PHASE 3: EXTRACT ASSIGNED REQUESTS ===
+        my_assigned_req_ids = set(assignments[self.dist.rank])
+        new_requests = []
+        remaining_queue = deque()
+
+        for req_item in waiting_queue:
+            if hasattr(req_item, 'llm_request') and req_item.llm_request:
+                if req_item.llm_request.request_id in my_assigned_req_ids:
+                    new_requests.append(req_item.llm_request)
+                else:
+                    remaining_queue.append(req_item)
+            else:
+                remaining_queue.append(req_item)
+
+        # Update waiting_queue in place
+        waiting_queue.clear()
+        waiting_queue.extend(remaining_queue)
+
+        # Return updated active requests and expected count
+        return active_requests + new_requests, expected_num_active_requests
+
+    # ==================================================================================
+    # Global Scheduling Methods for attention_dp
+    # ==================================================================================
+    # These methods implement global coordination across TP ranks for attention_dp:
+    # - Reduces tp_allgather calls from 3+ to 1 per scheduling step
+    # - Proactive architecture: Sync State → Global Simulation → Commit locally
+    # - Token-based load balancing
+    # ==================================================================================
+
+    # === PHASE 1: GATHER ===
+
+    def _build_local_state(
+        self,
+        active_requests: List[LlmRequest],
+    ) -> RankResourceState:
+        """
+        Build snapshot of local rank's current state.
+
+        This captures all information needed for global coordination without
+        modifying any actual resources.
+
+        Args:
+            active_requests: Currently active requests on this rank
+
+        Returns:
+            RankResourceState: Snapshot of current rank state
+        """
+        # Get resource snapshots from schedulers
+        capacity_snapshot = self.capacity_scheduler.get_resource_snapshot()
+        token_budget = self.micro_batch_scheduler.get_token_budget_snapshot()
+        current_tokens = self.micro_batch_scheduler.calculate_current_token_load(
+            active_requests)
+
+        # Count active requests by type
+        num_active_gen = sum(1 for r in active_requests
+                             if not r.is_context_init_state)
+        num_active_ctx = sum(1 for r in active_requests
+                             if r.is_context_init_state)
+
+        return RankResourceState(
+            rank_id=self.dist.rank,
+            free_kv_blocks=capacity_snapshot['free_kv_blocks'],
+            max_kv_blocks=capacity_snapshot['max_kv_blocks'],
+            current_batch_tokens=current_tokens,
+            max_token_budget=token_budget['max_num_tokens'],
+            current_batch_size=len(active_requests),
+            max_batch_size=token_budget['max_batch_size'],
+            num_active_gen_reqs=num_active_gen,
+            num_active_ctx_reqs=num_active_ctx,
+        )
+
+    def _gather_all_states(
+            self, local_state: RankResourceState) -> List[RankResourceState]:
+        """
+        THE SINGLE COMMUNICATION POINT.
+        Gather RankResourceState from all TP ranks via tp_allgather.
+
+        This is the ONLY synchronization point in the unified scheduler,
+        replacing the 3+ tp_allgather calls in the old architecture.
+
+        Args:
+            local_state: This rank's resource state
+
+        Returns:
+            List[RankResourceState]: States from all ranks
+        """
+        # Serialize to dict for communication (dataclasses are not directly serializable)
+        local_dict = {
+            'rank_id': local_state.rank_id,
+            'free_kv_blocks': local_state.free_kv_blocks,
+            'max_kv_blocks': local_state.max_kv_blocks,
+            'current_batch_tokens': local_state.current_batch_tokens,
+            'max_token_budget': local_state.max_token_budget,
+            'current_batch_size': local_state.current_batch_size,
+            'max_batch_size': local_state.max_batch_size,
+            'num_active_gen_reqs': local_state.num_active_gen_reqs,
+            'num_active_ctx_reqs': local_state.num_active_ctx_reqs,
+            'active_lora_task_ids': list(local_state.active_lora_task_ids),
+            'available_peft_pages': local_state.available_peft_pages,
+        }
+
+        # THE SINGLE tp_allgather
+        all_dicts = self.dist.tp_allgather(local_dict)
+
+        # Deserialize back to RankResourceState objects
+        result = []
+        for d in all_dicts:
+            # Convert active_lora_task_ids back to set
+            d['active_lora_task_ids'] = set(d.get('active_lora_task_ids', []))
+            result.append(RankResourceState(**d))
+
+        return result
+
+    # === PHASE 2: SIMULATE ===
+
+    def _calculate_assignment_score(
+        self,
+        rank_state: RankResourceState,
+    ) -> float:
+        """
+        Calculate assignment score for a rank.
+        Higher score = better assignment.
+
+        Scoring components:
+        1. Load penalty: Avoid overloaded ranks
+        2. Context request penalty: Balance context vs generation
+
+        Args:
+            rank_state: Current state of the candidate rank
+
+        Returns:
+            float: Assignment score (higher is better)
+        """
+        score = 0.0
+
+        # Component 1: Load balancing (token-based)
+        if rank_state.max_token_budget > 0 and rank_state.max_token_budget != float(
+                'inf'):
+            load_ratio = rank_state.current_batch_tokens / rank_state.max_token_budget
+            score -= load_ratio * 100.0
+
+        # Component 2: Context vs generation balancing
+        # Penalize ranks with many context requests (they block generation)
+        score -= rank_state.num_active_ctx_reqs * 2.0
+        score -= rank_state.num_active_gen_reqs * 1.0
+
+        return score
+
+    def _can_accept_request(
+        self,
+        request: LlmRequest,
+        rank_state: RankResourceState,
+    ) -> bool:
+        """
+        Check if rank can accept this request based on resource constraints.
+        This is the SIMULATION of capacity and token budget checks.
+
+        Args:
+            request: The request to check
+            rank_state: Current state of the candidate rank
+
+        Returns:
+            bool: True if rank can accept the request
+        """
+        # Check batch size limit
+        if rank_state.current_batch_size >= rank_state.max_batch_size:
+            return False
+
+        # Check token budget limit
+        tokens_needed = self.micro_batch_scheduler.estimate_tokens_needed(
+            request)
+        if rank_state.max_token_budget != float('inf'):
+            if rank_state.current_batch_tokens + tokens_needed > rank_state.max_token_budget:
+                return False
+
+        # Check KV cache capacity
+        blocks_needed = self.capacity_scheduler.estimate_blocks_needed(request)
+        if rank_state.free_kv_blocks < blocks_needed:
+            return False
+
+        return True
+
+    def _update_rank_state_after_assignment(
+        self,
+        rank_state: RankResourceState,
+        request: LlmRequest,
+    ) -> None:
+        """
+        Update simulated rank state after assigning a request.
+        This modifies the state IN PLACE during simulation.
+
+        Args:
+            rank_state: The rank state to update (modified in place)
+            request: The request that was assigned
+        """
+        # Decrement resources
+        tokens_needed = self.micro_batch_scheduler.estimate_tokens_needed(
+            request)
+        rank_state.current_batch_tokens += tokens_needed
+        rank_state.current_batch_size += 1
+
+        blocks_needed = self.capacity_scheduler.estimate_blocks_needed(request)
+        rank_state.free_kv_blocks -= blocks_needed
+
+        # Update request counters
+        if request.is_context_init_state:
+            rank_state.num_active_ctx_reqs += 1
+        else:
+            rank_state.num_active_gen_reqs += 1
+
+    def _simulate_global_schedule(
+        self,
+        candidate_requests:
+        List,  # List[RequestQueueItem] but avoid circular import
+        all_rank_states: List[RankResourceState],
+    ) -> Dict[int, List[int]]:
+        """
+        Deterministic water-filling algorithm.
+        ALL RANKS RUN THIS IDENTICALLY (SPMD).
+
+        This is the core scheduling algorithm that assigns requests to ranks
+        based on resource availability and optimization criteria.
+
+        Args:
+            candidate_requests: List of candidate requests to assign
+            all_rank_states: Current states of all ranks
+
+        Returns:
+            Dict mapping rank_id -> [assigned_request_ids]
+        """
+        # Deep copy to avoid modifying original states
+        sim_states = copy.deepcopy(all_rank_states)
+
+        # Initialize assignments
+        assignments = {state.rank_id: [] for state in sim_states}
+
+        # Sort candidates deterministically (all ranks must see same order!)
+        # Priority: non-relaxed first, then by request_id for determinism
+        sorted_candidates = sorted(
+            candidate_requests,
+            key=lambda item: (
+                # Check if request has attention_dp_relax flag
+                (getattr(item, 'llm_request', None) and getattr(
+                    item.llm_request, 'py_scheduling_params', None) and getattr(
+                        item.llm_request.py_scheduling_params,
+                        'attention_dp_relax', False)) or False,
+                # Secondary sort by request_id for determinism
+                item.request_id,
+            ))
+
+        # Water-filling algorithm
+        for req_item in sorted_candidates:
+            if not hasattr(req_item, 'llm_request') or not req_item.llm_request:
+                continue
+
+            req = req_item.llm_request
+
+            # Score all ranks for this request
+            best_rank_id = -1
+            best_score = -float('inf')
+
+            for rank_state in sim_states:
+                # Feasibility check
+                if not self._can_accept_request(req, rank_state):
+                    continue
+
+                # Calculate score
+                score = self._calculate_assignment_score(rank_state)
+
+                if score > best_score:
+                    best_score = score
+                    best_rank_id = rank_state.rank_id
+
+            # Assign to best rank (if any rank can accept)
+            if best_rank_id != -1:
+                assignments[best_rank_id].append(req.request_id)
+
+                # Update simulated state
+                target_state = sim_states[best_rank_id]
+                self._update_rank_state_after_assignment(target_state, req)
+
+        return assignments
+
+    def _apply_batching_filter(
+        self,
+        assignments: Dict[int, List[int]],
+        candidate_requests: List,
+    ) -> Dict[int, List[int]]:
+        """
+        Apply batching filter to assignments based on waiting logic.
+
+        If we should wait for all ranks to have context requests, this method
+        filters out context requests but keeps generation requests.
+
+        Args:
+            assignments: Dict mapping rank_id -> [assigned_request_ids]
+            candidate_requests: List of candidate requests
+
+        Returns:
+            Dict[int, List[int]]: Filtered assignments
+        """
+        # Check if we should wait
+        should_wait = self._should_wait_for_context_batching(
+            assignments, candidate_requests)
+        if not should_wait:
+            return assignments
+
+        # Build request ID to request mapping
+        req_id_to_req = {}
+        for req_item in candidate_requests:
+            if hasattr(req_item, 'llm_request') and req_item.llm_request:
+                req = req_item.llm_request
+                req_id_to_req[req.request_id] = req
+
+        # Filter out context requests, keep generation requests
+        filtered_assignments = {}
+        for rank_id in assignments:
+            filtered_req_ids = []
+            for req_id in assignments[rank_id]:
+                if req_id in req_id_to_req:
+                    req = req_id_to_req[req_id]
+                    # Keep only generation requests, remove context requests
+                    if not req.is_context_init_state:
+                        filtered_req_ids.append(req_id)
+                else:
+                    # Unknown request (shouldn't happen but keep for safety)
+                    filtered_req_ids.append(req_id)
+            filtered_assignments[rank_id] = filtered_req_ids
+
+        return filtered_assignments
+
+    def _should_wait_for_context_batching(
+        self,
+        assignments: Dict[int, List[int]],
+        candidate_requests: List,
+    ) -> bool:
+        """
+        Check if we should wait for all ranks to have context requests (attention_dp batching).
+
+        This implements the same logic as _balance_adp_requests to ensure:
+        1. All ranks have context requests before scheduling (avoid load imbalance)
+        2. Batch context requests together when possible
+        3. Timeout mechanism to avoid deadlock
+
+        Args:
+            assignments: Dict mapping rank_id -> [assigned_request_ids]
+            candidate_requests: List of candidate requests
+
+        Returns:
+            bool: True if we should wait (clear context requests), False if we should proceed
+        """
+        if not self.attention_dp_enable_balance:
+            return False
+
+        # Build request ID to request mapping
+        req_id_to_req = {}
+        for req_item in candidate_requests:
+            if hasattr(req_item, 'llm_request') and req_item.llm_request:
+                req = req_item.llm_request
+                req_id_to_req[req.request_id] = req
+
+        # Count context and generation requests per rank
+        rank_ctx_counts = {}
+        rank_gen_counts = {}
+        for rank_id, assigned_req_ids in assignments.items():
+            ctx_count = 0
+            gen_count = 0
+            for req_id in assigned_req_ids:
+                if req_id in req_id_to_req:
+                    req = req_id_to_req[req_id]
+                    if req.is_context_init_state:
+                        ctx_count += 1
+                    else:
+                        gen_count += 1
+            rank_ctx_counts[rank_id] = ctx_count
+            rank_gen_counts[rank_id] = gen_count
+
+        # Check conditions (same as _balance_adp_requests)
+        all_ranks_have_ctx_requests = all(count > 0
+                                          for count in rank_ctx_counts.values())
+        all_ranks_have_gen_requests = all(count > 0
+                                          for count in rank_gen_counts.values())
+
+        # Note: We don't check free_ctx_slots here because global coordination already handles capacity in _can_accept_request
+
+        if all_ranks_have_ctx_requests:
+            # All ranks have context requests
+            self.adp_ctx_waiting_iters_count = 0
+
+            # Check if we should batch (wait for more context requests)
+            if all_ranks_have_gen_requests:
+                if self.adp_ctx_batching_wait_iters_count < self.attention_dp_batching_wait_iters:
+                    self.adp_ctx_batching_wait_iters_count += 1
+                    return True  # Wait for batching
+                else:
+                    self.adp_ctx_batching_wait_iters_count = 0
+                    return False  # Proceed with scheduling
+            else:
+                return False  # Proceed (no generation requests to compete with)
+        else:
+            # Not all ranks have context requests
+            self.adp_ctx_waiting_iters_count += 1
+
+            timeout_reached = self.adp_ctx_waiting_iters_count >= self.attention_dp_time_out_iters
+            if timeout_reached or not all_ranks_have_gen_requests:
+                # Timeout or no generation requests - proceed anyway
+                self.adp_ctx_waiting_iters_count = 0
+                return False
+            else:
+                # Wait for all ranks to get context requests
+                return True

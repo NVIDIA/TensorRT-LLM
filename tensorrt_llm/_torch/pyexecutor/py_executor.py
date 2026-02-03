@@ -61,7 +61,7 @@ from .resource_manager import ResourceManager
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
-                        SerializableSchedulerOutput)
+                        SerializableSchedulerOutput, SimpleUnifiedScheduler)
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -354,6 +354,25 @@ class PyExecutor:
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
+
+        # Enable global scheduling for attention_dp
+        if self.enable_attention_dp and isinstance(
+                scheduler, SimpleUnifiedScheduler
+        ) and not scheduler.enable_global_scheduling:
+            scheduler.dist = dist
+            scheduler.max_num_active_requests = self.max_num_active_requests
+            scheduler.enable_global_scheduling = True
+
+            # Configure batching/waiting parameters
+            scheduler.attention_dp_enable_balance = self.attention_dp_enable_balance
+            if self.attention_dp_enable_balance:
+                scheduler.attention_dp_time_out_iters = self.attention_dp_time_out_iters
+                scheduler.attention_dp_batching_wait_iters = self.attention_dp_batching_wait_iters
+
+            logger.info(
+                "Enabled global scheduling for attention_dp (balance=%s)",
+                self.attention_dp_enable_balance)
+
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         self.async_transfer_manager = AsyncTransferManager(
@@ -1411,22 +1430,27 @@ class PyExecutor:
         return can_queue, can_queue_this_rank
 
     def _prepare_and_schedule_batch(self):
-        new_requests = self._fetch_and_activate_new_requests()
+        """Prepare and schedule batch for execution."""
+        # Step 1: Fetch and activate new requests
+        num_new_requests = self._fetch_and_activate_requests()
         if self.should_stop_processing:
             return None, None
 
+        # Step 2: Check KV cache transfer status
         if self.kv_cache_transceiver:
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
 
+        # Step 3: Calculate iter_stats
         iter_stats = None
         if self.enable_iter_perf_stats:
             iter_stats = self._get_init_iter_stats(
-                len(new_requests),
-                self._get_new_active_requests_queue_latency())
+                num_new_requests, self._get_new_active_requests_queue_latency())
 
+        # Step 4: Pad dummy requests
         self._pad_attention_dp_dummy_request()
 
+        # Step 5: Drafter logic
         if self.drafter is not None:
             # Honor permanent disable flag based on rolling acceptance first
             if self.drafter.draft_len_schedule is not None:
@@ -1469,9 +1493,11 @@ class PyExecutor:
             # that speculation is about to happen.
             self._prepare_draft_requests()
 
-        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+        # Step 6: Schedule batch
+        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule_batch(
         )
 
+        # Step 7: Post-processing
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
@@ -1492,6 +1518,44 @@ class PyExecutor:
             f'scheduled {len(scheduled_batch.context_requests)} context requests and '
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
+
+    def _fetch_and_activate_requests(self):
+        """
+        Fetch and activate new requests.
+
+        Returns:
+            int: Number of newly activated requests
+        """
+        if isinstance(self.scheduler, SimpleUnifiedScheduler):
+            # SimpleUnifiedScheduler: Fetch + explicit activation
+            self._fetch_and_enqueue_requests(self.waiting_queue)
+            old_active_count = len(self.active_requests)
+
+            # Activate requests and get expected count (no extra communication needed)
+            self.active_requests, self.expected_num_active_requests = \
+                self.scheduler.activate_new_requests(self.active_requests, self.waiting_queue)
+
+            return len(self.active_requests) - old_active_count
+        else:
+            # SimpleScheduler: Fetch and activate together
+            new_requests = self._fetch_and_activate_new_requests()
+            return len(new_requests)
+
+    def _schedule_batch(self):
+        """
+        Schedule the batch using the appropriate scheduler.
+
+        Returns:
+            tuple: (scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs)
+        """
+        if isinstance(self.scheduler, SimpleUnifiedScheduler):
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
+            return (scheduler_output.to_scheduled_requests(),
+                    scheduler_output.fitting_disagg_gen_init_requests,
+                    scheduler_output.num_fitting_requests)
+        else:
+            return self._schedule()
 
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
