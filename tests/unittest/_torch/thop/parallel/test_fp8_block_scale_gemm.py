@@ -126,7 +126,11 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     "dtype",
     [torch.bfloat16],
 )
-def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
+@pytest.mark.parametrize(
+    "use_tvm_ffi",
+    [True, False],
+)
+def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 
     torch.random.manual_seed(0)
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k
@@ -139,11 +143,11 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
 
     with autotune():
         cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-            act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+            a, act_b_fp8, act_b_sf, use_tvm_ffi=use_tvm_ffi)
 
     # test Cute DSL kernel
     cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-        act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+        a, act_b_fp8, act_b_sf, use_tvm_ffi=use_tvm_ffi)
 
     diff = calc_diff(cute_dsl_output, output_expected)
     assert diff < 1e-3
@@ -235,7 +239,11 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
     "dtype",
     [torch.bfloat16],
 )
-def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
+@pytest.mark.parametrize(
+    "use_tvm_ffi",
+    [True, False],
+)
+def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups, use_tvm_ffi):
 
     torch.random.manual_seed(0)
     a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
@@ -256,11 +264,19 @@ def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
                          dtype=torch.bfloat16)
     # tune
     with autotune():
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
-                                                    b_scales, output)
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8,
+                                                    b_fp8,
+                                                    a_scales,
+                                                    b_scales,
+                                                    output,
+                                                    use_tvm_ffi=use_tvm_ffi)
     # run the tuned kernel
-    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
-                                                b_scales, output)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8,
+                                                b_fp8,
+                                                a_scales,
+                                                b_scales,
+                                                output,
+                                                use_tvm_ffi=use_tvm_ffi)
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)

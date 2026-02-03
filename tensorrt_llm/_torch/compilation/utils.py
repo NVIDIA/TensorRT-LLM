@@ -96,6 +96,9 @@ def inplace_info():
         torch.ops.trtllm.pp_send_tensors.default: {
             1: "tensors"
         },
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell.default: {
+            5: "output"
+        }
     }
     if IS_CUDA_TILE_AVAILABLE:
         # cuda.tile availability depends on GPU capability thus runtime check.

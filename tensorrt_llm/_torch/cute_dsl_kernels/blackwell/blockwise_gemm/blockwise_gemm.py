@@ -2500,7 +2500,7 @@ class BlockwiseGemmKernel:
         b_ptr: cute.Pointer,
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
-        c_ptr: cute.Pointer,
+        c_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -2518,10 +2518,10 @@ class BlockwiseGemmKernel:
             b_ptr (cute.Pointer): Pointer to the B tensor.
             a_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for A.
             b_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for B.
-            c_ptr (cute.Pointer): Pointer to the C tensor.
+            c_tensor (cute.Tensor): Specially set as cute.Tensor for TVM FFI stream detection.
             max_active_clusters (cutlass.Constexpr): Maximum number of active
                 clusters.
-            current_stream (cuda.CUstream): CUDA stream for the operation.
+            stream (cuda.CUstream): CUDA stream for the operation.
         """
 
         # m, k, batch_size with inner most dimension as k
@@ -2534,14 +2534,6 @@ class BlockwiseGemmKernel:
             b_ptr,
             layout=cute.make_ordered_layout(
                 (n, k, batch_size),
-                order=(1, 0, 2),
-            ),
-        )
-        # m, n, batch_size
-        c_tensor = cute.make_tensor(
-            c_ptr,
-            layout=cute.make_ordered_layout(
-                (m, n, batch_size),
                 order=(1, 0, 2),
             ),
         )
