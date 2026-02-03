@@ -1509,9 +1509,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         # Construct MPI command.
         mpi_cmd = []
         if num_gpus > 1 and num_gpus <= 8:
-            # For bench runtime: only use mpirun if TRITON_PTXAS_PATH is set
+            # For bench runtime: optionally use mpirun to propagate environment variables.
+            # Set TRTLLM_BENCH_USE_MPIRUN=1 to enable (needed for newer GPUs like GB10
+            # where Triton's bundled ptxas doesn't support the architecture).
             if self._config.runtime == "bench" and os.getenv(
-                    "TRITON_PTXAS_PATH"):
+                    "TRTLLM_BENCH_USE_MPIRUN"):
                 mpi_cmd = ["mpirun", "-n", f"{num_gpus}"]
 
                 # Pass environment variables that are set
