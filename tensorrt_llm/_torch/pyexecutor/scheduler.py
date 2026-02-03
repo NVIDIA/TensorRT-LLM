@@ -67,6 +67,7 @@ class ScheduledRequests:
         self.context_requests: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.disagg_gen_init_requests: RequestList = []
 
     @staticmethod
     def from_lists(
@@ -80,8 +81,7 @@ class ScheduledRequests:
         scheduled.context_requests = context_requests
         scheduled.generation_requests = generation_requests
         scheduled.paused_requests = paused_requests
-        if disagg_gen_init_requests is not None:
-            scheduled.disagg_gen_init_requests = disagg_gen_init_requests
+        scheduled.disagg_gen_init_requests = disagg_gen_init_requests if disagg_gen_init_requests is not None else []
         return scheduled
 
     @property
@@ -1683,8 +1683,9 @@ class SimpleUnifiedScheduler(RequestScheduler):
             self.micro_batch_scheduler.schedule(fitting_gen_requests, inflight_request_ids)
 
         # Check if we should stop waiting
-        num_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                             for gen_req in generation_requests)
+        num_gen_tokens = sum(
+            self.micro_batch_scheduler.estimate_tokens_needed(gen_req)
+            for gen_req in generation_requests)
 
         max_num_tokens = self.micro_batch_scheduler.max_num_tokens
         if max_num_tokens is not None:
@@ -1755,8 +1756,9 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # Calculate scheduled tokens
         num_scheduled_ctx_tokens = sum(
             len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
-        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                       for gen_req in generation_requests)
+        num_scheduled_gen_tokens = sum(
+            self.micro_batch_scheduler.estimate_tokens_needed(gen_req)
+            for gen_req in generation_requests)
         num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
 
         # Get max_num_tokens from micro_batch_scheduler
@@ -1868,8 +1870,9 @@ class SimpleUnifiedScheduler(RequestScheduler):
             Tuple of (new_llm_requests, expected_num_active_requests)
         """
         # Calculate local capacity
-        max_new_requests = max(
-            0, self.max_num_active_requests - len(active_requests))
+        # Use capacity_scheduler.max_num_requests as fallback when max_num_active_requests is unset
+        max_active = self.max_num_active_requests if self.max_num_active_requests is not None else self.capacity_scheduler.max_num_requests
+        max_new_requests = max(0, max_active - len(active_requests))
 
         if max_new_requests == 0:
             return [], len(active_requests)
