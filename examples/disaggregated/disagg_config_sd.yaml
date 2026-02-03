@@ -1,0 +1,38 @@
+hostname: localhost
+port: 8000
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+free_gpu_memory_fraction: 0.25
+backend: "pytorch"
+disable_overlap_scheduler: True
+
+# Service discovery configuration
+disagg_cluster:
+  cluster_uri: "http://localhost:8000"
+  cluster_name: "test_cluster"
+  heartbeat_interval_sec: 1
+  inactive_timeout_sec: 2
+  minimal_instances:
+    context_servers: 1
+    generation_servers: 1
+
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+  cache_transceiver_config:
+    backend: "DEFAULT"
+  router:
+    type: "round_robin"
+  # urls removed - using service discovery instead
+
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: "DEFAULT"
+  router:
+    type: "round_robin"
+  # urls removed - using service discovery instead

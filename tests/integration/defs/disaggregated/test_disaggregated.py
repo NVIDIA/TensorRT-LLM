@@ -13,25 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import contextlib
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
+import traceback
+import uuid
 from collections import namedtuple
 from dataclasses import dataclass
+from functools import wraps
 from typing import Callable
 
+import openai
 import pytest
+import requests
+import yaml
 
 try:
     import ray
 except ImportError:
     import tensorrt_llm.ray_stub as ray
 
-import yaml
-from defs.common import (get_free_port_in_ci, parse_gsm8k_output,
+from defs.common import get_free_port_in_ci as get_free_port
+from defs.common import (parse_gsm8k_output,
                          revise_disagg_config_file_with_free_ports,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
@@ -43,6 +52,10 @@ from test_common.perf_metrics_utils import (get_timing_metrics,
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
+
+# Service discovery constants
+HEARTBEAT_INTERVAL = 1
+INACTIVE_TIMEOUT = 2
 
 
 @dataclass
@@ -72,6 +85,308 @@ def get_disagg_server_url_from_cfg(config_file: str) -> tuple[str, int]:
     server_host = config.get('hostname', 'localhost')
     server_port = config.get('port', 8000)
     return server_host, server_port
+
+
+@pytest.fixture
+def disagg_port():
+    return get_free_port()
+
+
+@pytest.fixture
+def work_dir():
+    return tempfile.mkdtemp()
+
+
+@pytest.fixture
+def router(request):
+    return request.param
+
+
+@pytest.fixture
+def service_discovery(request, disagg_port, work_dir):
+    if request.param == "etcd":
+        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
+        etcd = subprocess.Popen(["etcd", "--data-dir", data_dir])
+        yield etcd, f"etcd://localhost:2379"
+        try:
+            etcd.kill()
+            etcd.wait(timeout=10)
+            shutil.rmtree(data_dir)
+        except Exception:
+            print(f"Failed to kill etcd: {traceback.format_exc()}")
+    else:
+        yield None, f"http://localhost:{disagg_port}"
+
+
+@pytest.fixture
+def disagg_server_config(disagg_cluster_config, router, disagg_port):
+    return {
+        "hostname": "localhost",
+        "port": disagg_port,
+        "disagg_cluster": disagg_cluster_config,
+        "context_servers": {
+            "router": {
+                "type": router
+            }
+        },
+        "generation_servers": {
+            "router": {
+                "type": router
+            }
+        },
+    }
+
+
+@pytest.fixture
+def worker_config(disagg_cluster_config):
+    return {
+        "disagg_cluster": disagg_cluster_config,
+        "disable_overlap_scheduler": True,
+        "cache_transceiver_config": {
+            "backend": "DEFAULT"
+        },
+        "kv_cache_config": {
+            "free_gpu_memory_fraction": 0.2,
+            "enable_partial_reuse": False,
+        },
+        "cuda_graph_config": {},
+    }
+
+
+class ProcessWrapper:
+
+    def __init__(self, process, log_file=None, log_path=None, port=0):
+        self.process = process
+        self.log_file = log_file
+        self.log_path = log_path
+        self.port = port
+
+
+# Decorator for periodic checking
+def periodic_check(timeout=300, interval=3):
+
+    def decorator(func):
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                try:
+                    result = await func(*args, **kwargs)
+                    if result:
+                        return result
+                except Exception as e:
+                    logger.debug(f"Check failed: {e}")
+                await asyncio.sleep(interval)
+            raise TimeoutError(
+                f"Timeout after {timeout}s waiting for condition")
+
+        return wrapper
+
+    return decorator
+
+
+async def _wait_for_disagg_server_status(port,
+                                         check_ready,
+                                         min_ctx_workers=-1,
+                                         min_gen_workers=-1):
+    """Check disagg server status via /cluster_info endpoint."""
+    try:
+        info_resp = requests.get(f"http://localhost:{port}/cluster_info",
+                                 timeout=5)
+        if info_resp.status_code != 200:
+            return False
+        info = info_resp.json()
+
+        if check_ready and not info.get("is_ready", False):
+            return False
+
+        if min_ctx_workers != -1:
+            ctx_count = len(
+                info.get("current_workers", {}).get("context_servers", []))
+            if ctx_count < min_ctx_workers:
+                return False
+
+        if min_gen_workers != -1:
+            gen_count = len(
+                info.get("current_workers", {}).get("generation_servers", []))
+            if gen_count < min_gen_workers:
+                return False
+
+        return True
+    except Exception as e:
+        logger.debug(f"Failed to check server status: {e}")
+        return False
+
+
+@periodic_check(timeout=300, interval=3)
+async def wait_for_disagg_server_status(port,
+                                        min_ctx_workers=-1,
+                                        min_gen_workers=-1):
+    return await _wait_for_disagg_server_status(port, False, min_ctx_workers,
+                                                min_gen_workers)
+
+
+@periodic_check(timeout=300, interval=3)
+async def wait_for_disagg_server_ready(port):
+    """Wait for disagg server to be ready."""
+    return await _wait_for_disagg_server_status(port, True)
+
+
+def verify_cluster_info(ready,
+                        ctx_workers=-1,
+                        gen_workers=-1,
+                        port=0,
+                        expected_code=200):
+    """Verify cluster info from /cluster_info endpoint."""
+    assert port > 0, "port must be positive"
+    info_resp = requests.get(f"http://localhost:{port}/cluster_info")
+    assert info_resp.status_code == expected_code
+    info = info_resp.json()
+    logger.info(
+        f"verify_cluster_info: {info}, ready={ready}, ctx={ctx_workers}, gen={gen_workers}"
+    )
+    assert info["is_ready"] == ready
+    if ctx_workers != -1:
+        assert len(info["current_workers"]["context_servers"]) == ctx_workers
+    if gen_workers != -1:
+        assert len(info["current_workers"]["generation_servers"]) == gen_workers
+
+
+def _run_worker(model_name,
+                worker_config,
+                role,
+                port,
+                work_dir,
+                device=-1,
+                save_log=False):
+    worker_config_path = os.path.join(work_dir, f"{role}_{port}_config.yaml")
+    with open(worker_config_path, "w+") as f:
+        yaml.dump(worker_config, f)
+        f.flush()
+        cmd = [
+            "trtllm-serve",
+            "serve",
+            model_name,
+            "--host",
+            "localhost",
+            "--port",
+            str(port),
+            "--config",
+            worker_config_path,
+            "--server_role",
+            "context" if role.startswith("ctx") else "generation",
+        ]
+        env = os.environ.copy()
+        log_file = None
+        log_path = None
+        if save_log:
+            log_path = os.path.join(work_dir, f"worker_{role}_{port}.log")
+            log_file = open(log_path, "w+")
+            stdout = log_file
+            stderr = log_file
+        else:
+            stdout = sys.stdout
+            stderr = sys.stderr
+        if device != -1:
+            env["CUDA_VISIBLE_DEVICES"] = str(device)
+        print(f"Running {role} on port {port}")
+        return ProcessWrapper(subprocess.Popen(cmd,
+                                               env=env,
+                                               stdout=stdout,
+                                               stderr=stderr),
+                              log_file=log_file,
+                              log_path=log_path,
+                              port=port)
+
+
+def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False):
+    disagg_server_config_path = os.path.join(work_dir,
+                                             "disagg_server_config.yaml")
+    disagg_cluster_config["port"] = port
+    with open(disagg_server_config_path, "w+") as f:
+        yaml.dump(disagg_cluster_config, f)
+    cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
+    log_file = None
+    log_path = None
+    if save_log:
+        log_path = os.path.join(work_dir, "disagg_server.log")
+        log_file = open(log_path, "w+")
+        stdout = log_file
+        stderr = log_file
+    else:
+        stdout = sys.stdout
+        stderr = sys.stderr
+    p = subprocess.Popen(cmds, stdout=stdout, stderr=stderr)
+    return ProcessWrapper(p, log_file=log_file, log_path=log_path, port=port)
+
+
+def run_ctx_worker(model_name, ctx_worker_config, work_dir, port=0, device=0):
+    """Launch a context worker with service discovery."""
+    return _run_worker(model_name, ctx_worker_config, "ctx", port, work_dir,
+                       device)
+
+
+def run_gen_worker(model_name,
+                   gen_worker_config,
+                   work_dir,
+                   port=0,
+                   device=0):  # TODO use device=1 for multiple gpus
+    """Launch a generation worker with service discovery."""
+    return _run_worker(model_name, gen_worker_config, "gen", port, work_dir,
+                       device)
+
+
+def terminate(*args, show_log_lines=30):
+    """Terminate processes and show their logs."""
+    for arg in args:
+        if arg and isinstance(arg, ProcessWrapper):
+            try:
+                # Print log tail for debugging
+                if arg.log_path and os.path.exists(arg.log_path):
+                    print(f"-------------{arg.log_path}---------------")
+                    try:
+                        with open(arg.log_path, 'r') as f:
+                            lines = f.readlines()
+                            print(''.join(lines[-show_log_lines:]))
+                    except Exception as e:
+                        print(f"Failed to read log: {e}")
+            except Exception as e:
+                print(f"Failed to tail {arg.log_path}: {e}")
+
+            if arg.process:
+                print(f"Killing process {arg.process.pid}")
+                try:
+                    arg.process.kill()
+                    arg.process.wait(timeout=10)
+                    arg.process = None
+                    if arg.log_file:
+                        arg.log_file.close()
+                        arg.log_file = None
+                except Exception as e:
+                    print(f"Failed to terminate process {arg.process.pid}: {e}")
+
+
+def request_completion(model_name, prompt, port):
+    """Make a completion request to the disagg server."""
+    client = openai.OpenAI(api_key="tensorrt_llm",
+                           base_url=f"http://localhost:{port}/v1")
+    return client.completions.create(model=model_name,
+                                     prompt=prompt,
+                                     max_tokens=10,
+                                     temperature=0.0)
+
+
+@pytest.fixture
+def disagg_cluster_config(service_discovery):
+    # same cluster config for workers and proxy server
+    _, uri = service_discovery
+    return {
+        "cluster_uri": uri,
+        "cluster_name": "test_cluster",
+        "heartbeat_interval_sec": HEARTBEAT_INTERVAL,
+        "inactive_timeout_sec": INACTIVE_TIMEOUT,
+    }
 
 
 def get_test_config(test_desc, example_dir, test_root):
@@ -330,8 +645,12 @@ def run_client_tests(example_dir,
         # Prepare poll processes
         worker_processes = []
         if use_ray:
-            for proc_cm in workers_proc:
-                worker_processes.append(proc_cm.__enter__())
+            for proc in workers_proc:
+                # Ray passes context managers, SD passes raw Popen objects
+                if hasattr(proc, '__enter__'):
+                    worker_processes.append(proc.__enter__())
+                else:
+                    worker_processes.append(proc)
         else:
             worker_processes = [workers_proc]
 
@@ -603,6 +922,192 @@ def run_disaggregated_test(example_dir,
                     os.remove(extra_file)
 
 
+def _run_disaggregated_test_sd(  # TODO implement sd for multi-gpu tests
+        example_dir,
+        test_desc,
+        num_iters=5,
+        env=None,
+        cwd=None,
+        prompt_file="prompts.json",
+        extra_endpoints_test=None,
+        model_path=None,
+        service_discovery_backend="http"):
+    """Run disaggregated test using service discovery instead of MPI."""
+
+    test_configs_root = f"{os.path.dirname(__file__)}/test_configs"
+    config_map = {
+        "2_ranks_sd": (2, f"{example_dir}/disagg_config_sd.yaml"),
+        "2_ranks_diff_max_tokens_sd":
+        (2, f"{test_configs_root}/disagg_config_diff_max_tokens_sd.yaml"),
+        "2_ranks_trt_backend_sd":
+        (2, f"{test_configs_root}/disagg_config_trt_backend_sd.yaml"),
+        "gen_only_sd": (2,
+                        f"{test_configs_root}/disagg_config_gen_only_sd.yaml"),
+        "gen_only_trt_backend_sd":
+        (2, f"{test_configs_root}/disagg_config_gen_only_trt_backend_sd.yaml"),
+        "cuda_graph_sd":
+        (2, f"{test_configs_root}/disagg_config_cuda_graph_padding_sd.yaml"),
+        "mixed_sd": (2, f"{test_configs_root}/disagg_config_mixed_sd.yaml"),
+        "overlap_sd": (2, f"{test_configs_root}/disagg_config_overlap_sd.yaml"),
+        "perf_metrics_sd":
+        (2, f"{test_configs_root}/disagg_config_metrics_sd.yaml"),
+        "tool_calls_sd": (2,
+                          f"{test_configs_root}/disagg_config_overlap_sd.yaml"),
+        "trtllm_sampler_sd":
+        (2, f"{test_configs_root}/disagg_config_trtllm_sampler_sd.yaml"),
+        "load_balance_sd":
+        (4, f"{test_configs_root}/disagg_config_load_balance_sd.yaml"),
+        "cache_aware_balance_sd":
+        (4, f"{test_configs_root}/disagg_config_cache_aware_balance_sd.yaml"),
+        "conditional_sd":
+        (2, f"{test_configs_root}/disagg_config_conditional_sd.yaml"),
+        "ngram_sd": (2, f"{test_configs_root}/disagg_config_ngram_sd.yaml"),
+    }
+
+    if test_desc not in config_map:
+        raise ValueError(f"Unknown test_desc: {test_desc}")
+
+    num_ranks, config_file = config_map[test_desc]
+
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Extract server config
+    disagg_cluster = config.get("disagg_cluster", {})
+    server_host = config.get("hostname", "localhost")
+    server_port = get_free_port()
+
+    # Handle service discovery backend (etcd or HTTP)
+    work_dir = tempfile.mkdtemp()
+    etcd_process = None
+    data_dir = None
+    if service_discovery_backend == "etcd":
+        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
+        etcd_process = subprocess.Popen(["etcd", "--data-dir", data_dir])
+        disagg_cluster["cluster_uri"] = "etcd://localhost:2379"
+        logger.info("Started etcd for service discovery")
+    elif service_discovery_backend == "http":
+        disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
+        logger.info(
+            f"Using HTTP service discovery at {disagg_cluster['cluster_uri']}")
+
+    # Create worker config (separate from server config)
+    worker_config = {
+        "disagg_cluster":
+        disagg_cluster,
+        "disable_overlap_scheduler":
+        config.get("disable_overlap_scheduler", True),
+        "cache_transceiver_config":
+        config.get("cache_transceiver_config", {"backend": "DEFAULT"}),
+        "kv_cache_config":
+        config.get("kv_cache_config", {"free_gpu_memory_fraction": 0.2}),
+    }
+
+    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
+    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+
+    ctx_workers = []
+    gen_workers = []
+    disagg_server = None
+
+    try:
+        logger.info(
+            f"Starting {ctx_instances} context workers with service discovery")
+
+        # Launch context workers
+        for i in range(ctx_instances):
+            device = i  # Simple device assignment
+            ctx_worker = run_ctx_worker(
+                model_path or config.get("model"),
+                worker_config,
+                work_dir,
+                port=0,  # TODO set to 'device' for multiple gpus
+                device=device)
+            ctx_workers.append(ctx_worker)
+
+        logger.info(
+            f"Starting {gen_instances} generation workers with service discovery"
+        )
+
+        # Launch generation workers
+        for i in range(gen_instances):
+            device = ctx_instances + i  # Offset by ctx workers
+            gen_worker = run_gen_worker(
+                model_path or config.get("model"),
+                worker_config,
+                work_dir,
+                port=0,  # Auto-assign
+                device=0  # TODO set to 'device' for multiple gpus
+            )
+            gen_workers.append(gen_worker)
+
+        logger.info("Starting disagg server")
+
+        # Create server config (without worker URLs)
+        server_config = {
+            "hostname": server_host,
+            "port": server_port,
+            "disagg_cluster": disagg_cluster,
+            "context_servers": config.get("context_servers", {}),
+            "generation_servers": config.get("generation_servers", {}),
+        }
+        server_config["context_servers"].pop("urls", None)
+        server_config["generation_servers"].pop("urls", None)
+
+        disagg_server = run_disagg_server(server_config, work_dir, server_port)
+
+        logger.info("Waiting for workers to register via service discovery...")
+        asyncio.run(wait_for_disagg_server_ready(server_port))
+
+        verify_cluster_info(ready=True,
+                            ctx_workers=ctx_instances,
+                            gen_workers=gen_instances,
+                            port=server_port)
+
+        server_url = f"http://{server_host}:{server_port}"
+
+        # Create a temporary client config file with the correct server port
+        client_config = config.copy()
+        client_config["port"] = server_port
+        client_config["hostname"] = server_host
+        temp_fd, client_config_file = tempfile.mkstemp(suffix='.yaml',
+                                                       dir=work_dir)
+        with os.fdopen(temp_fd, 'w') as f:
+            yaml.dump(client_config, f)
+
+        # collect all worker processes for monitoring
+        all_worker_procs = [w.process for w in ctx_workers
+                            ] + [w.process for w in gen_workers]
+
+        # run client tests
+        run_client_tests(
+            os.path.dirname(config_file),
+            client_config_file,
+            test_desc,
+            num_iters,
+            env,
+            300,  # timeout
+            prompt_file,
+            extra_endpoints_test,
+            server_url,
+            all_worker_procs,
+            disagg_server.process,
+            use_ray=True)
+    finally:
+        logger.info("Cleaning up service discovery processes...")
+        # cleanup etcd if it was started
+        if etcd_process:
+            try:
+                etcd_process.kill()
+                etcd_process.wait(timeout=10)
+                if data_dir and os.path.exists(data_dir):
+                    shutil.rmtree(data_dir)
+                logger.info("Etcd process terminated")
+            except Exception:
+                print(f"Failed to kill etcd: {traceback.format_exc()}")
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+
+
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_diff_max_tokens(disaggregated_test_root,
@@ -642,6 +1147,30 @@ def test_disaggregated_single_gpu_with_mpirun(disaggregated_test_root,
                            "2_ranks",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_single_gpu_with_mpirun_sd(disaggregated_test_root,
+                                                 disaggregated_example_root,
+                                                 llm_venv, llama_model_root,
+                                                 service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "2_ranks_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],

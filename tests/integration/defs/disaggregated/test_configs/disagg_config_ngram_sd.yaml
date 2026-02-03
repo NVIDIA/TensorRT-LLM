@@ -1,0 +1,38 @@
+# Service discovery configuration
+hostname: localhost
+port: 8000
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+free_gpu_memory_fraction: 0.1
+backend: pytorch
+disable_overlap_scheduler: true
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: DEFAULT
+  router:
+    type: round_robin
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: DEFAULT
+  speculative_config:
+    decoding_type: NGram
+    max_draft_len: 4
+    max_matching_ngram_size: 4
+    is_keep_all: true
+    is_use_oldest: true
+    is_public_pool: true
+  router:
+    type: round_robin
+disagg_cluster:
+  cluster_uri: http://localhost:8000
+  cluster_name: test_cluster
+  heartbeat_interval_sec: 1
+  inactive_timeout_sec: 2
+  minimal_instances:
+    context_servers: 1
+    generation_servers: 1
