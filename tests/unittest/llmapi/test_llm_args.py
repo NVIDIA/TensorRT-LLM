@@ -1135,7 +1135,7 @@ class TestPyTorchBackendModelDefaults:
     def get_tinyllama_path(self):
         from utils.llm_data import llm_models_root
         return str(llm_models_root() /
-                   "llm-models/llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+                   "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
 
     @pytest.fixture(autouse=True)
     def setup(self, monkeypatch, tmp_path):

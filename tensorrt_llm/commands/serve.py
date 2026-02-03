@@ -424,7 +424,7 @@ def launch_mm_encoder_server(
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
     model = encoder_args["model"]
-    encoder_args.pop("build_config")
+    encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
 
     server = OpenAIServer(llm=mm_encoder,
