@@ -1780,10 +1780,16 @@ class PyExecutor:
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
 
-                    if self.drafter is not None:
-                        self.drafter.run_drafter_post(scheduled_batch,
-                                                      self.resource_manager,
-                                                      self.is_warmup)
+                    # Handle SaveHiddenStates mode - save hidden states after forward
+                    if not self.is_warmup:
+                        spec_resource_mgr = self.resource_manager.resource_managers.get(
+                            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                        if spec_resource_mgr is not None and hasattr(
+                                spec_resource_mgr, 'process_and_save'):
+                            spec_metadata = getattr(self.model_engine,
+                                                    'spec_metadata', None)
+                            spec_resource_mgr.process_and_save(
+                                scheduled_batch, spec_metadata)
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)

@@ -120,15 +120,3 @@ class Drafter(ABC):
         """
         self.max_total_draft_tokens = new_max_total_draft_tokens
         self.max_draft_len = new_max_total_draft_tokens
-
-    def run_drafter_post(
-        self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: Optional[ResourceManager] = None,
-        is_warmup: bool = False,
-    ) -> None:
-        """
-        If draft forward needs to be run directly after the target model forward,
-        this method can be overridden to do that.
-        Used in SaveHiddenStatesDrafter (to ensure correct input_ids)
-        """
