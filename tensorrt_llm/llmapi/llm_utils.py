@@ -6,7 +6,8 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import (Any, Callable, Dict, List, Optional, Tuple, Type, Union,
+                    get_args, get_origin)
 
 import torch
 import transformers
@@ -23,7 +24,6 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
 from ..builder import BuildConfig, Engine, build
 from ..llmapi.llm_args import TrtLlmArgs
 from ..logger import logger
-from ..lora_helper import LoraConfig
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
 from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
@@ -32,11 +32,11 @@ from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 # yapf: disable
 from .llm_args import (BaseLlmArgs, CalibConfig, CudaGraphConfig,
-                       DecodingConfig, DraftTargetDecodingConfig,
-                       Eagle3DecodingConfig, EagleDecodingConfig, KvCacheConfig,
-                       LlmArgs, LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MoeConfig, MTPDecodingConfig, NGramDecodingConfig,
-                       SchedulerConfig, UserProvidedDecodingConfig,
+                       DraftTargetDecodingConfig, Eagle3DecodingConfig,
+                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig,
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchLlmArgs, UserProvidedDecodingConfig,
                        _ModelFormatKind, _ModelWrapper, _ParallelConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
@@ -1012,7 +1012,6 @@ __all__ = [
 ]
 
 
-# Model defaults helper functions (moved from llm_args.py)
 def extract_llm_args_overrides(llm_args) -> Dict:
     """Extract user-provided overrides from a Pydantic model or dict."""
     if isinstance(llm_args, dict):
@@ -1092,26 +1091,37 @@ def apply_model_defaults_to_llm_args(llm_args, model_defaults: Dict) -> Dict:
     return applied
 
 
+def get_pydantic_config_fields(
+        llm_args_class: Type[BaseModel]) -> Dict[str, Type]:
+    """Dynamically discover all Pydantic BaseModel fields nested in an LlmArgs class."""
+    config_fields = {}
+
+    for field_name, field_info in llm_args_class.model_fields.items():
+        field_type = field_info.annotation
+
+        # Handle Optional[Type] and Type | None
+        origin = get_origin(field_type)
+        if origin is Union or (
+                origin is not None
+                and str(origin).startswith("<class 'types.UnionType'>")):
+            args = get_args(field_type)
+            non_none_types = [arg for arg in args if arg is not type(None)]
+            if non_none_types:
+                field_type = non_none_types[0]
+
+        if isinstance(field_type, type) and issubclass(field_type, BaseModel):
+            config_fields[field_name] = field_type
+
+    return config_fields
+
+
 def merge_llm_configs_with_defaults(
     llm_args: Dict,
     model_defaults: Dict,
     user_overrides: Optional[Dict] = None,
 ) -> Dict:
-    """Merge model-specific defaults into llm_args using Pydantic.
-
-    Only applies defaults for fields that are unset in llm_args.
-    Uses Pydantic's model_validate and model_dump(exclude_unset=True).
-    """
-    # Handle nested Pydantic models generically
-    config_classes = {
-        "kv_cache_config": KvCacheConfig,
-        "build_config": BuildConfig,
-        "scheduler_config": SchedulerConfig,
-        "decoding_config": DecodingConfig,
-        "quant_config": QuantConfig,
-        "lora_config": LoraConfig,
-        "moe_config": MoeConfig,
-    }
+    """Merge model-specific defaults into llm_args using Pydantic."""
+    config_classes = get_pydantic_config_fields(TorchLlmArgs)
 
     if user_overrides is None:
         user_overrides = llm_args if isinstance(llm_args, dict) else {}
@@ -1121,13 +1131,10 @@ def merge_llm_configs_with_defaults(
         if key in config_classes:
             config_class = config_classes[key]
 
-            # Get existing config or empty dict
             existing = llm_args.get(key, {})
             if hasattr(existing, 'model_dump'):
-                # If it's already a Pydantic model, convert to dict
                 existing = existing.model_dump()
             elif not isinstance(existing, dict):
-                # If it's not a dict, skip
                 continue
 
             override_value = user_overrides.get(key, {})
@@ -1142,7 +1149,6 @@ def merge_llm_configs_with_defaults(
                     merged[sub_key] = sub_default
             llm_args[key] = config_class.model_validate(merged)
         else:
-            # Simple fields - only set if not already present
             if key not in user_overrides:
                 llm_args[key] = default_value
 
@@ -1151,11 +1157,7 @@ def merge_llm_configs_with_defaults(
 
 def compute_applied_llm_defaults(model_defaults: Dict,
                                  user_overrides: Dict) -> Dict:
-    """Return the subset of model_defaults that will be applied.
-
-    Only defaults for fields not present in user_overrides are included.
-    Nested dicts are handled recursively.
-    """
+    """Return the subset of model_defaults that will be applied."""
 
     def _compute(defaults: Dict, overrides: Dict) -> Dict:
         applied = {}
