@@ -28,7 +28,10 @@ def temp_extra_llm_api_options_file():
                 "max_lora_rank": 8,
                 "max_loras": 4,
                 "max_cpu_loras": 4,
-            }
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5
+            },
         }
 
         with open(temp_file_path, 'w') as f:
