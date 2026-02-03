@@ -340,17 +340,17 @@ class FuseNVFP4Linear(BaseTransform):
 
 
 # ============================================================================
-# HuggingFace FineGrained FP8 Linear Patterns (for MiniMax M2, DeepSeek, etc.)
+# FineGrained FP8 Linear Patterns (for MiniMax M2, DeepSeek, etc.)
 # ============================================================================
 
 
-# HF FP8: with bias=None
-def _hf_fp8_ref_pattern_1(
+# FineGrained FP8: with bias=None
+def _finegrained_fp8_pattern_1(
     x: torch.Tensor,
     w_fp8: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
-    return torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+    return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
         x,
         w_fp8,
         None,
@@ -361,12 +361,12 @@ def _hf_fp8_ref_pattern_1(
     )
 
 
-def _hf_fp8_ref_repl_1(
+def _finegrained_fp8_repl_1(
     x: torch.Tensor,
     w_fp8: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
-    return torch.ops.auto_deploy.trtllm_hf_fp8_linear(
+    return torch.ops.auto_deploy.trtllm_finegrained_fp8_linear(
         x,
         w_fp8,
         None,
@@ -374,14 +374,14 @@ def _hf_fp8_ref_repl_1(
     )
 
 
-# HF FP8: with bias!=None
-def _hf_fp8_ref_pattern_2(
+# FineGrained FP8: with bias!=None
+def _finegrained_fp8_pattern_2(
     x: torch.Tensor,
     w_fp8: torch.Tensor,
     bias: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
-    return torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+    return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
         x,
         w_fp8,
         bias,
@@ -392,13 +392,13 @@ def _hf_fp8_ref_pattern_2(
     )
 
 
-def _hf_fp8_ref_repl_2(
+def _finegrained_fp8_repl_2(
     x: torch.Tensor,
     w_fp8: torch.Tensor,
     bias: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
-    return torch.ops.auto_deploy.trtllm_hf_fp8_linear(
+    return torch.ops.auto_deploy.trtllm_finegrained_fp8_linear(
         x,
         w_fp8,
         bias,
@@ -406,76 +406,76 @@ def _hf_fp8_ref_repl_2(
     )
 
 
-def _register_hf_fp8_linear_patterns(patterns: ADPatternMatcherPass) -> None:
+def _register_finegrained_fp8_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     """
-    Register HuggingFace FineGrained FP8 linear patterns.
+    Register FineGrained FP8 linear patterns.
 
-    HF FP8 uses block-wise weight quantization with per-block scales.
+    FineGrained FP8 uses block-wise weight quantization with per-block scales.
     The replacement uses TRT-LLM's optimized fp8_block_scaling_gemm kernel.
     """
-    # HF FP8 dummy tensors
+    # FineGrained FP8 dummy tensors
     # weight shape: [N, K], weight_scale shape: [N/128, K/128]
     N, K = 256, 256  # Must be multiples of 128 for block quantization
-    x_hf_fp8 = torch.randn(3, K, device="meta", dtype=torch.bfloat16)
-    w_hf_fp8 = torch.randn(N, K, device="meta", dtype=torch.float8_e4m3fn)
-    bias_hf = torch.randn(N, device="meta", dtype=torch.bfloat16)
+    x_fg_fp8 = torch.randn(3, K, device="meta", dtype=torch.bfloat16)
+    w_fg_fp8 = torch.randn(N, K, device="meta", dtype=torch.float8_e4m3fn)
+    bias_fg = torch.randn(N, device="meta", dtype=torch.bfloat16)
     # Per-block weight scale: [N/128, K/128]
-    weight_scale_hf = torch.randn(N // 128, K // 128, device="meta", dtype=torch.float32)
+    weight_scale_fg = torch.randn(N // 128, K // 128, device="meta", dtype=torch.float32)
 
     # no-bias variant
-    dummy_args_hf_fp8_1 = [
-        x_hf_fp8,
-        w_hf_fp8,
-        weight_scale_hf,
+    dummy_args_fg_fp8_1 = [
+        x_fg_fp8,
+        w_fg_fp8,
+        weight_scale_fg,
     ]
     register_ad_pattern(
-        search_fn=_hf_fp8_ref_pattern_1,
-        replace_fn=_hf_fp8_ref_repl_1,
+        search_fn=_finegrained_fp8_pattern_1,
+        replace_fn=_finegrained_fp8_repl_1,
         patterns=patterns,
-        dummy_args=dummy_args_hf_fp8_1,
+        dummy_args=dummy_args_fg_fp8_1,
     )
 
     # bias variant
-    dummy_args_hf_fp8_2 = [
-        x_hf_fp8,
-        w_hf_fp8,
-        bias_hf,
-        weight_scale_hf,
+    dummy_args_fg_fp8_2 = [
+        x_fg_fp8,
+        w_fg_fp8,
+        bias_fg,
+        weight_scale_fg,
     ]
     register_ad_pattern(
-        search_fn=_hf_fp8_ref_pattern_2,
-        replace_fn=_hf_fp8_ref_repl_2,
+        search_fn=_finegrained_fp8_pattern_2,
+        replace_fn=_finegrained_fp8_repl_2,
         patterns=patterns,
-        dummy_args=dummy_args_hf_fp8_2,
+        dummy_args=dummy_args_fg_fp8_2,
     )
 
 
-class FuseHFFP8LinearConfig(TransformConfig):
-    """Configuration for HuggingFace FineGrained FP8 linear fusion transform."""
+class FuseFineGrainedFP8LinearConfig(TransformConfig):
+    """Configuration for FineGrained FP8 linear fusion transform."""
 
     backend: str = Field(
         default="trtllm",
-        description="Backend to use for HF FP8 linear computation (default: 'trtllm').",
+        description="Backend to use for FineGrained FP8 linear computation (default: 'trtllm').",
     )
 
 
-@TransformRegistry.register("fuse_hf_fp8_linear")
-class FuseHFFP8Linear(BaseTransform):
-    """Matches and replaces HF FineGrained FP8 fake quantized linear ops with TRT-LLM ops.
+@TransformRegistry.register("fuse_finegrained_fp8_linear")
+class FuseFineGrainedFP8Linear(BaseTransform):
+    """Matches and replaces FineGrained FP8 fake quantized linear ops with TRT-LLM ops.
 
-    This transform replaces torch_fake_quant_hf_fp8_linear (which uses HuggingFace's
-    triton kernel) with trtllm_hf_fp8_linear (which uses TRT-LLM's optimized
+    This transform replaces torch_fake_quant_finegrained_fp8_linear (which uses HuggingFace's
+    triton kernel) with trtllm_finegrained_fp8_linear (which uses TRT-LLM's optimized
     fp8_block_scaling_gemm kernel).
 
     Used for models like MiniMax M2 and DeepSeek that use HuggingFace's FineGrained FP8
     quantization format with 128x128 block sizes.
     """
 
-    config: FuseHFFP8LinearConfig
+    config: FuseFineGrainedFP8LinearConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
-        return FuseHFFP8LinearConfig
+        return FuseFineGrainedFP8LinearConfig
 
     def _apply(
         self,
@@ -485,10 +485,10 @@ class FuseHFFP8Linear(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         if self.config.backend.lower() != "trtllm":
-            raise ValueError(f"Unsupported HF FP8 backend: {self.config.backend}")
+            raise ValueError(f"Unsupported FineGrained FP8 backend: {self.config.backend}")
 
         patterns = ADPatternMatcherPass()
-        _register_hf_fp8_linear_patterns(patterns)
+        _register_finegrained_fp8_linear_patterns(patterns)
         cnt = patterns.apply(gm.graph)
 
         info = TransformInfo(

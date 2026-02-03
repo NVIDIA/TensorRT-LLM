@@ -78,7 +78,7 @@ from ..interface import (
 def is_quantized_linear_scale_tensor(node: "Node", weight_node_key: str) -> bool:
     """Check if a weight node is a scale tensor for a quantized linear op.
 
-    Scale tensors (e.g., weight_scale_inv for HF FP8) are in "block space" and should
+    Scale tensors (e.g., weight_scale_inv for FineGrained FP8) are in "block space" and should
     not be sharded with the same min_local_shape as the actual weight tensor.
     They are handled separately by quantization_cb.
 
@@ -508,10 +508,10 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         return
 
 
-class HFFineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
-    """Tensor-parallel sharding for HuggingFace FineGrainedFP8 quantized linears.
+class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
+    """Tensor-parallel sharding for FineGrainedFP8 quantized linears.
 
-    HF FP8 uses per-block weight scales (weight_scale_inv) with shape [N/block_n, K/block_k].
+    FineGrained FP8 uses per-block weight scales (weight_scale_inv) with shape [N/block_n, K/block_k].
     When sharding the weight along a dimension, we also need to shard the scale tensor.
     """
 
@@ -779,14 +779,14 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         _insert_sharded_moe(gm, node, self.config, scale_names=self.scale_names())
 
 
-class HFFP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
-    """HuggingFace FineGrainedFP8-specific EP sharding behavior.
+class FineGrainedFP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
+    """FineGrainedFP8-specific EP sharding behavior.
 
-    HF FP8 MoE uses per-block weight scales (weight_scale_inv) for each expert's weights.
+    FineGrained FP8 MoE uses per-block weight scales (weight_scale_inv) for each expert's weights.
     """
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
-        if not is_op(node, torch.ops.auto_deploy.torch_quant_hf_fp8_moe):
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe):
             ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
             return False
         return True
@@ -806,7 +806,10 @@ class HFFP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
-    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_hf_fp8_moe), HFFP8EPShardingInfo),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe),
+        FineGrainedFP8EPShardingInfo,
+    ),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
@@ -1303,8 +1306,8 @@ TP_SHARDING_RULES = [
         FP4WeightShardingInfo,
     ),
     (
-        lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear),
-        HFFineGrainedFP8WeightShardingInfo,
+        lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear),
+        FineGrainedFP8WeightShardingInfo,
     ),
 ]
 

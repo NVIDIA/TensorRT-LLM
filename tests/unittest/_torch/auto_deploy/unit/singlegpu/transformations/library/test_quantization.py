@@ -115,24 +115,24 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
 
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_hf_fp8_quantization(bias):
-    """Test HuggingFace FineGrained FP8 quantization transform.
+def test_finegrained_fp8_quantization(bias):
+    """Test FineGrained FP8 quantization transform.
 
-    This tests the quantize_hf_fp8_linear_from_config transform which converts
-    linear layers to use the torch_fake_quant_hf_fp8_linear op with per-block
+    This tests the quantize_finegrained_fp8_linear_from_config transform which converts
+    linear layers to use the torch_fake_quant_finegrained_fp8_linear op with per-block
     quantization matching HuggingFace's FineGrainedFP8 format.
     """
     model = MLP(128, 256, 128).to(torch.float16).to("cuda")
     x = torch.randn(3, 128, dtype=torch.float16).to("cuda")
 
     quant_config = {"quant_method": "fp8"}
-    QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear
+    QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     gm_transformed = InferenceOptimizer(
         DummyFactory(quant_config),
         {
-            "quantize_hf_fp8_linear_from_config": {
+            "quantize_finegrained_fp8_linear_from_config": {
                 "stage": "pattern_matcher",
             },
         },

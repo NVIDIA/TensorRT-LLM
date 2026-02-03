@@ -1075,14 +1075,14 @@ def test_nvfp4_moe_different_input_scales(
                 f"Alpha recomputation mismatch. Got {actual_alpha}, expected {expected_alpha}"
             )
 # =============================================================================
-# HuggingFace FineGrainedFP8 MoE Tests
+# FineGrainedFP8 MoE Tests
 # =============================================================================
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
-class BlockSparseTop2MLPHFFP8(nn.Module):
-    """HuggingFace FineGrainedFP8 expert with per-block weight scales."""
+class BlockSparseTop2MLPFineGrainedFP8(nn.Module):
+    """FineGrainedFP8 expert with per-block weight scales."""
 
     def __init__(self, ffn_dim, hidden_dim, dtype=torch.bfloat16, device="cuda", block_size=None):
         super().__init__()
@@ -1136,7 +1136,7 @@ class BlockSparseTop2MLPHFFP8(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor):
         x = hidden_states
-        w1_out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+        w1_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
             x,
             self.w1_fp8,
             bias=None,
@@ -1145,7 +1145,7 @@ class BlockSparseTop2MLPHFFP8(nn.Module):
             input_zp=[],
             weight_zp=[],
         )
-        w3_out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+        w3_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
             x,
             self.w3_fp8,
             bias=None,
@@ -1155,7 +1155,7 @@ class BlockSparseTop2MLPHFFP8(nn.Module):
             weight_zp=[],
         )
         fused = self.act_fn(w1_out) * w3_out
-        out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+        out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
             fused,
             self.w2_fp8,
             bias=None,
@@ -1167,8 +1167,8 @@ class BlockSparseTop2MLPHFFP8(nn.Module):
         return out
 
 
-class HFFP8MoEOpModel(nn.Module):
-    """MoE model using HuggingFace FineGrainedFP8 quantized experts with torch_quant_hf_fp8_moe op."""
+class FineGrainedFP8MoEOpModel(nn.Module):
+    """MoE model using FineGrainedFP8 quantized experts with torch_quant_finegrained_fp8_moe op."""
 
     def __init__(
         self, hidden_size=256, intermediate_size=128, num_experts=4, top_k=2, device="cuda"
@@ -1181,10 +1181,10 @@ class HFFP8MoEOpModel(nn.Module):
 
         self.gate = nn.Linear(hidden_size, num_experts)
 
-        # Create HF FP8 experts
+        # Create FineGrained FP8 experts
         self.experts = nn.ModuleList(
             [
-                BlockSparseTop2MLPHFFP8(intermediate_size, hidden_size, device=device)
+                BlockSparseTop2MLPFineGrainedFP8(intermediate_size, hidden_size, device=device)
                 for _ in range(num_experts)
             ]
         )
@@ -1205,7 +1205,7 @@ class HFFP8MoEOpModel(nn.Module):
         w2_scale_list = [expert.w2_scale_inv for expert in self.experts]
         w3_scale_list = [expert.w3_scale_inv for expert in self.experts]
 
-        out = torch.ops.auto_deploy.torch_quant_hf_fp8_moe(
+        out = torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe(
             x,
             selected_experts,
             routing_weights,
@@ -1232,11 +1232,11 @@ class HFFP8MoEOpModel(nn.Module):
 
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires FP8 support")
 @pytest.mark.skipif(not trtllm_ops_available(), reason="Requires TRTLLM ops")
-def test_fuse_hf_fp8_moe():
-    """Test that fuse_hf_fp8_moe transforms torch_quant_hf_fp8_moe to fused op."""
+def test_fuse_finegrained_fp8_moe():
+    """Test that fuse_finegrained_fp8_moe transforms torch_quant_finegrained_fp8_moe to fused op."""
     device = "cuda"
     # Use sizes divisible by 128 for block scales
-    model = HFFP8MoEOpModel(
+    model = FineGrainedFP8MoEOpModel(
         hidden_size=512, intermediate_size=1536, num_experts=72, device=device
     ).to(device=device)
     model.gate = model.gate.to(dtype=torch.bfloat16)
@@ -1246,17 +1246,17 @@ def test_fuse_hf_fp8_moe():
     with torch.inference_mode():
         gm = torch_export_to_gm(model, args=(x,), clone=True)
 
-        # Verify initial graph has torch_quant_hf_fp8_moe
+        # Verify initial graph has torch_quant_finegrained_fp8_moe
         has_unfused = any(
-            is_op(n, torch.ops.auto_deploy.torch_quant_hf_fp8_moe) for n in gm.graph.nodes
+            is_op(n, torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe) for n in gm.graph.nodes
         )
-        assert has_unfused, "Expected torch_quant_hf_fp8_moe in initial graph"
+        assert has_unfused, "Expected torch_quant_finegrained_fp8_moe in initial graph"
 
         # Apply fusion transform
         gm_transformed = InferenceOptimizer(
             None,
             {
-                "fuse_hf_fp8_moe": {
+                "fuse_finegrained_fp8_moe": {
                     "stage": "post_load_fusion",
                 },
             },
@@ -1264,29 +1264,31 @@ def test_fuse_hf_fp8_moe():
 
         # Verify fused op is present
         has_fused = any(
-            is_op(n, torch.ops.auto_deploy.trtllm_quant_hf_fp8_block_scale_moe_fused)
+            is_op(n, torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused)
             for n in gm_transformed.graph.nodes
         )
-        assert has_fused, "Expected trtllm_quant_hf_fp8_block_scale_moe_fused after fusion"
+        assert has_fused, "Expected trtllm_quant_finegrained_fp8_moe_fused after fusion"
 
         # Verify unfused op is removed
         still_has_unfused = any(
-            is_op(n, torch.ops.auto_deploy.torch_quant_hf_fp8_moe)
+            is_op(n, torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe)
             for n in gm_transformed.graph.nodes
         )
-        assert not still_has_unfused, "torch_quant_hf_fp8_moe should be replaced after fusion"
+        assert not still_has_unfused, (
+            "torch_quant_finegrained_fp8_moe should be replaced after fusion"
+        )
 
 
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires FP8 support")
 @pytest.mark.skipif(not trtllm_ops_available(), reason="Requires TRTLLM ops")
-def test_trtllm_quant_hf_fp8_block_scale_moe_fused_correctness():
-    """Test functional correctness of fused HF FP8 MoE kernel vs unfused."""
+def test_trtllm_quant_finegrained_fp8_moe_fused_correctness():
+    """Test functional correctness of fused FineGrained FP8 MoE kernel vs unfused."""
     device = "cuda"
     dtype = torch.bfloat16
     torch.manual_seed(42)
 
     # Use sizes divisible by 128 for block scales
-    model = HFFP8MoEOpModel(
+    model = FineGrainedFP8MoEOpModel(
         hidden_size=512, intermediate_size=1536, num_experts=72, device=device
     ).to(device=device)
     model.gate = model.gate.to(dtype=dtype)
@@ -1302,7 +1304,7 @@ def test_trtllm_quant_hf_fp8_block_scale_moe_fused_correctness():
         gm_transformed = InferenceOptimizer(
             None,
             {
-                "fuse_hf_fp8_moe": {
+                "fuse_finegrained_fp8_moe": {
                     "stage": "post_load_fusion",
                 },
             },
@@ -1318,5 +1320,5 @@ def test_trtllm_quant_hf_fp8_block_scale_moe_fused_correctness():
             ref_output,
             atol=0.05,
             rtol=0.05,
-            msg="Fused HF FP8 MoE output differs from unfused reference",
+            msg="Fused FineGrained FP8 MoE output differs from unfused reference",
         )

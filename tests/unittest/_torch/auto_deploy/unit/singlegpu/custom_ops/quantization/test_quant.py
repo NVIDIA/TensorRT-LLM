@@ -316,10 +316,10 @@ def test_fake_quant_int4_linear_matches_fp_reference(bias_opt, input_dtype):
 @pytest.mark.parametrize("K", [128, 256])  # Must be divisible by block_size
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_hf_fp8_linear(M, N, K, bias):
-    """Test HuggingFace FineGrainedFP8 linear custom op.
+def test_finegrained_fp8_linear(M, N, K, bias):
+    """Test FineGrainedFP8 linear custom op.
 
-    This tests the torch_fake_quant_hf_fp8_linear op which implements
+    This tests the torch_fake_quant_finegrained_fp8_linear op which implements
     per-block FP8 quantization matching HuggingFace's FineGrainedFP8 format.
     """
     block_size = [128, 128]
@@ -348,11 +348,11 @@ def test_hf_fp8_linear(M, N, K, bias):
     )
     weight_fp8 = (weight.float() / scale_expanded).to(torch.float8_e4m3fn)
 
-    output_hf_fp8 = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+    output_fg_fp8 = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
         input_tensor,
         weight_fp8,
         bias_tensor,
-        [],  # input_scale - unused for HF FP8
+        [],  # input_scale - unused for FineGrained FP8
         [weight_scale_inv],  # weight_scale
         [],  # input_zp - unused
         [],  # weight_zp - unused
@@ -361,13 +361,13 @@ def test_hf_fp8_linear(M, N, K, bias):
     weight_dequant = (weight_fp8.float() * scale_expanded).to(input_tensor.dtype)
     output_ref = torch.nn.functional.linear(input_tensor, weight_dequant, bias_tensor)
 
-    assert output_hf_fp8.shape == output_ref.shape, (
-        f"Shape mismatch: {output_hf_fp8.shape} vs {output_ref.shape}"
+    assert output_fg_fp8.shape == output_ref.shape, (
+        f"Shape mismatch: {output_fg_fp8.shape} vs {output_ref.shape}"
     )
 
-    torch.testing.assert_close(output_hf_fp8, output_ref, rtol=0.1, atol=0.1)
+    torch.testing.assert_close(output_fg_fp8, output_ref, rtol=0.1, atol=0.1)
 
     cos = F.cosine_similarity(
-        output_hf_fp8.reshape(-1).float(), output_ref.reshape(-1).float(), dim=0
+        output_fg_fp8.reshape(-1).float(), output_ref.reshape(-1).float(), dim=0
     )
     assert cos > 0.95, f"Cosine similarity too low: {cos}"

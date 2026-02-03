@@ -70,9 +70,9 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_linear_from_config:
     stage: pattern_matcher
-  quantize_hf_fp8_linear_from_config:
+  quantize_finegrained_fp8_linear_from_config:
     stage: pattern_matcher
-  quantize_hf_fp8_moe:
+  quantize_finegrained_fp8_moe:
     stage: pattern_matcher
   quantize_fp8_bmm_from_config:
     stage: pattern_matcher
@@ -146,7 +146,7 @@ transforms:
     backend: trtllm
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
-  fuse_hf_fp8_linear:
+  fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
   fuse_moe:
@@ -158,10 +158,7 @@ transforms:
     expect_mem_change: true
     backend: trtllm
     allow_different_input_scales: false
-  fuse_hf_fp8_moe:
-    stage: post_load_fusion
-    enabled: true
-  fuse_nvfp4_moe:
+  fuse_finegrained_fp8_moe:
     stage: post_load_fusion
     expect_mem_change: true
     allow_different_input_scales: false

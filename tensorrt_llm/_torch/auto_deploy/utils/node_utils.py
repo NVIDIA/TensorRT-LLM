@@ -510,7 +510,7 @@ def is_any_moe_op(node: Node) -> bool:
             torch.ops.auto_deploy.torch_moe,
             torch.ops.auto_deploy.torch_quant_fp8_moe,
             torch.ops.auto_deploy.torch_quant_nvfp4_moe,
-            torch.ops.auto_deploy.torch_quant_hf_fp8_moe,
+            torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
             torch.ops.auto_deploy.triton_mxfp4_moe,
         ],
     )
@@ -578,7 +578,7 @@ def is_fake_quantized_linear_op(node: Node) -> bool:
     quantized_linear_op = {
         torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
         torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
-        torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear,
+        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
     }
 
     return is_op(node, quantized_linear_op)

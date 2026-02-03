@@ -774,8 +774,8 @@ def _torch_moe_dense_mlp_fake(
     return torch.empty_like(hidden_states)
 
 
-@torch.library.custom_op("auto_deploy::torch_quant_hf_fp8_moe", mutates_args=())
-def torch_quant_hf_fp8_moe(
+@torch.library.custom_op("auto_deploy::torch_quant_finegrained_fp8_moe", mutates_args=())
+def torch_quant_finegrained_fp8_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -789,7 +789,7 @@ def torch_quant_hf_fp8_moe(
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """
-    HuggingFace FineGrainedFP8 MoE op using block-wise FP8 quantized linear operations.
+    FineGrainedFP8 MoE op using block-wise FP8 quantized linear operations.
 
     This op uses the HF FineGrainedFP8 format with per-block weight scales and
     dynamic input quantization.
@@ -811,9 +811,9 @@ def torch_quant_hf_fp8_moe(
 
     if is_gated_mlp:
 
-        def make_hf_fp8_mlp(i):
+        def make_finegrained_fp8_mlp(i):
             def mlp(inp):
-                gate_out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+                gate_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
                     inp,
                     w1_weight[i],
                     bias=None,
@@ -822,7 +822,7 @@ def torch_quant_hf_fp8_moe(
                     input_zp=[],
                     weight_zp=[],
                 )
-                up_out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+                up_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
                     inp,
                     w3_weight[i],
                     bias=None,
@@ -832,7 +832,7 @@ def torch_quant_hf_fp8_moe(
                     weight_zp=[],
                 )
                 prod = torch_act_fn(gate_out) * up_out
-                return torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+                return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
                     prod,
                     w2_weight[i],
                     bias=None,
@@ -844,13 +844,13 @@ def torch_quant_hf_fp8_moe(
 
             return mlp
 
-        mlps = [make_hf_fp8_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_finegrained_fp8_mlp(i) for i in range(len(w1_weight))]
 
     else:
 
-        def make_hf_fp8_mlp(i):
+        def make_finegrained_fp8_mlp(i):
             def mlp(inp):
-                up_out = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+                up_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
                     inp,
                     w1_weight[i],
                     bias=None,
@@ -859,7 +859,7 @@ def torch_quant_hf_fp8_moe(
                     input_zp=[],
                     weight_zp=[],
                 )
-                return torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+                return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
                     torch_act_fn(up_out),
                     w2_weight[i],
                     bias=None,
@@ -871,13 +871,13 @@ def torch_quant_hf_fp8_moe(
 
             return mlp
 
-        mlps = [make_hf_fp8_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_finegrained_fp8_mlp(i) for i in range(len(w1_weight))]
 
     return _template_moe(x, selected_experts, routing_weights, mlps)
 
 
-@torch_quant_hf_fp8_moe.register_fake
-def torch_quant_hf_fp8_moe_fake(
+@torch_quant_finegrained_fp8_moe.register_fake
+def torch_quant_finegrained_fp8_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,

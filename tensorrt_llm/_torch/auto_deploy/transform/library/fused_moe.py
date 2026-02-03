@@ -2049,11 +2049,11 @@ class FuseNVFP4Moe(BaseTransform):
         return gm, info
 
 
-def _stack_hf_fp8_moe_weights(gm: GraphModule) -> int:
+def _stack_finegrained_fp8_moe_weights(gm: GraphModule) -> int:
     """
-    Stack per-expert HF FP8 block-scale weights and scales for the fused MoE kernel.
+    Stack per-expert FineGrained FP8 block-scale weights and scales for the fused MoE kernel.
 
-    HuggingFace FineGrainedFP8 uses:
+    FineGrainedFP8 uses:
     - FP8 weights with per-block scales (128x128 blocks)
     - Dynamic activation quantization at runtime (no pre-computed activation scales)
     """
@@ -2099,8 +2099,8 @@ def _stack_hf_fp8_moe_weights(gm: GraphModule) -> int:
     fused_key_counter = 0
     graph = gm.graph
 
-    replacement_op = torch.ops.auto_deploy.trtllm_quant_hf_fp8_block_scale_moe_fused
-    replaced_op = torch.ops.auto_deploy.torch_quant_hf_fp8_moe
+    replacement_op = torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused
+    replaced_op = torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe
 
     matched_nodes = [node for node in graph.nodes if is_op(node, replaced_op)]
     for node in matched_nodes:
@@ -2142,10 +2142,10 @@ def _stack_hf_fp8_moe_weights(gm: GraphModule) -> int:
         fc2_weight_scale = w2_scale_stacked
 
         # Register stacked tensors as new parameters
-        new_key_fc1_weights = f"hf_fp8_moe_fc1_stacked_{fused_key_counter}"
-        new_key_fc2_weights = f"hf_fp8_moe_fc2_stacked_{fused_key_counter}"
-        new_key_fc1_scale = f"hf_fp8_moe_fc1_scale_stacked_{fused_key_counter}"
-        new_key_fc2_scale = f"hf_fp8_moe_fc2_scale_stacked_{fused_key_counter}"
+        new_key_fc1_weights = f"finegrained_fp8_moe_fc1_stacked_{fused_key_counter}"
+        new_key_fc2_weights = f"finegrained_fp8_moe_fc2_stacked_{fused_key_counter}"
+        new_key_fc1_scale = f"finegrained_fp8_moe_fc1_scale_stacked_{fused_key_counter}"
+        new_key_fc2_scale = f"finegrained_fp8_moe_fc2_scale_stacked_{fused_key_counter}"
 
         _register_parameter(gm, new_key_fc1_weights, fc1_expert_weights)
         _register_parameter(gm, new_key_fc2_weights, fc2_expert_weights)
@@ -2183,13 +2183,13 @@ def _stack_hf_fp8_moe_weights(gm: GraphModule) -> int:
     return fused_key_counter
 
 
-@TransformRegistry.register("fuse_hf_fp8_moe")
-class FuseHFFP8Moe(BaseTransform):
+@TransformRegistry.register("fuse_finegrained_fp8_moe")
+class FuseFineGrainedFP8Moe(BaseTransform):
     """
-    Stack per-expert HuggingFace FineGrainedFP8 MoE weights and block scales.
+    Stack per-expert FineGrainedFP8 MoE weights and block scales.
 
-    This transform replaces torch_quant_hf_fp8_moe ops with the fused
-    trtllm_quant_hf_fp8_block_scale_moe_fused kernel which is cudagraph-compatible.
+    This transform replaces torch_quant_finegrained_fp8_moe ops with the fused
+    trtllm_quant_finegrained_fp8_moe_fused kernel which is cudagraph-compatible.
     """
 
     def _apply(
@@ -2200,7 +2200,7 @@ class FuseHFFP8Moe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _stack_hf_fp8_moe_weights(gm)
+            fused_key_counter = _stack_finegrained_fp8_moe_weights(gm)
 
         info = TransformInfo(
             skipped=(fused_key_counter == 0),

@@ -257,13 +257,13 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
         return gm, info
 
 
-@TransformRegistry.register("quantize_hf_fp8_moe")
-class QuantizeHFFP8MOE(Quantization):
+@TransformRegistry.register("quantize_finegrained_fp8_moe")
+class QuantizeFineGrainedFP8MOE(Quantization):
     """
     Traverse gm, find every torch.ops.auto_deploy.torch_moe, and replace it with the
-    HuggingFace FineGrainedFP8 quantized version.
+    FineGrainedFP8 quantized version.
 
-    This transform handles HF FP8 quantization config format:
+    This transform handles FineGrained FP8 quantization config format:
         "quantization_config": {
             "quant_method": "fp8",
             "weight_block_size": [128, 128],
@@ -274,7 +274,7 @@ class QuantizeHFFP8MOE(Quantization):
     algo_name = "fp8"
 
     def target_op(self):
-        return torch.ops.auto_deploy.torch_quant_hf_fp8_moe
+        return torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe
 
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
@@ -283,7 +283,7 @@ class QuantizeHFFP8MOE(Quantization):
         return ["weight_scale_inv"]
 
     def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
-        # Default block size is 128x128 for HF FP8
+        # Default block size is 128x128 for FineGrained FP8
         N, K = original_weight_shape
         block_n, block_k = 128, 128
         scale_shape = (N // block_n, K // block_k)

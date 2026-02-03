@@ -746,12 +746,12 @@ class INT4GPTQLinearQuantizationFromConfig(Quantization):
         del state_dict[qweight_ckpt]
 
 
-@TransformRegistry.register("quantize_hf_fp8_linear_from_config")
-class HFFineGrainedFP8LinearQuantization(Quantization):
-    """Quantization transform for HuggingFace FineGrainedFP8 (block-wise FP8) models.
+@TransformRegistry.register("quantize_finegrained_fp8_linear_from_config")
+class FineGrainedFP8LinearQuantization(Quantization):
+    """Quantization transform for FineGrainedFP8 (block-wise FP8) models.
 
-    This transform replaces linear ops with the HF FineGrainedFP8 quantized op.
-    The HF FP8 format uses per-block weight scales (weight_scale_inv) and
+    This transform replaces linear ops with the FineGrainedFP8 quantized op.
+    The FineGrained FP8 format uses per-block weight scales (weight_scale_inv) and
     dynamic input quantization.
 
     Config format (from HF config.json):
@@ -765,7 +765,7 @@ class HFFineGrainedFP8LinearQuantization(Quantization):
     algo_name = "fp8"
 
     def target_op(self):
-        return torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear.default
+        return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default
 
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
@@ -774,7 +774,7 @@ class HFFineGrainedFP8LinearQuantization(Quantization):
         return ["weight_scale_inv"]
 
     def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
-        # Default block size is 128x128 for HF FP8
+        # Default block size is 128x128 for FineGrained FP8
         N, K = original_weight_shape
         block_n, block_k = 128, 128
         scale_shape = (N // block_n, K // block_k)
@@ -784,9 +784,9 @@ class HFFineGrainedFP8LinearQuantization(Quantization):
         return ([], [scales["weight_scale_inv"]], [], [])
 
     def load_hook(self, state_dict, prefix, *args, weight_name: str):
-        """Load hook to handle HF FineGrainedFP8 checkpoint format.
+        """Load hook to handle FineGrainedFP8 checkpoint format.
 
-        HF FP8 checkpoints store:
+        FineGrained FP8 checkpoints store:
         - weight: float8_e4m3fn tensor
         - weight_scale_inv: per-block scale tensor
         """
