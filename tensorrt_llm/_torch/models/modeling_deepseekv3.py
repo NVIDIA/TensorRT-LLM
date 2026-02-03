@@ -1206,7 +1206,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.model_config.moe_backend == "TRTLLM"
                  and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
-        do_finalize = True
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
                                  do_finalize=do_finalize)
