@@ -13,8 +13,9 @@ from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
-# Assuming these imports exist in your environment
-from .llm_request import LlmRequest, LlmRequestState
+from .llm_request import (LlmRequest, LlmRequestState,
+                          executor_request_to_llm_request)
+from .request_utils import merge_requests
 
 RequestList = list[LlmRequest]
 
@@ -1585,41 +1586,43 @@ class SimpleUnifiedScheduler(RequestScheduler):
     def activate_new_requests(
         self,
         active_requests: RequestList,
-        waiting_queue: Optional[deque] = None,
+        waiting_queue: Optional[deque],
+        cp_config: dict,
+        cp_rank: int,
+        cp_size: int,
+        exclude_last_generation_logits: bool,
     ) -> tuple[RequestList, int]:
         """
         Activate new requests from waiting queue.
 
         For attention_dp mode, uses global coordination to assign requests across ranks.
-        For regular TP mode, returns active_requests unchanged (activation happens in executor).
+        For regular TP mode, returns empty list (activation happens in executor).
 
         Args:
             active_requests: Currently active requests
-            waiting_queue: Optional queue of waiting requests
+            waiting_queue: Queue of waiting RequestQueueItems
+            cp_config: CP configuration dict
+            cp_rank: Current CP rank
+            cp_size: Total number of CP ranks
+            exclude_last_generation_logits: Whether to exclude last generation logits
 
         Returns:
-            Tuple of (updated_active_requests, expected_num_active_requests)
-            - updated_active_requests: Updated list of active requests (may be same as input for TP mode)
+            Tuple of (new_llm_requests, expected_num_active_requests)
+            - new_llm_requests: List of newly activated LlmRequests (empty for TP mode)
             - expected_num_active_requests: Maximum number of active requests across all ranks
         """
         # Check if we need global coordination
         if not self.enable_global_scheduling or waiting_queue is None or len(
                 waiting_queue) == 0:
             # TP mode: No activation here (executor handles it)
-            return active_requests, len(active_requests)
-
-        # Calculate how many new candidates we can accept
-        total_capacity = self.dist.tp_size * self.max_num_active_requests
-        num_new_candidates = max(
-            0, min(total_capacity - len(active_requests), len(waiting_queue)))
-
-        if num_new_candidates == 0:
-            return active_requests, len(active_requests)
+            return [], len(active_requests)
 
         # Attention DP mode: Use global coordination to assign requests
-        return self._activate_with_global_coordination(active_requests,
-                                                       waiting_queue,
-                                                       num_new_candidates)
+        # Note: _activate_with_global_coordination will gather states first,
+        # then calculate num_new_candidates based on total active requests across all ranks
+        return self._activate_with_global_coordination(
+            active_requests, waiting_queue, cp_config, cp_rank, cp_size,
+            exclude_last_generation_logits)
 
     def schedule_request(
         self,
@@ -1669,7 +1672,10 @@ class SimpleUnifiedScheduler(RequestScheduler):
         self,
         active_requests: RequestList,
         waiting_queue: deque,
-        num_new_candidates: int,
+        cp_config: dict,
+        cp_rank: int,
+        cp_size: int,
+        exclude_last_generation_logits: bool,
     ) -> tuple[RequestList, int]:
         """
         Activate new requests using global coordination (attention_dp).
@@ -1679,19 +1685,47 @@ class SimpleUnifiedScheduler(RequestScheduler):
 
         Args:
             active_requests: Currently active requests
-            waiting_queue: Queue of waiting requests
-            num_new_candidates: Number of candidates to consider
+            waiting_queue: Queue of waiting RequestQueueItems
+            cp_config: CP configuration dict
+            cp_rank: Current CP rank
+            cp_size: Total number of CP ranks
+            exclude_last_generation_logits: Whether to exclude last generation logits
 
         Returns:
-            Tuple of (updated_active_requests, expected_num_active_requests)
+            Tuple of (new_llm_requests, expected_num_active_requests)
         """
+        # === PHASE 1: GATHER ===
+        # Gather states first to know total active requests across all ranks
+        local_state = self._build_local_state(active_requests)
+        all_rank_states = self._gather_all_states(local_state)
+
+        # Calculate total active requests across all ranks
+        total_num_active_requests = sum(state.current_batch_size
+                                        for state in all_rank_states)
+
+        # Calculate how many new candidates we can accept
+        total_capacity = self.dist.tp_size * self.max_num_active_requests
+        num_new_candidates = max(
+            0,
+            min(total_capacity - total_num_active_requests, len(waiting_queue)))
+
+        if num_new_candidates == 0:
+            # No capacity for new requests
+            expected_num_active_requests = max(state.current_batch_size
+                                               for state in all_rank_states)
+            return [], expected_num_active_requests
+
         # Extract candidate requests
         candidate_requests = list(
             itertools.islice(waiting_queue, num_new_candidates))
 
-        # === PHASE 1: GATHER ===
-        local_state = self._build_local_state(active_requests)
-        all_rank_states = self._gather_all_states(local_state)
+        # Populate llm_request for simulation (simple conversion, no CP partitioning)
+        for req_item in candidate_requests:
+            if not hasattr(req_item,
+                           'llm_request') or req_item.llm_request is None:
+                req_item.llm_request = executor_request_to_llm_request(
+                    req_item.id, req_item.request, req_item.child_req_ids,
+                    exclude_last_generation_logits)
 
         # === PHASE 2: SIMULATE ===
         assignments = self._simulate_global_schedule(candidate_requests,
@@ -1708,17 +1742,15 @@ class SimpleUnifiedScheduler(RequestScheduler):
             len(assignments[rank_id])
             for rank_id in range(len(all_rank_states)))
 
-        # === PHASE 3: EXTRACT ASSIGNED REQUESTS ===
+        # === PHASE 3: EXTRACT ASSIGNED REQUEST QUEUE ITEMS ===
         my_assigned_req_ids = set(assignments[self.dist.rank])
-        new_requests = []
+        assigned_request_items = []
         remaining_queue = deque()
 
         for req_item in waiting_queue:
-            if hasattr(req_item, 'llm_request') and req_item.llm_request:
-                if req_item.llm_request.request_id in my_assigned_req_ids:
-                    new_requests.append(req_item.llm_request)
-                else:
-                    remaining_queue.append(req_item)
+            if (hasattr(req_item, 'llm_request') and req_item.llm_request
+                    and req_item.llm_request.request_id in my_assigned_req_ids):
+                assigned_request_items.append(req_item)
             else:
                 remaining_queue.append(req_item)
 
@@ -1726,8 +1758,16 @@ class SimpleUnifiedScheduler(RequestScheduler):
         waiting_queue.clear()
         waiting_queue.extend(remaining_queue)
 
-        # Return updated active requests and expected count
-        return active_requests + new_requests, expected_num_active_requests
+        # === PHASE 4: CONVERT TO LLM REQUESTS WITH CP PARTITIONING ===
+        new_llm_requests = merge_requests(
+            assigned_request_items,
+            cp_config=cp_config,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            exclude_last_generation_logits=exclude_last_generation_logits)
+
+        # Return new LlmRequests and expected count
+        return new_llm_requests, expected_num_active_requests
 
     # ==================================================================================
     # Global Scheduling Methods for attention_dp
@@ -1955,8 +1995,8 @@ class SimpleUnifiedScheduler(RequestScheduler):
                     item.llm_request, 'py_scheduling_params', None) and getattr(
                         item.llm_request.py_scheduling_params,
                         'attention_dp_relax', False)) or False,
-                # Secondary sort by request_id for determinism
-                item.request_id,
+                # Secondary sort by id for determinism (RequestQueueItem.id)
+                item.id,
             ))
 
         # Water-filling algorithm

@@ -1528,14 +1528,48 @@ class PyExecutor:
         """
         if isinstance(self.scheduler, SimpleUnifiedScheduler):
             # SimpleUnifiedScheduler: Fetch + explicit activation
-            self._fetch_and_enqueue_requests(self.waiting_queue)
+            # Use expected_num_active_requests for timeout calculation
+            # (initialized to 0, then updated after each activation)
+            self._fetch_and_enqueue_requests(self.waiting_queue,
+                                             self.expected_num_active_requests)
             old_active_count = len(self.active_requests)
 
             # Activate requests and get expected count (no extra communication needed)
-            self.active_requests, self.expected_num_active_requests = \
-                self.scheduler.activate_new_requests(self.active_requests, self.waiting_queue)
+            # Note: Scheduler handles RequestQueueItem → LlmRequest conversion internally
+            new_llm_requests, self.expected_num_active_requests = \
+                self.scheduler.activate_new_requests(
+                    self.active_requests,
+                    self.waiting_queue,
+                    self.dist.cp_config,
+                    self.dist.cp_rank,
+                    self.dist.cp_size,
+                    self._should_exclude_last_generation_logits()
+                )
 
-            return len(self.active_requests) - old_active_count
+            # Merge new requests with existing active requests
+            updated_active_requests = self.active_requests + new_llm_requests
+
+            # Validate newly activated requests (those added after old_active_count)
+            newly_activated = updated_active_requests[old_active_count:]
+
+            def _respond_if_invalid(request: LlmRequest) -> bool:
+                """Immediately fail invalid request. Return True if invalid."""
+                try:
+                    self._validate_request(request)
+                    return False
+                except Exception as e:
+                    self._handle_errors(str(e), requests=[request])
+                    return True
+
+            validated_new_requests = [
+                request for request in newly_activated
+                if not _respond_if_invalid(request)
+            ]
+
+            # Rebuild active_requests with old requests + validated new requests
+            self.active_requests = updated_active_requests[:old_active_count] + validated_new_requests
+
+            return len(validated_new_requests)
         else:
             # SimpleScheduler: Fetch and activate together
             new_requests = self._fetch_and_activate_new_requests()
