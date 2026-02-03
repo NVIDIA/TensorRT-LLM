@@ -17,6 +17,15 @@ global_kvcache_config = KvCacheConfig(
     enable_block_reuse=True,
 )
 
+global_kvcache_config_prompt_logprobs = KvCacheConfig(
+    max_tokens=10000,
+    # block reuse is disabled for prompt logprobs
+    # because prompt logprobs are computed from context logits
+    # and context logits may not be calculated when using block reuse
+    # See https://nvbugs/5577178
+    enable_block_reuse=False,
+)
+
 
 @pytest.fixture(scope="module", params=[False, True])
 def gather_generation_logits_fixture(request) -> bool:
@@ -108,6 +117,7 @@ def simple_llm(request) -> LLM:
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         max_batch_size=8,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
+        kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
     return llm
 
@@ -274,6 +284,85 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str, s
 
         assert len(logprobs) == sampling_params.max_tokens, (
             f"Expected {sampling_params.max_tokens} logprob entries, got {len(logprobs)}"
+        )
+
+        for token_idx, (sampled_token_id, token_logprobs) in enumerate(zip(token_ids, logprobs)):
+            print(
+                f"\n  Token {token_idx}: "
+                f"ID={sampled_token_id}, "
+                f"Text={simple_llm.tokenizer.decode([sampled_token_id])!r}"
+            )
+
+            assert sampled_token_id in token_logprobs, (
+                f"Token {token_idx}: Sampled token ID {sampled_token_id} not in logprobs dict: {token_logprobs.keys()}"
+            )
+
+            if logprobs_k == 0:
+                assert len(token_logprobs) == 1, (
+                    f"Token {token_idx}: Expected 1 logprob (sampled only), got {len(token_logprobs)}"
+                )
+            else:
+                assert len(token_logprobs) <= logprobs_k + 1, (
+                    f"Token {token_idx}: Expected at most {logprobs_k + 1} logprobs, got {len(token_logprobs)}"
+                )
+                assert len(token_logprobs) >= 1
+
+            sorted_tokens_by_prob = sorted(
+                token_logprobs.items(), key=lambda x: x[1].logprob, reverse=True
+            )
+
+            if logprobs_k > 0:
+                sampled_token_rank = token_logprobs[sampled_token_id].rank
+                sampled_in_topk = sampled_token_rank <= logprobs_k
+
+                if not sampled_in_topk:
+                    assert sorted_tokens_by_prob[-1][0] == sampled_token_id, (
+                        f"Token {token_idx}: Sampled token (ID={sampled_token_id}, rank={sampled_token_rank}) "
+                        f"not in top-{logprobs_k}, should be last in sorted list, "
+                        f"but last token is ID={sorted_tokens_by_prob[-1][0]}"
+                    )
+
+            for rank_idx, (token_id, logprob_obj) in enumerate(sorted_tokens_by_prob, start=1):
+                token_text = simple_llm.tokenizer.decode([token_id])
+                is_sampled = "← SAMPLED" if token_id == sampled_token_id else ""
+                print(
+                    f"    • Token {token_id:5d} ({token_text:15s}): "
+                    f"logprob={logprob_obj.logprob:8.4f}, "
+                    f"rank={logprob_obj.rank} {is_sampled}"
+                )
+
+                if logprobs_k > 0 and sampled_in_topk:
+                    assert logprob_obj.rank == rank_idx, (
+                        f"Token {token_idx}: Token {token_id} rank mismatch. "
+                        f"Expected rank {rank_idx} (by sorted position), got {logprob_obj.rank}"
+                    )
+
+        print(f"{'=' * 80}\n")
+
+
+@pytest.mark.parametrize("logprobs_k", [0, 1, 3], ids=["top_0", "top_1", "top_3"])
+@pytest.mark.threadleak(enabled=False)
+def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LLM):
+    """Two scenarios:
+    - logprobs=0: Returns only sampled token (1 element)
+    - logprobs=K (K>0): Returns top-K tokens + sampled token if not in top-K (up to K+1 elements)
+    """
+
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        prompt_logprobs=logprobs_k,
+    )
+
+    for output in simple_llm.generate(["The future of AI is"], sampling_params=sampling_params):
+        print(f"\n{'=' * 80}")
+        print(f"Prompt text: {output.prompt!r}")
+        print(f"Prompt token IDs: {output.prompt_token_ids}")
+
+        logprobs = output.outputs[0].prompt_logprobs
+        token_ids = output.prompt_token_ids
+
+        assert len(logprobs) == len(token_ids), (
+            f"Expected {len(token_ids)} logprob entries, got {len(logprobs)}"
         )
 
         for token_idx, (sampled_token_id, token_logprobs) in enumerate(zip(token_ids, logprobs)):

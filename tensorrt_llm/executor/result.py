@@ -918,6 +918,7 @@ def compute_logprobs(
     context_logits: Optional[torch.Tensor],
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
+    prompt_token_ids: Optional[list[int]] = None,
 ) -> LogProbsResult:
     """
     Compute top-K logprobs from logits when engine doesn't provide them directly.
@@ -984,8 +985,8 @@ def compute_logprobs(
         return results
 
     prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs,
-        None) if k_prompt_logprobs and context_logits is not None else None
+        context_logits, k_prompt_logprobs, prompt_token_ids
+    ) if k_prompt_logprobs is not None and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
     ) if k_logprobs is not None and generation_logits is not None else None

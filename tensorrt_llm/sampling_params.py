@@ -352,7 +352,6 @@ class SamplingParams:
             self.logprobs = None
         if self.logprobs is True:
             self.logprobs = 0
-        self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
     # NB: Static, because downstream code only holds instances of
     #     bindings.SamplingConfig (not SamplingParams).
@@ -516,7 +515,7 @@ class SamplingParams:
 
         if is_pytorch_backend:
             config_kwargs["return_log_probs"] = self.logprobs is not None
-            if self.prompt_logprobs and not self.return_context_logits:
+            if self.prompt_logprobs is not None and not self.return_context_logits:
                 logger.info(
                     "Since prompt_logprobs is requested but return_context_logits is False, "
                     "internally enabling context logits for prompt logprobs computation. "
