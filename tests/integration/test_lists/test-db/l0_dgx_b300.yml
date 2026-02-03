@@ -17,7 +17,23 @@ l0_dgx_b300:
   tests:
   - unittest/_torch/attention
   - unittest/_torch/executor
-  - unittest/_torch/modules
+  # ------------- modules (non-MoE) ---------------
+  - unittest/_torch/modules/test_mla_helix.py
+  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
+  - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/test_awq_quantization.py
+  - unittest/_torch/modules/test_triton_linear.py
+  - unittest/_torch/modules/test_group_rmn_norm.py
+  - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/mamba
+  - unittest/_torch/modules/tests_lora_modules
+  # ------------- MoE components tests ---------------
+  - unittest/_torch/modules/test_moe_load_balancer.py
+  - unittest/_torch/modules/test_moe_routing.py
+  - unittest/_torch/modules/test_moe_host_sharer.py
+  # ------------- legacy MoE tests ---------------
+  - unittest/_torch/modules/test_fused_moe.py
+  # ---- end MoE tests ----
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
