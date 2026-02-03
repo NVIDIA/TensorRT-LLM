@@ -41,6 +41,7 @@ from .modeling_utils import ModelConfig, register_auto_model, register_vision_en
             "video": "<|vision_start|><|video_pad|><|vision_end|>",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        placeholders_separator="",
     ),
 )
 class Qwen3MoeVLModel(Qwen3VLModelBase):
