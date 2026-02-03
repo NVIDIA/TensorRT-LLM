@@ -315,12 +315,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
-        BlockwiseGemmKernel
+        Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
-    class CuteDSLNVFP4BlackwellLinear(TunableRunner):
+    class CuteDSLNVFP4BlackwellRunner(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
         tuning_config = TuningConfig(
@@ -592,7 +592,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 stream = cuda.CUstream(torch_stream.cuda_stream)
 
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                         use_prefetch)
+                         use_prefetch, self.use_tvm_ffi)
             if swap_ab:
                 kernel_m = n
                 kernel_n = m
@@ -772,7 +772,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLNVFP4BlackwellLinear(output_dtype, to_userbuffers,
+        runner = CuteDSLNVFP4BlackwellRunner(output_dtype, to_userbuffers,
                                              use_tvm_ffi)
         inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
@@ -2164,8 +2164,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    device=input_scale.device)
         return output, output_scale
 
-    class CuteDSLFp8BlackwellLinear(TunableRunner):
-        kernel_class = BlockwiseGemmKernel
+    class CuteDSLFp8BlackwellRunner(TunableRunner):
+        kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
         tuning_config = TuningConfig(
@@ -2175,8 +2175,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             constraint_specs=(ConstraintSpec(2, 1, fp8_scale_infer_shape), ),
         )
 
-        def __init__(self):
+        def __init__(self,
+                     output_dtype: torch.dtype = torch.bfloat16,
+                     use_tvm_ffi: bool = True):
             super().__init__()
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
+                )
+            self.output_dtype = output_dtype
+            self.use_tvm_ffi = use_tvm_ffi
 
         def get_valid_tactics(
             self,
@@ -2438,7 +2446,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
         tuner = AutoTuner.get()
 
-        runner = CuteDSLFP8BlackwellLinear(output_dtype=output_dtype,
+        runner = CuteDSLFp8BlackwellRunner(output_dtype=output_dtype,
                                            use_tvm_ffi=use_tvm_ffi)
 
         inputs = [input, weight, input_scale, weight_scale]
@@ -2467,8 +2475,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
-    class CuteDSLFp8BlackwellBmm(TunableRunner):
-        kernel_class = BlockwiseGemmKernel
+    class CuteDSLFp8BlackwellBmmRunner(TunableRunner):
+        kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
         tuning_config = TuningConfig(
@@ -2624,6 +2632,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_2cta_instrs,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                self.use_tvm_ffi,
             )
             if cache_key not in self.__class__.kernel_cache:
                 if self.use_tvm_ffi:
@@ -2752,8 +2761,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLFP8BlackwellBmm(output_dtype=output_dtype,
-                                        use_tvm_ffi=use_tvm_ffi)
+        runner = CuteDSLFp8BlackwellBmmRunner(output_dtype=output_dtype,
+                                              use_tvm_ffi=use_tvm_ffi)
 
         inputs = [input, weight, input_scale, weight_scale, output]
 

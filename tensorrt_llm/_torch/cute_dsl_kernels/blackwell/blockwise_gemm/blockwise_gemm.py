@@ -110,7 +110,7 @@ To collect performance with NCU profiler:
 
 Constraints are same as dense_gemm.py:
 * Supported input data types: fp8 (e4m3fn)
-  see detailed valid dtype combinations in below BlockwiseGemmKernel class documentation
+  see detailed valid dtype combinations in below Sm100BlockwiseGemmKernel class documentation
 * A/B tensor must have the same data type
 * Mma tiler M must be 64/128/256
 * Mma tiler N must be 128, align with the scaleB requirement
@@ -120,7 +120,7 @@ Constraints are same as dense_gemm.py:
 """
 
 
-class BlockwiseGemmKernel:
+class Sm100BlockwiseGemmKernel:
     """This class implements batched matrix multiplication (C = (SFA * A) * (SFB * B)) with support for fp8 (e4m3fn,
     e5m2) and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
 
@@ -150,7 +150,7 @@ class BlockwiseGemmKernel:
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 
     Example:
-        >>> gemm = BlockwiseGemmKernel(
+        >>> gemm = Sm100BlockwiseGemmKernel(
         ...     acc_dtype=cutlass.Float32,
         ...     use_2cta_instrs=True,
         ...     mma_tiler_mn=(128, 128),
@@ -2469,15 +2469,15 @@ class BlockwiseGemmKernel:
         """
         can_implement = True
         # Skip unsupported types
-        if not BlockwiseGemmKernel.is_valid_dtypes(ab_dtype, acc_dtype, c_dtype):
+        if not Sm100BlockwiseGemmKernel.is_valid_dtypes(ab_dtype, acc_dtype, c_dtype):
             can_implement = False
         # Skip invalid mma tile shape and cluster shape
-        if not BlockwiseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
+        if not Sm100BlockwiseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not BlockwiseGemmKernel.is_valid_tensor_alignment(
+        if not Sm100BlockwiseGemmKernel.is_valid_tensor_alignment(
             m, n, k, batch_size, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
             can_implement = False

@@ -25,7 +25,7 @@ from ..utils import (ActivationType, fp4_scale_infer_shape,
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellLinear
+        CuteDSLNVFP4BlackwellRunner
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -819,7 +819,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                             "Please add other backends to allowed_backends.")
                 else:
                     # SM version OK, check if CuteDSL supports the current shape
-                    cutedsl_runner = CuteDSLNVFP4BlackwellLinear(
+                    cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
                         self.output_dtype)
                     cutedsl_tactics = cutedsl_runner.get_valid_tactics(
                         inputs, profile)
@@ -878,7 +878,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                          self.output_dtype)(inputs,
                                                             tactic=sub_tactic)
         elif backend == "cutedsl":
-            return CuteDSLNVFP4BlackwellLinear(
+            return CuteDSLNVFP4BlackwellRunner(
                 self.output_dtype, self.to_userbuffers)(inputs,
                                                         tactic=sub_tactic)
         else:

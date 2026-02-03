@@ -143,11 +143,11 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 
     with autotune():
         cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-            a, act_b_fp8, act_b_sf, use_tvm_ffi=use_tvm_ffi)
+            act_a_fp8, act_b_fp8, act_a_sf, act_b_sf, use_tvm_ffi=use_tvm_ffi)
 
     # test Cute DSL kernel
     cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-        a, act_b_fp8, act_b_sf, use_tvm_ffi=use_tvm_ffi)
+        act_a_fp8, act_b_fp8, act_a_sf, act_b_sf, use_tvm_ffi=use_tvm_ffi)
 
     diff = calc_diff(cute_dsl_output, output_expected)
     assert diff < 1e-3
