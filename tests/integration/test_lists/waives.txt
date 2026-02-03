@@ -321,7 +321,6 @@ unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP] S
 unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_cuda_graph_overlap_scheduler SKIP (https://nvbugs/5843316)
 examples/test_mistral.py::test_mistral_with_bf16_lora_torch[mistral-7b-v0.1] SKIP (https://nvbugs/5846178)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[latency] SKIP (https://nvbugs/5846024)
-accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/5847284)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-trtllm-fp8] SKIP (https://nvbugs/5850183)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-trtllm-fp8] SKIP (https://nvbugs/5850183)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_autotune_fp8_fp4[RoutingDSlite-384-1024-1] SKIP (https://nvbugs/5859881)
