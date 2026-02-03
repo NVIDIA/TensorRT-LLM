@@ -15,6 +15,7 @@ from tensorrt_llm.bench.build.dataclasses import NemotronHybridConfig
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 _KV_CACHE_MAP = {
@@ -98,7 +99,11 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     mapping = {
         "pp_size": params.get("pp"),
         "tp_size": params.get("tp"),
-        "world_size": params.get("pp") * params.get("tp"),
+        "cp_size": params.get("cp"),
+        "cp_config": {
+            "cp_type": CpType[params.get("cp_type")]
+        } if params.get("cp", 0) > 1 else {},
+        "world_size": params.get("pp") * params.get("tp") * params.get("cp"),
         "moe_ep_size": params.get("ep"),
         "moe_cluster_size": params.get("cluster_size"),
         "gpus_per_node": params.get("gpus_per_node"),

@@ -27,7 +27,7 @@ The following abbreviated command syntax shows the commonly used arguments to st
 
 .. code-block:: bash
 
-   trtllm-serve <model> [--tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
+   trtllm-serve <model> [--tp_size <tp> --pp_size <pp> --ep_size <ep> --cp_size <cp> --host <host> --port <port>]
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
 
