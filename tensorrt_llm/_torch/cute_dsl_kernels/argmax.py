@@ -582,6 +582,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return True
         if N % _VOCAB_SIZE_ALIGNMENT != 0:
             return True
+        # Fall back on sm_120 - CUTLASS DSL JIT not well-supported for this setup
+        from ..._utils import get_sm_version
+
+        if get_sm_version() >= 120:
+            return True
         return False
 
     def argmax(x: torch.Tensor) -> torch.Tensor:
