@@ -7,35 +7,33 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
-from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
-from tensorrt_llm._torch.modules.fla.op import safe_exp
+from fla.ops.utils import prepare_chunk_indices
+from fla.ops.utils.op import safe_exp
 
 
 @triton.heuristics({
-    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     "USE_G": lambda args: args["g_cumsum"] is not None,
+    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in [32, 64, 128]
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "BT", "IS_VARLEN"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128] for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=["H", "K", "BT", "IS_VARLEN"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_scaled_dot_kkt_fwd_kernel(
     k,
-    beta,
     g_cumsum,
+    beta,
     A,
     cu_seqlens,
     chunk_indices,
     T,
     H: tl.constexpr,
-    Hg: tl.constexpr,
+    Hqk: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
@@ -61,9 +59,9 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
+            k + (bos * Hqk + i_h // (H // Hqk)) * K,
             (T, K),
-            (Hg * K, 1),
+            (Hqk * K, 1),
             (i_t * BT, i_k * BK),
             (BT, BK),
             (1, 0),
@@ -116,28 +114,23 @@ def chunk_scaled_dot_kkt_fwd(
         beta * K * K^T of shape `[B, T, H, BT]` where `BT` is the chunk size.
     """
 
-    B, T, Hg, K = k.shape
-
-    H = beta.shape[-1]
+    B, T, Hqk, K = k.shape
     BT = chunk_size
     chunk_indices = (prepare_chunk_indices(cu_seqlens, BT)
                      if cu_seqlens is not None else None)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    H = beta.shape[-1]
+
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
-        k=k,
-        beta=beta,
-        g_cumsum=g_cumsum,
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        BT=BT,
-        BK=64,
-        num_warps=8,
-        num_stages=3,
-    )
+    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](k=k,
+                                                 g_cumsum=g_cumsum,
+                                                 beta=beta,
+                                                 A=A,
+                                                 cu_seqlens=cu_seqlens,
+                                                 chunk_indices=chunk_indices,
+                                                 T=T,
+                                                 H=H,
+                                                 Hqk=Hqk,
+                                                 K=K,
+                                                 BT=BT)
     return A
