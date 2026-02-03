@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 
@@ -592,7 +592,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel, NemotronH
         super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
 
     @classmethod
-    def get_model_defaults(cls, llm_args: "BaseLlmArgs") -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Model-specific defaults for NemotronH.
 
         Disables block reuse due to SSM/hybrid architecture constraints.

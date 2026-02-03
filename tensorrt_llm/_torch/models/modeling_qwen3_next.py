@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -1256,7 +1256,7 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         self.preload_weight_modules = self.model.preload_weight_modules
 
     @classmethod
-    def get_model_defaults(cls, llm_args: 'BaseLlmArgs') -> dict:
+    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
         """Return model-specific LLM API defaults."""
         return {"kv_cache_config": {"enable_block_reuse": False}}
 
