@@ -8,11 +8,10 @@ FlashInfer MLA uses:
 - Prefill: BatchPrefillWithRaggedKVCacheWrapper with expanded K, V tensors
 - Decode: BatchMLAPagedAttentionWrapper with paged compressed KV cache
 
-FlashInfer MLA Cache Layout:
-    mla_cache: [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
+FlashInfer MLA Cache Layout (two separate caches):
+    ckv_cache: [num_pages, page_size, kv_lora_rank]
+    kpe_cache: [num_pages, page_size, qk_rope_head_dim]
     - No num_heads dimension (MLA-specific optimization)
-    - ckv portion: mla_cache[:, :, :kv_lora_rank] (zero-copy slice)
-    - kpe portion: mla_cache[:, :, kv_lora_rank:] (zero-copy slice)
 
 Reference: https://docs.flashinfer.ai/api/mla.html
 """
@@ -34,8 +33,8 @@ from ..attention_interface import (
     AttentionLayout,
     AttentionRegistry,
     Constant,
+    ContiguousPagedResourceHandler,
     MHACallable,
-    PagedResourceHandler,
     PrepareMetadataCallable,
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
@@ -441,8 +440,9 @@ def flashinfer_mla_with_cache(
     # Extra FlashInfer metadata
     flashinfer_batch_indices: torch.Tensor,
     flashinfer_positions: torch.Tensor,
-    # Paged cache (combined layout)
-    mla_cache: torch.Tensor,  # [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
+    # Paged caches (two separate caches)
+    ckv_cache: torch.Tensor,  # [num_pages, page_size, kv_lora_rank]
+    kpe_cache: torch.Tensor,  # [num_pages, page_size, qk_rope_head_dim]
     # Constants
     scale: Optional[float],
     kv_lora_rank: int,
@@ -453,10 +453,9 @@ def flashinfer_mla_with_cache(
     - Prefill: BatchPrefillWithRaggedKVCacheWrapper with expanded K, V tensors
     - Decode: BatchMLAPagedAttentionWrapper with paged compressed KV cache
 
-    FlashInfer MLA Cache Layout:
-        mla_cache: [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
-        - ckv portion: mla_cache[:, :, :kv_lora_rank] (zero-copy slice)
-        - kpe portion: mla_cache[:, :, kv_lora_rank:] (zero-copy slice)
+    FlashInfer MLA Cache Layout (two separate caches):
+        ckv_cache: [num_pages, page_size, kv_lora_rank]
+        kpe_cache: [num_pages, page_size, qk_rope_head_dim]
 
     Args:
         q_nope: Query non-positional component [B, S, N, qk_nope_head_dim]
@@ -465,7 +464,8 @@ def flashinfer_mla_with_cache(
         kpe: Key positional encoding [B, S, 1, qk_rope_head_dim]
         kv_b_proj_weight: Projection weight [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
         (metadata args): Standard paged attention metadata
-        mla_cache: Paged MLA cache with combined ckv and kpe
+        ckv_cache: Paged cache for compressed KV
+        kpe_cache: Paged cache for key positional encoding
         scale: Softmax scale factor
         kv_lora_rank: Rank of compressed KV
 
@@ -493,15 +493,7 @@ def flashinfer_mla_with_cache(
     if scale is None:
         scale = 1.0 / math.sqrt(qk_head_dim)
 
-    page_size = mla_cache.shape[1]
-
-    # Slice the combined cache into ckv and kpe portions (zero-copy views).
-    # NOTE: These slices are NON-CONTIGUOUS because they share the underlying storage
-    # with different stride patterns. FlashInfer's MLA decode kernel requires contiguous
-    # tensors, so we call .contiguous() when passing to wrapper.run() in the decode path.
-    # See the TODO comment in the decode section for performance improvement ideas.
-    ckv_cache = mla_cache[:, :, :kv_lora_rank]
-    kpe_cache = mla_cache[:, :, kv_lora_rank:]
+    page_size = ckv_cache.shape[1]
 
     # Flatten inputs to [total_tokens, ...] format
     bs = b * s
@@ -511,11 +503,12 @@ def flashinfer_mla_with_cache(
     kpe_flat = kpe.contiguous().view(bs, qk_rope_head_dim)
 
     # Convert cache dtype if needed
-    if mla_cache.dtype == torch.float8_e4m3fn:
+    if ckv_cache.dtype == torch.float8_e4m3fn:
         compressed_kv_flat = compressed_kv_flat.to(torch.float8_e4m3fn)
         kpe_flat = kpe_flat.to(torch.float8_e4m3fn)
 
     # Append to paged cache using FlashInfer's append function
+    # Note: caches are guaranteed contiguous by CachedSequenceInterface._create_kv_cache_manager
     flashinfer.page.append_paged_mla_kv_cache(
         compressed_kv_flat,
         kpe_flat,
@@ -651,21 +644,12 @@ def flashinfer_mla_with_cache(
 
         # Run attention in compressed space
         # y_decode_compressed: [num_decode, N, kv_lora_rank]
-        #
-        # IMPORTANT: ckv_cache and kpe_cache are non-contiguous slices of the combined
-        # mla_cache tensor (sliced on the last dimension). FlashInfer's MLA kernel does
-        # not correctly handle these non-contiguous stride patterns, causing incorrect
-        # memory access and wrong attention outputs.
-        #
-        # TODO(perf): The .contiguous() calls here copy the entire KV cache each decode
-        # step, which is expensive. A better solution would be to store ckv and kpe as
-        # separate contiguous tensors from the start, avoiding the copy. This requires
-        # changes to the cache allocation in FlashInferMLAAttention.get_cache_cls().
+        # Note: caches are guaranteed contiguous by CachedSequenceInterface._create_kv_cache_manager
         y_decode_compressed = wrapper_decode.run(
             q_nope_absorbed,
             q_pe_decode,
-            ckv_cache.contiguous(),
-            kpe_cache.contiguous(),
+            ckv_cache,
+            kpe_cache,
         )
 
         # Project output back from latent space to v_head_dim
@@ -699,7 +683,8 @@ def flashinfer_mla_with_cache_fake(
     seq_len_with_cache_host: torch.Tensor,
     flashinfer_batch_indices: torch.Tensor,
     flashinfer_positions: torch.Tensor,
-    mla_cache: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
 ) -> torch.Tensor:
@@ -723,11 +708,10 @@ class FlashInferMLAAttention(AttentionDescriptor):
     - Source op: torch_mla (same as torch_mla backend)
     - Cached op: flashinfer_mla_with_cache with paged cache
 
-    FlashInfer MLA Cache Layout:
-        mla_cache: [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
+    FlashInfer MLA Cache Layout (two separate caches):
+        ckv_cache: [num_pages, page_size, kv_lora_rank]
+        kpe_cache: [num_pages, page_size, qk_rope_head_dim]
         - No num_heads dimension (MLA-specific optimization)
-        - ckv portion: mla_cache[:, :, :kv_lora_rank] (zero-copy slice)
-        - kpe portion: mla_cache[:, :, kv_lora_rank:] (zero-copy slice)
 
     Reference: https://docs.flashinfer.ai/api/mla.html
     """
@@ -783,10 +767,9 @@ class FlashInferMLAAttention(AttentionDescriptor):
     ) -> ResourceHandlerDict:
         """Get cache initializers using FlashInfer MLA paged cache layout.
 
-        Creates a single paged cache with combined layout:
-        - mla_cache: [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
-        - ckv portion: mla_cache[:, :, :kv_lora_rank] (zero-copy slice)
-        - kpe portion: mla_cache[:, :, kv_lora_rank:] (zero-copy slice)
+        Creates two separate paged caches:
+        - ckv_cache: [num_pages, page_size, kv_lora_rank]
+        - kpe_cache: [num_pages, page_size, qk_rope_head_dim]
         """
         # Extract dimensions from source node args
         # torch_mla signature: q_nope, q_pe, compressed_kv, kpe, kv_b_proj_weight, ...
@@ -801,11 +784,14 @@ class FlashInferMLAAttention(AttentionDescriptor):
 
         cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype)
 
-        # FlashInfer MLA uses a single paged cache with no num_heads dimension
-        # Layout: [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
+        # FlashInfer MLA uses two separate paged caches with no num_heads dimension
         return {
-            "mla_cache": PagedResourceHandler(
-                kv_lora_rank + qk_rope_head_dim,
+            "ckv_cache": ContiguousPagedResourceHandler(
+                kv_lora_rank,
+                dtype=cache_dtype,
+            ),
+            "kpe_cache": ContiguousPagedResourceHandler(
+                qk_rope_head_dim,
                 dtype=cache_dtype,
             ),
         }

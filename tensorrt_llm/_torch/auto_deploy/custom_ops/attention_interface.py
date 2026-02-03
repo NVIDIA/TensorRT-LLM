@@ -1025,6 +1025,48 @@ class ManagedResourceHandler(ResourceHandler):
         raise NotImplementedError("Managed resources should not be allocated directly!")
 
 
+class ContiguousPagedResourceHandler(ResourceHandler):
+    """Handler for paged resources that require contiguous memory.
+
+    Unlike PagedResourceHandler which is managed by KVCacheManager (with potentially
+    non-contiguous interleaved memory), this handler allocates contiguous memory
+    separately. This is required for backends like FlashInfer MLA that need
+    contiguous cache tensors.
+
+    The allocation is deferred until after KVCacheManager is created, so we know
+    the actual number of pages to allocate.
+    """
+
+    def __init__(self, *token_shape: int, dtype: torch.dtype) -> None:
+        """Initialize the ContiguousPagedResourceHandler.
+
+        Args:
+            token_shape: The shape of the resource per token.
+            dtype: The dtype of the resource.
+        """
+        self.token_shape = token_shape
+        self.dtype = dtype
+
+    def allocate(self, sequence_info, num_pages: int, page_size: int) -> torch.Tensor:
+        """Allocate contiguous paged resource.
+
+        Args:
+            sequence_info: SequenceInfo with device information.
+            num_pages: Number of pages to allocate.
+            page_size: Number of tokens per page.
+
+        Returns:
+            Contiguous tensor of shape [num_pages, page_size, *token_shape].
+        """
+        return torch.empty(
+            num_pages,
+            page_size,
+            *self.token_shape,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+
 class PagedResourceHandler(ManagedResourceHandler):
     """An abstract interface to handle a paged resource.
 

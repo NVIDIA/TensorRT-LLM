@@ -14,6 +14,7 @@ from tensorrt_llm.mapping import Mapping
 from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ..custom_ops.attention_interface import (
+    ContiguousPagedResourceHandler,
     PagedResourceHandler,
     ResourceHandler,
     ResourceHandlerDict,
@@ -95,6 +96,7 @@ class CachedSequenceInterface:
         self._kv_cache_manager: Optional[Union[KVCacheManager, MambaHybridCacheManager]] = None
         # Ordered dicts tracking resource handlers by type
         self._paged_cache_order: ResourceHandlerDict = {}  # Paged resources (kv caches)
+        self._contiguous_paged_cache_order: ResourceHandlerDict = {}  # Contiguous paged resources
         self._state_resource_order: ResourceHandlerDict = {}  # State resources (ssm states)
 
     @property
@@ -322,6 +324,9 @@ class CachedSequenceInterface:
             if isinstance(handler, PagedResourceHandler):
                 self._paged_cache_order[name] = handler
                 self._caches[name] = None  # Will be set by _create_kv_cache_manager
+            elif isinstance(handler, ContiguousPagedResourceHandler):
+                self._contiguous_paged_cache_order[name] = handler
+                self._caches[name] = None  # Will be allocated after _create_kv_cache_manager
             elif isinstance(handler, StateResourceHandler):
                 self._state_resource_order[name] = handler
                 self._caches[name] = None  # Will be set by _create_kv_cache_manager
@@ -337,6 +342,13 @@ class CachedSequenceInterface:
             # instead of passing in an overwrite here.
             max_tokens_estimate = None
         self._create_kv_cache_manager(max_tokens=max_tokens_estimate)
+
+        # Allocate contiguous paged caches (after KVCacheManager so we know page count)
+        if self._contiguous_paged_cache_order:
+            num_pages = self._kv_cache_manager.blocks_in_primary_pool
+            page_size = self._kv_cache_manager.tokens_per_block
+            for name, handler in self._contiguous_paged_cache_order.items():
+                self._caches[name] = handler.allocate(self.info, num_pages, page_size)
 
         return len(self._caches)
 

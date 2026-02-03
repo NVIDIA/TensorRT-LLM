@@ -5,7 +5,7 @@ torch_backend_mla_with_cache reference implementation.
 
 Key features tested:
 - 5 tensor arguments: q_nope, q_pe, compressed_kv, kpe, kv_b_proj_weight
-- Paged cache: [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
+- Paged caches: ckv_cache [num_pages, page_size, kv_lora_rank] and kpe_cache [num_pages, page_size, qk_rope_head_dim]
 - Prefill: Expand compressed_kv, compute normal attention via BatchPrefillWithRaggedKVCacheWrapper
 - Decode: BatchMLAPagedAttentionWrapper with paged compressed KV cache
 
@@ -184,10 +184,9 @@ def _create_paged_cache_and_metadata(
     Returns:
         Dictionary with paged cache and metadata tensors
     """
-    # Paged MLA cache: [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
-    mla_cache = torch.zeros(
-        max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
-    )
+    # Paged MLA caches (two separate caches)
+    ckv_cache = torch.zeros(max_num_pages, page_size, kv_lora_rank, dtype=dtype, device=device)
+    kpe_cache = torch.zeros(max_num_pages, page_size, qk_rope_head_dim, dtype=dtype, device=device)
 
     # Compute total KV lengths (input_pos + seq_len for each sequence)
     kv_lengths = [pos + seq_len for pos, seq_len in zip(input_positions, seq_lengths)]
@@ -249,7 +248,8 @@ def _create_paged_cache_and_metadata(
         )
 
     return {
-        "mla_cache": mla_cache,
+        "ckv_cache": ckv_cache,
+        "kpe_cache": kpe_cache,
         "batch_info_host": batch_info_host,
         "cu_seqlen_host": qo_indptr_host,
         "cu_num_pages": cu_num_pages,
@@ -264,12 +264,14 @@ def _create_paged_cache_and_metadata(
 
 def _copy_unpaged_to_paged_cache(
     unpaged_cache: torch.Tensor,
-    paged_cache: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
     batch_size: int,
     tokens_per_seq: list,
     page_size: int,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
+    kv_lora_rank: int,
 ):
     """Copy unpaged cache data to paged cache format.
 
@@ -278,12 +280,14 @@ def _copy_unpaged_to_paged_cache(
 
     Args:
         unpaged_cache: Source cache [batch, max_seq, dim]
-        paged_cache: Destination paged cache [num_pages, page_size, dim]
+        ckv_cache: Destination paged ckv cache [num_pages, page_size, kv_lora_rank]
+        kpe_cache: Destination paged kpe cache [num_pages, page_size, qk_rope_head_dim]
         batch_size: Number of sequences
         tokens_per_seq: Number of tokens to copy per sequence
         page_size: Number of tokens per page
         cu_num_pages: Cumulative page counts from flashinfer metadata [batch_size + 1]
         cache_loc: Page indices from flashinfer metadata
+        kv_lora_rank: Rank of compressed KV (split dimension)
     """
     for batch_idx in range(batch_size):
         num_tokens = tokens_per_seq[batch_idx]
@@ -301,9 +305,10 @@ def _copy_unpaged_to_paged_cache(
             if tokens_to_copy <= 0:
                 break
 
-            paged_cache[page_num, :tokens_to_copy] = unpaged_cache[
-                batch_idx, token_offset : token_offset + tokens_to_copy
-            ]
+            # Split unpaged cache into ckv and kpe portions
+            unpaged_data = unpaged_cache[batch_idx, token_offset : token_offset + tokens_to_copy]
+            ckv_cache[page_num, :tokens_to_copy] = unpaged_data[:, :kv_lora_rank]
+            kpe_cache[page_num, :tokens_to_copy] = unpaged_data[:, kv_lora_rank:]
             token_offset += tokens_to_copy
 
 
@@ -431,7 +436,8 @@ def test_flashinfer_mla_op_context(seq_length, num_heads, batch_size, dtype, dev
         flashinfer_meta["seq_len_with_cache_host"],
         batch_indices,
         positions,
-        flashinfer_meta["mla_cache"],
+        flashinfer_meta["ckv_cache"],
+        flashinfer_meta["kpe_cache"],
         None,  # scale
         kv_lora_rank,
     )
@@ -540,12 +546,14 @@ def test_flashinfer_mla_op_decode(prefill_seq_length, num_heads, batch_size, dty
     if prefill_seq_length > 0:
         _copy_unpaged_to_paged_cache(
             torch_meta["mla_cache"],
-            flashinfer_meta["mla_cache"],
+            flashinfer_meta["ckv_cache"],
+            flashinfer_meta["kpe_cache"],
             batch_size,
             [prefill_seq_length] * batch_size,  # Number of tokens to copy
             page_size,
             flashinfer_meta["cu_num_pages"],
             flashinfer_meta["cache_loc"],
+            kv_lora_rank,
         )
 
     # =========================================================================
@@ -602,7 +610,8 @@ def test_flashinfer_mla_op_decode(prefill_seq_length, num_heads, batch_size, dty
         flashinfer_meta["seq_len_with_cache_host"],
         batch_indices,
         positions,
-        flashinfer_meta["mla_cache"],
+        flashinfer_meta["ckv_cache"],
+        flashinfer_meta["kpe_cache"],
         None,  # scale
         kv_lora_rank,
     )
@@ -746,7 +755,8 @@ def test_flashinfer_mla_context_and_generate(
         flashinfer_meta["seq_len_with_cache_host"],
         batch_indices,
         positions,
-        flashinfer_meta["mla_cache"],
+        flashinfer_meta["ckv_cache"],
+        flashinfer_meta["kpe_cache"],
         None,
         kv_lora_rank,
     )
@@ -810,8 +820,9 @@ def test_flashinfer_mla_context_and_generate(
         seq_lengths_gen,
         input_positions_gen,
     )
-    # Use the same cache
-    flashinfer_meta_gen["mla_cache"] = flashinfer_meta["mla_cache"]
+    # Use the same caches
+    flashinfer_meta_gen["ckv_cache"] = flashinfer_meta["ckv_cache"]
+    flashinfer_meta_gen["kpe_cache"] = flashinfer_meta["kpe_cache"]
 
     # Run torch backend generate
     torch_output_gen = torch.ops.auto_deploy.torch_cached_mla_with_cache(
@@ -862,7 +873,8 @@ def test_flashinfer_mla_context_and_generate(
         flashinfer_meta_gen["seq_len_with_cache_host"],
         batch_indices_gen,
         positions_gen,
-        flashinfer_meta_gen["mla_cache"],
+        flashinfer_meta_gen["ckv_cache"],
+        flashinfer_meta_gen["kpe_cache"],
         None,
         kv_lora_rank,
     )
@@ -994,7 +1006,8 @@ def test_flashinfer_mla_with_variable_seq_lengths(seq_lengths, num_heads, dtype,
         flashinfer_meta["seq_len_with_cache_host"],
         batch_indices,
         positions,
-        flashinfer_meta["mla_cache"],
+        flashinfer_meta["ckv_cache"],
+        flashinfer_meta["kpe_cache"],
         None,
         kv_lora_rank,
     )
@@ -1163,7 +1176,8 @@ def test_flashinfer_mla_variable_seq_multi_decode(
         flashinfer_meta["seq_len_with_cache_host"],
         batch_indices,
         positions,
-        flashinfer_meta["mla_cache"],
+        flashinfer_meta["ckv_cache"],
+        flashinfer_meta["kpe_cache"],
         None,
         kv_lora_rank,
     )
@@ -1227,8 +1241,9 @@ def test_flashinfer_mla_variable_seq_multi_decode(
             seq_lengths_decode,
             input_positions_decode,
         )
-        # Use the same cache
-        flashinfer_meta_decode["mla_cache"] = flashinfer_meta["mla_cache"]
+        # Use the same caches
+        flashinfer_meta_decode["ckv_cache"] = flashinfer_meta["ckv_cache"]
+        flashinfer_meta_decode["kpe_cache"] = flashinfer_meta["kpe_cache"]
 
         # Run torch backend decode
         torch_output_decode = torch.ops.auto_deploy.torch_cached_mla_with_cache(
@@ -1281,7 +1296,8 @@ def test_flashinfer_mla_variable_seq_multi_decode(
             flashinfer_meta_decode["seq_len_with_cache_host"],
             batch_indices_decode,
             positions_decode,
-            flashinfer_meta_decode["mla_cache"],
+            flashinfer_meta_decode["ckv_cache"],
+            flashinfer_meta_decode["kpe_cache"],
             None,
             kv_lora_rank,
         )
