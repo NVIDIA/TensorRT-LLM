@@ -3190,10 +3190,6 @@ def launchTestJobs(pipeline, testFilter)
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 4],
-        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 4],
-        "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 4],
-        "H100_PCIe-PyTorch-4": ["h100-cr", "l0_h100", 4, 4],
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-AutoDeploy-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
@@ -3235,8 +3231,6 @@ def launchTestJobs(pipeline, testFilter)
         // "L40S-TensorRT-Post-Merge-4": ["l40s", "l0_l40s", 4, 5],
         // "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
-        "H100_PCIe-PyTorch-Post-Merge-1": ["h100-cr", "l0_h100", 1, 2],
-        "H100_PCIe-PyTorch-Post-Merge-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-CPP-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         // "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
         // "H100_PCIe-TensorRT-Post-Merge-2": ["h100-cr", "l0_h100", 2, 5],
@@ -3281,6 +3275,12 @@ def launchTestJobs(pipeline, testFilter)
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
+        "DGX_H100_PCIe-PyTorch-1": ["dgx-h100-oci", "l0_h100", 1, 4],
+        "DGX_H100_PCIe-PyTorch-2": ["dgx-h100-oci", "l0_h100", 2, 4],
+        "DGX_H100_PCIe-PyTorch-3": ["dgx-h100-oci", "l0_h100", 3, 4],
+        "DGX_H100_PCIe-PyTorch-4": ["dgx-h100-oci", "l0_h100", 4, 4],
+        "DGX_H100_PCIe-PyTorch-Post-Merge-1": ["dgx-h100-oci", "l0_h100", 1, 2],
+        "DGX_H100_PCIe-PyTorch-Post-Merge-2": ["dgx-h100-oci", "l0_h100", 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-2": ["dgx-h100-x2-oci", "l0_dgx_h100", 2, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 1, 2],
