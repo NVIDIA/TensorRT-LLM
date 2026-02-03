@@ -249,13 +249,25 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             TLLM_CHECK(preAllocSendBuffer->getDataType() == inputKvCacheBlocks.at(0)->getDataType());
         }
+        // Connections are ordered CP-major (all connections for CP=0, then all for CP=1, etc.)
+        // from targetIRanks(). Within each CP domain, connections are ordered by (TP, PP).
+        // The bufferSizeForTarget is indexed as: cpDomainIdx * pPDomainSize + ppDomainIdx.
+        // So we need to compute cacheIdx based on the CP-major connection ordering.
+        auto connectionsPerCPDomain = connections.size() / cPDomainSize;
+        TLLM_CHECK_WITH_INFO(connectionsPerCPDomain > 0, "connectionsPerCPDomain must be > 0");
+
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
             NVTX3_SCOPED_RANGE(sendBufferFun);
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             auto startTime = LlmRequest::getSteadyClockNow();
-            auto cacheIdx = processIdx % (pPDomainSize * cPDomainSize);
+            // Compute cacheIdx based on CP-major connection ordering:
+            // - cpDomainIdx = which CP domain this connection belongs to.
+            // - ppDomainIdx = which PP domain within the CP domain (for PP > 1).
+            auto cpDomainIdx = processIdx / connectionsPerCPDomain;
+            auto ppDomainIdx = (processIdx % connectionsPerCPDomain) % pPDomainSize;
+            auto cacheIdx = cpDomainIdx * pPDomainSize + ppDomainIdx;
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
