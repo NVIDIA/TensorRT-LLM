@@ -1,3 +1,4 @@
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, Tuple, Union
 
@@ -12,19 +13,26 @@ class ConsumableWeightsDict:
     This reduces peak memory usage by deleting weight tensors from the dictionary
     after they have been copied to the model, rather than keeping all weights
     in memory until loading completes.
+
+    Thread-safe: uses a lock to protect concurrent access. Iteration methods
+    (keys, values, items, __iter__) return snapshot copies to allow safe
+    concurrent iteration while other threads may modify the dictionary.
     """
 
     def __init__(self, weights: Dict[str, Any]):
         self._weights = weights
+        self._lock = threading.Lock()
 
     def __getitem__(self, key: str) -> Any:
         return self._weights[key]
 
     def __setitem__(self, key: str, value: Any) -> None:
-        self._weights[key] = value
+        with self._lock:
+            self._weights[key] = value
 
     def __delitem__(self, key: str) -> None:
-        del self._weights[key]
+        with self._lock:
+            del self._weights[key]
 
     def __contains__(self, key: str) -> bool:
         return key in self._weights
@@ -33,22 +41,31 @@ class ConsumableWeightsDict:
         return len(self._weights)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._weights)
+        # Return iterator over a snapshot copy of keys to allow concurrent modification
+        with self._lock:
+            return iter(list(self._weights.keys()))
 
     def keys(self):
-        return self._weights.keys()
+        # Return a snapshot copy of keys to allow concurrent modification
+        with self._lock:
+            return list(self._weights.keys())
 
     def values(self):
-        return self._weights.values()
+        # Return a snapshot copy of values to allow concurrent modification
+        with self._lock:
+            return list(self._weights.values())
 
     def items(self) -> Iterator[Tuple[str, Any]]:
-        return self._weights.items()
+        # Return a snapshot copy of items to allow concurrent modification
+        with self._lock:
+            return list(self._weights.items())
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._weights.get(key, default)
 
     def update(self, other: Dict[str, Any]) -> None:
-        self._weights.update(other)
+        with self._lock:
+            self._weights.update(other)
 
     def mark_consumed(self, prefix: str) -> int:
         """
@@ -59,13 +76,16 @@ class ConsumableWeightsDict:
 
         Returns:
             The number of keys deleted.
+
+        Thread-safe: uses a lock to prevent concurrent modification issues.
         """
-        keys_to_delete = [
-            k for k in self._weights.keys() if k.startswith(prefix + ".")
-        ]
-        for key in keys_to_delete:
-            del self._weights[key]
-        return len(keys_to_delete)
+        with self._lock:
+            keys_to_delete = [
+                k for k in self._weights.keys() if k.startswith(prefix + ".")
+            ]
+            for key in keys_to_delete:
+                del self._weights[key]
+            return len(keys_to_delete)
 
 
 class BaseWeightLoader(ABC):
