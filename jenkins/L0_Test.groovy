@@ -39,7 +39,7 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.12-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.01-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -2014,7 +2014,7 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=25.12 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.01 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
