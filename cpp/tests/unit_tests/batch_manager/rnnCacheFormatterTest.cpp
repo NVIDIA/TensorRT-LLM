@@ -10,6 +10,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 
 #include <random>
+#include <tuple>
 
 namespace texec = tensorrt_llm::executor;
 namespace tbm = tensorrt_llm::batch_manager;
@@ -314,10 +315,10 @@ TEST_F(HybridModelCounterpartsTest, DifferentPPDistributionKvRnn)
     auto mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{0, 2}));
 
-    // pickRecvConnections should map back correctly (use free function template)
-    auto rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
+    auto [rnnPickUp, rnnLocalRankIndices] = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         mergedCounterParts.size(), contextRnnState, contextRank0, genRnnState, mergedCounterParts);
-    EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1})); // indices in mergedCounterParts
+    EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
+    EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 }
 
 // Test: Asymmetric hybrid PP distribution where KV and RNN have different counterparts
@@ -378,10 +379,10 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     auto mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{0, 2, 4, 6}));
 
-    // RNN pickRecvConnections: needs ranks {0, 2}, should map to indices {0, 1} in merged
-    auto rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
+    auto [rnnPickUp, rnnLocalRankIndices] = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         mergedCounterParts.size(), contextRnnState, contextRank0, genRnnState, mergedCounterParts);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
+    EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 
     // ============= Test from Context rank 1 (PP=0, TP=1) =============
     SizeType32 contextRank1 = 1;
@@ -403,9 +404,10 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{1, 3, 5, 7}));
 
-    rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
+    std::tie(rnnPickUp, rnnLocalRankIndices) = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         mergedCounterParts.size(), contextRnnState, contextRank1, genRnnState, mergedCounterParts);
-    EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1})); // ranks 1,3 at indices 0,1 in merged
+    EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
+    EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 }
 
 // Test: Completely disjoint KV and RNN counterparts
@@ -469,10 +471,10 @@ TEST_F(HybridModelCounterpartsTest, DisjointKvRnnCounterparts)
     mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{4, 6})); // Only RNN ranks
 
-    // pickRecvConnections for RNN: ranks {4, 6} at indices {0, 1} in merged
-    auto rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
+    auto [rnnPickUp, rnnLocalRankIndices] = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         mergedCounterParts.size(), contextRnnState, contextRank2, genRnnState, mergedCounterParts);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
+    EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 }
 
 // ==================== ATTENTION-ONLY MODEL TESTS ====================
@@ -682,10 +684,10 @@ TEST_F(HybridModelCounterpartsTest, KvMorePPThanRnn)
     auto merged = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(merged, (std::vector<SizeType32>{0, 2, 4, 6}));
 
-    // pickRecvConnections for RNN should correctly map to indices 0, 1 in merged list
-    auto rnnPickUp = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
+    auto [rnnPickUp, rnnLocalRankIndices] = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
         merged.size(), contextRnnState, contextRank0, genRnnState, merged);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
+    EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 }
 
 // Test: Edge case - RNN-only model (0 attention layers)

@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <numeric>
 #include <vector>
 
 // Forward declare TransferSession in the correct global namespace scope
@@ -104,29 +105,35 @@ std::vector<size_t> pickSendConnections(size_t numConnections, CacheStateT const
 }
 
 /**
- * @brief Pick receive connections
+ * @brief Pick receive connections and their corresponding local rank indices.
  * @tparam CacheStateT Either kv_cache::CacheState or rnn_cache::RnnCacheState
+ * @return Pair of (pickUpConnections, localRankIndices) where pickUpConnections are indices into counterPartRanks
+ *         and localRankIndices are the corresponding indices into targetInfo.mIRanks.
  */
 template <typename CacheStateT>
-std::vector<size_t> pickRecvConnections(size_t numConnections, CacheStateT const& selfConfig, SizeType32 selfIdx,
-    CacheStateT const& destConfig, std::vector<SizeType32> const& counterPartRanks)
+std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+    CacheStateT const& selfConfig, SizeType32 selfIdx, CacheStateT const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks)
 {
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     if (targetInfo.mIRanks.empty())
     {
-        return {};
+        return {{}, {}};
     }
 
     auto baseIndices = pickSendConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
 
     if (targetInfo.mPeerDupHeadFactor <= 1)
     {
-        return baseIndices;
+        std::vector<size_t> localRankIndices(baseIndices.size());
+        std::iota(localRankIndices.begin(), localRankIndices.end(), 0);
+        return {baseIndices, localRankIndices};
     }
 
     int selfDPRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
-    std::vector<size_t> ret;
+    std::vector<size_t> pickUpConnections;
+    std::vector<size_t> localRankIndices;
     for (int i = 0; i < targetInfo.mDomainTPSize; i++)
     {
         if ((i % targetInfo.mPeerDupHeadFactor) == (selfDPRank % targetInfo.mPeerDupHeadFactor))
@@ -134,11 +141,12 @@ std::vector<size_t> pickRecvConnections(size_t numConnections, CacheStateT const
             for (int j = 0; j < targetInfo.mDomainPPSize; j++)
             {
                 size_t localIdx = (i * targetInfo.mDomainPPSize) + j;
-                ret.push_back(baseIndices.at(localIdx));
+                pickUpConnections.push_back(baseIndices.at(localIdx));
+                localRankIndices.push_back(localIdx);
             }
         }
     }
-    return ret;
+    return {pickUpConnections, localRankIndices};
 }
 } // namespace cache_formatter_utils
 } // namespace tensorrt_llm::batch_manager
@@ -189,8 +197,11 @@ public:
 
     [[nodiscard]] virtual BaseKVCacheManager* getCacheManager() const noexcept = 0;
 
-    [[nodiscard]] virtual std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
+    /// @brief Pick receive connections and their corresponding local rank indices.
+    /// @return Pair of (pickUpConnections, localRankIndices).
+    [[nodiscard]] virtual std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+        std::vector<SizeType32> const& counterPartRanks) const
         = 0;
 
     /// @brief Destructor.
@@ -227,8 +238,8 @@ public:
         return mCacheManager;
     }
 
-    [[nodiscard]] std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig,
+    [[nodiscard]] std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
         std::vector<SizeType32> const& counterPartRanks) const override;
 
 private:

@@ -42,22 +42,23 @@
 namespace tensorrt_llm::batch_manager
 {
 /// Used for KV and RNN cache format()
-size_t computeBufferIdx(size_t processIdx, executor::kv_cache::TargetRanksInfo const& targetInfo)
+size_t computeBufferIdx(size_t localIdx, executor::kv_cache::TargetRanksInfo const& targetInfo)
 {
-    size_t bufferTpRank = (processIdx / targetInfo.mDomainPPSize) / targetInfo.mPeerDupHeadFactor;
-    return (bufferTpRank * targetInfo.mDomainPPSize) + (processIdx % targetInfo.mDomainPPSize);
+    size_t bufferTpRank = (localIdx / targetInfo.mDomainPPSize) / targetInfo.mPeerDupHeadFactor;
+    return (bufferTpRank * targetInfo.mDomainPPSize) + (localIdx % targetInfo.mDomainPPSize);
 }
 
-void sendBuffer(TransferSession& session, int deviceId, size_t localIdx, size_t processIdx,
+void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
     std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
     runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
-    executor::kv_cache::TargetRanksInfo const& targetInfo)
+    executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections)
 {
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send localIdx: %ld processIdx: %ld", localIdx, processIdx);
+    size_t connIdx = pickUpConnections[localIdx];
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send localIdx: %ld connIdx: %ld", localIdx, connIdx);
     NVTX3_SCOPED_RANGE(sendBuffer);
     TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-    TLLM_CHECK(session.getConnections().size() > (processIdx / targetInfo.mPeerDupHeadFactor));
-    TLLM_CHECK(outputBuffers.size() > (processIdx / targetInfo.mPeerDupHeadFactor));
+    TLLM_CHECK(session.getConnections().size() > (connIdx / targetInfo.mPeerDupHeadFactor));
+    TLLM_CHECK(outputBuffers.size() > (connIdx / targetInfo.mPeerDupHeadFactor));
 
     auto startTime = LlmRequest::getSteadyClockNow();
 
@@ -66,10 +67,10 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx, size_t 
 
     if (bufferIdx < bufferCoverTargetNum)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send processIdx: %ld bufferIdx: %ld size:%ld", processIdx,
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
             bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
-        session.send(processIdx, outputBuffers[bufferIdx]->data(), outputBuffers[bufferIdx]->getSizeInBytes());
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " end send processIdx: %ld bufferIdx: %ld size:%ld", processIdx,
+        session.send(connIdx, outputBuffers[bufferIdx]->data(), outputBuffers[bufferIdx]->getSizeInBytes());
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " end send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
             bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
     }
     else
@@ -97,7 +98,7 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx, size_t 
             auto copyTargetSlice = runtime::ITensor::slice(sendUseAllocBuffer, 0, sendSize);
             bufferManager.copy(*copySlice, *copyTargetSlice);
             bufferManager.getStream().synchronize();
-            session.send(processIdx, copyTargetSlice->data(), copyTargetSlice->getSizeInBytes());
+            session.send(connIdx, copyTargetSlice->data(), copyTargetSlice->getSizeInBytes());
             remainSendSize -= sendSize;
         }
     }
@@ -120,8 +121,8 @@ void sendAllBuffers(TransferSession& session, int deviceId,
             TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
             for (size_t i = 0; i < targetNum; i++)
             {
-                sendBuffer(session, deviceId, i, pickUpConnections[i], outputBuffers, bufferCoverTargetNum,
-                    preAllocSendBuffer, bufferManager, targetInfo);
+                sendBuffer(session, deviceId, i, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
+                    targetInfo, pickUpConnections);
             }
         }
         else
@@ -139,13 +140,12 @@ void sendAllBuffers(TransferSession& session, int deviceId,
                 for (size_t i = 0; i < sendConcurrencyNum; i++)
                 {
                     size_t idx = i + (targetNum - remainSendNum);
-                    size_t connIdx = pickUpConnections[idx];
-                    TLLM_CHECK(connIdx < session.getConnections().size());
+                    TLLM_CHECK(pickUpConnections[idx] < session.getConnections().size());
                     futures.push_back(std::async(std::launch::async,
-                        [&, idx, connIdx]()
+                        [&, idx]()
                         {
-                            sendBuffer(session, deviceId, idx, connIdx, outputBuffers, bufferCoverTargetNum,
-                                preAllocSendBuffer, bufferManager, targetInfo);
+                            sendBuffer(session, deviceId, idx, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer,
+                                bufferManager, targetInfo, pickUpConnections);
                         }));
                 }
                 for (auto& future : futures)
@@ -158,8 +158,8 @@ void sendAllBuffers(TransferSession& session, int deviceId,
     }
     else
     {
-        sendBuffer(session, deviceId, 0, pickUpConnections[0], outputBuffers, bufferCoverTargetNum, preAllocSendBuffer,
-            bufferManager, targetInfo);
+        sendBuffer(session, deviceId, 0, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
+            targetInfo, pickUpConnections);
     }
 }
 } // namespace tensorrt_llm::batch_manager
@@ -306,8 +306,9 @@ void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::
     }
 }
 
-std::vector<size_t> CacheFormatter::pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
+std::pair<std::vector<size_t>, std::vector<size_t>> CacheFormatter::pickRecvConnections(size_t numConnections,
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks) const
 {
     return cache_formatter_utils::pickRecvConnections<CacheState>(
         numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
@@ -555,7 +556,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto blockRange = getBlockRangeForReceiving(
         mCacheManager, llmRequest, destConfig.getEnableBlockReuse(), destConfig.getEnablePartialReuse());
 
-    auto pickUpConnections
+    auto [pickUpConnections, localRankIndices]
         = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     if (pickUpConnections.empty())
     {
@@ -740,7 +741,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 
                 for (size_t i = 0; i < targetNum; i++)
                 {
-                    auto layerNum = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
+                    auto layerNum = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(localRankIndices[i]));
                     bufferEleSizes[i] = cacheBlockSizePerLayer * layerNum;
                 }
                 return bufferEleSizes;

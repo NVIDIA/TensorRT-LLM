@@ -985,7 +985,7 @@ public:
             {
                 // TODO: index -> validConnectionIdx conversion
                 // TODO(shreyasm): this will not work for RNN. Will error out in the constructor if used with RNN.
-                auto pickUpIdx
+                auto [pickUpIdx, localRankIdx]
                     = mFormatter->pickRecvConnections(kvCounterParts.size(), mSelfState.getCacheState().value(),
                         mSelfState.getCommState().value().getSelfIdx(), destCacheState, kvCounterParts);
                 auto validConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();

@@ -129,7 +129,9 @@ void RnnCacheFormatter::format(TransferSession& session)
     //    Each target gets: conv states + ssm states for overlapping layers
     auto const& modelConfig = selfConfig.getModelConfig();
     auto const maxBatchSize = mRnnStateManager->getMaxBatchSize();
-    int const selfTPSizePerDPGroup = selfConfig.getParallelConfig().mEnableAttentionDP ? selfTPNum / selfConfig.getParallelConfig().mDPsize : selfTPNum;
+    int const selfTPSizePerDPGroup = selfConfig.getParallelConfig().mEnableAttentionDP
+        ? selfTPNum / selfConfig.getParallelConfig().mDPsize
+        : selfTPNum;
     SizeType32 convDimLocal = modelConfig.mConvDimSize / selfTPSizePerDPGroup;
     SizeType32 numHeadsLocal = modelConfig.mNumHeads / selfTPSizePerDPGroup;
 
@@ -147,7 +149,8 @@ void RnnCacheFormatter::format(TransferSession& session)
     for (size_t i = 0; i < targetNum; i++)
     {
         SizeType32 layersForTarget = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
-        bufferSizesPerTarget[i] = layersForTarget * (convBytesPerLayer + ssmBytesPerLayer) * peerDuplicateHeadFactor / targetInfo.mDomainTPSize;
+        bufferSizesPerTarget[i] = layersForTarget * (convBytesPerLayer + ssmBytesPerLayer) * peerDuplicateHeadFactor
+            / targetInfo.mDomainTPSize;
     }
 
     auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
@@ -211,7 +214,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     int deviceId;
     TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
 
-    auto pickUpConnections = cache_formatter_utils::pickRecvConnections<RnnCacheState>(
+    auto [pickUpConnections, localRankIndices] = cache_formatter_utils::pickRecvConnections<RnnCacheState>(
         connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     auto const sourceNum = pickUpConnections.size();
 
@@ -292,13 +295,13 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     convBytesPerLayer = (convBytesPerLayer + 15) & ~static_cast<size_t>(15);
     size_t ssmBytesPerLayer = selfNumHeadsLocal * modelConfig.mHeadDim * modelConfig.mDState
         * common::getDTypeSize(selfConfig.getSsmStateDataType());
-    
+
     std::vector<size_t> bufferSizesPerSource(sourceNum, 0);
     size_t validTpSources = sourceNum / sourceInfo.mDomainPPSize;
-        
+
     // Compute source conv bytes for SSM offset
     size_t sourceConvBytesPerLayer = convBytesPerLayer / validTpSources;
-    
+
     for (size_t i = 0; i < sourceNum; i++)
     {
         SizeType32 layersFromSource = sourceInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));

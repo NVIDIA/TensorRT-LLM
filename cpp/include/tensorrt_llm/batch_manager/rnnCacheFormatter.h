@@ -81,12 +81,12 @@ public:
     }
 
     /// @brief Not supported for RNN cache. Always throws.
-    [[nodiscard]] std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig,
+    [[nodiscard]] std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
         std::vector<SizeType32> const& counterPartRanks) const override
     {
         TLLM_THROW("RnnCacheFormatter::pickRecvConnections(CacheState) not supported. Use RnnCacheState version.");
-        return {};
+        return {{}, {}};
     }
 
     /// @brief Returns nullptr since RNN cache formatter doesn't use KV cache manager.

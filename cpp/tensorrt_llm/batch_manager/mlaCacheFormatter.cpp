@@ -37,35 +37,32 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-// some context rank in connection
-std::vector<size_t> MLACacheFormatter::pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
+std::pair<std::vector<size_t>, std::vector<size_t>> MLACacheFormatter::pickRecvConnections(size_t numConnections,
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks) const
 {
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     if (targetInfo.mIRanks.empty())
     {
-        return {};
+        return {{}, {}};
     }
 
-    // This function is called only by gen side and we only support CPSize=1 on context size.
     TLLM_CHECK(targetInfo.mDomainCPSize == 1);
     TLLM_CHECK(numConnections == counterPartRanks.size());
-    std::vector<size_t> ret;
-    // targetInfo , mRanks [tpranks, ppranks]
+    std::vector<size_t> pickUpConnections;
+    std::vector<size_t> localRankIndices;
     int dpRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
     for (int i = 0; i < targetInfo.mDomainPPSize; i++)
     {
-        // Compute the index in targetInfo.mIRanks
         size_t rankIdx = i + (dpRank % (targetInfo.mDomainTPSize)) * targetInfo.mDomainPPSize;
-        // Get the actual rank value
         auto rank = targetInfo.mIRanks.at(rankIdx);
-        // Find position in counterPartRanks
         auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
         TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
-        ret.push_back(std::distance(counterPartRanks.begin(), it));
+        pickUpConnections.push_back(std::distance(counterPartRanks.begin(), it));
+        localRankIndices.push_back(rankIdx);
     }
-    return ret;
+    return {pickUpConnections, localRankIndices};
 }
 
 std::vector<size_t> MLACacheFormatter::pickSendConnections(size_t numConnections, CacheState const& selfConfig,
@@ -396,7 +393,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
-    auto pickUpConnections
+    auto [pickUpConnections, localRankIndices]
         = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     if (pickUpConnections.empty())
     {
@@ -503,7 +500,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 for (size_t i = 0; i < targetNum; i++)
                 {
                     auto const peerAttentionLayerNum
-                        = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
+                        = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(localRankIndices[i]));
                     bufferEleSizes[i] = cacheSizePerLayer * peerAttentionLayerNum;
                 }
                 return bufferEleSizes;
