@@ -254,7 +254,6 @@ class PyTorchModelEngine(ModelEngine):
         torch_compile_max_num_streams = self.torch_compile_config.max_num_streams if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'max_num_streams'].default
 
-        # Eagle3 draft model now does not support torch.compile
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
 
