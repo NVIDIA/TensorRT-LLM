@@ -918,7 +918,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
-    def disaggMode = stageName.contains("PerfSanity-Disagg")
+    def disaggMode = stageName.contains("Disagg-PerfSanity")
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
@@ -3366,7 +3366,7 @@ def launchTestJobs(pipeline, testFilter)
     ]
     // PerfSanity post-merge aggr tests
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-AGGR-PerfSanity-Node2-GPU8-Post-Merge",
+        "GB200-8_GPUs-2_Nodes-PyTorch-Aggr-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_aggr_perf_sanity_node2_gpu8",
         5,
