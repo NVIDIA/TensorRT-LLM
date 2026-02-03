@@ -136,18 +136,7 @@ else
         cleanup_on_failure "Failed to get TensorRT-LLM environment variables. Check ${full_logdir}/2_get_env.log for details"
     fi
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
-    # Install lm_eval[api]==0.4.9.1 if not installed
-    # if ! srun --container-name=${container_name} \
-    #     --container-mounts=${container_mount} --no-container-mount-home \
-    #     --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-    #     bash -c "pip install lm_eval[api]==0.4.9.1" \
-    #     &> ${full_logdir}/2_install_lm_eval.log; then
-    #     cleanup_on_failure "lm_eval installation failed. Check ${full_logdir}/2_install_lm_eval.log for details"
-    # fi
-    # echo "lm_eval installation completed successfully"
 fi
-
-
 
 # Get node lists and replace the placeholder with the actual node names
 echo "SLURM_NODELIST: ${SLURM_NODELIST}"

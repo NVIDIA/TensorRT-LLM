@@ -625,12 +625,6 @@ def submit_job(config, log_dir, dry_run):
             ]
             client_cmds.append(" ".join(accuracy_prefix + accuracy_cmd))
 
-    # post_process_cmd = [
-    #     f"bash /lustre/fsw/portfolios/coreai/users/xqiao/bench-disagg-r1/scripts/post_process.sh {log_dir} {gen_tp_size} {mtp_size} {log_dir}",
-    #     f"&> {log_dir}/8_post_process.log",
-    # ]
-    # client_cmds.append(" ".join(client_slurm_prefix + post_process_cmd))
-
     # record ${SLURM_JOB_NODELIST} to ${log_dir}/8_done_job_id.txt
     done_cmd = [
         "echo", "${SLURM_JOB_NODELIST}", ">",
