@@ -351,7 +351,7 @@ def create_py_executor(
         has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
         chunk_size=max_num_tokens,
     )
-    logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
+    logger.info("ATTENTION RUNTIME FEATURES: %s", attn_runtime_features)
     with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN,
                           RestoreMode.PINNED):
         model_engine = PyTorchModelEngine(

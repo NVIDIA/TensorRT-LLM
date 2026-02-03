@@ -19,7 +19,7 @@ from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, ExecutorConfig,
-                                 KvCacheRetentionConfig, SchedulerConfig)
+                                 KvCacheRetentionConfig)
 # yapf: enable
 from ..builder import BuildConfig, Engine, build
 from ..llmapi.llm_args import TrtLlmArgs
