@@ -749,7 +749,7 @@ using Kernel_traits_nl_bidirectional_sliding_window = fmha::{kernel_traits}<
     {warps_n},
     {ctas_per_head},
     {kernel_flags} | 0x200 /* no_loop flag */,
-    /*bidirectional_sliding_window mask*/ 5,
+    /*bidirectional sliding window mask*/ 5,
     /*bmm2_fp16_epilogue*/ true,
     {output_dtype_}>;
 
@@ -934,7 +934,7 @@ using Kernel_traits_nl_tiled_bidirectional_sliding_window = fmha::{kernel_traits
     {warps_n},
     {ctas_per_head},
     {kernel_flags} | 0x200 /* no_loop flag */,
-    /*bidirectional_sliding_window mask*/ 5,
+    /*bidirectional sliding window mask*/ 5,
     /*bmm2_fp16_epilogue*/ true,
     {output_dtype_}>;
 
@@ -2231,6 +2231,7 @@ def selected_mask_types(kspec):
         if kspec.enable_attn_logit_softcapping:
             padding_mask = '0'
             custom_mask = '0'
+            bidirectional_sliding_window_mask = '0'
 
         if kspec.head_size not in [32, 64, 128]:
             bidirectional_sliding_window_mask = '0'
@@ -3381,13 +3382,16 @@ def get_cubin_header(kernel_traits, specs_names):
                 '').replace('ldgsts_', '').replace('causal_', '').replace(
                     'alibi_', '').replace('softmax_', '').replace(
                         'sliding_or_chunked_', '').replace(
-                            'custom_mask_', '').replace('qkv_', '').replace(
-                                'q_kv_', '').replace('q_paged_kv_', '').replace(
-                                    'q_k_v_', '').replace('ws_', '').replace(
-                                        'softcapping_',
-                                        '').replace('sage_', '').replace(
-                                            'skipSoftmax_',
-                                            '').replace('output_', ''))
+                            'bidirectional_sliding_window_', '').replace(
+                                'custom_mask_', '').replace('qkv_', '').replace(
+                                    'q_kv_',
+                                    '').replace('q_paged_kv_', '').replace(
+                                        'q_k_v_',
+                                        '').replace('ws_', '').replace(
+                                            'softcapping_',
+                                            '').replace('sage_', '').replace(
+                                                'skipSoftmax_',
+                                                '').replace('output_', ''))
         flash_attention = 'flash_attention' in kname
         warp_specialization = 'tma_ws' in kname
         toks = tname.split('_')
