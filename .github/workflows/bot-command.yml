@@ -46,7 +46,7 @@ jobs:
             "Run `/bot [-h|--help]` to print this help message.\n\n" +
             "See details below for each supported subcommand.\n\n" +
             "<details>\n\n" +
-            "`run  [--reuse-test (optional)pipeline-id --disable-fail-fast --skip-test --stage-list \"A10-PyTorch-1, xxx\" --gpu-type \"A30, H100_PCIe\" --test-backend \"pytorch, cpp\" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\" --detailed-log --debug(experimental)]`\n\n" +
+            "`run  [--reuse-test (optional)pipeline-id --disable-fail-fast --skip-test --stage-list \"A10-PyTorch-1, xxx\" --gpu-type \"A30, H100_PCIe\" --test-backend \"pytorch, cpp\" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\" --detailed-log --debug(experimental) --high-priority]`\n\n" +
             "Launch build/test pipelines. All previously running jobs will be killed.\n\n" +
             "`--reuse-test (optional)pipeline-id ` *(OPTIONAL)* : Allow the new pipeline to reuse build artifacts and skip successful test stages from a specified pipeline or the last pipeline if no pipeline-id is indicated. If the Git commit ID has changed, this option will be always ignored. The DEFAULT behavior of the bot is to reuse build artifacts and successful test results from the last pipeline.\n\n" +
             "`--disable-reuse-test ` *(OPTIONAL)* : Explicitly prevent the pipeline from reusing build artifacts and skipping successful test stages from a previous pipeline. Ensure that all builds and tests are run regardless of previous successes.\n\n" +
@@ -62,6 +62,7 @@ jobs:
             "`--extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages. Examples: --extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\".\n\n" +
             "`--detailed-log ` *(OPTIONAL)* : Enable flushing out all logs to the Jenkins console. This will significantly increase the log volume and may slow down the job.\n\n" +
             "`--debug ` *(OPTIONAL)* : **Experimental feature**. Enable access to the CI container for debugging purpose. Note: Specify exactly one stage in the `stage-list` parameter to access the appropriate container environment. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--high-priority ` *(OPTIONAL)* : Run the pipeline with high priority. This option is restricted to authorized users only and will route the job to a high-priority queue.\n\n" +
             "### kill\n\n" +
             "`kill  `\n\n" +
             "Kill all running builds associated with pull request.\n\n" +

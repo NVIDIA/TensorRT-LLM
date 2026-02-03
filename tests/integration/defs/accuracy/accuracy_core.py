@@ -452,7 +452,7 @@ class LongBenchV2(AccuracyTask):
     EVALUATOR_KWARGS = dict(
         dataset_path=DATASET_DIR,
         length="medium",
-        max_len=120000,
+        max_input_length=120000,
         apply_chat_template=True,
         random_seed=0,
     )

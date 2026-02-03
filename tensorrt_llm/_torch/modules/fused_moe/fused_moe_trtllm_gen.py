@@ -16,7 +16,7 @@ from ...custom_ops.trtllm_gen_custom_ops import \
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 
 # isort: off
@@ -82,6 +82,7 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -99,6 +100,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
 
         sm_version = get_sm_version()
@@ -140,15 +142,22 @@ class TRTLLMGenFusedMoE(MoE):
                     dtype = self.dtype or torch.bfloat16
 
                     workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-                        ep_size, self.routing_method.experts_per_token,
-                        max_num_tokens, hidden_size, dtype)
+                        ep_size,
+                        self.routing_method.experts_per_token,
+                        max_num_tokens,
+                        hidden_size,
+                        dtype,
+                        self.num_experts if self.layer_load_balancer else None,
+                    )
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_slots,
-                        workspace_size_per_rank=workspace_size)
+                        num_slots=self.num_slots,
+                        workspace_size_per_rank=workspace_size,
+                        num_experts=self.num_experts
+                        if self.layer_load_balancer else None)
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
                         "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"
@@ -169,6 +178,15 @@ class TRTLLMGenFusedMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+    def _to_trtllm_gen_activation_type(self,
+                                       activation_type: ActivationType) -> int:
+        if activation_type == ActivationType.Swiglu:
+            return 0
+        elif activation_type == ActivationType.Relu2:
+            return 1
+        else:
+            raise ValueError(f"Unsupported activation type: {activation_type}")
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         # If no attention DP, no need to use AlltoAll.
@@ -224,7 +242,7 @@ class TRTLLMGenFusedMoE(MoE):
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod(
-                ) if self.swiglu_alpha is not None else NVFP4TRTLLMGenFusedMoEBaseMethod(
+                ) if self.swiglu_alpha is not None or self.activation_type == ActivationType.Relu2 else NVFP4TRTLLMGenFusedMoEBaseMethod(
                 )
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
@@ -450,9 +468,10 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_ids=token_selected_experts,
             )
         elif self.has_nvfp4:
+            factor = 1 if self.activation_type == ActivationType.Relu2 else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
-
+                -2] // factor
+            act_type = self._to_trtllm_gen_activation_type(self.activation_type)
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -480,6 +499,7 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
+                act_type=act_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
             )
@@ -690,7 +710,10 @@ class TRTLLMGenFusedMoE(MoE):
 
             self._load_balancer_done_wait_gpu_stage(is_first_call)
 
-            ignore_allreduce = self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type in (
+                AlltoallMethodType.NVLinkTwoSided,
+                AlltoallMethodType.NVLinkOneSided,
+            )
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -778,14 +801,32 @@ class TRTLLMGenFusedMoE(MoE):
                 payloads.append(token_selected_experts)
                 payloads.append(token_final_scales)
 
-                recv_tensors = self.moe_a2a.dispatch(
-                    token_selected_experts,
-                    payloads,
-                    runtime_max_tokens_per_rank,
-                    invalid_token_expert_id=
-                    -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
-                    expert_id_payload_index=expert_id_payload_index,
-                )
+                loadbalancer_local_statistic_info = None
+                if self.layer_load_balancer and is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
+                    )
+                if loadbalancer_local_statistic_info is not None:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_experts,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=
+                        -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                        eplb_local_stats=loadbalancer_local_statistic_info,
+                    )
+                    gathered_stats = self.moe_a2a._state.eplb_gathered_stats
+                    self._load_balancer_update_statistic_with_gathered_statistic(
+                        gathered_stats)
+                else:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_experts,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=
+                        -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                    )
 
                 if x_sf is not None:
                     x_recv, x_sf_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors

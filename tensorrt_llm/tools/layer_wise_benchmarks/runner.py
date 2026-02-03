@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import itertools
+import os
 import unittest.mock
 import weakref
 from enum import IntEnum
@@ -11,6 +12,7 @@ import torch
 import tensorrt_llm._torch.model_config
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
@@ -54,8 +56,15 @@ def round_up(a, b):
     return ceil_div(a, b) * b
 
 
-def get_balanced_selection_no_cache(
-    num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+def get_balanced_selection_impl_default(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    dp_size: int,
+    dp_rank: int,
+    ep_size: int,
 ):
     token_id = torch.arange(dp_rank * num_tokens * top_k, (dp_rank + 1) * num_tokens * top_k).view(
         num_tokens, top_k
@@ -66,6 +75,32 @@ def get_balanced_selection_no_cache(
     ) % experts_per_rank
     token_selected_experts = token_selected_experts.sort(dim=-1).values
     return token_selected_experts.contiguous().to(dtype=dtype, device=device)
+
+
+def get_balanced_selection_impl_random(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    dp_size: int,
+    dp_rank: int,
+    ep_size: int,
+):
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_experts, 0, 128)
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(num_tokens, approx_max_load=False)
+    assert sum(num_tokens_per_expert) == num_tokens * top_k
+    token_selected_experts = helper.generate_token_selected_experts(
+        num_tokens, num_tokens_per_expert
+    )
+    return token_selected_experts.contiguous().to(dtype=dtype, device=device)
+
+
+def get_balanced_selection_no_cache(*args, **kwargs):
+    if os.environ.get("TRTLLM_LAYERWISE_BENCHMARK_BALANCED_IMPL", "DEFAULT") == "RANDOM":
+        return get_balanced_selection_impl_random(*args, **kwargs)
+    else:
+        return get_balanced_selection_impl_default(*args, **kwargs)
 
 
 get_balanced_selection = functools.cache(get_balanced_selection_no_cache)
@@ -406,8 +441,24 @@ class Runner:
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
 
-        self.layers = [model.model.layers[i] for i in layer_indices]
+        def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
+            # TODO: to be more general, we should call DecoderModel.forward
+            residual_fusion = hasattr(model.model.layers[layer_indices[0]], "next_layer_layernorm")
+            for layer_idx in layer_indices:
+                layer = model.model.layers[layer_idx]
+                if residual_fusion:
+                    hidden_states, residual = layer(
+                        position_ids, hidden_states, attn_metadata, residual, **kwargs
+                    )
+                else:
+                    hidden_states = layer(position_ids, hidden_states, attn_metadata, **kwargs)
+            return hidden_states, residual
+
+        model.forward = forward
+
         self.model_config = model.model_config
+        self.model = model
+        self.layer_indices = layer_indices
 
     @staticmethod
     @contextlib.contextmanager
@@ -608,27 +659,20 @@ class Runner:
             kwargs["mamba_metadata"] = mamba_metadata
 
         def run_pack(*, check=False):
-            output = hidden_states, residual
             with model_extra_attrs(self.model_config.extra_attrs):
                 get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
                 with torch.inference_mode():
-                    # TODO: to be more general, we should call DecoderModel.forward
-                    for layer in self.layers:
-                        residual_fusion = hasattr(layer, "next_layer_layernorm")
-                        if residual_fusion:
-                            output = layer(
-                                position_ids, output[0], attn_metadata, output[1], **kwargs
-                            )
-                        else:
-                            output = layer(position_ids, output[0], attn_metadata, **kwargs), None
+                    hidden_states_out, residual_out = self.model(
+                        position_ids, hidden_states, attn_metadata, residual, **kwargs
+                    )
             if check:
-                if output[0].isnan().any():
+                if hidden_states_out.isnan().any():
                     raise ValueError("Has nan, please fix weights initialization")
-                if output[0].isinf().any():
+                if hidden_states_out.isinf().any():
                     raise ValueError("Has inf, please fix weights initialization")
-                if (output[0] == 0).sum() > 0.5 * output[0].numel():
+                if (hidden_states_out == 0).sum() > 0.5 * hidden_states_out.numel():
                     raise ValueError("Too many zeros, please fix weights initialization")
-            return output
+            return hidden_states_out, residual_out
 
         return run_pack
 
@@ -655,10 +699,13 @@ class Runner:
             else 0
         )
         moe_modules = []
-        for layer in self.layers:
+        for layer_idx in self.layer_indices:
+            layer = self.model.model.layers[layer_idx]
             if layer.__class__.__name__ == "NemotronHLayer":
                 if layer.layer_type == "E":
                     moe_modules.append(layer.mixer.experts)
+            elif layer.__class__.__name__ in ["GatedMLP"]:
+                pass
             else:
                 moe_modules.append(layer.mlp.experts)
 

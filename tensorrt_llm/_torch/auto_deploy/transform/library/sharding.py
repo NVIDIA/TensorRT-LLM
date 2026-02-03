@@ -151,6 +151,11 @@ class ShardingTransformConfig(TransformConfig):
 
     process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
 
+    enable_attention_dp: bool = Field(
+        default=False,
+        description="When True, skip TP sharding as attention data parallelism is enabled.",
+    )
+
     def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
         init_process_grid_from_config(self)
         if sources is None:
@@ -686,6 +691,77 @@ def _resolve_ep_cls_from_node(node: Node) -> type[EPShardingInfo]:
     return EPShardingInfo
 
 
+class RMSNormShardingInfo(ShardingTransformInfo):
+    """Configuration for replacing RMSNorm with sharded version.
+
+    When RMSNorm (torch_rmsnorm) operates on sharded activations with
+    weight shape [num_heads * head_dim] (full hidden size), it needs to be
+    replaced with sharded_rmsnorm which uses all_reduce to compute
+    the correct global mean across shards.
+
+    The detection of whether an RMSNorm needs this treatment is done in
+    _shard_qk_norm based on weight shape matching q/k projection
+    output dimensions.
+    """
+
+    world_size: int
+
+    @classmethod
+    def from_node(cls, node: Node, **kwargs) -> "RMSNormShardingInfo":
+        """Create a RMSNormShardingInfo from a node."""
+        return cls(target_node=node.name, **kwargs)
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        """Validate that the node is a torch_rmsnorm op."""
+        if not is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
+            ad_logger.debug(
+                f"RMSNormShardingInfo only applies to torch_rmsnorm ops. "
+                f"Got {node.target}. Skipping."
+            )
+            return False
+        return True
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Replace torch_rmsnorm with sharded_rmsnorm and shard the weight.
+
+        This handles both:
+        1. Weight sharding: Shard the RMSNorm weight across ranks
+        2. Op replacement: Replace with sharded_rmsnorm which uses all_reduce
+           for computing the correct global mean across shards.
+        """
+        # Get original arguments: (input, weight, eps)
+        input_node = node.args[0]
+        weight_node = node.args[1]
+        eps = node.args[2]
+
+        # Shard the weight parameter (column-wise for 1D RMSNorm weight)
+        weight_key = weight_node.target
+        weight_tensor = gm.get_parameter(weight_key)
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight_tensor,
+            param_key=weight_key,
+            dim=0,  # Column shard for 1D weight
+            rank=self.config.rank,
+            world_size=self.world_size,
+        )
+        ad_logger.debug(f"Sharded RMSNorm weight: {weight_key}")
+
+        # Insert the new node with world_size parameter
+        with gm.graph.inserting_after(node):
+            new_node = gm.graph.call_function(
+                torch.ops.auto_deploy.sharded_rmsnorm.default,
+                args=(input_node, weight_node, eps, self.world_size),
+            )
+
+        # Replace all uses with the new node and remove the old node
+        node.replace_all_uses_with(new_node)
+        gm.graph.erase_node(node)
+        ad_logger.debug(
+            f"Replaced torch_rmsnorm with sharded_rmsnorm (world_size={self.world_size})"
+        )
+
+
 ########################################################
 #  Transform API classes
 ########################################################
@@ -738,8 +814,9 @@ class Sharding(BaseTransform):
             f"Using allreduce strategy: {config.allreduce_strategy.name}, dist backend: {config.dist_backend}"
         )
 
-        if world_size < 2:
-            ad_logger.info("Skipping sharding for single device")
+        if world_size < 2 or config.enable_attention_dp:
+            reason = "single device" if world_size < 2 else "attention DP enabled"
+            ad_logger.info(f"Skipping sharding: {reason}")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -822,6 +899,9 @@ class ShardingTransformExecutor(BaseTransform):
         for ep_transform in transforms.ep_transforms:
             if check_and_apply(ep_transform):
                 num_matches += 1
+        for rmsnorm_transform in transforms.rmsnorm_transforms:
+            if check_and_apply(rmsnorm_transform):
+                num_matches += 1
 
         # post-sharding cleanup transformations
         for update_transform in transforms.parameter_update_transforms:
@@ -845,6 +925,7 @@ class ShardingTransformContainer(BaseModel):
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
+    rmsnorm_transforms: List[RMSNormShardingInfo] = Field(default_factory=list)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -853,6 +934,7 @@ class ShardingTransformContainer(BaseModel):
             BMMShardingInfo: self.bmm_transforms,
             EPShardingInfo: self.ep_transforms,
             ParameterUpdateInfo: self.parameter_update_transforms,
+            RMSNormShardingInfo: self.rmsnorm_transforms,
         }
 
     def add(self, transform: ShardingTransformInfo) -> bool:
@@ -1293,14 +1375,30 @@ def _shard_parameter_node(
 
 
 def _update_node_args(node: Node, args: tuple) -> None:
-    """Update the node's arguments with the new sharded arguments."""
+    """Update the node's arguments with the new sharded arguments.
+
+    For Node args: preserve the current value (may have been updated by other transforms).
+    For non-Node args (shapes, sizes, indices): use the stored sharded value.
+
+    This prevents ParameterUpdateInfo from reverting Node references that were
+    intentionally updated by other transforms.
+    """
     if "sharded" in node.meta and node.meta["sharded"]:
         return
-    node.args = args
+
+    # Build new args: preserve current Node refs, apply stored non-Node values
+    new_args = []
+    for i, stored_arg in enumerate(args):
+        if isinstance(stored_arg, Node):
+            # Node args: preserve current value (may have been updated by other transforms)
+            new_args.append(node.args[i])
+        else:
+            # Non-Node args (shapes, sizes, indices): use stored sharded value
+            new_args.append(stored_arg)
+
+    node.args = tuple(new_args)
     node.meta["sharded"] = True
-    ad_logger.debug(
-        f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
-    )
+    ad_logger.debug(f"Updated node {node}: sharded arguments are now {node.args}.")
 
 
 def _insert_sharded_moe(
@@ -1832,43 +1930,242 @@ def _determine_fused_weight_dims(
         return None
     linear_node = linear_nodes[0]
     fused_weight_dims = None
-    # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
-    split_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.split_with_sizes]))
-    if len(split_nodes) > 0:
-        assert len(linear_nodes) == 1
+    if len(linear_nodes) == 1:
         linear_node = linear_nodes[0]
-        assert len(split_nodes) == 1, "Expecting exactly one split node for fused weights"
-        fused_weight_dims = split_nodes[0].args[1]
+        # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
+        linear_split_users = list(
+            filtered_nodes(linear_node.users, ops=torch.ops.aten.split_with_sizes)
+        )
+        linear_slice_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.slice))
+        linear_chunk_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
+        if len(linear_split_users) > 0:
+            assert len(linear_split_users) == 1, (
+                "Expecting exactly one split node for fused weights"
+            )
+            fused_weight_dims = linear_split_users[0].args[1]
 
-    slice_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.slice]))
-    if len(slice_nodes) > 0:
-        # we are probably in fused QKV case with single linear node and 3 slice nodes
-        assert len(linear_nodes) == 1
-        linear_node = linear_nodes[0]
-        assert all(
-            s.args[1] == 2 for s in filtered_nodes(linear_node.users, ops=torch.ops.aten.slice)
-        ), "Expecting slice nodes to slice tensor over dim=2"
-        fused_weight_dims = [s.args[3] - s.args[2] for s in linear_node.users]
-        weight_dim = shape(linear_node)[2]
-        if sum(fused_weight_dims) != weight_dim:
-            if fused_weight_dims[-1] > weight_dim:
-                fused_weight_dims[-1] = weight_dim - sum(fused_weight_dims[:-1])
-            else:
-                ad_logger.warning(
-                    f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
-                )
-                return None
-    chunk_nodes = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
-    if len(chunk_nodes) > 0:
-        assert len(linear_nodes) == 1
-        linear_node = linear_nodes[0]
-        assert len(chunk_nodes) == 1, "Expecting exactly one chunk node for fused weights"
-        num_chunks = chunk_nodes[0].args[1]
-        weight_dim = shape(linear_node)[2]
-        fused_weight_dims = [weight_dim // num_chunks] * num_chunks
-    if fused_weight_dims is not None:
-        fused_weight_dims = tuple(fused_weight_dims)
-    return fused_weight_dims
+        elif len(linear_slice_users) > 0:
+            # we are probably in fused QKV case with single linear node and 3 slice nodes
+            assert all(s.args[1] == 2 for s in linear_slice_users), (
+                "Expecting slice nodes to slice tensor over dim=2"
+            )
+            fused_weight_dims = [s.args[3] - s.args[2] for s in linear_slice_users]
+            assert fused_weight_dims, "fused weight dims cannot be empty"
+            weight_dim = linear_node.meta["val"].shape[2]
+            if sum(fused_weight_dims) != weight_dim:
+                if fused_weight_dims[-1] > weight_dim:
+                    fused_weight_dims[-1] = weight_dim - sum(fused_weight_dims[:-1])
+                else:
+                    ad_logger.warning(
+                        f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
+                    )
+                    return
+
+        elif len(linear_chunk_users) > 0:
+            assert len(linear_chunk_users) == 1, (
+                "Expecting exactly one chunk node for fused weights"
+            )
+            num_chunks = linear_chunk_users[0].args[1]
+            weight_dim = linear_node.meta["val"].shape[2]
+            fused_weight_dims = [weight_dim // num_chunks] * num_chunks
+
+
+def _find_upstream_qk_proj(node: Node, gm: GraphModule) -> Optional[str]:
+    """
+    Find the upstream q/k projection linear node from an RMSNorm input.
+
+    Traverses backwards through pass-through tensor operations (view, reshape,
+    type conversions, quantize/dequantize, etc.) to find the immediate producer.
+    If that producer is a q_proj or k_proj linear, returns the weight name.
+
+    Args:
+        node: The input node to start traversing from (typically RMSNorm's activation input)
+        gm: The graph module containing the nodes
+
+    Returns:
+        The weight name if a q_proj or k_proj is found as immediate upstream, None otherwise.
+
+    TODO: Is there a more efficient way to do this?
+    """
+    # Pass-through ops that we traverse through (these don't change the semantic meaning)
+    passthrough_ops = [
+        torch.ops.aten.view,
+        torch.ops.aten.reshape,
+        torch.ops.aten.contiguous,
+        torch.ops.aten.clone,
+        torch.ops.aten.to,
+        torch.ops.aten._to_copy,
+        torch.ops.aten.slice,
+        torch.ops.aten.transpose,
+        torch.ops.aten.permute,
+    ]
+
+    visited = set()
+    current = node
+
+    # Traverse through pass-through ops to find the actual producer
+    while current is not None and current not in visited:
+        visited.add(current)
+
+        # Check if this is a linear operation (the producer we're looking for)
+        if is_any_lin_op(current):
+            try:
+                weight_name = extract_weight_name(current)
+                if weight_name and ("q_proj" in weight_name or "k_proj" in weight_name):
+                    return weight_name
+            except (AttributeError, AssertionError):
+                pass
+            # Found a linear but not q/k proj - this is not a QK norm
+            return None
+
+        # If this is a pass-through op, continue to its first input
+        if is_op(current, passthrough_ops):
+            # Get the first tensor input (skip non-tensor args like dims)
+            tensor_inputs = [arg for arg in current.all_input_nodes if isinstance(arg, Node)]
+            if tensor_inputs:
+                current = tensor_inputs[0]
+                continue
+
+        # Hit a non-passthrough, non-linear op - stop searching
+        break
+
+    return None
+
+
+def _shard_qk_norm(
+    layer_subgraph: LayerSubgraph,
+    linear_nodes: List[Node],
+    transform_container: ShardingTransformContainer,
+) -> int:
+    """
+    Shard RMSNorm ops in attention layers that operate on full hidden size.
+
+    This function detects torch_rmsnorm ops that are true QK norms - i.e., norms that
+    operate on the output of q_proj or k_proj. These global QK norms operate on
+    flattened Q/K output [batch, seq, hidden_size] before reshape and need special
+    handling for tensor parallelism:
+    1. Weight sharding: The norm weight is column-sharded across ranks
+    2. Global mean: Replaced with sharded_rmsnorm which uses all_reduce
+
+    Detection criteria:
+    1. The RMSNorm's input must trace back to a q_proj or k_proj linear operation
+    2. The weight shape must match q/k projection output dimensions
+
+    Example1: - Global Norm on all heads directly on flattened Q/K output (e.g. MiniMax):
+        self.q_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_attention_heads, eps=config.rms_norm_eps)
+        weight shape: [num_heads * head_dim] -> matches valid_sizes -> will be sharded
+        Status: Needs sharding (weight matches q projection output dim)
+
+    Example2: - Norm per head after reshaping to [batch, seq, num_heads, head_dim] (e.g. GLM 4.7):
+        self.q_norm = Glm4MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        weight shape: [head_dim] -> does NOT match valid_sizes -> skipped
+        Status: No sharding needed (weight doesn't match q/k output dims)
+
+    Args:
+        layer_subgraph: The attention layer subgraph
+        linear_nodes: The linear nodes (q/k/v projections)
+        transform_container: Container for sharding transformations
+
+    Returns:
+        Number of nodes added for sharding
+    """
+    if layer_subgraph.layer_type != LayerType.ATTENTION or layer_subgraph.terminating_node is None:
+        return 0
+
+    config = transform_container.config
+    world_size = config.world_size
+    gm = linear_nodes[0].graph.owning_module
+    added_nodes = 0
+
+    # Collect valid output dimensions from q/k/v projections
+    # These are the only valid sizes for intermediate weights (e.g., q_norm, k_norm)
+    valid_sizes = set()
+    for lin_node in linear_nodes:
+        try:
+            wkey = extract_weight_name(lin_node)
+            w = gm.get_parameter(wkey)
+            valid_sizes.add(w.shape[0])  # q: num_heads*head_dim, k/v: num_kv_heads*head_dim
+        except (AttributeError, AssertionError):
+            pass
+
+    # Find all intermediate weight nodes between q/k/v projections and o_proj.
+    intermediate_weight_nodes = subgraph(
+        sources=linear_nodes,
+        sinks=[layer_subgraph.terminating_node],
+        include=lambda n: n.op == "get_attr",
+    )
+
+    for weight_node in intermediate_weight_nodes:
+        weight_key = weight_node.target
+
+        # First check: is this weight consumed by a torch_rmsnorm op
+        if len(list(weight_node.users)) == 0:
+            continue
+
+        user_node = list(weight_node.users)[0]
+        if not is_op(user_node, torch.ops.auto_deploy.torch_rmsnorm):
+            continue
+
+        # Verify this is a true QK norm by checking its input traces back to q_proj or k_proj
+        # This filters out input_layernorm which feeds INTO q/k/v projections (not after them)
+        rmsnorm_input = user_node.args[0]  # activation input (not the weight)
+        upstream_proj = _find_upstream_qk_proj(rmsnorm_input, gm)
+        if upstream_proj is None:
+            ad_logger.debug(
+                f"Skipping {user_node.name} - input does not trace back to q_proj or k_proj "
+                f"(likely input_layernorm or other non-QK norm)"
+            )
+            continue
+
+        ad_logger.debug(f"Found QK norm {user_node.name} with upstream projection: {upstream_proj}")
+
+        # Try to get the parameter
+        try:
+            param = gm.get_parameter(weight_key)
+        except AttributeError:
+            ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
+            continue
+
+        # Only shard 1D weights (RMSNorm weights are always 1D)
+        if param.dim() != 1:
+            ad_logger.debug(
+                f"Skipping intermediate weight {weight_key} with dim={param.dim()} (not 1D)"
+            )
+            continue
+
+        # Check if the weight size is divisible by world_size
+        if param.shape[0] % world_size != 0:
+            ad_logger.debug(
+                f"Skipping intermediate weight {weight_key} with shape {param.shape} "
+                f"(not divisible by world_size={world_size})"
+            )
+            continue
+
+        # Check if weight size matches one of the q/k/v projection output dimensions
+        # This filters out per-head norms and unrelated weights like inv_freq
+        if valid_sizes and param.shape[0] not in valid_sizes:
+            ad_logger.debug(
+                f"Skipping intermediate weight {weight_key} with shape {param.shape} "
+                f"(not in valid_sizes={valid_sizes}, likely per-head norm)"
+            )
+            continue
+
+        # Add RMSNormShardingInfo to replace with sharded_rmsnorm
+        # This handles both weight sharding and op replacement in one transform
+        if transform_container.add(
+            RMSNormShardingInfo.from_node(
+                user_node,
+                config=config,
+                world_size=world_size,
+            )
+        ):
+            ad_logger.debug(
+                f"Added RMSNormShardingInfo for {user_node.name} "
+                f"(will replace with sharded_rmsnorm for global mean)"
+            )
+            added_nodes += 1
+
+    return added_nodes
 
 
 def _process_column_sharding(
@@ -1949,6 +2246,10 @@ def _process_column_sharding(
                     )
                 )
         # chunk nodes do not need to be updated
+
+    # Shard intermediate weights (e.g. q/k/v -> q_norm, k_norm ... -> o_proj) for attention layers
+    added_nodes += _shard_qk_norm(layer_subgraph, linear_nodes, transform_container)
+
     return added_nodes
 
 

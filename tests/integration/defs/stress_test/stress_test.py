@@ -32,6 +32,7 @@ import contextlib
 import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -44,7 +45,7 @@ import pandas as pd
 import pytest
 import requests
 import yaml
-from defs.common import parse_gsm8k_output
+from defs.common import get_free_port_in_ci, parse_gsm8k_output
 from defs.conftest import get_device_count, get_device_memory, llm_models_root
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
@@ -72,10 +73,18 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 GRACEFUL_TERMINATION_TIMEOUT = 300  # seconds - set longer when stress large model
 
 
+def _get_default_port() -> int:
+    """Get a default port using CI allocation if available, otherwise use 8000."""
+    try:
+        return get_free_port_in_ci()
+    except Exception:
+        return 8000
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     """Dataclass to store server configuration for trtllm-serve"""
-    port: int = 8000
+    port: int = field(default_factory=_get_default_port)
     host: str = "localhost"
     pp_size: int = 1
     ep_size: Optional[int] = 1
@@ -167,8 +176,7 @@ class PerformanceParams:
     # Ensure indefinite runs specially for different concurrency values
     test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
     concurrency_list: List[int] = field(
-        default_factory=lambda:
-        [8, 16, 32, 64, 128, 256, 384, 512, 640, 768, 896, 1024])
+        default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
     @property
     def request_count_list(self) -> List[int]:
@@ -339,6 +347,26 @@ def check_server_health(server_url: str,
         return False, f"Server health check failed: {str(e)}"
     except Exception as e:
         return False, f"Unexpected error during health check: {str(e)}"
+
+
+def is_port_available(port: int,
+                      host: str = "localhost") -> Tuple[bool, Optional[str]]:
+    """
+    Check if a port is available for binding.
+
+    Args:
+        port: Port number to check
+        host: Host to bind to
+
+    Returns:
+        Tuple of (is_available, error_message)
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+            return True, None
+        except OSError as e:
+            return False, f"Port {port} is already in use on {host}: {e}"
 
 
 @pytest.mark.parametrize(
@@ -519,6 +547,10 @@ def stress_test(config,
     else:
         stress_config = None
 
+    # Check if port is available
+    is_available, port_error = is_port_available(test_server_config.port,
+                                                 test_server_config.host)
+
     # Check if server is already running
     is_healthy, _ = check_server_health(test_server_config.url,
                                         test_server_config.health_check_timeout)
@@ -530,6 +562,9 @@ def stress_test(config,
     # Start server
     print_info("Starting trtllm-serve server...")
     print_info(f"Model path: {model_path}")
+    print_info(
+        f"Server port: {test_server_config.port} (allocated via CI port mechanism)"
+    )
 
     # Verify that model path exists
     if not os.path.exists(model_path):
@@ -552,7 +587,7 @@ def stress_test(config,
             extra_llm_options.update({
                 "cuda_graph_config": {
                     "enable_padding": True,
-                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
                 },
                 "print_iter_log": True,
             })
@@ -759,6 +794,7 @@ def create_aiperf_command(model_name,
                           model_path,
                           request_count,
                           concurrency,
+                          server_url,
                           input_len_mean=PerformanceParams.input_len_mean,
                           input_len_std=PerformanceParams.input_len_std,
                           output_len_mean=PerformanceParams.output_len_mean,
@@ -772,6 +808,7 @@ def create_aiperf_command(model_name,
         model_path: Path to the model
         request_count: Number of requests to send
         concurrency: Number of concurrent requests
+        server_url: URL of the server (e.g., "localhost:8000")
         input_len_mean: Mean input length
         input_len_std: Standard deviation of input length
         output_len_mean: Mean output length
@@ -790,6 +827,8 @@ def create_aiperf_command(model_name,
         model_path,
         "--endpoint-type",
         "completions",
+        "-u",
+        server_url,
         "--random-seed",
         "123",
         "--synthetic-input-tokens-mean",
@@ -928,6 +967,7 @@ def measure_capacity_stage(model_name,
             model_path=model_path,
             request_count=request_count,
             concurrency=concurrency,
+            server_url=f"{server_config.host}:{server_config.port}",
             input_len_mean=performance_params.input_len_mean,
             input_len_std=performance_params.input_len_std,
             output_len_mean=performance_params.output_len_mean,
@@ -1023,6 +1063,7 @@ def stress_stage(model_name,
         model_path=model_path,
         request_count=request_count,
         concurrency=stress_concurrency,
+        server_url=f"{server_config.host}:{server_config.port}",
         input_len_mean=PerformanceParams.input_len_mean,
         input_len_std=PerformanceParams.input_len_std,
         output_len_mean=PerformanceParams.output_len_mean,

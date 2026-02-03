@@ -483,7 +483,6 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 
 void KVCacheBlock::freeDescendantsRecursively()
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     bool hasChildren = !mNextBlocks.empty();
     if (hasChildren)
     {
@@ -1636,6 +1635,11 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 TLLM_CHECK_WITH_INFO(block->getBlockId() == bid,
                     "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
                 needMatch = false; // no matching needed for following blocks
+
+                if (block->getPrevBlock() != nullptr)
+                {
+                    block->getPrevBlock()->removeNextBlock(block->getBlockKey());
+                }
                 block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
                 block->setPrevBlock(searchRoot);
                 block->setPrevBlockInSeq(searchRoot);
@@ -2915,6 +2919,18 @@ void KVCacheManager::removeToken(RequestIdType requestId)
 
 void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLengths)
 {
+    // Check if the sequence still exists before rewinding
+    // In overlap mode with MTP, the request may have been terminated and removed
+    // from mSequences before rewindKVCache is called
+    {
+        std::scoped_lock lck(mSequencesMtx);
+        if (mSequences.find(requestId) == mSequences.end())
+        {
+            TLLM_LOG_DEBUG("Request %lu has already been removed from KV cache manager, skipping rewind", requestId);
+            return;
+        }
+    }
+
     for (SizeType32 si = 0; si < rewindLengths; ++si)
     {
         removeToken(requestId);

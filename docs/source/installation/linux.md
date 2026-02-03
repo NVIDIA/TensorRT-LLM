@@ -37,7 +37,7 @@
    Once all prerequisites are in place, TensorRT LLM can be installed as follows:
 
    ```bash
-   pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
+   pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
    ```
    **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 
@@ -72,5 +72,5 @@ There are some known limitations when you pip install pre-built TensorRT LLM whe
    ```bash
    CURRENT_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
    echo "torch==$CURRENT_TORCH_VERSION" > /tmp/torch-constraint.txt
-   pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
+   pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
    ```
