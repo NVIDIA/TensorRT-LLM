@@ -120,7 +120,7 @@ class ReasoningParserFactory:
         try:
             reasoning_parser_class = ReasoningParserFactory.parsers[
                 reasoning_parser.lower()]
-            if reasoning_parser == "deepseek-r1":
+            if reasoning_parser == "deepseek-r1" or reasoning_parser == "qwen3":
                 return reasoning_parser_class(reasoning_at_start=True)
             elif reasoning_parser == "nano-v3":
                 # Note: If the model is with reasoning (default behavior), `reasoning_at_start` should be True, and the starting response should be parsed into `reasoning_content`.
