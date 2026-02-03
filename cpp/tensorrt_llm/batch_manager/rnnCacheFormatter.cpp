@@ -77,12 +77,6 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto const selfTPNum = selfParallel.mTensorParallelism;
     auto const selfPPRank = selfIdx / selfTPNum;
     auto const& selfLayersPerPP = selfParallel.mRnnLayerNumPerPP;
-
-    SizeType32 selfStartLayer = 0; // global layer id
-    for (SizeType32 pp = 0; pp < selfPPRank; pp++)
-    {
-        selfStartLayer += selfLayersPerPP[pp];
-    }
     SizeType32 const numLocalLayers = selfLayersPerPP[selfPPRank];
 
     if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
@@ -154,9 +148,11 @@ void RnnCacheFormatter::format(TransferSession& session)
     }
 
     auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
-    auto [outputBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
-        = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
-            cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
+    auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
+        cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
+    auto& outputBuffers = std::get<0>(allocationResult);
+    auto& bufferCoverTargetNum = std::get<1>(allocationResult);
+    auto& onlyUseDynamicBuffer = std::get<2>(allocationResult);
 
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
 
@@ -214,8 +210,10 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     int deviceId;
     TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
 
-    auto [pickUpConnections, localRankIndices] = cache_formatter_utils::pickRecvConnections<RnnCacheState>(
+    auto pickRecvConnResult = cache_formatter_utils::pickRecvConnections<RnnCacheState>(
         connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto pickUpConnections = std::get<0>(pickRecvConnResult);
+    auto localRankIndices = std::get<1>(pickRecvConnResult);
     auto const sourceNum = pickUpConnections.size();
 
     if (sourceNum == 0)
@@ -237,12 +235,6 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     auto const selfTPNum = selfParallel.mTensorParallelism;
     auto const selfPPRank = selfIdx / selfTPNum;
     auto const& selfLayersPerPP = selfParallel.mRnnLayerNumPerPP;
-
-    SizeType32 selfStartLayer = 0;
-    for (SizeType32 pp = 0; pp < selfPPRank; pp++)
-    {
-        selfStartLayer += selfLayersPerPP[pp];
-    }
     SizeType32 const numLocalLayers = selfLayersPerPP[selfPPRank];
 
     if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
@@ -312,9 +304,11 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     size_t remainNoCoverSourceNum = 0;
     size_t bufferCoverSourceNum = 0;
     auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
-    auto [recvBuffers, bufferCoverSourceNumTmp, onlyUseDynamicBuffer]
-        = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
-            cacheBufferId, static_cast<int>(sourceNum), bufferSizesPerSource, bufferManager);
+    auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
+        cacheBufferId, static_cast<int>(sourceNum), bufferSizesPerSource, bufferManager);
+    auto& recvBuffers = std::get<0>(allocationResult);
+    auto& bufferCoverSourceNumTmp = std::get<1>(allocationResult);
+    auto& onlyUseDynamicBuffer = std::get<2>(allocationResult);
 
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
     bufferCoverSourceNum = bufferCoverSourceNumTmp;

@@ -393,8 +393,10 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
-    auto [pickUpConnections, localRankIndices]
+    auto pickRecvConnResult
         = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto pickUpConnections = std::get<0>(pickRecvConnResult);
+    auto localRankIndices = std::get<1>(pickRecvConnResult);
     if (pickUpConnections.empty())
     {
         TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: %ld", llmRequest.mRequestId);

@@ -63,8 +63,6 @@ private:
     static size_t computeTransferBufferSize(RnnStateManager* rnnStateManager, std::optional<size_t> maxNumTokens);
 
     RnnStateManager* mRnnStateManager;
-    nvinfer1::DataType mConvStateDataType;
-    nvinfer1::DataType mSsmStateDataType;
 };
 
 } // namespace tensorrt_llm::batch_manager::rnn_state_manager
