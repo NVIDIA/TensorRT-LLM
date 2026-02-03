@@ -65,7 +65,8 @@ def cu_seqlens_to_chunk_indices_offsets(
     seq_ends = cu_wo0[1:]
 
     misaligned = (seq_starts % chunk_size) > 0
-    prefix_inserts = torch.cumsum(misaligned, dim=0) - misaligned
+    misaligned_int = misaligned.to(torch.int64)
+    prefix_inserts = torch.cumsum(misaligned_int, dim=0) - misaligned_int
     extra_chunks = misaligned.sum()
 
     # N is small scalar; sync for size only.
