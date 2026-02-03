@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 import torch
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    pass
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
@@ -627,14 +627,6 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
         self._execution_stats = None
-
-    @classmethod
-    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Model-specific defaults for HunyuanDense.
-
-        Disables block reuse due to hybrid Mamba architecture constraints.
-        """
-        return {"kv_cache_config": {"enable_block_reuse": False}}
 
     def load_weights(self, weights: ConsumableWeightsDict):
         tp_size = self.model_config.mapping.tp_size
