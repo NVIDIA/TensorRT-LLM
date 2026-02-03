@@ -1,6 +1,7 @@
 __pycache__/
 .vscode
 .cursor
+.ai
 *.engine
 *.engine.config
 *.cache
