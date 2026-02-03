@@ -222,8 +222,24 @@ class ModelLoader:
         if checkpoint_loader is None:
             return llm_args
 
-        config = checkpoint_loader.load_config(checkpoint_dir,
-                                               trust_remote_code=True)
+        # Pass relevant context from llm_args to config loader so that
+        # _resolve_class can correctly determine the model class
+        config_kwargs = {
+            'trust_remote_code': True,
+            'mm_encoder_only': llm_args.mm_encoder_only,
+        }
+
+        # Add mapping if available
+        if hasattr(llm_args, 'parallel_config') and llm_args.parallel_config:
+            config_kwargs['mapping'] = llm_args.parallel_config.mapping
+
+        # Add spec_config if available
+        if hasattr(llm_args, 'decoding_config') and llm_args.decoding_config:
+            # The decoding_config attribute contains the actual spec_config
+            config_kwargs[
+                'spec_config'] = llm_args.decoding_config.decoding_config
+
+        config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
 
