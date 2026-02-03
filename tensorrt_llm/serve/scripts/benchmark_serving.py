@@ -42,7 +42,8 @@ from tensorrt_llm.serve.scripts.backend_request_func import (
 from tensorrt_llm.serve.scripts.benchmark_dataset import (
     AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
     HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
-    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
+    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset,
+    LongDataCollectionsDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
 from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
@@ -751,6 +752,9 @@ def main(args: argparse.Namespace):
         elif args.dataset_path in AIMODataset.SUPPORTED_DATASET_PATHS:
             dataset_class = AIMODataset
             args.hf_split = "train"
+        elif args.dataset_path in LongDataCollectionsDataset.SUPPORTED_DATASET_PATHS:
+            dataset_class = LongDataCollectionsDataset
+            args.hf_split = "train"
         else:
             supported_datasets = set([
                 dataset_name for cls in HuggingFaceDataset.__subclasses__()
@@ -778,6 +782,7 @@ def main(args: argparse.Namespace):
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             output_len=args.hf_output_len,
+            input_len=args.hf_input_len,
         )
 
     elif args.dataset_name == "trtllm_custom":
@@ -1337,6 +1342,13 @@ if __name__ == "__main__":
         default=None,
         help="Output length for each request. Overrides the output lengths "
         "from the sampled HF dataset.",
+    )
+    hf_group.add_argument(
+        "--hf-input-len",
+        type=int,
+        default=None,
+        help="Input length for each request. Discard or clamp the input lengths "
+        "from the sampled HF dataset to the specified value.",
     )
 
     sampling_group = parser.add_argument_group("sampling parameters")
