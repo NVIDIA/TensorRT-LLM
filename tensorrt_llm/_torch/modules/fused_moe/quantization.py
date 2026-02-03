@@ -579,8 +579,6 @@ def load_activation_scales_fp8_qdq(module: torch.nn.Module, weights: Dict):
 
     return max_fc31_input_scale, max_fc2_input_scale
 
-    return tmp_fc31_input_scale.max(), tmp_fc2_input_scale.max()
-
 
 def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
                                            w1_weight_scale, w3_weight_scale,
