@@ -205,10 +205,19 @@ def test_cancel_request_in_transmission(attention_type):
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
 
 
-def create_hybrid_cache_manager(mapping, dtype):
+def create_hybrid_cache_manager(mapping,
+                                dtype,
+                                mamba_conv_dtype=torch.float16,
+                                mamba_ssm_dtype=torch.float16):
     """
     Create a MambaHybridCacheManager for testing hybrid models.
     This manager handles both KV cache (attention layers) and Mamba cache (RNN layers).
+
+    Args:
+        mapping: The mapping configuration.
+        dtype: KV cache dtype (DataType enum).
+        mamba_conv_dtype: Mamba conv states dtype (torch dtype).
+        mamba_ssm_dtype: Mamba SSM states dtype (torch dtype).
     """
     num_mamba_layers = 1
     num_attention_layers = 1
@@ -226,8 +235,8 @@ def create_hybrid_cache_manager(mapping, dtype):
         mamba_head_dim=64,
         mamba_num_layers=num_mamba_layers,
         mamba_layer_mask=mamba_layer_mask,
-        mamba_cache_dtype=torch.float16,
-        mamba_ssm_cache_dtype=torch.float16,
+        mamba_cache_dtype=mamba_conv_dtype,
+        mamba_ssm_cache_dtype=mamba_ssm_dtype,
         kv_cache_config=KvCacheConfig(
             max_tokens=256,
             enable_block_reuse=False,
@@ -268,15 +277,72 @@ def fill_hybrid_cache_buffers(hybrid_cache_manager):
         ssm_buffer.copy_(random_ssm)
 
 
+@pytest.fixture(scope="function")
+def hybrid_dtypes(request):
+    """
+    Returns (kv_dtype, mamba_conv_dtype, mamba_ssm_dtype) based on the parametrized string.
+
+    KV dtype: fp8, bf16
+    Conv dtype: fp8, bf16, fp32
+    SSM dtype: bf16, fp32
+    """
+    kv_dtype_str, conv_dtype_str, ssm_dtype_str = request.param
+
+    # Map KV dtype strings to DataType enum
+    kv_dtype_map = {
+        "fp8": DataType.FP8,
+        "bf16": DataType.BF16,
+    }
+
+    # Map Mamba dtype strings to torch dtype
+    torch_dtype_map = {
+        "fp8": torch.float8_e4m3fn,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+
+    return kv_dtype_map[kv_dtype_str], torch_dtype_map[
+        conv_dtype_str], torch_dtype_map[ssm_dtype_str]
+
+
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("backend", ["UCX"], ids=["UCX"])
-def test_hybrid_cache_transceiver_single_process(backend):
+@pytest.mark.parametrize(
+    "hybrid_dtypes",
+    [
+        # (kv_dtype, conv_dtype, ssm_dtype)
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "bf16", "fp32"),
+        ("bf16", "fp32", "bf16"),
+        ("bf16", "fp32", "fp32"),
+        ("fp8", "bf16", "bf16"),
+        ("fp8", "bf16", "fp32"),
+        ("fp8", "fp32", "bf16"),
+        ("fp8", "fp32", "fp32"),
+    ],
+    ids=[
+        "kv_bf16-conv_bf16-ssm_bf16",
+        "kv_bf16-conv_bf16-ssm_fp32",
+        "kv_bf16-conv_fp32-ssm_bf16",
+        "kv_bf16-conv_fp32-ssm_fp32",
+        "kv_fp8-conv_bf16-ssm_bf16",
+        "kv_fp8-conv_bf16-ssm_fp32",
+        "kv_fp8-conv_fp32-ssm_bf16",
+        "kv_fp8-conv_fp32-ssm_fp32",
+    ],
+    indirect=["hybrid_dtypes"],
+)
+def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
+                                                 monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
     mapping = Mapping(world_size=1, rank=0)
-    dtype = DataType.HALF
+    kv_dtype, mamba_conv_dtype, mamba_ssm_dtype = hybrid_dtypes
 
     # Create hybrid cache managers (combines KV + Mamba) for context and generation
-    hybrid_cache_manager_ctx = create_hybrid_cache_manager(mapping, dtype)
-    hybrid_cache_manager_gen = create_hybrid_cache_manager(mapping, dtype)
+    hybrid_cache_manager_ctx = create_hybrid_cache_manager(
+        mapping, kv_dtype, mamba_conv_dtype, mamba_ssm_dtype)
+    hybrid_cache_manager_gen = create_hybrid_cache_manager(
+        mapping, kv_dtype, mamba_conv_dtype, mamba_ssm_dtype)
 
     cache_transceiver_config = CacheTransceiverConfig(backend=backend,
                                                       max_tokens_in_buffer=512)
@@ -317,7 +383,7 @@ def test_hybrid_cache_transceiver_single_process(backend):
     hybrid_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
                                                ctx_request.prompt_len, 1,
                                                ctx_request)
-    hybrid_cache_manager_ctx.mamba_impl.allocate_cache_blocks(
+    hybrid_cache_manager_ctx._impl.mamba_impl.allocate_cache_blocks(
         [ctx_request.py_request_id])
 
     # Send ctx request (sends both KV and Mamba states)
@@ -338,7 +404,7 @@ def test_hybrid_cache_transceiver_single_process(backend):
     hybrid_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
                                                gen_request.prompt_len, 1,
                                                gen_request)
-    hybrid_cache_manager_gen.mamba_impl.allocate_cache_blocks(
+    hybrid_cache_manager_gen._impl.mamba_impl.allocate_cache_blocks(
         [gen_request.py_request_id])
 
     cache_transceiver_gen.request_and_receive_async(gen_request)
@@ -361,7 +427,9 @@ def test_hybrid_cache_transceiver_single_process(backend):
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("backend", ["UCX"], ids=["UCX"])
-def test_hybrid_cache_transceiver_cancel_request(backend):
+def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
+
     mapping = Mapping(world_size=1, rank=0)
     dtype = DataType.HALF
 
@@ -404,7 +472,7 @@ def test_hybrid_cache_transceiver_cancel_request(backend):
     hybrid_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
                                                ctx_request.prompt_len, 1,
                                                ctx_request)
-    hybrid_cache_manager_ctx.mamba_impl.allocate_cache_blocks(
+    hybrid_cache_manager_ctx._impl.mamba_impl.allocate_cache_blocks(
         [ctx_request.py_request_id])
 
     # Send ctx request
@@ -431,7 +499,7 @@ def test_hybrid_cache_transceiver_cancel_request(backend):
     hybrid_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
                                                gen_request.prompt_len, 1,
                                                gen_request)
-    hybrid_cache_manager_gen.mamba_impl.allocate_cache_blocks(
+    hybrid_cache_manager_gen._impl.mamba_impl.allocate_cache_blocks(
         [gen_request.py_request_id])
 
     # Try to receive gen request

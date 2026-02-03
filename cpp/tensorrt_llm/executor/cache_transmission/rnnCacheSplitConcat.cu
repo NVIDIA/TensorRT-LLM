@@ -395,8 +395,8 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
         "splitRnnConvState - numLayers: %d, convDimLocal: %d, dConvMinus1: %d, "
         "domainPPSize: %d, domainTPSize: %d, convDimDomainTP: %d, "
         "outputCacheNum: %zu, inputBlockNum: %zu, peerDupHeadFactor: %d",
-        numLayers, convDimLocal, dConvMinus1, domainPPSize, domainTPSize, convDimDomainTP,
-        outputSplitBlocks.size(), inputBlockNum, targetRankInfo.mPeerDupHeadFactor);
+        numLayers, convDimLocal, dConvMinus1, domainPPSize, domainTPSize, convDimDomainTP, outputSplitBlocks.size(),
+        inputBlockNum, targetRankInfo.mPeerDupHeadFactor);
 
     // Set up device pointers
     T const** inputConvPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
@@ -658,7 +658,7 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     constexpr int blockDimx = 128;
     dim3 gridDim(numLayers, outputBlockNum);
     dim3 blockDim(blockDimx);
-    
+
     int const rowStrideBytes = dConvMinus1 * sizeof(T);
     int vecSizeByte = 16;
     while (vecSizeByte > static_cast<int>(sizeof(T)) && (rowStrideBytes % vecSizeByte) != 0)
@@ -771,8 +771,8 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
         "concatRnnSsmState - numLayers: %d, numHeadsLocal: %d, headDim: %d, dState: %d, "
         "domainPPSize: %d, domainTPSize: %d, headNumDomainTP: %d, "
         "inputCacheNum: %zu, peerDupHeadFactor: %d",
-        numLayers, numHeadsLocal, headDim, dState, domainPPSize, domainTPSize, headNumDomainTP,
-        inputSplitBlocks.size(), targetRankInfo.mPeerDupHeadFactor);
+        numLayers, numHeadsLocal, headDim, dState, domainPPSize, domainTPSize, headNumDomainTP, inputSplitBlocks.size(),
+        targetRankInfo.mPeerDupHeadFactor);
 
     T** outputSsmPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
     T const** inputCachePtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data()) + outputBlockNum;

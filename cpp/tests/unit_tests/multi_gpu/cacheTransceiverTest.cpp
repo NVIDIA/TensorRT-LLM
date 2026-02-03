@@ -1275,7 +1275,6 @@ protected:
     std::mt19937 generator;
 };
 
-
 TEST_P(AsymmetricalCacheTest, TestCase)
 {
     if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
