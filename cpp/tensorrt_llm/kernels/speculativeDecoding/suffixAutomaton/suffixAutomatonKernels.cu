@@ -18,6 +18,8 @@
  * https://github.com/basetenlabs/sa_spec
  */
 
+#include <cassert>
+
 #include "suffixAutomatonKernels.h"
 #include "tensorrt_llm/common/config.h"
 
@@ -43,7 +45,7 @@ __global__ void suffixAutomatonExtendKernel(int batchSize, int draftLength, Suff
     }
 
     int batchIndex = batchIndices[i];
-    TLLM_ASSERT(batchIndex >= 0 && batchIndex < static_cast<int>(SAConfig::MAX_SLOTS));
+    assert(batchIndex >= 0 && batchIndex < static_cast<int>(SAConfig::MAX_SLOTS));
 
     SuffixAutomaton& slot = slots[batchIndex];
 
@@ -96,6 +98,21 @@ size_t getSuffixAutomatonMaxSlots()
 size_t getSuffixAutomatonMaxSeqLen()
 {
     return SAConfig::MAX_SEQUENCE_LENGTH;
+}
+
+void initAutomaton(SuffixAutomaton* sa)
+{
+    // Use placement new to initialize the SuffixAutomaton struct
+    new (sa) SuffixAutomaton();
+}
+
+void buildAutomatonFromTokens(SuffixAutomaton* sa, int const* tokens, int numTokens)
+{
+    // Extend the automaton with each token
+    for (int i = 0; i < numTokens; i++)
+    {
+        sa->extend(Token(tokens[i]));
+    }
 }
 
 } // namespace kernels::speculative_decoding::suffix_automaton

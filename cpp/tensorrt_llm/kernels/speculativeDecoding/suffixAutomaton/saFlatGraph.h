@@ -20,9 +20,10 @@
 
 #pragma once
 
+#include <cassert>
+
 #include "saFlatHashMap.h"
 #include "saTypes.h"
-#include "tensorrt_llm/common/assert.h"
 
 #include "tensorrt_llm/common/config.h"
 
@@ -110,7 +111,7 @@ struct SAFlatGraph
     SA_CUDA_CALLABLE NodeIndex* at(NodeIndex nodeId, Key key, bool insertIfNotExists = false)
     {
 
-        TLLM_ASSERT(nodeId < mNodes.size());
+        assert(nodeId < mNodes.size());
 
         auto& node = mNodes.at(nodeId);
 
@@ -143,7 +144,7 @@ struct SAFlatGraph
             auto& newEdges = mAllocator.at(newEdgesPtr);
 
             auto* valPtr = newEdges.at(node.mInlinedKey, true);
-            TLLM_ASSERT(valPtr != nullptr);
+            assert(valPtr != nullptr);
             *valPtr = node.mInlinedNodeIndex;
 
             node.setEdgesPtr(newEdgesPtr);
@@ -171,13 +172,13 @@ struct SAFlatGraph
             {
                 auto* valPtr = newEdges.at(kvPair.first, true);
                 // must have space
-                TLLM_ASSERT(valPtr != nullptr);
+                assert(valPtr != nullptr);
                 *valPtr = kvPair.second;
             }
 
             // insert the new key
             res = newEdges.at(key, true);
-            TLLM_ASSERT(res != nullptr);
+            assert(res != nullptr);
 
             // free the old hashmap
             mAllocator.free(edgesPtr);
@@ -206,7 +207,7 @@ struct SAFlatGraph
 
     SA_CUDA_CALLABLE NodeData& pushBackClone(NodeIndex oldNodeId)
     {
-        TLLM_ASSERT(oldNodeId < mNodes.size());
+        assert(oldNodeId < mNodes.size());
 
         auto& oldNode = mNodes.at(oldNodeId);
 

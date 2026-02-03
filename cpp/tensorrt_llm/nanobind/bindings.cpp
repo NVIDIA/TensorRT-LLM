@@ -47,6 +47,7 @@
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
+#include "tensorrt_llm/nanobind/suffixAutomaton/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -511,6 +512,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     auto mUserbuffers = mInternal.def_submodule("userbuffers", "User buffers internal bindings");
     tensorrt_llm::kernels::userbuffers::UserBufferBindings::initBindings(mUserbuffers);
+
+    auto mSuffixAutomaton = mInternal.def_submodule("suffix_automaton", "Suffix automaton internal bindings");
+    tensorrt_llm::nanobind::suffix_automaton::initBindings(mSuffixAutomaton);
 
     // NVLS allocators
     nb::class_<tr::IpcNvlsHandle>(m, "IpcNvlsHandle")

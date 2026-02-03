@@ -1130,6 +1130,19 @@ class MTPDecodingConfig(DecodingBaseConfig):
     use_mtp_vanilla: bool = False
     mtp_eagle_one_model: bool = True
 
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding"
+    )
+    sa_spec_threshold: int = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+                     " length of the suffix match exceeds the threshold, use"
+                     " the suffix automaton output for the next draft tokens."
+    )
+
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
     num_nextn_predict_layers_from_model_config: int = 1

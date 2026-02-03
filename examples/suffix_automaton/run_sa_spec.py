@@ -85,6 +85,12 @@ def parse_args():
         default=1,
         help="Tensor parallelism size",
     )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=None,
+        help="Maximum sequence length (default: model's max)",
+    )
     return parser.parse_args()
 
 
@@ -104,13 +110,19 @@ def create_llm(args) -> "LLM":
     print(f"  - SA enabled: {args.use_sa_spec}")
     if args.use_sa_spec:
         print(f"  - SA threshold: {args.sa_spec_threshold}")
+    if args.max_seq_len is not None:
+        print(f"  - Max seq len: {args.max_seq_len}")
     print()
     
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model,
         tensor_parallel_size=args.tp_size,
         speculative_config=mtp_config,
     )
+    if args.max_seq_len is not None:
+        llm_kwargs["max_seq_len"] = args.max_seq_len
+    
+    llm = LLM(**llm_kwargs)
     
     return llm
 
@@ -123,7 +135,7 @@ def run_generation(
     """Run generation and return outputs with timing."""
     
     sampling_params = SamplingParams(
-        max_new_tokens=max_new_tokens,
+        max_tokens=max_new_tokens,
         temperature=0.0,  # Greedy decoding for reproducibility
     )
     

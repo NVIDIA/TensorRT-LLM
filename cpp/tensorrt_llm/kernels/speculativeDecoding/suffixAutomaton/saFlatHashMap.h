@@ -24,10 +24,11 @@
 #include <cstring>
 #include <utility>
 
+#include <cassert>
+
 #include "saBuffer.h"
 #include "saCudaCallable.h"
 #include "saNamedType.h"
-#include "tensorrt_llm/common/assert.h"
 
 #include "tensorrt_llm/common/config.h"
 
@@ -62,7 +63,7 @@ struct SAFlatHashMap
 
     SA_CUDA_CALLABLE SAFlatHashMap& operator=(SAFlatHashMap const& other)
     {
-        TLLM_ASSERT(mCapacity == other.mCapacity);
+        assert(mCapacity == other.mCapacity);
         std::memcpy(static_cast<void*>(data()), static_cast<void const*>(other.data()), sizeof(Bucket) * mCapacity);
         return *this;
     }

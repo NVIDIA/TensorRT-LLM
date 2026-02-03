@@ -7,8 +7,9 @@ demonstrating the pattern matching and draft token prediction capabilities.
 """
 
 import time
-import torch
 from typing import List, Tuple
+
+import torch
 
 # Import the native SA implementation
 from tensorrt_llm._torch.speculative.suffix_automaton import (
@@ -46,7 +47,7 @@ def test_basic_pattern_matching():
         print(f"Match found! Length: {length}, Position after match: {pos}")
         
         # Get draft tokens (what follows the first occurrence of AB)
-        drafts = state.get_draft_tokens(pos, 4)
+        drafts = state.get_draft_tokens(pos, 2)
         print(f"Draft tokens (what followed 'AB' before): {drafts}")
         
         # Expected: [30, 40] since that's what came after the first "AB"

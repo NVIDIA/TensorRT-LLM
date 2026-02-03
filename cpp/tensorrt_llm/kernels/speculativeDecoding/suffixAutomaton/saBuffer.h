@@ -29,7 +29,6 @@
 #include <vector>
 
 #include "saCudaCallable.h"
-#include "tensorrt_llm/common/assert.h"
 
 #include "tensorrt_llm/common/config.h"
 
@@ -48,13 +47,13 @@ struct SABuffer
 
     SA_CUDA_CALLABLE T const& at(IndexT row) const
     {
-        TLLM_ASSERT(static_cast<size_t>(+row) < Size);
+        assert(static_cast<size_t>(+row) < Size);
         return mData[+row];
     }
 
     SA_CUDA_CALLABLE T& at(IndexT row)
     {
-        TLLM_ASSERT(static_cast<size_t>(+row) < Size);
+        assert(static_cast<size_t>(+row) < Size);
         return mData[+row];
     }
 
@@ -162,12 +161,12 @@ struct SADynamicBuffer
     SA_CUDA_CALLABLE void extend(size_t n)
     {
         mLength = IndexT(+mLength + n);
-        TLLM_ASSERT(static_cast<size_t>(+mLength) <= Size);
+        assert(static_cast<size_t>(+mLength) <= Size);
     }
 
     SA_CUDA_CALLABLE T& pushBack(T const& value)
     {
-        TLLM_ASSERT(static_cast<size_t>(+mLength) < Size);
+        assert(static_cast<size_t>(+mLength) < Size);
 
         T& result = mData.at(mLength);
         result = value;
@@ -177,7 +176,7 @@ struct SADynamicBuffer
 
     SA_CUDA_CALLABLE T& pushBack(T&& value)
     {
-        TLLM_ASSERT(static_cast<size_t>(+mLength) < Size);
+        assert(static_cast<size_t>(+mLength) < Size);
         T& result = mData.at(mLength);
         result = std::move(value);
         mLength = IndexT(+mLength + 1);
@@ -186,7 +185,7 @@ struct SADynamicBuffer
 
     SA_CUDA_CALLABLE T& popBack()
     {
-        TLLM_ASSERT(!empty());
+        assert(!empty());
         T& result = mData.at(IndexT(+mLength - 1));
         mLength = IndexT(+mLength - 1);
         return result;
@@ -194,13 +193,13 @@ struct SADynamicBuffer
 
     SA_CUDA_CALLABLE T const& at(IndexT row) const
     {
-        TLLM_ASSERT(row < mLength);
+        assert(row < mLength);
         return mData.at(row);
     }
 
     SA_CUDA_CALLABLE T& at(IndexT row)
     {
-        TLLM_ASSERT(row < mLength);
+        assert(row < mLength);
         return mData.at(row);
     }
 

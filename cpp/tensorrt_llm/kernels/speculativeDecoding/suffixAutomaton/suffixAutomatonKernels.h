@@ -94,6 +94,16 @@ size_t getSuffixAutomatonMaxSlots();
 //! \return Maximum sequence length
 size_t getSuffixAutomatonMaxSeqLen();
 
+//! \brief Initialize a SuffixAutomaton using placement new
+//! \param sa Pointer to allocated memory for the SuffixAutomaton
+void initAutomaton(SuffixAutomaton* sa);
+
+//! \brief Build a suffix automaton by extending with the given tokens
+//! \param sa Pointer to an initialized SuffixAutomaton
+//! \param tokens Array of token IDs
+//! \param numTokens Number of tokens in the array
+void buildAutomatonFromTokens(SuffixAutomaton* sa, int const* tokens, int numTokens);
+
 } // namespace kernels::speculative_decoding::suffix_automaton
 
 TRTLLM_NAMESPACE_END

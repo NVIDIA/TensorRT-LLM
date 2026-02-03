@@ -26,13 +26,14 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include <cassert>
+
 #include "saConfig.h"
 #include "saCudaCallable.h"
 #include "saFlatGraph.h"
 #include "saNamedType.h"
 #include "saOptional.h"
 #include "saTypes.h"
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -112,7 +113,7 @@ struct SuffixAutomaton
             NodeIndex p = pOpt.value();
 
             NodeIndex* qPtr = mStates.at(p, token);
-            TLLM_ASSERT(qPtr != nullptr);
+            assert(qPtr != nullptr);
             NodeIndex q = *qPtr;
 
             auto& pData = mStates.at(p);
@@ -167,7 +168,7 @@ struct SuffixAutomaton
         {
             auto& nodeData = mStates.at(state);
             SAOptional<TextIndex> posOpt = nodeData.pos;
-            TLLM_ASSERT(!posOpt.hasValue() || +*posOpt <= +mTokens.size());
+            assert(!posOpt.hasValue() || +*posOpt <= +mTokens.size());
 
             bool isLast = posOpt.hasValue() && +*posOpt + 1 >= +mTokens.size();
 
@@ -196,7 +197,7 @@ struct SuffixAutomaton
             return SAOptional<LookupResult>();
         }
 
-        TLLM_ASSERT(*posOpt < mTokens.size());
+        assert(*posOpt < mTokens.size());
 
         // Return the position after the suffix match
         TextIndex matchEnd = TextIndex(+*posOpt + 1);

@@ -17,11 +17,12 @@
 
 #pragma once
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
+namespace nb = nanobind;
 
-namespace tensorrt_llm::pybind::suffix_automaton
+namespace tensorrt_llm::nanobind::suffix_automaton
 {
 
-void initBindings(pybind11::module_& m);
+void initBindings(nb::module_& m);
 
-} // namespace tensorrt_llm::pybind::suffix_automaton
+} // namespace tensorrt_llm::nanobind::suffix_automaton

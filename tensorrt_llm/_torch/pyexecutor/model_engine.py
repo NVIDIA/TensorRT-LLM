@@ -3,6 +3,7 @@ import contextlib
 import functools
 import gc
 import inspect
+import itertools
 import math
 import os
 import weakref
@@ -467,6 +468,7 @@ class PyTorchModelEngine(ModelEngine):
             self.cache_indirection_attention = None
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
+        self.sa_spec_seen_requests: set[int] = set()
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
@@ -3321,7 +3323,13 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        if self.mapping.is_last_pp_rank():
+        # Initialize SA state for new requests (only if SA speculative decoding is enabled)
+        use_sa_spec = (self.spec_config is not None 
+                       and getattr(self.spec_config, 'use_sa_spec', False))
+
+        
+        if use_sa_spec and self.mapping.is_last_pp_rank():
+            logger.info(f"use_sa_spec: {use_sa_spec} start to build sa state for new requests")
             for request in itertools.chain(
                 scheduled_requests.context_requests,
                 scheduled_requests.generation_requests
@@ -3334,6 +3342,8 @@ class PyTorchModelEngine(ModelEngine):
                     # Use lazy import to avoid circular dependency
                     from ..speculative import suffix_automaton as sa_spec
                     sa_spec.add_request(request.py_request_id, request.get_tokens(0))
+            
+            logger.info(f"use_sa_spec: {use_sa_spec} build sa state for new requests done")
 
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
