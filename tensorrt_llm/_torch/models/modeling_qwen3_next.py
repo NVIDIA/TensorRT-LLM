@@ -16,9 +16,12 @@
 # limitations under the License.
 
 import os
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
 import torch.nn.functional as F
 import triton
 import triton.language as tl

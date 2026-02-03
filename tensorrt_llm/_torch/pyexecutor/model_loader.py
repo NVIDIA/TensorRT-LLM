@@ -300,6 +300,9 @@ class ModelLoader:
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
+            finally:
+                if 'memo' in locals():
+                    del memo
 
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)
@@ -428,9 +431,13 @@ class ModelLoader:
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
 
         # Allow overriding the number of layers via environment variable
+        # Note: This is kept for backward compatibility, but model_kwargs is preferred
         num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",
                                                  "0"))
         if num_layers_override > 0:
+            logger.warning(
+                f"TLLM_OVERRIDE_LAYER_NUM is deprecated. Use model_kwargs instead: "
+                f"model_kwargs={{'num_hidden_layers': {num_layers_override}}}")
             config.pretrained_config.num_hidden_layers = num_layers_override
             for sub_config in ["text_config", "vision_config"]:
                 if hasattr(config.pretrained_config, sub_config):
