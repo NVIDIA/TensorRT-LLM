@@ -1760,6 +1760,35 @@ def tunable_allreduce(
         trigger_completion_at_end,
     )
 
+    if hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
+        if input.numel() > 0 and input.size(0) > 0:
+            spec = AllReduceRunner.tuning_config.dynamic_tensor_specs[0]
+            base_val = int(input.size(spec.dim_idx))
+            if callable(spec.gen_tuning_buckets):
+                if AllReduceRunner.tuning_config.tune_max_num_tokens is None:
+                    opt_shapes = spec.gen_tuning_buckets(base_val)
+                else:
+                    opt_shapes = spec.gen_tuning_buckets(
+                        AllReduceRunner.tuning_config.tune_max_num_tokens)
+            else:
+                opt_shapes = spec.gen_tuning_buckets
+
+            opt_shapes = set(opt_shapes)
+            if AllReduceRunner.tuning_config.tune_max_num_tokens is not None:
+                opt_shapes.add(
+                    min(AllReduceRunner.tuning_config.tune_max_num_tokens,
+                        base_val))
+            else:
+                opt_shapes.add(base_val)
+
+            elements_per_token = input.numel() // input.size(0)
+            if elements_per_token > 0:
+                element_size = input.element_size()
+                for tokens in sorted([int(v) for v in opt_shapes if v > 0]):
+                    size_bytes = int(tokens * elements_per_token * element_size)
+                    torch.ops.trtllm.preallocate_nccl_window_buffer(
+                        group, size_bytes, 2)
+
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
         [allreduce_runner],
