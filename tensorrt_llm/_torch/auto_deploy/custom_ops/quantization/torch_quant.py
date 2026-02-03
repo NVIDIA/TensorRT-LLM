@@ -487,3 +487,73 @@ def _torch_fake_quant_hf_fp8_linear_fake(
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_hf_fp8_linear", mutates_args=())
+def trtllm_hf_fp8_linear(
+    input: torch.Tensor,  # [..., K] bfloat16
+    weight: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [N] or None
+    weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale
+) -> torch.Tensor:
+    """TRT-LLM optimized HuggingFace FineGrainedFP8 linear operation.
+
+    Uses TRT-LLM's optimized fp8_block_scaling_gemm kernel instead of HF's triton kernel.
+    - weight_scale: per-block weight scale with shape [ceil(N/128), ceil(K/128)]
+    - Input is dynamically quantized using fp8_quantize_1x128
+    - Assumes 128x128 block size (standard for DeepSeek/MiniMax style FP8)
+    """
+    from tensorrt_llm._utils import get_sm_version, is_sm_100f
+
+    # Ensure input is bfloat16 for the optimized kernel
+    if input.dtype == torch.float8_e4m3fn:
+        raise ValueError("trtllm_hf_fp8_linear expects bfloat16 input, not FP8")
+
+    # Validate block size is 128 (required by TRT-LLM kernels)
+    N, K = weight.shape
+    scale_n, scale_k = weight_scale.shape
+    block_n = N // scale_n
+    block_k = K // scale_k
+    if block_n != 128 or block_k != 128:
+        raise ValueError(
+            f"trtllm_hf_fp8_linear requires 128x128 block size, but got {block_n}x{block_k}. "
+            f"Weight shape: {weight.shape}, scale shape: {weight_scale.shape}"
+        )
+
+    # Flatten input for GEMM: [..., K] -> [M, K]
+    input_shape = input.shape
+    input_2d = input.reshape(-1, input_shape[-1])
+
+    # SM version-specific paths (following linear.py pattern)
+    if is_sm_100f():
+        # Blackwell path: use fp8_quantize_1x128 + fp8_block_scaling_gemm
+        act_fp8, act_sf = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
+    elif get_sm_version() == 120:
+        # SM120 path
+        from tensorrt_llm._torch.modules.linear import per_token_quant_and_transform
+
+        act_fp8, act_sf = per_token_quant_and_transform(input_2d)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
+    else:
+        # Hopper (SM90) path
+        act_fp8, act_sf = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
+
+    if bias is not None:
+        output = output + bias
+
+    # Reshape back to original batch dimensions: [M, N] -> [..., N]
+    return output.reshape(*input_shape[:-1], weight.shape[0])
+
+
+@trtllm_hf_fp8_linear.register_fake
+def _trtllm_hf_fp8_linear_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    out_features = weight.shape[0]
+    return torch.empty((*input.shape[:-1], out_features), dtype=torch.bfloat16, device=input.device)

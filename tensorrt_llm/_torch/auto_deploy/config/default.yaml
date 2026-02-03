@@ -146,6 +146,9 @@ transforms:
     backend: trtllm
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
+  fuse_hf_fp8_linear:
+    stage: post_load_fusion
+    backend: trtllm
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
