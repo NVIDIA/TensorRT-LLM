@@ -62,7 +62,7 @@ def nano_llm_model():
         tensor_parallel_size=1,
         max_batch_size=2,
         cuda_graph_config=CudaGraphConfig(),
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False, mamba_ssm_cache_dtype="float32"),
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, mamba_ssm_cache_dtype="float32", free_gpu_memory_fraction=0.4),
     )
     yield nano_llm
 
