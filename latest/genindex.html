@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc1" />
+  <meta name="docsearch:version" content="1.3.0rc2" />
 
 
   </head>
@@ -868,6 +868,13 @@
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-mm_embedding_serve-gpus_per_node">trtllm-serve-mm_embedding_serve command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --grpc
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-grpc">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -2479,6 +2486,10 @@
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.cross_kv_cache_fraction">cross_kv_cache_fraction (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.ctx_dp_rank">ctx_dp_rank (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.ctx_info_endpoint">ctx_info_endpoint (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.ctx_request_id">ctx_request_id (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
 </li>
@@ -4293,6 +4304,8 @@
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.layer_quant_mode">layer_quant_mode (tensorrt_llm.llmapi.QuantConfig property)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.layer_types">layer_types (tensorrt_llm.runtime.ModelConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.layer_wise_benchmarks_config">layer_wise_benchmarks_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.normalization.LayerNorm">LayerNorm (class in tensorrt_llm.layers.normalization)</a>
 
@@ -7615,9 +7628,13 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParamsE">tensorrt_llm::executor::ContextPhaseParams (C++ class)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsE9VecTokens13RequestIdTypeNSt8optionalI9VecTokensEE">tensorrt_llm::executor::ContextPhaseParams::ContextPhaseParams (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsE9VecTokens13RequestIdTypePvNSt8optionalI9VecTokensEE">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsE9VecTokens13RequestIdTypeRKNSt6vectorIcEENSt8optionalI9VecTokensEE">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsERK18ContextPhaseParams">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsERR18ContextPhaseParams">[4]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsE9VecTokens13RequestIdTypeNSt8optionalI9VecTokensEENSt8optionalI10SizeType32EENSt8optionalINSt6stringEEE">tensorrt_llm::executor::ContextPhaseParams::ContextPhaseParams (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsE9VecTokens13RequestIdTypePvNSt8optionalI9VecTokensEENSt8optionalI10SizeType32EENSt8optionalINSt6stringEEE">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsE9VecTokens13RequestIdTypeRKNSt6vectorIcEENSt8optionalI9VecTokensEENSt8optionalI10SizeType32EENSt8optionalINSt6stringEEE">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsERK18ContextPhaseParams">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams18ContextPhaseParamsERR18ContextPhaseParams">[4]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams7deleterEPKv">tensorrt_llm::executor::ContextPhaseParams::deleter (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor18ContextPhaseParams12getCtxDpRankEv">tensorrt_llm::executor::ContextPhaseParams::getCtxDpRank (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor18ContextPhaseParams21getDisaggInfoEndpointEv">tensorrt_llm::executor::ContextPhaseParams::getDisaggInfoEndpoint (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NKR12tensorrt_llm8executor18ContextPhaseParams14getDraftTokensEv">tensorrt_llm::executor::ContextPhaseParams::getDraftTokens (C++ function)</a>
 </li>
@@ -7628,6 +7645,10 @@
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor18ContextPhaseParams18getSerializedStateEv">tensorrt_llm::executor::ContextPhaseParams::getSerializedState (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams8getStateEv">tensorrt_llm::executor::ContextPhaseParams::getState (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor18ContextPhaseParams8getStateEv">[1]</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams10mCtxDpRankE">tensorrt_llm::executor::ContextPhaseParams::mCtxDpRank (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams19mDisaggInfoEndpointE">tensorrt_llm::executor::ContextPhaseParams::mDisaggInfoEndpoint (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams12mDraftTokensE">tensorrt_llm::executor::ContextPhaseParams::mDraftTokens (C++ member)</a>
 </li>
@@ -7646,6 +7667,16 @@
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams12releaseStateEv">tensorrt_llm::executor::ContextPhaseParams::releaseState (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams13RequestIdTypeE">tensorrt_llm::executor::ContextPhaseParams::RequestIdType (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams12setCtxDpRankERKNSt8optionalI10SizeType32EE">tensorrt_llm::executor::ContextPhaseParams::setCtxDpRank (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams21setDisaggInfoEndpointERKNSt8optionalINSt6stringEEE">tensorrt_llm::executor::ContextPhaseParams::setDisaggInfoEndpoint (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams14setDraftTokensERKNSt8optionalI9VecTokensEE">tensorrt_llm::executor::ContextPhaseParams::setDraftTokens (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams17setFirstGenTokensERK9VecTokens">tensorrt_llm::executor::ContextPhaseParams::setFirstGenTokens (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams8setReqIdERK13RequestIdType">tensorrt_llm::executor::ContextPhaseParams::setReqId (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18ContextPhaseParams8StatePtrE">tensorrt_llm::executor::ContextPhaseParams::StatePtr (C++ type)</a>
 </li>
@@ -10597,6 +10628,8 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EXL1EEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64, true&gt;::type (C++ type)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64&gt; (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64&gt;::name (C++ member)</a>
@@ -10605,8 +10638,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64&gt;::type (C++ type)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt; (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::name (C++ member)</a>
@@ -13807,6 +13838,8 @@
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">--gpus_per_node</a>
 </li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-grpc">--grpc</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-host">--host</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">--kv_cache_free_gpu_memory_fraction</a>
@@ -14497,9 +14530,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 25, 2026.</p>
+  <p>Last updated on January 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/45d7022">45d7022</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/f42a6cb">f42a6cb</a>.</p>
   
 </div></div>
       
