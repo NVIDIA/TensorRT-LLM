@@ -296,7 +296,6 @@ class GuidedDecoder:
         self.token_mask[:num_bitmask_tokens].copy_(
             self.token_mask_host[:num_bitmask_tokens], non_blocking=True)
 
-    @torch.inference_mode()
     def _apply_bitmask(self,
                        requests: GuidedRequests,
                        logits: torch.Tensor,
@@ -465,9 +464,10 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # torch.compile kernels are called with GIL being held;
         # this could cause deadlock with CUDA callback to Python code.
         # See: https://github.com/pytorch/pytorch/issues/163061
-        torch.compiler.set_stance("force_eager")
+        torch._inductor.config.cpp_wrapper = True
 
     @nvtx_range("GuidedDecoder.add_batch")
+    @torch.compiler.disable
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
                   new_tokens: Optional[torch.Tensor] = None) -> None:
@@ -499,6 +499,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def build(self) -> List[Tuple[int, str]]:
         return self._build(self.requests_hostfunc)
 
+    @torch.compiler.disable
     def execute(self,
                 logits: torch.Tensor,
                 d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
@@ -528,6 +529,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self._init_disagg_gen_requests(self.requests_hostfunc)
 
     @nvtx_range("GuidedDecoder.add_draft_batch")
+    @torch.compiler.disable
     def add_draft_batch(self,
                         new_tokens: torch.Tensor,
                         num_accepted_tokens: torch.Tensor,
@@ -567,6 +569,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
             else:
                 assert req.is_draft
 
+    @torch.compiler.disable
     def execute_draft_batch(self,
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
