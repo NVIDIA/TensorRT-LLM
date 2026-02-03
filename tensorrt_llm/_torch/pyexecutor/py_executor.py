@@ -355,23 +355,30 @@ class PyExecutor:
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
 
-        # Enable global scheduling for attention_dp
-        if self.enable_attention_dp and isinstance(
-                scheduler, SimpleUnifiedScheduler
-        ) and not scheduler.enable_global_scheduling:
-            scheduler.dist = dist
-            scheduler.max_num_active_requests = self.max_num_active_requests
-            scheduler.enable_global_scheduling = True
+        # Configure SimpleUnifiedScheduler
+        if isinstance(scheduler, SimpleUnifiedScheduler):
+            # Configure batch waiting (for TP-only mode)
+            scheduler.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
+            scheduler.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
+            scheduler.enable_batch_waiting = (
+                scheduler.batch_wait_timeout_iters > 0
+                or scheduler.batch_wait_max_tokens_ratio > 0)
 
-            # Configure batching/waiting parameters
-            scheduler.attention_dp_enable_balance = self.attention_dp_enable_balance
-            if self.attention_dp_enable_balance:
-                scheduler.attention_dp_time_out_iters = self.attention_dp_time_out_iters
-                scheduler.attention_dp_batching_wait_iters = self.attention_dp_batching_wait_iters
+            # Enable global scheduling for attention_dp if needed
+            if self.enable_attention_dp and not scheduler.enable_global_scheduling:
+                scheduler.dist = dist
+                scheduler.max_num_active_requests = self.max_num_active_requests
+                scheduler.enable_global_scheduling = True
 
-            logger.info(
-                "Enabled global scheduling for attention_dp (balance=%s)",
-                self.attention_dp_enable_balance)
+                # Configure batching/waiting parameters for attention_dp
+                scheduler.attention_dp_enable_balance = self.attention_dp_enable_balance
+                if self.attention_dp_enable_balance:
+                    scheduler.attention_dp_time_out_iters = self.attention_dp_time_out_iters
+                    scheduler.attention_dp_batching_wait_iters = self.attention_dp_batching_wait_iters
+
+                logger.info(
+                    "Enabled global scheduling for attention_dp (balance=%s)",
+                    self.attention_dp_enable_balance)
 
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
@@ -1519,6 +1526,26 @@ class PyExecutor:
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
 
+    def _validate_new_requests(
+            self, new_requests: List[LlmRequest]) -> List[LlmRequest]:
+        """
+        Validate new requests and handle errors for invalid ones.
+
+        Args:
+            new_requests: List of new requests to validate
+
+        Returns:
+            List of validated requests (invalid ones are removed and errors are handled)
+        """
+        validated_requests = []
+        for request in new_requests:
+            try:
+                self._validate_request(request)
+                validated_requests.append(request)
+            except Exception as e:
+                self._handle_errors(str(e), requests=[request])
+        return validated_requests
+
     def _fetch_and_activate_requests(self):
         """
         Fetch and activate new requests.
@@ -1527,15 +1554,15 @@ class PyExecutor:
             int: Number of newly activated requests
         """
         if isinstance(self.scheduler, SimpleUnifiedScheduler):
-            # SimpleUnifiedScheduler: Fetch + explicit activation
-            # Use expected_num_active_requests for timeout calculation
-            # (initialized to 0, then updated after each activation)
+            # SimpleUnifiedScheduler path: Works for both attention_dp and TP-only modes
+            # Fetch and enqueue requests from executor queue
             self._fetch_and_enqueue_requests(self.waiting_queue,
                                              self.expected_num_active_requests)
-            old_active_count = len(self.active_requests)
 
-            # Activate requests and get expected count (no extra communication needed)
-            # Note: Scheduler handles RequestQueueItem → LlmRequest conversion internally
+            # Activate new requests through scheduler
+            # Scheduler returns LlmRequests (already converted, only once)
+            # For attention_dp: expected_num_active_requests is max across all ranks
+            # For TP-only: expected_num_active_requests is local count
             new_llm_requests, self.expected_num_active_requests = \
                 self.scheduler.activate_new_requests(
                     self.active_requests,
@@ -1546,32 +1573,14 @@ class PyExecutor:
                     self._should_exclude_last_generation_logits()
                 )
 
-            # Merge new requests with existing active requests
-            updated_active_requests = self.active_requests + new_llm_requests
-
-            # Validate newly activated requests (those added after old_active_count)
-            newly_activated = updated_active_requests[old_active_count:]
-
-            def _respond_if_invalid(request: LlmRequest) -> bool:
-                """Immediately fail invalid request. Return True if invalid."""
-                try:
-                    self._validate_request(request)
-                    return False
-                except Exception as e:
-                    self._handle_errors(str(e), requests=[request])
-                    return True
-
-            validated_new_requests = [
-                request for request in newly_activated
-                if not _respond_if_invalid(request)
-            ]
-
-            # Rebuild active_requests with old requests + validated new requests
-            self.active_requests = updated_active_requests[:old_active_count] + validated_new_requests
+            # Validate and add new requests to active_requests
+            validated_new_requests = self._validate_new_requests(
+                new_llm_requests)
+            self.active_requests.extend(validated_new_requests)
 
             return len(validated_new_requests)
         else:
-            # SimpleScheduler: Fetch and activate together
+            # SimpleScheduler path
             new_requests = self._fetch_and_activate_new_requests()
             return len(new_requests)
 
@@ -1583,12 +1592,16 @@ class PyExecutor:
             tuple: (scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs)
         """
         if isinstance(self.scheduler, SimpleUnifiedScheduler):
+            # SimpleUnifiedScheduler path: Works for both attention_dp and TP-only modes
+            # - For attention_dp: Batching done during activation via _apply_batching_filter()
+            # - For TP-only: Batching done during scheduling via _apply_batch_waiting()
             scheduler_output = self.scheduler.schedule_request(
                 self.active_requests, self.inflight_req_ids)
             return (scheduler_output.to_scheduled_requests(),
                     scheduler_output.fitting_disagg_gen_init_requests,
                     scheduler_output.num_fitting_requests)
         else:
+            # SimpleScheduler path
             return self._schedule()
 
     def _kv_connector_start_batch(self, scheduled_batch):

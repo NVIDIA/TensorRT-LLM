@@ -13,8 +13,7 @@ from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
-from .llm_request import (LlmRequest, LlmRequestState,
-                          executor_request_to_llm_request)
+from .llm_request import LlmRequest, LlmRequestState
 from .request_utils import merge_requests
 
 RequestList = list[LlmRequest]
@@ -755,7 +754,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         """
         return {
             'max_num_tokens':
-            self.max_num_tokens if self.max_num_tokens else float('inf'),
+            self.max_num_tokens
+            if self.max_num_tokens is not None else float('inf'),
             'max_batch_size':
             self.max_batch_size,
         }
@@ -1488,23 +1488,34 @@ class PyCapacityScheduler:
         Estimate how many KV cache blocks this request will consume in the next step.
         Read-only: Does not allocate blocks.
 
-        For VSWA, returns worst-case across all window sizes.
+        For VSWA (Variable Sliding Window Attention), returns worst-case (maximum) across
+        all window sizes to ensure resource estimation is conservative.
 
         Args:
             request: The request to estimate for
 
         Returns:
-            int: Number of blocks needed
+            int: Number of blocks needed (worst-case for VSWA)
         """
         if self.kv_cache_manager is None:
             return 0
 
-        # Use default window size (0) for simplicity in non-VSWA cases
-        # For VSWA, this would need to check all window sizes, but for a conservative
-        # estimate we use window_size=0 (which typically represents the primary/max window)
-        window_size = 0
-        return self.kv_cache_manager.get_needed_blocks_one_step(
-            request, lookahead=False, window_size=window_size)
+        # For VSWA, check all window sizes and return worst-case (maximum)
+        # This matches the logic in MaxUtilizationScheduler.prepare_blocks_if_schedulable
+        window_sizes = set(self.kv_cache_manager.max_attention_window_vec)
+        if len(window_sizes) == 0:
+            # No window sizes configured, use default
+            return self.kv_cache_manager.get_needed_blocks_one_step(
+                request, lookahead=False, window_size=0)
+
+        # Check all window sizes and return maximum (worst-case)
+        max_blocks = 0
+        for window_size in window_sizes:
+            blocks_needed = self.kv_cache_manager.get_needed_blocks_one_step(
+                request, lookahead=False, window_size=window_size)
+            max_blocks = max(max_blocks, blocks_needed)
+
+        return max_blocks
 
 
 class SimpleUnifiedScheduler(RequestScheduler):
@@ -1583,6 +1594,14 @@ class SimpleUnifiedScheduler(RequestScheduler):
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
 
+        # 5. Batch waiting state (for TP-only mode)
+        # These track the waiting logic for batch waiting in TP-only mode
+        # Will be configured by PyExecutor if needed
+        self.batch_wait_timeout_iters = 0
+        self.batch_wait_max_tokens_ratio = 0.0
+        self.enable_batch_waiting = False
+        self.batch_wait_iters_count = 0
+
     def activate_new_requests(
         self,
         active_requests: RequestList,
@@ -1596,7 +1615,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         Activate new requests from waiting queue.
 
         For attention_dp mode, uses global coordination to assign requests across ranks.
-        For regular TP mode, returns empty list (activation happens in executor).
+        For regular TP mode, activates requests locally based on available capacity.
 
         Args:
             active_requests: Currently active requests
@@ -1608,21 +1627,156 @@ class SimpleUnifiedScheduler(RequestScheduler):
 
         Returns:
             Tuple of (new_llm_requests, expected_num_active_requests)
-            - new_llm_requests: List of newly activated LlmRequests (empty for TP mode)
+            - new_llm_requests: List of newly activated LlmRequests
             - expected_num_active_requests: Maximum number of active requests across all ranks
         """
-        # Check if we need global coordination
-        if not self.enable_global_scheduling or waiting_queue is None or len(
-                waiting_queue) == 0:
-            # TP mode: No activation here (executor handles it)
+        # Check if we have any waiting requests
+        if waiting_queue is None or len(waiting_queue) == 0:
             return [], len(active_requests)
 
-        # Attention DP mode: Use global coordination to assign requests
-        # Note: _activate_with_global_coordination will gather states first,
-        # then calculate num_new_candidates based on total active requests across all ranks
-        return self._activate_with_global_coordination(
-            active_requests, waiting_queue, cp_config, cp_rank, cp_size,
-            exclude_last_generation_logits)
+        if self.enable_global_scheduling:
+            # Attention DP mode: Use global coordination to assign requests
+            return self._activate_with_global_coordination(
+                active_requests, waiting_queue, cp_config, cp_rank, cp_size,
+                exclude_last_generation_logits)
+        else:
+            # TP-only mode: Activate requests locally
+            return self._activate_local(active_requests, waiting_queue,
+                                        cp_config, cp_rank, cp_size,
+                                        exclude_last_generation_logits)
+
+    def _schedule_generation_only_during_waiting(
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+    ) -> Optional[UnifiedSchedulerOutput]:
+        """
+        Proactive optimization: Schedule only generation requests when in waiting mode.
+
+        This avoids expensive context request scheduling when we're already waiting
+        for more generation requests to accumulate.
+
+        Args:
+            active_requests: Currently active requests
+            inflight_request_ids: Set of inflight request IDs
+
+        Returns:
+            UnifiedSchedulerOutput if still waiting (with empty context_requests),
+            None if should exit waiting mode and run normal scheduling
+        """
+        # Split requests by type
+        generation_requests_only = [
+            r for r in active_requests if not r.is_context_init_state
+        ]
+
+        # Check if we have generation requests to avoid dead waiting
+        if len(generation_requests_only) == 0:
+            # No generation requests, stop waiting to avoid dead lock
+            self.batch_wait_iters_count = 0
+            return None  # Exit to normal path
+
+        # Only schedule generation requests (skip expensive context scheduling)
+        fitting_gen_requests, fitting_disagg_gen_init, paused_gen_requests = \
+            self.capacity_scheduler.schedule_request(generation_requests_only)
+
+        _, generation_requests = \
+            self.micro_batch_scheduler.schedule(fitting_gen_requests, inflight_request_ids)
+
+        # Check if we should stop waiting
+        num_gen_tokens = sum(1 + gen_req.num_draft_tokens
+                             for gen_req in generation_requests)
+
+        max_num_tokens = self.micro_batch_scheduler.max_num_tokens
+        if max_num_tokens is not None:
+            # Check if we've timed out or have enough generation tokens
+            should_stop_waiting = (
+                self.batch_wait_iters_count >= self.batch_wait_timeout_iters
+                or num_gen_tokens
+                >= self.batch_wait_max_tokens_ratio * max_num_tokens)
+
+            if should_stop_waiting:
+                # Stop waiting, next iteration will schedule context requests
+                self.batch_wait_iters_count = 0
+                return None  # Exit to normal path
+            else:
+                # Continue waiting
+                self.batch_wait_iters_count += 1
+        else:
+            # No token budget limit, stop waiting
+            self.batch_wait_iters_count = 0
+            return None  # Exit to normal path
+
+        # Return with empty context requests (still waiting)
+        return UnifiedSchedulerOutput(
+            context_requests=[],
+            generation_requests=generation_requests,
+            paused_requests=paused_gen_requests,
+            fitting_disagg_gen_init_requests=fitting_disagg_gen_init,
+            num_fitting_requests=len(fitting_gen_requests),
+            updated_active_requests=None,
+        )
+
+    def _apply_batch_waiting(
+        self,
+        context_requests: RequestList,
+        generation_requests: RequestList,
+    ) -> RequestList:
+        """
+        Apply batch waiting logic for TP-only mode.
+
+        Return an empty list if scheduled requests fulfill the waiting conditions,
+        otherwise return the original context requests.
+
+        Waiting conditions:
+        - The number of scheduled tokens (both context and generation) is smaller than
+          `self.batch_wait_max_tokens_ratio * self.micro_batch_scheduler.max_num_tokens`
+        - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`
+
+        Args:
+            context_requests: Scheduled context requests
+            generation_requests: Scheduled generation requests
+
+        Returns:
+            Empty list if should wait, otherwise original context_requests
+        """
+        # Skip if batch waiting is not enabled
+        if not self.enable_batch_waiting:
+            return context_requests
+
+        # Skip if no context requests to wait for
+        if len(context_requests) == 0:
+            return context_requests
+
+        # Skip if no generation requests (to avoid dead waiting)
+        if len(generation_requests) == 0:
+            self.batch_wait_iters_count = 0
+            return context_requests
+
+        # Calculate scheduled tokens
+        num_scheduled_ctx_tokens = sum(
+            len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
+        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
+                                       for gen_req in generation_requests)
+        num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+
+        # Get max_num_tokens from micro_batch_scheduler
+        max_num_tokens = self.micro_batch_scheduler.max_num_tokens
+        if max_num_tokens is None:
+            # No token budget limit, cannot apply batch waiting
+            return context_requests
+
+        # Check waiting conditions
+        should_waiting = (self.batch_wait_iters_count
+                          < self.batch_wait_timeout_iters
+                          and num_scheduled_tokens
+                          < self.batch_wait_max_tokens_ratio * max_num_tokens)
+
+        if should_waiting:
+            self.batch_wait_iters_count += 1
+            return []
+
+        self.batch_wait_iters_count = 0
+        return context_requests
 
     def schedule_request(
         self,
@@ -1635,8 +1789,8 @@ class SimpleUnifiedScheduler(RequestScheduler):
         This method handles capacity scheduling (KV cache allocation) and
         micro-batch scheduling (token budget + chunking).
 
-        Note: For SimpleUnifiedScheduler with attention_dp, call activate_new_requests()
-        first to update active_requests before scheduling.
+        For TP-only mode (enable_global_scheduling=False), also applies batch waiting logic.
+        For attention_dp mode (enable_global_scheduling=True), batching is done during activation.
 
         Args:
             active_requests: Currently active requests
@@ -1645,6 +1799,19 @@ class SimpleUnifiedScheduler(RequestScheduler):
         Returns:
             UnifiedSchedulerOutput with scheduled requests
         """
+        # Proactive optimization for TP-only mode:
+        # If we're already in waiting mode, skip context scheduling to save computation
+        if (not self.enable_global_scheduling and self.enable_batch_waiting
+                and self.batch_wait_iters_count > 0):
+            # Try generation-only scheduling (optimization path)
+            result = self._schedule_generation_only_during_waiting(
+                active_requests, inflight_request_ids)
+            if result is not None:
+                # Still waiting, return early with empty context
+                return result
+            # Otherwise, exit waiting mode and fall through to normal path
+
+        # Normal path: schedule all requests
         # Capacity scheduling (KV cache allocation)
         fitting_requests, fitting_disagg_gen_init, paused_requests = \
             self.capacity_scheduler.schedule_request(active_requests)
@@ -1652,6 +1819,12 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # Micro-batch scheduling (token budget + chunking)
         context_requests, generation_requests = \
             self.micro_batch_scheduler.schedule(fitting_requests, inflight_request_ids)
+
+        # Apply batch waiting for TP-only mode
+        # For attention_dp, batching is done during activation via _apply_batching_filter()
+        if not self.enable_global_scheduling:
+            context_requests = self._apply_batch_waiting(
+                context_requests, generation_requests)
 
         # Return results
         return UnifiedSchedulerOutput(
@@ -1667,6 +1840,63 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # Dry run capacity check
         fitting, _, _ = self.capacity_scheduler.schedule_request(requests)
         return len(fitting) == len(requests)
+
+    def _activate_local(
+        self,
+        active_requests: RequestList,
+        waiting_queue: deque,
+        cp_config: dict,
+        cp_rank: int,
+        cp_size: int,
+        exclude_last_generation_logits: bool,
+    ) -> tuple[RequestList, int]:
+        """
+        Activate new requests locally (TP-only mode, no global coordination).
+
+        This method handles request activation when enable_global_scheduling=False,
+        which means we're in TP-only mode without attention_dp.
+
+        Args:
+            active_requests: Currently active requests on this rank
+            waiting_queue: Queue of waiting RequestQueueItems
+            cp_config: CP configuration dict
+            cp_rank: Current CP rank
+            cp_size: Total number of CP ranks
+            exclude_last_generation_logits: Whether to exclude last generation logits
+
+        Returns:
+            Tuple of (new_llm_requests, expected_num_active_requests)
+        """
+        # Calculate local capacity
+        max_new_requests = max(
+            0, self.max_num_active_requests - len(active_requests))
+
+        if max_new_requests == 0:
+            return [], len(active_requests)
+
+        # Pop requests from waiting queue (local capacity only)
+        new_request_items = []
+        for _ in range(min(max_new_requests, len(waiting_queue))):
+            if len(waiting_queue) == 0:
+                break
+            new_request_items.append(waiting_queue.popleft())
+
+        if len(new_request_items) == 0:
+            return [], len(active_requests)
+
+        # Convert RequestQueueItems to LlmRequests (ONLY ONCE)
+        new_llm_requests = merge_requests(
+            new_request_items,
+            cp_config=cp_config,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            exclude_last_generation_logits=exclude_last_generation_logits)
+
+        # For TP-only mode, expected_num_active_requests is local count
+        expected_num_active_requests = len(active_requests) + len(
+            new_llm_requests)
+
+        return new_llm_requests, expected_num_active_requests
 
     def _activate_with_global_coordination(
         self,
@@ -1719,13 +1949,24 @@ class SimpleUnifiedScheduler(RequestScheduler):
         candidate_requests = list(
             itertools.islice(waiting_queue, num_new_candidates))
 
-        # Populate llm_request for simulation (simple conversion, no CP partitioning)
+        # Convert candidate RequestQueueItems to LlmRequests ONCE
+        # These will be used for simulation AND execution (no recreation)
+        candidate_llm_requests = merge_requests(
+            candidate_requests,
+            cp_config=cp_config,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            exclude_last_generation_logits=exclude_last_generation_logits)
+
+        # Attach llm_request back to RequestQueueItem for simulation
+        # Note: merge_requests may create child requests, we need to map them back
+        llm_req_map = {}  # request_id -> LlmRequest
+        for llm_req in candidate_llm_requests:
+            llm_req_map[llm_req.request_id] = llm_req
+
         for req_item in candidate_requests:
-            if not hasattr(req_item,
-                           'llm_request') or req_item.llm_request is None:
-                req_item.llm_request = executor_request_to_llm_request(
-                    req_item.id, req_item.request, req_item.child_req_ids,
-                    exclude_last_generation_logits)
+            if req_item.id in llm_req_map:
+                req_item.llm_request = llm_req_map[req_item.id]
 
         # === PHASE 2: SIMULATE ===
         assignments = self._simulate_global_schedule(candidate_requests,
@@ -1742,32 +1983,28 @@ class SimpleUnifiedScheduler(RequestScheduler):
             len(assignments[rank_id])
             for rank_id in range(len(all_rank_states)))
 
-        # === PHASE 3: EXTRACT ASSIGNED REQUEST QUEUE ITEMS ===
+        # === PHASE 3: EXTRACT ASSIGNED LLMREQUESTS ===
         my_assigned_req_ids = set(assignments[self.dist.rank])
-        assigned_request_items = []
-        remaining_queue = deque()
+        assigned_llm_requests = []
 
-        for req_item in waiting_queue:
+        # Convert to list to allow safe modification of waiting_queue
+        items_to_process = list(waiting_queue)
+        waiting_queue.clear()
+
+        for req_item in items_to_process:
             if (hasattr(req_item, 'llm_request') and req_item.llm_request
                     and req_item.llm_request.request_id in my_assigned_req_ids):
-                assigned_request_items.append(req_item)
+                # Reuse the LlmRequest we created earlier ✅ (created only once!)
+                assigned_llm_requests.append(req_item.llm_request)
+                # Also add child requests if they exist
+                if req_item.llm_request.child_requests:
+                    assigned_llm_requests.extend(
+                        req_item.llm_request.child_requests)
             else:
-                remaining_queue.append(req_item)
+                # Put back unassigned items
+                waiting_queue.append(req_item)
 
-        # Update waiting_queue in place
-        waiting_queue.clear()
-        waiting_queue.extend(remaining_queue)
-
-        # === PHASE 4: CONVERT TO LLM REQUESTS WITH CP PARTITIONING ===
-        new_llm_requests = merge_requests(
-            assigned_request_items,
-            cp_config=cp_config,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            exclude_last_generation_logits=exclude_last_generation_logits)
-
-        # Return new LlmRequests and expected count
-        return new_llm_requests, expected_num_active_requests
+        return assigned_llm_requests, expected_num_active_requests
 
     # ==================================================================================
     # Global Scheduling Methods for attention_dp
