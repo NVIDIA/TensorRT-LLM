@@ -195,7 +195,6 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
                 = (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size / 2) / Cta_tile_p::N)
                 * Cta_tile_p::N;
 
-            // TODO I am not at all confident of this math
             kv_loop_end = min(kv_loop_end,
                 (fmha::div_up(q_sequence_start + Cta_tile_p::M + params.sliding_window_size / 2, int(Cta_tile_p::N))
                     * Cta_tile_p::N));

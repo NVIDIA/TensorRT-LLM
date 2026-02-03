@@ -297,19 +297,19 @@ struct Compute
         // Handle sliding window or chunked attention masking
         if constexpr (SLIDING_OR_CHUNKED_ATTENTION)
         {
-            if (is_chunked_attention)
-            {
-                // Handle chunked attention
-                kv_left_mask_end = div_up(
-                    ((tile_offset_end >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size),
-                    STEP_KV);
-            }
-            else if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+            if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
             {
                 // Handle bidirectional sliding window attention
                 kv_left_mask_end = div_up(tile_offset_end - params.sliding_window_size / 2, STEP_KV);
                 kv_right_mask_start
                     = min(kv_idx_end - 1, (tile_offset_start + params.sliding_window_size / 2 + 1) / STEP_KV);
+            }
+            else if (is_chunked_attention)
+            {
+                // Handle chunked attention
+                kv_left_mask_end = div_up(
+                    ((tile_offset_end >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size),
+                    STEP_KV);
             }
             else
             {

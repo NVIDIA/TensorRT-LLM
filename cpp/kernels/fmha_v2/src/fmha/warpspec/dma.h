@@ -207,13 +207,7 @@ struct DMA
             // Skip initial kv tiles due to sliding_window_size
             if (SLIDING_OR_CHUNKED_ATTENTION)
             {
-                if (is_chunked_attention)
-                {
-                    int kv_offset_start
-                        = ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size);
-                    kv_idx_start = kv_offset_start / STEP_KV;
-                }
-                else if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+                if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
                 {
                     int kv_offset_start = max(0, q_step_offset - params.sliding_window_size / 2);
                     int kv_offset_end = min(kv_steps * STEP_KV - 1, q_step_end + params.sliding_window_size / 2);
@@ -222,6 +216,12 @@ struct DMA
                     // exclusive
                     kv_idx_start = kv_offset_start / STEP_KV;
                     kv_idx_end = kv_offset_end / STEP_KV + 1;
+                }
+                else if (is_chunked_attention)
+                {
+                    int kv_offset_start
+                        = ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size);
+                    kv_idx_start = kv_offset_start / STEP_KV;
                 }
                 else
                 {
