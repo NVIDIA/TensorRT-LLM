@@ -219,6 +219,12 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ## Any changes to versions, additions, or removals of third-party libraries
 /3rdparty/** @NVIDIA/trt-llm-oss-compliance
 
+### Vendored Third-Party Code (triton-kernels)
+## This is a temporary vendored copy of triton-kernels from the Triton project (MIT License).
+## Do not accept contributions to this directory - it should only be updated via scripts/vendor_triton_kernels.py
+## This can be removed if and when triton-kernels is published as a separate wheel.
+/triton_kernels/** @NVIDIA/trt-llm-oss-compliance
+
 ### Docker & Installation Scripts
 ## These scripts install and pin dependency versions
 /docker/common/** @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
