@@ -1847,7 +1847,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return self._get_batch_cache_indices_by_pool_id(
             request_ids,
-            pool_id=self.layer_to_pool_mapping_dict[layer_id],
+            pool_id=self.layer_to_pool_mapping_dict[
+                self.layer_offsets[layer_id]],
             is_kv_aggregate=True)
 
     def _get_batch_cache_indices_by_pool_id(
