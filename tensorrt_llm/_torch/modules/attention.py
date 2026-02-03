@@ -246,10 +246,6 @@ class Attention(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
-        if config.mapping.has_cp_ulysses():
-            tp_size = tp_size * cp_size
-            assert self.num_heads % tp_size == 0
-            assert self.num_key_value_heads % tp_size == 0
         self.tp_size = tp_size
         self.tp_rank = mapping.tp_rank
         assert self.num_heads % tp_size == 0
@@ -368,12 +364,20 @@ class Attention(nn.Module):
                     is_neox=self.pos_embd_params.is_neox,
                 )
 
+        self.attn_num_heads = self.num_heads
+        self.attn_num_key_value_heads = self.num_key_value_heads
+        if config.mapping.has_cp_ulysses():
+            assert self.attn_num_heads % cp_size == 0
+            self.attn_num_heads = self.attn_num_heads // cp_size
+            assert self.attn_num_key_value_heads % cp_size == 0
+            self.attn_num_key_value_heads = self.attn_num_key_value_heads // cp_size
+
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
-            self.num_heads,
+            self.attn_num_heads,
             self.head_dim,
-            self.num_key_value_heads,
+            self.attn_num_key_value_heads,
             pos_embd_params=self.pos_embd_params if self.rope_fusion else None,
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -433,18 +437,19 @@ class Attention(nn.Module):
         if cp_size == 1:
             return q, k, v
         assert k is None and v is None
-        cp_q_head_num = self.num_heads * cp_size
-        cp_kv_head_num = self.num_key_value_heads * cp_size
-        q_view = q.view(-1, cp_q_head_num + 2 * cp_kv_head_num, self.head_dim)
+        q_view = q.view(-1, self.num_heads + 2 * self.num_key_value_heads,
+                        self.head_dim)
 
         q_slices = []
         for cp_idx in range(cp_size):
-            q_slice_start = cp_idx * self.num_heads
-            k_slice_start = cp_idx * self.num_key_value_heads + cp_q_head_num
-            v_slice_start = cp_idx * self.num_key_value_heads + cp_q_head_num + cp_kv_head_num
-            ranges = [(q_slice_start, q_slice_start + self.num_heads),
-                      (k_slice_start, k_slice_start + self.num_key_value_heads),
-                      (v_slice_start, v_slice_start + self.num_key_value_heads)]
+            q_slice_start = cp_idx * self.attn_num_heads
+            k_slice_start = cp_idx * self.attn_num_key_value_heads + self.num_heads
+            v_slice_start = cp_idx * self.attn_num_key_value_heads + self.num_heads + self.num_key_value_heads
+            ranges = [
+                (q_slice_start, q_slice_start + self.attn_num_heads),
+                (k_slice_start, k_slice_start + self.attn_num_key_value_heads),
+                (v_slice_start, v_slice_start + self.attn_num_key_value_heads)
+            ]
             idx_list = [torch.arange(s, e, device=q.device) for s, e in ranges]
             idx = torch.cat(idx_list)
             q_selected = q_view.index_select(dim=1, index=idx)
