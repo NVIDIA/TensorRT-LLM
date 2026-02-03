@@ -1485,6 +1485,15 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
         return getattr(_ContextChunkingPolicy, self.value)
 
 
+class WaitingQueuePolicy(StrEnum):
+    """Waiting queue scheduling policy for managing pending requests."""
+
+    FCFS = "fcfs"  # First-Come-First-Served
+    PRIORITY = "priority"  # By request's priority parameter
+    SHORTEST_FIRST = "shortest_first"  # By input length (SJF)
+    CACHE_AWARE = "cache_aware"  # By KV cache hit rate
+
+
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
 class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
@@ -1522,6 +1531,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None, description="The dynamic batch config to use")
+
+    waiting_queue_policy: WaitingQueuePolicy = Field(
+        default=WaitingQueuePolicy.FCFS,
+        description="The waiting queue scheduling policy")
 
     def _to_pybind(self):
         return _SchedulerConfig(
