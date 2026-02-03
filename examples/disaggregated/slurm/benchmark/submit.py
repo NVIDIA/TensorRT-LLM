@@ -73,8 +73,16 @@ def allocate_gpus(
         local_gpu_id = global_gpu_cursor % gpus_per_node
         return node_id, local_gpu_id
 
+    def align_cursor_to_node_boundary():
+        """Align cursor to next node boundary if we're mid-node."""
+        nonlocal global_gpu_cursor
+        if global_gpu_cursor % gpus_per_node != 0:
+            current_node = global_gpu_cursor // gpus_per_node
+            global_gpu_cursor = (current_node + 1) * gpus_per_node
+
     def assign_server(server_allocation: Dict[str, Any], world_size: int,
                       gpus_per_node: int):
+        """Assign GPUs contiguously for a single server instance."""
         nonlocal global_gpu_cursor
         for _ in range(world_size):
             node_id, gpu_id = get_gpu_location(gpus_per_node)
@@ -91,6 +99,11 @@ def allocate_gpus(
         world_size: int,
         gpus_per_node: int,
     ):
+        # Align to node boundary at the START of each server type (ctx / gen).
+        # 1) Instances of different server types don't share nodes.
+        # 2) Instances of the same server type can share nodes.
+        align_cursor_to_node_boundary()
+
         if server_type not in server_allocations:
             server_allocations[server_type] = {}
         for i in range(num_servers):
@@ -105,6 +118,41 @@ def allocate_gpus(
                    gpus_per_node)
     assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size,
                    gpus_per_node)
+
+    # Validate no port conflicts: each server binds to its first node.
+    bound_addresses = {}  # (first_node, port) -> (server_type, server_id)
+    for server_type in allocations:
+        for server_id, server in allocations[server_type].items():
+            first_node = list(server["nodes"].keys())[0]
+            port = server["port"]
+            addr = (first_node, port)
+            if addr in bound_addresses:
+                conflict = bound_addresses[addr]
+                # Build verbose allocation summary.
+                lines = ["", "=" * 60, "SERVER ALLOCATION SUMMARY", "=" * 60]
+                for stype in allocations:
+                    for sid, srv in allocations[stype].items():
+                        srv_first_node = list(srv["nodes"].keys())[0]
+                        srv_port = srv["port"]
+                        nodes_str = ", ".join(
+                            f"{n}: GPUs {gpus}"
+                            for n, gpus in srv["nodes"].items())
+                        marker = ""
+                        if (stype == server_type and sid == server_id) or \
+                           (stype == conflict[0] and sid == conflict[1]):
+                            marker = " <<<< CONFLICT"
+                        lines.append(f"  {stype} server {sid}: "
+                                     f"bind={srv_first_node}:{srv_port}, "
+                                     f"nodes=[{nodes_str}]{marker}")
+                lines.extend([
+                    "=" * 60,
+                    f"ERROR: {server_type} server {server_id} and "
+                    f"{conflict[0]} server {conflict[1]} both bind to "
+                    f"{first_node}:{port}",
+                    "=" * 60,
+                ])
+                raise RuntimeError("\n".join(lines))
+            bound_addresses[addr] = (server_type, server_id)
 
     return allocations
 

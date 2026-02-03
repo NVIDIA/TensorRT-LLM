@@ -35,6 +35,7 @@ l0_h100:
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_sanity
   - unittest/disaggregated/test_disagg_utils.py
+  - unittest/disaggregated/test_disagg_bench_submit.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
