@@ -999,10 +999,12 @@ def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size)
 # HuggingFace FP8 Block Scale MoE Tests
 # ============================================================================
 
-HF_FP8_BLOCK_SIZE = 128  # HuggingFace FP8 uses 128x128 block scales
+FINEGRAINED_FP8_BLOCK_SIZE = 128  # FineGrained FP8 uses 128x128 block scales
 
 
-def quantize_to_hf_fp8_block_scale(tensor: torch.Tensor, block_size: int = HF_FP8_BLOCK_SIZE):
+def quantize_to_finegrained_fp8_block_scale(
+    tensor: torch.Tensor, block_size: int = FINEGRAINED_FP8_BLOCK_SIZE
+):
     """
     Quantize tensor to FP8 with per-block scales (HuggingFace format).
 
@@ -1055,31 +1057,31 @@ def quantize_to_hf_fp8_block_scale(tensor: torch.Tensor, block_size: int = HF_FP
     return tensor_fp8, scales.to(torch.float32)
 
 
-HF_FP8_BATCH_SIZES = [1, 4]
-HF_FP8_HIDDEN_SIZES = [256, 512]  # Must be multiple of 128
-HF_FP8_NUM_EXPERTS = [4, 8]
-HF_FP8_TOP_K = [2]
-HF_FP8_INTERMEDIATE_SIZES = [256, 512]  # Must be multiple of 128
+FINEGRAINED_FP8_BATCH_SIZES = [1, 4]
+FINEGRAINED_FP8_HIDDEN_SIZES = [256, 512]  # Must be multiple of 128
+FINEGRAINED_FP8_NUM_EXPERTS = [4, 8]
+FINEGRAINED_FP8_TOP_K = [2]
+FINEGRAINED_FP8_INTERMEDIATE_SIZES = [256, 512]  # Must be multiple of 128
 
 
-@pytest.mark.parametrize("batch_size", HF_FP8_BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HF_FP8_HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", HF_FP8_NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", HF_FP8_TOP_K)
-@pytest.mark.parametrize("intermediate_size", HF_FP8_INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("batch_size", FINEGRAINED_FP8_BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", FINEGRAINED_FP8_HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", FINEGRAINED_FP8_NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", FINEGRAINED_FP8_TOP_K)
+@pytest.mark.parametrize("intermediate_size", FINEGRAINED_FP8_INTERMEDIATE_SIZES)
 @pytest.mark.skipif(
     not fp8_compatible() or not trtllm_ops_available(),
     reason="Requires FP8 and TensorRT-LLM ops support",
 )
 @skip_pre_hopper
-def test_trtllm_hf_fp8_block_scale_moe_hopper(
+def test_trtllm_finegrained_fp8_moe_hopper(
     batch_size,
     hidden_size,
     num_experts,
     top_k,
     intermediate_size,
 ):
-    """Test HF FP8 block scale MoE on Hopper (SM90) path.
+    """Test FineGrained FP8 block scale MoE on Hopper (SM90) path.
 
     This test verifies:
     1. The op runs without error
@@ -1088,7 +1090,7 @@ def test_trtllm_hf_fp8_block_scale_moe_hopper(
 
     Note: Pure torch reference comparison has high error due to dynamic activation
     quantization in the kernel. For functional correctness, see
-    test_trtllm_quant_hf_fp8_block_scale_moe_fused_correctness in test_moe_fusion.py
+    test_trtllm_quant_finegrained_fp8_moe_fused_correctness in test_moe_fusion.py
     which compares fused vs unfused ops.
     """
     from tensorrt_llm._utils import is_sm_100f
@@ -1115,12 +1117,12 @@ def test_trtllm_hf_fp8_block_scale_moe_hopper(
     fc2_weights_bf16 = gen_tensor((num_experts, hidden_size, intermediate_size), dtype, scale=0.1)
 
     # Quantize to FP8 with block scales
-    fc1_weights_fp8, fc1_scales = quantize_to_hf_fp8_block_scale(fc1_weights_bf16)
-    fc2_weights_fp8, fc2_scales = quantize_to_hf_fp8_block_scale(fc2_weights_bf16)
+    fc1_weights_fp8, fc1_scales = quantize_to_finegrained_fp8_block_scale(fc1_weights_bf16)
+    fc2_weights_fp8, fc2_scales = quantize_to_finegrained_fp8_block_scale(fc2_weights_bf16)
 
     # Run on Hopper (native path)
     torch.cuda.synchronize()
-    test_output = torch.ops.auto_deploy.trtllm_quant_hf_fp8_block_scale_moe_fused(
+    test_output = torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused(
         x,
         selected_experts,
         routing_weights,
@@ -1154,23 +1156,23 @@ def test_trtllm_hf_fp8_block_scale_moe_hopper(
     )
 
 
-@pytest.mark.parametrize("batch_size", HF_FP8_BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HF_FP8_HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", HF_FP8_NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", HF_FP8_TOP_K)
-@pytest.mark.parametrize("intermediate_size", HF_FP8_INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("batch_size", FINEGRAINED_FP8_BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", FINEGRAINED_FP8_HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", FINEGRAINED_FP8_NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", FINEGRAINED_FP8_TOP_K)
+@pytest.mark.parametrize("intermediate_size", FINEGRAINED_FP8_INTERMEDIATE_SIZES)
 @pytest.mark.skipif(
     not fp8_compatible() or not trtllm_ops_available(),
     reason="Requires FP8 and TensorRT-LLM ops support",
 )
-def test_trtllm_hf_fp8_block_scale_moe_blackwell(
+def test_trtllm_finegrained_fp8_moe_blackwell(
     batch_size,
     hidden_size,
     num_experts,
     top_k,
     intermediate_size,
 ):
-    """Test HF FP8 block scale MoE on Blackwell (SM100+) path.
+    """Test FineGrained FP8 block scale MoE on Blackwell (SM100+) path.
 
     This test verifies:
     1. The op runs without error
@@ -1179,7 +1181,7 @@ def test_trtllm_hf_fp8_block_scale_moe_blackwell(
 
     Note: Pure torch reference comparison has high error due to dynamic activation
     quantization in the kernel. For functional correctness, see
-    test_trtllm_quant_hf_fp8_block_scale_moe_fused_correctness in test_moe_fusion.py
+    test_trtllm_quant_finegrained_fp8_moe_fused_correctness in test_moe_fusion.py
     which compares fused vs unfused ops.
     """
     from tensorrt_llm._utils import is_sm_100f
@@ -1206,12 +1208,12 @@ def test_trtllm_hf_fp8_block_scale_moe_blackwell(
     fc2_weights_bf16 = gen_tensor((num_experts, hidden_size, intermediate_size), dtype, scale=0.1)
 
     # Quantize to FP8 with block scales
-    fc1_weights_fp8, fc1_scales = quantize_to_hf_fp8_block_scale(fc1_weights_bf16)
-    fc2_weights_fp8, fc2_scales = quantize_to_hf_fp8_block_scale(fc2_weights_bf16)
+    fc1_weights_fp8, fc1_scales = quantize_to_finegrained_fp8_block_scale(fc1_weights_bf16)
+    fc2_weights_fp8, fc2_scales = quantize_to_finegrained_fp8_block_scale(fc2_weights_bf16)
 
     # Run on Blackwell (native path)
     torch.cuda.synchronize()
-    test_output = torch.ops.auto_deploy.trtllm_quant_hf_fp8_block_scale_moe_fused(
+    test_output = torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused(
         x,
         selected_experts,
         routing_weights,

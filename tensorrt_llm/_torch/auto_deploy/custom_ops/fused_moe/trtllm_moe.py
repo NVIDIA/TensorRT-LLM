@@ -577,8 +577,8 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("auto_deploy::trtllm_quant_hf_fp8_block_scale_moe_fused", mutates_args=())
-def trtllm_quant_hf_fp8_block_scale_moe_fused(
+@torch.library.custom_op("auto_deploy::trtllm_quant_finegrained_fp8_moe_fused", mutates_args=())
+def trtllm_quant_finegrained_fp8_moe_fused(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -589,9 +589,9 @@ def trtllm_quant_hf_fp8_block_scale_moe_fused(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
-    """TensorRT-LLM Cutlass FP8 Block Scale MoE for HuggingFace FineGrainedFP8 format.
+    """TensorRT-LLM Cutlass FP8 Block Scale MoE for FineGrainedFP8 format.
 
-    This op uses the DeepSeek FP8 block scale format which is compatible with HF FP8.
+    This op uses the DeepSeek FP8 block scale format which is compatible with FineGrained FP8.
     Activations are quantized dynamically at runtime (no pre-computed activation scales).
 
     Computes (per expert):
@@ -710,8 +710,8 @@ def trtllm_quant_hf_fp8_block_scale_moe_fused(
         return output[0].view(x_shape)
 
 
-@trtllm_quant_hf_fp8_block_scale_moe_fused.register_fake
-def trtllm_quant_hf_fp8_block_scale_moe_fused_fake(
+@trtllm_quant_finegrained_fp8_moe_fused.register_fake
+def trtllm_quant_finegrained_fp8_moe_fused_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,

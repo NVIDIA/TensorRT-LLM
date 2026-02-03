@@ -274,8 +274,8 @@ class FakeFP8Linear(nn.Linear):
         )
 
 
-class FakeHFFP8Linear(nn.Linear):
-    """Fake HuggingFace FineGrainedFP8 linear layer for testing.
+class FakeFineGrainedFP8Linear(nn.Linear):
+    """Fake FineGrainedFP8 linear layer for testing.
 
     Mimics the behavior of transformers.integrations.finegrained_fp8.FP8Linear
     with per-block quantization (block_size = [128, 128] by default).
@@ -309,7 +309,7 @@ class FakeHFFP8Linear(nn.Linear):
         self.register_buffer("weight_scale_inv", weight_scale_inv)
 
     def forward(self, x):
-        return torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+        return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
             x, self.weight, self.bias, [], [self.weight_scale_inv], [], []
         )
 

@@ -431,17 +431,17 @@ def torch_fake_quant_int4_gptq_linear_fake(
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
 
 
-@torch.library.custom_op("auto_deploy::torch_fake_quant_hf_fp8_linear", mutates_args=())
-def torch_fake_quant_hf_fp8_linear(
+@torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
+def torch_fake_quant_finegrained_fp8_linear(
     input: torch.Tensor,  # [..., K]
     weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
     bias: Optional[torch.Tensor],  # [N] or None
-    input_scale: List[torch.Tensor],  # unused for HF FP8 (input quantized on the fly)
+    input_scale: List[torch.Tensor],  # unused for FineGrained FP8 (input quantized on the fly)
     weight_scale: List[torch.Tensor],  # [weight_scale_inv]
     input_zp: List[torch.Tensor],  # unused
     weight_zp: List[torch.Tensor],  # unused
 ) -> torch.Tensor:
-    """HuggingFace FineGrainedFP8 linear operation.
+    """FineGrainedFP8 linear operation.
     - weight_scale[0] = weight_scale_inv (per-block weight scale)
     - input_scale, input_zp, weight_zp are unused
     - block_size is inferred from weight and weight_scale_inv shapes
@@ -474,8 +474,8 @@ def torch_fake_quant_hf_fp8_linear(
     return output.to(dtype=input.dtype)
 
 
-@torch_fake_quant_hf_fp8_linear.register_fake
-def _torch_fake_quant_hf_fp8_linear_fake(
+@torch_fake_quant_finegrained_fp8_linear.register_fake
+def _torch_fake_quant_finegrained_fp8_linear_fake(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
     bias: Optional[torch.Tensor],
@@ -489,14 +489,14 @@ def _torch_fake_quant_hf_fp8_linear_fake(
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
 
 
-@torch.library.custom_op("auto_deploy::trtllm_hf_fp8_linear", mutates_args=())
-def trtllm_hf_fp8_linear(
+@torch.library.custom_op("auto_deploy::trtllm_finegrained_fp8_linear", mutates_args=())
+def trtllm_finegrained_fp8_linear(
     input: torch.Tensor,  # [..., K] bfloat16
     weight: torch.Tensor,  # [N, K] float8_e4m3fn
     bias: Optional[torch.Tensor],  # [N] or None
     weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale
 ) -> torch.Tensor:
-    """TRT-LLM optimized HuggingFace FineGrainedFP8 linear operation.
+    """TRT-LLM optimized FineGrainedFP8 linear operation.
 
     Uses TRT-LLM's optimized fp8_block_scaling_gemm kernel instead of HF's triton kernel.
     - weight_scale: per-block weight scale with shape [ceil(N/128), ceil(K/128)]
@@ -507,7 +507,7 @@ def trtllm_hf_fp8_linear(
 
     # Ensure input is bfloat16 for the optimized kernel
     if input.dtype == torch.float8_e4m3fn:
-        raise ValueError("trtllm_hf_fp8_linear expects bfloat16 input, not FP8")
+        raise ValueError("trtllm_finegrained_fp8_linear expects bfloat16 input, not FP8")
 
     # Validate block size is 128 (required by TRT-LLM kernels)
     N, K = weight.shape
@@ -516,7 +516,7 @@ def trtllm_hf_fp8_linear(
     block_k = K // scale_k
     if block_n != 128 or block_k != 128:
         raise ValueError(
-            f"trtllm_hf_fp8_linear requires 128x128 block size, but got {block_n}x{block_k}. "
+            f"trtllm_finegrained_fp8_linear requires 128x128 block size, but got {block_n}x{block_k}. "
             f"Weight shape: {weight.shape}, scale shape: {weight_scale.shape}"
         )
 
@@ -547,8 +547,8 @@ def trtllm_hf_fp8_linear(
     return output.reshape(*input_shape[:-1], weight.shape[0])
 
 
-@trtllm_hf_fp8_linear.register_fake
-def _trtllm_hf_fp8_linear_fake(
+@trtllm_finegrained_fp8_linear.register_fake
+def _trtllm_finegrained_fp8_linear_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
