@@ -5,6 +5,7 @@ from typing import List
 
 import pytest
 import torch
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -14,10 +15,11 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
                                                         SamplingConfig)
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
+                                                             KVCacheManagerV2)
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -359,10 +361,17 @@ accuracy_dict = {
 @pytest.mark.parametrize("num_generation_steps",
                          num_generation_steps,
                          ids=lambda x: f"num_generation_steps: {x}")
+@pytest.mark.parametrize("v2_kv_cache", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
 def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                        generation_seq_len_q: int,
-                       num_generation_steps: List[int]):
+                       num_generation_steps: List[int], v2_kv_cache: bool):
     """Test MLA computation for both context and generation phases"""
+
+    if v2_kv_cache and getSMVersion() != 100:
+        pytest.skip(
+            "v2_kv_cache is only supported for MLA on Blackwell architectures")
+
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads
     q_lora_rank = scenario.q_lora_rank
@@ -403,7 +412,8 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,
                           kv_cache_dtype, context_sequence_lengths,
-                          generation_seq_len_q, num_generation_steps)
+                          generation_seq_len_q, num_generation_steps,
+                          v2_kv_cache)
 
 
 def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
@@ -411,7 +421,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,
                           kv_cache_dtype, context_sequence_lengths,
-                          generation_seq_len_q, num_generation_steps):
+                          generation_seq_len_q, num_generation_steps,
+                          v2_kv_cache):
     AttentionCls = get_attention_backend(backend_name)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -597,7 +608,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         (num_generation_steps + 1) * generation_seq_len_q +
         kv_cache_tokens_per_block - 1
     ) // kv_cache_tokens_per_block * kv_cache_tokens_per_block * max_num_contexts
-    kv_cache_manager = KVCacheManager(
+    kv_cache_cls = KVCacheManagerV2 if v2_kv_cache else KVCacheManager
+    kv_cache_manager = kv_cache_cls(
         KvCacheConfig(
             max_tokens=max_tokens,
             enable_block_reuse=False,
@@ -625,8 +637,14 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         )
         req.paged_kv_block_ids = []
         beam_width = 1
-        kv_cache_manager.impl.add_sequence(req_id, ctx_len, beam_width, req)
         request_list.append(req)
+        if v2_kv_cache:
+            kv_cache = kv_cache_manager._create_kv_cache(req_id, None, None)
+            success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
+            assert success, f"Failed to resume KV cache for request {req_id}"
+            kv_cache.capacity = ctx_len
+        else:
+            kv_cache_manager.impl.add_sequence(req_id, ctx_len, beam_width, req)
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(context_sequence_lengths, dtype=torch.int),
         request_ids=list(range(len(context_sequence_lengths))),
@@ -649,7 +667,11 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         if step > 0:
             for req_id in range(len(context_sequence_lengths)):
                 for _ in range(generation_seq_len_q):
-                    kv_cache_manager.impl.add_token(req_id)
+                    if v2_kv_cache:
+                        kv_cache = kv_cache_manager.kv_cache_map[req_id]
+                        kv_cache.capacity += 1
+                    else:
+                        kv_cache_manager.impl.add_token(req_id)
             attn_metadata = AttentionCls.Metadata(
                 seq_lens=torch.tensor([generation_seq_len_q] *
                                       len(context_sequence_lengths),
