@@ -113,15 +113,15 @@ class CutlassFusedMoE(MoE):
         },
     }
 
-    # Quantization algorithms that support gptoss_style
     _GPTOSS_SUPPORTED_ALGOS = {QuantAlgo.W4A8_MXFP4_MXFP8}
+    """set[QuantAlgo]: Quantization algorithms that support swiglu_gptoss_style."""
 
     @classmethod
     def can_implement(
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if CutlassFusedMoE can implement the given quantization algorithm.
@@ -145,8 +145,8 @@ class CutlassFusedMoE(MoE):
                 - FP8/FP8_BLOCK_SCALES/W4A8_MXFP4_FP8: float16, bfloat16, float32
                 - NVFP4: float16, bfloat16, float8_e4m3fn
                 - W4A16_MXFP4/W4A8_AWQ/W8A16/W4A8_MXFP4_MXFP8: float16, bfloat16
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                CutlassFusedMoE only supports gptoss_style for W4A8_MXFP4_MXFP8 quantization.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CutlassFusedMoE only supports swiglu_gptoss_style for W4A8_MXFP4_MXFP8 quantization.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -160,10 +160,10 @@ class CutlassFusedMoE(MoE):
             return _warn_and_return(
                 f"CutlassFusedMoE requires SM >= 80, got SM{sm_version}")
 
-        # Check gptoss_style support
-        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+        # Check swiglu_gptoss_style support
+        if swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
             return _warn_and_return(
-                f"CutlassFusedMoE gptoss_style only supports W4A8_MXFP4_MXFP8 "
+                f"CutlassFusedMoE swiglu_gptoss_style only supports W4A8_MXFP4_MXFP8 "
                 f"(got quant_algo={quant_algo})")
 
         # Check if quant_algo is supported

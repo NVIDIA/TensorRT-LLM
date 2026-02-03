@@ -37,6 +37,15 @@ class DeepEPLowLatency(Communication):
     DeepEP Low Latency strategy supporting both pre-quant and post-quant
     """
 
+    SUPPORTED_HIDDEN_SIZES = {2048, 2560, 3584, 4096, 5120, 6144, 7168}
+    """set[int]: Hidden sizes supported by the low-latency DeepEP kernel (SWITCH_HIDDEN in launch.cuh)."""
+
+    SUPPORTED_HIDDEN_SIZES_EXTENSION = {4096, 6144, 7168}
+    """set[int]: Hidden sizes supported by extension kernels (nvfp4 post-quant/low-precision combine).
+
+    Sourced from SWITCH_HIDDEN_FOR_EXTENSION_KERNELS in extension_kernels.cu.
+    """
+
     def __init__(
         self,
         mapping: Mapping,
@@ -50,6 +59,13 @@ class DeepEPLowLatency(Communication):
         moe_max_num_tokens: Optional[int] = None,
     ):
         super().__init__(mapping)
+
+        # Validate hidden_size against kernel constraints
+        if hidden_size not in self.SUPPORTED_HIDDEN_SIZES:
+            raise RuntimeError(
+                f"DeepEPLowLatency does not support hidden_size={hidden_size}. "
+                f"Supported hidden sizes: {sorted(self.SUPPORTED_HIDDEN_SIZES)}"
+            )
 
         # Store needed parameters
         self.num_slots = num_slots
@@ -86,8 +102,6 @@ class DeepEPLowLatency(Communication):
         """
         Check if DeepEP Low Latency is supported on the current platform
         """
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") != "1":
-            return False
         if not deep_ep_installed:
             return False
         return True
@@ -95,15 +109,35 @@ class DeepEPLowLatency(Communication):
     def supports_post_quant_dispatch(self) -> bool:
         """
         DeepEP Low Latency supports post-quant for: fp8_qdq, nvfp4, w4afp8
+
+        Note: nvfp4 post-quant dispatch uses extension kernels which require
+        hidden_size in SUPPORTED_HIDDEN_SIZES_EXTENSION.
+
+        Note: fp8_qdq and w4afp8 post-quant dispatch views fp8 (1 byte) as
+        bf16 (2 bytes) via .view(torch.bfloat16), halving the hidden dimension.
+        The halved dimension must be in SUPPORTED_HIDDEN_SIZES for the dispatch
+        kernel (SWITCH_HIDDEN in internode_ll.cu) to work.
         """
         if not self.enable_postquant_alltoall:
             return False
-        return self._has_nvfp4() or self._has_fp8_qdq() or self._has_w4afp8()
+        if self._has_nvfp4():
+            # nvfp4 dispatch uses extension kernels with stricter hidden_size requirement
+            return self.hidden_size in self.SUPPORTED_HIDDEN_SIZES_EXTENSION
+        if self._has_fp8_qdq() or self._has_w4afp8():
+            # fp8/w4afp8 post-quant dispatch views fp8 (1 byte) as bf16 (2 bytes),
+            # halving the hidden dimension. The kernel must support the halved size.
+            return (self.hidden_size // 2) in self.SUPPORTED_HIDDEN_SIZES
+        return False
 
     def supports_low_precision_combine(self) -> bool:
         """
         DeepEP Low Latency supports low-precision combine for: fp8_qdq, nvfp4, w4afp8
+
+        Note: low-precision combine uses extension kernels which require
+        hidden_size in SUPPORTED_HIDDEN_SIZES_EXTENSION.
         """
+        if self.hidden_size not in self.SUPPORTED_HIDDEN_SIZES_EXTENSION:
+            return False
         return self._has_nvfp4() or self._has_fp8_qdq() or self._has_w4afp8()
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:

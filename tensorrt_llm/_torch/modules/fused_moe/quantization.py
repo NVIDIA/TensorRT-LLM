@@ -1,6 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import inspect
 import math
 from abc import ABC, abstractmethod
+from enum import Enum, auto
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -173,11 +189,38 @@ def interleave_linear_and_gate(x: torch.Tensor,
     return x
 
 
+class EplbSupportStatus(Enum):
+    """EPLB support status for FusedMoEMethod classes."""
+    SUPPORTED = auto()
+    NOT_SUPPORTED = auto()
+    NOT_VERIFIED = auto()
+
+
 class FusedMoEMethodBase(ABC):
     """
     Base class for all fused MoE methods.
     """
     weight_alignment: int = 1
+    """Required byte alignment for MoE weight tensors."""
+
+    eplb_support_status: EplbSupportStatus = EplbSupportStatus.NOT_SUPPORTED
+    """Online EPLB support status for this quantization method.
+
+    Defaults to NOT_SUPPORTED for safety so that new subclasses do not
+    silently claim EPLB compatibility.  Subclasses that have been verified
+    to work with online EPLB should override this to SUPPORTED; those that
+    have not yet been tested may set it to NOT_VERIFIED.
+    """
+
+    @classmethod
+    def supports_online_eplb(cls) -> bool:
+        """
+        Check if this FusedMoEMethod supports online EPLB.
+
+        Returns:
+            True if online EPLB is supported, False otherwise.
+        """
+        return cls.eplb_support_status == EplbSupportStatus.SUPPORTED
 
     @classmethod
     def need_load_shared_weights(cls, module):
@@ -552,6 +595,7 @@ class FusedMoEMethodBase(ABC):
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = module.dtype
@@ -656,6 +700,7 @@ def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
 
 
 class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -832,6 +877,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -1091,6 +1137,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
 
 class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         module.sm_version = get_sm_version()
@@ -1224,6 +1271,7 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
 
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         module.sm_version = get_sm_version()
@@ -1657,6 +1705,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
 
 
 class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     group_size = 32
 
@@ -1866,6 +1915,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     """
     Base class for NVFP4 fused MoE methods for all backends.
     """
+    eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
@@ -3157,6 +3207,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
 
 class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
     def create_weights(self, module: torch.nn.Module):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
@@ -3215,6 +3266,7 @@ def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
 
 
 class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def create_weights(self,
                        module: torch.nn.Module,
@@ -3362,6 +3414,7 @@ class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
 
 
 class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
     weight_dtype = FUSED_MOE_MXFP4_WEIGHT_DTYPE
     block_scales_dtype = FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE
     # Cutlass MoE backend requires weight elements to be 128 aligned.
@@ -3534,6 +3587,7 @@ class W4A16MXFP4CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
 
 
 class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
     def create_weights(self, module: torch.nn.Module):
         fake_input_scale = nn.Parameter(torch.empty(
@@ -3564,6 +3618,7 @@ class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
 
 
 class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         fc31_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
@@ -3970,6 +4025,7 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
 
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         fc31_input_dequant = nn.Parameter(torch.empty(

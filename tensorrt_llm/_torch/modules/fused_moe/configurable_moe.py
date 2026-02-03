@@ -100,25 +100,25 @@ class ConfigurableMoE(MoE):
         cls,
         quant_algo,
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ):
         """
         ConfigurableMoE is a wrapper class that delegates to specific backends.
 
         To check capability, query the specific backend class directly:
-        - CutlassFusedMoE.can_implement(quant_algo, dtype_activation, gptoss_style)
-        - TRTLLMGenFusedMoE.can_implement(quant_algo, dtype_activation, gptoss_style)
+        - CutlassFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
+        - TRTLLMGenFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
         - etc.
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation data type
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled
 
         Returns:
             Tuple[bool, Optional[str]]: Always returns (False, reason)
         """
-        del quant_algo, dtype_activation, gptoss_style  # Unused - wrapper class
+        del quant_algo, dtype_activation, swiglu_gptoss_style  # Unused - wrapper class
         return False, (
             "ConfigurableMoE is a wrapper class. "
             "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly."

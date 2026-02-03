@@ -318,7 +318,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if CuteDslFusedMoE can implement the given quantization algorithm.
@@ -327,14 +327,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         - NVFP4: SM in {100, 103}
 
         Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
-        Does NOT support gptoss_style (bias/swiglu with custom alpha/beta/limit).
+        Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation input data type. Only bfloat16 is supported
                 because output dtype is hardcoded to bfloat16 (input/output dtype must match).
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                CuteDslFusedMoE does NOT support gptoss_style.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CuteDslFusedMoE does NOT support swiglu_gptoss_style.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -360,10 +360,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             return _warn_and_return(
                 "CuteDslFusedMoE does not support unquantized mode")
 
-        # CuteDslFusedMoE does NOT support gptoss_style
-        if gptoss_style:
+        # CuteDslFusedMoE does NOT support swiglu_gptoss_style
+        if swiglu_gptoss_style:
             return _warn_and_return(
-                "CuteDslFusedMoE does not support gptoss_style (bias/swiglu with custom alpha/beta/limit)"
+                "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
         # NVFP4 - SM in {100, 103}
