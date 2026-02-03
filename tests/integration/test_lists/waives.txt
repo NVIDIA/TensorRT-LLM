@@ -376,4 +376,3 @@ unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_autotune_fp8_fp4[Routi
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[disable_skip_indexer] SKIP (https://nvbugs/5859886)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-tp4-cutlass-fp8] SKIP (https://nvbugs/5651865)
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False] SKIP (https://nvbugs/5863806)
-accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False] SKIP (https://nvbugs/5863806)
