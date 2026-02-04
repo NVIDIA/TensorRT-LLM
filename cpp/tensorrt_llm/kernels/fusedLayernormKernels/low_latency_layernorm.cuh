@@ -276,7 +276,7 @@ struct LowLatencyLayerNorm
             }
 
             typename PackType<typename Traits::OutputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type normed_output;
-            typename PackType<typename Traits::AccumulatorType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
+            typename PackType<typename Traits::InputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
                 high_precision_normed_output;
             for (int j = 0; j < Traits::PACKED_ELEMS_PER_COMPUTE; j++)
             {
@@ -300,7 +300,7 @@ struct LowLatencyLayerNorm
                 }
                 if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
                 {
-                    high_precision_normed_output.array[j] = normed_out;
+                    high_precision_normed_output.array[j] = (typename Traits::InputType) normed_out;
                 }
                 if constexpr (Traits::OUTPUT_SCALE == SCALE_TYPE::SCALAR)
                 {

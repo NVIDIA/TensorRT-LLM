@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -38,7 +38,7 @@ from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType
+from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
@@ -243,13 +243,21 @@ class NemotronHMOE(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Fp4QuantizedTensor,
+                             Tuple[Union[torch.Tensor, Fp4QuantizedTensor],
+                                   torch.Tensor]],
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
-        assert hidden_states.shape[-1] == self.hidden_dim
-        orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, self.hidden_dim)
+
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_hp = hidden_states
+        else:
+            hidden_states_hp = hidden_states
+
+        assert hidden_states_hp.shape[-1] == self.hidden_dim
+        orig_shape = hidden_states_hp.shape
+        hidden_states_hp_2d = hidden_states_hp.view(-1, self.hidden_dim)
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         def _compute_shared_output():
@@ -260,7 +268,8 @@ class NemotronHMOE(nn.Module):
             return shared_expert_output
 
         def _compute_routed_output():
-            router_logits = self.gate(hidden_states)
+            # Gate uses high precision input for accurate routing decisions.
+            router_logits = self.gate(hidden_states_hp_2d)
 
             routed_hidden_states = hidden_states
             if self.use_latent_moe:
@@ -322,6 +331,9 @@ class NemotronHLayer(DecoderLayer):
             # Enable fused NVFP4 quantization if possible.
             # It might be overridden in `_try_attach_nvfp4_scale` function.
             quantize_type="nvfp4" if self.is_nvfp4 else None,
+            # Enable high precision output for MoE layer.
+            # It might be overridden in `_try_attach_nvfp4_scale` function.
+            return_hp_output=layer_type == "E",
         )
 
         if layer_type == "M":
@@ -356,20 +368,34 @@ class NemotronHLayer(DecoderLayer):
 
         Called lazily on first forward (weights don't exist during __init__).
         """
-        # MoE layer is skipped for now since the gate needs high precision input.
+        # Normal handling for Mamba, MLP, and Attention layers.
         first_linear_attr = {
             'M': 'in_proj',
             '-': 'up_proj',
             '*': 'qkv_proj'
         }.get(self.layer_type)
-
         if first_linear_attr:
             first_linear = getattr(self.mixer, first_linear_attr, None)
             if first_linear and hasattr(first_linear, 'input_scale'):
                 self.norm.nvfp4_scale = first_linear.input_scale
                 return
 
+        # Special handling for MoE layer: fetch shared_expert.up_proj.input_scale
+        # as representation of the input scale.
+        if self.layer_type == 'E':
+            if (hasattr(self.mixer, 'shared_experts')
+                    and self.mixer.shared_experts is not None
+                    and hasattr(self.mixer.shared_experts, 'up_proj')
+                    and hasattr(self.mixer.shared_experts.up_proj,
+                                'input_scale') and
+                    self.mixer.shared_experts.up_proj.input_scale is not None):
+                self.norm.nvfp4_scale = self.mixer.shared_experts.up_proj.input_scale
+                # Enable high precision output for MoE layer.
+                self.norm.return_hp_output = True
+                return
+
         self.norm.is_nvfp4 = False
+        self.norm.return_hp_output = False
 
     def forward(
         self,
@@ -384,7 +410,12 @@ class NemotronHLayer(DecoderLayer):
         if self.norm.is_nvfp4 and not hasattr(self.norm, 'nvfp4_scale'):
             self._try_attach_nvfp4_scale()
 
-        hidden_states, residual = self.norm(hidden_states, residual)
+        if self.norm.return_hp_output:
+            hidden_states, residual, high_precision_normed_output = self.norm(
+                hidden_states, residual)
+            hidden_states = (hidden_states, high_precision_normed_output)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
         hidden_states = self.mixer(hidden_states,
                                    attn_metadata,
                                    spec_metadata=spec_metadata,
