@@ -36,7 +36,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
                                                       _KVCache)
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import GPU_LEVEL
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
+                                                              GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
                                                              typed_range)
@@ -1884,6 +1885,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.allocated_bytes = allocated_bytes
 
         return KVCacheStatus(allocated_bytes=self.impl.get_quota(GPU_LEVEL))
+
+    def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
+        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+        block_ids_per_seq_tensors = [
+            torch.tensor([
+                i // self.num_local_layers if i != BAD_PAGE_INDEX else i
+                for i in sublist
+            ],
+                         dtype=torch.int) for sublist in block_ids_per_seq
+        ]
+        padded_tensor = torch.nn.utils.rnn.pad_sequence(
+            block_ids_per_seq_tensors, batch_first=True, padding_value=0)
+        return padded_tensor
 
     def add_dummy_requests(
             self,
