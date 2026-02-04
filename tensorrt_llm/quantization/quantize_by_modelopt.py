@@ -437,11 +437,11 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                       shuffle=False,
                                       collate_fn=tokenizer.collate_function)
     else:
-        batch_encoded = tokenizer.batch_encode_plus(dataset,
-                                                    return_tensors="pt",
-                                                    padding=True,
-                                                    truncation=True,
-                                                    max_length=block_size)
+        batch_encoded = tokenizer(dataset,
+                                  return_tensors="pt",
+                                  padding=True,
+                                  truncation=True,
+                                  max_length=block_size)
         if device:
             batch_encoded = batch_encoded.to(device)
 
@@ -886,9 +886,11 @@ def quantize_and_export(*,
                     pass
                 tensorrt_llm_config["qwen_type"] = qwen_config.model_type
                 if qwen_config.model_type == "qwen2":
+                    from .._utils import get_rope_theta
                     tensorrt_llm_config[
                         "norm_epsilon"] = qwen_config.rms_norm_eps
-                    tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
+                    tensorrt_llm_config["rotary_base"] = get_rope_theta(
+                        qwen_config)
                 tensorrt_llm_config[
                     "intermediate_size"] = qwen_config.intermediate_size
                 with open(f"{export_path}/config.json", "w") as f:

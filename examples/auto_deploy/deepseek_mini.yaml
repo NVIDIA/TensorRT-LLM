@@ -1,0 +1,7 @@
+# run with
+# python build_and_run_ad.py --model "deepseek-ai/DeepSeek-R1" --args.yaml-extra "deepseek_mini.yaml"
+world_size: 1
+model_kwargs:
+  num_hidden_layers: 4
+skip_loading_weights: true
+compile_backend: torch-simple

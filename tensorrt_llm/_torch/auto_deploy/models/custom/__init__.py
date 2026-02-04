@@ -1,9 +1,9 @@
-from .modeling_eagle import Eagle3DrafterForCausalLM
+from .modeling_deepseek import DeepSeekV3ForCausalLM
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
 
 __all__ = (
-    "Eagle3DrafterForCausalLM",
+    "DeepSeekV3ForCausalLM",
     "NemotronFlashForCausalLM",
     "NemotronFlashPreTrainedTokenizerFast",
     "NemotronHForCausalLM",

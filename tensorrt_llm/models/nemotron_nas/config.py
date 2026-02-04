@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.convert_utils import infer_dtype
+from tensorrt_llm.models.convert_utils import get_rope_theta, infer_dtype
 from tensorrt_llm.models.modeling_utils import PretrainedConfig, QuantConfig
 from tensorrt_llm.models.nemotron_nas.convert import \
     hf_block_configs_to_layer_configs
@@ -198,7 +198,7 @@ class DeciConfig(PretrainedConfig):
                    num_key_value_heads=hf_config.num_key_value_heads,
                    norm_epsilon=hf_config.rms_norm_eps,
                    rotary_scaling=hf_config.rope_scaling,
-                   rotary_base=hf_config.rope_theta,
+                   rotary_base=get_rope_theta(hf_config),
                    vocab_size=hf_config.vocab_size,
                    max_position_embeddings=hf_config.max_position_embeddings,
                    mapping=mapping,

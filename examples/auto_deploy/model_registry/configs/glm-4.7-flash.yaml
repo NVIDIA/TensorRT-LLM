@@ -1,0 +1,31 @@
+model: zai-org/GLM-4.7-Flash
+args:
+  mode: graph
+  # world_size: 8
+  runtime: trtllm
+  trust_remote_code: true
+  compile_backend: torch-simple
+  max_seq_len: 512
+  max_batch_size: 64
+  # attn_page_size: 512
+  # attn_page_size: 64
+  # attn_backend: flashinfer
+  model_factory: AutoModelForCausalLM
+  # skip_loading_weights: true
+  disable_overlap_scheduler: true
+  kv_cache_config:
+    enable_block_reuse: false
+  model_kwargs:
+    torch_dtype: bfloat16
+    # num_hidden_layers: 2
+benchmark:
+  enabled: false
+prompt:
+  batch_size: 2
+  queries:
+  - prompt: 'In simple words and a single sentence, explain the concept of gravity:'
+  - prompt: 'How big is the universe? '
+  sp_kwargs:
+    top_p: 0.95
+    temperature: 1
+# dry_run: false

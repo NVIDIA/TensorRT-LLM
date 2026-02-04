@@ -370,8 +370,8 @@ def main(args):
         if runtime_rank == 0:
             output_ids = outputs['output_ids']
             output_beams_list = [
-                tokenizer.batch_decode(beam_tokens[:, input_lengths[i]:],
-                                       skip_special_tokens=True)
+                tokenizer.decode(beam_tokens[:, input_lengths[i]:],
+                                 skip_special_tokens=True)
                 for i, beam_tokens in enumerate(output_ids)
             ]
             output_ids_list = [
@@ -480,8 +480,8 @@ def main(args):
         tokens_list = output_ids[:, max_length:].tolist()
         output_ids = output_ids.reshape([batch_size, num_sequences, -1])
         output_lines_list = [
-            tokenizer.batch_decode(output_ids[:, i, max_length:],
-                                   skip_special_tokens=True)
+            tokenizer.decode(output_ids[:, i, max_length:],
+                             skip_special_tokens=True)
             for i in range(num_sequences)
         ]
 
