@@ -788,7 +788,7 @@ class Deepseekv3MoE(nn.Module):
         if model_config.quant_config and model_config.quant_config.group_size is not None:
             block_size = model_config.quant_config.group_size
 
-        shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
+        self.shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size)
 
         self.shared_experts = GatedMLP(
@@ -797,7 +797,7 @@ class Deepseekv3MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
-            overridden_tp_size=shared_tp_size,
+            overridden_tp_size=self.shared_tp_size,
             reduce_output=False)
 
         self.allreduce = None
@@ -836,6 +836,9 @@ class Deepseekv3MoE(nn.Module):
         if self.use_dp:
             # If using attention DP, the shared experts also use DP instead of TP.
             shared_tp_size = 1
+        elif hasattr(self.experts, 'num_fused_shared_expert'
+                     ) and self.experts.num_fused_shared_expert > 0:
+            shared_tp_size = self.mapping.moe_tp_size
         else:
             # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
             # The math.gcd operation ensures that shared_tp_size falls in the supported TP sizes.
@@ -913,14 +916,18 @@ class Deepseekv3MoE(nn.Module):
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
-        routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output, _compute_shared_output,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared], self.aux_stream)
+        if self.shared_experts is not None:
+            routed_output, shared_output = maybe_execute_in_parallel(
+                _compute_routed_output, _compute_shared_output,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared], self.aux_stream)
+        else:
+            shared_output = None
+            routed_output = _compute_routed_output()
 
         if not do_finalize:
             return [shared_output, *routed_output]
-        else:
+        elif shared_output is not None:
             if routed_output.dim() == 3:
                 assert shared_output.numel(
                 ) * self.top_k == routed_output.numel(
@@ -931,13 +938,13 @@ class Deepseekv3MoE(nn.Module):
                 assert shared_output.size() == routed_output.size(
                 ), 'unmatched tensor shape'
                 final_hidden_states = shared_output + routed_output
+        else:
+            final_hidden_states = routed_output
 
-            if not self.use_dp and self.mapping.tp_size > 1:
-                final_hidden_states = self.allreduce(
-                    final_hidden_states,
-                    all_reduce_params=final_all_reduce_params)
-
-            return final_hidden_states
+        if not self.use_dp and self.mapping.tp_size > 1:
+            final_hidden_states = self.allreduce(
+                final_hidden_states, all_reduce_params=final_all_reduce_params)
+        return final_hidden_states
 
 
 class DeepseekV3DecoderLayer(DecoderLayer):
@@ -1620,3 +1627,24 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+            # Note: merge shared expert into FusedMoe module
+            if idx >= self.config.first_k_dense_replace and idx % self.config.moe_layer_freq == 0:
+                if hasattr(layer.mlp.experts, 'num_fused_shared_expert'
+                           ) and layer.mlp.experts.num_fused_shared_expert > 0:
+                    layer.mlp.experts.fuse_shared_expert(
+                        layer.mlp.shared_experts)
+                    layer.mlp.shared_experts = None
+
+        # Also process MTP layers if present
+        if self.draft_model is not None and hasattr(self.draft_model,
+                                                    'mtp_layers'):
+            for layer in self.model.layers[self.config.num_hidden_layers:]:
+                # MTP layers also have MoE, need to fuse shared experts
+                if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                    if hasattr(
+                            layer.mlp.experts, 'num_fused_shared_expert'
+                    ) and layer.mlp.experts.num_fused_shared_expert > 0:
+                        layer.mlp.experts.fuse_shared_expert(
+                            layer.mlp.shared_experts)
+                        layer.mlp.shared_experts = None

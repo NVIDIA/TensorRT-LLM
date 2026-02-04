@@ -61,8 +61,8 @@ Runner::Runner(int32_t tileTokensDim)
 }
 
 void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
-    int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
-    int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
+    int32_t numFusedSharedExpert, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts,
+    float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
     int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
@@ -75,6 +75,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
+
+        int32_t const totalExpertsPerToken = topK + numFusedSharedExpert;
 
         // output:
         routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -96,9 +98,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrTopKIds = expertIds;
         routingData.mNumTokens = numTokens;
         routingData.mNumExperts = numExperts;
+        routingData.mNumFusedSharedExperts = numFusedSharedExpert;
         routingData.mNumExpertGroups = nGroup;
         routingData.mNumLimitedGroups = topkGroup;
         routingData.mTopK = topK;
+        routingData.mTotalExpertsPerToken = totalExpertsPerToken;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
         routingData.mTileTokensDim = mTileTokensDim;
         routingData.mLocalExpertsStartIdx = localExpertOffset;
@@ -106,6 +110,23 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumLocalExperts = localNumExperts;
         routingData.mRouteScale = routedScalingFactor;
         routingData.mUseRoutingSoftmax = false;
+
+        // TODO Should these be passed directly instead? This does assume a constant number of experts per device
+        int32_t const numDevices = numExperts / localNumExperts;
+        int32_t const deviceIndex = localExpertOffset / localNumExperts;
+        int32_t const baseTokensPerDevice = numTokens / numDevices;
+        int32_t const remainingTokens = numTokens % numDevices;
+
+        if (deviceIndex < remainingTokens)
+        {
+            routingData.mSharedExpertTokenOffset = (baseTokensPerDevice + 1) * deviceIndex;
+            routingData.mSharedExpertNumTokens = baseTokensPerDevice + 1;
+        }
+        else
+        {
+            routingData.mSharedExpertTokenOffset = remainingTokens + deviceIndex * baseTokensPerDevice;
+            routingData.mSharedExpertNumTokens = baseTokensPerDevice;
+        }
         moe::dev::routing::routingDeepSeek::run(routingData, stream);
     }
     else if (routingMethodType == RoutingMethodType::Llama4)
@@ -115,6 +136,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         {
             TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
         }
+        TLLM_CHECK_WITH_INFO(numFusedSharedExpert == 0, "Llama routing method does not support fusing shared expert");
+
         moe::dev::routing::routingLlama4::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
@@ -159,6 +182,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     else if (routingMethodType == RoutingMethodType::Renormalize /* default */
         || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */)
     {
+        TLLM_CHECK_WITH_INFO(
+            numFusedSharedExpert == 0, "Renormalize routing method does not support fusing shared expert");
+
         moe::dev::routing::routingRenormalize::Data routingData;
 
         //
@@ -434,6 +460,9 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     moe::dev::convertsf::Data& convertSfData, moe::dev::activation::Data& activationData,
     moe::dev::finalize::Data& finalizeData)
 {
+    int32_t const totalNumExperts = args.num_experts + args.num_fused_shared_experts;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+
     // Setup sf conversion data if needed
     convertSfData.inSfPtr = args.hidden_states_scale;
     convertSfData.outSfPtr = workspace.hidden_states_scale_linear;
@@ -452,7 +481,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     activationData.inDqSfsPtr = workspace.gemm1_output_scale;
     activationData.outDqSfsPtr = workspace.activation_output_scale;
     activationData.innerDim = args.intermediate_size * 2;
-    activationData.topK = args.top_k;
+    activationData.topK = totalExpertsPerToken; // TODO Rename topK in activation data struct
     activationData.numTokens = args.num_tokens;
     activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
 
@@ -479,8 +508,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         }
         finalizeData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
         finalizeData.numTokens = args.num_tokens;
-        finalizeData.numExperts = args.num_experts;
-        finalizeData.topK = args.top_k;
+        finalizeData.numExperts = totalNumExperts; // TODO Is this used?
+        finalizeData.topK = totalExpertsPerToken;  // TODO Rename topK in finalize data struct
         // We want to fuse unpadding into the finalize kernel, so we need to use the output hidden size.
         finalizeData.hiddenDim = args.valid_hidden_size.value_or(args.hidden_size);
         finalizeData.hiddenDimPadded = args.output_hidden_size.value_or(args.hidden_size);
@@ -490,12 +519,15 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
 
 std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const& args, int64_t configIndex) const
 {
+    int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_experts;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+
     auto const& config = mPassingConfigs[configIndex];
 
-    auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(args.top_k, args.hidden_size,
-        args.intermediate_size, args.local_num_experts, args.num_tokens, config.gemm1Config));
-    auto workspace_size_fc2 = static_cast<int32_t>(mGemm2.getWorkspaceSizeInBytes(args.top_k, args.hidden_size,
-        args.intermediate_size, args.local_num_experts, args.num_tokens, config.gemm2Config));
+    auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(totalExpertsPerToken,
+        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm1Config));
+    auto workspace_size_fc2 = static_cast<int32_t>(mGemm2.getWorkspaceSizeInBytes(totalExpertsPerToken,
+        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm2Config));
     return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
 
@@ -530,7 +562,6 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
 int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-
     int32_t indexGemm1 = mPermuteGemm1.getDefaultValidConfigIndex(
         topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, validHiddenSize, validIntermediateSize);
     int32_t indexGemm2 = mGemm2.getDefaultValidConfigIndex(
@@ -553,6 +584,9 @@ void Runner::run(
     sync_check_cuda_error(stream);
     setOpsData(args, workspace, convertSfData, activationData, finalizeData);
 
+    int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_experts;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+
     void* hidden_states_scale_linear{args.hidden_states_scale};
 
     auto const& config = mPassingConfigs[configIndex];
@@ -560,7 +594,7 @@ void Runner::run(
     mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
         workspace.expert_weights, args.output1_scales_scalar, args.output1_scales_gate_scalar, args.gemm1_bias,
         args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit, workspace.gemm1_output, workspace.gemm1_output_scale,
-        args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
+        totalExpertsPerToken, args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens,
         workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
         workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
         args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config,
@@ -581,11 +615,11 @@ void Runner::run(
 
     // Run gemm2
     mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, args.output2_scales_scalar,
-        args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k,
-        args.output_hidden_size.value_or(args.hidden_size), args.intermediate_size, args.local_num_experts,
-        args.num_tokens, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
-        workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
-        config.gemm2Config, args.valid_hidden_size.value_or(args.hidden_size),
+        args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, totalExpertsPerToken,
+        args.output_hidden_size.value_or(args.hidden_size), args.intermediate_size, totalLocalExperts, args.num_tokens,
+        workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+        workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream, config.gemm2Config,
+        args.valid_hidden_size.value_or(args.hidden_size),
         args.valid_intermediate_size.value_or(args.intermediate_size));
 
     // Run finalize
