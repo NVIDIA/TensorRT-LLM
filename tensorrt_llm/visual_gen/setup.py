@@ -30,12 +30,15 @@ from setuptools.command.install import install
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 compile_svd = False
+compile_fused_qk_norm_rope = False
 for i in range(torch.cuda.device_count()):
     capability = torch.cuda.get_device_capability(i)
     sm = f"{capability[0]}{capability[1]}"
     if sm == "120":
         compile_svd = True
         print(f"svdquant only supports SM 120, will compile SVD for SM {sm}")
+    if sm in ["80", "86", "89", "90", "100", "103", "120"]:
+        compile_fused_qk_norm_rope = True
 
 class CustomInstallCommand(install):
     def run(self):
@@ -77,7 +80,8 @@ class CustomBuildExtension(BuildExtension):
                 ext.extra_compile_args["cxx"] += ext.extra_compile_args["msvc"]
                 ext.extra_compile_args["nvcc"] += ext.extra_compile_args["nvcc_msvc"]
             else:
-                ext.extra_compile_args["cxx"] += ext.extra_compile_args["gcc"]
+                if "gcc" in ext.extra_compile_args:
+                    ext.extra_compile_args["cxx"] += ext.extra_compile_args["gcc"]
         super().build_extensions()
 
 
@@ -175,9 +179,43 @@ def load_requirements(fname="requirements.txt"):
             lines.append(line)
         return lines
 
+def fused_qk_norm_rope_extension():
+    """Fused QK Norm Rope extension."""
+
+    os.path.dirname(__file__)
+
+    fused_qk_norm_rope_extension = CUDAExtension(
+        name="visual_gen.csrc.fused_qk_norm_rope",
+        sources=["visual_gen/csrc/DiTRMSNormRope/fused_qk_norm_rope_kernel.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "--use_fast_math",
+                "-gencode=arch=compute_80,code=sm_80",
+                "-gencode=arch=compute_86,code=sm_86",
+                "-gencode=arch=compute_89,code=sm_89",
+                "-gencode=arch=compute_90,code=sm_90",
+                "-gencode=arch=compute_100,code=sm_100",
+                "-gencode=arch=compute_103,code=sm_103",
+                "-gencode=arch=compute_120,code=sm_120",
+            ],
+        },
+    )
+    return fused_qk_norm_rope_extension
+
 ext_modules = []
 if compile_svd:
     ext_modules.append(svd_extension())
+if compile_fused_qk_norm_rope:
+    ext_modules.append(fused_qk_norm_rope_extension())
 requirements = load_requirements()
 setup(
     name="visual_gen",

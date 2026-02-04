@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+try:
+    import fused_qk_norm_rope
+except:
+    print("fused_qk_norm_rope is not available")
+
 from .layers import ditAttnProcessor, ditLayerNorm, ditLinear, ditRMSNorm
 from .ops import *  # noqa: F403
 from .utils import create_default_dit_configs, setup_configs
