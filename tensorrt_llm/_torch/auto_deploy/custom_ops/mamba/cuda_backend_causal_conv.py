@@ -39,10 +39,10 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    CausalConvResourceHandler,
     Constant,
     MHACallable,
     ResourceHandlerDict,
-    StateResourceHandler,
 )
 
 
@@ -197,10 +197,12 @@ class CudaBackendCausalConv(AttentionDescriptor):
         in_channels = inp_fake.shape[-1]
         kernel_size = w_fake.shape[-1]
 
-        conv_state_handler = StateResourceHandler(
-            in_channels,
-            max(1, kernel_size - 1),
-            # NOTE: not configurable at the moment, using auto to match the input dtype
+        # NOTE: cuda backend stores kernel_size - 1 elements in state.
+        # CausalConvResourceHandler.state_shape = (conv_dim, d_conv - 1), so d_conv = kernel_size.
+        # Ensure d_conv >= 1 (state_shape[-1] >= 0).
+        conv_state_handler = CausalConvResourceHandler(
+            conv_dim=in_channels,
+            d_conv=max(1, kernel_size),  # state_shape[-1] = d_conv - 1 = kernel_size - 1
             dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
         )
         return {"conv_state_cache": conv_state_handler}
