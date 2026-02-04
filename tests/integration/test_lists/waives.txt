@@ -354,3 +354,5 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_2_nodes_grace_bla
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_2_nodes_grace_blackwell-k2_thinking_fp4_tep8_32k8k] SKIP (https://nvbugs/5846166)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-kimi-k2-thinking-fp4_1k1k_ctx1_dep4_gen1_dep8_eplb0_mtp0_ccb-UCX] SKIP (https://nvbugs/5846166)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-kimi-k2-thinking-fp4_8k1k_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] SKIP (https://nvbugs/5846166)
+full:gb10/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False] SKIP (https://nvbugs/5820511)
+full:gb10/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True] SKIP (https://nvbugs/5820511)
