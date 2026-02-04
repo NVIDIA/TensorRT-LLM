@@ -92,11 +92,6 @@ tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
     TLLM_CHECK_WITH_INFO(!pools.empty(), "Pool index %lu is out of bounds", poolIdx);
     auto const& pool = pools.at(poolIdx);
     auto ptr = block->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
-    for (int dim = 0; dim < ptr->getShape().nbDims; ++dim)
-    {
-        std::cout << ptr->getShape().d[dim] << " ";
-    }
-    std::cout << std::endl;
     auto const blockOffset = block->getMemoryPoolBlockIndex();
     tr::ITensor::SharedPtr blockTensor{tr::ITensor::slice(ptr, blockOffset, 1)};
     return blockTensor;

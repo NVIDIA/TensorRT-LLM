@@ -1109,7 +1109,8 @@ private:
     SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
         GenerationRequest& sequence, LlmRequest& llmRequest,
         std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
-        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
+        bool shareLastContextBlockAmongBeams, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
+        std::string const& directory = "");
 
     //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
     void freeChildren(BlockPtr const& block);
