@@ -1455,12 +1455,17 @@ def deep_gemm_gen_tuning_buckets(x: int):
     return buckets
 
 
+def default_deep_gemm_tuning_buckets(x: int):
+    buckets = tuple(range(8, 128, 8))
+    # Clamp x to be between 4096 and 8192.
+    x = min(x, 8192)
+    x = max(x, 4096)
+    buckets += tuple(range(128, x, 128))
+    return buckets
+
+
 class fp8SwapABGemmRunner(TunableRunner):
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
-        tune_max_num_tokens=4096,
-    )
+    tuning_config = TuningConfig()
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool):
         self.output_dtype = output_dtype
@@ -1477,9 +1482,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        # Encode swap_ab as False (0) and True (1). Currently enabled when GEMM m <= 128.
-        input, _, _ = inputs
-        return [0, 1] if input.shape[0] <= 128 else [0]
+        return [0]
 
     def forward(
         self,
@@ -1494,7 +1497,7 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
-        forward_func = deep_gemm.fp8_gemm_ntt if tactic == 1 else deep_gemm.fp8_gemm_nt
+        forward_func = deep_gemm.fp8_gemm_nt
         forward_func(
             (a, a_sf),
             (weight, weight_scale),
@@ -1511,14 +1514,22 @@ def fp8_swap_ab_gemm(
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
-    tune_max_num_tokens: int = 4096,
+    tune_max_num_tokens: int = -1,
 ) -> torch.Tensor:
     tuner = AutoTuner.get()
     fp8_swap_ab_gemm_runner = fp8SwapABGemmRunner(
         output_dtype,
         disable_ue8m0_cast,
     )
-    fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+
+    # If tune_max_num_tokens is -1, set tune_max_num_tokens to None so that the autotuner will use curr_max_num_tokens.
+    if tune_max_num_tokens > 0:
+        fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+        fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (DynamicTensorSpec(0, 0, deep_gemm_gen_tuning_buckets),)
+    else:
+        fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = None
+        fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (DynamicTensorSpec(0, 0, default_deep_gemm_tuning_buckets),)
+
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
         [fp8_swap_ab_gemm_runner],
@@ -1538,7 +1549,7 @@ def _(
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
-    tune_max_num_tokens: int = 4096,
+    tune_max_num_tokens: int = -1,
 ) -> torch.Tensor:
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
