@@ -457,7 +457,7 @@ def submit_job(config, log_dir, dry_run):
 
     # Generate disagg server config
     server_config = convert_allocations_to_server_config(allocations)
-    with open(os.path.join(log_dir, "server_config.yaml"), "w") as f:
+    with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
         yaml.dump(server_config, f)
     disagg_server_hostname = server_config['hostname']
     disagg_server_port = server_config['port']
@@ -557,7 +557,7 @@ def submit_job(config, log_dir, dry_run):
     ]
     start_server_cmds.append(" ".join(cmd))
 
-    with open(os.path.join(log_dir, "start_server_cmds.sh"), "w") as f:
+    with open(os.path.join(log_dir, "start_server_cmds_base.sh"), "w") as f:
         f.write("\n".join(start_server_cmds) + "\n")
 
     # Generate client commands (use script_dir for benchmark scripts)
@@ -632,7 +632,7 @@ def submit_job(config, log_dir, dry_run):
     ]
     client_cmds.append(" ".join(done_cmd))
 
-    with open(os.path.join(log_dir, "client_cmds.sh"), "w") as f:
+    with open(os.path.join(log_dir, "client_cmds_base.sh"), "w") as f:
         f.write("\n".join(client_cmds) + "\n")
 
     # Resolve slurm script_file path
