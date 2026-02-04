@@ -322,6 +322,74 @@ NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
     TLLM_CHECK(mHandle);
 }
 
+[[nodiscard]] MemoryDescs NixlHelper::coalesceMemoryDescs(MemoryDescs const& descs)
+{
+    auto const& descVec = descs.getDescs();
+
+    // If empty or single element, return as-is
+    if (descVec.size() <= 1)
+    {
+        return descs;
+    }
+
+    size_t const numDescs = descVec.size();
+
+    // Create index array and sort by address
+    std::vector<size_t> sortedIndices(numDescs);
+    std::iota(sortedIndices.begin(), sortedIndices.end(), 0);
+
+    std::sort(sortedIndices.begin(), sortedIndices.end(),
+        [&descVec](size_t lhs, size_t rhs)
+        {
+            // Sort by deviceId first, then by address
+            if (descVec[lhs].getDeviceId() != descVec[rhs].getDeviceId())
+            {
+                return descVec[lhs].getDeviceId() < descVec[rhs].getDeviceId();
+            }
+            return descVec[lhs].getAddr() < descVec[rhs].getAddr();
+        });
+
+    std::vector<MemoryDesc> coalesced;
+    coalesced.reserve(numDescs);
+
+    // Start with the first entry
+    size_t firstIdx = sortedIndices[0];
+    uintptr_t currentAddr = descVec[firstIdx].getAddr();
+    size_t currentLen = descVec[firstIdx].getLen();
+    uint32_t currentDeviceId = descVec[firstIdx].getDeviceId();
+
+    for (size_t idx = 1; idx < numDescs; ++idx)
+    {
+        size_t sortedIdx = sortedIndices[idx];
+        auto const& desc = descVec[sortedIdx];
+
+        // Check if current can be coalesced with previous
+        bool isContiguous = (currentAddr + currentLen == desc.getAddr()) && (currentDeviceId == desc.getDeviceId());
+
+        if (isContiguous)
+        {
+            // Coalesce: extend the current region
+            currentLen += desc.getLen();
+        }
+        else
+        {
+            // Cannot coalesce: save the current region and start a new one
+            coalesced.emplace_back(currentAddr, currentLen, currentDeviceId);
+
+            currentAddr = desc.getAddr();
+            currentLen = desc.getLen();
+            currentDeviceId = desc.getDeviceId();
+        }
+    }
+
+    // Add the last region
+    coalesced.emplace_back(currentAddr, currentLen, currentDeviceId);
+
+    TLLM_LOG_DEBUG("NixlHelper::coalesceMemoryDescs: coalesced %zu -> %zu entries", descVec.size(), coalesced.size());
+
+    return MemoryDescs{descs.getType(), std::move(coalesced)};
+}
+
 [[nodiscard]] std::pair<MemoryDescs, MemoryDescs> NixlHelper::coalesceTransferDescs(
     TransferDescs const& srcDescs, TransferDescs const& dstDescs)
 {
@@ -526,8 +594,12 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 {
+    // Coalesce contiguous memory regions to reduce registration overhead (enabled by default)
+    // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
+    auto coalescedDescs = common::getEnvNixlDisableCoalesce() ? descs : NixlHelper::coalesceMemoryDescs(descs);
+
     nixl_status_t status;
-    status = mRawAgent->registerMem(NixlHelper::convertRegDlist(descs), &mExtraParams);
+    status = mRawAgent->registerMem(NixlHelper::convertRegDlist(coalescedDescs), &mExtraParams);
     TLLM_CHECK(status == NIXL_SUCCESS);
 
     std::string localMD;
@@ -537,8 +609,12 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
 {
+    // Coalesce contiguous memory regions to match what was registered (enabled by default)
+    // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
+    auto coalescedDescs = common::getEnvNixlDisableCoalesce() ? descs : NixlHelper::coalesceMemoryDescs(descs);
+
     nixl_status_t status;
-    status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(descs), &mExtraParams);
+    status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(coalescedDescs), &mExtraParams);
     TLLM_CHECK(status == NIXL_SUCCESS);
 }
 
@@ -585,6 +661,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // Will be deprecated with ETCD or callbacks
 
     // Coalesce contiguous memory regions to reduce transfer count (enabled by default)
+    // This matches the coalescing done during registerMemory()
     // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
     if (common::getEnvNixlDisableCoalesce())
     {
