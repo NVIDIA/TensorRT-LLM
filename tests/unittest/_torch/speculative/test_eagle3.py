@@ -92,7 +92,6 @@ def test_kv_lens_runtime_with_eagle3_one_model():
         f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
 
 
-@pytest.mark.skip(reason="https://nvbugs/5856637")
 @pytest.mark.parametrize(
     "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
     [
