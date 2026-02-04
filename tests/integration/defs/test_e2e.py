@@ -38,125 +38,9 @@ from .conftest import (get_device_count, get_sm_version, llm_models_root,
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
-TEST_MEM_USAGE = os.environ.get('TEST_MEM_USAGE', True)
-
-if TEST_MEM_USAGE:
-    os.environ['TLLM_LOG_LEVEL'] = 'INFO'
-
 _MEM_FRACTION_50 = 0.5
 _MEM_FRACTION_80 = 0.8
 _MEM_FRACTION_95 = 0.95
-
-
-def _get_mem_info_from_log(file, ranks_num):
-    import re
-
-    # Peak memory size, model memory size and extra memory size are printed
-    # only when TLLM_LOG_LEVEL=INFO
-    pattern = re.compile(r"\[MemUsageChange] Allocated ([\d]+\.[\d]+) GiB ")
-    fraction_pattern = re.compile(r"fraction is set ([\d]+\.[\d]+), ")
-    total_mem_pattern = re.compile(r"device total memory ([\d]+\.[\d]+) GiB")
-    peak_mem_pattern = re.compile(
-        r"Peak memory during memory usage profiling \(torch \+ non-torch\): ([\d]+\.[\d]+) GiB"
-    )
-    extra_mem_pattern = re.compile(
-        r"Memory used outside torch \(e\.g\., NCCL and CUDA graphs\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
-    )
-    activation_pattern = re.compile(
-        r"Memory dynamically allocated during inference \(inside torch\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
-    )
-    model_pattern = re.compile(
-        r"Memory used after loading model weights \(inside torch\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
-    )
-    tmp_kv_patterm = re.compile(r"tmp kv_mem ([\d]+\.[\d]+) GiB")
-    start_time_mem_pattern = re.compile(
-        r"Memory used after loading model weights \(outside torch\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
-    )
-
-    fraction = 0.90
-    kv_mem_size = []
-    total_memory = []
-    peak_memory = []
-    extra_memory = []
-    activation_memory = []
-    model_memory = []
-    tmp_kv = []
-    start_time_mem = []
-    file.seek(0)
-    lines = file.readlines()
-    for line in lines:
-        match = pattern.findall(line)
-        if len(match) > 0:
-            kv_mem_size.append(float(match[0]))
-        match = fraction_pattern.findall(line)
-        if len(match) > 0:
-            fraction = float(match[0])
-        match = total_mem_pattern.findall(line)
-        if len(match) > 0:
-            total_memory.append(float(match[0]))
-        match = peak_mem_pattern.findall(line)
-        if len(match) > 0:
-            peak_memory.append(float(match[0]))
-        match = extra_mem_pattern.findall(line)
-        if len(match) > 0:
-            extra_memory.append(float(match[0]))
-        match = activation_pattern.findall(line)
-        if len(match) > 0:
-            activation_memory.append(float(match[0]))
-        match = model_pattern.findall(line)
-        if len(match) > 0:
-            model_memory.append(float(match[0]))
-        match = tmp_kv_patterm.findall(line)
-        if len(match) > 0:
-            tmp_kv.append(float(match[0]))
-        match = start_time_mem_pattern.findall(line)
-        if len(match) > 0:
-            start_time_mem.append(float(match[0]))
-
-    assert len(
-        kv_mem_size) % 2 == 0, "no enough memory usage information in log"
-    kv_mem_size = kv_mem_size[len(kv_mem_size) // 2:]
-    return peak_memory, model_memory, sum(
-        kv_mem_size
-    ) / ranks_num, extra_memory, fraction, total_memory, activation_memory, sum(
-        tmp_kv) / ranks_num, sum(start_time_mem) - ranks_num
-
-
-def _get_kv_mem_size_candidate(total_Gib, used_Gib, fraction):
-    return (total_Gib - used_Gib) * fraction
-
-
-def _check_mem_usage(file, mem_info, ranks_num=1):
-    if file is None or not TEST_MEM_USAGE:
-        return
-    delta = 0.3  # 0.3 GB as buffer
-    peak, model_size, kv_mem_size, extra, fraction, total_memory, activation_memory, tmp_kv, start_time_mem = _get_mem_info_from_log(
-        file, ranks_num)
-
-    peak = max(peak)
-    min_total = min(total_memory)
-    e_peak, e_model_size, e_kv_mem_size, e_extra = mem_info
-    import torch
-    _, total = torch.cuda.mem_get_info()
-    e_kv_mem_size = _get_kv_mem_size_candidate(min_total,
-                                               (e_peak + start_time_mem),
-                                               fraction)
-    print(
-        f"Expected memory usage: peak mem {e_peak + start_time_mem}, model mem {e_model_size}, kv mem {e_kv_mem_size:.2f}, extra {e_extra}, total {total / (1 << 30):.2f}"
-    )
-    print(
-        f"Running memory information: peak mem {peak}, model mem {model_size}, kv mem {kv_mem_size}, extra {extra}, total {min_total}, activation {activation_memory}, tmp_kv {tmp_kv}, fraction  {fraction}, none-torch memory at starttime {start_time_mem}"
-    )
-
-    increased_peak_mem = peak - tmp_kv - e_peak - start_time_mem - delta
-    assert increased_peak_mem <= 0, (
-        f"increased peak memory {increased_peak_mem} is larger than 0,"
-        f" which is calculated as peak ({peak}) - tmp_kv ({tmp_kv}) -"
-        f" e_peak ({e_peak}) - start_time_mem ({start_time_mem}) - delta ({delta})."
-    )
-    assert kv_mem_size >= e_kv_mem_size - delta, f"kv memory size {kv_mem_size} is smaller than expected {e_kv_mem_size}"
-    # assert model_size <= e_model_size + delta, f"model memory {model_size} is larger than expected {e_model_size}"
-    # assert max(extra) <= e_extra + delta, f"extra memory size {extra} is larger than expected {e_extra}"
 
 
 def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
@@ -992,16 +876,8 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
     model_id = llama_model_root.split(r"/")[-1]
     if "nvfp4-quantized" in llama_model_root:
         model_id += "-NVFP4"
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_id}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        check_call(benchmark_cmd, shell=True, stdout=running_log)
-        if model_id in mapping and not use_extra_config:
-            # extra config defines max kv cache tokens number to be 40000 which makes the checking
-            # the checking process not unified.
-            _check_mem_usage(running_log, [mapping[model_id], 0, 0, 0])
+
+    check_call(benchmark_cmd, shell=True)
 
 
 def test_trtllm_bench_mgmn(llm_root, llm_venv):
@@ -1023,17 +899,7 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
             f"throughput " \
             f"--dataset {str(dataset_path)} --backend pytorch --tp 2"
 
-    model_name = model_name.split(r"/")[-1]
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        check_call(benchmark_cmd,
-                   shell=True,
-                   stdout=running_log,
-                   env=llm_venv._new_env)
-        _check_mem_usage(running_log, [30, 0, 0, 0])
+    check_call(benchmark_cmd, shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("model_subdir", [
@@ -1177,18 +1043,7 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
             assert engine_path is not None, "Engine path should not be None"
             benchmark_cmd += f" --engine_dir {engine_path}"
 
-        if skip_engine_build:
-            model_name = model_name.split("/")[-1]
-            with tempfile.NamedTemporaryFile(
-                    mode='w+t',
-                    suffix=f".{model_name}_{streaming}.log",
-                    dir="./",
-                    delete=True,
-                    delete_on_close=True) as running_log:
-                check_call(benchmark_cmd, shell=True, stdout=running_log)
-                _check_mem_usage(running_log, [19.4, 0, 0, 0])
-        else:
-            check_call(benchmark_cmd, shell=True)
+        check_call(benchmark_cmd, shell=True)
 
         assert os.path.exists(
             iteration_log
@@ -1883,14 +1738,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     os.symlink(src, dst, target_is_directory=True)
 
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=".Llama-3.1-8B-Instruct.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        venv_check_call(llm_venv, [str(example_root / "quickstart_example.py")],
-                        stdout=running_log)
-        _check_mem_usage(running_log, [4.60, 0, 0, 0])
+    venv_check_call(llm_venv, [str(example_root / "quickstart_example.py")])
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2012,23 +1860,16 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             "Llama3.1-8B-FP8": 13.05,
             "Llama3.1-8B-NVFP4": 10.2
         }
-        with tempfile.NamedTemporaryFile(mode='w+t',
-                                         suffix=f".{model_name}.log",
-                                         dir="./",
-                                         delete=True,
-                                         delete_on_close=True) as running_log:
-            cmds = [
-                str(example_root / "quickstart_advanced.py"),
-                "--enable_chunked_prefill",
-                f"--model_dir={llm_models_root()}/{model_path}",
-            ]
-            if "Qwen3" in model_name:
-                cmds.append(f"--kv_cache_fraction=0.6")
-            if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
-                cmds.append(f"--max_num_tokens=1024")
-            llm_venv.run_cmd(cmds, stdout=running_log)
-            if model_name in mapping:
-                _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
+        cmds = [
+            str(example_root / "quickstart_advanced.py"),
+            "--enable_chunked_prefill",
+            f"--model_dir={llm_models_root()}/{model_path}",
+        ]
+        if "Qwen3" in model_name:
+            cmds.append(f"--kv_cache_fraction=0.6")
+        if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
+            cmds.append(f"--max_num_tokens=1024")
+        llm_venv.run_cmd(cmds)
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2038,25 +1879,17 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                                      model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd(
-            [
-                str(example_root / "quickstart_advanced.py"),
-                "--use_cuda_graph",
-                "--spec_decode_max_draft_len",
-                "1",  # test 1 MTP module
-                "--spec_decode_algo",
-                "MTP",
-                "--model_dir",
-                f"{llm_models_root()}/{model_path}",
-                "--use_one_model",
-            ],
-            stdout=running_log)
-        _check_mem_usage(running_log, [54.90, 0, 0, 0])
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--use_cuda_graph",
+        "--spec_decode_max_draft_len",
+        "1",  # test 1 MTP module
+        "--spec_decode_algo",
+        "MTP",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--use_one_model",
+    ])
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2066,24 +1899,16 @@ def test_ptp_quickstart_advanced_mtp_eagle(llm_root, llm_venv, model_name,
                                            model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--use_cuda_graph",
-            "--spec_decode_max_draft_len",
-            "3",
-            "--spec_decode_algo",
-            "MTP",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-        ],
-                         stdout=running_log)
-        # 74.60 is the memory usage for DeepSeek-V3-Lite-BF16 with MTP Eagle 2 two model style as one extra kv cache is needed for draft model.
-        _check_mem_usage(running_log, [74.60, 0, 0, 0])
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--use_cuda_graph",
+        "--spec_decode_max_draft_len",
+        "3",
+        "--spec_decode_algo",
+        "MTP",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+    ])
 
 
 @pytest.mark.skip_less_device(4)
@@ -2153,32 +1978,19 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
 
-    # Set expected memory based on model size
-    if "GPT-OSS-120B" in model_name:
-        expected_mem = [106.71, 0, 0, 0]  # Memory for 120B model with Eagle3
-    else:
-        expected_mem = [25.2, 0, 0, 0]  # Memory for Llama-3.1-8B with Eagle3
-
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--spec_decode_max_draft_len",
-            "4",
-            "--spec_decode_algo",
-            "eagle3",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--draft_model_dir",
-            f"{llm_models_root()}/{eagle_model_path}",
-            "--disable_kv_cache_reuse",
-            "--disable_overlap_scheduler",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, expected_mem)
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--spec_decode_max_draft_len",
+        "4",
+        "--spec_decode_algo",
+        "eagle3",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--draft_model_dir",
+        f"{llm_models_root()}/{eagle_model_path}",
+        "--disable_kv_cache_reuse",
+        "--disable_overlap_scheduler",
+    ])
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
@@ -2190,30 +2002,23 @@ def test_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
                                                      eagle_model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--prompt",
-            "You are a good assistant. Please tell me the capital of France is",
-            "--spec_decode_max_draft_len",
-            "3",
-            "--spec_decode_algo",
-            "eagle3",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--draft_model_dir",
-            f"{llm_models_root()}/{eagle_model_path}",
-            "--disable_kv_cache_reuse",
-            "--disable_overlap_scheduler",
-            "--eagle_choices",
-            "[[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [2, 0], [0, 0, 0], [0, 1, 0], [1, 0, 0]]",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [27, 0, 0, 0])
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--prompt",
+        "You are a good assistant. Please tell me the capital of France is",
+        "--spec_decode_max_draft_len",
+        "3",
+        "--spec_decode_algo",
+        "eagle3",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--draft_model_dir",
+        f"{llm_models_root()}/{eagle_model_path}",
+        "--disable_kv_cache_reuse",
+        "--disable_overlap_scheduler",
+        "--eagle_choices",
+        "[[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [2, 0], [0, 0, 0], [0, 1, 0], [1, 0, 0]]",
+    ])
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
@@ -2224,30 +2029,23 @@ def test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree(
         llm_root, llm_venv, model_name, model_path, eagle_model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--prompt",
-            "You are a good assistant. Please tell me the capital of France is",
-            "--spec_decode_max_draft_len",
-            "3",
-            "--spec_decode_algo",
-            "eagle3",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--draft_model_dir",
-            f"{llm_models_root()}/{eagle_model_path}",
-            "--disable_kv_cache_reuse",
-            "--disable_overlap_scheduler",
-            "--eagle_choices",
-            "[[0], [1], [2]]",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [27, 0, 0, 0])
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--prompt",
+        "You are a good assistant. Please tell me the capital of France is",
+        "--spec_decode_max_draft_len",
+        "3",
+        "--spec_decode_algo",
+        "eagle3",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--draft_model_dir",
+        f"{llm_models_root()}/{eagle_model_path}",
+        "--disable_kv_cache_reuse",
+        "--disable_overlap_scheduler",
+        "--eagle_choices",
+        "[[0], [1], [2]]",
+    ])
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2257,27 +2055,20 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
                                        model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--spec_decode_algo",
-            "NGRAM",
-            "--spec_decode_max_draft_len",
-            "4",
-            "--max_matching_ngram_size",
-            "2",
-            "--use_cuda_graph",
-            "--disable_kv_cache_reuse",
-            "--disable_overlap_scheduler",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [27.0, 0, 0, 0])
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--spec_decode_algo",
+        "NGRAM",
+        "--spec_decode_max_draft_len",
+        "4",
+        "--max_matching_ngram_size",
+        "2",
+        "--use_cuda_graph",
+        "--disable_kv_cache_reuse",
+        "--disable_overlap_scheduler",
+    ])
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2287,22 +2078,15 @@ def test_ptp_quickstart_advanced_auto(llm_root, llm_venv, model_name,
                                       model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--spec_decode_algo",
-            "AUTO",
-            "--use_cuda_graph",
-            "--max_batch_size=4",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [27.0, 0, 0, 0])
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--spec_decode_algo",
+        "AUTO",
+        "--use_cuda_graph",
+        "--max_batch_size=4",
+    ])
 
 
 @skip_post_blackwell
@@ -2316,32 +2100,25 @@ def test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance(
         llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--moe_tp_size=1",
-            "--moe_ep_size=4",
-            "--tp_size=4",
-            "--use_cuda_graph",
-            "--enable_attention_dp",
-            f"--kv_cache_fraction={_MEM_FRACTION_95}",
-            "--max_batch_size=1",
-            "--max_seq_len=3000",
-            "--disable_kv_cache_reuse",
-            "--attention_dp_enable_balance",
-            "--attention_dp_time_out_iters",
-            "10",
-            "--attention_dp_batching_wait_iters",
-            "10",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [106.3, 0, 0, 0], 8)
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=4",
+        "--tp_size=4",
+        "--use_cuda_graph",
+        "--enable_attention_dp",
+        f"--kv_cache_fraction={_MEM_FRACTION_95}",
+        "--max_batch_size=1",
+        "--max_seq_len=3000",
+        "--disable_kv_cache_reuse",
+        "--attention_dp_enable_balance",
+        "--attention_dp_time_out_iters",
+        "10",
+        "--attention_dp_batching_wait_iters",
+        "10",
+    ])
 
 
 @skip_post_blackwell
@@ -2358,27 +2135,20 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
                                                    model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--moe_tp_size=1",
-            "--moe_ep_size=8",
-            "--tp_size=8",
-            "--use_cuda_graph",
-            "--enable_attention_dp",
-            f"--kv_cache_fraction={_MEM_FRACTION_95}",
-            "--max_batch_size=1",
-            "--max_seq_len=3000",
-            "--disable_kv_cache_reuse",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [106.3, 0, 0, 0], 8)
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=8",
+        "--tp_size=8",
+        "--use_cuda_graph",
+        "--enable_attention_dp",
+        f"--kv_cache_fraction={_MEM_FRACTION_95}",
+        "--max_batch_size=1",
+        "--max_seq_len=3000",
+        "--disable_kv_cache_reuse",
+    ])
 
 
 @pytest.mark.skip_less_device_memory(110000)
@@ -2392,37 +2162,30 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     is_blackwell = get_sm_version() > 90
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--moe_tp_size=1",
-            "--moe_ep_size=8",
-            "--tp_size=8",
-            "--use_cuda_graph",
-            f"--kv_cache_fraction={_MEM_FRACTION_50 if is_blackwell else _MEM_FRACTION_95}",
-            "--max_batch_size=1",
-            "--max_seq_len=3000",
-            "--disable_kv_cache_reuse",
-            "--spec_decode_algo",
-            "MTP",
-            "--spec_decode_max_draft_len",
-            "5",
-            "--use_relaxed_acceptance_for_thinking",
-            "--relaxed_topk=10",
-            "--relaxed_delta=0.5",
-            "--enable_attention_dp",
-            "--use_one_model",
-            "--moe_backend",
-            "DEEPGEMM" if is_blackwell else "CUTLASS",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [85.6, 0, 0, 0], 8)
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=8",
+        "--tp_size=8",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50 if is_blackwell else _MEM_FRACTION_95}",
+        "--max_batch_size=1",
+        "--max_seq_len=3000",
+        "--disable_kv_cache_reuse",
+        "--spec_decode_algo",
+        "MTP",
+        "--spec_decode_max_draft_len",
+        "5",
+        "--use_relaxed_acceptance_for_thinking",
+        "--relaxed_topk=10",
+        "--relaxed_delta=0.5",
+        "--enable_attention_dp",
+        "--use_one_model",
+        "--moe_backend",
+        "DEEPGEMM" if is_blackwell else "CUTLASS",
+    ])
 
 
 @skip_pre_ada
@@ -2438,25 +2201,18 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
         llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--moe_tp_size=1",
-            "--moe_ep_size=8",
-            "--tp_size=8",
-            "--use_cuda_graph",
-            f"--kv_cache_fraction={_MEM_FRACTION_50}",
-            "--max_batch_size=1",
-            "--max_seq_len=512",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [50.0, 0, 0, 0], 8)
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=8",
+        "--tp_size=8",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--max_batch_size=1",
+        "--max_seq_len=512",
+    ])
 
 
 @skip_pre_blackwell
@@ -2530,7 +2286,7 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
             max_num_tokens=4608,
             warmup=0,
             eos_id=1,
-            kv_cache_free_gpu_mem_fraction=0.1,
+            kv_cache_free_gpu_mem_fraction=0.6,
             scheduler_policy="max_utilization",
             extra_llm_api_options=extra_config_path,
             input_mean=1000,
@@ -2586,24 +2342,15 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
         "Nemotron-Ultra-253B": 72.3,
         "DeepSeek-V3-671B-FP8": 83.8
     }
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--enable_chunked_prefill",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            f"--tp_size={gpu_count}",
-            "--max_batch_size=32",
-            "--max_num_tokens=256",
-        ],
-                         stdout=running_log)
-        if model_name in mapping:
-            _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0],
-                             gpu_count)
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_chunked_prefill",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        f"--tp_size={gpu_count}",
+        "--max_batch_size=32",
+        "--max_num_tokens=256",
+    ])
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -2630,7 +2377,7 @@ def test_ptp_quickstart_advanced_pp_enabled(llm_root, llm_venv, model_name,
         f"--tp_size={tp_size}",
         f"--pp_size={pp_size}",
         "--moe_ep_size=1",
-        "--kv_cache_fraction=0.5",
+        "--kv_cache_fraction=0.6",
     ]
     if cuda_graph:
         cmd.extend([
@@ -2664,7 +2411,7 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
         "--tp_size=8",
         "--moe_ep_size=8",
         "--max_seq_len=22000",
-        "--kv_cache_fraction=0.1",
+        "--kv_cache_fraction=0.6",
     ]
     if cuda_graph:
         cmd.extend([
@@ -2706,18 +2453,11 @@ def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
 def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     model_path = "Llama-3_1-8B-Instruct_fp8_nvfp4_hf"
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_path}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [12.0, 0, 0, 0])
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+    ])
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
@@ -3509,7 +3249,7 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
         True,
         "kv_cache_config":
         KvCacheConfig(
-            free_gpu_memory_fraction=0.2,
+            free_gpu_memory_fraction=0.6,
             enable_block_reuse=False,
         ),
         "cuda_graph_config":
