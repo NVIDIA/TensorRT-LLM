@@ -2,7 +2,7 @@
 
 This module provides:
 - torch_cached_mla_with_cache: cached backend op
-- MultiHeadLatentAttention: attention descriptor
+- TorchBackendMLAAttention: attention descriptor
 
 FlashInfer MLA Cache Layout:
     mla_cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
@@ -439,7 +439,7 @@ def torch_backend_mla_with_cache_fake(
 
 
 @AttentionRegistry.register("torch_mla")
-class MultiHeadLatentAttention(AttentionDescriptor):
+class TorchBackendMLAAttention(AttentionDescriptor):
     """Attention descriptor for Multi-head Latent Attention (MLA).
 
     This descriptor uses FlashInfer-compatible compressed cache:
