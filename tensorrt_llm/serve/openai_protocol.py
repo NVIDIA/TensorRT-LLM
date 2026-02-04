@@ -77,7 +77,7 @@ class OpenAIBaseModel(BaseModel):
 
 class StreamOptions(OpenAIBaseModel):
     include_usage: Optional[bool] = True
-    continuous_usage_stats: Optional[bool] = True
+    continuous_usage_stats: Optional[bool] = False
 
 
 class PromptTokensDetails(OpenAIBaseModel):
