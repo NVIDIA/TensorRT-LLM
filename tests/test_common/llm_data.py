@@ -99,16 +99,31 @@ def mock_snapshot_download(repo_id: str, **kwargs) -> str:
     return local_path
 
 
-def with_mocked_hf_download(func):
+def with_mocked_hf_download_for_single_gpu(func):
     """Decorator to mock huggingface_hub.snapshot_download for tests.
 
     When applied, any calls to snapshot_download will be redirected to use
     local model paths from LLM_MODELS_ROOT instead of downloading from HuggingFace.
+
+    NOTE: We must patch snapshot_download at the location where it's actually imported
+    with 'from huggingface_hub import snapshot_download', since that creates a
+    local binding that won't be affected by patching huggingface_hub.snapshot_download.
+
+    Additionally sets HF_HUB_OFFLINE=1 to ensure no network requests are made to
+    HuggingFace.
+
+    WARNING: This decorator only works for single-GPU tests. For multi-GPU tests, the
+    mock won't be applied in MPI worker processes.
     """
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with patch("huggingface_hub.snapshot_download", side_effect=mock_snapshot_download):
+        with (
+            patch.dict(os.environ, {"HF_HUB_OFFLINE": "1"}),
+            patch(
+                "tensorrt_llm.llmapi.utils.snapshot_download", side_effect=mock_snapshot_download
+            ),
+        ):
             return func(*args, **kwargs)
 
     return wrapper
