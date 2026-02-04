@@ -81,14 +81,14 @@ def inplace_info():
             1: "logits"
         },
         torch.ops.trtllm.moe_unpermute_inplace.default: {
-            2: "output"
+            1: "output"
         },
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
         },
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
         {
-            6: "output"
+            1: "output"
         },
         torch.ops.trtllm.pp_recv_tensors.default: {
             1: "tensors"
@@ -97,7 +97,7 @@ def inplace_info():
             1: "tensors"
         },
         torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell.default: {
-            5: "output"
+            1: "output"
         }
     }
     if IS_CUDA_TILE_AVAILABLE:
