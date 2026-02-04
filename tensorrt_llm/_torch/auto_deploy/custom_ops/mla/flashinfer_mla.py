@@ -5,7 +5,8 @@ This module provides:
 - flashinfer_mla_with_cache: cached backend op with paged KV cache
 
 FlashInfer MLA uses:
-- Prefill: BatchPrefillWithRaggedKVCacheWrapper with expanded K, V tensors
+- Regular prefill (input_pos == 0): BatchPrefillWithRaggedKVCacheWrapper with expanded K, V
+- Chunked prefill (input_pos > 0): BatchMLAPagedAttentionWrapper with matrix absorption
 - Decode: BatchMLAPagedAttentionWrapper with paged compressed KV cache
 
 FlashInfer MLA Cache Layout (two separate caches):
@@ -83,27 +84,33 @@ class _FlashInferMLAPlanner:
     """A class interface to handle FlashInfer MLA-related planning/wrapping operations.
 
     For MLA attention:
-    - Prefill uses BatchPrefillWithRaggedKVCacheWrapper with expanded K, V tensors
+    - Regular prefill uses BatchPrefillWithRaggedKVCacheWrapper with expanded K, V tensors
+    - Chunked prefill uses BatchMLAPagedAttentionWrapper with matrix absorption (same as decode)
     - Decode uses BatchMLAPagedAttentionWrapper with paged compressed KV cache
     """
 
     workspace_buffer: Optional[torch.Tensor]
     prefill_wrapper: Optional[flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper]
     decode_wrapper: Optional["flashinfer.mla.BatchMLAPagedAttentionWrapper"]
+    # Separate wrapper for chunked/incremental prefill (uses same kernel as decode but different planning)
+    chunked_prefill_wrapper: Optional["flashinfer.mla.BatchMLAPagedAttentionWrapper"]
     cached_cuda_graph_decode_wrappers: Dict[
         MLADecodePlanParams, "flashinfer.mla.BatchMLAPagedAttentionWrapper"
     ]
     plan_params_prefill: Optional[MLAPrefillPlanParams]
     plan_params_decode: Optional[MLADecodePlanParams]
+    plan_params_chunked_prefill: Optional[MLADecodePlanParams]
     kv_layout: Literal["NHD", "HND"] = "NHD"
 
     def __init__(self):
         self.workspace_buffer = None
         self.prefill_wrapper = None
         self.decode_wrapper = None
+        self.chunked_prefill_wrapper = None
         self.cached_cuda_graph_decode_wrappers = {}
         self.plan_params_prefill = None
         self.plan_params_decode = None
+        self.plan_params_chunked_prefill = None
 
     def _init_decode_wrapper(
         self,
@@ -118,6 +125,7 @@ class _FlashInferMLAPlanner:
     def reset(self, device: torch.device) -> None:
         self.plan_params_prefill = None
         self.plan_params_decode = None
+        self.plan_params_chunked_prefill = None
 
         if isinstance(self.workspace_buffer, torch.Tensor):
             return
@@ -134,6 +142,8 @@ class _FlashInferMLAPlanner:
         )
         # Decode uses BatchMLAPagedAttentionWrapper with paged compressed KV cache
         self.decode_wrapper = self._init_decode_wrapper()
+        # Chunked prefill uses same kernel as decode but with variable-length queries
+        self.chunked_prefill_wrapper = self._init_decode_wrapper()
 
     def plan_prefill(
         self,
@@ -186,6 +196,35 @@ class _FlashInferMLAPlanner:
 
         return self.prefill_wrapper
 
+    def _plan_mla_wrapper(
+        self,
+        wrapper: "flashinfer.mla.BatchMLAPagedAttentionWrapper",
+        qo_indptr: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        plan_params: MLADecodePlanParams,
+    ):
+        """Helper to plan a BatchMLAPagedAttentionWrapper."""
+        # Compute actual KV lengths from paging metadata:
+        # kv_len = (num_pages - 1) * page_size + last_page_len
+        num_pages_per_seq = kv_page_indptr[1:] - kv_page_indptr[:-1]
+        kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + kv_last_page_len
+        wrapper.plan(
+            qo_indptr,
+            kv_page_indptr,
+            kv_page_indices,
+            kv_len_arr,
+            plan_params.num_heads,
+            plan_params.kv_lora_rank,  # head_dim_ckv
+            plan_params.qk_rope_head_dim,  # head_dim_kpe
+            plan_params.page_size,
+            causal=True,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            sm_scale=plan_params.sm_scale,
+        )
+
     def plan_decode(
         self,
         kv_page_indptr: torch.Tensor,
@@ -196,36 +235,17 @@ class _FlashInferMLAPlanner:
         """Plan decode using BatchMLAPagedAttentionWrapper.
 
         For MLA decode, we use the paged compressed KV cache with
-        FlashInfer's optimized MLA kernels.
-        """
+        FlashInfer's optimized MLA kernels. Each sequence generates 1 token.
 
-        # plan decode helper function
-        def _plan_decode(
-            wrapper: "flashinfer.mla.BatchMLAPagedAttentionWrapper",
-        ):
-            batch_size = kv_page_indptr.shape[0] - 1
-            # for a pure decode batch, qo_indptr is just [0, 1, 2, ..., batch_size]
-            qo_indptr = torch.arange(
-                batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32
-            )
-            # Compute actual KV lengths from paging metadata:
-            # kv_len = (num_pages - 1) * page_size + last_page_len
-            num_pages_per_seq = kv_page_indptr[1:] - kv_page_indptr[:-1]
-            kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + kv_last_page_len
-            wrapper.plan(
-                qo_indptr,
-                kv_page_indptr,
-                kv_page_indices,
-                kv_len_arr,
-                plan_params.num_heads,
-                plan_params.kv_lora_rank,  # head_dim_ckv
-                plan_params.qk_rope_head_dim,  # head_dim_kpe
-                plan_params.page_size,
-                causal=True,
-                q_data_type=plan_params.q_dtype,
-                kv_data_type=plan_params.kv_dtype,
-                sm_scale=plan_params.sm_scale,
-            )
+        Args:
+            kv_page_indptr: Cumulative page counts [batch_size + 1].
+            kv_page_indices: Page indices for the KV cache.
+            kv_last_page_len: Length of the last page per sequence.
+            plan_params: Parameters for planning.
+        """
+        # Decode qo_indptr: [0, 1, 2, ..., batch_size] (1 token per sequence)
+        batch_size = kv_page_indptr.shape[0] - 1
+        qo_indptr = torch.arange(batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32)
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
         if (
@@ -235,20 +255,62 @@ class _FlashInferMLAPlanner:
             # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
             wrapper = self._init_decode_wrapper()
             self.cached_cuda_graph_decode_wrappers[plan_params] = wrapper
-            _plan_decode(self.cached_cuda_graph_decode_wrappers[plan_params])
+            self._plan_mla_wrapper(
+                wrapper, qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_len, plan_params
+            )
 
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
             return wrapper
 
-        # check for re-planning
+        # Re-plan if plan_params changed
         if plan_params != self.plan_params_decode:
-            _plan_decode(self.decode_wrapper)
+            self._plan_mla_wrapper(
+                self.decode_wrapper,
+                qo_indptr,
+                kv_page_indptr,
+                kv_page_indices,
+                kv_last_page_len,
+                plan_params,
+            )
             self.plan_params_decode = plan_params
 
-        # return decode wrapper
         return self.decode_wrapper
+
+    def plan_chunked_prefill(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        plan_params: MLADecodePlanParams,
+    ) -> "flashinfer.mla.BatchMLAPagedAttentionWrapper":
+        """Plan chunked/incremental prefill using BatchMLAPagedAttentionWrapper.
+
+        For chunked prefill (input_pos > 0), we use the same kernel as decode but with
+        variable-length queries. Each sequence can have multiple tokens.
+
+        Args:
+            qo_indptr: Cumulative query lengths [batch_size + 1].
+            kv_page_indptr: Cumulative page counts [batch_size + 1].
+            kv_page_indices: Page indices for the KV cache.
+            kv_last_page_len: Length of the last page per sequence.
+            plan_params: Parameters for planning.
+        """
+        # Re-plan if plan_params changed
+        if plan_params != self.plan_params_chunked_prefill:
+            self._plan_mla_wrapper(
+                self.chunked_prefill_wrapper,
+                qo_indptr,
+                kv_page_indptr,
+                kv_page_indices,
+                kv_last_page_len,
+                plan_params,
+            )
+            self.plan_params_chunked_prefill = plan_params
+
+        return self.chunked_prefill_wrapper
 
     def plan_generate_only(
         self,
@@ -528,7 +590,8 @@ def flashinfer_mla_with_cache(
         y = None
 
     # =========================================================================
-    # PREFILL phase: Use BatchPrefillWithRaggedKVCacheWrapper with expanded K, V
+    # PREFILL phase: Use BatchPrefillWithRaggedKVCacheWrapper for regular prefill
+    #                or BatchMLAPagedAttentionWrapper for chunked prefill
     # =========================================================================
     if num_prefill > 0:
         q_nope_prefill = q_nope_flat[:num_prefill_tokens]
@@ -536,56 +599,133 @@ def flashinfer_mla_with_cache(
         compressed_kv_prefill = compressed_kv_flat[:num_prefill_tokens]
         kpe_prefill = kpe_flat[:num_prefill_tokens]
 
-        # Expand compressed_kv using kv_b_proj_weight to get k_nope and v
-        # compressed_kv: [num_prefill_tokens, kv_lora_rank]
-        # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
-        # kv_expanded: [num_prefill_tokens, N * (qk_nope_head_dim + v_head_dim)]
-        kv_expanded = torch.matmul(compressed_kv_prefill, kv_b_proj_weight.t())
-        kv_expanded = kv_expanded.view(num_prefill_tokens, num_heads, qk_nope_head_dim + v_head_dim)
+        # Check if any prefill sequence has cached tokens (chunked prefill)
+        # seq_len_with_cache > current_seq_len means there are cached tokens
+        q_lens = cu_seqlen_host[1 : num_prefill + 1] - cu_seqlen_host[:num_prefill]
+        kv_lens = seq_len_with_cache_host[:num_prefill]
+        is_chunked_prefill = (kv_lens > q_lens).any().item()
 
-        # Split into k_nope and v
-        k_nope_prefill = kv_expanded[:, :, :qk_nope_head_dim]  # [tokens, N, qk_nope_head_dim]
-        v_prefill = kv_expanded[:, :, qk_nope_head_dim:].contiguous()  # [tokens, N, v_head_dim]
+        if is_chunked_prefill:
+            # =================================================================
+            # CHUNKED PREFILL: Use BatchMLAPagedAttentionWrapper with absorption
+            # Same approach as decode, but with variable-length Q sequences
+            # =================================================================
 
-        # Expand kpe to all heads: [tokens, qk_rope_head_dim] -> [tokens, N, qk_rope_head_dim]
-        kpe_expanded = kpe_prefill.unsqueeze(1).expand(-1, num_heads, -1).contiguous()
+            # Extract W_kn and W_v from kv_b_proj_weight
+            # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+            # Reshape to [N, qk_nope_head_dim + v_head_dim, kv_lora_rank]
+            kv_b_proj_reshaped = kv_b_proj_weight.view(
+                num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank
+            )
+            # W_kn: [N, qk_nope_head_dim, kv_lora_rank]
+            w_kn = kv_b_proj_reshaped[:, :qk_nope_head_dim, :]
+            # W_v: [N, v_head_dim, kv_lora_rank]
+            w_v = kv_b_proj_reshaped[:, qk_nope_head_dim:, :]
 
-        # Concatenate to form full Q and K
-        # Q: [tokens, N, qk_head_dim]
-        q_prefill = torch.cat([q_nope_prefill, q_pe_prefill], dim=-1).contiguous()
-        # K: [tokens, N, qk_head_dim]
-        k_prefill = torch.cat([k_nope_prefill, kpe_expanded], dim=-1).contiguous()
+            # Absorb W_kn into q_nope:
+            # q_nope_prefill: [num_prefill_tokens, N, qk_nope_head_dim]
+            # w_kn: [N, qk_nope_head_dim, kv_lora_rank]
+            # q_nope_absorbed: [num_prefill_tokens, N, kv_lora_rank]
+            q_nope_absorbed = torch.einsum("bnd,ndk->bnk", q_nope_prefill, w_kn).contiguous()
 
-        # Compute the causal mask for ragged prefill
-        custom_mask = _compute_ragged_causal_mask(
-            cu_seqlen_host=cu_seqlen_host,
-            num_seq=num_prefill,
-            device=q_nope.device,
-        )
+            # Build qo_indptr for variable-length prefill sequences
+            qo_indptr = cu_seqlen_host[: num_prefill + 1].to(
+                device=cu_num_pages.device, dtype=torch.int32
+            )
 
-        pp_prefill = MLAPrefillPlanParams(
-            num_heads=num_heads,
-            num_kv_heads=num_heads,  # For MLA with expanded KV, same as num_heads
-            head_dim_qk=qk_head_dim,
-            head_dim_vo=v_head_dim,
-            num_seq=num_prefill,
-            q_dtype=q_nope.dtype,
-            kv_dtype=k_prefill.dtype,
-            sm_scale=scale,
-        )
+            pp_chunked = MLADecodePlanParams(
+                num_heads=num_heads,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                qk_nope_head_dim=qk_nope_head_dim,
+                v_head_dim=v_head_dim,
+                num_seq=num_prefill,
+                page_size=page_size,
+                q_dtype=q_nope.dtype,
+                kv_dtype=ckv_cache.dtype,
+                sm_scale=scale,
+            )
 
-        wrapper_prefill = _GlobalFlashInferMLAPlanner.plan_prefill(
-            qo_indptr_host=cu_seqlen_host[: num_prefill + 1],
-            kv_indptr_host=cu_seqlen_host[: num_prefill + 1],  # Same as qo for self-attention
-            plan_params=pp_prefill,
-            custom_mask=custom_mask,
-        )
+            wrapper_chunked = _GlobalFlashInferMLAPlanner.plan_chunked_prefill(
+                qo_indptr=qo_indptr,
+                kv_page_indptr=cu_num_pages[: num_prefill + 1],
+                kv_page_indices=cache_loc,
+                kv_last_page_len=last_page_len[:num_prefill],
+                plan_params=pp_chunked,
+            )
 
-        y_prefill = wrapper_prefill.run(
-            q_prefill,
-            k_prefill,
-            v_prefill,
-        )
+            # Run paged MLA attention in compressed space
+            y_prefill_compressed = wrapper_chunked.run(
+                q_nope_absorbed,
+                q_pe_prefill,
+                ckv_cache,
+                kpe_cache,
+            )
+
+            # Project output back from latent space to v_head_dim
+            # y_prefill_compressed: [num_prefill_tokens, N, kv_lora_rank]
+            # w_v: [N, v_head_dim, kv_lora_rank]
+            # y_prefill: [num_prefill_tokens, N, v_head_dim]
+            y_prefill = torch.einsum("bnk,nvk->bnv", y_prefill_compressed, w_v)
+
+        else:
+            # =================================================================
+            # REGULAR PREFILL: Use BatchPrefillWithRaggedKVCacheWrapper
+            # Expand compressed_kv to K, V and use ragged attention
+            # =================================================================
+
+            # Expand compressed_kv using kv_b_proj_weight to get k_nope and v
+            # compressed_kv: [num_prefill_tokens, kv_lora_rank]
+            # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+            # kv_expanded: [num_prefill_tokens, N * (qk_nope_head_dim + v_head_dim)]
+            kv_expanded = torch.matmul(compressed_kv_prefill, kv_b_proj_weight.t())
+            kv_expanded = kv_expanded.view(
+                num_prefill_tokens, num_heads, qk_nope_head_dim + v_head_dim
+            )
+
+            # Split into k_nope and v
+            k_nope_prefill = kv_expanded[:, :, :qk_nope_head_dim]  # [tokens, N, qk_nope_head_dim]
+            v_prefill = kv_expanded[:, :, qk_nope_head_dim:].contiguous()  # [tokens, N, v_head_dim]
+
+            # Expand kpe to all heads: [tokens, qk_rope_head_dim] -> [tokens, N, qk_rope_head_dim]
+            kpe_expanded = kpe_prefill.unsqueeze(1).expand(-1, num_heads, -1).contiguous()
+
+            # Concatenate to form full Q and K
+            # Q: [tokens, N, qk_head_dim]
+            q_prefill = torch.cat([q_nope_prefill, q_pe_prefill], dim=-1).contiguous()
+            # K: [tokens, N, qk_head_dim]
+            k_prefill = torch.cat([k_nope_prefill, kpe_expanded], dim=-1).contiguous()
+
+            # Compute the causal mask for ragged prefill
+            custom_mask = _compute_ragged_causal_mask(
+                cu_seqlen_host=cu_seqlen_host,
+                num_seq=num_prefill,
+                device=q_nope.device,
+            )
+
+            pp_prefill = MLAPrefillPlanParams(
+                num_heads=num_heads,
+                num_kv_heads=num_heads,  # For MLA with expanded KV, same as num_heads
+                head_dim_qk=qk_head_dim,
+                head_dim_vo=v_head_dim,
+                num_seq=num_prefill,
+                q_dtype=q_nope.dtype,
+                kv_dtype=k_prefill.dtype,
+                sm_scale=scale,
+            )
+
+            wrapper_prefill = _GlobalFlashInferMLAPlanner.plan_prefill(
+                qo_indptr_host=cu_seqlen_host[: num_prefill + 1],
+                kv_indptr_host=cu_seqlen_host[: num_prefill + 1],  # Same as qo for self-attention
+                plan_params=pp_prefill,
+                custom_mask=custom_mask,
+            )
+
+            y_prefill = wrapper_prefill.run(
+                q_prefill,
+                k_prefill,
+                v_prefill,
+            )
 
         if y is not None:
             y[:num_prefill_tokens] = y_prefill

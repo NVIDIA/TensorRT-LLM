@@ -366,8 +366,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
     MAX_NUM_TOKENS = MAX_SEQ_LEN
 
-    def get_default_kwargs(self):
-        return {
+    def get_default_kwargs(self, enable_chunked_prefill=False):
+        config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "compile_backend": "torch-cudagraph",
@@ -385,6 +385,11 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                 "torch_dtype": "bfloat16"
             },
         }
+        if enable_chunked_prefill:
+            config["enable_chunked_prefill"] = True
+            config[
+                "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
+        return config
 
     def get_default_sampling_params(self):
         eos_id = -1
@@ -395,8 +400,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_auto_dtype(self):
-        kwargs = self.get_default_kwargs()
+    @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
+    def test_auto_dtype(self, enable_chunked_prefill):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,

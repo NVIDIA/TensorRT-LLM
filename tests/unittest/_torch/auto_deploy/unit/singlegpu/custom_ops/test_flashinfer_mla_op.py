@@ -1319,3 +1319,218 @@ def test_flashinfer_mla_variable_seq_multi_decode(
     assert torch.isfinite(flashinfer_output_decode).all(), (
         "Final decode output contains NaN or Inf values"
     )
+
+
+@pytest.mark.parametrize(
+    "chunk_config",
+    [
+        # Each config has list of chunk sizes per sequence
+        # e.g., [[32, 16, 8], [64, 32, 16]] means 2 sequences with 3 chunks each
+        {"chunks_per_seq": [[32, 16], [64, 32]]},  # 2 sequences, 2 chunks each
+        {"chunks_per_seq": [[32, 16, 8], [64, 32, 16]]},  # 2 sequences, 3 chunks each
+        {"chunks_per_seq": [[64, 32, 16, 8]]},  # 1 sequence, 4 chunks
+        {
+            "chunks_per_seq": [[32, 32, 32], [48, 48, 48], [64, 64, 64]]
+        },  # 3 sequences, 3 chunks each
+        {"chunks_per_seq": [[16, 16, 16, 16, 16]]},  # 1 sequence, 5 chunks
+    ],
+)
+@pytest.mark.parametrize("num_heads", [8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_mla_chunked_prefill(chunk_config, num_heads, dtype, device):
+    """Test FlashInfer MLA chunked prefill (incremental prefill) with multiple chunks.
+
+    This test verifies that chunked prefill works correctly when:
+    1. First chunk is processed (input_pos == 0) - uses BatchPrefillWithRaggedKVCacheWrapper
+    2. Subsequent chunks are processed (input_pos > 0) - uses BatchMLAPagedAttentionWrapper
+
+    In chunked prefill, the Q tokens attend to all KV tokens (cached + current),
+    which is different from regular prefill where Q and KV lengths are equal.
+
+    Compares flashinfer_mla_with_cache against torch_backend_mla_with_cache.
+    """
+    chunks_per_seq = chunk_config["chunks_per_seq"]
+    batch_size = len(chunks_per_seq)
+    num_chunks = len(chunks_per_seq[0])  # Assume all sequences have same number of chunks
+
+    # MLA dimensions
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64  # Must be 64 for FlashInfer MLA.
+    kv_lora_rank = 512  # Must be 512 for FlashInfer MLA.
+    v_head_dim = 128
+    page_size = 32
+
+    # Calculate total sequence lengths
+    total_seq_lengths = [sum(chunks) for chunks in chunks_per_seq]
+    max_seq_len = max(total_seq_lengths) + 128
+    max_num_pages = batch_size * (max_seq_len // page_size + 2)
+
+    # Common kv_b_proj_weight
+    kv_head_dim = qk_nope_head_dim + v_head_dim
+    weight_scale = 1.0 / (kv_lora_rank**0.5)
+    kv_b_proj_weight = (
+        torch.randn(num_heads * kv_head_dim, kv_lora_rank, dtype=dtype, device=device)
+        * weight_scale
+    )
+
+    # Initialize caches (will be reused across chunks)
+    torch_mla_cache = torch.zeros(
+        batch_size, max_seq_len, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+    )
+    flashinfer_ckv_cache = torch.zeros(
+        max_num_pages, page_size, kv_lora_rank, dtype=dtype, device=device
+    )
+    flashinfer_kpe_cache = torch.zeros(
+        max_num_pages, page_size, qk_rope_head_dim, dtype=dtype, device=device
+    )
+
+    # Track cumulative positions per sequence
+    cumulative_positions = [0] * batch_size
+
+    # Process each chunk
+    for chunk_idx in range(num_chunks):
+        # Get current chunk lengths
+        current_chunk_lengths = [
+            chunks_per_seq[seq_idx][chunk_idx] for seq_idx in range(batch_size)
+        ]
+        total_tokens = sum(current_chunk_lengths)
+        input_positions = cumulative_positions.copy()
+
+        # Create inputs for this chunk
+        q_nope_list = []
+        q_pe_list = []
+        compressed_kv_list = []
+        kpe_list = []
+
+        for chunk_len in current_chunk_lengths:
+            inputs = _create_mla_inputs(
+                1,
+                chunk_len,
+                num_heads,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                kv_lora_rank,
+                v_head_dim,
+                dtype,
+                device,
+            )
+            q_nope_list.append(inputs["q_nope"].squeeze(0))
+            q_pe_list.append(inputs["q_pe"].squeeze(0))
+            compressed_kv_list.append(inputs["compressed_kv"].squeeze(0))
+            kpe_list.append(inputs["kpe"].squeeze(0))
+
+        q_nope_flat = torch.cat(q_nope_list, dim=0).unsqueeze(0)
+        q_pe_flat = torch.cat(q_pe_list, dim=0).unsqueeze(0)
+        compressed_kv_flat = torch.cat(compressed_kv_list, dim=0).unsqueeze(0)
+        kpe_flat = torch.cat(kpe_list, dim=0).unsqueeze(0)
+
+        # =====================================================================
+        # Torch backend
+        # =====================================================================
+        torch_meta = _create_unpaged_cache_and_metadata(
+            batch_size,
+            max_seq_len,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype,
+            device,
+            current_chunk_lengths,
+            input_positions,
+        )
+        torch_meta["mla_cache"] = torch_mla_cache  # Use shared cache
+
+        torch_output = torch.ops.auto_deploy.torch_cached_mla_with_cache(
+            q_nope_flat,
+            q_pe_flat,
+            compressed_kv_flat,
+            kpe_flat,
+            kv_b_proj_weight,
+            torch_meta["batch_info_host"],
+            torch_meta["seq_len"],
+            torch_meta["input_pos"],
+            torch_meta["slot_idx"],
+            torch_meta["cu_seqlen"],
+            torch_meta["mla_cache"],
+            None,
+            kv_lora_rank,
+        )
+
+        # =====================================================================
+        # FlashInfer backend
+        # =====================================================================
+        _GlobalFlashInferMLAPlanner.reset(torch.device(device))
+
+        flashinfer_meta = _create_paged_cache_and_metadata(
+            batch_size,
+            max_num_pages,
+            page_size,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype,
+            device,
+            current_chunk_lengths,
+            input_positions,
+        )
+        # Use shared caches
+        flashinfer_meta["ckv_cache"] = flashinfer_ckv_cache
+        flashinfer_meta["kpe_cache"] = flashinfer_kpe_cache
+
+        qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        qo_indptr[1:] = torch.cumsum(
+            torch.tensor(current_chunk_lengths, device=device), dim=0
+        ).int()
+
+        batch_indices, positions = flashinfer.get_batch_indices_positions(
+            qo_indptr,
+            flashinfer.get_seq_lens(
+                flashinfer_meta["cu_num_pages"],
+                flashinfer_meta["last_page_len"],
+                page_size=page_size,
+            ),
+            total_tokens,
+        )
+
+        flashinfer_output = torch.ops.auto_deploy.flashinfer_mla_with_cache(
+            q_nope_flat,
+            q_pe_flat,
+            compressed_kv_flat,
+            kpe_flat,
+            kv_b_proj_weight,
+            flashinfer_meta["batch_info_host"],
+            flashinfer_meta["cu_seqlen_host"],
+            flashinfer_meta["cu_num_pages"],
+            flashinfer_meta["cu_num_pages_host"],
+            flashinfer_meta["cache_loc"],
+            flashinfer_meta["last_page_len"],
+            flashinfer_meta["last_page_len_host"],
+            flashinfer_meta["seq_len_with_cache_host"],
+            batch_indices,
+            positions,
+            flashinfer_meta["ckv_cache"],
+            flashinfer_meta["kpe_cache"],
+            None,
+            kv_lora_rank,
+        )
+
+        # Verify outputs match
+        is_first_chunk = chunk_idx == 0
+        chunk_type = "regular prefill" if is_first_chunk else "chunked prefill"
+        assert torch.allclose(
+            flashinfer_output.cpu().to(torch.float32),
+            torch_output.cpu().to(torch.float32),
+            atol=0.05,
+            rtol=0.02,
+        ), (
+            f"Chunk {chunk_idx + 1}/{num_chunks} ({chunk_type}) outputs don't match. "
+            f"Max diff: {(flashinfer_output - torch_output).abs().max():.6f}"
+        )
+
+        # Verify outputs are finite
+        assert torch.isfinite(flashinfer_output).all(), (
+            f"Chunk {chunk_idx + 1}/{num_chunks} ({chunk_type}) output contains NaN or Inf values"
+        )
+
+        # Update cumulative positions for next chunk
+        for seq_idx in range(batch_size):
+            cumulative_positions[seq_idx] += current_chunk_lengths[seq_idx]
