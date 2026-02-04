@@ -58,26 +58,43 @@ class ExpertStatistic:
         self.start = start
         self.stop = stop
         self._meta_info = None
-        self._records = {}
+        self._records = {}        # Raw token_selected_experts tensors
+        self._records_bincount = {}  # Aggregated bincount results (legacy format)
 
     @property
     def _should_record(self) -> bool:
-        return self.current_iter_id is not None and self.start <= self.current_iter_id < self.stop
+        # Changed from `< self.stop` to `<= self.stop` to match nsys profiling behavior
+        # Now "10-20" means iter 10, 11, ..., 20 (inclusive) for both nsys and statistics
+        return self.current_iter_id is not None and self.start <= self.current_iter_id <= self.stop
+
+    def _save(self) -> None:
+        """Save recorded statistics to files in both formats."""
+        logger.info(
+            f'[ExpertStatistic] Rank={self.rank_id}, saving after stop={self.stop}, start={self.start}'
+        )
+        path = os.environ.get('EXPERT_STATISTIC_PATH', 'expert_statistic')
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+
+        # Save metadata
+        if self.rank_id == 0:
+            with open(f"{path}/meta_info.json", "w") as f:
+                json.dump(self._meta_info, f)
+
+        # Save bincount results (legacy format, same as before)
+        safetensors.torch.save_file(
+            self._records_bincount, f"{path}/rank{self.rank_id}.safetensors")
+
+        # Save raw token_selected_experts tensors (new format)
+        safetensors.torch.save_file(
+            self._records, f"{path}/rank{self.rank_id}_raw.safetensors")
 
     def _set_iter(self, iter_id: int) -> None:
+        # Save after the stop iteration has been recorded (when moving to stop+1)
+        # This ensures iter=stop's data is captured before saving
+        if self.current_iter_id == self.stop:
+            self._save()
         self.current_iter_id = iter_id
-        if iter_id == self.stop:
-            logger.info(
-                f'[ExpertStatistic] Rank={self.rank_id}, saving iter={iter_id}, start={self.start}, stop={self.stop}'
-            )
-            path = os.environ.get('EXPERT_STATISTIC_PATH', 'expert_statistic')
-            if not os.path.exists(path):
-                os.makedirs(path, exist_ok=True)
-            if self.rank_id == 0:
-                with open(f"{path}/meta_info.json", "w") as f:
-                    json.dump(self._meta_info, f)
-            safetensors.torch.save_file(
-                self._records, f"{path}/rank{self.rank_id}.safetensors")
 
     def _set_layer(self, layer: int) -> None:
         self.current_layer = layer
@@ -92,10 +109,16 @@ class ExpertStatistic:
                 "num_experts": expert_count,
                 "num_experts_per_token": token_selected_experts.size(-1)
             }
+
+        key = f"{self.current_iter_id}_{self.current_layer}"
+
+        # Save raw token_selected_experts tensor (new format)
+        self._records[key] = token_selected_experts.cpu().contiguous()
+
+        # Also compute and save bincount (legacy format)
         counts = torch.bincount(token_selected_experts.flatten(),
                                 minlength=expert_count)
-        key = f"{self.current_iter_id}_{self.current_layer}"
-        if key not in self._records:
-            self._records[key] = counts.cpu()
+        if key not in self._records_bincount:
+            self._records_bincount[key] = counts.cpu()
         else:
-            self._records[key] += counts.cpu()
+            self._records_bincount[key] += counts.cpu()

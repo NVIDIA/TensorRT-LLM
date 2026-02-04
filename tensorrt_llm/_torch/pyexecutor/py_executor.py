@@ -281,6 +281,9 @@ class PyExecutor:
         self.peft_cache_config = peft_cache_config
 
         self.iter_counter = 0
+        # Unified iteration counter for both nsys profiling and ExpertStatistic
+        # This is incremented in profile_step() before any forward/continue decisions
+        self._profile_iter = -1
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -727,7 +730,11 @@ class PyExecutor:
 
     @contextmanager
     def _profiler(self):
-        it = -1
+        # Note: self._profile_iter is used instead of local 'it' variable
+        # This allows _forward_step() to access the same iteration counter
+        # that nsys profiling uses, ensuring "10-20" has the same meaning
+        # for both TLLM_PROFILE_START_STOP and EXPERT_STATISTIC_ITER_RANGE
+        self._profile_iter = -1
         enabled = False
         start_time = None
 
@@ -764,14 +771,14 @@ class PyExecutor:
         calibrator = get_calibrator()
 
         def profile_step():
-            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
-            calibrator.post_step(it)
-            if it in self.profile_stop_iters and not self.is_warmup:
+            nonlocal enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
+            calibrator.post_step(self._profile_iter)
+            if self._profile_iter in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
-                    logger.info(f"Profiling stopped at iteration {it}, "
+                    logger.info(f"Profiling stopped at iteration {self._profile_iter}, "
                                 f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
                 calibrator.stop()
@@ -779,7 +786,7 @@ class PyExecutor:
 
             if start_time is not None and self.print_log and self.dist.rank == 0:
                 end_time = time.time()
-                if it % 2 == 0:
+                if self._profile_iter % 2 == 0:
                     end_event_1.record()
                     if start_event_2 is not None:
                         end_event_2.synchronize()
@@ -811,19 +818,19 @@ class PyExecutor:
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
 
-            it += 1
+            self._profile_iter += 1
 
-            if it in self.profile_start_iters and not self.is_warmup:
+            if self._profile_iter in self.profile_start_iters and not self.is_warmup:
                 assert not enabled, "Inconsistent CUDA profiling state"
                 calibrator.start()
                 torch.cuda.cudart().cudaProfilerStart()
                 if enable_torch_trace:
                     torch_profiler.start()
-                logger.info(f"Profiling started at iteration {it}.")
+                logger.info(f"Profiling started at iteration {self._profile_iter}.")
                 enabled = True
-            calibrator.pre_step(it)
+            calibrator.pre_step(self._profile_iter)
             start_time = time.time()
-            if it % 2 == 0:
+            if self._profile_iter % 2 == 0:
                 if start_event_1 is None:
                     start_event_1 = torch.cuda.Event(enable_timing=True)
                 start_event_1.record()
@@ -840,7 +847,7 @@ class PyExecutor:
                 if enable_torch_trace:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
-                    logger.info(f"Profiling stopped at iteration {it}, "
+                    logger.info(f"Profiling stopped at iteration {self._profile_iter}, "
                                 f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
                 calibrator.stop()
@@ -2628,7 +2635,11 @@ class PyExecutor:
             scheduled_requests: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
-        ExpertStatistic.set_iter(self.iter_counter)
+        # Use self._profile_iter for ExpertStatistic to ensure unified iteration tracking
+        # with nsys profiling. This is the same counter used by profile_step(), so
+        # "10-20" has the same meaning for both TLLM_PROFILE_START_STOP and
+        # EXPERT_STATISTIC_ITER_RANGE, even when 'continue' statements skip iterations.
+        ExpertStatistic.set_iter(self._profile_iter)
 
         @nvtx_range(
             f"[Executor] _forward_step {self.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"

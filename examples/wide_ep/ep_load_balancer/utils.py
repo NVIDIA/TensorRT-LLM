@@ -6,11 +6,23 @@ import torch
 
 
 def load_expert_statistic(path: str):
+    """Load expert statistics (bincount results) from saved files.
+
+    Loads from .safetensors files which contain pre-computed bincount results.
+    This is the same format as the original implementation.
+
+    Returns:
+        meta_info: Dictionary containing metadata (num_experts, num_experts_per_token, etc.)
+        statistic: Dictionary mapping (iter_id, layer_id) to expert token counts
+    """
     with open(f"{path}/meta_info.json", "r") as f:
         meta_info = json.load(f)
 
     statistic_files = glob.glob(f"{path}/rank*.safetensors")
+    # Exclude *_raw.safetensors files
+    statistic_files = [f for f in statistic_files if not f.endswith('_raw.safetensors')]
     statistic = {}
+
     for statistic_file in statistic_files:
         rank_statistic = safetensors.torch.load_file(statistic_file)
         for key, data in rank_statistic.items():
@@ -35,3 +47,33 @@ def load_expert_statistic(path: str):
     meta_info["iter_stop"] = iters[-1] + 1
     meta_info["layers"] = layers
     return meta_info, statistic
+
+
+def load_raw_expert_statistic(path: str):
+    """Load raw token_selected_experts tensors from *_raw.safetensors files.
+
+    Returns:
+        meta_info: Dictionary containing metadata
+        raw_statistic: Dictionary mapping (iter_id, layer_id, rank_id)
+                       to raw token_selected_experts tensors
+    """
+    import re
+
+    with open(f"{path}/meta_info.json", "r") as f:
+        meta_info = json.load(f)
+
+    statistic_files = glob.glob(f"{path}/rank*_raw.safetensors")
+    raw_statistic = {}
+
+    for statistic_file in statistic_files:
+        match = re.search(r'rank(\d+)_raw\.safetensors', statistic_file)
+        rank_id = int(match.group(1)) if match else 0
+
+        rank_statistic = safetensors.torch.load_file(statistic_file)
+        for key, data in rank_statistic.items():
+            iter_idx, layer_idx = key.split("_")
+            full_key = (int(iter_idx), int(layer_idx), rank_id)
+            raw_statistic[full_key] = data
+
+    meta_info["ep_size"] = len(statistic_files)
+    return meta_info, raw_statistic
