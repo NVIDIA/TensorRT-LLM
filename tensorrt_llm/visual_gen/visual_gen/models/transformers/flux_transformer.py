@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -49,6 +50,11 @@ from visual_gen.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+disable_fused_qk_norm_rope = os.environ.get("ENABLE_FUSED_QK_NORM_ROPE", "0") == "0"
+capability = torch.cuda.get_device_capability(0)
+sm = f"{capability[0]}{capability[1]}"
+if sm not in ["80", "86", "89", "90", "100", "103", "120"]:
+    disable_fused_qk_norm_rope = True
 
 class ditFluxAttnProcessor(ditAttnProcessor):
     def __call__(
@@ -59,32 +65,78 @@ class ditFluxAttnProcessor(ditAttnProcessor):
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
-            attn, hidden_states, encoder_hidden_states
-        )
+        if disable_fused_qk_norm_rope:
+            query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+                attn, hidden_states, encoder_hidden_states
+            )
 
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
+            query = query.unflatten(-1, (attn.heads, -1))
+            key = key.unflatten(-1, (attn.heads, -1))
+            value = value.unflatten(-1, (attn.heads, -1))
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
 
-        if attn.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+            if attn.added_kv_proj_dim is not None:
+                encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+                encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+                encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
 
-            encoder_query = attn.norm_added_q(encoder_query)
-            encoder_key = attn.norm_added_k(encoder_key)
+                encoder_query = attn.norm_added_q(encoder_query)
+                encoder_key = attn.norm_added_k(encoder_key)
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
 
-        if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            if image_rotary_emb is not None:
+                query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+        else:
+            qkv_t = attn.to_qkv(hidden_states)
+            if attn.added_kv_proj_dim is None:
+                bs, seq_len = qkv_t.shape[:2]
+                all_qkv = qkv_t.reshape(-1,attn.heads*attn.head_dim*3)#.squeeze()
+                torch.ops.fused_qk_norm_rope_0.fused_qk_norm_rope_0(
+                    all_qkv,
+                    all_qkv.shape[0],
+                    seq_len,
+                    attn.heads,
+                    attn.heads,
+                    attn.heads,
+                    attn.head_dim,
+                    attn.norm_k.eps,
+                    attn.norm_q.weight,
+                    attn.norm_k.weight,
+                    image_rotary_emb[0],
+                    image_rotary_emb[1],
+                )
+            else:
+                bs = qkv_t.shape[0]
+                encoder_qkv_t = attn.to_added_qkv(encoder_hidden_states)
+                seq_len = qkv_t.shape[1] + encoder_qkv_t.shape[1]
+                all_qkv = torch.cat([encoder_qkv_t, qkv_t], dim=1).reshape(-1,attn.heads*attn.head_dim*3)
+                torch.ops.fused_qk_norm_rope.fused_qk_norm_rope(
+                    all_qkv,
+                    all_qkv.shape[0],
+                    seq_len,
+                    attn.heads,
+                    attn.heads,
+                    attn.heads,
+                    attn.head_dim,
+                    attn.norm_k.eps,
+                    attn.norm_q.weight,
+                    attn.norm_k.weight,
+                    attn.norm_added_q.weight,
+                    attn.norm_added_k.weight,
+                    image_rotary_emb[0],
+                    image_rotary_emb[1],
+                )
+
+            all_qkv_reshaped = all_qkv.view(bs, seq_len, 3, attn.heads, attn.head_dim)
+            query = all_qkv_reshaped[:, :, 0, :, :]
+            key = all_qkv_reshaped[:, :, 1, :, :]
+            value = all_qkv_reshaped[:, :, 2, :, :]
 
         hidden_states = self.visual_gen_attn(
             query, key, value, attn_mask=attention_mask, tensor_layout="NHD"

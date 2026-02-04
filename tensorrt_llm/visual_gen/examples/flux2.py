@@ -123,11 +123,11 @@ def run_inference(pipe, args, enable_autotuner: bool = False):
 
 
 def main():
-    """Main function for Flux text-to-image generation."""
+    """Main function for Flux2 text-to-image generation."""
     # Setup argument parser
-    parser = BaseArgumentParser("Flux Text-to-Image Generation")
+    parser = BaseArgumentParser("Flux2 Text-to-Image Generation")
 
-    # Set defaults for Flux
+    # Set defaults for Flux2
     parser.set_defaults(
         model_path="black-forest-labs/FLUX.2-dev",
         prompt="dog dancing near the sun",

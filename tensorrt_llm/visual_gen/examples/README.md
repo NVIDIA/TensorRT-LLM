@@ -73,6 +73,12 @@ python flux.py --model_path "black-forest-labs/FLUX.1-dev" --height 1024 --width
 python flux2.py --model_path "black-forest-labs/FLUX.2-dev" --height 1024 --width 1024 --enable_cuda_graph
 ```
 
+You can also try to set `ENABLE_FUSED_QK_NORM_ROPE=1` to run Flux1/Flux2 with a fused qk_norm and rope kernel. You may get some perf gain depends on you device.
+```bash
+ENABLE_FUSED_QK_NORM_ROPE=1 python flux2.py --model_path "black-forest-labs/FLUX.2-dev" --height 1024 --width 1024 --enable_cuda_graph
+```
+
+
 #### HunyuanImage-2.1
 ```bash
 # HunyuanImage2.1 is independent with diffusers, we have to access relative codes from Github
