@@ -445,3 +445,4 @@ l0_h100:
   - examples/test_ad_speculative_decoding.py::test_eagle_model_with_weights
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[1]
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[2]
+  - examples/test_ad_export_onnx.py::test_ad_export_onnx[Qwen/Qwen2.5-3B-Instruct-/tmp/test_ad_export_onnx_qwen2.5-3b-36]
