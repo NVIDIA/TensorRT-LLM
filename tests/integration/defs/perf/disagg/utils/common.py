@@ -2,50 +2,50 @@
 
 import os
 
-# GPU resource configuration
-# Centralized configuration for all GPU-specific parameters
+# GPU resource configuration - centralized config for all GPU-specific parameters
+# job_name_prefix: SLURM job name format is {prefix}-{base} (e.g., coreai_comparch_trtllm-unified.benchmark)
 GPU_RESOURCE_CONFIG = {
-    # OCI GB200
-    "GB200": {
-        "slurm_extra_args": "--gres=gpu:4",  # SLURM extra arguments (empty string if not required)
+    "GB200": {  # OCI GB200
+        "slurm_extra_args": "--gres=gpu:4",
         "set_segment": True,
-        "lock_freq_graphics_mhz": 2062,  # GPU graphics clock lock frequency (MHz)
-        "lock_freq_memory_mhz": 3996,  # GPU memory clock lock frequency (MHz)
+        "lock_freq_graphics_mhz": 2062,
+        "lock_freq_memory_mhz": 3996,
+        "job_name_prefix": "",
     },
-    # Lyris GB200
-    "GB200_LYRIS": {
-        "slurm_extra_args": "",  # GB300 does not require extra args
+    "GB200_LYRIS": {  # Lyris GB200
+        "slurm_extra_args": "",
         "set_segment": True,
-        "lock_freq_graphics_mhz": None,  # TODO: Set GB300 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
+        "job_name_prefix": "coreai_comparch_trtllm",
     },
-    # Lyris GB300
-    "GB300": {
-        "slurm_extra_args": "",  # GB300 does not require extra args
+    "GB300": {  # Lyris GB300
+        "slurm_extra_args": "",
         "set_segment": True,
-        "lock_freq_graphics_mhz": None,  # TODO: Set GB300 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
+        "job_name_prefix": "coreai_comparch_trtllm",
     },
-    # H100
     "H100": {
-        "slurm_extra_args": "",  # H100 does not require extra args
+        "slurm_extra_args": "",
         "set_segment": False,
-        "lock_freq_graphics_mhz": None,  # TODO: Set H100 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
+        "job_name_prefix": "",
     },
-    # B200
-    "B200": {
+    "B200": {  # OCI B200
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
-        "lock_freq_graphics_mhz": None,  # TODO: Set B200 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
+        "job_name_prefix": "coreai_comparch_trtllm",
     },
-    # B300
-    "B300": {
+    "B300": {  # OCI B300
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
-        "lock_freq_graphics_mhz": None,  # TODO: Set B300 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
+        "job_name_prefix": "coreai_comparch_trtllm",
     },
 }
 
@@ -67,7 +67,17 @@ class EnvManager:
 
     @staticmethod
     def get_slurm_job_name() -> str:
-        return os.getenv("SLURM_JOB_NAME", "unified-benchmark")
+        """Get SLURM job name based on GPU type configuration.
+        
+        Format: {prefix}-{base} or just {base} if no prefix.
+        Example: coreai_comparch_trtllm-unified.benchmark
+        
+        Customize via SLURM_JOB_BASE_NAME env var (default: unified.benchmark)
+        """
+        gpu_type = EnvManager.get_gpu_type()
+        prefix = GPU_RESOURCE_CONFIG.get(gpu_type, {}).get("job_name_prefix", "")
+        base = os.getenv("SLURM_JOB_BASE_NAME", "unified.benchmark")
+        return f"{prefix}-{base}" if prefix else base
 
     @staticmethod
     def get_slurm_set_segment() -> bool:
