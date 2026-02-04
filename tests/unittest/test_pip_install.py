@@ -115,47 +115,47 @@ def download_wheel(args):
                           shell=True)
 
 
-def install_tensorrt_llm():
-    """
-    Installs the tensorrt_llm wheel, dynamically creating a torch constraint
-    if torch is already installed to prevent it from being replaced.
-    """
-    print("##########  Install tensorrt_llm package  ##########")
+def get_torch_constraint_file(constraint_dir="."):
+    """Create a torch constraint file if torch is already installed.
 
-    install_command = "pip3 install tensorrt_llm-*.whl"
+    This prevents pip from changing the pre-installed PyTorch version,
+    which could cause ABI incompatibility issues.
 
-    # Always check for an existing torch installation, regardless of OS.
+    Args:
+        constraint_dir: Directory to create the constraint file in.
+
+    Returns:
+        Path to constraint file if torch is installed, None otherwise.
+    """
     try:
-        print("Checking for existing torch installation...")
         torch_version_result = subprocess.run(
             ['python3', '-c', 'import torch; print(torch.__version__)'],
             capture_output=True,
             text=True,
             check=True)
         torch_version = torch_version_result.stdout.strip()
-
         if torch_version:
             print(f"Found installed torch version: {torch_version}")
-            constraint_filename = "torch-constraint.txt"
-            with open(constraint_filename, "w") as f:
+            constraint_file = os.path.join(constraint_dir,
+                                           "torch-constraint.txt")
+            with open(constraint_file, "w") as f:
                 f.write(f"torch=={torch_version}\n")
-            print(
-                f"Created {constraint_filename} to constrain torch to version {torch_version}."
-            )
-
-            # Modify install command to use the constraint
-            install_command += f" -c {constraint_filename}"
-        else:
-            # This case is unlikely if the subprocess call succeeds
-            print(
-                "Could not determine installed torch version. Installing without constraint."
-            )
-
+            print(f"Created {constraint_file} to constrain torch version.")
+            return constraint_file
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # This handles cases where python3 fails or 'import torch' raises an error.
         print("Torch is not installed. Proceeding without constraint.")
+    return None
 
-    # Execute the final installation command
+
+def install_tensorrt_llm():
+    """Install the tensorrt_llm wheel with torch version constraint."""
+    print("##########  Install tensorrt_llm package  ##########")
+
+    install_command = "pip3 install tensorrt_llm-*.whl"
+    constraint_file = get_torch_constraint_file()
+    if constraint_file:
+        install_command += f" -c {constraint_file}"
+
     print(f"Executing command: {install_command}")
     subprocess.check_call(install_command, shell=True)
 
@@ -225,7 +225,7 @@ def test_python_builds(args):
     This test verifies the TRTLLM_PRECOMPILED_LOCATION workflow:
     1. Install required system libs
     2. Use precompiled wheel URL to extract C++ bindings
-    3. Build Python-only wheel (editable install with --no-deps)
+    3. Build Python-only wheel (editable install with torch constraint)
     4. Verify installation works correctly
     5. Run quickstart example
     6. Clean up editable install to leave env in clean state
@@ -250,10 +250,12 @@ def test_python_builds(args):
     env = os.environ.copy()
     env["TRTLLM_PRECOMPILED_LOCATION"] = wheel_url
 
-    # Use --no-deps to avoid changing torch/torchvision versions.
-    subprocess.check_call(["pip3", "install", "-e", ".", "--no-deps", "-v"],
-                          cwd=repo_root,
-                          env=env)
+    install_cmd = ["pip3", "install", "-e", ".", "-v"]
+    constraint_file = get_torch_constraint_file(repo_root)
+    if constraint_file:
+        install_cmd.extend(["-c", constraint_file])
+
+    subprocess.check_call(install_cmd, cwd=repo_root, env=env)
     run_sanity_check(examples_path=f"{repo_root}/examples")
 
     # Clean up: uninstall editable install to leave env in clean state
