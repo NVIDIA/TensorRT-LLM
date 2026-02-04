@@ -361,7 +361,7 @@ class TrtllmAttentionGlobalState:
         """Create host_prepare function for CUDA graph support.
 
         This function runs OUTSIDE the graph, before each forward (including replay).
-        It updates tensors with current batch values.
+        It updates tensors with current batch values using vectorized GPU operations.
         """
         layer_states = self._layer_states
         global_state = self
@@ -373,7 +373,7 @@ class TrtllmAttentionGlobalState:
             cache_loc: torch.Tensor,
             seq_len_with_cache_host: torch.Tensor,
         ) -> None:
-            """Fill device/host tensors before graph replay."""
+            """Fill device/host tensors before graph replay using vectorized ops."""
             if not layer_states:
                 return
 
@@ -388,56 +388,62 @@ class TrtllmAttentionGlobalState:
             if first_state.sequence_length is None:
                 return
 
-            # Compute metadata
-            input_seq_lens = (cu_seqlen_host[1 : num_seq + 1] - cu_seqlen_host[:num_seq]).int()
-            seq_len_with_cache = seq_len_with_cache_host[:num_seq].int()
-            past_kv_lens = seq_len_with_cache - input_seq_lens.cpu()
-
-            context_total_kv = (
-                seq_len_with_cache[:num_prefill].sum().item() if num_prefill > 0 else 0
-            )
-            gen_total_kv = (
-                seq_len_with_cache[num_prefill:num_seq].sum().item() if num_decode > 0 else 0
-            )
-
             num_layers = first_state.num_layers if first_state.num_layers > 0 else 32
 
-            # Block offsets info
-            pages_per_seq = (cu_num_pages_host[1 : num_seq + 1] - cu_num_pages_host[:num_seq]).int()
-            max_blocks = pages_per_seq.max().item() if num_seq > 0 else 1
+            # Compute metadata on CPU (these are already host tensors)
+            input_seq_lens = (cu_seqlen_host[1 : num_seq + 1] - cu_seqlen_host[:num_seq]).int()
+            seq_len_with_cache = seq_len_with_cache_host[:num_seq].int()
+            past_kv_lens = seq_len_with_cache - input_seq_lens
+
+            # Compute totals without .item() - use tensor ops
+            context_total_kv = seq_len_with_cache[:num_prefill].sum() if num_prefill > 0 else 0
+            gen_total_kv = seq_len_with_cache[num_prefill:num_seq].sum() if num_decode > 0 else 0
+
+            # Block offsets info - compute on CPU
+            cu_num_pages_cpu = cu_num_pages_host[: num_seq + 1].int()
+            pages_per_seq = cu_num_pages_cpu[1 : num_seq + 1] - cu_num_pages_cpu[:num_seq]
+            max_blocks = pages_per_seq.max().item()
             global_state.set_max_blocks_per_seq(max_blocks)
 
-            kv_factor = 2
-            multiplier = num_layers * kv_factor
+            total_pages = cu_num_pages_cpu[num_seq].item()
 
-            # Update ALL layer states
-            for state in layer_states.values():
+            # Prepare GPU tensors once (outside loop)
+            seq_len_gpu = seq_len_with_cache.cuda()
+            input_seq_lens_gpu = input_seq_lens.cuda()
+
+            # Compute block offsets ONCE on first layer's tensor, then copy to others
+            first_block_offsets = None
+            if total_pages > 0:
+                cu_num_pages_gpu = cu_num_pages_cpu.cuda()
+                cache_loc_gpu = cache_loc[:total_pages]
+
+                # Vectorized: find which sequence each page belongs to
+                page_indices = torch.arange(total_pages, device="cuda")
+                seq_indices = torch.searchsorted(cu_num_pages_gpu[1:], page_indices, right=True)
+                seq_indices = seq_indices.clamp(max=num_seq - 1)
+
+                # Compute within-sequence page index
+                page_in_seq = page_indices - cu_num_pages_gpu[seq_indices]
+
+                # Compute base offsets: cache_loc * multiplier
+                kv_factor = 2
+                multiplier = num_layers * kv_factor
+                base_offsets = cache_loc_gpu * multiplier
+                base_offsets_plus1 = base_offsets + 1
+
+            # Update first layer state and compute block offsets
+            states_list = list(layer_states.values())
+            for i, state in enumerate(states_list):
                 if state.sequence_length is None:
                     continue
 
-                # kv_cache_block_offsets is pre-allocated in TrtllmLayerState.__post_init__
-                # Don't reallocate to maintain stable tensor address for CUDA graphs
-                if state.kv_cache_block_offsets is None:
-                    # This shouldn't happen after __post_init__, but just in case
-                    ctx_len = state.max_context_length
-                    tpb = state.tokens_per_block
-                    max_blocks_per_seq = (ctx_len + tpb - 1) // tpb
-                    state.kv_cache_block_offsets = torch.zeros(
-                        1,
-                        state.max_num_requests,
-                        2,
-                        max_blocks_per_seq,
-                        dtype=torch.int32,
-                        device="cuda",
-                    )
+                # Fill device tensors (non-blocking) - all layers get same values
+                state.sequence_length[:num_seq].copy_(seq_len_gpu, non_blocking=True)
+                state.context_lengths[:num_seq].copy_(input_seq_lens_gpu, non_blocking=True)
 
-                # Fill device tensors
-                state.sequence_length[:num_seq].copy_(seq_len_with_cache.cuda(), non_blocking=True)
-                state.context_lengths[:num_seq].copy_(input_seq_lens.cuda(), non_blocking=True)
-
-                # Fill host tensors
+                # Fill host tensors - all layers get same values
                 state.host_past_key_value_lengths[:num_seq].copy_(past_kv_lens)
-                state.host_context_lengths[:num_seq].copy_(input_seq_lens.cpu())
+                state.host_context_lengths[:num_seq].copy_(input_seq_lens)
                 if num_prefill > 0:
                     state.host_request_types[:num_prefill].fill_(0)
                 if num_decode > 0:
@@ -445,19 +451,19 @@ class TrtllmAttentionGlobalState:
                 state.host_total_kv_lens[0] = context_total_kv
                 state.host_total_kv_lens[1] = gen_total_kv
 
-                # Fill block offsets
-                state.kv_cache_block_offsets.zero_()
-                offset = 0
-                for i in range(num_seq):
-                    n_pages = pages_per_seq[i].item()
-                    if n_pages > 0:
-                        base_offsets = cache_loc[offset : offset + n_pages] * multiplier
-                        state.kv_cache_block_offsets[0, i, 0, :n_pages] = base_offsets
-                        state.kv_cache_block_offsets[0, i, 1, :n_pages] = base_offsets + 1
-                        offset += n_pages
-
-            # Synchronize to ensure all copies complete before graph replay
-            torch.cuda.synchronize()
+                # Block offsets - compute once, copy to rest
+                if total_pages > 0:
+                    if first_block_offsets is None:
+                        # First layer: compute block offsets
+                        state.kv_cache_block_offsets.zero_()
+                        state.kv_cache_block_offsets[0, seq_indices, 0, page_in_seq] = base_offsets
+                        state.kv_cache_block_offsets[0, seq_indices, 1, page_in_seq] = (
+                            base_offsets_plus1
+                        )
+                        first_block_offsets = state.kv_cache_block_offsets
+                    else:
+                        # Other layers: copy from first (much faster than recomputing)
+                        state.kv_cache_block_offsets.copy_(first_block_offsets, non_blocking=True)
 
         return _host_prepare_trtllm_metadata
 
