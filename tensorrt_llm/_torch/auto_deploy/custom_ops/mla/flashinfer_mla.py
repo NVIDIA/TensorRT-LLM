@@ -115,12 +115,26 @@ class _FlashInferMLAPlanner:
     def _init_decode_wrapper(
         self,
         use_cuda_graph: bool = False,
+        qo_indptr: Optional[torch.Tensor] = None,
+        kv_indptr: Optional[torch.Tensor] = None,
+        kv_indices: Optional[torch.Tensor] = None,
+        kv_len_arr: Optional[torch.Tensor] = None,
     ):
         assert self.workspace_buffer is not None
-        return flashinfer.mla.BatchMLAPagedAttentionWrapper(
-            self.workspace_buffer,
-            use_cuda_graph=use_cuda_graph,
-        )
+        if use_cuda_graph:
+            return flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=kv_len_arr,
+            )
+        else:
+            return flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=False,
+            )
 
     def reset(self, device: torch.device) -> None:
         self.plan_params_prefill = None
@@ -247,13 +261,24 @@ class _FlashInferMLAPlanner:
         batch_size = kv_page_indptr.shape[0] - 1
         qo_indptr = torch.arange(batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32)
 
+        # Compute kv_len_arr for CUDA graph wrapper initialization
+        num_pages_per_seq = kv_page_indptr[1:] - kv_page_indptr[:-1]
+        kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + kv_last_page_len
+
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
         if (
             cuda_graph_state.in_warm_up()
             and plan_params not in self.cached_cuda_graph_decode_wrappers
         ):
             # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
-            wrapper = self._init_decode_wrapper()
+            # Pass the buffer tensors to the wrapper for use_cuda_graph=True
+            wrapper = self._init_decode_wrapper(
+                use_cuda_graph=True,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_page_indptr,
+                kv_indices=kv_page_indices,
+                kv_len_arr=kv_len_arr,
+            )
             self.cached_cuda_graph_decode_wrappers[plan_params] = wrapper
             self._plan_mla_wrapper(
                 wrapper, qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_len, plan_params

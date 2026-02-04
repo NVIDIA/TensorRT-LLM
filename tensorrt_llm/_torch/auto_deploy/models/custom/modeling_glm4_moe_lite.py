@@ -319,7 +319,9 @@ class Glm4MoeLiteMLP(nn.Module):
 class Glm4MoeLiteMoEGate(nn.Module):
     """MoE Gating for GLM4 MoE Lite with top-k selection.
 
-    Uses pure PyTorch implementation matching HuggingFace's routing logic.
+    Uses fused TensorRT-LLM custom ops for efficient routing:
+    - dsv3_router_gemm_op: Fused router GEMM for non-float32 weights
+    - noaux_tc_op: Fused sigmoid + bias + group top-k + normalize + scale
     """
 
     def __init__(self, config):
@@ -331,6 +333,13 @@ class Glm4MoeLiteMoEGate(nn.Module):
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+
+        # noaux_tc_op always normalizes, so norm_topk_prob must be True
+        if not self.norm_topk_prob:
+            raise ValueError(
+                "Glm4MoeLiteMoEGate requires norm_topk_prob=True when using fused ops. "
+                "The noaux_tc_op kernel always normalizes routing weights."
+            )
 
         self.weight = nn.Parameter(
             torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
@@ -348,57 +357,37 @@ class Glm4MoeLiteMoEGate(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass returning (selected_experts, routing_weights).
 
-        Implements the same routing logic as HuggingFace's Glm4MoeLiteMoE.route_tokens_to_experts.
+        Uses fused TensorRT-LLM ops for efficient routing:
+        1. dsv3_router_gemm_op: Router GEMM (when weights are not float32)
+        2. noaux_tc_op: Fused sigmoid + bias + group top-k + normalize + scale
         """
         bsz, seq_len, hidden_dim = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
-        # Compute router logits - both must be same dtype
-        # self.weight is float32 for numerical stability
-        router_logits = F.linear(hidden_states_flat.float(), self.weight.float())
+        # Router GEMM - use fused op when weights are not float32
+        if self.weight.dtype == torch.float32:
+            router_logits = F.linear(hidden_states_flat.float(), self.weight)
+        else:
+            router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_states_flat, self.weight.t(), bias=None, out_dtype=torch.float32
+            )
 
-        # Apply sigmoid activation
-        router_logits = router_logits.sigmoid()
-
-        # Add correction bias for expert selection
-        router_logits_for_choice = router_logits + self.e_score_correction_bias
-
-        # Group-wise top-k selection
-        # Compute group scores by taking top-2 within each group and summing
-        group_scores = (
-            router_logits_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
+        # Fused routing: sigmoid + bias + group top-k + normalize + scale
+        # noaux_tc_op internally applies:
+        # 1. Sigmoid to router_logits
+        # 2. Adds e_score_correction_bias
+        # 3. Group-wise top-2 scoring and top group selection
+        # 4. Top-k expert selection from selected groups
+        # 5. Gathers weights from sigmoid scores
+        # 6. Normalizes and scales by routed_scaling_factor
+        topk_weights, topk_indices = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            self.e_score_correction_bias,
+            self.n_group,
+            self.topk_group,
+            self.top_k,
+            self.routed_scaling_factor,
         )
-
-        # Select top groups
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-
-        # Create score mask for selected groups
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(-1, self.n_routed_experts)
-        )
-
-        # Mask out experts from non-selected groups
-        scores_for_choice = router_logits_for_choice.masked_fill(~score_mask.bool(), 0.0)
-
-        # Select top-k experts from selected groups
-        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-
-        # Get routing weights from original (sigmoid) router logits
-        topk_weights = router_logits.gather(1, topk_indices)
-
-        # Normalize routing weights if configured
-        if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weights = topk_weights / denominator
-
-        # Apply scaling factor
-        topk_weights = topk_weights * self.routed_scaling_factor
 
         return topk_indices, topk_weights
 

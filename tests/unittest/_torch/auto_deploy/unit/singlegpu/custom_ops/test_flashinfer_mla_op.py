@@ -20,6 +20,7 @@ import tensorrt_llm._torch.auto_deploy  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.mla.flashinfer_mla import (
     _GlobalFlashInferMLAPlanner,
 )
+from tensorrt_llm._torch.auto_deploy.utils.cuda_graph import CudaGraphWarmUpPhase
 
 
 def _create_mla_inputs(
@@ -1534,3 +1535,639 @@ def test_flashinfer_mla_chunked_prefill(chunk_config, num_heads, dtype, device):
         # Update cumulative positions for next chunk
         for seq_idx in range(batch_size):
             cumulative_positions[seq_idx] += current_chunk_lengths[seq_idx]
+
+
+# =============================================================================
+# CUDA Graph Tests
+# =============================================================================
+# Tests for CUDA graph functionality of the FlashInfer MLA planner to verify
+# that wrappers are correctly created and cached with use_cuda_graph=True.
+
+
+@pytest.mark.parametrize("prefill_seq_length", [64, 128])
+@pytest.mark.parametrize("num_heads", [1, 8])
+@pytest.mark.parametrize("batch_size", [4, 16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_mla_cuda_graph_wrapper_creation(
+    prefill_seq_length, num_heads, batch_size, dtype, device
+):
+    """Test that CUDA graph wrappers are created with use_cuda_graph=True during warm-up.
+
+    This test verifies that:
+    1. During CudaGraphWarmUpPhase, the planner creates a wrapper with use_cuda_graph=True
+    2. The wrapper is cached in cached_cuda_graph_decode_wrappers
+    3. The wrapper has correct buffer tensors attached
+    """
+    # MLA dimensions
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64  # Must be 64 for FlashInfer MLA.
+    kv_lora_rank = 512  # Must be 512 for FlashInfer MLA.
+    v_head_dim = 128
+    page_size = 64
+
+    seq_length = 1  # Decode phase
+
+    max_seq_len = 256
+    max_num_pages = batch_size * (max_seq_len // page_size + 1)
+
+    # Create input tensors
+    inputs = _create_mla_inputs(
+        batch_size,
+        seq_length,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
+    )
+
+    # Sequence lengths and positions
+    seq_lengths = [seq_length] * batch_size
+    input_positions = [prefill_seq_length] * batch_size
+
+    # Create paged cache
+    flashinfer_meta = _create_paged_cache_and_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        seq_lengths,
+        input_positions,
+    )
+
+    # Pre-fill cache with random data
+    if prefill_seq_length > 0:
+        total_prefill_pages = (prefill_seq_length - 1) // page_size + 1
+        for batch_idx in range(batch_size):
+            page_start = batch_idx * total_prefill_pages
+            for page_offset in range(total_prefill_pages):
+                page_idx = page_start + page_offset
+                tokens_in_page = min(page_size, prefill_seq_length - page_offset * page_size)
+                if tokens_in_page > 0:
+                    flashinfer_meta["ckv_cache"][page_idx, :tokens_in_page] = torch.randn(
+                        tokens_in_page, kv_lora_rank, dtype=dtype, device=device
+                    ) / (kv_lora_rank**0.5)
+                    flashinfer_meta["kpe_cache"][page_idx, :tokens_in_page] = torch.randn(
+                        tokens_in_page, qk_rope_head_dim, dtype=dtype, device=device
+                    ) / (qk_rope_head_dim**0.5)
+
+    # Reset planner
+    _GlobalFlashInferMLAPlanner.workspace_buffer = None
+    _GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers = {}
+    _GlobalFlashInferMLAPlanner.reset(torch.device(device))
+
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    qo_indptr[1:] = torch.cumsum(torch.tensor(seq_lengths, device=device), dim=0).int()
+
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            flashinfer_meta["cu_num_pages"],
+            flashinfer_meta["last_page_len"],
+            page_size=page_size,
+        ),
+        batch_size * seq_length,
+    )
+
+    # Verify no wrappers exist before warm-up
+    assert len(_GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers) == 0, (
+        "Expected no cached wrappers before warm-up"
+    )
+
+    # Warm-up phase: This triggers wrapper creation with use_cuda_graph=True
+    with CudaGraphWarmUpPhase():
+        output = torch.ops.auto_deploy.flashinfer_mla_with_cache(
+            inputs["q_nope"],
+            inputs["q_pe"],
+            inputs["compressed_kv"],
+            inputs["kpe"],
+            inputs["kv_b_proj_weight"],
+            flashinfer_meta["batch_info_host"],
+            flashinfer_meta["cu_seqlen_host"],
+            flashinfer_meta["cu_num_pages"],
+            flashinfer_meta["cu_num_pages_host"],
+            flashinfer_meta["cache_loc"],
+            flashinfer_meta["last_page_len"],
+            flashinfer_meta["last_page_len_host"],
+            flashinfer_meta["seq_len_with_cache_host"],
+            batch_indices,
+            positions,
+            flashinfer_meta["ckv_cache"],
+            flashinfer_meta["kpe_cache"],
+            None,  # scale
+            kv_lora_rank,
+        )
+
+    # Verify a CUDA graph wrapper was created
+    assert len(_GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers) == 1, (
+        f"Expected 1 cached wrapper after warm-up, "
+        f"got {len(_GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers)}"
+    )
+
+    # Verify the wrapper has the correct plan params
+    for (
+        plan_params,
+        wrapper,
+    ) in _GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers.items():
+        assert plan_params.num_seq == batch_size, (
+            f"Plan params num_seq={plan_params.num_seq} doesn't match batch_size={batch_size}"
+        )
+        assert plan_params.num_heads == num_heads, (
+            f"Plan params num_heads={plan_params.num_heads} doesn't match num_heads={num_heads}"
+        )
+        assert plan_params.kv_lora_rank == kv_lora_rank, (
+            f"Plan params kv_lora_rank={plan_params.kv_lora_rank} doesn't match "
+            f"kv_lora_rank={kv_lora_rank}"
+        )
+        assert plan_params.page_size == page_size, (
+            f"Plan params page_size={plan_params.page_size} doesn't match page_size={page_size}"
+        )
+
+        # Verify wrapper is not None
+        assert wrapper is not None, "CUDA graph wrapper should not be None"
+
+    # Verify output is valid
+    expected_shape = (batch_size, seq_length, num_heads, v_head_dim)
+    assert output.shape == expected_shape, f"Expected shape {expected_shape}, got {output.shape}"
+    assert torch.isfinite(output).all(), "Output contains NaN or Inf values"
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_mla_cuda_graph_wrapper_caching_per_batch_size(batch_size, dtype, device):
+    """Test that CUDA graph wrappers are cached per batch size.
+
+    This test verifies that:
+    1. Each batch size gets its own cached wrapper
+    2. Wrappers are keyed by MLADecodePlanParams which includes num_seq
+    """
+    # MLA dimensions
+    num_heads = 8
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    v_head_dim = 128
+    page_size = 64
+    prefill_seq_length = 64
+
+    seq_length = 1  # Decode phase
+
+    max_seq_len = 256
+    max_num_pages = batch_size * (max_seq_len // page_size + 1)
+
+    # Create inputs
+    inputs = _create_mla_inputs(
+        batch_size,
+        seq_length,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
+    )
+
+    seq_lengths = [seq_length] * batch_size
+    input_positions = [prefill_seq_length] * batch_size
+
+    flashinfer_meta = _create_paged_cache_and_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        seq_lengths,
+        input_positions,
+    )
+
+    # Pre-fill cache
+    if prefill_seq_length > 0:
+        total_prefill_pages = (prefill_seq_length - 1) // page_size + 1
+        for batch_idx in range(batch_size):
+            page_start = batch_idx * total_prefill_pages
+            for page_offset in range(total_prefill_pages):
+                page_idx = page_start + page_offset
+                tokens_in_page = min(page_size, prefill_seq_length - page_offset * page_size)
+                if tokens_in_page > 0:
+                    flashinfer_meta["ckv_cache"][page_idx, :tokens_in_page] = torch.randn(
+                        tokens_in_page, kv_lora_rank, dtype=dtype, device=device
+                    ) / (kv_lora_rank**0.5)
+                    flashinfer_meta["kpe_cache"][page_idx, :tokens_in_page] = torch.randn(
+                        tokens_in_page, qk_rope_head_dim, dtype=dtype, device=device
+                    ) / (qk_rope_head_dim**0.5)
+
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    qo_indptr[1:] = torch.cumsum(torch.tensor(seq_lengths, device=device), dim=0).int()
+
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            flashinfer_meta["cu_num_pages"],
+            flashinfer_meta["last_page_len"],
+            page_size=page_size,
+        ),
+        batch_size * seq_length,
+    )
+
+    # Reset planner
+    _GlobalFlashInferMLAPlanner.workspace_buffer = None
+    _GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers = {}
+    _GlobalFlashInferMLAPlanner.reset(torch.device(device))
+
+    # Warm-up to create CUDA graph wrapper for this batch size
+    with CudaGraphWarmUpPhase():
+        _ = torch.ops.auto_deploy.flashinfer_mla_with_cache(
+            inputs["q_nope"],
+            inputs["q_pe"],
+            inputs["compressed_kv"],
+            inputs["kpe"],
+            inputs["kv_b_proj_weight"],
+            flashinfer_meta["batch_info_host"],
+            flashinfer_meta["cu_seqlen_host"],
+            flashinfer_meta["cu_num_pages"],
+            flashinfer_meta["cu_num_pages_host"],
+            flashinfer_meta["cache_loc"],
+            flashinfer_meta["last_page_len"],
+            flashinfer_meta["last_page_len_host"],
+            flashinfer_meta["seq_len_with_cache_host"],
+            batch_indices,
+            positions,
+            flashinfer_meta["ckv_cache"],
+            flashinfer_meta["kpe_cache"],
+            None,
+            kv_lora_rank,
+        )
+
+    # Verify wrapper was created for this batch size
+    assert len(_GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers) == 1, (
+        f"Expected 1 cached wrapper for batch_size={batch_size}, "
+        f"got {len(_GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers)}"
+    )
+
+    # Verify the wrapper has the correct num_seq
+    for plan_params in _GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers:
+        assert plan_params.num_seq == batch_size, (
+            f"Plan params num_seq={plan_params.num_seq} doesn't match batch_size={batch_size}"
+        )
+
+
+@pytest.mark.parametrize("prefill_seq_length", [64])
+@pytest.mark.parametrize("num_heads", [8])
+@pytest.mark.parametrize("batch_size", [4, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_mla_plan_generate_only(
+    prefill_seq_length, num_heads, batch_size, dtype, device
+):
+    """Test plan_generate_only function for re-planning decode-only batches.
+
+    This test verifies that:
+    1. plan_generate_only can re-plan cached CUDA graph wrappers
+    2. The wrappers can be used after re-planning
+    """
+    # MLA dimensions
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    v_head_dim = 128
+    page_size = 64
+
+    seq_length = 1  # Decode phase
+
+    max_seq_len = 256
+    max_num_pages = batch_size * (max_seq_len // page_size + 1)
+
+    # Create inputs
+    inputs = _create_mla_inputs(
+        batch_size,
+        seq_length,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
+    )
+
+    seq_lengths = [seq_length] * batch_size
+    input_positions = [prefill_seq_length] * batch_size
+
+    flashinfer_meta = _create_paged_cache_and_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        seq_lengths,
+        input_positions,
+    )
+
+    # Pre-fill cache
+    if prefill_seq_length > 0:
+        total_prefill_pages = (prefill_seq_length - 1) // page_size + 1
+        for batch_idx in range(batch_size):
+            page_start = batch_idx * total_prefill_pages
+            for page_offset in range(total_prefill_pages):
+                page_idx = page_start + page_offset
+                tokens_in_page = min(page_size, prefill_seq_length - page_offset * page_size)
+                if tokens_in_page > 0:
+                    flashinfer_meta["ckv_cache"][page_idx, :tokens_in_page] = torch.randn(
+                        tokens_in_page, kv_lora_rank, dtype=dtype, device=device
+                    ) / (kv_lora_rank**0.5)
+                    flashinfer_meta["kpe_cache"][page_idx, :tokens_in_page] = torch.randn(
+                        tokens_in_page, qk_rope_head_dim, dtype=dtype, device=device
+                    ) / (qk_rope_head_dim**0.5)
+
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    qo_indptr[1:] = torch.cumsum(torch.tensor(seq_lengths, device=device), dim=0).int()
+
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            flashinfer_meta["cu_num_pages"],
+            flashinfer_meta["last_page_len"],
+            page_size=page_size,
+        ),
+        batch_size * seq_length,
+    )
+
+    # Reset planner
+    _GlobalFlashInferMLAPlanner.workspace_buffer = None
+    _GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers = {}
+    _GlobalFlashInferMLAPlanner.reset(torch.device(device))
+
+    # First warm-up to create the wrapper
+    with CudaGraphWarmUpPhase():
+        output1 = torch.ops.auto_deploy.flashinfer_mla_with_cache(
+            inputs["q_nope"],
+            inputs["q_pe"],
+            inputs["compressed_kv"],
+            inputs["kpe"],
+            inputs["kv_b_proj_weight"],
+            flashinfer_meta["batch_info_host"],
+            flashinfer_meta["cu_seqlen_host"],
+            flashinfer_meta["cu_num_pages"],
+            flashinfer_meta["cu_num_pages_host"],
+            flashinfer_meta["cache_loc"],
+            flashinfer_meta["last_page_len"],
+            flashinfer_meta["last_page_len_host"],
+            flashinfer_meta["seq_len_with_cache_host"],
+            batch_indices,
+            positions,
+            flashinfer_meta["ckv_cache"],
+            flashinfer_meta["kpe_cache"],
+            None,
+            kv_lora_rank,
+        )
+
+    # Verify wrapper was created
+    assert len(_GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers) == 1
+
+    # Now test plan_generate_only - this is called by the host-side preparation
+    # to re-plan the cached wrappers before graph replay
+    _GlobalFlashInferMLAPlanner.plan_generate_only(
+        batch_size,
+        flashinfer_meta["cu_num_pages"][: batch_size + 1],
+        flashinfer_meta["cache_loc"],
+        flashinfer_meta["last_page_len"][:batch_size],
+    )
+
+    # Run again (not in warm-up, so it should use cached wrapper)
+    # First, update the inputs to simulate new tokens
+    new_inputs = _create_mla_inputs(
+        batch_size,
+        seq_length,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
+    )
+
+    # Create new metadata for position+1
+    new_input_positions = [prefill_seq_length + 1] * batch_size
+    new_flashinfer_meta = _create_paged_cache_and_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        seq_lengths,
+        new_input_positions,
+    )
+    # Reuse the same cache
+    new_flashinfer_meta["ckv_cache"] = flashinfer_meta["ckv_cache"]
+    new_flashinfer_meta["kpe_cache"] = flashinfer_meta["kpe_cache"]
+
+    new_qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    new_qo_indptr[1:] = torch.cumsum(torch.tensor(seq_lengths, device=device), dim=0).int()
+
+    new_batch_indices, new_positions = flashinfer.get_batch_indices_positions(
+        new_qo_indptr,
+        flashinfer.get_seq_lens(
+            new_flashinfer_meta["cu_num_pages"],
+            new_flashinfer_meta["last_page_len"],
+            page_size=page_size,
+        ),
+        batch_size * seq_length,
+    )
+
+    output2 = torch.ops.auto_deploy.flashinfer_mla_with_cache(
+        new_inputs["q_nope"],
+        new_inputs["q_pe"],
+        new_inputs["compressed_kv"],
+        new_inputs["kpe"],
+        inputs["kv_b_proj_weight"],  # Use same weights
+        new_flashinfer_meta["batch_info_host"],
+        new_flashinfer_meta["cu_seqlen_host"],
+        new_flashinfer_meta["cu_num_pages"],
+        new_flashinfer_meta["cu_num_pages_host"],
+        new_flashinfer_meta["cache_loc"],
+        new_flashinfer_meta["last_page_len"],
+        new_flashinfer_meta["last_page_len_host"],
+        new_flashinfer_meta["seq_len_with_cache_host"],
+        new_batch_indices,
+        new_positions,
+        new_flashinfer_meta["ckv_cache"],
+        new_flashinfer_meta["kpe_cache"],
+        None,
+        kv_lora_rank,
+    )
+
+    # Verify output is valid
+    expected_shape = (batch_size, seq_length, num_heads, v_head_dim)
+    assert output2.shape == expected_shape, f"Expected shape {expected_shape}, got {output2.shape}"
+    assert torch.isfinite(output2).all(), "Output contains NaN or Inf values"
+
+    # Outputs should be different since inputs are different
+    assert not torch.allclose(output1, output2, atol=1e-6), (
+        "Outputs should differ since inputs are different"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_mla_cuda_graph_multiple_batch_sizes(dtype, device):
+    """Test that multiple batch sizes can have their own CUDA graph wrappers.
+
+    This test verifies that the planner correctly caches wrappers for
+    different batch sizes, which is important for supporting multiple
+    CUDA graph configurations.
+    """
+    # MLA dimensions
+    num_heads = 8
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    v_head_dim = 128
+    page_size = 64
+    prefill_seq_length = 64
+
+    seq_length = 1  # Decode phase
+
+    batch_sizes = [4, 8, 16]
+
+    # Reset planner
+    _GlobalFlashInferMLAPlanner.workspace_buffer = None
+    _GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers = {}
+    _GlobalFlashInferMLAPlanner.reset(torch.device(device))
+
+    for batch_size in batch_sizes:
+        max_num_pages = batch_size * (256 // page_size + 1)
+
+        inputs = _create_mla_inputs(
+            batch_size,
+            seq_length,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
+            dtype,
+            device,
+        )
+
+        seq_lengths = [seq_length] * batch_size
+        input_positions = [prefill_seq_length] * batch_size
+
+        flashinfer_meta = _create_paged_cache_and_metadata(
+            batch_size,
+            max_num_pages,
+            page_size,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype,
+            device,
+            seq_lengths,
+            input_positions,
+        )
+
+        qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        qo_indptr[1:] = torch.cumsum(torch.tensor(seq_lengths, device=device), dim=0).int()
+
+        batch_indices, positions = flashinfer.get_batch_indices_positions(
+            qo_indptr,
+            flashinfer.get_seq_lens(
+                flashinfer_meta["cu_num_pages"],
+                flashinfer_meta["last_page_len"],
+                page_size=page_size,
+            ),
+            batch_size * seq_length,
+        )
+
+        # Warm-up to create wrapper for this batch size
+        with CudaGraphWarmUpPhase():
+            _ = torch.ops.auto_deploy.flashinfer_mla_with_cache(
+                inputs["q_nope"],
+                inputs["q_pe"],
+                inputs["compressed_kv"],
+                inputs["kpe"],
+                inputs["kv_b_proj_weight"],
+                flashinfer_meta["batch_info_host"],
+                flashinfer_meta["cu_seqlen_host"],
+                flashinfer_meta["cu_num_pages"],
+                flashinfer_meta["cu_num_pages_host"],
+                flashinfer_meta["cache_loc"],
+                flashinfer_meta["last_page_len"],
+                flashinfer_meta["last_page_len_host"],
+                flashinfer_meta["seq_len_with_cache_host"],
+                batch_indices,
+                positions,
+                flashinfer_meta["ckv_cache"],
+                flashinfer_meta["kpe_cache"],
+                None,
+                kv_lora_rank,
+            )
+
+    # Verify we have a wrapper for each batch size
+    assert len(_GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers) == len(batch_sizes), (
+        f"Expected {len(batch_sizes)} cached wrappers, "
+        f"got {len(_GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers)}"
+    )
+
+    # Verify each batch size has a wrapper
+    cached_num_seqs = {
+        params.num_seq for params in _GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers
+    }
+    assert cached_num_seqs == set(batch_sizes), (
+        f"Expected wrappers for batch_sizes {batch_sizes}, got {cached_num_seqs}"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_mla_init_decode_wrapper_with_buffers(batch_size, dtype, device):
+    """Test that _init_decode_wrapper correctly passes buffer tensors with use_cuda_graph=True.
+
+    This test directly tests the _init_decode_wrapper method to verify buffer handling.
+    """
+    # Reset planner
+    _GlobalFlashInferMLAPlanner.workspace_buffer = None
+    _GlobalFlashInferMLAPlanner.cached_cuda_graph_decode_wrappers = {}
+    _GlobalFlashInferMLAPlanner.reset(torch.device(device))
+
+    # Create buffer tensors
+    qo_indptr = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
+    kv_indptr = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * 2
+    kv_indices = torch.arange(batch_size * 2, device=device, dtype=torch.int32)
+    kv_len_arr = torch.ones(batch_size, device=device, dtype=torch.int32) * 64
+
+    # Test creating wrapper without CUDA graph (no buffers needed)
+    wrapper_no_cg = _GlobalFlashInferMLAPlanner._init_decode_wrapper(use_cuda_graph=False)
+    assert wrapper_no_cg is not None, "Should create wrapper without CUDA graph"
+
+    # Test creating wrapper with CUDA graph (buffers required)
+    wrapper_with_cg = _GlobalFlashInferMLAPlanner._init_decode_wrapper(
+        use_cuda_graph=True,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        kv_len_arr=kv_len_arr,
+    )
+    assert wrapper_with_cg is not None, "Should create wrapper with CUDA graph"
+
+    # Both wrappers should be valid BatchMLAPagedAttentionWrapper instances
+    assert isinstance(wrapper_no_cg, flashinfer.mla.BatchMLAPagedAttentionWrapper), (
+        "Should be BatchMLAPagedAttentionWrapper"
+    )
+    assert isinstance(wrapper_with_cg, flashinfer.mla.BatchMLAPagedAttentionWrapper), (
+        "Should be BatchMLAPagedAttentionWrapper"
+    )
