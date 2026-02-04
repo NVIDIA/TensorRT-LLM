@@ -146,13 +146,13 @@ echo "all_nodes_str: ${all_nodes_str}"
 
 start_server_cmds_base_file=${full_logdir}/start_server_cmds_base.sh
 start_server_cmds_file=${full_logdir}/start_server_cmds.sh
-replace_placeholder ${start_server_cmds_base_file} ${all_nodes_str} ${start_server_cmds_file}
+replace_placeholder "${start_server_cmds_base_file}" "${all_nodes_str}" "${start_server_cmds_file}"
 server_config_base_file=${full_logdir}/server_config_base.yaml
 server_config_file=${full_logdir}/server_config.yaml
-replace_placeholder ${server_config_base_file} ${all_nodes_str} ${server_config_file}
+replace_placeholder "${server_config_base_file}" "${all_nodes_str}" "${server_config_file}"
 client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
-replace_placeholder ${client_cmds_base_file} ${all_nodes_str} ${client_cmds_file}
+replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
 # start the servers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
 echo "Starting worker commands from ${start_server_cmds_file}..."
