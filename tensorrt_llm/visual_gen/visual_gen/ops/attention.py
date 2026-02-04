@@ -144,6 +144,10 @@ class BaseAttn:
         tensor_layout="HND",
         valid_query_length=None,
         valid_kv_length=None,
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         raise NotImplementedError(
             "BaseAttn is not implemented, please implement it in the subclass"
@@ -239,6 +243,10 @@ class CuDNNAttn(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         if tensor_layout not in ["HND", "NHD"]:
             raise NotImplementedError("Tensor layout not supported for DefaultAttn")
@@ -525,6 +533,10 @@ class SparseVideoGenAttn2(BaseAttn):
         enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
+        cu_seqlens_q = None,
+        cu_seqlens_k = None,
+        max_seqlen_q = 0,
+        max_seqlen_k = 0,
     ):
         logger.debug("Using SparseVideoGen2Attn")
         if return_lse:
