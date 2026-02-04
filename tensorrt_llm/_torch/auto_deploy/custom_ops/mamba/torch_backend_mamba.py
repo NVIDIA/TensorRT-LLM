@@ -36,7 +36,7 @@ from ..attention_interface import (
     Constant,
     MHACallable,
     ResourceHandlerDict,
-    StateResourceHandler,
+    SSMResourceHandler,
 )
 from .torch_mamba import _torch_ssm_prefill
 
@@ -327,8 +327,11 @@ class TorchBackendSSM(AttentionDescriptor):
         ssm_state_dtype = cls.resolve_cache_dtype(cache_config.mamba_ssm_cache_dtype, hs_fake.dtype)
 
         return {
-            "ssm_state_cache": StateResourceHandler(
-                num_heads, head_dim, ssm_state_size, dtype=ssm_state_dtype
+            "ssm_state_cache": SSMResourceHandler(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                d_state=ssm_state_size,
+                dtype=ssm_state_dtype,
             )
         }
 

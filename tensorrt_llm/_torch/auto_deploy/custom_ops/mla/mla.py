@@ -15,6 +15,7 @@
 
 """Custom ops for MultiHead Latent attention."""
 
+import math
 from typing import List, Optional, Union
 
 import torch
@@ -22,7 +23,7 @@ from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
-from ..attention.triton_attention import _flattened_context_mha, _generate_mha
+from ..attention.triton_attention import _decode_attention, _prefill_attention
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -155,11 +156,15 @@ def fused_flattened_mla_with_cache(
     query_states = torch.cat((q_nope, q_pe), dim=-1)  # [b*s,n,d]
     key_states = torch.cat((k_nope, k_pe.expand(*bs_view, num_heads, -1)), dim=-1)  # [b*s,n,d]
 
+    # Compute scale if not provided
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(qk_head_dim)
+
     # Compute attention
     y = torch.empty_like(value_states)
     if s == 1:
-        # generate-only phase
-        _generate_mha(
+        # generate-only phase (decode)
+        _decode_attention(
             query_states.contiguous(),
             key_states.contiguous(),
             value_states.contiguous(),
@@ -167,21 +172,23 @@ def fused_flattened_mla_with_cache(
             v_cache,
             cache_loc,
             input_pos,
+            scale,
             y,
         )
 
     else:
-        # mixed context + generate phase
-        _flattened_context_mha(
+        # mixed context + generate phase (prefill)
+        _prefill_attention(
             query_states.contiguous(),
             key_states.contiguous(),
             value_states.contiguous(),
-            input_pos,
-            cache_loc,
             k_cache,
             v_cache,
+            input_pos,
+            cache_loc,
             seq_len,
             seq_start,
+            scale,
             y,
         )
 

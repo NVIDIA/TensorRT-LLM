@@ -654,6 +654,12 @@ class BaseWorker(GenerationExecutor):
             self.engine.shutdown()
             self.engine = None
 
+    def get_disaggregated_params(self) -> dict:
+        if self.engine is None or self.engine.kv_cache_transceiver is None:
+            logger.warning("Engine or kv cache transceiver is not initialized")
+            return {}
+        return self.engine.kv_cache_transceiver.get_disaggregated_params()
+
     # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(

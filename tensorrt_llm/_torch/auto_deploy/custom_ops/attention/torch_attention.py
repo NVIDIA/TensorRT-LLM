@@ -251,7 +251,7 @@ def update_kv_cache(
     v_cache: torch.Tensor,
     seq_len: torch.Tensor,  # metadata
     input_pos: torch.Tensor,  # metadata
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -260,12 +260,12 @@ def update_kv_cache(
     """
 
     for idx in range(seq_len.shape[0]):
-        k_cache[cache_loc[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = key_states[
+        k_cache[slot_idx[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = key_states[
             seq_start[idx] : seq_start[idx] + seq_len[idx], ...
         ]
-        v_cache[cache_loc[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = (
-            value_states[seq_start[idx] : seq_start[idx] + seq_len[idx], ...]
-        )
+        v_cache[slot_idx[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = value_states[
+            seq_start[idx] : seq_start[idx] + seq_len[idx], ...
+        ]
 
 
 @torch.library.custom_op("auto_deploy::torch_attention_fused_mla_ref", mutates_args=())

@@ -311,3 +311,6 @@ properties:
   llm_id:
     annotation: str
     default: inspect._empty
+  disaggregated_params:
+    annotation: dict
+    default: None

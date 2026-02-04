@@ -44,20 +44,22 @@ from .triton_attention_with_kv_cache import (
 )
 
 
-def _generate_mha(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+def _decode_attention(
+    q: torch.Tensor,  # [num_decode, num_heads, qk_head_dim]
+    k: torch.Tensor,  # [num_decode, num_kv_heads, qk_head_dim]
+    v: torch.Tensor,  # [num_decode, num_kv_heads, v_head_dim]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    cache_locs: torch.Tensor,
-    input_pos: torch.Tensor,
+    slot_idx: torch.Tensor,  # [num_decode]
+    input_pos: torch.Tensor,  # [num_decode]
     scale: float,
-    out: torch.Tensor,
+    out: torch.Tensor,  # [num_decode, num_heads, v_head_dim]
     sinks: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
-):
-    b, (n_heads, q_d_head) = q.shape[0], q.shape[-2:]
+) -> None:
+    """Handle decode phase - single token generation attention."""
+    num_decode = q.shape[0]
+    n_heads, q_d_head = q.shape[-2:]
     max_seq_len, n_kv_heads = k_cache.shape[1:3]
     v_d_head = v.shape[-1]
     device = q.device
@@ -65,13 +67,13 @@ def _generate_mha(
     SEQ_BLOCK_SIZE = 64
     num_blocks = (max_seq_len + SEQ_BLOCK_SIZE - 1) // SEQ_BLOCK_SIZE
     stage1_output_values = torch.empty(
-        b, n_heads, num_blocks, v_d_head, device=device, dtype=torch.float32
+        num_decode, n_heads, num_blocks, v_d_head, device=device, dtype=torch.float32
     )
     stage1_output_logsumexp = torch.empty(
-        b, n_heads, num_blocks, device=device, dtype=torch.float32
+        num_decode, n_heads, num_blocks, device=device, dtype=torch.float32
     ) - float("inf")
 
-    update_kv_cache[(b, n_kv_heads, 1)](
+    update_kv_cache[(num_decode, n_kv_heads, 1)](
         k,
         v,
         None,
@@ -79,7 +81,7 @@ def _generate_mha(
         k_cache,
         v_cache,
         input_pos,
-        cache_locs,
+        slot_idx,
         max_seq_len,
         n_kv_heads,
         q_d_head,
@@ -91,7 +93,7 @@ def _generate_mha(
     HEAD_BLOCK_SIZE = max(16, triton.next_power_of_2(n_heads // n_kv_heads))
     gqa_attention_kv_stage1[
         (
-            b,
+            num_decode,
             n_kv_heads,
             num_blocks,
         )
@@ -99,7 +101,7 @@ def _generate_mha(
         q,
         k_cache,
         v_cache,
-        cache_locs,
+        slot_idx,
         input_pos,
         stage1_output_values,
         stage1_output_logsumexp,
@@ -116,7 +118,7 @@ def _generate_mha(
     )
     has_sinks = sinks is not None
 
-    attention_kv_stage2[(b, n_heads, 1)](
+    attention_kv_stage2[(num_decode, n_heads, 1)](
         stage1_output_values,
         stage1_output_logsumexp,
         out,
@@ -130,29 +132,30 @@ def _generate_mha(
     )
 
 
-def _flattened_context_mha(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+def _prefill_attention(
+    q: torch.Tensor,  # [num_prefill_tokens, num_heads, qk_head_dim]
+    k: torch.Tensor,  # [num_prefill_tokens, num_kv_heads, qk_head_dim]
+    v: torch.Tensor,  # [num_prefill_tokens, num_kv_heads, v_head_dim]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    seq_len: torch.Tensor,
-    seq_start: torch.Tensor,
+    input_pos: torch.Tensor,  # [num_prefill]
+    slot_idx: torch.Tensor,  # [num_prefill]
+    seq_len: torch.Tensor,  # [num_prefill]
+    seq_start: torch.Tensor,  # [num_prefill]
     scale: float,
-    out: torch.Tensor,
+    out: torch.Tensor,  # [num_prefill_tokens, num_heads, v_head_dim]
     sinks: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
 ) -> None:
-    # NOTE: s_total == sum(seq_len)
-    s_total, n_heads, q_d_head = q.shape
+    """Handle prefill phase - context attention with variable sequence lengths."""
+    # NOTE: num_prefill_tokens == sum(seq_len)
+    num_prefill_tokens, n_heads, q_d_head = q.shape
     max_cache_seq_len, n_kv_heads = k_cache.shape[1:3]
     v_d_head = v.shape[-1]
-    BATCH_SIZE: int = len(input_pos)
+    num_prefill = len(input_pos)
     SEQ_BLOCK = 32
 
-    update_kv_cache[(BATCH_SIZE, n_kv_heads, (max(seq_len) + SEQ_BLOCK - 1) // SEQ_BLOCK)](
+    update_kv_cache[(num_prefill, n_kv_heads, (max(seq_len) + SEQ_BLOCK - 1) // SEQ_BLOCK)](
         k,
         v,
         seq_len,
@@ -160,7 +163,7 @@ def _flattened_context_mha(
         k_cache,
         v_cache,
         input_pos,
-        cache_loc,
+        slot_idx,
         max_cache_seq_len,
         n_kv_heads,
         q_d_head,
@@ -169,8 +172,7 @@ def _flattened_context_mha(
         GENERATE_ONLY=False,
     )
 
-    # TODO: use input_pos to get the correct cache locations
-    grid = (BATCH_SIZE, n_heads, (max(seq_len) + SEQ_BLOCK - 1) // SEQ_BLOCK)
+    grid = (num_prefill, n_heads, (max(seq_len) + SEQ_BLOCK - 1) // SEQ_BLOCK)
     has_sinks = sinks is not None
 
     context_attention_kv_flattened[grid](
@@ -180,7 +182,7 @@ def _flattened_context_mha(
         k_cache,
         v_cache,
         input_pos,
-        cache_loc,
+        slot_idx,
         out,
         scale,
         n_heads,
@@ -205,7 +207,7 @@ def flattened_mha_with_cache(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     cu_seqlen: torch.Tensor,
     # EXTRA METADATA
     #
@@ -223,73 +225,64 @@ def flattened_mha_with_cache(
 
     NOTE: this op can also handle seq_len==0, which might be useful for CUDAGRAPH.
     """
-    # check for sequence info and truncate metadata
+    # Extract batch info from batch_info_host
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
 
-    seq_len = seq_len[:num_seq]
-    input_pos = input_pos[:num_seq]
-    cache_loc = cache_loc[:num_seq]
-    seq_start = cu_seqlen[:num_seq]
-
-    # b, s info
-    # NOTE: b, s are just the shapes of the input tensor q; not necessarily the number of sequences.
-    # Generally speaking, we expect one of two cases here:
-    # 1. b > 0, s==1: this indicates a generate-only batch of tokens.
-    # 2. b==1, s > 0: this indicates a mixed context+generate phase. The actual number of sequences
-    #    and number of tokens per sequence are encoded in seq_len and seq_start.
+    # Get cache and head dimensions
     num_kv_heads, qk_head_dim = k_cache.shape[-2:]
     v_head_dim = v_cache.shape[-1]
     b, s = q.shape[:2]
 
-    # check for num_heads
+    # Determine num_heads from input shape
     num_heads = q.shape[2] // qk_head_dim if q.ndim == 3 else q.shape[2]
 
-    # Define output shape
+    # Define output shape (preserve original input format)
     output_shape = (b, s, num_heads * v_head_dim) if q.ndim == 3 else (b, s, num_heads, v_head_dim)
 
-    # reshapes with head_dim
-    if s == 1:
-        bs_view = (b, s)
-    else:
-        bs_view = (b * s,)
+    # Flatten Q, K, V to [total_tokens, heads, head_dim]
+    bs = b * s
+    q_flat = q.contiguous().view(bs, num_heads, qk_head_dim)
+    k_flat = k.contiguous().view(bs, num_kv_heads, qk_head_dim)
+    v_flat = v.contiguous().view(bs, num_kv_heads, v_head_dim)
 
-    q = q.contiguous().view(*bs_view, num_heads, qk_head_dim)
-    k = k.contiguous().view(*bs_view, num_kv_heads, qk_head_dim)
-    v = v.contiguous().view(*bs_view, num_kv_heads, v_head_dim)
-
+    # Compute scale if not provided
     scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
-    # run attention
-    y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
-    if s == 1:
-        # generate-only phase
-        _generate_mha(
-            q,
-            k,
-            v,
+
+    # Preallocate output tensor
+    y = q_flat.new_empty(bs, num_heads, v_head_dim)
+
+    # PREFILL: process context tokens with variable sequence lengths
+    if num_prefill > 0:
+        _prefill_attention(
+            q_flat[:num_prefill_tokens],
+            k_flat[:num_prefill_tokens],
+            v_flat[:num_prefill_tokens],
             k_cache,
             v_cache,
-            cache_loc,
-            input_pos,
+            input_pos[:num_prefill],
+            slot_idx[:num_prefill],
+            seq_len[:num_prefill],
+            cu_seqlen[:num_prefill],
             scale,
-            y,
+            y[:num_prefill_tokens],
             sinks,
             sliding_window,
         )
-    else:
-        # mixed context + generate phase
-        _flattened_context_mha(
-            q,
-            k,
-            v,
-            input_pos,
-            cache_loc,
+
+    # DECODE: process single-token generation
+    if num_decode > 0:
+        _decode_attention(
+            q_flat[num_prefill_tokens:num_total_tokens],
+            k_flat[num_prefill_tokens:num_total_tokens],
+            v_flat[num_prefill_tokens:num_total_tokens],
             k_cache,
             v_cache,
-            seq_len,
-            seq_start,
+            slot_idx[num_prefill:num_seq],
+            input_pos[num_prefill:num_seq],
             scale,
-            y,
+            y[num_prefill_tokens:num_total_tokens],
             sinks,
             sliding_window,
         )
@@ -307,7 +300,7 @@ def flattened_mha_fake(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     cu_seqlen: torch.Tensor,
     # EXTRA METADATA
     #
@@ -346,7 +339,7 @@ class TritonAttention(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info_host", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
+        return ["batch_info_host", "seq_len", "input_pos", "slot_idx", "cu_seqlen"]
 
     @classmethod
     def get_cache_initializers(

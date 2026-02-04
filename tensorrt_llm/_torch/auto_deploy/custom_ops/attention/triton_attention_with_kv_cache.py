@@ -28,7 +28,7 @@ def update_kv_cache(
     k_cache_ptr,  # [MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD]
     v_cache_ptr,  # [MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD]
     input_pos_ptr,  # Specifies the sequence index in the caches at which to write the provided kv
-    cache_loc_ptr,  # Specifies the batch index for each of the input sequences
+    slot_idx_ptr,  # Specifies the slot index for each of the input sequences
     MAX_SEQ_LENGTH: tl.constexpr,
     N_KV_HEADS: tl.constexpr,
     Q_D_HEAD: tl.constexpr,
@@ -49,14 +49,14 @@ def update_kv_cache(
         seq_len = tl.load(seq_len_ptr + batch_id)
 
     # cache is [bsnd]
-    # cache_loc_ptr stores the batch index for the sequences provided to the kernel.
-    cache_loc = tl.load(cache_loc_ptr + batch_id)
+    # slot_idx_ptr stores the slot index for the sequences provided to the kernel.
+    slot_idx = tl.load(slot_idx_ptr + batch_id)
 
     kv_position = tl.load(input_pos_ptr + batch_id)
 
     K_D_HEAD: tl.constexpr = Q_D_HEAD
-    k_cache_batch_offset = cache_loc * N_KV_HEADS * MAX_SEQ_LENGTH * K_D_HEAD
-    v_cache_batch_offset = cache_loc * N_KV_HEADS * MAX_SEQ_LENGTH * V_D_HEAD
+    k_cache_batch_offset = slot_idx * N_KV_HEADS * MAX_SEQ_LENGTH * K_D_HEAD
+    v_cache_batch_offset = slot_idx * N_KV_HEADS * MAX_SEQ_LENGTH * V_D_HEAD
 
     k_dhead_offsets = tl.arange(0, triton.next_power_of_2(K_D_HEAD))
     k_dhead_mask = k_dhead_offsets < K_D_HEAD
@@ -114,7 +114,7 @@ def gqa_attention_kv_stage1(
     q_ptr,  # [Batch, 1, N_HEADS, D_HEAD]
     k_cache_ptr,  # [MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD]
     v_cache_ptr,  # [MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD]
-    cache_loc_ptr,  # [Batch] # Specifies the batch index for each of the generate tokens.
+    slot_idx_ptr,  # [Batch] # Specifies the slot index for each of the generate tokens.
     input_pos_ptr,  # [Batch]
     output_values_ptr,  # [Batch, N_HEADS, num_blocks, D_HEAD]
     output_logsumexp_ptr,  # [Batch, N_HEADS, num_blocks]
@@ -152,9 +152,9 @@ def gqa_attention_kv_stage1(
     seq_block_id = tl.program_id(axis=2)
 
     kv_position = tl.load(input_pos_ptr + batch_id)
-    kv_batch_id = tl.load(cache_loc_ptr + batch_id)
+    slot_idx = tl.load(slot_idx_ptr + batch_id)
     K_D_HEAD: tl.constexpr = Q_D_HEAD
-    batch_offset = kv_batch_id * N_KV_HEADS * MAX_SEQ_LEN
+    batch_offset = slot_idx * N_KV_HEADS * MAX_SEQ_LEN
 
     # Offsets for the block of sequences this program processes.
     seq_start_pos = seq_block_id * SEQ_BLOCK_SIZE
@@ -267,7 +267,7 @@ def attention_kv_stage1(
     q_ptr,  # [Batch, 1, N_HEADS, D_HEAD]
     k_cache_ptr,  # [MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD]
     v_cache_ptr,  # [MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD]
-    cache_loc_ptr,  # [Batch] # Specifies the batch index for each of the generate tokens.
+    slot_idx_ptr,  # [Batch] # Specifies the slot index for each of the generate tokens.
     input_pos_ptr,  # [Batch]
     output_values_ptr,  # [Batch, N_HEADS, num_blocks, D_HEAD]
     output_logsumexp_ptr,  # [Batch, N_HEADS, num_blocks]
@@ -298,8 +298,8 @@ def attention_kv_stage1(
     epsilon: tl.constexpr = 1e-38  # float32 smallest positive number
 
     kv_position = tl.load(input_pos_ptr + batch_id)
-    kv_batch_id = tl.load(cache_loc_ptr + batch_id)
-    kv_batch_offset = kv_batch_id * N_KV_HEADS * MAX_SEQ_LEN * D_HEAD
+    slot_idx = tl.load(slot_idx_ptr + batch_id)
+    slot_batch_offset = slot_idx * N_KV_HEADS * MAX_SEQ_LEN * D_HEAD
     # Offsets for the block of sequences this program processes.
     seq_start_pos = seq_block_id * SEQ_BLOCK_SIZE
 
@@ -323,7 +323,7 @@ def attention_kv_stage1(
     q = tl.load(q_ptr + q_batch_offset + q_head_offset + dhead_offsets, mask=dhead_mask)
 
     kv_block_offsets = (
-        kv_batch_offset
+        slot_batch_offset
         + seq_offsets[:, None] * D_HEAD * N_KV_HEADS
         + kv_head_offset
         + dhead_offsets[None, :]
@@ -597,7 +597,7 @@ def context_attention_kv_flattened(
     k_cache_ptr,  # [bsnd]
     v_cache_ptr,  # [bsnd]
     input_pos_ptr,  # [b] # specifies the location in the sequence where kv must be written back.
-    cache_loc_ptr,  # [b] # location of the sequence in the cache.
+    slot_idx_ptr,  # [b] # slot index of the sequence in the cache.
     o_ptr,
     SCALE: tl.constexpr,
     N_HEADS: tl.constexpr,  # Number of heads
@@ -626,10 +626,10 @@ def context_attention_kv_flattened(
     HEAD_RATIO: tl.constexpr = N_HEADS // N_KV_HEADS
 
     # cache is [bsnd]
-    # cache_loc_ptr stores the batch index for the sequences provided to the kernel.
-    cache_loc = tl.load(cache_loc_ptr + batch_id)
+    # slot_idx_ptr stores the slot index for the sequences provided to the kernel.
+    slot_idx = tl.load(slot_idx_ptr + batch_id)
 
-    cache_batch_offset = cache_loc * N_KV_HEADS * MAX_SEQ_LENGTH
+    cache_batch_offset = slot_idx * N_KV_HEADS * MAX_SEQ_LENGTH
     cache_head_offset = head_id // HEAD_RATIO
 
     q_dhead_offsets = tl.arange(0, triton.next_power_of_2(Q_D_HEAD))
@@ -750,7 +750,7 @@ def update_kv_cache_rope_fusion(
     k_cache_ptr,  # [MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD]
     v_cache_ptr,  # [MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD]
     input_pos_ptr,  # Specifies the sequence index in the caches at which to write the provided kv
-    cache_loc_ptr,  # Specifies the batch index for each of the input sequences
+    slot_idx_ptr,  # Specifies the slot index for each of the input sequences
     f_ptr,  # [MAX_SEQ_LEN, D_HEAD//2, 2] # frequencies for rope embadding.
     MAX_SEQ_LENGTH: tl.constexpr,
     N_HEADS: tl.constexpr,
@@ -781,12 +781,12 @@ def update_kv_cache_rope_fusion(
         seq_len = tl.load(seq_len_ptr + batch_id)
 
     # cache is [bsnd]
-    # cache_loc_ptr stores the batch index for the sequences provided to the kernel.
-    cache_loc = tl.load(cache_loc_ptr + batch_id)
+    # slot_idx_ptr stores the slot index for the sequences provided to the kernel.
+    slot_idx = tl.load(slot_idx_ptr + batch_id)
 
     kv_position = tl.load(input_pos_ptr + batch_id)
 
-    cache_batch_offset = cache_loc * N_KV_HEADS * MAX_SEQ_LENGTH * D_HEAD
+    cache_batch_offset = slot_idx * N_KV_HEADS * MAX_SEQ_LENGTH * D_HEAD
     cache_head_offset = kv_head_id * D_HEAD
 
     # Assuming D_HEAD is a power of 2
