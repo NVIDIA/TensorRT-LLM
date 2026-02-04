@@ -2915,3 +2915,11 @@ def torch_empty_cache() -> None:
         gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def print_process_info(request):
+    """Fixture to print process ID and markers for debugging isolation."""
+    pid = os.getpid()
+    markers = [marker.name for marker in request.node.own_markers]
+    print(f"Test: {request.node.name} | PID: {pid} | Markers: {markers}")
