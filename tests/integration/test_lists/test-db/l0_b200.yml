@@ -176,7 +176,13 @@ l0_b200:
       stage: pre_merge
       backend: autodeploy
   tests:
+  - unittest/auto_deploy/singlegpu/compile
+  - unittest/auto_deploy/singlegpu/custom_ops
+  - unittest/auto_deploy/singlegpu/models
+  - unittest/auto_deploy/singlegpu/shim
+  - unittest/auto_deploy/singlegpu/smoke
+  - unittest/auto_deploy/singlegpu/transformations
+  - unittest/auto_deploy/singlegpu/utils
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[torch-True-1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
-  - unittest/_torch/auto_deploy/unit/singlegpu

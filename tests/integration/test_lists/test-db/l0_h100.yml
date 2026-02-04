@@ -432,7 +432,13 @@ l0_h100:
       backend: autodeploy
       orchestrator: mpi
   tests:
-  - unittest/_torch/auto_deploy/unit/singlegpu
+  - unittest/auto_deploy/singlegpu/compile
+  - unittest/auto_deploy/singlegpu/custom_ops
+  - unittest/auto_deploy/singlegpu/models
+  - unittest/auto_deploy/singlegpu/shim
+  - unittest/auto_deploy/singlegpu/smoke
+  - unittest/auto_deploy/singlegpu/transformations
+  - unittest/auto_deploy/singlegpu/utils
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-True-1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-False]

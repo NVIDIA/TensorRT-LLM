@@ -923,7 +923,7 @@
     "test_mode: Test mode (\"stress-test\" or \"stress-stage-alone\")\"": 1771.5283138155937,
     "test_unittests.py::test_unittests_v2[unittest/_torch/attention/test_attention_mla.py]": 26.32902159006335,
     "test_unittests.py::test_unittests_v2[unittest/_torch/attention]": 588.56,
-    "test_unittests.py::test_unittests_v2[unittest/_torch/auto_deploy/unit/singlegpu]": 539.3006387590431,
+    "test_unittests.py::test_unittests_v2[unittest/auto_deploy/singlegpu]": 539.3006387590431,
     "test_unittests.py::test_unittests_v2[unittest/_torch/compilation]": 31.94,
     "test_unittests.py::test_unittests_v2[unittest/_torch/debugger]": 36.69,
     "test_unittests.py::test_unittests_v2[unittest/_torch/executor]": 170.86,
