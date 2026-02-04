@@ -715,13 +715,9 @@ def fp8_block_scaling_bmm_out(
         if use_cute_dsl_blockscaling_bmm:
             mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
                 mat1)
-            output = out.new_empty(out.shape,
-                                   dtype=out.dtype,
-                                   device=out.device)
             torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(mat1_fp8, mat2_fp8,
                                                         mat1_scale, mat2_scale,
-                                                        output)
-            out.copy_(output)
+                                                        out)
             mat1_scale = None
         else:
             torch.bmm(mat1.transpose(0, 1),
