@@ -2502,7 +2502,7 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
-        # When using a KV connector, mark new requests as disagg generation init.
+        # When using a KV connector, mark new requests as `DISAGG_GENERATION_INIT`
         # If the connector later decides not to load asynchronously, mark_ready_requests()
         # will move them back to CONTEXT_INIT.
         if self.kv_connector_manager:
@@ -2738,7 +2738,7 @@ class PyExecutor:
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
-            if self.kv_cache_transceiver and not self.kv_connector_manager:
+            if self.kv_cache_transceiver:
                 # Trigger KV cache exchange for new disagg_gen_init_requests
                 self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
             elif self.kv_connector_manager:
