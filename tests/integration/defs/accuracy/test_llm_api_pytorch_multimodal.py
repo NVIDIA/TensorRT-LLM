@@ -103,6 +103,7 @@ class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@skip_pre_hopper
 class TestNVILA_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Efficient-Large-Model/NVILA-8B"
     MODEL_PATH = f"{llm_models_root()}/vila/NVILA-8B"
@@ -159,6 +160,7 @@ class TestVILA1_5_3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@skip_pre_hopper
 class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
     MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
