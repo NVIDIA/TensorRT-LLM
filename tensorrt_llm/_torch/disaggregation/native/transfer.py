@@ -19,7 +19,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferOp,
     TransferRequest,
 )
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import (
+from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     RxSessionBase,
     SessionArgsBase,
@@ -28,18 +28,14 @@ from tensorrt_llm._torch.disaggregation.base.kv_transfer import (
     TaskIdType,
     TxSessionBase,
 )
-from tensorrt_llm._torch.disaggregation.native.aux_buffer import AuxBuffer
-from tensorrt_llm._torch.disaggregation.native.kv_mapper import (
-    InstanceInfo,
-    KVMapperFactory,
-    PeerOverlapTargets,
-    PeerRegistrar,
-    RankInfo,
-)
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
+from tensorrt_llm._torch.disaggregation.native.rank_info import InstanceInfo, RankInfo
+from tensorrt_llm._torch.disaggregation.native.region.aux import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
@@ -120,12 +116,11 @@ class TaskStatus(Enum):
 
 
 class AuxSendTask:
-    def __init__(self, params: DisaggregatedParams, slot: int, mapper: KVMapperFactory):
+    def __init__(self, params: DisaggregatedParams, slot: int, peer_registrar: PeerRegistrar):
         self._params = params
         self._unique_rid = params.disagg_request_id
         self._slot = slot
-        self._kv_map = mapper
-        self._registrar = self._kv_map.peer_registrar
+        self._registrar = peer_registrar
         self._status = TaskStatus.INIT
         self._future = concurrent.futures.Future()
         self._transferred_count = 0
@@ -150,7 +145,7 @@ class AuxSendTask:
         if self._perf_timer is not None:
             self._perf_timer.record_prepare_args_start(peer_rank_info.instance_rank)
         expected_transfers = len(
-            self._kv_map.get_peer_overlap_targets(peer_rank_info, peer_rank_info.dp_rank).ranks
+            self._registrar.get_peer_overlap(peer_rank_info, peer_rank_info.dp_rank).ranks
         )
         if not self._should_write(peer_rank_info):
             if self._perf_timer is not None:
@@ -178,7 +173,7 @@ class AuxSendTask:
 
         peer_slot = req_info.aux_slot
 
-        src_aux_meta = self._registrar.rank_info.aux_meta
+        src_aux_meta = self._registrar.self_rank_info.aux_meta
 
         src_ptrs = [
             ptr + item_size * self._slot
@@ -210,7 +205,7 @@ class AuxSendTask:
 
     def _should_write(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated
-        self_ri = self._registrar.rank_info
+        self_ri = self._registrar.self_rank_info
         self_tp_size_per_dp_group = (
             self_ri.tp_size // self_ri.dp_size if self_ri.enable_attention_dp else self_ri.tp_size
         )
@@ -253,7 +248,7 @@ class AuxSendTask:
         task_latency_ms = self._perf_timer.get_task_latency(peer_rank) * 1000
         throughput_mbs = self._perf_timer.get_transfer_throughput(peer_rank)
 
-        ri = self._registrar.rank_info
+        ri = self._registrar.self_rank_info
         csv_line = (
             f"AuxSendTask,{self._unique_rid},{peer_rank},"
             f"{transfer_size},{avg_segment_size},{entry_count},"
@@ -276,10 +271,9 @@ class KVSendTask:
         kv_slice: KVSlice,
         params: DisaggregatedParams,
         slice_id: int,
-        mapper: KVMapperFactory,
+        peer_registrar: PeerRegistrar,
     ):
-        self._kv_map = mapper
-        self._registrar = self._kv_map.peer_registrar
+        self._registrar = peer_registrar
         self._future = concurrent.futures.Future()
         self._first_transfer = False
         self._extraction_count = 0
@@ -322,7 +316,7 @@ class KVSendTask:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         if self._perf_timer is not None:
             self._perf_timer.record_prepare_args_start(peer_ri.instance_rank)
-        targets = self._kv_map.get_peer_overlap_targets(peer_ri, peer_ri.dp_rank)
+        targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
         expected_transfers = len(targets.ranks)
         if not self._first_transfer:
             self._first_transfer = True
@@ -359,41 +353,33 @@ class KVSendTask:
             dst_block_ids = dst_block_ids[:-1]
         src_block_ids, dst_block_ids = self._filter_kv_blocks(src_block_ids, dst_block_ids)
 
-        extractor = self._kv_map.self_extractor
-        src_block_ptrs = extractor.block_ptrs(src_block_ids)
-        self_block_size = extractor.kv_pool_attrs.block_bytes[0]
-        peer_extractor = self._kv_map.peer_extractor(peer_ri.instance_name, peer_ri.instance_rank)
-        dst_block_ptrs = peer_extractor.block_ptrs(dst_block_ids)
-        dst_block_size = peer_extractor.kv_pool_attrs.block_bytes[0]
-        logger.debug(
-            f"KVSendTask._create_write_meta: extracted KV block pointers -> "
-            f"src_blocks={src_block_ptrs}, src_block_size={self_block_size}, "
-            f"dst_blocks={dst_block_ptrs}, dst_block_size={dst_block_size}"
+        extractor = self._registrar.self_extractor
+        peer_extractor = self._registrar.peer_extractor(
+            peer_ri.instance_name, peer_ri.instance_rank
         )
-        mapper = self._kv_map.get_kv_map(peer_ri)
-        (
-            src_frags,
-            dst_frags,
-            dst_blocks_size,
-        ) = mapper(src_block_ptrs, self_block_size, dst_block_ptrs, dst_block_size)
 
-        src_blocks_size = dst_blocks_size
-        logger.debug(
-            f"KVSendTask._create_write_meta: mapped KV pointers for transfer -> "
-            f"src_frags={src_frags}, src_blocks_size={src_blocks_size}, "
-            f"dst_frags={dst_frags}, dst_blocks_size={dst_blocks_size}"
-        )
+        src_region = extractor.extract(src_block_ids)
+        dst_region = peer_extractor.extract(dst_block_ids)
+        mapper = self._registrar.get_kv_map(peer_ri)
+        region_pair = mapper.map(src_region, dst_region)
+
+        src_frags = region_pair.src.memory.ptrs
+        dst_frags = region_pair.dst.memory.ptrs
+        frag_size = region_pair.src.memory.bytes_per_region
+        kv_sizes = [frag_size] * len(src_frags)
 
         if self._perf_timer is not None:
+            transfer_total_size = frag_size * len(src_frags)
             self._perf_timer.record_prepare_args_end(peer_ri.instance_rank)
             self._perf_timer.record_transfer_sizes(
-                peer_ri.instance_rank, src_blocks_size * len(src_frags), len(dst_frags)
+                peer_ri.instance_rank, transfer_total_size, len(dst_frags)
             )
+
         return WriteMeta(
             future_for_task=self._future,
             src_kv_ptrs=src_frags,
             dst_kv_ptrs=dst_frags,
-            kv_sizes=[src_blocks_size] * len(src_frags),
+            kv_sizes=kv_sizes,
             dst_device_id=dst_device_id,
             expected_transfers=expected_transfers,
             peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
@@ -410,15 +396,13 @@ class KVSendTask:
         else:
             return True
 
-    def _should_write(
-        self, peer_overlap_targets: PeerOverlapTargets, peer_rank_info: RankInfo
-    ) -> bool:
-        dup_head_factor = peer_overlap_targets.duplicate_head_factor
+    def _should_write(self, peer_overlap: PeerOverlap, peer_rank_info: RankInfo) -> bool:
+        dup_head_factor = peer_overlap.duplicate_head_factor
         if dup_head_factor <= 1:
             return True
         peer_ri = peer_rank_info
         peer_dp_rank = peer_ri.dp_rank if peer_ri.enable_attention_dp else 0
-        self_ri = self._registrar.rank_info
+        self_ri = self._registrar.self_rank_info
         self_tp_size_per_dp_group = (
             self_ri.tp_size // self_ri.dp_size if self_ri.enable_attention_dp else self_ri.tp_size
         )
@@ -426,7 +410,7 @@ class KVSendTask:
         return (peer_dp_rank % dup_head_factor) == (self_tp_rank_in_dp_group % dup_head_factor)
 
     def _filter_kv_blocks(self, src_block_ids, dst_block_ids) -> tuple[list[int], list[int]]:
-        # TODO: filter the kv block_ids according to the peer_overlap_targets
+        # TODO: filter the kv block_ids according to the peer_overlap
         return src_block_ids, dst_block_ids
 
     def print_perf_info(self, peer_rank: int):
@@ -442,7 +426,7 @@ class KVSendTask:
         task_latency_ms = self._perf_timer.get_task_latency(peer_rank) * 1000
         throughput_mbs = self._perf_timer.get_transfer_throughput(peer_rank)
 
-        ri = self._registrar.rank_info
+        ri = self._registrar.self_rank_info
         csv_line = (
             f"KVSendTask,{self._unique_rid},{peer_rank},"
             f"{transfer_size},{avg_segment_size},{entry_count},"
@@ -498,12 +482,11 @@ class ReqInfoManager:
 class Sender:
     def __init__(
         self,
-        mapper: KVMapperFactory,
+        peer_registrar: PeerRegistrar,
         device_id: int,
         agent: BaseTransferAgent,
     ):
-        self._kv_map = mapper
-        self._registrar = self._kv_map.peer_registrar
+        self._registrar = peer_registrar
         self._device_id = device_id
         self._agent = agent
         self._peer_reqs = ReqInfoManager()
@@ -516,7 +499,7 @@ class Sender:
         self._sessions_lock = threading.Lock()  # Protects _tx_sessions access
         logger.info(f" Sender init end with endpoint: {self._messenger.endpoint}")
         self._closed = False
-        self._instance_rank = self._kv_map._ri.instance_rank
+        self._instance_rank = self._registrar.self_rank_info.instance_rank
 
         # Multi-threaded task queue support
         self._num_threads = KV_TRANSFER_NUM_THREADS
@@ -547,7 +530,7 @@ class Sender:
                 req_info.instance_name, req_info.instance_rank
             )
             expected_count = len(
-                self._kv_map.get_peer_overlap_targets(peer_ri, req_info.instance_rank).ranks
+                self._registrar.get_peer_overlap(peer_ri, req_info.instance_rank).ranks
             )
             if self._peer_reqs.is_ready(unique_rid, expected_count):
                 tx_session.state.status = SessionStatus.READY
@@ -846,7 +829,7 @@ class Sender:
         self._peer_reqs.add_req_info(req_info.unique_rid, req_info.instance_rank, req_info)
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         expected_transfers = len(
-            self._kv_map.get_peer_overlap_targets(peer_ri, req_info.instance_rank).ranks
+            self._registrar.get_peer_overlap(peer_ri, req_info.instance_rank).ranks
         )
         if self._peer_reqs.is_ready(req_info.unique_rid, expected_transfers):
             if req_info.unique_rid in self._tx_sessions:
@@ -918,7 +901,7 @@ class TxSession(TxSessionBase):
         with self._lock:
             params = self._base_args.params
             slice_id = len(self._kv_tasks)
-            task = KVSendTask(slice, params, slice_id, self._sender._kv_map)
+            task = KVSendTask(slice, params, slice_id, self._sender._registrar)
             self._kv_tasks.append(task)
             self._sender.dispatch_task(task)
             return task.slice_id
@@ -927,7 +910,7 @@ class TxSession(TxSessionBase):
         with self._lock:
             params = self._base_args.params
             slot = self.aux_slot
-            task = AuxSendTask(params, slot, self._sender._kv_map)
+            task = AuxSendTask(params, slot, self._sender._registrar)
 
             self._aux_task = task
             self._sender.dispatch_task(task)
@@ -972,15 +955,14 @@ class KVRecvTask:
         kv_slice: KVSlice,
         slice_id: int,
         params: DisaggregatedParams,
-        mapper: KVMapperFactory,
+        peer_registrar: PeerRegistrar,
         aux_slot: int,
     ):
         self._unique_rid = unique_rid
         self._kv_slice = kv_slice
         self._slice_id = slice_id
         self._params = params
-        self._kv_map = mapper
-        self._registrar = self._kv_map.peer_registrar
+        self._registrar = peer_registrar
         self._status = TaskStatus.INIT
         self._exception = None
         self._future = concurrent.futures.Future()
@@ -1016,22 +998,22 @@ class KVRecvTask:
     def _create_req_info(self) -> RecvReqInfo:
         return RecvReqInfo(
             sender_req_id=self._params.ctx_request_id,
-            instance_name=self._registrar.rank_info.instance_name,
-            instance_rank=self._registrar.rank_info.instance_rank,
+            instance_name=self._registrar.self_rank_info.instance_name,
+            instance_rank=self._registrar.self_rank_info.instance_rank,
             block_ids=self._kv_slice.block_ids,
             unique_rid=self._unique_rid,
             aux_slot=self._aux_slot,
         )
 
     def _make_read_meta(self, peer_ii, peer_dp_rank) -> ReadMeta:
-        peer_overlap_targets = self._kv_map.get_peer_overlap_targets(peer_ii, peer_dp_rank)
+        peer_overlap = self._registrar.get_peer_overlap(peer_ii, peer_dp_rank)
         if not self._first_transfer:
             self._first_transfer = True
-            self._expected_transfers = len(peer_overlap_targets.ranks)
+            self._expected_transfers = len(peer_overlap.ranks)
         return ReadMeta(
             slice_id=self._slice_id,
             unique_rid=self._unique_rid,
-            target_ranks=peer_overlap_targets.ranks,
+            target_ranks=peer_overlap.ranks,
         )
 
     def print_perf_info(self, peer_rank: int):
@@ -1040,7 +1022,7 @@ class KVRecvTask:
 
         task_latency_ms = self._perf_timer.get_task_latency(peer_rank) * 1000
 
-        ri = self._registrar.rank_info
+        ri = self._registrar.self_rank_info
         # CSV: task_type,unique_rid,peer_rank,size,avg_seg,count,prepare_args,queue,transfer,task,throughput
         csv_line = f"KVRecvTask,{self._unique_rid},{peer_rank},,,,,,,{task_latency_ms:.3f},"
         info_msg = (
@@ -1053,12 +1035,11 @@ class KVRecvTask:
 class Receiver:
     def __init__(
         self,
-        mapper: KVMapperFactory,
+        peer_registrar: PeerRegistrar,
         device_id: int,
         agent: BaseTransferAgent,
     ):
-        self._kv_map = mapper
-        self._registrar = self._kv_map.peer_registrar
+        self._registrar = peer_registrar
         self._device_id = device_id
         self._agent = agent
         self._dealers = {}
@@ -1144,7 +1125,7 @@ class Receiver:
 
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
-                rank_info = self._registrar.rank_info
+                rank_info = self._registrar.self_rank_info
                 dealer.send([MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()])
 
             self._sender_ep_instance_map[params.ctx_info_endpoint] = sender_info
@@ -1239,7 +1220,7 @@ class RxSession(RxSessionBase):
             slice,
             slice_id,
             params,
-            self._receiver._kv_map,
+            self._receiver._registrar,
             aux_slot=self.aux_slot,
         )
         self._kv_tasks.append(task)
@@ -1412,8 +1393,8 @@ class TransferWorker:
             self._instance_info_server = InstanceInfoServer(self._instance_info)
         else:
             self._instance_info_server = None
-        self._peer_registrar = PeerRegistrar(self._rank_info, self._instance_info)
-        self._peer_kv_map = KVMapperFactory(self._peer_registrar, self._kv_cache_manager)
+        self._kv_extractor = KVRegionExtractorV1(self._kv_cache_manager)
+        self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
         # NixlTransferAgent configuration from environment variables
         # num_threads: number of dedicated threads for large batch transfers
@@ -1434,8 +1415,8 @@ class TransferWorker:
         if self._aux_buffer is not None:
             self._register_aux_buffer()
 
-        self._sender = Sender(self._peer_kv_map, device_id, self._agent)
-        self._receiver = Receiver(self._peer_kv_map, device_id, self._agent)
+        self._sender = Sender(self._peer_registrar, device_id, self._agent)
+        self._receiver = Receiver(self._peer_registrar, device_id, self._agent)
         self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
         # self._rank_info.endpoint = self._sender.endpoint
         self._rank_info.self_endpoint = self._receiver.endpoint
