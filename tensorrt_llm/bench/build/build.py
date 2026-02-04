@@ -30,6 +30,7 @@ def get_benchmark_engine_settings(
     quant_config: QuantConfig,
     tp_size: int,
     pp_size: int,
+    cp_size: int,
     target_input_len: int,
     target_output_len: int,
     kv_cache_gpu_mem_fraction: float = 0.95,
@@ -58,6 +59,7 @@ def get_benchmark_engine_settings(
             quant_config,
             tp_size,
             pp_size,
+            cp_size,
             target_input_len,
             target_output_len,
             kv_cache_gpu_mem_fraction,
@@ -146,6 +148,14 @@ def apply_build_mode_settings(params):
     default=1,
     required=False,
     help="Number of pipeline parallel shards to run the benchmark with.",
+)
+@optgroup.option(
+    "--cp_size",
+    "-cp",
+    type=int,
+    default=1,
+    required=False,
+    help="Number of context parallel shards to run the benchmark with.",
 )
 @optgroup.option(
     "--quantization",
@@ -241,6 +251,7 @@ def build_command(
     # Collect configuration parameters from CLI parameters.
     tp_size = params.get("tp_size")
     pp_size = params.get("pp_size")
+    cp_size = params.get("cp_size")
     quantization = params.get("quantization")
     max_seq_len: int = params.get("max_seq_len")
     # Dataset options
@@ -258,7 +269,7 @@ def build_command(
     checkpoint_path = bench_env.checkpoint_path or model_name
     model_config = get_model_config(model_name, bench_env.checkpoint_path)
     engine_dir = Path(bench_env.workspace, model_name,
-                      f"tp_{tp_size}_pp_{pp_size}")
+                      f"tp_{tp_size}_pp_{pp_size}_cp_{cp_size}")
 
     # Set the compute quantization.
     quant_algo = QuantAlgo(quantization) if quantization is not None else None
@@ -297,6 +308,7 @@ def build_command(
             quant_config,
             tp_size,
             pp_size,
+            cp_size,
             target_input_len,
             target_output_len,
         )
@@ -328,6 +340,7 @@ def build_command(
               dtype=model_config.dtype,
               tensor_parallel_size=tp_size,
               pipeline_parallel_size=pp_size,
+              context_parallel_size=cp_size,
               build_config=build_config,
               quant_config=quant_config,
               workspace=str(bench_env.workspace),
