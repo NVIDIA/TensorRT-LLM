@@ -20,7 +20,8 @@ from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
-                                 mpi_send_object, torch_pybind11_abi)
+                                 mpi_send_object, mpi_world_size,
+                                 torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
@@ -455,6 +456,18 @@ class MPIDist(Distributed):
         self._cp_comm = None
         self._tp_comm = None
         self._pp_comm = None
+
+        # Validate that all ranks in the mapping are within the MPI world size
+        # to prevent segfaults when creating sub-communicators
+        if ENABLE_MULTI_DEVICE:
+            actual_world_size = mpi_world_size()
+            max_rank_needed = mapping.world_size
+
+            if max_rank_needed > actual_world_size:
+                raise RuntimeError(
+                    f"Mapping requires world_size={max_rank_needed} "
+                    f"(tp_size={mapping.tp_size} * pp_size={mapping.pp_size} * cp_size={mapping.cp_size}), "
+                    f"but MPI world size is only {actual_world_size}. ")
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
