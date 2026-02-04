@@ -37,6 +37,12 @@ struct NixlHelper
     static void posixGpuToFileFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
     static void posixFileToGpuFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
 
+    /// @brief Coalesce contiguous memory regions to reduce memory registration overhead.
+    /// Adjacent memory regions with the same deviceId will be merged into a single region.
+    /// @param descs Memory descriptors to coalesce
+    /// @return Coalesced MemoryDescs
+    [[nodiscard]] static MemoryDescs coalesceMemoryDescs(MemoryDescs const& descs);
+
     /// @brief Coalesce contiguous memory regions in src and dst to reduce transfer count.
     /// If src[i] and src[i+1] are contiguous, and dst[i] and dst[i+1] are also contiguous
     /// (with same deviceId), they will be merged into a single transfer.
