@@ -546,7 +546,9 @@ class FusedMoEMethodBase(ABC):
             logger.warning(
                 f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
             )
-            param = torch.nn.Parameter(torch.empty_like(metadata,
+            # Extract meta tensor from metadata dict
+            meta_tensor = metadata['meta']
+            param = torch.nn.Parameter(torch.empty_like(meta_tensor,
                                                         device="cuda"),
                                        requires_grad=False)
             module.register_parameter(param_name, param)
