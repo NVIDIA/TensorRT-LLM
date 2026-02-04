@@ -158,6 +158,18 @@ class CompletionOutput:
     def logprobs_diff(self) -> TokenLogprobs | List[float]:
         return self.logprobs[self._last_logprobs_len:]
 
+    def __getstate__(self):
+        # Exclude _incremental_states which contains unpicklable DecodeStream objects
+        return {
+            slot: getattr(self, slot)
+            for slot in self.__slots__ if slot != "_incremental_states"
+        }
+
+    def __setstate__(self, state):
+        for slot, value in state.items():
+            setattr(self, slot, value)
+        self._incremental_states = None
+
 
 class GenerationResultBase:
     ''' This holds the core logic of the GenerationResult class. '''
