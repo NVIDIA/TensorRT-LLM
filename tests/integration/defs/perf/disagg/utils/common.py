@@ -10,7 +10,7 @@ GPU_RESOURCE_CONFIG = {
         "set_segment": True,
         "lock_freq_graphics_mhz": 2062,
         "lock_freq_memory_mhz": 3996,
-        "job_name_prefix": "",
+        "job_name_prefix": "coreai_comparch_trtllm",
     },
     "GB200_LYRIS": {  # Lyris GB200
         "slurm_extra_args": "",
@@ -38,14 +38,14 @@ GPU_RESOURCE_CONFIG = {
         "set_segment": False,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
-        "job_name_prefix": "coreai_comparch_trtllm",
+        "job_name_prefix": "",
     },
     "B300": {  # OCI B300
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
-        "job_name_prefix": "coreai_comparch_trtllm",
+        "job_name_prefix": "",
     },
 }
 
