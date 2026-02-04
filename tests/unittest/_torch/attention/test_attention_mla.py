@@ -5,7 +5,6 @@ from typing import List
 
 import pytest
 import torch
-from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -367,10 +366,6 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                        generation_seq_len_q: int,
                        num_generation_steps: List[int], v2_kv_cache: bool):
     """Test MLA computation for both context and generation phases"""
-
-    if v2_kv_cache and getSMVersion() != 100:
-        pytest.skip(
-            "v2_kv_cache is only supported for MLA on Blackwell architectures")
 
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads
