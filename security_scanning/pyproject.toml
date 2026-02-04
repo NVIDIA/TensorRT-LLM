@@ -18,9 +18,11 @@ dependencies = [
     "numpy (<2)",
     "onnx (>=1.18.0,<1.20.0)",
     "onnx-graphsurgeon (>=0.5.2)",
-    "openai (>=2.15.0,<3.0.0)",
+    "onnxscript (==0.5.4)",
+    "graphviz (>=0.21,<0.22)",
+    "openai (>=2.16.0,<3.0.0)",
     "polygraphy (>=0.49.26,<0.50.0)",
-    "psutil (>=7.2.1,<8.0.0)",
+    "psutil (>=7.2.2,<8.0.0)",
     "nvidia-ml-py (>=13)",
     "pulp (>=3.3.0,<4.0.0)",
     "h5py (==3.12.1)",
@@ -38,7 +40,6 @@ dependencies = [
     "pydantic-settings[yaml] (>=2.12.0,<3.0.0)",
     "omegaconf (>=2.3.0,<3.0.0)",
     "pillow (>=12.1.0,<13.0.0)",
-    "wheel (<=0.45.1)",
     "optimum (>=2.1.0,<3.0.0)",
     "datasets (==3.1.0)",
     "evaluate (>=0.4.6,<0.5.0)",
@@ -79,7 +80,8 @@ dependencies = [
     "mistral-common (==1.8.6)",
     "torchao (>=0.14.1)",
     "cuda-core (>=0.5.1,<0.6.0)",
-    "dynamic-path-manager (>=1.0.1,<2.0.0)"
+    "cuda-tile (>=1.0.1)",
+    "nvidia-cuda-tileiras (>=13.1)"
 ]
 
 

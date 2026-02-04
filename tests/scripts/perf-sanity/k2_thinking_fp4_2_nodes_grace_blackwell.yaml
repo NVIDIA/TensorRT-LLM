@@ -32,9 +32,9 @@ server_configs:
         iterations: 10
         isl: 32768
         osl: 8192
-        random_range_ratio: 0.2
         backend: "openai"
         trust_remote_code: true
+        dataset_file: datasets/perf-ci/k2_thinking-32k8k-20480-ratio-1_for_serve.json
 
   # 32k8k configs - DEP8 with CUTLASS
   - name: "k2_thinking_fp4_dep8_32k8k"
@@ -67,6 +67,6 @@ server_configs:
         iterations: 10
         isl: 32768
         osl: 8192
-        random_range_ratio: 0.2
         backend: "openai"
         trust_remote_code: true
+        dataset_file: datasets/perf-ci/k2_thinking-32k8k-20480-ratio-1_for_serve.json

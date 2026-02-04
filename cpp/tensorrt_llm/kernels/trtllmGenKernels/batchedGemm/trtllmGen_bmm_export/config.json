@@ -30,7 +30,7 @@
             "epilogueTileM": 128,
             "numStagesMma": 1,
             "transposeMmaOutput": true,
-            "useShuffledMatrixA": true,
+            "useShuffledMatrix": true,
             "useDeepSeekFp8": false
         },
 
@@ -86,7 +86,7 @@
             "epilogueTileM": 64,
             "clusterDimX": 1,
             "transposeMmaOutput": true,
-            "useShuffledMatrixA": false,
+            "useShuffledMatrix": false,
             "useDeepSeekFp8": true,
             "numStagesMmaWithinWorkTile": 2,
             "hoistMmaTaskTryWaits": true,
@@ -175,6 +175,7 @@
             "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
             "routeAct": false,
             "fusedAct": false,
+            "eltwiseActType": ["none", "relu2"],
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": ["bf16", "fp16", "e4m3"],
             "tileK": 512,
@@ -194,15 +195,18 @@
             "numExperts": 2,
             "numStagesMma": 2,
             "tileScheduler": "static",
-            "useShuffledMatrixA": false,
+            "useShuffledMatrix": false,
             "layoutA": "T"
         },
         {
             "_comment": "FP4_FC1_LowLatency",
             "_template": "BatchedGemmFp4LowLatency",
             "routeAct": "tma",
-            "fusedAct": true,
-            "act": ["swiglu", "geglu"],
+            "fusedAct,act,eltwiseActType": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "swiglu", "relu2"]
+            ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "e2m1",
@@ -220,12 +224,14 @@
             ]
         },
         {
-            "_comment": "FP4_FC1_GeGlu_SplitK_LowLatency",
+            "_comment": "FP4_FC1_SplitK_LowLatency",
             "_template": "BatchedGemmFp4LowLatency",
-            "act": "geglu",
             "routeAct": "tma",
             "routeSfsAct": "tma",
-            "fusedAct": true,
+            "fusedAct,act,eltwiseActType": [
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
             "sfLayoutA": "128x4",
             "sfLayoutB": "linear",
             "dtypeC": "e2m1",
@@ -245,8 +251,11 @@
             "_comment": "FP4_FC1_HighThroughput",
             "_template": "BatchedGemmFp4HighThroughput",
             "routeAct": "tma",
-            "fusedAct": true,
-            "act": ["swiglu", "geglu"],
+            "fusedAct,act,eltwiseActType": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
             "numRegsPerThreadNonEpilogueWarp": 48,
@@ -263,8 +272,11 @@
             "_comment": "FP4_FC1_HighThroughputTile256",
             "_template": "BatchedGemmFp4HighThroughput",
             "routeAct": "tma",
-            "fusedAct": true,
-            "act": ["swiglu", "geglu"],
+            "fusedAct,act,eltwiseActType": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": false,
             "dtypeC": "e2m1",
@@ -367,7 +379,7 @@
                 ["static", 2],
                 ["persistent", 4]
             ],
-            "useShuffledMatrixA": false,
+            "useShuffledMatrix": false,
             "layoutA": "T"
         },
         {
@@ -388,14 +400,17 @@
                 ["static", 2],
                 ["persistent", 4]
             ],
-            "useShuffledMatrixA": false,
+            "useShuffledMatrix": false,
             "layoutA": "T"
         },
         {
             "_comment": "PerTensor_FP8_FC1_LowLatency",
             "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
             "routeAct": "tma",
-            "fusedAct": true,
+            "fusedAct,eltwiseActType": [
+                [true, "none"],
+                [false, "relu2"]
+            ],
             "usePerTokenSfB": true,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "e4m3",
@@ -414,7 +429,10 @@
             "_comment": "PerTensor_FP8_FC1_HighThroughput",
             "_template": "BatchedGemmPerTensorScalingFp8HighThroughput",
             "routeAct": "tma",
-            "fusedAct": true,
+            "fusedAct,eltwiseActType": [
+                [true, "none"],
+                [false, "relu2"]
+            ],
             "usePerTokenSfB": true,
             "numRegsPerThreadNonEpilogueWarp": 56,
             "numRegsPerThreadEpilogueWarp": 128,

@@ -10,13 +10,15 @@ build-backend = "setuptools.build_meta"
 ####################################################################################################
 [tool.isort]
 line_length = 80
+known_first_party = ["tensorrt_llm"]
+known_third_party = ["triton_kernels"]
 
 [tool.yapf]
 based_on_style = "pep8"
 column_limit = 80
 
 [tool.codespell]
-skip = ".git,3rdparty,tests/integration/test_input_files**,**.jsonl,**.json"
+skip = ".git,3rdparty,triton_kernels,tests/integration/test_input_files**,**.jsonl,**.json"
 exclude-file = "examples/models/core/whisper/tokenizer.py"
 ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw,dOut"
 
@@ -42,6 +44,7 @@ fix = true
 # orders of magnitude faster, so we should move to deprecate `yapf`.
 exclude = [
     "**3rdparty/**",
+    "triton_kernels/**",
     ".devcontainer/make_env.py",
     ".github/scripts/label_community_user.py",
     ".github/scripts/pr_checklist_check.py",
@@ -1458,6 +1461,7 @@ convention = "google"
 
 [tool.ruff.lint.isort]
 known-first-party = ["tensorrt_llm"]
+known-third-party = ["triton_kernels"]
 split-on-trailing-comma = false
 
 
@@ -1490,7 +1494,7 @@ disallow_untyped_calls = false
 disallow_incomplete_defs = false
 disallow_untyped_defs = false
 warn_return_any = false
-exclude = []
+exclude = ["triton_kernels"]
 
 
 [[tool.mypy.overrides]]

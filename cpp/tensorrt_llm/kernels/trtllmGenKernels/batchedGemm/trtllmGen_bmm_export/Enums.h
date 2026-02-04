@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -115,9 +115,16 @@ enum class TileScheduler
 {
     // Static scheduler (Non-persistent).
     Static = 0,
-    // Dynamic persistent scheduler. This is either based on an atomically incremented global work id
-    // prior to SM100 archs, or the HW supported work id scheduler based on UGETNEXTWORKID for SM100+.
+    // Dynamic persistent scheduler for SM100+.
     Persistent,
+    // Static persistent scheduler. Launches a fixed grid size based on the number of SMs and uses
+    // the underlying PersistentTileSchedulerSm90 for static work distribution. Each CTA iterates
+    // through tiles and exits the loop by setting is_valid_tile to false when work is exhausted.
+    StaticPersistent,
+    // Dynamic persistent scheduler for SM90+ using atomicAdd on a global counter.
+    // Uses DynamicPersistentPipelinedTileSchedulerSm90 which enables work-stealing among CTAs
+    // by atomically fetching work tile indices from a global counter.
+    PersistentSm90,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -169,6 +176,28 @@ BIAS_TYPE_FUNCTION(M)
 BIAS_TYPE_FUNCTION(Mn)
 
 #undef BIAS_TYPE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to check if a scheduler is persistent.
+inline bool isPersistentScheduler(TileScheduler scheduler)
+{
+    return scheduler == TileScheduler::Persistent || scheduler == TileScheduler::StaticPersistent
+        || scheduler == TileScheduler::PersistentSm90;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to check if CTA rasterization order is compatible with clean early exit of the
+// kernel. Clean early exit requires CTA indices to increase monotonically along the batch
+// dimension, so when a CTA exits the kernel early, it exits with all valid tiles already done.
+// Zigzag or batch-major patterns are NOT compatible because they may cause valid tiles to be
+// skipped when exiting early.
+inline bool supportsCleanEarlyExit(CtaSwizzleType swizzleType, bool batchM, TileScheduler /* scheduler */)
+{
+    return (
+        batchM ? (swizzleType == CtaSwizzleType::RasterizeAlongN) : (swizzleType == CtaSwizzleType::RasterizeAlongM));
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

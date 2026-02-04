@@ -1,10 +1,13 @@
 __pycache__/
 .vscode
+.cursor
 *.engine
 *.engine.config
 *.cache
 *.nsys-rep
 *.npy
+*.so
+*.whl
 .VSCodeCounter
 cpp/build*
 cpp/Release

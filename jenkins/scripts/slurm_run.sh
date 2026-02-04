@@ -58,7 +58,10 @@ cd $llmSrcNode/tests/integration/defs
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
 echo "TRTLLM WHEEL PATH: $trtllmWhlPath"
-pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytestCommand")
+# In disaggregated mode, we only set coverage config file in benchmark pytest.
+if [[ -z "${DISAGG_SERVING_TYPE:-}" || "${DISAGG_SERVING_TYPE}" == "BENCHMARK" ]]; then
+    pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytestCommand")
+fi
 
 # Only the first process will save the coverage config file
 if [ $SLURM_PROCID -eq 0 ]; then

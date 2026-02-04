@@ -7,7 +7,10 @@ import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
@@ -55,6 +58,151 @@ class CutlassFusedMoE(MoE):
             routing(topK, etc.) [+ dynamic quant for fp8 qdq and nvfp4 ] [+ fp4_allgather] + FusedMoe Op[no allreduce] + reducescatter, with AttentionDP on
             equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
     """
+
+    # Quantization algorithm support table for can_implement()
+    # Format: quant_algo -> {sm_constraint, dtypes}
+    # sm_constraint types:
+    #   - ("min", N): SM >= N
+    #   - ("exact", N): SM == N
+    #   - ("in", {N1, N2, ...}): SM in set
+    _QUANT_SUPPORT_TABLE = {
+        # Unquantized (FP16/BF16): SM >= 80
+        None: {
+            "sm_constraint": ("min", 80),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # FP8 per-tensor (QDQ): SM >= 89
+        QuantAlgo.FP8: {
+            "sm_constraint": ("min", 89),
+            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+        },
+        # FP8_BLOCK_SCALES: SM == 90 only
+        QuantAlgo.FP8_BLOCK_SCALES: {
+            "sm_constraint": ("exact", 90),
+            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+        },
+        # NVFP4: SM in {100, 103}
+        QuantAlgo.NVFP4: {
+            "sm_constraint": ("in", {100, 103}),
+            "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+        },
+        # W4A8_AWQ: SM in {89, 90} only
+        QuantAlgo.W4A8_AWQ: {
+            "sm_constraint": ("in", {89, 90}),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # W8A16: SM >= 80
+        QuantAlgo.W8A16: {
+            "sm_constraint": ("min", 80),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # W4A16_MXFP4: SM == 90 only
+        QuantAlgo.W4A16_MXFP4: {
+            "sm_constraint": ("exact", 90),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # W4A8_MXFP4_FP8: SM in {100, 103}
+        QuantAlgo.W4A8_MXFP4_FP8: {
+            "sm_constraint": ("in", {100, 103}),
+            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+        },
+        # W4A8_MXFP4_MXFP8: SM in {100, 103}
+        QuantAlgo.W4A8_MXFP4_MXFP8: {
+            "sm_constraint": ("in", {100, 103}),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+    }
+
+    # Quantization algorithms that support gptoss_style
+    _GPTOSS_SUPPORTED_ALGOS = {QuantAlgo.W4A8_MXFP4_MXFP8}
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if CutlassFusedMoE can implement the given quantization algorithm.
+
+        CutlassFusedMoE supports:
+        - Unquantized (FP16/BF16): SM >= 80
+        - FP8 per-tensor (QDQ): SM >= 89
+        - FP8_BLOCK_SCALES: SM == 90 only
+        - NVFP4: SM in {100, 103}
+        - W4A8_AWQ: SM in {89, 90} only
+        - W8A16: SM >= 80
+        - W4A16_MXFP4: SM == 90 only
+        - W4A8_MXFP4_FP8: SM in {100, 103}
+        - W4A8_MXFP4_MXFP8: SM in {100, 103}
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation input data type (before quantization).
+                Supported dtypes vary by quantization mode:
+                - Unquantized: float16, bfloat16
+                - FP8/FP8_BLOCK_SCALES/W4A8_MXFP4_FP8: float16, bfloat16, float32
+                - NVFP4: float16, bfloat16, float8_e4m3fn
+                - W4A16_MXFP4/W4A8_AWQ/W8A16/W4A8_MXFP4_MXFP8: float16, bfloat16
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CutlassFusedMoE only supports gptoss_style for W4A8_MXFP4_MXFP8 quantization.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        # Check minimum SM version for Cutlass backend
+        if sm_version < 80:
+            return _warn_and_return(
+                f"CutlassFusedMoE requires SM >= 80, got SM{sm_version}")
+
+        # Check gptoss_style support
+        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+            return _warn_and_return(
+                f"CutlassFusedMoE gptoss_style only supports W4A8_MXFP4_MXFP8 "
+                f"(got quant_algo={quant_algo})")
+
+        # Check if quant_algo is supported
+        if quant_algo not in cls._QUANT_SUPPORT_TABLE:
+            return _warn_and_return(
+                f"CutlassFusedMoE does not support quant_algo={quant_algo}")
+
+        support_info = cls._QUANT_SUPPORT_TABLE[quant_algo]
+
+        # Check SM version constraint
+        constraint_type, constraint_value = support_info["sm_constraint"]
+        algo_name = "unquantized" if quant_algo is None else quant_algo.name
+
+        if constraint_type == "min":
+            if sm_version < constraint_value:
+                return _warn_and_return(
+                    f"CutlassFusedMoE {algo_name} requires SM >= {constraint_value}, "
+                    f"got SM{sm_version}")
+        elif constraint_type == "exact":
+            if sm_version != constraint_value:
+                return _warn_and_return(
+                    f"CutlassFusedMoE {algo_name} only supports SM{constraint_value}, "
+                    f"got SM{sm_version}")
+        elif constraint_type == "in":
+            if sm_version not in constraint_value:
+                sm_list = "/".join(f"SM{v}" for v in sorted(constraint_value))
+                return _warn_and_return(
+                    f"CutlassFusedMoE {algo_name} only supports {sm_list}, "
+                    f"got SM{sm_version}")
+
+        # Check dtype_activation
+        supported_dtypes = support_info["dtypes"]
+        if dtype_activation not in supported_dtypes:
+            dtype_list = ", ".join(str(d) for d in supported_dtypes)
+            return _warn_and_return(
+                f"CutlassFusedMoE {algo_name} requires {dtype_list}, "
+                f"got {dtype_activation}")
+
+        return True, None
 
     def __init__(
         self,
@@ -411,6 +559,7 @@ class CutlassFusedMoE(MoE):
         tuner_num_tokens: Optional[int] = None,
         tuner_top_k: Optional[int] = None,
         moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with Cutlass backend.
@@ -429,6 +578,7 @@ class CutlassFusedMoE(MoE):
             tuner_num_tokens: Number of tokens for profiling tuner (optional)
             tuner_top_k: Top-k value for profiling tuner (optional)
             moe_output: Pre-allocated output buffer (optional)
+            enable_alltoall: Whether alltoall communication is enabled (optional). If None, defaults to self.enable_alltoall.
 
         Returns:
             final_hidden_states: Output tensor from MoE computation
@@ -440,6 +590,9 @@ class CutlassFusedMoE(MoE):
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 weight_dtype = torch.uint8
+
+        if enable_alltoall is None:
+            enable_alltoall = self.enable_alltoall
 
         result = torch.ops.trtllm.fused_moe(
             x,
@@ -462,7 +615,7 @@ class CutlassFusedMoE(MoE):
             ep_rank=self.ep_rank,
             cluster_size=self.cluster_size,
             cluster_rank=self.cluster_rank,
-            enable_alltoall=self.enable_alltoall,
+            enable_alltoall=enable_alltoall,
             use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
             use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
             use_int8_woq_per_channel=self.has_int8_woq_per_channel,
@@ -534,6 +687,8 @@ class CutlassFusedMoE(MoE):
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
+            self.num_slots, token_selected_slots)
 
         if self.apply_router_weight_on_input:
             assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"

@@ -36,7 +36,7 @@ def _torch_generate_mha(
     v: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     input_pos: torch.Tensor,
     scale: float,
     out: torch.Tensor,
@@ -51,14 +51,14 @@ def _torch_generate_mha(
 
     # Update KV cache for single token
     for i in range(b):
-        cache_idx = cache_loc[i].item()
+        cache_idx = slot_idx[i].item()
         pos = input_pos[i].item()
         k_cache[cache_idx, pos] = k[i, 0]  # Remove sequence dim
         v_cache[cache_idx, pos] = v[i, 0]  # Remove sequence dim
 
     # Compute attention for each sequence using manual computation
     for i in range(b):
-        cache_idx = cache_loc[i].item()
+        cache_idx = slot_idx[i].item()
         pos = input_pos[i].item()
 
         # Get query, key, value for this sequence
@@ -121,7 +121,7 @@ def _torch_context_mha(
     k: torch.Tensor,
     v: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     seq_len: torch.Tensor,
@@ -134,14 +134,14 @@ def _torch_context_mha(
 ) -> None:
     """Context attention (multiple tokens, potentially multiple sequences) using existing torch functions."""
     # Update KV cache first using existing function
-    update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, cache_loc, seq_start)
+    update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start)
 
     # Compute attention for each sequence
     attn_outputs = []
     for idx in range(seq_len.shape[0]):
         seq_len_i = seq_len[idx].item()
         input_pos_i = input_pos[idx].item()
-        cache_loc_i = cache_loc[idx].item()
+        slot_idx_i = slot_idx[idx].item()
         seq_start_i = seq_start[idx].item()
 
         # Skip sequences with zero length
@@ -153,8 +153,8 @@ def _torch_context_mha(
 
         # Get keys and values from cache
         kv_seq_len = input_pos_i + seq_len_i
-        k_seq = k_cache[cache_loc_i, :kv_seq_len]  # [kv_seq_len, n_kv_heads, head_dim]
-        v_seq = v_cache[cache_loc_i, :kv_seq_len]  # [kv_seq_len, n_kv_heads, head_dim]
+        k_seq = k_cache[slot_idx_i, :kv_seq_len]  # [kv_seq_len, n_kv_heads, head_dim]
+        v_seq = v_cache[slot_idx_i, :kv_seq_len]  # [kv_seq_len, n_kv_heads, head_dim]
 
         # Manual attention computation (shared path for both softcapping and non-softcapping)
         n_heads = q_seq.shape[1]
@@ -255,7 +255,7 @@ def torch_backend_mha_with_cache(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     cu_seqlen: torch.Tensor,
     # EXTRA METADATA
     #
@@ -281,7 +281,7 @@ def torch_backend_mha_with_cache(
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     input_pos = input_pos[:num_seq]
-    cache_loc = cache_loc[:num_seq]
+    slot_idx = slot_idx[:num_seq]
     seq_start = cu_seqlen[:num_seq]
 
     # check for num_heads
@@ -314,7 +314,7 @@ def torch_backend_mha_with_cache(
             v,
             k_cache,
             v_cache,
-            cache_loc,
+            slot_idx,
             input_pos,
             scale,
             y,
@@ -329,7 +329,7 @@ def torch_backend_mha_with_cache(
             k,
             v,
             input_pos,
-            cache_loc,
+            slot_idx,
             k_cache,
             v_cache,
             seq_len,
@@ -354,7 +354,7 @@ def torch_backend_mha_with_cache_fake(
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     cu_seqlen: torch.Tensor,
     # EXTRA METADATA
     #
@@ -394,7 +394,7 @@ class TorchBackendAttention(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info_host", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
+        return ["batch_info_host", "seq_len", "input_pos", "slot_idx", "cu_seqlen"]
 
     @classmethod
     def get_cache_initializers(

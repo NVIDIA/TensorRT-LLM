@@ -439,13 +439,14 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
             so_file.unlink()
 
     # Build rawref
-    print("-- Building kv_cache_manager_v2 rawref extension...")
+    print("-- Building kv_cache_manager_v2 rawref extension...", end=" ")
     rawref_dir = kv_cache_mgr_dir / "rawref"
     build_run(f'"{venv_python}" setup.py build_ext --inplace', cwd=rawref_dir)
+    print("Done")
 
     if use_mypyc:
         # Build mypyc
-        print("-- Building kv_cache_manager_v2 mypyc extensions...")
+        print("-- Building kv_cache_manager_v2 mypyc extensions...", end=" ")
         # setup_mypyc.py is in kv_cache_manager_v2 but executed from runtime dir
         setup_mypyc = kv_cache_mgr_dir / "setup_mypyc.py"
         build_run(f'"{venv_python}" "{setup_mypyc}" build_ext --inplace',
@@ -456,6 +457,8 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
             raise RuntimeError(
                 "Failed to build kv_cache_manager_v2: no shared library generated."
             )
+        print("Done")
+    print("-- Done building kv_cache_manager_v2.")
 
 
 def main(*,
@@ -1006,7 +1009,6 @@ def add_arguments(parser: ArgumentParser):
                         action="store_true",
                         help="Always configure cmake before building")
     parser.add_argument("--use_ccache",
-                        "-ccache",
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")

@@ -10,7 +10,7 @@ metadata:
   dataset_file: disagg_datasets/kimi-k2-1024-1024-20000-ratio-1_for_serve.json
   accuracy:
     datasets:
-    - dataset_name: gpqa_diamond_cot_zeroshot
+    - dataset_name: gpqa_diamond_local
       expected_value: 0.65
       threshold_type: hypothesis_test
       filter_type: strict-match
@@ -29,7 +29,7 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 1.0
   streaming: true
-  concurrency_list: '16384'
+  concurrency_list: '8192'
   input_length: 1024
   output_length: 1024
   dataset_file: <dataset_file>

@@ -3,14 +3,16 @@
 This module defines the base classes and interfaces for all transforms.
 """
 
+import os
 import time
 from abc import ABC
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from functools import total_ordering, wraps
-from typing import Any, Callable, Dict, Mapping, Tuple, Type, Union, final
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Type, Union, final
 
+import torch
 import torch.nn as nn
 from pydantic import BaseModel, Field
 from torch.fx import GraphModule, Node
@@ -27,6 +29,7 @@ from ..utils._graph import (
 )
 from ..utils.cuda_mem_tracker import get_mem_info
 from ..utils.logger import ad_logger
+from .graph_module_visualizer import to_dot
 
 # ANSI color codes for log formatting (set to False to disable colors)
 # NOTE: colors disabled by default to make logging in CI/CD pipelines easier to read
@@ -102,6 +105,7 @@ class Stages(Enum):
     POST_LOAD_FUSION = "post_load_fusion"  # post-loading fusion and perf optimizations of the graph
     CACHE_INIT = "cache_init"  # initialization of cached attention + (KV) cache initialization
     VISUALIZE = "visualize"  # visualization of the graph
+    EXPORT_ONNX = "export_onnx"  # export the graph to onnx
     COMPILE = "compile"  # graph compilation stage using low-level compilers like torch.compile
 
     def __lt__(self, other):
@@ -165,6 +169,11 @@ class TransformConfig(BaseModel):
     requires_shape_prop: bool = Field(
         default=False,
         description="Whether this transform requires shape propagation before it is applied.",
+    )
+    debug_visualize_dir: Optional[str] = Field(
+        default=None,
+        description="Debug visualization directory. None to disable visualization, "
+        "or a path string to specify the output directory.",
     )
 
     expect_mem_change: bool = Field(
@@ -257,6 +266,7 @@ def with_transform_logging(call_fn: Callable) -> Callable:
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
+        idx: int,
     ) -> nn.Module:
         prefix = f"[stage={self.config.stage.value}, transform={self.get_transform_key()}]"
         original_log = ad_logger.log
@@ -268,7 +278,7 @@ def with_transform_logging(call_fn: Callable) -> Callable:
 
         ad_logger.log = _patched_log  # type: ignore[assignment]
         try:
-            return call_fn(self, gm, cm, factory, shared_config)
+            return call_fn(self, gm, cm, factory, shared_config, idx)
         finally:
             ad_logger.log = original_log  # type: ignore[assignment]
 
@@ -346,6 +356,7 @@ class BaseTransform(ABC):
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
+        idx: int,
     ) -> nn.Module:
         """Apply the transform to the graph.
 
@@ -354,6 +365,7 @@ class BaseTransform(ABC):
             cm: The cached sequence interface defining the sequence interface.
             factory: The model factory used to build the model.
             shared_config: Global info shared between multiple transforms.
+            idx: The index of the transform in the pipeline.
 
         Returns:
             nn.Module: The transformed model.
@@ -473,9 +485,32 @@ class BaseTransform(ABC):
         autodeploy_meta[self._mem_history_key] = mem_history
 
         self._set_autodeploy_meta(mod, autodeploy_meta)
+        self._visualize_graph(mod, idx)
 
         # return the graph module
         return mod
+
+    @final
+    def _visualize_graph(self, mod: nn.Module, idx: int) -> None:
+        """Visualize the graph if debug visualization is enabled.
+        Args:
+            mod: The graph module to visualize.
+            idx: The index of the transform in the pipeline.
+        Note:
+            we may want to consider doing this for each subgraph.
+            See https://github.com/NVIDIA/TensorRT-LLM/issues/10203
+        """
+        if not isinstance(mod, torch.fx.GraphModule):
+            return
+        visualize_dir = self.config.debug_visualize_dir
+        if not visualize_dir:
+            return
+        if not os.path.exists(visualize_dir):
+            os.makedirs(visualize_dir)
+        name_stem = f"gm_{idx + 1:02d}_{self.get_transform_key()}"
+        visualize_path = os.path.join(visualize_dir, f"{name_stem}")
+        to_dot(mod, name=name_stem, save_path=visualize_path, format="svg")
+        ad_logger.debug(f"[{idx + 1:02d}] Visualized {name_stem} to {visualize_path}")
 
     @final
     def _apply_per_gm_or_whole_model(
@@ -620,6 +655,7 @@ class BaseTransform(ABC):
             abs(diff.resv) >= mem_change_threshold
             or abs(diff.alloc) >= mem_change_threshold
             or abs(diff.frag) >= mem_change_threshold
+            or abs(diff.free) >= mem_change_threshold
         )
 
         def _fmt_val_with_delta(val: float, delta: float, color: str) -> str:
