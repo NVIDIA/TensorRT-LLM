@@ -309,6 +309,13 @@ class TrtllmAttentionGlobalState:
             cls._instance._host_prepare_called: bool = False
             # Cache the current num_seq for tensor slicing
             cls._instance._current_num_seq: int = 0
+            # Pre-allocated CPU buffers for host_prepare (avoid tensor allocation)
+            cls._instance._cpu_buffers_initialized: bool = False
+            cls._instance._cpu_input_seq_lens: Optional[torch.Tensor] = None
+            cls._instance._cpu_seq_len_with_cache: Optional[torch.Tensor] = None
+            cls._instance._cpu_past_kv_lens: Optional[torch.Tensor] = None
+            cls._instance._cpu_cu_num_pages: Optional[torch.Tensor] = None
+            cls._instance._cpu_pages_per_seq: Optional[torch.Tensor] = None
         return cls._instance
 
     def _init_shared_tensors(
@@ -355,6 +362,29 @@ class TrtllmAttentionGlobalState:
         )
 
         self._shared_tensors_initialized = True
+
+    def _init_cpu_buffers(self, max_seqs: int) -> None:
+        """Initialize pre-allocated CPU buffers to avoid tensor allocation in hot path."""
+        if self._cpu_buffers_initialized:
+            return
+
+        # Pre-allocate pinned CPU buffers for intermediate computations
+        self._cpu_input_seq_lens = torch.zeros(
+            max_seqs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._cpu_seq_len_with_cache = torch.zeros(
+            max_seqs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._cpu_past_kv_lens = torch.zeros(
+            max_seqs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._cpu_cu_num_pages = torch.zeros(
+            max_seqs + 1, dtype=torch.long, device="cpu", pin_memory=True
+        )
+        self._cpu_pages_per_seq = torch.zeros(
+            max_seqs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._cpu_buffers_initialized = True
 
     def _init_gpu_buffers(self, max_pages: int, max_seqs: int) -> None:
         """Initialize pre-allocated GPU buffers for vectorized operations."""
@@ -465,12 +495,17 @@ class TrtllmAttentionGlobalState:
             cache_loc: torch.Tensor,
             seq_len_with_cache_host: torch.Tensor,
         ) -> None:
-            """Fill device/host tensors before graph replay using vectorized ops."""
+            """Fill device/host tensors before graph replay using vectorized ops.
+
+            OPTIMIZED: Uses pre-allocated buffers with out= parameters to avoid
+            tensor allocation overhead in the hot path.
+            """
             if not layer_states:
                 return
 
-            num_prefill = int(batch_info_host[0].item())
-            num_decode = int(batch_info_host[2].item())
+            # Fast integer extraction (avoid .item() overhead by using int() directly)
+            num_prefill = int(batch_info_host[0])
+            num_decode = int(batch_info_host[2])
             num_seq = num_prefill + num_decode
 
             if num_seq == 0:
@@ -482,35 +517,10 @@ class TrtllmAttentionGlobalState:
 
             num_layers = first_state.num_layers if first_state.num_layers > 0 else 32
 
-            # Initialize pool pointers once (static for cache lifetime)
-            if not global_state._pool_pointers_initialized:
-                if _trtllm_config._sequence_info is not None:
-                    ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
-                    ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
-                    global_state._init_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
+            # Initialize buffers once (lazy initialization)
+            if not global_state._cpu_buffers_initialized:
+                global_state._init_cpu_buffers(first_state.max_num_requests)
 
-            # Compute metadata on CPU (these are already host tensors)
-            input_seq_lens = (cu_seqlen_host[1 : num_seq + 1] - cu_seqlen_host[:num_seq]).int()
-            seq_len_with_cache = seq_len_with_cache_host[:num_seq].int()
-            past_kv_lens = seq_len_with_cache - input_seq_lens
-
-            # Compute totals without .item() - use tensor ops
-            context_total_kv = seq_len_with_cache[:num_prefill].sum() if num_prefill > 0 else 0
-            gen_total_kv = seq_len_with_cache[num_prefill:num_seq].sum() if num_decode > 0 else 0
-
-            # Block offsets info - compute on CPU
-            cu_num_pages_cpu = cu_num_pages_host[: num_seq + 1].int()
-            pages_per_seq = cu_num_pages_cpu[1 : num_seq + 1] - cu_num_pages_cpu[:num_seq]
-            max_blocks = pages_per_seq.max().item()
-            global_state.set_max_blocks_per_seq(max_blocks)
-
-            total_pages = cu_num_pages_cpu[num_seq].item()
-
-            # Prepare GPU tensors once (outside loop)
-            seq_len_gpu = seq_len_with_cache.cuda()
-            input_seq_lens_gpu = input_seq_lens.cuda()
-
-            # Initialize pre-allocated GPU buffers if needed
             if not global_state._gpu_buffers_initialized:
                 max_pages = first_state.max_num_requests * (
                     (first_state.max_context_length + first_state.tokens_per_block - 1)
@@ -518,53 +528,50 @@ class TrtllmAttentionGlobalState:
                 )
                 global_state._init_gpu_buffers(max_pages, first_state.max_num_requests)
 
-            # Compute block offsets using vectorized GPU operations
-            seq_indices = None
-            page_in_seq = None
-            base_offsets = None
-            if total_pages > 0:
-                # Use pre-allocated buffers with out= to avoid allocations
-                global_state._gpu_cu_pages[: num_seq + 1].copy_(cu_num_pages_cpu.long())
-                cu_num_pages_gpu = global_state._gpu_cu_pages[: num_seq + 1]
+            # Initialize pool pointers once (static for cache lifetime)
+            if not global_state._pool_pointers_initialized:
+                if _trtllm_config._sequence_info is not None:
+                    ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
+                    ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
+                    global_state._init_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
 
-                # Use pre-allocated page_positions slice
-                page_positions = global_state._gpu_page_positions[:total_pages]
-
-                # searchsorted into pre-allocated buffer
-                torch.searchsorted(
-                    cu_num_pages_gpu[1:],
-                    page_positions,
-                    right=True,
-                    out=global_state._gpu_seq_idx[:total_pages],
-                )
-                seq_indices = global_state._gpu_seq_idx[:total_pages].clamp(max=num_seq - 1)
-
-                # Compute page_in_seq into pre-allocated buffer
-                torch.sub(
-                    page_positions,
-                    cu_num_pages_gpu[seq_indices],
-                    out=global_state._gpu_page_idx[:total_pages],
-                )
-                page_in_seq = global_state._gpu_page_idx[:total_pages]
-
-                # Compute base offsets into pre-allocated buffer
-                kv_factor = 2
-                multiplier = num_layers * kv_factor
-                torch.mul(
-                    cache_loc[:total_pages],
-                    multiplier,
-                    out=global_state._gpu_base_offset[:total_pages],
-                )
-                base_offsets = global_state._gpu_base_offset[:total_pages]
-
-            # All layers share the same tensors (single KV cache pool), update ONCE
-            # Fill shared device tensors
-            global_state._shared_sequence_length[:num_seq].copy_(seq_len_gpu, non_blocking=True)
-            global_state._shared_context_lengths[:num_seq].copy_(
-                input_seq_lens_gpu, non_blocking=True
+            # Use pre-allocated CPU buffers with out= to avoid tensor allocation
+            input_seq_lens = global_state._cpu_input_seq_lens[:num_seq]
+            torch.sub(
+                cu_seqlen_host[1 : num_seq + 1],
+                cu_seqlen_host[:num_seq],
+                out=input_seq_lens,
             )
 
-            # Fill shared host tensors
+            seq_len_with_cache = global_state._cpu_seq_len_with_cache[:num_seq]
+            seq_len_with_cache.copy_(seq_len_with_cache_host[:num_seq])
+
+            past_kv_lens = global_state._cpu_past_kv_lens[:num_seq]
+            torch.sub(seq_len_with_cache, input_seq_lens, out=past_kv_lens)
+
+            # Compute totals (avoid .item() by keeping as tensor)
+            context_total_kv = seq_len_with_cache[:num_prefill].sum() if num_prefill > 0 else 0
+            gen_total_kv = seq_len_with_cache[num_prefill:num_seq].sum() if num_decode > 0 else 0
+
+            # Block offsets info - use pre-allocated buffers
+            cu_num_pages = global_state._cpu_cu_num_pages[: num_seq + 1]
+            cu_num_pages.copy_(cu_num_pages_host[: num_seq + 1])
+
+            pages_per_seq = global_state._cpu_pages_per_seq[:num_seq]
+            torch.sub(cu_num_pages[1 : num_seq + 1], cu_num_pages[:num_seq], out=pages_per_seq)
+
+            # Get max and total (unavoidable .item() for control flow)
+            max_blocks = int(pages_per_seq.max())
+            global_state.set_max_blocks_per_seq(max_blocks)
+            total_pages = int(cu_num_pages[num_seq])
+
+            # H2D copies using pinned memory (non-blocking)
+            global_state._shared_sequence_length[:num_seq].copy_(
+                seq_len_with_cache, non_blocking=True
+            )
+            global_state._shared_context_lengths[:num_seq].copy_(input_seq_lens, non_blocking=True)
+
+            # Fill shared host tensors (CPU to CPU, fast)
             global_state._shared_host_past_key_value_lengths[:num_seq].copy_(past_kv_lens)
             global_state._shared_host_context_lengths[:num_seq].copy_(input_seq_lens)
             if num_prefill > 0:
@@ -574,9 +581,44 @@ class TrtllmAttentionGlobalState:
             global_state._shared_host_total_kv_lens[0] = context_total_kv
             global_state._shared_host_total_kv_lens[1] = gen_total_kv
 
-            # Fill shared block offsets
-            if total_pages > 0 and seq_indices is not None:
-                global_state._shared_kv_cache_block_offsets.zero_()
+            # Compute block offsets on GPU (vectorized)
+            if total_pages > 0:
+                # Copy cu_pages to GPU (small tensor)
+                global_state._gpu_cu_pages[: num_seq + 1].copy_(cu_num_pages)
+                cu_num_pages_gpu = global_state._gpu_cu_pages[: num_seq + 1]
+
+                # Use pre-allocated page_positions slice
+                page_positions = global_state._gpu_page_positions[:total_pages]
+
+                # searchsorted on GPU
+                torch.searchsorted(
+                    cu_num_pages_gpu[1:],
+                    page_positions,
+                    right=True,
+                    out=global_state._gpu_seq_idx[:total_pages],
+                )
+                seq_indices = global_state._gpu_seq_idx[:total_pages]
+
+                # page_in_seq on GPU
+                torch.sub(
+                    page_positions,
+                    cu_num_pages_gpu[seq_indices],
+                    out=global_state._gpu_page_idx[:total_pages],
+                )
+                page_in_seq = global_state._gpu_page_idx[:total_pages]
+
+                # base_offsets on GPU
+                kv_factor = 2
+                multiplier = num_layers * kv_factor
+                torch.mul(
+                    cache_loc[:total_pages],
+                    multiplier,
+                    out=global_state._gpu_base_offset[:total_pages],
+                )
+                base_offsets = global_state._gpu_base_offset[:total_pages]
+
+                # Fill block offsets using advanced indexing (only zero the slice we need)
+                global_state._shared_kv_cache_block_offsets[:, :num_seq, :, :].zero_()
                 global_state._shared_kv_cache_block_offsets[0, seq_indices, 0, page_in_seq] = (
                     base_offsets
                 )
@@ -584,7 +626,7 @@ class TrtllmAttentionGlobalState:
                     base_offsets + 1
                 )
 
-            # Mark that host_prepare has run - _prepare_trtllm_metadata can skip computation
+            # Mark that host_prepare has run
             global_state._host_prepare_called = True
             global_state._current_num_seq = num_seq
 
@@ -597,6 +639,9 @@ class TrtllmAttentionGlobalState:
         self._max_blocks_per_seq = 0
         self._host_prepare_called = False
         self._current_num_seq = 0
+        self._cpu_buffers_initialized = False
+        self._gpu_buffers_initialized = False
+        self._pool_pointers_initialized = False
 
 
 # Global state singleton
