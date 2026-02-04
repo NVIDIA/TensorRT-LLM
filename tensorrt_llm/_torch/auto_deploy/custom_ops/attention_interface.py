@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union, final
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 from torch.types import Number
@@ -283,6 +284,41 @@ class InputBuffer:
             self._device_views = self._create_views(self._device_buffer)
 
 
+class CacheConfig(BaseModel):
+    """Cache configuration for attention-related dtypes."""
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
+
+    dtype: Optional[torch.dtype] = Field(default=None, description="KV cache dtype.")
+    mamba_dtype: Optional[torch.dtype] = Field(default=None, description="Mamba cache dtype.")
+    delta_dtype: Optional[torch.dtype] = Field(
+        default=torch.float32, description="Delta cache dtype. Defaults to float32."
+    )
+
+    @field_validator("dtype", "mamba_dtype", "delta_dtype", mode="before")
+    @classmethod
+    def _coerce_dtype(cls, value):
+        if value is None or isinstance(value, torch.dtype):
+            return value
+        if isinstance(value, str):
+            dtype = getattr(torch, value, None)
+            assert isinstance(dtype, torch.dtype), f"Invalid {dtype=}"
+            return dtype
+        return value
+
+    def __or__(self, other: "CacheConfig") -> "CacheConfig":
+        """Combine two CacheConfig objects field-wise using Python's `or` semantics."""
+        if not isinstance(other, CacheConfig):
+            raise NotImplementedError(f"Cannot combine CacheConfig with {type(other)}")
+        merged_kwargs = {}
+        for field_name in type(self).model_fields.keys():
+            merged_kwargs[field_name] = getattr(self, field_name) or getattr(other, field_name)
+        return CacheConfig(**merged_kwargs)
+
+
 class SequenceInfo:
     """An interface to hold information about how the sequence is laid out and stored in cache.
 
@@ -499,6 +535,12 @@ class SequenceInfo:
 
     def _get_arg(self, name: str) -> torch.Tensor:
         """Get the argument from the input buffer either on device or host."""
+        # Handle special KV cache pool arguments for TRT-LLM attention
+        if name == "kv_cache_pool_pointers":
+            return self._kv_cache_pool_pointers
+        elif name == "kv_cache_pool_mapping":
+            return self._kv_cache_pool_mapping
+
         if name.endswith("_host"):
             arg = self._input_buffer.get_host_view(name.replace("_host", ""))
         else:
@@ -1003,6 +1045,38 @@ class SequenceInfo:
         for host_function, args in self._host_prepare_functions:
             host_function(**{arg: self._get_arg(arg) for arg in args})
 
+    # KV Cache pool info for TRT-LLM attention (set by CacheInterface after KVCacheManager creation)
+    _kv_cache_pool_pointers: Optional[torch.Tensor] = None
+    _kv_cache_pool_mapping: Optional[torch.Tensor] = None
+
+    def set_kv_cache_pool_info(
+        self, pool_pointers: torch.Tensor, pool_mapping: torch.Tensor
+    ) -> None:
+        """Set KV cache pool pointers and mapping for TRT-LLM attention.
+
+        This is called by CacheInterface after KVCacheManager is created,
+        allowing TRT-LLM attention to use the same pool as AD's cache system.
+
+        Args:
+            pool_pointers: Pool pointer tensor from KVCacheManager.kv_cache_pool_pointers
+            pool_mapping: Layer to pool mapping from KVCacheManager.kv_cache_pool_mapping
+        """
+        self._kv_cache_pool_pointers = pool_pointers
+        self._kv_cache_pool_mapping = pool_mapping
+        # Add to available_args so host prepare functions can request them
+        self._available_args.add("kv_cache_pool_pointers")
+        self._available_args.add("kv_cache_pool_mapping")
+
+    @property
+    def kv_cache_pool_pointers(self) -> Optional[torch.Tensor]:
+        """Get KV cache pool pointers if set."""
+        return self._kv_cache_pool_pointers
+
+    @property
+    def kv_cache_pool_mapping(self) -> Optional[torch.Tensor]:
+        """Get KV cache pool mapping if set."""
+        return self._kv_cache_pool_mapping
+
 
 class ResourceHandler(ABC):
     """An abstract interface to handle a generic resource needed by attention operators.
@@ -1101,6 +1175,16 @@ class PrepareMetadataCallable(Protocol):
     ) -> List[torch.Tensor]: ...
 
 
+class GetCacheCallable(Protocol):
+    def __call__(self, sequence_info: SequenceInfo) -> torch.Tensor: ...
+
+
+class GetBufferCallable(GetCacheCallable):
+    pass
+
+
+CacheInitializerDict = Dict[str, GetCacheCallable]
+BufferInitializerDict = Dict[str, GetBufferCallable]
 AttentionLayout = Literal["bsnd", "bnsd"]
 
 ResourceHandlerDict = Dict[str, ResourceHandler]

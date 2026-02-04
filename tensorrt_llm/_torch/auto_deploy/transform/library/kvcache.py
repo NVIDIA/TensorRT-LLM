@@ -28,6 +28,7 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionRegistry,
+    CacheConfig,
     Constant,
     PrepareMetadataCallable,
 )
@@ -49,6 +50,9 @@ class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
     backend: Optional[str] = Field(default=None, description="The attention backend to use.")
+    cache_config: CacheConfig = Field(
+        default_factory=CacheConfig, description="The custom cache configuration to use."
+    )
 
 
 @TransformRegistry.register("insert_cached_attention")
