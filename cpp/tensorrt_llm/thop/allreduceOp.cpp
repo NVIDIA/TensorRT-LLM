@@ -1428,10 +1428,11 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-void preallocateNCCLWindowBuffer(torch::List<int64_t> const& group, int64_t size_bytes, int64_t buffers_per_size)
+void preallocateNCCLWindowBuffer(
+    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t buffers_per_size)
 {
 #if ENABLE_MULTI_DEVICE
-    if (buffers_per_size <= 0 || size_bytes <= 0 || group.size() == 0)
+    if (buffers_per_size <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
     {
         return;
     }
@@ -1454,9 +1455,20 @@ void preallocateNCCLWindowBuffer(torch::List<int64_t> const& group, int64_t size
     auto& allocator = NCCLWindowAllocator::getInstance();
     ncclComm_t comm = *comm_ptr;
 
-    auto const size = static_cast<size_t>(size_bytes);
-    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) of %zu bytes for comm %p",
-        buffers_per_size, size, static_cast<void*>(comm));
+    int64_t num_tokens = input.size(0);
+    int64_t elements_per_token = input.numel() / num_tokens;
+    if (elements_per_token <= 0)
+    {
+        return;
+    }
+    auto const size = static_cast<size_t>(num_tokens) * static_cast<size_t>(elements_per_token)
+        * static_cast<size_t>(input.element_size());
+    if (size == 0)
+    {
+        return;
+    }
+    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) for tokens=%ld (%zu bytes) comm %p",
+        buffers_per_size, num_tokens, size, static_cast<void*>(comm));
     for (int64_t i = 0; i < buffers_per_size; ++i)
     {
         try
@@ -1478,7 +1490,6 @@ void preallocateNCCLWindowBuffer(torch::List<int64_t> const& group, int64_t size
     }
 #else
     (void) group;
-    (void) size_bytes;
     (void) buffers_per_size;
 #endif
 }
@@ -1802,7 +1813,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int rank,"
         "int nranks,"
         "float eps) -> Tensor[]");
-    m.def("preallocate_nccl_window_buffer(int[] group, int size, int count) -> ()");
+    m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -1824,5 +1835,5 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
                 reinterpret_cast<int64_t*>(workspace.data_ptr()), (int) tp_size);
             return std::vector<at::Tensor>{};
         });
-    m.impl("preallocate_nccl_window_buffer", [](torch::List<int64_t> const&, int64_t, int64_t) { return; });
+    m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
 }

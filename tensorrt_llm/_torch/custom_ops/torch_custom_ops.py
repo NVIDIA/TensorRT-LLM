@@ -1781,17 +1781,18 @@ def tunable_allreduce(
             else:
                 opt_shapes.add(base_val)
 
-            elements_per_token = input.numel() // input.size(0)
-            if elements_per_token > 0:
-                element_size = input.element_size()
+                input_shape = list(input.shape)
                 for tokens in sorted([int(v) for v in opt_shapes if v > 0]):
-                    size_bytes = int(tokens * elements_per_token * element_size)
                     logger.debug(
                         "[tunable_allreduce] Pre-allocating NCCL window buffers: "
-                        "tokens=%d size_bytes=%d group=%s", tokens, size_bytes,
-                        list(group))
+                        "tokens=%d group=%s", tokens, list(group))
+                    if tokens == input_shape[0]:
+                        prealloc_input = input
+                    else:
+                        prealloc_shape = [tokens] + input_shape[1:]
+                        prealloc_input = input.new_empty(prealloc_shape)
                     torch.ops.trtllm.preallocate_nccl_window_buffer(
-                        group, size_bytes, 2)
+                        prealloc_input, group, 2)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
