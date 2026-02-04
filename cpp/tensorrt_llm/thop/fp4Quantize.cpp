@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/arcquantFP4.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -232,6 +233,37 @@ at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<a
 
     return globalScale;
 }
+
+// https://github.com/actypedef/ARCQuant/blob/main/kernels/src/bindings.cpp
+// X: [M, KQ], bf16
+// reorder_index: [KQ], int16
+// KE: int, residual dimension, grouped by 16 and interleaved with last KQ dimensions.
+// [KQ - KE, KQ_b0, KE_b0, KQ_b1, KE_b1, ...] KQ_bi and KE_bi have size 16.
+std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
+    at::Tensor const& X, at::Tensor const& reorder_index, int64_t KE)
+{
+    CHECK_TH_CUDA(X);
+    CHECK_CONTIGUOUS(X);
+    TORCH_CHECK(X.dtype() == at::ScalarType::BFloat16, "X must be a bf16 tensor");
+
+    int const M = X.size(0);
+    int const KQ = X.size(1);
+    int const K = KQ + KE;
+
+    auto QX = at::detail::empty_cuda({M, K / 2}, FLOAT4_E2M1X2, X.device(), std::nullopt);
+
+    bool isSfSwizzledLayout = true;
+    int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(M, K / 16)
+                                        : tensorrt_llm::computeLinearLayoutSFSize(M, K / 16);
+    auto SFX = at::detail::empty_cuda({SFSize}, SF_DTYPE, X.device(), std::nullopt);
+
+    auto ptr_X = X.data_ptr<int16_t>();
+    auto ptr_idx = reorder_index.data_ptr<int16_t>();
+    auto ptr_QX = QX.data_ptr<uint8_t>();
+    auto ptr_SFX = SFX.data_ptr<uint8_t>();
+    tensorrt_llm::kernels::run_reorder_activation_nvfp4<__nv_bfloat16, 16>(ptr_X, ptr_idx, ptr_QX, ptr_SFX, M, KQ, KE);
+    return std::make_tuple(QX, SFX);
+}
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -242,10 +274,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
         "isSfSwizzledLayout=True) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
+    m.def("fp4_quantize_with_reorder_residual(Tensor X, Tensor reorder_index, int KE) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_quantize", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize));
     m.impl("calculate_nvfp4_global_scale", TORCH_FN(tensorrt_llm::torch_ext::calculate_nvfp4_global_scale));
+    m.impl("fp4_quantize_with_reorder_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_reorder_residual));
 }
