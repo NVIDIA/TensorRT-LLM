@@ -532,8 +532,7 @@ class ConfigLoader:
         # Apply overrides based on field paths
         for (section, key), value_getter in field_mapping.items():
             if section in config:
-                new_value = value_getter()
-                config[section][key] = new_value
+                config[section][key] = value_getter()
         return config
 
     def _get_full_model_path(self, config: dict) -> str:
