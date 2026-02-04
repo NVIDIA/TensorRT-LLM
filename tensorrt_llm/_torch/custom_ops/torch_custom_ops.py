@@ -1525,10 +1525,12 @@ def fp8_swap_ab_gemm(
     # If tune_max_num_tokens is -1, set tune_max_num_tokens to None so that the autotuner will use curr_max_num_tokens.
     if tune_max_num_tokens > 0:
         fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
-        fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (DynamicTensorSpec(0, 0, deep_gemm_gen_tuning_buckets),)
+        fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (
+            DynamicTensorSpec(0, 0, deep_gemm_gen_tuning_buckets), )
     else:
         fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = None
-        fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (DynamicTensorSpec(0, 0, default_deep_gemm_gen_tuning_buckets),)
+        fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (
+            DynamicTensorSpec(0, 0, default_deep_gemm_gen_tuning_buckets), )
 
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
