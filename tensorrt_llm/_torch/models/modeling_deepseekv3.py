@@ -973,9 +973,7 @@ class Deepseekv3MoE(nn.Module):
         shared_model_config = model_config
         if shared_quant_config is not model_config.quant_config:
             shared_model_config = copy.copy(model_config)
-            shared_model_config._frozen = False
             shared_model_config.quant_config = shared_quant_config
-            shared_model_config._frozen = True
 
         # For shared experts, use the block size implied by their quant config.
         block_size = 1
