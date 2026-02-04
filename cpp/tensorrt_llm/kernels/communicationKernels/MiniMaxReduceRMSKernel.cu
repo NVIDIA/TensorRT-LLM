@@ -9,6 +9,9 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels::minimax_ar
 {
+namespace
+{ // anonymous namespace
+
 template <int NRanks>
 struct LamportComm
 {
@@ -144,25 +147,9 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
     int access_id = index_helper.access_id;
     int access_stride = index_helper.access_stride;
     int tot_access = index_helper.tot_access;
+    int tot_tokens = params.size / params.hidden_dim;
     float4 clear_vec = get_neg_zero();
     // FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
-
-    alignas(16) float vals[4];
-    float sum_variance = 0.F;
-    *reinterpret_cast<float4*>(vals) = reinterpret_cast<float4*>(params.allreduce_in)[access_id];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        if (is_neg_zero(vals[i]))
-        {
-            vals[i] = 0.F;
-        }
-        sum_variance += vals[i] * vals[i];
-    }
-    // step 1: reduce from single rank to get the variance sum
-    tensorrt_llm::common::blockReduceSumV2<float, 1>(&sum_variance);
-
-    // step 2: reduce from all ranks to get the variance sum
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -173,65 +160,190 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
 #endif
     LamportComm<NRanks> comm(params.workspace, params.rank);
     int clear_access = comm.clear_size / kElemsPerAccess<DType>;
-    // be careful, we only use float to load and store variance sum
-    // but we use float4 to load input tensor
-    // constexpr int StrideGap = kElemsPerAccess<float>;
-    // Push data to other ranks
-    for (int r = 0; r < NRanks; ++r)
+    for (int idx = access_id; idx < tot_access; idx += access_stride, token_id += token_stride)
     {
-        reinterpret_cast<float*>(comm.data_bufs[r])[params.rank * tot_access + access_id] = (sum_variance);
-    }
+        alignas(16) float vals[4];
+        float sum_variance = 0.F;
+        *reinterpret_cast<float4*>(vals) = reinterpret_cast<float4*>(params.allreduce_in)[access_id];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            if (is_neg_zero(vals[i]))
+            {
+                vals[i] = 0.F;
+            }
+            sum_variance += vals[i] * vals[i];
+        }
+        // step 1: reduce from single rank to get the variance sum
+        tensorrt_llm::common::blockReduceSumV2<float, 1>(&sum_variance);
 
+        // step 2: reduce from all ranks to get the variance sum
+        // be careful, we only use float to load and store variance sum
+        // but we use float4 to load input tensor
+        // constexpr int StrideGap = kElemsPerAccess<float>;
+        // Push data to other ranks
+        // we only need the first thread to push data to other ranks
+        if (threadIdx.x == 0)
+        {
+            for (int r = 0; r < NRanks; ++r)
+            {
+                // temp data buffer [nranks, total_tokens, 1]
+                reinterpret_cast<float*>(comm.data_bufs[r])[(params.rank * tot_tokens) + token_id] = (sum_variance);
+            }
+        }
+
+        // Load data from other ranks
+        bool done = false;
+        float vars_all_ranks[NRanks];
+        while (!done)
+        {
+            done = true;
+#pragma unroll
+            for (int r = 0; r < NRanks; ++r)
+            {
+                vars_all_ranks[r] = ld_global_volatile(
+                    &reinterpret_cast<float*>(comm.data_bufs[params.rank])[(r * tot_tokens) + token_id]);
+                done &= !is_neg_zero(vars_all_ranks[r]);
+            }
+        }
+        sum_variance = 0.F;
+#pragma unroll
+        for (int r = 0; r < NRanks; ++r)
+        {
+            sum_variance += vars_all_ranks[r];
+        }
+
+        // step 3: calculate the rms norm (input * rsqrt(variance + eps))
+
+        // load norm weight
+        // TODO: correct the access_id_in_token
+        __nv_bfloat16 norm_weight[4];
+        *reinterpret_cast<__nv_bfloat164*>(norm_weight)
+            = reinterpret_cast<__nv_bfloat164*>(params.rms_gamma)[access_id_in_token];
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            vals[i] = vals[i] * rsqrtf(sum_variance + params.rms_eps) * static_cast<float>(norm_weight[i]);
+        }
+
+        // step 4: store the rms norm
+        reinterpret_cast<float4*>(params.rms_norm_out)[access_id] = *reinterpret_cast<float4*>(vals);
+    }
     for (int idx = access_id; idx < clear_access; idx += access_stride)
     {
         // Clear comm buffer that previous kernel used
         reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
     }
-
-    // Load data from other ranks
-    bool done = false;
-    float4 vars_all_ranks[NRanks];
-    while (!done)
-    {
-        done = true;
-#pragma unroll
-        for (int r = 0; r < NRanks; ++r)
-        {
-            vars_all_ranks[r] = ld_global_volatile(
-                &reinterpret_cast<float*>(comm.data_bufs[r])[params.rank * tot_access + access_id]);
-            done &= !is_neg_zero(vars_all_ranks[r]);
-        }
-    }
-    sum_variance = 0.F;
-#pragma unroll
-    for (int r = 0; r < NRanks; ++r)
-    {
-        sum_variance += vars_all_ranks[r];
-    }
-
-    // step 3: calculate the rms norm (input * rsqrt(variance + eps))
-
-    // load norm weight
-    // TODO: correct the access_id_in_token
-    __nv_bfloat16 norm_weight = reinterpret_cast<__nv_bfloat16*>(params.rms_gamma)[access_id_in_token];
-
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        vals[i] = vals[i] * rsqrtf(sum_variance + params.rms_eps) * static_cast<float>(norm_weight);
-    }
-
-    // step 4: store the rms norm
-    reinterpret_cast<float4*>(params.rms_norm_out)[access_id] = *reinterpret_cast<float4*>(vals);
-
     comm.update(params.size * NRanks);
-
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (TriggerCompletionAtEnd)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
 #endif
+}
+
+int get_sm_count()
+{
+    static int sm_count = 0;
+    if (sm_count == 0)
+    {
+        int device_id;
+        TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
+        cudaDeviceProp device_prop;
+        cudaGetDeviceProperties(&device_prop, device_id);
+        sm_count = device_prop.multiProcessorCount;
+    }
+    return sm_count;
+}
+
+template <typename DType, int NRanks>
+void minimax_reduce_rms_kernel_launcher(MiniMaxReduceRMSParams const& params)
+{
+    TLLM_CHECK(params.size % params.hidden_dim == 0);
+    TLLM_CHECK(params.hidden_dim % kElemsPerAccess<DType> == 0);
+    static int SM = tensorrt_llm::common::getSMVersion();
+    int token_num = params.size / params.hidden_dim;
+    // for current problem size, we only need one cluster
+    int sm_count = get_sm_count();
+    int cluster_size = 1;
+    int cluster_num = token_num;
+    int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
+    int block_size = threads_per_token;
+    int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
+
+    cudaLaunchConfig_t cfg;
+    cfg.gridDim = grid_size;
+    cfg.blockDim = block_size;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = params.stream;
+
+    cudaLaunchAttribute attribute[2];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attribute[1].id = cudaLaunchAttributeClusterDimension;
+    attribute[1].val.clusterDim.x = cluster_size;
+    attribute[1].val.clusterDim.y = 1;
+    attribute[1].val.clusterDim.z = 1;
+    cfg.attrs = attribute;
+    cfg.numAttrs = SM >= 90 ? 2 : 0;
+
+    bool trigger_completion_at_end = params.trigger_completion_at_end;
+    if (trigger_completion_at_end)
+    {
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport<DType, NRanks, true>, params));
+    }
+    else
+    {
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport<DType, NRanks, false>, params));
+    }
+}
+
+template <int NRanks>
+void dispatch_dtype(MiniMaxReduceRMSParams const& params)
+{
+    if (params.dtype == nvinfer1::DataType::kHALF)
+    {
+        minimax_reduce_rms_kernel_launcher<half, NRanks>(params);
+    }
+    else if (params.dtype == nvinfer1::DataType::kBF16)
+    {
+        minimax_reduce_rms_kernel_launcher<__nv_bfloat16, NRanks>(params);
+    }
+    else if (params.dtype == nvinfer1::DataType::kFLOAT)
+    {
+        minimax_reduce_rms_kernel_launcher<float, NRanks>(params);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "Unsupported data type for minimax_reduce_rms_op");
+    }
+}
+} // namespace
+
+void minimax_reduce_rms_op(MiniMaxReduceRMSParams const& params)
+{
+    if (params.nranks == 2)
+    {
+        dispatch_dtype<2>(params);
+    }
+    else if (params.nranks == 4)
+    {
+        dispatch_dtype<4>(params);
+    }
+    else if (params.nranks == 8)
+    {
+        dispatch_dtype<8>(params);
+    }
+    else if (params.nranks == 16)
+    {
+        dispatch_dtype<16>(params);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "minimax_reduce_rms_op: unsupported ranks number!");
+    }
 }
 
 } // namespace kernels::minimax_ar

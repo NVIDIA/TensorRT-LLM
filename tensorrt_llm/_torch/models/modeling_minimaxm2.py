@@ -139,6 +139,7 @@ class MiniMaxRMSNorm(nn.Module):
         self.weight.copy_(weights[0]["weight"][slice_start:slice_end].to(self.weight.dtype))
 
     def forward(self, hidden_states: torch.Tensor):
+        """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
 
@@ -147,7 +148,19 @@ class MiniMaxRMSNorm(nn.Module):
 
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         hidden_states = self.weight * hidden_states.to(input_dtype)
-        return hidden_states
+        """
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        rms_norm_out = torch.ops.trtllm.minimax_allreduce_rms(
+            hidden_states,
+            self.weight,
+            self.workspace,
+            self.mapping.tp_rank,
+            self.mapping.tp_size,
+            self.eps,
+            False,
+        )
+        return rms_norm_out.to(input_dtype)
 
 
 # It's a little bit tricky to implement special qk norm

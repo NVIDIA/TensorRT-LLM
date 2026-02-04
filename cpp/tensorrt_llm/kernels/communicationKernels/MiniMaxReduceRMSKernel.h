@@ -49,12 +49,11 @@ struct MiniMaxReduceRMSParams
     void* rms_norm_out{};
     void* rms_gamma{};
     float rms_eps{};
-    float* scale_factor{};
     cudaStream_t stream{};
     bool trigger_completion_at_end = true;
 };
 
-void allreduce_fusion_op(AllReduceFusionParams const& params);
+void minimax_reduce_rms_op(MiniMaxReduceRMSParams const& params);
 
 } // namespace kernels::minimax_ar
 

@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/kernels/communicationKernels/MiniMaxReduceRMSKernel.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
@@ -1823,6 +1824,32 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     return {output, residualOut};
 }
 
+torch::Tensor minimax_allreduce_rms(torch::Tensor const& input, torch::Tensor const& norm_weight,
+    torch::Tensor workspace, int64_t const rank, int64_t const nranks, double const eps,
+    bool const trigger_completion_at_end_)
+{
+    auto allreduce_params = tensorrt_llm::kernels::minimax_ar::MiniMaxReduceRMSParams();
+
+    allreduce_params.nranks = static_cast<int>(nranks);
+    allreduce_params.rank = static_cast<int>(rank);
+    allreduce_params.dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    allreduce_params.size = static_cast<int>(input.numel());
+    allreduce_params.hidden_dim = static_cast<int>(input.size(-1));
+    allreduce_params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
+    allreduce_params.allreduce_in = input.data_ptr();
+    // allreduce_params.rms_norm_out = nullptr;
+    allreduce_params.rms_gamma = norm_weight.data_ptr();
+    allreduce_params.rms_eps = static_cast<float>(eps);
+    allreduce_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+    torch::Tensor rms_norm_out = torch::empty_like(input);
+    allreduce_params.rms_norm_out = rms_norm_out.mutable_data_ptr();
+
+    tensorrt_llm::kernels::minimax_ar::minimax_reduce_rms_op(allreduce_params);
+
+    return rms_norm_out;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -1887,6 +1914,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
+    m.def(
+        "minimax_allreduce_rms("
+        "Tensor input,"
+        "Tensor norm_weight,"
+        "Tensor workspace,"
+        "int rank,"
+        "int nranks,"
+        "float eps,"
+        "bool trigger_completion_at_end) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -1897,6 +1933,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
+    m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)
