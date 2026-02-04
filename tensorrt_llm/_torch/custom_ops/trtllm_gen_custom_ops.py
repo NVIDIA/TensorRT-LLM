@@ -27,6 +27,7 @@ def prepare_dummy_topk_and_hook(
     n_group: Optional[int],
     topk_group: Optional[int],
     routed_scaling_factor: Optional[float],
+    local_num_experts: Optional[int] = None,
     hidden_states_index: int = 2,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, TuningConfig]:
     """
@@ -85,8 +86,11 @@ def prepare_dummy_topk_and_hook(
             'is_fused':
             False,  # fuse_routing_kernel
             'callable_e_score_correction_bias':
-            lambda: torch.randn(
-                num_experts, dtype=torch.bfloat16, device=hidden_states.device)
+            (lambda: torch.ones(
+                num_experts, dtype=torch.bfloat16, device=hidden_states.device))
+            if local_num_experts == num_experts else
+            (lambda: torch.randn(
+                num_experts, dtype=torch.bfloat16, device=hidden_states.device))
         })
     routing_method = ROUTING_METHOD_TYPE_TO_CLASS[routing_method_type](
         top_k=top_k, **routing_cls_kwargs)
@@ -405,6 +409,7 @@ def fp4_block_scale_moe_runner(
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
+            local_num_experts=local_num_experts,
             hidden_states_index=2,
         )
 
@@ -724,6 +729,7 @@ def fp8_block_scale_moe_runner(
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
+            local_num_experts=local_num_experts,
             hidden_states_index=2,
         )
 
@@ -1034,6 +1040,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
+            local_num_experts=local_num_experts,
             hidden_states_index=2,
         )
 
@@ -1306,6 +1313,7 @@ def e4m3_mxe2m1_block_scale_moe_runner(
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
+            local_num_experts=local_num_experts,
             hidden_states_index=2,
         )
 
@@ -1572,6 +1580,7 @@ def bf16_mxe2m1_block_scale_moe_runner(
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
+            local_num_experts=local_num_experts,
             hidden_states_index=2,
         )
 
@@ -1826,6 +1835,7 @@ def fp8_fp4_block_scale_moe_runner(
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
+            local_num_experts=local_num_experts,
             hidden_states_index=2,
         )
 
