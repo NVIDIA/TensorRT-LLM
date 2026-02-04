@@ -1455,7 +1455,7 @@ def deep_gemm_gen_tuning_buckets(x: int):
     return buckets
 
 
-def default_deep_gemm_tuning_buckets(x: int):
+def default_deep_gemm_gen_tuning_buckets(x: int):
     buckets = tuple(range(8, 128, 8))
     # Clamp x to be between 4096 and 8192.
     x = min(x, 8192)
@@ -1528,7 +1528,7 @@ def fp8_swap_ab_gemm(
         fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (DynamicTensorSpec(0, 0, deep_gemm_gen_tuning_buckets),)
     else:
         fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = None
-        fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (DynamicTensorSpec(0, 0, default_deep_gemm_tuning_buckets),)
+        fp8SwapABGemmRunner.tuning_config.dynamic_tensor_specs = (DynamicTensorSpec(0, 0, default_deep_gemm_gen_tuning_buckets),)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
