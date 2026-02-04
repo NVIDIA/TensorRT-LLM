@@ -1,7 +1,7 @@
 import concurrent
 import uuid
 from itertools import chain
-from typing import List
+from typing import Any, Dict, List
 
 import torch
 
@@ -277,6 +277,12 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         raise NotImplementedError("cancel_request is not implemented")
         # self.transfer_worker.cancel_request(req)
 
+    def get_disaggregated_params(self) -> Dict[str, Any]:
+        raise NotImplementedError("get_disaggregated_params is not implemented")
+
+    def prepare_context_requests(self, requests: List[LlmRequest]):
+        raise NotImplementedError("prepare_context_requests is not implemented")
+
     def _check_compatible(self):
         if self.mapping.cp_size != 1:
             raise ValueError(
@@ -288,8 +294,5 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             raise ValueError("PyNativeCacheTransceiver: _check_compatible: VSWA is not supported")
         return
 
-    def prepare_context_request(self, requests: List[LlmRequest]):
-        raise NotImplementedError
-
     def get_context_state(self):
-        raise NotImplementedError
+        raise NotImplementedError("get_context_state is not implemented")
