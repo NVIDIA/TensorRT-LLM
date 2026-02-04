@@ -269,16 +269,30 @@ __global__ void routingMainKernel(KernelParams params)
             auto finalScore = OutputT{scoreNorm * params.mRouteScale / redNorm};
 
             // write expert idx out already
-            auto idxTopK = blockIdx.x * params.mTopK + laneIdx;
+            auto idxTopK = blockIdx.x * params.mTotalExpertsPerToken + laneIdx;
+            auto idxShared = blockIdx.x * params.mTotalExpertsPerToken + params.mTopK + laneIdx;
             if (laneIdx < params.mTopK && params.mPtrTopKPacked != nullptr)
             {
                 PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(finalScore), static_cast<int16_t>(expertIdx)};
                 params.mPtrTopKPacked[idxTopK] = packedScore;
             }
 
+            if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKPacked != nullptr)
+            {
+                PackedScoreIdx<OutputT> packedScore{
+                    static_cast<OutputT>(1.0F), static_cast<int16_t>(params.mNumExperts + laneIdx)};
+                params.mPtrTopKPacked[idxShared] = packedScore;
+            }
+
             if (laneIdx < params.mTopK && params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr)
             {
                 params.mPtrTopKWeights[idxTopK] = finalScore;
+            }
+
+            // Write score of 1.0 for shared expert if enabled
+            if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKWeights != nullptr)
+            {
+                params.mPtrTopKWeights[idxShared] = static_cast<OutputT>(1.0F);
             }
         }
     }
@@ -629,9 +643,15 @@ void run(Data& data, void* stream)
             "If permuted index is required, `mPtrTopKPacked` or `mPtrTopKIds` is also required");
     TLLM_CHECK_WITH_INFO(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
     int const numBlocks = data.mNumTokens;
-    int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
+    int const numExperts = data.mNumExperts + data.mNumFusedSharedExperts;
+    int const topK = data.mTopK + data.mNumFusedSharedExperts;
+    int const numThreadsHist = getMaxNumExperts(numExperts);
+    int const maxNumTopExperts = getMaxNumExperts(numExperts);
 
-    bool const useSingleCluster = data.mNumTokens <= 1024;
+    // Number of threads in the cluster.
+    int numThreadsPerCluster = numThreadsHist * NumBlocksPerCluster;
+
+    bool const useSingleCluster = data.mNumTokens <= 1024 && data.mNumTokens * topK <= numThreadsPerCluster;
     if (!useSingleCluster)
     {
         // Reset the global histograms (not used in single-cluster code path).
@@ -658,15 +678,15 @@ void run(Data& data, void* stream)
     int const numBlocksCoop = smCount - 8;
 
     // Maximum number of tokens supported by the kernel using a cooperative launch.
-    int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
+    int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / topK;
     if (data.mPtrTopKIds == nullptr)
     {
         TLLM_CHECK_WITH_INFO(data.mNumExperts >= MaxSupportedTopExperts,
             "Routing kernel expects %d to be at most #experts %d", MaxSupportedTopExperts, data.mNumExperts);
         TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExpertCount,
             "Routing kernel expects #experts %d  <= #threads %d", data.mNumExperts, MaxSupportedExpertCount);
-        TLLM_CHECK_WITH_INFO(data.mTopK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= %d, got %d",
-            MaxSupportedTopExperts, data.mTopK);
+        TLLM_CHECK_WITH_INFO(topK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= %d, got %d",
+            MaxSupportedTopExperts, topK);
 
         // Routing needs to be executed - validate routing kernel constraints
         if (data.mNumExpertGroups > 1)
@@ -690,6 +710,16 @@ void run(Data& data, void* stream)
                 data.mNumExpertGroups);
             TLLM_CHECK_WITH_INFO(data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.",
                 data.mNumExperts);
+
+            TLLM_CHECK_WITH_INFO(data.mNumFusedSharedExperts <= WarpSize,
+                "Number of fused shared experts (%d must be less than warp size.", WarpSize);
+
+            if (data.mNumFusedSharedExperts > 0)
+            {
+                // Disabling due to lack of testing
+                // TLLM_CHECK_WITH_INFO(
+                //     data.mPtrTopKPacked == nullptr, "Shared expert fusion is not compatible with packed scores");
+            }
         }
 
         int const numThreadsMain = max(data.mNumExpertGroups * WarpSize, getMaxNumExperts(data.mNumExperts));
@@ -705,6 +735,14 @@ void run(Data& data, void* stream)
             numThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/false);
+    }
+
+    if (data.mNumFusedSharedExperts > 0)
+    {
+        data.mNumExperts += data.mNumFusedSharedExperts;
+        data.mTopK += data.mNumFusedSharedExperts;
+        data.mNumLocalExperts += data.mNumFusedSharedExperts;
+        // data.mLocalExpertsStartIdx += data.mNumFusedSharedExperts;
     }
 
     if (data.mPtrPermutedIdxSize != nullptr)
@@ -725,7 +763,7 @@ void run(Data& data, void* stream)
         }
         else
         {
-            const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
+            const int32_t expandedIdxSize = data.mNumTokens * topK;
             const int32_t histogramEltsPerBlock = 8 * numThreadsHist;
             const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
 
