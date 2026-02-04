@@ -565,6 +565,11 @@ FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType,
     {
         sm = kSM_120;
     }
+    // SM103 uses SM100 FMHA v2 kernels (similar to how SM121 uses SM120 kernels)
+    if (sm == kSM_103)
+    {
+        sm = kSM_100;
+    }
     return FusedMHAKernelFactoryV2::Get().getXMMAKernels(
         sMhaKernelMetaInfosV2, sMhaKernelMetaInfosV2Size, inputType, outputType, sm);
 }
