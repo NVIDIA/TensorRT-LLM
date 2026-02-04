@@ -68,10 +68,10 @@ class EnvManager:
     @staticmethod
     def get_slurm_job_name() -> str:
         """Get SLURM job name based on GPU type configuration.
-        
+
         Format: {prefix}-{base} or just {base} if no prefix.
         Example: coreai_comparch_trtllm-unified.benchmark
-        
+
         Customize via SLURM_JOB_BASE_NAME env var (default: unified.benchmark)
         """
         gpu_type = EnvManager.get_gpu_type()
