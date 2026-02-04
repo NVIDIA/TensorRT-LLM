@@ -7,8 +7,8 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, SessionStatus
-from tensorrt_llm._torch.disaggregation.native.kv_transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
