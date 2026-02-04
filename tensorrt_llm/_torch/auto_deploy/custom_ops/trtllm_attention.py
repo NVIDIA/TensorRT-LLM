@@ -250,57 +250,28 @@ class TrtllmLayerState:
     interleaved_kv_cache: torch.Tensor = field(default=None)
 
     def __post_init__(self):
-        """Allocate pre-sized tensors."""
-        if self.sequence_length is None:
-            device = "cuda"
-
-            # Device tensors
-            self.sequence_length = torch.zeros(
-                self.max_num_requests, dtype=torch.int32, device=device
-            )
-            self.context_lengths = torch.zeros(
-                self.max_num_requests, dtype=torch.int32, device=device
-            )
-
-            # Pre-allocate kv_cache_block_offsets with MAX size for CUDA graph stability
-            max_blocks_per_seq = (
-                self.max_context_length + self.tokens_per_block - 1
-            ) // self.tokens_per_block
-            self.kv_cache_block_offsets = torch.zeros(
-                1,  # num_pools
-                self.max_num_requests,
-                2,  # K and V
-                max_blocks_per_seq,
-                dtype=torch.int32,
-                device=device,
-            )
-
-            # Host tensors (pinned memory for async transfers)
-            self.host_past_key_value_lengths = torch.zeros(
-                self.max_num_requests, dtype=torch.int32, device="cpu", pin_memory=True
-            )
-            self.host_context_lengths = torch.zeros(
-                self.max_num_requests, dtype=torch.int32, device="cpu", pin_memory=True
-            )
-            self.host_request_types = torch.zeros(
-                self.max_num_requests, dtype=torch.int32, device="cpu", pin_memory=True
-            )
-            self.host_total_kv_lens = torch.zeros(
-                2, dtype=torch.int64, device="cpu", pin_memory=True
-            )
-            # Pool pointers: [num_pools, 2] where each row is [k_cache_ptr, v_cache_ptr]
-            # thop.attention expects 2D tensor: [num_pools, 2]
-            self.host_kv_cache_pool_pointers = torch.zeros(
-                1, 2, dtype=torch.int64, device="cpu", pin_memory=True
-            )
+        """Initialize tensors - use shared tensors from global state where possible."""
+        # Only host_kv_cache_pool_mapping is layer-specific
+        # All other tensors are shared across layers (single KV pool)
+        if self.host_kv_cache_pool_mapping is None:
             # Pool mapping: 2D [num_layers, 2] format expected by thop.attention
-            # pool_mapping[layer, 0] = pool_idx (0 for single pool)
-            # pool_mapping[layer, 1] = layer_offset (0 when using per-layer pointers)
-            # Use max 256 layers to cover most models
+            # This is the ONLY per-layer tensor since it has layer-specific offsets
             max_layers = 256
             self.host_kv_cache_pool_mapping = torch.zeros(
                 max_layers, 2, dtype=torch.int32, device="cpu", pin_memory=True
             )
+
+    def init_from_shared(self, global_state: "TrtllmAttentionGlobalState") -> None:
+        """Initialize layer to use shared tensors from global state."""
+        # All layers share the same tensors (single KV cache pool)
+        self.sequence_length = global_state._shared_sequence_length
+        self.context_lengths = global_state._shared_context_lengths
+        self.kv_cache_block_offsets = global_state._shared_kv_cache_block_offsets
+        self.host_past_key_value_lengths = global_state._shared_host_past_key_value_lengths
+        self.host_context_lengths = global_state._shared_host_context_lengths
+        self.host_request_types = global_state._shared_host_request_types
+        self.host_total_kv_lens = global_state._shared_host_total_kv_lens
+        self.host_kv_cache_pool_pointers = global_state._shared_host_kv_cache_pool_pointers
 
 
 class TrtllmAttentionGlobalState:
@@ -321,7 +292,57 @@ class TrtllmAttentionGlobalState:
             cls._instance._gpu_seq_idx: Optional[torch.Tensor] = None
             cls._instance._gpu_page_idx: Optional[torch.Tensor] = None
             cls._instance._gpu_base_offset: Optional[torch.Tensor] = None
+            # SHARED tensors across all layers (since KVCacheManager uses single pool)
+            cls._instance._shared_tensors_initialized: bool = False
+            cls._instance._shared_sequence_length: Optional[torch.Tensor] = None
+            cls._instance._shared_context_lengths: Optional[torch.Tensor] = None
+            cls._instance._shared_kv_cache_block_offsets: Optional[torch.Tensor] = None
+            cls._instance._shared_host_past_key_value_lengths: Optional[torch.Tensor] = None
+            cls._instance._shared_host_context_lengths: Optional[torch.Tensor] = None
+            cls._instance._shared_host_request_types: Optional[torch.Tensor] = None
+            cls._instance._shared_host_total_kv_lens: Optional[torch.Tensor] = None
+            cls._instance._shared_host_kv_cache_pool_pointers: Optional[torch.Tensor] = None
         return cls._instance
+
+    def _init_shared_tensors(
+        self, max_num_requests: int, max_context_length: int, tokens_per_block: int
+    ) -> None:
+        """Initialize shared tensors used by all layers."""
+        if self._shared_tensors_initialized:
+            return
+
+        device = "cuda"
+        max_blocks_per_seq = (max_context_length + tokens_per_block - 1) // tokens_per_block
+
+        # Shared device tensors
+        self._shared_sequence_length = torch.zeros(
+            max_num_requests, dtype=torch.int32, device=device
+        )
+        self._shared_context_lengths = torch.zeros(
+            max_num_requests, dtype=torch.int32, device=device
+        )
+        self._shared_kv_cache_block_offsets = torch.zeros(
+            1, max_num_requests, 2, max_blocks_per_seq, dtype=torch.int32, device=device
+        )
+
+        # Shared host tensors (pinned memory)
+        self._shared_host_past_key_value_lengths = torch.zeros(
+            max_num_requests, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._shared_host_context_lengths = torch.zeros(
+            max_num_requests, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._shared_host_request_types = torch.zeros(
+            max_num_requests, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._shared_host_total_kv_lens = torch.zeros(
+            2, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._shared_host_kv_cache_pool_pointers = torch.zeros(
+            1, 2, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+
+        self._shared_tensors_initialized = True
 
     def _init_gpu_buffers(self, max_pages: int, max_seqs: int) -> None:
         """Initialize pre-allocated GPU buffers for vectorized operations."""
@@ -348,8 +369,12 @@ class TrtllmAttentionGlobalState:
         num_layers: int = 0,
     ) -> TrtllmLayerState:
         """Get or create per-layer state."""
+        # Initialize shared tensors once (used by all layers)
+        if not self._shared_tensors_initialized:
+            self._init_shared_tensors(max_num_requests, max_context_length, tokens_per_block)
+
         if layer_idx not in self._layer_states:
-            self._layer_states[layer_idx] = TrtllmLayerState(
+            state = TrtllmLayerState(
                 layer_idx=layer_idx,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
@@ -359,6 +384,9 @@ class TrtllmAttentionGlobalState:
                 max_context_length=max_context_length,
                 num_layers=num_layers,
             )
+            # Link layer to shared tensors
+            state.init_from_shared(self)
+            self._layer_states[layer_idx] = state
         return self._layer_states[layer_idx]
 
     def init_workspace(self, buffer: torch.Tensor) -> None:
@@ -439,8 +467,7 @@ class TrtllmAttentionGlobalState:
                 )
                 global_state._init_gpu_buffers(max_pages, first_state.max_num_requests)
 
-            # Compute block offsets ONCE on first layer's tensor, then copy to others
-            first_block_offsets = None
+            # Compute block offsets using vectorized GPU operations
             seq_indices = None
             page_in_seq = None
             base_offsets = None
@@ -479,39 +506,32 @@ class TrtllmAttentionGlobalState:
                 )
                 base_offsets = global_state._gpu_base_offset[:total_pages]
 
-            # Update first layer state and compute block offsets
-            states_list = list(layer_states.values())
-            for i, state in enumerate(states_list):
-                if state.sequence_length is None:
-                    continue
+            # All layers share the same tensors (single KV cache pool), update ONCE
+            # Fill shared device tensors
+            global_state._shared_sequence_length[:num_seq].copy_(seq_len_gpu, non_blocking=True)
+            global_state._shared_context_lengths[:num_seq].copy_(
+                input_seq_lens_gpu, non_blocking=True
+            )
 
-                # Fill device tensors (non-blocking) - all layers get same values
-                state.sequence_length[:num_seq].copy_(seq_len_gpu, non_blocking=True)
-                state.context_lengths[:num_seq].copy_(input_seq_lens_gpu, non_blocking=True)
+            # Fill shared host tensors
+            global_state._shared_host_past_key_value_lengths[:num_seq].copy_(past_kv_lens)
+            global_state._shared_host_context_lengths[:num_seq].copy_(input_seq_lens)
+            if num_prefill > 0:
+                global_state._shared_host_request_types[:num_prefill].fill_(0)
+            if num_decode > 0:
+                global_state._shared_host_request_types[num_prefill:num_seq].fill_(1)
+            global_state._shared_host_total_kv_lens[0] = context_total_kv
+            global_state._shared_host_total_kv_lens[1] = gen_total_kv
 
-                # Fill host tensors - all layers get same values
-                state.host_past_key_value_lengths[:num_seq].copy_(past_kv_lens)
-                state.host_context_lengths[:num_seq].copy_(input_seq_lens)
-                if num_prefill > 0:
-                    state.host_request_types[:num_prefill].fill_(0)
-                if num_decode > 0:
-                    state.host_request_types[num_prefill:num_seq].fill_(1)
-                state.host_total_kv_lens[0] = context_total_kv
-                state.host_total_kv_lens[1] = gen_total_kv
-
-                # Block offsets - compute once, copy to rest
-                if total_pages > 0 and seq_indices is not None:
-                    if first_block_offsets is None:
-                        # First layer: compute block offsets
-                        state.kv_cache_block_offsets.zero_()
-                        state.kv_cache_block_offsets[0, seq_indices, 0, page_in_seq] = base_offsets
-                        state.kv_cache_block_offsets[0, seq_indices, 1, page_in_seq] = (
-                            base_offsets + 1
-                        )
-                        first_block_offsets = state.kv_cache_block_offsets
-                    else:
-                        # Other layers: copy from first (much faster than recomputing)
-                        state.kv_cache_block_offsets.copy_(first_block_offsets, non_blocking=True)
+            # Fill shared block offsets
+            if total_pages > 0 and seq_indices is not None:
+                global_state._shared_kv_cache_block_offsets.zero_()
+                global_state._shared_kv_cache_block_offsets[0, seq_indices, 0, page_in_seq] = (
+                    base_offsets
+                )
+                global_state._shared_kv_cache_block_offsets[0, seq_indices, 1, page_in_seq] = (
+                    base_offsets + 1
+                )
 
         return _host_prepare_trtllm_metadata
 
