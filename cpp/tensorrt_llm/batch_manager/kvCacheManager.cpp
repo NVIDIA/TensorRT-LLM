@@ -1722,9 +1722,9 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
                 ? tk::KVCacheIndex::nullIndex
                 : tk::KVCacheIndex{common::flat_index3(
                     block->getMemoryPoolBlockIndex(), layerIdx, fieldIdx, pool.numLayers, mKVFactor)};
-            TLLM_LOG_DEBUG(
-                "setOffsets: offsetIndex=%d, block->getMemoryPoolBlockIndex()=%d, fieldIdx=%d, blockIndex=%d",
-                offsetIndex, block->getMemoryPoolBlockIndex(), fieldIdx, blockIndex.get());
+            // TLLM_LOG_DEBUG(
+            //     "setOffsets: offsetIndex=%d, block->getMemoryPoolBlockIndex()=%d, fieldIdx=%d, blockIndex=%d",
+            //     offsetIndex, block->getMemoryPoolBlockIndex(), fieldIdx, blockIndex.get());
             offsetsPtr[offsetIndex] = blockIndex;
         }
     }
@@ -1856,15 +1856,15 @@ std::shared_ptr<KVCacheBlock> BlockManager::findBlocksInReuseTreeByBlockKey(
 SizeType32 WindowBlockManager::loadOrAllocateBlocks(
     std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>> const& matchedBlocks,
     SizeType32 numContextBlocks, GenerationRequest& sequence, LlmRequest& llmRequest,
-    std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions, executor::KvCacheTransferMode mode,
-    std::string const& directory)
+    std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions, bool shareLastContextBlockAmongBeams,
+    executor::KvCacheTransferMode mode, std::string const& directory)
 {
     SizeType32 numMatchedTokens{0};
 
     // The last block cannot be shared between beams because it will be written to.
     // Make sure a unique block is allocated per beam.
     auto const beamWidth = sequence.getBeamWidth();
-    SizeType32 numSharedContextBlocks = beamWidth > 1 ? numContextBlocks - 1 : numContextBlocks;
+    SizeType32 numSharedContextBlocks = shareLastContextBlockAmongBeams ? numContextBlocks : numContextBlocks - 1;
 
     // Claim all reusable blocks to prevent them from accidentally being overwritten by offloading/onboarding logic
     for (auto& [partialMatch, numMatched, matchingBlock, matchingNode] : matchedBlocks)
@@ -2124,8 +2124,9 @@ void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 inp
 
     TLLM_CHECK(perBlockRetentions.size() == (size_t) numContextBlocks);
 
-    auto const prepopulatedPromptLen = loadOrAllocateBlocks(
-        matchedBlocks, numContextBlocks, sequence, llmRequest, perBlockRetentions, mode, directory);
+    auto const prepopulatedPromptLen
+        = loadOrAllocateBlocks(matchedBlocks, numContextBlocks, sequence, llmRequest, perBlockRetentions,
+            /*shareLastContextBlockAmongBeams=*/inputLength % mTokensPerBlock == 0, mode, directory);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
 
@@ -2398,8 +2399,40 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
     }
 
     // It points to the next token to be processed/generated
-    auto currentPosition = request.isContextFinished() ? request.getNumTokens(0) : request.getContextCurrentPosition();
-    TLLM_CHECK(currentPosition % mTokensPerBlock == 0);
+    auto currentPosition
+        = request.isContextFinished() ? (request.getNumTokens(0) - 1) : request.getContextCurrentPosition();
+    TLLM_LOG_DEBUG("%s::copyLinearAttentionBlock - Request %lu, currentPosition %d", mLogPrefix.c_str(), requestId,
+        currentPosition);
+    // TLLM_CHECK(currentPosition % mTokensPerBlock == 0);
+    // copy only happens in context phase or the first token of decoding phase (only when promptLen % tokensPerBlock ==
+    // 0)
+    if (currentPosition % mTokensPerBlock != 0 || currentPosition > request.getPromptLen() || currentPosition == 0)
+    {
+        return;
+    }
+
+    // edge case: promptLen % tokensPerBlock == 0, and this is the first token of decoding phase
+    if (currentPosition == request.getPromptLen())
+    {
+        if (sequence.getBeamWidth() == 1)
+        {
+            // the block of beam0 is inherited from context phase, no need to copy
+            return;
+        }
+        // copy beam 0 to other beams
+        auto beam0Block = getBlockById(sequence.getCacheBlockIds(mWindowSize).at(0).back());
+        for (auto beamIdx = 1; beamIdx < sequence.getBeamWidth(); ++beamIdx)
+        {
+            auto beamBlockId = sequence.getCacheBlockIds(mWindowSize).at(beamIdx).back();
+            auto beamBlock = getBlockById(beamBlockId);
+            mTransferManager->onboard(beam0Block, beamBlock, mPools,
+                mTokensPerBlock, // Size of each current state block is fixed. Passing TokensPerBlock to tell the
+                                 // transfer manager to copy the entire block.
+                sequence.getTransferMode(), sequence.getDirectory());
+        }
+        return;
+    }
+
     auto prevBlockIndex = currentPosition / mTokensPerBlock - 1;
     std::set<std::pair<KVCacheBlock::IdType, KVCacheBlock::IdType>> onboardedBlocks;
     for (auto beamIdx = 0; beamIdx < sequence.getBeamWidth(); ++beamIdx)

@@ -1257,7 +1257,8 @@ private:
         std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>> const& matchedBlocks,
         SizeType32 numContextBlocks, GenerationRequest& sequence, LlmRequest& llmRequest,
         std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
-        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
+        bool shareLastContextBlockAmongBeams, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
+        std::string const& directory = "");
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
