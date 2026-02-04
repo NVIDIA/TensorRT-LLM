@@ -762,18 +762,11 @@ class CachedSequenceInterface:
         self._clear_caches()
 
     def _try_resize_pt_cache_backend(self, new_num_pages: int) -> bool:
-        """Try to resize using PTCacheBackend if available.
+        """Try to resize cache.
 
-        Returns True if PTCacheBackend handled the resize, False otherwise.
+        Returns True if resize was handled, False otherwise.
         """
-        try:
-            from ..custom_ops.trtllm_attention import get_pt_cache_backend
-
-            pt_backend = get_pt_cache_backend()
-            if pt_backend is not None:
-                return pt_backend.resize(new_num_pages)
-        except ImportError:
-            pass
+        # Cache resizing is handled by KVCacheManager
         return False
 
     def _regenerate_cache_views(self):

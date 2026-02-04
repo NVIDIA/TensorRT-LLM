@@ -34,13 +34,6 @@ This implementation bridges the gap by:
 1. Converting AD's metadata to TRT-LLM's format
 2. Using AD's separate K/V caches with TRT-LLM's paged context FMHA
 3. Managing per-layer state through global state dictionary
-
-Cache Backend Options:
----------------------
-- SimpleCacheBackend (default): Per-layer cache allocation, Python metadata prep
-- PTCacheBackend: Unified pool via PT's KVCacheManager, C++ fast path for metadata
-
-Set `use_pt_cache_backend=True` in TrtllmAttentionConfig to use PTCacheBackend.
 """
 
 from dataclasses import dataclass, field
@@ -72,18 +65,6 @@ from .attention_interface import (
     SequenceInfo,
 )
 
-# Import cache backends
-
-# PTCacheBackend is optional - only import if available
-try:
-    from .pt_cache_backend import PTCacheBackend, PTCacheConfig
-
-    _HAS_PT_CACHE_BACKEND = True
-except ImportError:
-    _HAS_PT_CACHE_BACKEND = False
-    PTCacheBackend = None
-    PTCacheConfig = None
-
 
 class TrtllmWorkspaceResourceHandler(ResourceHandler):
     """Resource handler for TRT-LLM workspace buffer.
@@ -101,7 +82,6 @@ class TrtllmWorkspaceResourceHandler(ResourceHandler):
         # Allocate new workspace
         buffer = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=sequence_info.device)
         _global_state.init_workspace(buffer)
-        ad_logger.debug(f"[TRT-LLM] Initialized workspace: {buffer.shape}, device={buffer.device}")
         return buffer
 
 
@@ -113,7 +93,6 @@ class TrtllmKVResourceHandler(KVPagedResourceHandler):
 
     Uses kv_factor=2 (unified K+V) and kv_layout="HND" to match what thop.attention expects.
     When __eq__ returns True, KVCacheManager manages the cache and we use AD's pool directly.
-    When use_pt_cache_backend=True, PTCacheBackend creates its own separate cache management.
     """
 
     def __init__(
@@ -141,15 +120,9 @@ class TrtllmKVResourceHandler(KVPagedResourceHandler):
     def __eq__(self, other: "KVPagedResourceHandler") -> bool:
         """Check compatibility for KVCacheManager resource grouping.
 
-        When use_pt_cache_backend=True, return False to use PTCacheBackend's separate management.
-        When use_pt_cache_backend=False, return True so KVCacheManager manages all layers'
-        KV caches with correct num_blocks calculation and we use AD's pool directly.
+        Return True so KVCacheManager manages all layers' KV caches with correct
+        num_blocks calculation and we use AD's pool directly.
         """
-        # When PTCacheBackend is enabled, don't let KVCacheManager manage this
-        if self._trtllm_config.use_pt_cache_backend:
-            return False
-
-        # For direct AD pool integration, match compatible handlers
         if not isinstance(other, KVPagedResourceHandler):
             return False
         return (
@@ -160,13 +133,12 @@ class TrtllmKVResourceHandler(KVPagedResourceHandler):
         )
 
     def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
-        """Allocate cache - either via PTCacheBackend, KVCacheManager, or simple allocation."""
+        """Allocate cache via KVCacheManager or simple allocation."""
         # Configure global state first (first time only)
         if not self._trtllm_config.is_configured:
             self._trtllm_config.configure(sequence_info)
 
-        # Set model config for FP8 KV cache support (first time only, regardless of backend)
-        # This must be done for BOTH PTCacheBackend and direct AD pool paths
+        # Set model config for FP8 KV cache support (first time only)
         if self._trtllm_config._num_layers == 0:
             cache_dtype = self.dtype
             self._trtllm_config.set_model_config(
@@ -176,33 +148,8 @@ class TrtllmKVResourceHandler(KVPagedResourceHandler):
                 dtype=cache_dtype,
             )
 
-        # Try PTCacheBackend if enabled
-        if self._trtllm_config.use_pt_cache_backend and _HAS_PT_CACHE_BACKEND:
-            # Get or create PT backend
-            pt_backend = self._trtllm_config.get_or_create_pt_cache_backend(sequence_info)
-
-            if pt_backend is not None:
-                # Register host prepare function ONCE (only for layer 0)
-                if self.layer_idx == 0:
-                    host_fn = pt_backend.get_host_prepare_metadata_function()
-                    if host_fn is not None:
-                        host_args = pt_backend.get_host_prepare_metadata_args()
-                        sequence_info.register_host_prepare_for_attention_forward(
-                            host_fn, host_args
-                        )
-
-                # PTCacheBackend returns unified K+V cache for each layer
-                return pt_backend.get_unified_cache(self.layer_idx)
-
         # Fallback: simple allocation (when __eq__=True, KVCacheManager handles this instead)
-        # This is called when __eq__=False or as a safety fallback
-        ad_logger.warning(
-            f"[TRT-LLM] Fallback allocation for layer {self.layer_idx} - "
-            "consider using PTCacheBackend or ensuring KVCacheManager manages the cache"
-        )
-
         # Unified KV cache format: [num_blocks, kv_factor=2, num_kv_heads, tokens_per_block, head_dim]
-        # This matches HND layout with kv_factor dimension
         cache = torch.empty(
             sequence_info.num_blocks,
             self.kv_factor,  # 2 for K and V
@@ -211,10 +158,6 @@ class TrtllmKVResourceHandler(KVPagedResourceHandler):
             self.head_dim,
             device=sequence_info.device,
             dtype=self.dtype,
-        )
-        ad_logger.debug(
-            f"[TRT-LLM] Created unified KV cache: shape={cache.shape}, dtype={cache.dtype}, "
-            f"device={cache.device}"
         )
         return cache
 
@@ -426,10 +369,6 @@ class TrtllmAttentionGlobalState:
             self._shared_host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[layer_i, 1].item()
 
         self._pool_pointers_initialized = True
-        ad_logger.debug(
-            f"[TRT-LLM Attention] Pool pointers initialized: "
-            f"pool_ptr={self._shared_host_kv_cache_pool_pointers[0, 0]}"
-        )
 
     def get_or_create_layer_state(
         self,
@@ -901,103 +840,52 @@ def trtllm_mha_with_cache(
     # Prepare output tensor
     output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
-    # Check if PTCacheBackend is active - if so, use its metadata
-    pt_backend = _trtllm_config.pt_cache_backend
-    if pt_backend is not None:
-        # PTCacheBackend's metadata is prepared via two mechanisms:
-        # 1. During forward (warmup/capture/normal): host_prepare_fn is called here
-        # 2. During inference: run_host_prepare_for_attention_forward() calls registered fn
-        #    BEFORE graph replay (updates device tensors before replay)
-        #
-        # CUDA graph handling:
-        # - HOST tensor VALUES are baked into the graph at capture time
-        # - DEVICE tensor ADDRESSES are captured (data can be updated before replay)
-        #
-        # Therefore:
-        # - During capture: call host_prepare_fn with skip_device_ops=True
-        #   (sets host tensors correctly for capture, skips H2D copies that aren't allowed)
-        # - Outside capture: call host_prepare_fn normally (sets all tensors)
-        is_capturing = torch.cuda.is_current_stream_capturing()
-        host_prepare_fn = pt_backend.get_host_prepare_metadata_function()
-        if host_prepare_fn is not None:
-            host_prepare_fn(
-                batch_info_host,
-                cu_seqlen_host,
-                cu_num_pages_host,
-                cache_loc,
-                seq_len_with_cache_host,
-                skip_device_ops=is_capturing,  # Skip H2D during capture
-            )
+    # Get num_layers from config for block offset calculation
+    num_layers = _trtllm_config._num_layers if _trtllm_config._num_layers > 0 else 32
+    state = _global_state.get_or_create_layer_state(
+        layer_idx=layer_idx,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_num_requests=max_num_requests,
+        max_context_length=max_context_length,
+        num_layers=num_layers,
+    )
 
-        # Get metadata from PTCacheBackend
-        # NOTE: We slice tensors to num_seq because the TRT-LLM kernel uses
-        # tensor SIZE to determine batch size. This is incompatible with CUDA
-        # graphs since slicing creates different addresses each time.
-        sequence_length = pt_backend.sequence_length[:num_seq]
-        host_past_key_value_lengths = pt_backend.host_past_key_value_lengths[:num_seq]
-        host_total_kv_lens = pt_backend.host_total_kv_lens
-        context_lengths = pt_backend.context_lengths[:num_seq]
-        host_context_lengths = pt_backend.host_context_lengths[:num_seq]
-        host_request_types = pt_backend.host_request_types[:num_seq]
+    # Get AD's pool pointers if available (for proper integration)
+    ad_pool_pointers = None
+    ad_pool_mapping = None
 
-        # Get block offsets from PTCacheBackend - shape [1, num_seq, 2, max_blocks]
-        # PTCacheBackend already sets K/V at different indices (*2 for K, *2+1 for V)
-        # in _fill_block_offsets_from_cache_loc(), so use directly
-        kv_cache_block_offsets = pt_backend.kv_cache_block_offsets[:, :num_seq, :, :]
+    if _trtllm_config._sequence_info is not None:
+        ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
+        ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
 
-        # Get pool pointers directly from C++ KVCacheManager: [[base_ptr, 0]]
-        # The C++ pool stores data in [heads, tokens, dim] layout per block,
-        # which matches what the kernel expects - no transpose needed!
-        host_kv_cache_pool_pointers = pt_backend.get_pool_pointers()
-        host_kv_cache_pool_mapping = pt_backend.get_pool_mapping()
-    else:
-        # Fall back to original metadata preparation
-        # Get num_layers from config for block offset calculation
-        num_layers = _trtllm_config._num_layers if _trtllm_config._num_layers > 0 else 32
-        state = _global_state.get_or_create_layer_state(
-            layer_idx=layer_idx,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_num_requests=max_num_requests,
-            max_context_length=max_context_length,
-            num_layers=num_layers,
-        )
-
-        # Get AD's pool pointers if available (for proper integration)
-        ad_pool_pointers = None
-        ad_pool_mapping = None
-
-        if _trtllm_config._sequence_info is not None:
-            ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
-            ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
-
-        # Prepare TRT-LLM metadata using fallback
-        (
-            sequence_length,
-            host_past_key_value_lengths,
-            host_total_kv_lens,
-            context_lengths,
-            host_context_lengths,
-            host_request_types,
-            kv_cache_block_offsets,
-            host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping,
-        ) = _prepare_trtllm_metadata(
-            batch_info_host,
-            cu_seqlen_host,
-            cu_num_pages,
-            cu_num_pages_host,
-            cache_loc,
-            last_page_len,
-            last_page_len_host,
-            seq_len_with_cache_host,
-            state,
-            kv_cache,  # Unified KV cache
-            ad_pool_pointers=ad_pool_pointers,
-            ad_pool_mapping=ad_pool_mapping,
-        )
+    # Prepare TRT-LLM metadata
+    (
+        sequence_length,
+        host_past_key_value_lengths,
+        host_total_kv_lens,
+        context_lengths,
+        host_context_lengths,
+        host_request_types,
+        kv_cache_block_offsets,
+        host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping,
+    ) = _prepare_trtllm_metadata(
+        batch_info_host,
+        cu_seqlen_host,
+        cu_num_pages,
+        cu_num_pages_host,
+        cache_loc,
+        last_page_len,
+        last_page_len_host,
+        seq_len_with_cache_host,
+        state,
+        kv_cache,  # Unified KV cache
+        ad_pool_pointers=ad_pool_pointers,
+        ad_pool_mapping=ad_pool_mapping,
+    )
 
     # Compute softmax scale
     # sm_scale = scale if scale is not None else (1.0 / (head_dim**0.5))
@@ -1017,78 +905,6 @@ def trtllm_mha_with_cache(
         spec_decoding_tensor_params.extend([None, None, None])
 
     mla_tensor_params = [None, None]
-
-    # Debug: log tensor info before attention call
-    if layer_idx == 0:
-        ad_logger.debug(
-            f"[TRT-LLM Attention L{layer_idx}] qkv_fused={qkv_fused.shape}, dtype={qkv_fused.dtype}, "
-            f"output={output.shape}, workspace={workspace_buffer.shape}"
-        )
-        ad_logger.debug(
-            f"[TRT-LLM Attention L{layer_idx}] sequence_length={sequence_length.shape}, "
-            f"context_lengths={context_lengths.shape}, kv_block_offsets={kv_cache_block_offsets.shape}"
-        )
-        ad_logger.debug(
-            f"[TRT-LLM Attention L{layer_idx}] pool_pointers={host_kv_cache_pool_pointers.shape}, "
-            f"pool_mapping={host_kv_cache_pool_mapping.shape}"
-        )
-        ad_logger.debug(
-            f"[TRT-LLM Attention L{layer_idx}] num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
-            f"head_dim={head_dim}, tokens_per_block={tokens_per_block}"
-        )
-
-    # DEBUG: Environment variable to skip thop.attention and use PyTorch SDPA
-    import os
-
-    use_debug_sdpa = os.environ.get("DEBUG_USE_SDPA", "0") == "1"
-
-    if use_debug_sdpa:
-        # Fall back to PyTorch SDPA for debugging (no cache update)
-        ad_logger.warning(f"[DEBUG] Using PyTorch SDPA for layer {layer_idx} (DEBUG_USE_SDPA=1)")
-        # Handle GQA: expand K/V to match Q's head count
-        n_rep = num_heads // num_kv_heads  # Repeat factor for GQA
-        q_sdpa = (
-            q.reshape(num_tokens, num_heads, head_dim)
-            .transpose(0, 1)
-            .unsqueeze(0)
-            .to(torch.bfloat16)
-        )
-        k_for_sdpa = k.reshape(num_tokens, num_kv_heads, head_dim).transpose(
-            0, 1
-        )  # [kv_heads, tokens, dim]
-        v_for_sdpa = v.reshape(num_tokens, num_kv_heads, head_dim).transpose(
-            0, 1
-        )  # [kv_heads, tokens, dim]
-        # Repeat K/V for GQA
-        k_sdpa = (
-            k_for_sdpa.unsqueeze(1)
-            .expand(-1, n_rep, -1, -1)
-            .reshape(num_heads, num_tokens, head_dim)
-            .unsqueeze(0)
-            .to(torch.bfloat16)
-        )
-        v_sdpa = (
-            v_for_sdpa.unsqueeze(1)
-            .expand(-1, n_rep, -1, -1)
-            .reshape(num_heads, num_tokens, head_dim)
-            .unsqueeze(0)
-            .to(torch.bfloat16)
-        )
-        out_sdpa = torch.nn.functional.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa, is_causal=True
-        )
-        output = (
-            out_sdpa.squeeze(0)
-            .transpose(0, 1)
-            .reshape(num_tokens, num_heads * head_dim)
-            .to(q.dtype)
-        )
-        # Pad output if needed
-        if output.shape[0] < b * s:
-            output_padded = torch.zeros(b * s, num_heads * head_dim, dtype=q.dtype, device=q.device)
-            output_padded[:num_tokens] = output
-            output = output_padded
-        return output.view(b, s, num_heads * head_dim)
 
     try:
         thop.attention(
@@ -1172,26 +988,12 @@ def trtllm_mha_with_cache(
             None,  # quant_q_buffer
         )
     except Exception as e:
-        ad_logger.error(f"TRT-LLM attention failed at layer {layer_idx}: {e}")
-        ad_logger.error(f"  num_seq={num_seq}, num_tokens={num_tokens}")
-        ad_logger.error(f"  q_flat.shape={q_flat.shape}, k_flat.shape={k_flat.shape}")
-        ad_logger.error(f"  kv_cache.shape={kv_cache.shape}")
-        # DEBUG: Fall back to PyTorch SDPA instead of crashing
-        ad_logger.warning(f"[DEBUG] Falling back to PyTorch SDPA for layer {layer_idx}")
-        # Simple SDPA without cache update (just for debugging)
-        q_sdpa = q.reshape(num_tokens, num_heads, head_dim).transpose(0, 1).unsqueeze(0)
-        k_sdpa = k.reshape(num_tokens, num_kv_heads, head_dim).transpose(0, 1).unsqueeze(0)
-        v_sdpa = v.reshape(num_tokens, num_kv_heads, head_dim).transpose(0, 1).unsqueeze(0)
-        out_sdpa = torch.nn.functional.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa, is_causal=True
-        )
-        output = out_sdpa.squeeze(0).transpose(0, 1).reshape(num_tokens, num_heads * head_dim)
-        # Skip the copy-back since we didn't use the kernel
-        return (
-            output.view(b, s, num_heads * head_dim)
-            if output.shape[0] == b * s
-            else torch.zeros(b, s, num_heads * head_dim, dtype=q.dtype, device=q.device)
-        )
+        raise RuntimeError(
+            f"TRT-LLM attention failed at layer {layer_idx}: {e}\n"
+            f"  num_seq={num_seq}, num_tokens={num_tokens}\n"
+            f"  q_flat.shape={q_flat.shape}, k_flat.shape={k_flat.shape}\n"
+            f"  kv_cache.shape={kv_cache.shape}"
+        ) from e
 
     # Reshape output back to AD format [b, s, num_heads * head_dim]
     # Pad back to original batch*seq size if needed
@@ -1236,11 +1038,6 @@ class TrtllmAttentionConfig:
 
     This class stores runtime configuration that's set during cache initialization
     and used when constructing the attention op constants.
-
-    Attributes:
-        use_pt_cache_backend: If True, use PTCacheBackend with PT's KVCacheManager
-            for efficient C++ metadata preparation. If False (default), use
-            SimpleCacheBackend with Python-based metadata preparation.
     """
 
     _instance = None
@@ -1259,9 +1056,7 @@ class TrtllmAttentionConfig:
         self.max_num_tokens: int = 2048
         self.is_configured: bool = False
 
-        # Cache backend configuration
-        self.use_pt_cache_backend: bool = False
-        self._pt_cache_backend: Optional["PTCacheBackend"] = None
+        # Model configuration
         self._num_layers: int = 0
         self._num_kv_heads_per_layer: List[int] = []
         self._head_dim: int = 0
@@ -1277,7 +1072,6 @@ class TrtllmAttentionConfig:
 
     def configure(self, si: SequenceInfo):
         """Configure from SequenceInfo."""
-        # PR 11149 renamed page_size -> tokens_per_block
         self.page_size = si.tokens_per_block
         self.max_batch_size = si.max_batch_size
         self.max_seq_len = si.max_seq_len
@@ -1287,12 +1081,6 @@ class TrtllmAttentionConfig:
         # Store SequenceInfo reference for AD pool pointer access
         self._sequence_info = si
 
-        ad_logger.info(
-            f"[TRT-LLM Attention Config] page_size={self.page_size}, "
-            f"max_batch_size={self.max_batch_size}, max_seq_len={self.max_seq_len}, "
-            f"max_num_tokens={self.max_num_tokens}, use_pt_cache_backend={self.use_pt_cache_backend}"
-        )
-
     def set_model_config(
         self,
         num_layers: int,
@@ -1300,9 +1088,7 @@ class TrtllmAttentionConfig:
         head_dim: int,
         dtype: torch.dtype,
     ):
-        """Set model configuration for PTCacheBackend.
-
-        This should be called during model analysis before cache initialization.
+        """Set model configuration.
 
         Args:
             num_layers: Total number of attention layers
@@ -1320,109 +1106,12 @@ class TrtllmAttentionConfig:
             # FP8_KV_CACHE quant mode = 128 (from tensorrt_llm.quantization.mode.QuantMode)
             self._quant_mode = 128
             # Default KV scales (1.0) - for FP8 models, scale is typically 1.0
-            # These tensors must be on GPU for thop.attention
             self._kv_scale_orig_quant = torch.ones(1, dtype=torch.float32, device="cuda")
             self._kv_scale_quant_orig = torch.ones(1, dtype=torch.float32, device="cuda")
-            ad_logger.info(
-                f"[TRT-LLM] Enabled FP8 KV cache: quant_mode={self._quant_mode}, kv_scale=1.0"
-            )
         else:
             self._quant_mode = 0
             self._kv_scale_orig_quant = None
             self._kv_scale_quant_orig = None
-
-    def get_or_create_pt_cache_backend(self, si: SequenceInfo) -> Optional["PTCacheBackend"]:
-        """Get or create the PTCacheBackend instance.
-
-        This is called during cache initialization if use_pt_cache_backend is True.
-
-        Args:
-            si: SequenceInfo with cache configuration
-
-        Returns:
-            PTCacheBackend instance, or None if not configured to use it
-        """
-        if not self.use_pt_cache_backend:
-            return None
-
-        if not _HAS_PT_CACHE_BACKEND:
-            ad_logger.warning(
-                "[TRT-LLM] PTCacheBackend requested but not available. "
-                "Falling back to SimpleCacheBackend."
-            )
-            return None
-
-        if self._pt_cache_backend is not None:
-            return self._pt_cache_backend
-
-        # Validate we have model config
-        if self._num_layers == 0 or not self._num_kv_heads_per_layer:
-            ad_logger.error(
-                "[TRT-LLM] Cannot create PTCacheBackend: model config not set. "
-                "Call set_model_config() first."
-            )
-            return None
-
-        # Calculate optimal num_blocks based on available GPU memory
-        # si.num_blocks may be too small (from dummy KVCacheManager) - calculate our own
-        #
-        # Each block needs: tokens_per_block * num_kv_heads * head_dim * kv_factor * dtype_size
-        # For all layers: multiply by num_layers
-        dtype_size = (
-            1 if self._dtype == torch.float8_e4m3fn else (2 if self._dtype == torch.float16 else 4)
-        )
-        kv_factor = 2  # K and V
-        max_kv_heads = max(self._num_kv_heads_per_layer)
-        bytes_per_block_per_layer = (
-            si.tokens_per_block * max_kv_heads * self._head_dim * kv_factor * dtype_size
-        )
-        bytes_per_block_total = bytes_per_block_per_layer * self._num_layers
-
-        # Get available GPU memory
-        free_mem = torch.cuda.mem_get_info()[0]
-
-        # Use 80% of free memory for KV cache (leave room for other allocations)
-        mem_for_kv = int(free_mem * 0.80)
-        optimal_blocks = max(64, mem_for_kv // bytes_per_block_total)
-
-        # Cap at theoretical max to avoid wasting memory
-        max_blocks_per_seq = (si.max_seq_len + si.tokens_per_block - 1) // si.tokens_per_block
-        theoretical_max = max_blocks_per_seq * si.max_batch_size
-        num_blocks = min(optimal_blocks, theoretical_max)
-
-        ad_logger.info(
-            f"[TRT-LLM PTCacheBackend] Calculated num_blocks={num_blocks} "
-            f"(optimal={optimal_blocks}, theoretical_max={theoretical_max}, "
-            f"free_mem={free_mem / 1e9:.2f}GB, bytes_per_block={bytes_per_block_total})"
-        )
-
-        # PR 11149 renamed: num_pages -> num_blocks, page_size -> tokens_per_block
-        config = PTCacheConfig(
-            num_layers=self._num_layers,
-            num_kv_heads_per_layer=self._num_kv_heads_per_layer,
-            head_dim=self._head_dim,
-            tokens_per_block=si.tokens_per_block,
-            max_num_sequences=si.max_batch_size,
-            max_seq_len=si.max_seq_len,
-            num_pages=num_blocks,  # Use our calculated optimal blocks
-            dtype=self._dtype,
-        )
-
-        # Create and initialize backend
-        self._pt_cache_backend = PTCacheBackend(config)
-        self._pt_cache_backend.initialize(si, si.device)
-
-        ad_logger.info(
-            f"[TRT-LLM] Created PTCacheBackend: num_layers={self._num_layers}, "
-            f"num_blocks={si.num_blocks}, tokens_per_block={si.tokens_per_block}"
-        )
-
-        return self._pt_cache_backend
-
-    @property
-    def pt_cache_backend(self) -> Optional["PTCacheBackend"]:
-        """Get the PTCacheBackend instance if available."""
-        return self._pt_cache_backend
 
 
 # Global config singleton
@@ -1439,13 +1128,6 @@ class TrtllmAttention(AttentionDescriptor):
     Note: This backend assumes RoPE is applied outside the attention kernel,
     which matches AD's current pattern.
 
-    Cache Backend Options:
-        - SimpleCacheBackend (default): Per-layer cache allocation
-        - PTCacheBackend: Uses PT's KVCacheManager with C++ fast path
-
-    To enable PTCacheBackend, set:
-        TrtllmAttentionConfig().use_pt_cache_backend = True
-
     Usage:
         Set `backend: trtllm` in your AD config under `insert_cached_attention`.
     """
@@ -1453,7 +1135,7 @@ class TrtllmAttention(AttentionDescriptor):
     # Class-level counter for layer indices
     _layer_counter: int = 0
 
-    # Track num_kv_heads per layer for PTCacheBackend config
+    # Track num_kv_heads per layer for model config
     _num_kv_heads_per_layer: List[int] = []
     _head_dim: int = 0
     _dtype: torch.dtype = torch.float16
@@ -1477,10 +1159,10 @@ class TrtllmAttention(AttentionDescriptor):
 
     @classmethod
     def _track_layer_config(cls, num_kv_heads: int, head_dim: int, dtype: torch.dtype) -> None:
-        """Track layer configuration for PTCacheBackend setup.
+        """Track layer configuration.
 
         This is called for each layer during graph analysis to collect
-        the per-layer KV head counts needed by PTCacheBackend.
+        the per-layer KV head counts needed for model configuration.
         """
         cls._num_kv_heads_per_layer.append(num_kv_heads)
         cls._head_dim = head_dim
@@ -1571,19 +1253,11 @@ class TrtllmAttention(AttentionDescriptor):
 
         Returns host_prepare function that runs OUTSIDE CUDA graphs to update tensors.
         """
-        # Check if we're using PTCacheBackend
-        if _trtllm_config.use_pt_cache_backend and _trtllm_config.pt_cache_backend is not None:
-            return _trtllm_config.pt_cache_backend.get_host_prepare_metadata_function()
-
-        # Non-PTCacheBackend: Return global state's host_prepare function
         return _global_state.create_host_prepare_function()
 
     @classmethod
     def get_host_prepare_metadata_args(cls) -> List[str]:
         """Get argument names for host_prepare function."""
-        if _trtllm_config.use_pt_cache_backend and _trtllm_config.pt_cache_backend is not None:
-            return _trtllm_config.pt_cache_backend.get_host_prepare_metadata_args()
-
         return [
             "batch_info_host",
             "cu_seqlen_host",
@@ -1613,12 +1287,6 @@ class TrtllmAttention(AttentionDescriptor):
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
-        if attn_mask is not None or dropout_p != 0.0 or not is_causal:
-            ad_logger.debug(
-                f"Unsupported attention arguments for {source_attn_node=}: "
-                f"{attn_mask=}, {dropout_p=}, {is_causal=}"
-            )
-
         # Get scale
         if len(source_attn_node.args) > 6:
             scale = source_attn_node.args[6]
@@ -1638,7 +1306,7 @@ class TrtllmAttention(AttentionDescriptor):
         head_dim = k_fake.shape[3]
         dtype = k_fake.dtype
 
-        # Track layer configuration for PTCacheBackend
+        # Track layer configuration for model config
         cls._track_layer_config(num_kv_heads, head_dim, dtype)
 
         # Get layer index
@@ -1648,13 +1316,6 @@ class TrtllmAttention(AttentionDescriptor):
         tokens_per_block = _trtllm_config.page_size
         max_num_requests = _trtllm_config.max_batch_size
         max_context_length = _trtllm_config.max_seq_len
-
-        ad_logger.debug(
-            f"[TRT-LLM] Layer {layer_idx} constants: num_heads={num_heads}, "
-            f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, scale={scale}, "
-            f"tokens_per_block={tokens_per_block}, max_num_requests={max_num_requests}, "
-            f"max_context_length={max_context_length}"
-        )
 
         # Return constants in order expected by trtllm_mha_with_cache
         return [
@@ -1674,63 +1335,6 @@ class TrtllmAttention(AttentionDescriptor):
 # =============================================================================
 
 
-def enable_pt_cache_backend(enable: bool = True) -> None:
-    """Enable or disable PTCacheBackend for TRT-LLM attention.
-
-    When enabled, the TRT-LLM attention backend uses PT's KVCacheManager
-    for efficient metadata preparation via C++ code paths.
-
-    Benefits of PTCacheBackend:
-    - ~50% faster metadata preparation (C++ vs Python loops)
-    - Pre-allocated tensors for CUDA graph compatibility
-    - Direct access to unified pool pointers for thop.attention
-
-    Limitations (current implementation):
-    - Does not support block reuse (AD manages page assignments)
-    - Does not support host offloading
-
-    Usage:
-        # Before building the model with AD
-        from tensorrt_llm._torch.auto_deploy.custom_ops.trtllm_attention import (
-            enable_pt_cache_backend
-        )
-        enable_pt_cache_backend(True)
-
-        # Then proceed with AD model building
-        # ...
-
-    Args:
-        enable: Whether to enable PTCacheBackend (default: True)
-    """
-    if enable and not _HAS_PT_CACHE_BACKEND:
-        ad_logger.warning(
-            "PTCacheBackend is not available (missing TensorRT-LLM bindings). "
-            "Falling back to SimpleCacheBackend."
-        )
-        return
-
-    _trtllm_config.use_pt_cache_backend = enable
-    ad_logger.info(f"[TRT-LLM] PTCacheBackend {'enabled' if enable else 'disabled'}")
-
-
-def get_pt_cache_backend() -> Optional["PTCacheBackend"]:
-    """Get the current PTCacheBackend instance if available.
-
-    Returns:
-        The PTCacheBackend instance, or None if not initialized or disabled.
-    """
-    return _trtllm_config.pt_cache_backend
-
-
-def is_pt_cache_backend_enabled() -> bool:
-    """Check if PTCacheBackend is enabled.
-
-    Returns:
-        True if PTCacheBackend is enabled and available.
-    """
-    return _trtllm_config.use_pt_cache_backend and _HAS_PT_CACHE_BACKEND
-
-
 def reset_trtllm_attention_state() -> None:
     """Reset all TRT-LLM attention state.
 
@@ -1739,7 +1343,5 @@ def reset_trtllm_attention_state() -> None:
     - Layer counter
     - Global state (per-layer states, workspace)
     - Configuration (page size, batch size, etc.)
-    - PTCacheBackend instance
     """
     TrtllmAttention._reset_layer_counter()
-    ad_logger.info("[TRT-LLM] Attention state reset")
