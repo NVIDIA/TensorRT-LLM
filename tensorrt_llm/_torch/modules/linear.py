@@ -2721,3 +2721,30 @@ class Linear(nn.Module):
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"
         self.quant_method.pre_reload_weights(self)
+
+
+class TwoNVFP4LinearMethod(NVFP4LinearMethod):
+    self.residual_dim = 128
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        out_features_with_residule = out_features + self.residual_dim
+        self.reorder_index = torch.arange(in_features, dtype=torch.int16)
+        super().create_weights(module, in_features, out_features_with_residule,
+                               bias, dtype)
+
+    def _input_prepare(self, module: Linear, input: torch.Tensor):
+        if isinstance(input, Fp4QuantizedTensor) or isinstance(input, tuple):
+            raise RuntimeError("No quantization fusion for TwoFP4 now.")
+        else:
+            # Input is a regular tensor () - apply pre_quant_scale if it exists (for NVFP4_AWQ)
+            if module.pre_quant_scale is not None:
+                assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
+                input = input * module.pre_quant_scale
+
+            # TODO: fuse global scale.
+            input_scale = input.abs().max() / (448.0 * 6.0)
+            input = input / input_scale
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_residual(
+                input, self.reorder_index)
+        return act_fp4, act_sf
