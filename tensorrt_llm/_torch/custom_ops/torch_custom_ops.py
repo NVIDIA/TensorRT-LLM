@@ -1,3 +1,4 @@
+import threading
 from functools import lru_cache
 from typing import List, Mapping, Optional, Tuple, Union
 
@@ -26,6 +27,9 @@ from ..utils import (ActivationType, fp4_scale_infer_shape,
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
+
+_nccl_prealloc_lock = threading.Lock()
+_nccl_prealloc_done = set()
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -1782,7 +1786,13 @@ def tunable_allreduce(
                 opt_shapes.add(base_val)
 
                 input_shape = list(input.shape)
-                for tokens in sorted([int(v) for v in opt_shapes if v > 0]):
+            group_key = tuple(group)
+            for tokens in sorted([int(v) for v in opt_shapes if v > 0]):
+                cache_key = (group_key, tokens)
+                with _nccl_prealloc_lock:
+                    if cache_key in _nccl_prealloc_done:
+                        continue
+                    _nccl_prealloc_done.add(cache_key)
                     logger.debug(
                         "[tunable_allreduce] Pre-allocating NCCL window buffers: "
                         "tokens=%d group=%s", tokens, list(group))
