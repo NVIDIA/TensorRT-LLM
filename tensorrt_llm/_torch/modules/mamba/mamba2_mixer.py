@@ -236,8 +236,8 @@ class Mamba2Mixer(nn.Module):
                 zxbcdt.shape[0],
                 (self.num_heads * self.head_dim) // self.tp_size,
             ],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            dtype=zxbcdt.dtype,
+            device=zxbcdt.device,
         )
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out,

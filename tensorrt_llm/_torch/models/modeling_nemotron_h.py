@@ -311,10 +311,17 @@ class NemotronHLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
+        self.is_nvfp4 = (model_config.quant_config is not None
+                         and model_config.quant_config.quant_mode is not None
+                         and model_config.quant_config.quant_mode.has_nvfp4())
+
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
+            # Enable fused NVFP4 quantization if possible.
+            # It might be overridden in `_try_attach_nvfp4_scale` function.
+            quantize_type="nvfp4" if self.is_nvfp4 else None,
         )
 
         if layer_type == "M":
@@ -344,29 +351,51 @@ class NemotronHLayer(DecoderLayer):
         else:
             raise ValueError(f"{layer_type} is not supported")
 
+    def _try_attach_nvfp4_scale(self):
+        """Attach input_scale from mixer's first linear to norm for fused RMSNorm+Quant.
+
+        Called lazily on first forward (weights don't exist during __init__).
+        """
+        # MoE layer is skipped for now since the gate needs high precision input.
+        first_linear_attr = {
+            'M': 'in_proj',
+            '-': 'up_proj',
+            '*': 'qkv_proj'
+        }.get(self.layer_type)
+
+        if first_linear_attr:
+            first_linear = getattr(self.mixer, first_linear_attr, None)
+            if first_linear and hasattr(first_linear, 'input_scale'):
+                self.norm.nvfp4_scale = first_linear.input_scale
+                return
+
+        self.norm.is_nvfp4 = False
+
     def forward(
         self,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
 
-        residual = hidden_states
+        if self.norm.is_nvfp4 and not hasattr(self.norm, 'nvfp4_scale'):
+            self._try_attach_nvfp4_scale()
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, residual = self.norm(hidden_states, residual)
         hidden_states = self.mixer(hidden_states,
                                    attn_metadata,
                                    spec_metadata=spec_metadata,
                                    **kwargs)
-        hidden_states = torch.add(hidden_states, residual)
+
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, None)
 
-        return hidden_states
+        return hidden_states, residual
 
 
 class NemotronHModel(DecoderModel):
@@ -450,16 +479,15 @@ class NemotronHModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-
+        residual = torch.zeros_like(hidden_states)
         for layer in self.layers[:self.num_hidden_layers]:
-            hidden_states = layer(position_ids,
-                                  hidden_states,
-                                  attn_metadata,
-                                  spec_metadata=spec_metadata,
-                                  mamba_metadata=self.mamba_metadata)
-
-        hidden_states = self.norm_f(hidden_states)
-
+            hidden_states, residual = layer(position_ids,
+                                            hidden_states,
+                                            residual=residual,
+                                            attn_metadata=attn_metadata,
+                                            spec_metadata=spec_metadata,
+                                            mamba_metadata=self.mamba_metadata)
+        hidden_states, _ = self.norm_f(hidden_states, residual)
         return hidden_states
 
 
