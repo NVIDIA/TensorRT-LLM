@@ -138,7 +138,12 @@ class FakeEngine:
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
-        pages = kv_cache.get_page_indices(lc_id, beam)
+        base_pages = kv_cache.get_base_page_indices(lc_id, beam)
+        page_scale = manager.get_page_index_scale(layer_id, role)
+        pages = [
+            BAD_PAGE_INDEX if base_page is BAD_PAGE_INDEX else base_page * page_scale
+            for base_page in base_pages
+        ]
         capacity = kv_cache.capacity
         history_len = len(history)
         assert len(history) == history_len
@@ -181,8 +186,13 @@ class FakeEngine:
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
-        pages = kv_cache.get_page_indices(lc_id, beam)[
+        base_pages = kv_cache.get_base_page_indices(lc_id, beam)[
             : div_up(history_len + len(input), tokens_per_block)
+        ]
+        page_scale = manager.get_page_index_scale(layer_id, role)
+        pages = [
+            BAD_PAGE_INDEX if base_page is BAD_PAGE_INDEX else base_page * page_scale
+            for base_page in base_pages
         ]
         capacity = kv_cache.capacity
         input_range = (history_len, history_len + len(input))
