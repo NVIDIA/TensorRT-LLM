@@ -314,7 +314,27 @@ class TrtllmAttentionGlobalState:
             cls._instance._layer_states: Dict[int, TrtllmLayerState] = {}
             cls._instance._workspace: Optional[torch.Tensor] = None
             cls._instance._max_blocks_per_seq: int = 0
+            # Pre-allocated GPU buffers for vectorized block offset computation
+            cls._instance._gpu_buffers_initialized: bool = False
+            cls._instance._gpu_cu_pages: Optional[torch.Tensor] = None
+            cls._instance._gpu_page_positions: Optional[torch.Tensor] = None
+            cls._instance._gpu_seq_idx: Optional[torch.Tensor] = None
+            cls._instance._gpu_page_idx: Optional[torch.Tensor] = None
+            cls._instance._gpu_base_offset: Optional[torch.Tensor] = None
         return cls._instance
+
+    def _init_gpu_buffers(self, max_pages: int, max_seqs: int) -> None:
+        """Initialize pre-allocated GPU buffers for vectorized operations."""
+        if self._gpu_buffers_initialized:
+            return
+
+        # Pre-allocate buffers with max sizes to avoid per-call allocations
+        self._gpu_cu_pages = torch.zeros(max_seqs + 1, dtype=torch.long, device="cuda")
+        self._gpu_page_positions = torch.arange(max_pages, dtype=torch.long, device="cuda")
+        self._gpu_seq_idx = torch.zeros(max_pages, dtype=torch.long, device="cuda")
+        self._gpu_page_idx = torch.zeros(max_pages, dtype=torch.long, device="cuda")
+        self._gpu_base_offset = torch.zeros(max_pages, dtype=torch.int32, device="cuda")
+        self._gpu_buffers_initialized = True
 
     def get_or_create_layer_state(
         self,
@@ -411,25 +431,53 @@ class TrtllmAttentionGlobalState:
             seq_len_gpu = seq_len_with_cache.cuda()
             input_seq_lens_gpu = input_seq_lens.cuda()
 
+            # Initialize pre-allocated GPU buffers if needed
+            if not global_state._gpu_buffers_initialized:
+                max_pages = first_state.max_num_requests * (
+                    (first_state.max_context_length + first_state.tokens_per_block - 1)
+                    // first_state.tokens_per_block
+                )
+                global_state._init_gpu_buffers(max_pages, first_state.max_num_requests)
+
             # Compute block offsets ONCE on first layer's tensor, then copy to others
             first_block_offsets = None
+            seq_indices = None
+            page_in_seq = None
+            base_offsets = None
             if total_pages > 0:
-                cu_num_pages_gpu = cu_num_pages_cpu.cuda()
-                cache_loc_gpu = cache_loc[:total_pages]
+                # Use pre-allocated buffers with out= to avoid allocations
+                global_state._gpu_cu_pages[: num_seq + 1].copy_(cu_num_pages_cpu.long())
+                cu_num_pages_gpu = global_state._gpu_cu_pages[: num_seq + 1]
 
-                # Vectorized: find which sequence each page belongs to
-                page_indices = torch.arange(total_pages, device="cuda")
-                seq_indices = torch.searchsorted(cu_num_pages_gpu[1:], page_indices, right=True)
-                seq_indices = seq_indices.clamp(max=num_seq - 1)
+                # Use pre-allocated page_positions slice
+                page_positions = global_state._gpu_page_positions[:total_pages]
 
-                # Compute within-sequence page index
-                page_in_seq = page_indices - cu_num_pages_gpu[seq_indices]
+                # searchsorted into pre-allocated buffer
+                torch.searchsorted(
+                    cu_num_pages_gpu[1:],
+                    page_positions,
+                    right=True,
+                    out=global_state._gpu_seq_idx[:total_pages],
+                )
+                seq_indices = global_state._gpu_seq_idx[:total_pages].clamp(max=num_seq - 1)
 
-                # Compute base offsets: cache_loc * multiplier
+                # Compute page_in_seq into pre-allocated buffer
+                torch.sub(
+                    page_positions,
+                    cu_num_pages_gpu[seq_indices],
+                    out=global_state._gpu_page_idx[:total_pages],
+                )
+                page_in_seq = global_state._gpu_page_idx[:total_pages]
+
+                # Compute base offsets into pre-allocated buffer
                 kv_factor = 2
                 multiplier = num_layers * kv_factor
-                base_offsets = cache_loc_gpu * multiplier
-                base_offsets_plus1 = base_offsets + 1
+                torch.mul(
+                    cache_loc[:total_pages],
+                    multiplier,
+                    out=global_state._gpu_base_offset[:total_pages],
+                )
+                base_offsets = global_state._gpu_base_offset[:total_pages]
 
             # Update first layer state and compute block offsets
             states_list = list(layer_states.values())
@@ -452,13 +500,13 @@ class TrtllmAttentionGlobalState:
                 state.host_total_kv_lens[1] = gen_total_kv
 
                 # Block offsets - compute once, copy to rest
-                if total_pages > 0:
+                if total_pages > 0 and seq_indices is not None:
                     if first_block_offsets is None:
                         # First layer: compute block offsets
                         state.kv_cache_block_offsets.zero_()
                         state.kv_cache_block_offsets[0, seq_indices, 0, page_in_seq] = base_offsets
                         state.kv_cache_block_offsets[0, seq_indices, 1, page_in_seq] = (
-                            base_offsets_plus1
+                            base_offsets + 1
                         )
                         first_block_offsets = state.kv_cache_block_offsets
                     else:
