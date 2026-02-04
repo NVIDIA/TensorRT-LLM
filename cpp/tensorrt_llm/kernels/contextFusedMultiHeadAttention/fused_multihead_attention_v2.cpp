@@ -565,7 +565,7 @@ FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType,
     {
         sm = kSM_120;
     }
-    // SM103 uses SM100 FMHA v2 kernels (similar to how SM121 uses SM120 kernels)
+    // SM103 uses SM100 FMHA v2 kernels
     if (sm == kSM_103)
     {
         sm = kSM_100;
