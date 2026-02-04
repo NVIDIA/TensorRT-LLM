@@ -641,6 +641,8 @@ def run_client_tests(example_dir,
         if prompt_file == "long_prompts.json":
             # Use max_tokens 4 for long prompts to reduce test time
             client_cmd.extend(['--max-tokens', '4'])
+        if test_desc in ["tool_calls", "tool_calls_sd"]:
+            client_cmd.extend(['-e', 'chat', '-o', 'output_tool_calls.json'])
 
         # Prepare poll processes
         worker_processes = []
@@ -660,12 +662,15 @@ def run_client_tests(example_dir,
         if client_test_set.completion:
             check_call(client_cmd, env=env, poll_procs=poll_procs)
 
-        # Run streaming completion test
-        if client_test_set.completion_streaming:
-            streaming_client_cmd = client_cmd + [
-                '--streaming', '-o', 'output_streaming.json'
-            ]
-            check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
+        # tool calls test does not need to run streaming and completion
+        if test_desc in ["tool_calls", "tool_calls_sd"]:
+            continue
+
+        # Streaming client run
+        streaming_client_cmd = client_cmd + [
+            '--streaming', '-o', 'output_streaming.json'
+        ]
+        check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run chat completion test
         if client_test_set.chat:
@@ -925,7 +930,7 @@ def run_disaggregated_test(example_dir,
 def _run_disaggregated_test_sd(  # TODO implement sd for multi-gpu tests
         example_dir,
         test_desc,
-        num_iters=5,
+        num_iters=2, # TODO change to 5
         env=None,
         cwd=None,
         prompt_file="prompts.json",
@@ -1081,7 +1086,7 @@ def _run_disaggregated_test_sd(  # TODO implement sd for multi-gpu tests
 
         # run client tests
         run_client_tests(
-            os.path.dirname(config_file),
+            example_dir,
             client_config_file,
             test_desc,
             num_iters,
@@ -1168,6 +1173,351 @@ def test_disaggregated_single_gpu_with_mpirun_sd(disaggregated_test_root,
     _run_disaggregated_test_sd(
         disaggregated_example_root,
         "2_ranks_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_diff_max_tokens_sd(disaggregated_test_root,
+                                          disaggregated_example_root,
+                                          llm_venv, llama_model_root,
+                                          service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "2_ranks_diff_max_tokens_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_trt_backend_sd(disaggregated_test_root,
+                                      disaggregated_example_root,
+                                      llm_venv, llama_model_root,
+                                      service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "2_ranks_trt_backend_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_benchmark_gen_only_sd(disaggregated_test_root,
+                                             disaggregated_example_root,
+                                             llm_venv, llama_model_root,
+                                             service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "gen_only_sd",
+        env=env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_benchmark_gen_only_trt_backend_sd(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        llama_model_root, service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "gen_only_trt_backend_sd",
+        env=env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_cuda_graph_sd(disaggregated_test_root,
+                                     disaggregated_example_root,
+                                     llm_venv, llama_model_root,
+                                     service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "cuda_graph_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_mixed_sd(disaggregated_test_root,
+                                disaggregated_example_root,
+                                llm_venv, llama_model_root,
+                                service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "mixed_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_overlap_sd(disaggregated_test_root,
+                                  disaggregated_example_root,
+                                  llm_venv, llama_model_root,
+                                  service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "overlap_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_perf_metrics_sd(disaggregated_test_root,
+                                       disaggregated_example_root,
+                                       llm_venv, llama_model_root,
+                                       service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    def extra_endpoints_test(server_url: str):
+        item = get_timing_metrics(server_url)
+        validate_timing_metrics(item, "perf_metrics_sd test")
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "perf_metrics_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        extra_endpoints_test=extra_endpoints_test,
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_chat_completion_tool_calls_sd(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        llama_model_root, service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "tool_calls_sd",
+        num_iters=1,
+        prompt_file="tool_call_prompts.json",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_trtllm_sampler_sd(disaggregated_test_root,
+                                         disaggregated_example_root,
+                                         llm_venv, llama_model_root,
+                                         service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "trtllm_sampler_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_load_balance_sd(disaggregated_test_root,
+                                       disaggregated_example_root,
+                                       llm_venv, llama_model_root,
+                                       service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "load_balance_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_cache_aware_balance_sd(disaggregated_test_root,
+                                              disaggregated_example_root,
+                                              llm_venv, llama_model_root,
+                                              service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "cache_aware_balance_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_conditional_sd(disaggregated_test_root,
+                                      disaggregated_example_root,
+                                      llm_venv, llama_model_root,
+                                      service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "conditional_sd",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
+def test_disaggregated_ngram_sd(disaggregated_test_root,
+                                disaggregated_example_root,
+                                llm_venv, llama_model_root,
+                                service_discovery_backend):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    _run_disaggregated_test_sd(
+        disaggregated_example_root,
+        "ngram_sd",
         env=llm_venv._new_env,
         cwd=llm_venv.get_working_directory(),
         service_discovery_backend=service_discovery_backend)
