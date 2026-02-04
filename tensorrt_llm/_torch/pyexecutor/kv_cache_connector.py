@@ -48,6 +48,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     KvCacheConnectorManager as KvCacheConnectorManagerCpp
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.logger import logger
 
 from .llm_request import get_draft_token_length
 from .scheduler import ScheduledRequests
@@ -467,6 +468,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 # The req we get from the C++ call is different than the one in python.
                 # Replace it with the canonical request.
                 self.new_async_requests.loading[req.py_request_id] = req
+
+        logger.debug(
+            f"Marking {len(ready_requests)} requests with as ready IDs {list(map(lambda x: x.py_request_id, ready_requests))}."
+        )
+
         return ready_requests
 
     def handle_metadata(self) -> object:
