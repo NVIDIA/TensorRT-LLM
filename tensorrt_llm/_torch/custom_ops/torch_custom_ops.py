@@ -1,6 +1,6 @@
 import threading
 from functools import lru_cache
-from typing import List, Mapping, Optional, Tuple, Union
+from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]
@@ -1656,8 +1656,8 @@ def _(
 
 
 class AllReduceRunner(TunableRunner):
-    _prealloc_lock = threading.Lock()
-    _prealloc_done = set()
+    _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
+    _prealloc_done: ClassVar[set] = set()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -1700,7 +1700,7 @@ class AllReduceRunner(TunableRunner):
             try:
                 if torch.cuda.is_current_stream_capturing():
                     return
-            except Exception:
+            except (RuntimeError, AssertionError):
                 # If capture status can't be queried, avoid prealloc to be safe.
                 return
 
