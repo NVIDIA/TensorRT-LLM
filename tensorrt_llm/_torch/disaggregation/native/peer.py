@@ -7,9 +7,10 @@ from tensorrt_llm._torch.disaggregation.native.region.block import (
     HeadMatchMapper,
     HeadMismatchMapper,
     IdentityMapper,
+    IndexerKCacheHeadMatchMapper,
     RegionMapperBase,
 )
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1, PoolRole
 
 
 @dataclass
@@ -170,7 +171,11 @@ class PeerRegistrar:
         return mapping
 
     def get_kv_map(
-        self, peer_ri: RankInfo, self_layer_group_id: int = 0, peer_layer_group_id: int = 0
+        self,
+        peer_ri: RankInfo,
+        self_layer_group_id: int = 0,
+        peer_layer_group_id: int = 0,
+        pool_role: PoolRole = PoolRole.KV_CACHE,
     ) -> RegionMapperBase:
         """
         Get mapper for a specific layer group pair.
@@ -184,7 +189,7 @@ class PeerRegistrar:
             RegionMapperBase for the specified layer group pair.
         """
         peer_key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
-        key = (peer_key, self_layer_group_id, peer_layer_group_id)
+        key = (peer_key, self_layer_group_id, peer_layer_group_id, pool_role)
         if key in self._kv_map_cache:
             return self._kv_map_cache[key]
 
@@ -245,15 +250,32 @@ class PeerRegistrar:
             return mapper
 
         if head_match:
-            mapper = HeadMatchMapper(
-                transfer_layers=transfer_layers,
-                src_layer_off=self_layer_offset,
-                dst_layer_off=peer_layer_offset,
-                self_ri=self._ri,
-                peer_ri=peer_ri,
-            )
+            if pool_role == PoolRole.INDEXER:
+                pool_idx = self_group_attrs.roles_to_pool_idx[pool_role]
+                block_size_per_layer = self_group_attrs.block_bytes_per_pool[pool_idx] / (
+                    len(self_group_attrs.global_layer_ids)
+                )
+                mapper = IndexerKCacheHeadMatchMapper(
+                    transfer_layers=transfer_layers,
+                    src_layer_off=self_layer_offset,
+                    dst_layer_off=peer_layer_offset,
+                    self_ri=self._ri,
+                    peer_ri=peer_ri,
+                    block_size_per_layer=block_size_per_layer,
+                )
+            else:
+                mapper = HeadMatchMapper(
+                    transfer_layers=transfer_layers,
+                    src_layer_off=self_layer_offset,
+                    dst_layer_off=peer_layer_offset,
+                    self_ri=self._ri,
+                    peer_ri=peer_ri,
+                )
             self._kv_map_cache[key] = mapper
             return mapper
+
+        if pool_role == PoolRole.INDEXER:
+            raise ValueError("IndexerKCacheHeadMatchMapper is not supported for head mismatch case")
 
         # head mismatch case
         mapper = HeadMismatchMapper(

@@ -96,6 +96,53 @@ class HeadMatchMapper(RegionMapperBase):
         )
 
 
+class IndexerKCacheHeadMatchMapper(RegionMapperBase):
+    """
+    ---- mapper_head_match ----
+
+    Move/copy entire contiguous block(s) (multi-layer fragment) as a single chunk.
+    Align by whole fragment size (frag_size) and apply a constant source/destination block offset.
+
+    src_ptrs:  [ S0 ]         [ S1 ]          ...
+                 |              |
+              + src_off      + src_off
+                 |              |
+          [ S0 + src_off ] [ S1 + src_off ]   ->  (each points to a frag of size frag_size)
+                   copy whole frag
+                 |              |
+                 v              v
+          [ D0 + dst_off ] [ D1 + dst_off ]   ->  (destination frags)
+    """
+
+    def __init__(
+        self,
+        transfer_layers: int,
+        src_layer_off: int,
+        dst_layer_off: int,
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+        block_size_per_layer: int,
+    ):
+        self._frag_size = block_size_per_layer * transfer_layers
+        self._src_block_off = block_size_per_layer * src_layer_off
+        self._dst_block_off = block_size_per_layer * dst_layer_off
+
+    def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
+        src_group = src_regions.memory
+        dst_group = dst_regions.memory
+        assert len(src_group.ptrs) == len(dst_group.ptrs), (
+            f"Number of regions of src({len(src_group.ptrs)}) and dst({len(dst_group.ptrs)}) must match"
+        )
+        new_src_ptrs = [src_ptr + self._src_block_off for src_ptr in src_group.ptrs]
+        new_dst_ptrs = [dst_ptr + self._dst_block_off for dst_ptr in dst_group.ptrs]
+        new_src = MemRegionGroup(ptrs=new_src_ptrs, bytes_per_region=self._frag_size)
+        new_dst = MemRegionGroup(ptrs=new_dst_ptrs, bytes_per_region=self._frag_size)
+        return SpecRegionPair(
+            src=SpecRegion(memory=new_src, spec=src_regions.spec),
+            dst=SpecRegion(memory=new_dst, spec=dst_regions.spec),
+        )
+
+
 class HeadMismatchMapper(RegionMapperBase):
     """
     ---- mapper_head_mismatch ----

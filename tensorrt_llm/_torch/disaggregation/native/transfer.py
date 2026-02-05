@@ -369,19 +369,24 @@ class KVSendTask:
                 )
                 dst_block_ids = dst_block_ids[:-1]
             src_block_ids, dst_block_ids = self._filter_kv_blocks(src_block_ids, dst_block_ids)
-
-            # Extract regions for this layer group
-            src_region = extractor.extract(src_block_ids, layer_group_id=self_group_id)
-            dst_region = peer_extractor.extract(dst_block_ids, layer_group_id=peer_group_id)
-
-            # Get mapper for this layer group pair
-            mapper = self._registrar.get_kv_map(peer_ri, self_group_id, peer_group_id)
-            region_pair = mapper.map(src_region, dst_region)
-
-            src_frags.extend(region_pair.src.memory.ptrs)
-            dst_frags.extend(region_pair.dst.memory.ptrs)
-            frag_size = region_pair.src.memory.bytes_per_region
-            kv_sizes.extend([frag_size] * len(region_pair.src.memory.ptrs))
+            for pool_role in extractor.kv_pool_attrs.layer_group_attrs_list[
+                self_group_id
+            ].roles_to_pool_idx.keys():
+                # Extract regions for this layer group
+                src_region = extractor.extract(
+                    src_block_ids, layer_group_id=self_group_id, pool_role=pool_role
+                )
+                dst_region = peer_extractor.extract(
+                    dst_block_ids, layer_group_id=peer_group_id, pool_role=pool_role
+                )
+                mapper = self._registrar.get_kv_map(
+                    peer_ri, self_group_id, peer_group_id, pool_role
+                )
+                region_pair = mapper.map(src_region, dst_region)
+                src_frags.extend(region_pair.src.memory.ptrs)
+                dst_frags.extend(region_pair.dst.memory.ptrs)
+                frag_size = region_pair.src.memory.bytes_per_region
+                kv_sizes.extend([frag_size] * len(region_pair.src.memory.ptrs))
 
         if self._perf_timer is not None:
             transfer_total_size = frag_size * len(src_frags)

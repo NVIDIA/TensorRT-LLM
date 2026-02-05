@@ -17,9 +17,10 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.region.aux import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2, Role
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -140,45 +141,24 @@ def create_transfer_worker_setup(
                 dtype=dtype,
                 vocab_size=vocab_size,
             )
-            # V2: Initialize pools for ALL layer_groups
+            # V2: Initialize pools using kv_pool_attrs
             random_seed = 0 if is_mla else None
-            kv_factor = ctx_kv_cache_manager.kv_factor
+            kv_pool_attrs = KVRegionExtractorV1.create_kv_pool_attrs_from_manager(
+                ctx_kv_cache_manager
+            )
 
-            # First pass: collect maximum num_pages for each pool across all layer_groups
-            pool_info = {}  # pool_base_ptr -> (max_num_pages, page_stride, first_local_layer)
-            for group_id, local_layer_ids in enumerate(ctx_kv_cache_manager.impl.layer_grouping):
-                first_local_layer = local_layer_ids[0]
-                pool_base_ptr = int(
-                    ctx_kv_cache_manager.impl.get_mem_pool_base_address(first_local_layer, Role.KEY)
-                )
-                page_stride = ctx_kv_cache_manager.impl.get_page_stride(first_local_layer, Role.KEY)
-                num_pages = ctx_kv_cache_manager.impl.get_page_index_upper_bound(
-                    first_local_layer, Role.KEY
-                )
+            # Collect unique pools (deduplicate by pool_base_ptr, keep max size)
+            unique_pools = {}  # pool_base_ptr -> pool_size
+            for layer_group_attrs in kv_pool_attrs.layer_group_attrs_list:
+                for pool_idx, pool_ptr in enumerate(layer_group_attrs.pool_base_ptrs):
+                    pool_size = layer_group_attrs.pool_sizes[pool_idx]
+                    if pool_ptr not in unique_pools or pool_size > unique_pools[pool_ptr]:
+                        unique_pools[pool_ptr] = pool_size
 
-                if pool_base_ptr not in pool_info:
-                    pool_info[pool_base_ptr] = (num_pages, page_stride, first_local_layer)
-                else:
-                    # Keep the maximum num_pages for this pool
-                    existing_num_pages, existing_page_stride, existing_layer = pool_info[
-                        pool_base_ptr
-                    ]
-                    if num_pages > existing_num_pages:
-                        pool_info[pool_base_ptr] = (num_pages, page_stride, first_local_layer)
-
-            # Second pass: initialize each pool with the maximum required size
-            for pool_base_ptr, (num_pages, page_stride, first_local_layer) in pool_info.items():
-                pool_size_bytes = num_pages * page_stride * kv_factor
-                element_size = (
-                    page_stride
-                    * kv_factor
-                    // (
-                        ctx_kv_cache_manager.tokens_per_block
-                        * ctx_kv_cache_manager.num_kv_heads_per_layer[first_local_layer]
-                        * ctx_kv_cache_manager.head_dim
-                    )
-                )
-                pool_size_elements = pool_size_bytes // element_size
+            # Initialize each unique pool with random data
+            element_bytes = get_size_in_bytes(1, ctx_kv_cache_manager.dtype)
+            for pool_base_ptr, pool_size in unique_pools.items():
+                pool_size_elements = pool_size // element_bytes
                 pool_tensor = convert_to_torch_tensor(
                     TensorWrapper(pool_base_ptr, ctx_kv_cache_manager.dtype, [pool_size_elements])
                 )
@@ -188,7 +168,7 @@ def create_transfer_worker_setup(
                     generator = None
                 random_values = torch.rand(
                     pool_tensor.shape,
-                    dtype=torch.float32,
+                    dtype=pool_tensor.dtype,
                     device=pool_tensor.device,
                     generator=generator,
                 )
@@ -247,7 +227,7 @@ def create_transfer_worker_setup(
                 generator = None
             random_values = torch.rand(
                 pool_tensor.shape,
-                dtype=torch.float32,
+                dtype=pool_tensor.dtype,
                 device=pool_tensor.device,
                 generator=generator,
             )

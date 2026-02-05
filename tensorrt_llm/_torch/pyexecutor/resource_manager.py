@@ -480,6 +480,7 @@ class KVCacheManager(BaseResourceManager):
                                                        dtype=torch.int32,
                                                        pin_memory=True,
                                                        device='cpu')
+        self.enable_indexer_k_cache = enable_indexer_k_cache
 
     def shutdown(self):
         self.impl.release_pools()

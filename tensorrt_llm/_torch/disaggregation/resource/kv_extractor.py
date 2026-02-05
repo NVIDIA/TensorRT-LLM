@@ -159,6 +159,18 @@ class KVRegionExtractorV1(RegionExtractorBase):
                 * element_bytes
             ) * len(local_layer_ids)
             block_sizes: List[int] = [block_size]
+            roles_to_pool_idx: Dict[PoolRole, int] = {PoolRole.KV_CACHE: 0}
+
+            if manager.enable_indexer_k_cache:
+                roles_to_pool_idx[PoolRole.INDEXER] = 1
+                indexer_k_cache_pool = manager.impl.get_indexer_k_cache_pool()
+                indexer_k_cache_pool_base_ptr = int(indexer_k_cache_pool.data_ptr())
+                indexer_k_cache_pool_size = (
+                    indexer_k_cache_pool.element_size() * indexer_k_cache_pool.numel()
+                )
+                pool_ptrs.append(indexer_k_cache_pool_base_ptr)
+                pool_sizes.append(indexer_k_cache_pool_size)
+                block_sizes.append(indexer_k_cache_pool.shape[-1] * len(local_layer_ids))
 
             global_layer_ids = [local_layer_to_global_layer_id[lid] for lid in local_layer_ids]
 
@@ -169,7 +181,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
                 group_id=group_id,
                 pool_base_ptrs=pool_ptrs,
                 pool_sizes=pool_sizes,
-                roles_to_pool_idx={PoolRole.KV_CACHE: 0},
+                roles_to_pool_idx=roles_to_pool_idx,
                 block_bytes_per_pool=block_sizes,
                 global_layer_ids=global_layer_ids,
                 kv_head_num_per_rank=num_kv_heads,
@@ -203,7 +215,10 @@ class KVRegionExtractorV1(RegionExtractorBase):
             pool_base_ptr = key_addr_with_offset - key_attr.offset
 
             page_stride_key = manager.impl.get_page_stride(first_local_layer, Role.KEY)
-            num_pages = manager.impl.get_page_index_upper_bound(first_local_layer, Role.KEY)
+            num_pages = (
+                manager.impl.get_page_index_upper_bound(first_local_layer, Role.KEY)
+                // manager.kv_factor
+            )
 
             pool_size = num_pages * page_stride_key * manager.kv_factor
             block_size = page_stride_key * manager.kv_factor * len(local_layer_ids)
@@ -251,14 +266,19 @@ class KVRegionExtractorV1(RegionExtractorBase):
         else:
             raise ValueError(f"Unsupported KVCacheManager type: {type(manager)}")
 
-    def extract(self, region_ids: List[int], layer_group_id: int = 0) -> SpecRegion:
+    def extract(
+        self,
+        region_ids: List[int],
+        layer_group_id: int = 0,
+        pool_role: PoolRole = PoolRole.KV_CACHE,
+    ) -> SpecRegion:
         """
         Given a list of region_ids, returns a single SpecRegion,
         whose memory is a MemRegionGroup containing all blocks described
         by region_ids.
         """
         layer_group_attrs = self._kv_pool_attrs.layer_group_attrs_list[layer_group_id]
-        pool_idx = layer_group_attrs.roles_to_pool_idx[PoolRole.KV_CACHE]
+        pool_idx = layer_group_attrs.roles_to_pool_idx[pool_role]
 
         base_ptr = int(layer_group_attrs.pool_base_ptrs[pool_idx])
         block_size = int(layer_group_attrs.block_bytes_per_pool[pool_idx])

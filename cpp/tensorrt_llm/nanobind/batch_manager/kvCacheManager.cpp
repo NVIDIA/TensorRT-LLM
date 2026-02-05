@@ -442,6 +442,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_indexer_k_cache_pool",
+            [](tbk::BaseKVCacheManager& self) -> at::Tensor
+            {
+                auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
+                return pool;
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
