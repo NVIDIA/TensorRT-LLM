@@ -128,6 +128,54 @@ def _chunk_cumsum_fwd_kernel(
 
 @triton.autotune(
     configs=[
+        # Small headdim/dstate configs (hdim<=64, dstate<=128) - increased parallelism
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=3,
+            num_warps=4,
+        ),
+        # Low register pressure configs for large dstate (dstate=128)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        # Original configs for larger headdim/dstate values
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
@@ -175,39 +223,12 @@ def _chunk_cumsum_fwd_kernel(
         ),
         triton.Config(
             {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": 32
             },
             num_stages=4,
             num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=5,
-            num_warps=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=5,
-            num_warps=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=4,
-            num_warps=2,
         ),
     ],
     key=["hdim", "dstate", "chunk_size"],
@@ -351,6 +372,41 @@ def _chunk_state_fwd_kernel(
 
 @triton.autotune(
     configs=[
+        # Small headdim/dstate configs for better parallelism
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=3,
+            num_warps=4),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=3,
+            num_warps=4),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=3,
+            num_warps=4),
+        # Low register pressure configs
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=4),
+        # Original configs for larger dimensions
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
@@ -393,36 +449,12 @@ def _chunk_state_fwd_kernel(
             num_warps=4),
         triton.Config(
             {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": 32
             },
             num_stages=4,
             num_warps=4),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=5,
-            num_warps=2),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=5,
-            num_warps=2),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=4,
-            num_warps=2),
     ],
     key=["hdim", "dstate", "chunk_size"],
 )
