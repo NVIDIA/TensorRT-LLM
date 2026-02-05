@@ -185,6 +185,47 @@ class EnvManager:
     def get_debug_job_id() -> str:
         return os.getenv("DEBUG_JOB_ID", "908390")
 
+    # ========== CI/CD Environment Variables ==========
+    @staticmethod
+    def get_trtllm_branch() -> str:
+        return os.getenv("TRT_LLM_BRANCH", "default")
+
+    @staticmethod
+    def get_trtllm_repo() -> str:
+        return os.getenv("TRT_LLM_REPO", "NVIDIA/TensorRT-LLM")
+
+    @staticmethod
+    def get_trtllm_version() -> str:
+        return os.getenv("TRT_LLM_VERSION", "default")
+
+    @staticmethod
+    def get_commit_hash() -> str:
+        return os.getenv("COMMIT_HASH", "default")
+
+    @staticmethod
+    def get_commit_time() -> str:
+        return os.getenv("COMMIT_TIME", "default")
+
+    @staticmethod
+    def get_docker_image() -> str:
+        return os.getenv("DOCKER_IMAGE", "default")
+
+    @staticmethod
+    def get_env_info() -> dict:
+        """Get all environment information as a dictionary."""
+        return {
+            "TRT_LLM_BRANCH": EnvManager.get_trtllm_branch(),
+            "TRT_LLM_REPO": EnvManager.get_trtllm_repo(),
+            "TRT_LLM_VERSION": EnvManager.get_trtllm_version(),
+            "COMMIT_HASH": EnvManager.get_commit_hash(),
+            "COMMIT_TIME": EnvManager.get_commit_time(),
+            "DOCKER_IMAGE": EnvManager.get_docker_image(),
+            "INSTALL_MODE": EnvManager.get_install_mode(),
+            "GPU_TYPE": EnvManager.get_gpu_type(),
+            "SLURM_PARTITION": EnvManager.get_slurm_partition(),
+            "SLURM_ACCOUNT": EnvManager.get_slurm_account(),
+        }
+
 
 CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")
 

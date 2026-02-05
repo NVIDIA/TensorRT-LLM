@@ -44,6 +44,26 @@ else:
     logger.debug(f"Debug mode: Skipping atexit handler: {EnvManager.get_debug_job_id()}")
 
 
+def _log_env_info():
+    """Log environment information at session start."""
+    env_info = EnvManager.get_env_info()
+    
+    logger.info(f"\n{'=' * 60}")
+    logger.info("Environment Information")
+    logger.info(f"{'=' * 60}")
+    logger.info(f"TRT_LLM_BRANCH:    {env_info['TRT_LLM_BRANCH']}")
+    logger.info(f"TRT_LLM_REPO:      {env_info['TRT_LLM_REPO']}")
+    logger.info(f"TRT_LLM_VERSION:   {env_info['TRT_LLM_VERSION']}")
+    logger.info(f"COMMIT_HASH:       {env_info['COMMIT_HASH']}")
+    logger.info(f"COMMIT_TIME:       {env_info['COMMIT_TIME']}")
+    logger.info(f"DOCKER_IMAGE:      {env_info['DOCKER_IMAGE']}")
+    logger.info(f"INSTALL_MODE:      {env_info['INSTALL_MODE']}")
+    logger.info(f"GPU_TYPE:          {env_info['GPU_TYPE']}")
+    logger.info(f"SLURM_PARTITION:   {env_info['SLURM_PARTITION']}")
+    logger.info(f"SLURM_ACCOUNT:     {env_info['SLURM_ACCOUNT']}")
+    logger.info(f"{'=' * 60}")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def session_lifecycle():
     """Session lifecycle management."""
@@ -53,6 +73,10 @@ def session_lifecycle():
     JobTracker.record_pid()
 
     session_tracker.start()
+    
+    # Log environment information at session start
+    _log_env_info()
+    
     try:
         yield
     finally:
@@ -85,6 +109,7 @@ class TestDisaggBenchmark:
         result = None
 
         try:
+            env_info = EnvManager.get_env_info()
             logger.info(f"\n{'=' * 60}")
             logger.info(f"Performance Test: {test_config.display_name}")
             logger.info(f"Test ID: {test_config.test_id}")
@@ -95,6 +120,10 @@ class TestDisaggBenchmark:
             logger.info(f"Benchmark: {test_config.benchmark_type}")
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
+            logger.info(f"GPU_TYPE:          {env_info['GPU_TYPE']}")
+            logger.info(f"TRT_LLM_VERSION:   {env_info['TRT_LLM_VERSION']}")
+            logger.info(f"COMMIT_HASH:       {env_info['COMMIT_HASH']}")
+            logger.info(f"DOCKER_IMAGE:      {env_info['DOCKER_IMAGE']}")
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
@@ -160,6 +189,7 @@ class TestDisaggBenchmark:
         result = None
 
         try:
+            env_info = EnvManager.get_env_info()
             logger.info(f"\n{'=' * 60}")
             logger.info(f"Accuracy Test: {test_config.display_name}")
             logger.info(f"Test ID: {test_config.test_id}")
@@ -174,6 +204,10 @@ class TestDisaggBenchmark:
 
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
+            logger.info(f"GPU_TYPE:          {env_info['GPU_TYPE']}")
+            logger.info(f"TRT_LLM_VERSION:   {env_info['TRT_LLM_VERSION']}")
+            logger.info(f"COMMIT_HASH:       {env_info['COMMIT_HASH']}")
+            logger.info(f"DOCKER_IMAGE:      {env_info['DOCKER_IMAGE']}")
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
@@ -239,6 +273,7 @@ class TestDisaggBenchmark:
         result = None
 
         try:
+            env_info = EnvManager.get_env_info()
             logger.info(f"\n{'=' * 60}")
             logger.info(f"Stress Test (Perf + Accuracy): {test_config.display_name}")
             logger.info(f"Test ID: {test_config.test_id}")
@@ -255,6 +290,10 @@ class TestDisaggBenchmark:
 
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
+            logger.info(f"GPU_TYPE:          {env_info['GPU_TYPE']}")
+            logger.info(f"TRT_LLM_VERSION:   {env_info['TRT_LLM_VERSION']}")
+            logger.info(f"COMMIT_HASH:       {env_info['COMMIT_HASH']}")
+            logger.info(f"DOCKER_IMAGE:      {env_info['DOCKER_IMAGE']}")
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
