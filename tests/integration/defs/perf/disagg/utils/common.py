@@ -61,13 +61,13 @@ class EnvManager:
     @staticmethod
     def get_slurm_job_name() -> str:
         """Get SLURM job name: {SLURM_ACCOUNT}-{base}.
-        
+
         Example: myaccount-unified.benchmark
         Customize base via SLURM_JOB_BASE_NAME env var (default: unified.benchmark)
         """
         account = EnvManager.get_slurm_account()
         base = os.getenv("SLURM_JOB_BASE_NAME", "unified.benchmark")
-        
+
         # Only use account as prefix if it's set and not a placeholder
         if account and not account.startswith("<"):
             return f"{account}-{base}"
