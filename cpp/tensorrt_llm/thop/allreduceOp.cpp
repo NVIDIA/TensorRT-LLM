@@ -1429,22 +1429,22 @@ private:
 #endif // ENABLE_MULTI_DEVICE
 
 void preallocateNCCLWindowBuffer(
-    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t buffers_per_size)
+    torch::Tensor const& input, torch::List<int64_t> const& group, const int64_t buffersPerSize)
 {
 #if ENABLE_MULTI_DEVICE
-    if (buffers_per_size <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
+    if (buffersPerSize <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
     {
         return;
     }
 
-    std::set<int> group_set;
+    std::set<int> groupSet;
     for (auto const& rank : group)
     {
-        group_set.insert(static_cast<int>(rank));
+        groupSet.insert(static_cast<int>(rank));
     }
 
-    auto comm_ptr = getComm(group_set);
-    if (!comm_ptr || *comm_ptr == nullptr)
+    auto const commPtr = getComm(groupSet);
+    if (!commPtr || *commPtr == nullptr)
     {
         TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffers] NCCL comm is null; skipping preallocation");
         return;
@@ -1452,48 +1452,48 @@ void preallocateNCCLWindowBuffer(
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
     auto& allocator = NCCLWindowAllocator::getInstance();
-    ncclComm_t comm = *comm_ptr;
+    const ncclComm_t comm = *commPtr;
 
-    int64_t num_tokens = input.size(0);
-    int64_t elements_per_token = input.numel() / num_tokens;
-    if (elements_per_token <= 0)
+    const int64_t numTokens = input.size(0);
+    const int64_t elementsPerToken = input.numel() / numTokens;
+    if (elementsPerToken <= 0)
     {
         return;
     }
-    auto const size = static_cast<size_t>(num_tokens) * static_cast<size_t>(elements_per_token)
+    const size_t bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
         * static_cast<size_t>(input.element_size());
-    if (size == 0)
+    if (bufferSize == 0)
     {
         return;
     }
     TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) for tokens=%ld (%zu bytes) comm %p",
-        buffers_per_size, num_tokens, size, static_cast<void*>(comm));
-    std::vector<void*> allocated_ptrs;
-    allocated_ptrs.reserve(buffers_per_size);
+        buffersPerSize, numTokens, bufferSize, static_cast<void*>(comm));
+    std::vector<void*> allocatedPtrs;
+    allocatedPtrs.reserve(buffersPerSize);
     try
     {
-        for (int64_t i = 0; i < buffers_per_size; ++i)
+        for (int64_t i = 0; i < buffersPerSize; ++i)
         {
-            auto buffer = allocator.requestBuffer(comm, size);
+            auto buffer = allocator.requestBuffer(comm, bufferSize);
             if (!buffer.isValid())
             {
                 break;
             }
-            allocated_ptrs.push_back(buffer.ptr);
+            allocatedPtrs.push_back(buffer.ptr);
         }
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] requestBuffer failed for %zu bytes: %s", size, e.what());
+        TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] requestBuffer failed for %zu bytes: %s", bufferSize, e.what());
     }
 
-    for (auto ptr : allocated_ptrs)
+    for (auto ptr : allocatedPtrs)
     {
         allocator.releaseBuffer(comm, ptr);
     }
 #else
     (void) group;
-    (void) buffers_per_size;
+    (void) buffersPerSize;
 #endif
 }
 
