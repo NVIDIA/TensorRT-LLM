@@ -3523,7 +3523,9 @@ def get_cubin_header(kernel_traits, specs_names):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
-                        '_sliding_or_chunked_causal', '_custom_mask', '_causal'
+                        '_sliding_or_chunked_causal',
+                        '_bidirectional_sliding_window', '_custom_mask',
+                        '_causal'
                     ]
                     for mask_type in mask_types:
                         lname = lname.replace(mask_type, '')
