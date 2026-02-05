@@ -800,10 +800,20 @@ class Sharding(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
         config = self.config
         config.factory_config = factory.get_sharding_config() if factory else {}
         config.rank = local_rank
         config.world_size = world_size
+
+        # Early exit for single device - no sharding needed
+        # Create empty container with default config for downstream transforms
+        if world_size < 2:
+            ad_logger.info("Skipping sharding: single device")
+            shared_config.sharding_transform_container = ShardingTransformContainer(config=config)
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
         # validate the config
         config.validate_config()
         # initialize the transform container
@@ -813,9 +823,8 @@ class Sharding(BaseTransform):
             f"Using allreduce strategy: {config.allreduce_strategy.name}, dist backend: {config.dist_backend}"
         )
 
-        if world_size < 2 or config.enable_attention_dp:
-            reason = "single device" if world_size < 2 else "attention DP enabled"
-            ad_logger.info(f"Skipping sharding: {reason}")
+        if config.enable_attention_dp:
+            ad_logger.info("Skipping sharding: attention DP enabled")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )

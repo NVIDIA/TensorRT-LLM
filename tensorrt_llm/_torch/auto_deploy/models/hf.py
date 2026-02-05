@@ -142,6 +142,18 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         model_config, _ = self._get_model_config()
         return getattr(model_config, "vocab_size", None)
 
+    @property
+    def hidden_size(self) -> Optional[int]:
+        """Return the hidden size from the model config."""
+        model_config, _ = self._get_model_config()
+        return getattr(model_config, "hidden_size", None)
+
+    @property
+    def dtype(self) -> Optional[torch.dtype]:
+        """Return the model dtype from the model config."""
+        model_config, _ = self._get_model_config()
+        return getattr(model_config, "torch_dtype", None)
+
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
     ) -> Tuple[PretrainedConfig, Dict[str, Any]]:

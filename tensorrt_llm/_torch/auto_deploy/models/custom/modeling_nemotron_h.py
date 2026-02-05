@@ -635,3 +635,160 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
 
 
 AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
+
+
+# =============================================================================
+# Eagle Layer Builder for NemotronH MTP (Multi-Token Prediction)
+# =============================================================================
+#
+# The MTP drafter is built using EagleDrafterForCausalLM with NemotronH-specific
+# Eagle layers. This approach:
+# - Uses the unified EagleDrafterForCausalLM wrapper from modeling_eagle.py
+# - Builds NemotronHEagleLayer instances via build_nemotron_eagle_layers()
+# - Handles NemotronH-specific architecture: pattern-based layers ("*E"),
+#   no RoPE, start projections (enorm, hnorm, eh_proj), and final_layernorm
+
+# =============================================================================
+
+
+class NemotronHEagleLayer(nn.Module):
+    """Eagle layer for NemotronH models.
+
+    This layer follows the unified Eagle interface:
+        forward(hidden_states, inputs_embeds, position_ids) -> Tensor
+
+    NemotronH does not use RoPE, so position_ids is accepted but ignored.
+    The layer implements the MTP (Multi-Token Prediction) architecture:
+    - First layer fuses embeds + hidden_states via start projections (enorm, hnorm, eh_proj)
+    - All layers have pre-norm residual block with mixer (Attention or MoE)
+    - Last layer applies final_layernorm
+
+    Architecture for pattern "*E":
+        Layer 0 (*): Attention with start projections
+        Layer 1 (E): MoE with final_layernorm
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        layer_type: str,
+        has_start_projections: bool,
+        has_end_norm: bool,
+    ):
+        super().__init__()
+        eps = getattr(config, "layer_norm_epsilon", getattr(config, "norm_eps", 1e-5))
+        self.has_start_projections = has_start_projections
+        self.has_end_norm = has_end_norm
+
+        # Start projections (only on first layer)
+        # These fuse embeds + hidden_states: eh_proj(cat(enorm(embeds), hnorm(hidden)))
+        if has_start_projections:
+            self.enorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+            self.hnorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+            self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+
+        # Pre-layer norm
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+
+        # Mixer based on layer type
+        if layer_type == "*":
+            self.mixer = NemotronHAttention(config, layer_idx=layer_idx)
+        elif layer_type == "E":
+            self.mixer = NemotronHMOE(config, layer_idx=layer_idx)
+        else:
+            raise ValueError(f"Unknown MTP layer type: {layer_type}")
+
+        # Final norm (only on last layer)
+        if has_end_norm:
+            self.final_layernorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Forward pass with unified Eagle interface.
+
+        Args:
+            hidden_states: Hidden states from target model [batch, seq, hidden_size]
+            inputs_embeds: Token embeddings [batch, seq, hidden_size]
+            position_ids: Position IDs (ignored - NemotronH doesn't use RoPE)
+
+        Returns:
+            Updated hidden states [batch, seq, hidden_size]
+        """
+        # Note: position_ids is ignored - NemotronH doesn't use RoPE
+
+        # Fuse embeddings and hidden states (first layer only)
+        if self.has_start_projections:
+            e_normed = self.enorm(inputs_embeds)
+            h_normed = self.hnorm(hidden_states)
+            hidden_states = self.eh_proj(torch.cat([e_normed, h_normed], dim=-1))
+
+        # Standard pre-norm residual block
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.mixer(hidden_states)
+        hidden_states = residual + hidden_states
+
+        # Final layer norm (last layer only)
+        if self.has_end_norm:
+            hidden_states = self.final_layernorm(hidden_states)
+
+        return hidden_states
+
+
+def build_nemotron_eagle_layers(config) -> Union[nn.ModuleList, nn.Module]:
+    """Build NemotronH MTP layers for Eagle drafter.
+
+    This function is called by get_eagle_layers() in modeling_eagle.py when
+    model_type is "nemotron_h".
+
+    NemotronH Eagle layers differ from Llama Eagle layers in:
+    - Do NOT use RoPE (hybrid Mamba model)
+    - Use pattern-based construction ("*E" = Attention + MoE)
+    - First layer has start projections (enorm, hnorm, eh_proj)
+    - Last layer has final_layernorm
+
+    Forward signature (unified interface):
+        forward(hidden_states, inputs_embeds, position_ids) -> Tensor
+
+    For backward compatibility with checkpoints:
+    - Single layer: returns NemotronHEagleLayer directly (not wrapped in ModuleList)
+    - Multiple layers: returns nn.ModuleList of NemotronHEagleLayer instances
+
+    This matches the Llama Eagle layer builder behavior for checkpoint weight loading.
+
+    Args:
+        config: Model configuration with NemotronH-specific parameters
+                (mtp_hybrid_override_pattern, n_routed_experts, etc.)
+
+    Returns:
+        nn.ModuleList of NemotronHEagleLayer instances, or single NemotronHEagleLayer
+    """
+    pattern = getattr(config, "mtp_hybrid_override_pattern", "*E")
+
+    if len(pattern) > 1:
+        return nn.ModuleList(
+            [
+                NemotronHEagleLayer(
+                    config,
+                    layer_idx=i,
+                    layer_type=char,
+                    has_start_projections=(i == 0),
+                    has_end_norm=(i == len(pattern) - 1),
+                )
+                for i, char in enumerate(pattern)
+            ]
+        )
+    else:
+        # Single layer case - return layer directly (not wrapped in ModuleList)
+        return NemotronHEagleLayer(
+            config,
+            layer_idx=0,
+            layer_type=pattern[0],
+            has_start_projections=True,
+            has_end_norm=True,
+        )

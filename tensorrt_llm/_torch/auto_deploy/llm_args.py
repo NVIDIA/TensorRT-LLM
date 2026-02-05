@@ -14,6 +14,7 @@ from ...llmapi.llm_args import (
     _ParallelConfig,
 )
 from .models import ModelFactory, ModelFactoryRegistry
+from .models.eagle import EagleOneModelFactory
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
 
@@ -161,6 +162,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         "file. Arguments are resolved in order: 1) Default values in model config class, 2) Values "
         "in model config file, 3) Values in model_kwargs. Note: if a kwarg doesn't exist in the "
         "model config class, it will be ignored.",
+    )
+
+    speculative_model_kwargs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra kwargs for the speculative (draft) model config class. Same semantics "
+        "as model_kwargs but applied to the draft model when using speculative decoding. Only used "
+        "when using Eagle3 speculative decoding with one model.",
     )
 
     skip_loading_weights: bool = Field(
@@ -316,7 +324,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         """Create a model factory from the arguments."""
 
         # TODO (lucaslie): consider supporting Path objects in the model factory
-        return ModelFactoryRegistry.get(self.model_factory)(
+        target_factory = ModelFactoryRegistry.get(self.model_factory)(
             model=str(self.model),
             model_kwargs=self.model_kwargs,
             tokenizer=None if self.tokenizer is None else str(self.tokenizer),
@@ -324,6 +332,29 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
         )
+
+        # Check if we need to wrap with EagleOneModelFactory for one-model Eagle
+        is_eagle_one_model = (
+            self.speculative_config is not None
+            and isinstance(self.speculative_config, EagleDecodingConfig)
+            and self.speculative_config.eagle3_one_model
+        )
+        if is_eagle_one_model:
+            # Compute max_num_tokens if not set, then adjust for draft tokens
+            max_num_tokens = self.max_num_tokens or self.max_batch_size * self.max_seq_len
+            max_num_tokens = (
+                min(max_num_tokens, self.max_batch_size * self.max_seq_len)
+                + (self.speculative_config.max_total_draft_tokens + 1) * self.max_batch_size
+            )
+            target_factory = EagleOneModelFactory.build_from_target(
+                target_factory=target_factory,
+                speculative_config=self.speculative_config,
+                max_batch_size=self.max_batch_size,
+                max_num_tokens=max_num_tokens,
+                draft_model_kwargs=self.speculative_model_kwargs or None,
+            )
+
+        return target_factory
 
     def is_cuda_graph_enabled(self) -> bool:
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]

@@ -83,6 +83,7 @@ transforms:
     stage: pattern_matcher
   detect_hidden_states_for_capture:
     stage: pattern_matcher
+    run_per_gm: false
   detect_sharding:
     stage: sharding
     simple_shard_only: false

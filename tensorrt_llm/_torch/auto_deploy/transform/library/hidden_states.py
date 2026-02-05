@@ -18,6 +18,7 @@
 from typing import Dict, List, Optional, Set, Tuple, Type
 
 import torch
+import torch.nn as nn
 from torch._ops import OpOverloadPacket
 from torch.fx import GraphModule, Node
 
@@ -33,6 +34,7 @@ from ...custom_ops.attention_interface import (
 )
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import named_graphmodules
 from ...utils.node_utils import get_all_layer_subgraphs, is_op
 from ..interface import (
     BaseTransform,
@@ -146,22 +148,22 @@ class DetectHiddenStatesForCapture(BaseTransform):
 
         return residual_add_nodes
 
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        if not self.config.capture_hidden_states:
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
+    def _apply_to_subgraph(self, gm: GraphModule) -> Tuple[GraphModule, TransformInfo]:
+        """Apply the hidden states capture transform to a single subgraph.
 
+        Args:
+            gm: The graph module to transform.
+
+        Returns:
+            The transformed graph module and transform info.
+        """
+        # Skip if already processed
         if gm.graph.find_nodes(
             op="call_function", target=torch.ops.auto_deploy.residual_add_for_capture.default
         ):
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         residual_add_nodes = self.collect_residual_add_nodes(gm)
 
@@ -174,11 +176,11 @@ class DetectHiddenStatesForCapture(BaseTransform):
         }
 
         assert residual_add_nodes.keys() == self.config.eagle3_layers_to_capture, (
-            f"Unable to find residual add nodes for layers. Expected: {self.config.eagle3_layers_to_capture}, \
-            Found: {residual_add_nodes.keys()}"
+            f"Unable to find residual add nodes for layers. Expected: {self.config.eagle3_layers_to_capture}, "
+            f"Found: {residual_add_nodes.keys()}"
         )
 
-        # replace residual add nodes with special placeholder nodes
+        # Replace residual add nodes with special placeholder nodes
         for layer_number, res_node in residual_add_nodes.items():
             with gm.graph.inserting_before(res_node):
                 new_node = gm.graph.call_function(
@@ -190,10 +192,50 @@ class DetectHiddenStatesForCapture(BaseTransform):
             gm.graph.erase_node(res_node)
 
         cnt = len(residual_add_nodes)
-        info = TransformInfo(
+        return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=(cnt == 0), has_valid_shapes=(cnt == 0)
         )
-        return gm, info
+
+    def _apply_to_full_model(
+        self,
+        mod: nn.Module,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[nn.Module, TransformInfo]:
+        """Apply hidden states capture transform to the full model.
+
+        This method iterates over all graph modules in the model and applies the
+        transform only to target model subgraphs, skipping draft model subgraphs.
+        Hidden state capture is only needed on the target model since that's where
+        the hidden states are generated for the draft model to consume.
+        """
+        if not self.config.capture_hidden_states:
+            return mod, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        total_matches = 0
+        for name, gm in named_graphmodules(mod):
+            # Skip draft model subgraph - hidden states capture only applies to target model
+            if name == "draft_model":
+                continue
+
+            gm, info = self._apply_to_subgraph(gm)
+
+            if name == "":
+                mod = gm
+            else:
+                mod.set_submodule(name, gm)
+
+            total_matches += info.num_matches
+
+        return mod, TransformInfo(
+            skipped=(total_matches == 0),
+            num_matches=total_matches,
+            is_clean=(total_matches == 0),
+            has_valid_shapes=(total_matches == 0),
+        )
 
 
 class HiddenStatesResourceHandler(ResourceHandler):

@@ -195,18 +195,18 @@ class _InsertCachedOperator(BaseTransform):
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
-        for idx, attn_node in enumerate(source_attn_nodes):
+        for attn_node in source_attn_nodes:
             # pick out GEMMs
             qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
             # setup + store cache initializers and caches as input nodes
-            cache_in_nodes = []
-            for k, resource_handler in attn_descriptor.get_cache_initializers(
+            cache_initializers = attn_descriptor.get_cache_initializers(
                 attn_node, cm.kv_cache_config
-            ).items():
-                k_indexed = f"{k}_{idx}"
-                cm.add_resource(k_indexed, resource_handler)
-                cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
+            )
+            unique_names = cm.add_resource_group(cache_initializers)
+            cache_in_nodes = [
+                self._process_cache_node(gm, unique_names[k]) for k in cache_initializers.keys()
+            ]
 
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
