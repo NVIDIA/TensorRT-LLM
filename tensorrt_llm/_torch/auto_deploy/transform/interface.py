@@ -655,6 +655,7 @@ class BaseTransform(ABC):
             abs(diff.resv) >= mem_change_threshold
             or abs(diff.alloc) >= mem_change_threshold
             or abs(diff.frag) >= mem_change_threshold
+            or abs(diff.free) >= mem_change_threshold
         )
 
         def _fmt_val_with_delta(val: float, delta: float, color: str) -> str:

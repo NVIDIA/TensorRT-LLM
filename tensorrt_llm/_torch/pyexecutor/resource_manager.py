@@ -23,7 +23,8 @@ from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (AttentionLayerConfig,
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
+                                                      AttentionLayerConfig,
                                                       BufferConfig,
                                                       GpuCacheTierConfig,
                                                       HostCacheTierConfig)
@@ -900,6 +901,25 @@ class KVCacheManager(BaseResourceManager):
     def get_last_block_id(self, request_id: int) -> int:
         return self.impl.get_last_block_id(request_id)
 
+    def get_priority_by_block_id(self,
+                                 block_id: int,
+                                 window_size: Optional[int] = None) -> int:
+        """Get the retention priority of a block by its ID.
+
+        Args:
+            block_id: The ID of the block.
+            window_size: The attention window size this block belongs to.
+                         Required for VSWA configurations with multiple window sizes.
+
+        Returns:
+            The retention priority of the block (0-100), or default priority (35) if not found.
+        """
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+        return self.impl.get_priority_by_block_id(block_id, window_size)
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
@@ -1704,7 +1724,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         # Last token cannot be recovered, so we don't include it in the input tokens to look up for the block that can be reused.
                         kv_cache = self._create_kv_cache(
                             req.py_request_id, req.lora_task_id,
-                            req.get_tokens(0)[:-1]
+                            req.get_tokens(DEFAULT_BEAM_INDEX)[:-1]
                             if self.enable_block_reuse else None)
                         assert beam_width == 1, "Currently, KVCacheManagerV2 only supports beam width 1"
                         if not self.enable_block_reuse:
@@ -1771,9 +1791,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_num_draft_tokens: int = 0,
             use_mrope: bool = False,
             max_beam_width: int = 1,
-            num_extra_decoding_steps:
-        int = 0,  # TODO: support num_extra_decoding_steps
-    ):
+            num_extra_decoding_steps: int = 0):
 
         beam_width = max_beam_width
         requests = []
@@ -1848,7 +1866,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return self._get_batch_cache_indices_by_pool_id(
             request_ids,
-            pool_id=self.layer_to_pool_mapping_dict[layer_id],
+            pool_id=self.layer_to_pool_mapping_dict[
+                self.layer_offsets[layer_id]],
             is_kv_aggregate=True)
 
     def _get_batch_cache_indices_by_pool_id(
@@ -2040,8 +2059,9 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.enable_block_reuse and not req.is_dummy_request:
                 if req.context_current_position > kv_cache.num_committed_tokens:
                     kv_cache.commit(
-                        req.get_tokens(0)[kv_cache.num_committed_tokens:req.
-                                          context_current_position])
+                        req.get_tokens(DEFAULT_BEAM_INDEX)
+                        [kv_cache.num_committed_tokens:req.
+                         context_current_position])
                 kv_cache.stop_committing()
             else:
                 kv_cache.resize(None, req.context_current_position)

@@ -20,6 +20,7 @@ l0_dgx_b200_perf_sanity:
   # - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_dep8_mtp1_1k1k] TIMEOUT (90) # failed
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_tp8_mtp3_8k1k]
   # - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_dep8_mtp1_8k1k] TIMEOUT (90) # failed
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_tp8_6k1k] TIMEOUT (90)
   # deepseek_r1_fp4_v2_blackwell
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_tp4_mtp3_1k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_tp4_mtp3_8k1k]

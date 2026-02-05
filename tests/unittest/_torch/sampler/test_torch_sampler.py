@@ -35,7 +35,6 @@ import torch
 from scipy.stats import power_divergence
 from utils.util import assert_no_cuda_sync, force_ampere
 
-from tensorrt_llm._torch.pyexecutor import sampling_utils_flashinfer
 from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
 from tensorrt_llm._torch.pyexecutor.sampler import (
     GREEDY,
@@ -84,6 +83,9 @@ class TestStrategySelection:
     class MockLlmRequest:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
+
+        def __init__(self):
+            self._py_sampling_strategy: Strategy | None = None
 
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
@@ -1562,12 +1564,15 @@ class TestBatchedSampling:
                 generator: Optional[torch.Generator] = None,
                 return_probs: bool,
                 group_metadata: StrategyMetadata | None = None,
-            ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-                assert issubclass(group_key, sampling_utils_flashinfer._StrategyImpls.StrategyImpl)
+            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
                 assert generator is sampler.get_generator(logits.device)
+                if isinstance(group_key, tuple):
+                    assert isinstance(group_key[0], str)
+                else:
+                    assert isinstance(group_key, str)
                 nonlocal flashinfer_keys_seen
-                assert group_key not in flashinfer_keys_seen
-                flashinfer_keys_seen.add(group_key)
+                assert (group_key, return_probs) not in flashinfer_keys_seen
+                flashinfer_keys_seen.add((group_key, return_probs))
                 return sample_grouped_strategies_orig(
                     group_key,
                     strategies,

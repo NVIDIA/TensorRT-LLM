@@ -549,20 +549,26 @@ class AggrTestCmds(NamedTuple):
             server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, server_port)
 
             server_file_path = os.path.join(self.output_dir, f"trtllm-serve.{server_idx}.log")
+            server_error_file_path = os.path.join(
+                self.output_dir, f"trtllm-serve.{server_idx}.error.log"
+            )
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
-            with open(server_file_path, "w") as server_ctx:
+            with (
+                open(server_file_path, "w") as server_ctx,
+                open(server_error_file_path, "w") as server_err_ctx,
+            ):
                 server_proc = subprocess.Popen(
                     server_cmd_with_port,
                     stdout=server_ctx,
-                    stderr=subprocess.STDOUT,
+                    stderr=server_err_ctx,
                     env=copy.deepcopy(os.environ),
                 )
 
             wait_for_endpoint_ready(
                 f"http://{server_hostname}:{server_port}/health",
                 timeout=self.timeout,
-                check_files=[server_file_path],
+                check_files=[server_file_path, server_error_file_path],
                 server_proc=server_proc,
             )
 
@@ -571,20 +577,27 @@ class AggrTestCmds(NamedTuple):
                 client_file_path = os.path.join(
                     self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
                 )
+                client_error_file_path = os.path.join(
+                    self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.error.log"
+                )
 
                 client_cmd_with_port = add_host_port_to_cmd(
                     client_cmd, server_hostname, server_port
                 )
                 print_info(f"Starting client. cmd is {client_cmd_with_port}")
 
-                output = subprocess.check_output(
+                result = subprocess.run(
                     client_cmd_with_port,
-                    stderr=subprocess.STDOUT,
+                    capture_output=True,
                     env=copy.deepcopy(os.environ),
-                ).decode()
+                    check=True,
+                )
+                output = result.stdout.decode()
 
                 with open(client_file_path, "w") as client_ctx:
                     client_ctx.write(output)
+                with open(client_error_file_path, "w") as client_err_ctx:
+                    client_err_ctx.write(result.stderr.decode())
 
                 outputs.append(output)
 
@@ -723,7 +736,10 @@ class DisaggTestCmds(NamedTuple):
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
             self._generate_hostname_file(server_idx, port)
             server_file_path = os.path.join(
-                self.output_dir, f"trtllm-serve.{server_idx}.{self.disagg_serving_type}.log"
+                self.output_dir, f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log"
+            )
+            server_error_file_path = os.path.join(
+                self.output_dir, f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.error.log"
             )
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
@@ -732,11 +748,14 @@ class DisaggTestCmds(NamedTuple):
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
                 )
-                with open(server_file_path, "w") as server_ctx:
+                with (
+                    open(server_file_path, "w") as server_ctx,
+                    open(server_error_file_path, "w") as server_err_ctx,
+                ):
                     server_proc = subprocess.Popen(
                         server_cmd,
                         stdout=server_ctx,
-                        stderr=subprocess.STDOUT,
+                        stderr=server_err_ctx,
                         env=copy.deepcopy(os.environ),
                     )
                 self.wait_for_benchmark_ready(benchmark_status_file)
@@ -747,16 +766,22 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             disagg_server_file_path = os.path.join(
-                self.output_dir, f"trtllm-serve.{server_idx}.{self.disagg_serving_type}.log"
+                self.output_dir, f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log"
+            )
+            disagg_server_error_file_path = os.path.join(
+                self.output_dir, f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.error.log"
             )
             try:
                 self._generate_disagg_server_config(server_idx, port)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
-                with open(disagg_server_file_path, "w") as disagg_server_ctx:
+                with (
+                    open(disagg_server_file_path, "w") as disagg_server_ctx,
+                    open(disagg_server_error_file_path, "w") as disagg_server_err_ctx,
+                ):
                     disagg_server_proc = subprocess.Popen(
                         disagg_cmd,
                         stdout=disagg_server_ctx,
-                        stderr=subprocess.STDOUT,
+                        stderr=disagg_server_err_ctx,
                         env=copy.deepcopy(os.environ),
                     )
                 self.wait_for_benchmark_ready(benchmark_status_file)
@@ -770,21 +795,28 @@ class DisaggTestCmds(NamedTuple):
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
                 )
-                server_files = [
-                    os.path.join(self.output_dir, f"trtllm-serve.{server_idx}.DISAGG_SERVER.log"),
-                ]
-                for ctx_idx in range(self.num_ctx_servers):
-                    server_files.append(
+                server_files = (
+                    [
                         os.path.join(
-                            self.output_dir, f"trtllm-serve.{server_idx}.CTX_{ctx_idx}.log"
-                        )
-                    )
-                for gen_idx in range(self.num_gen_servers):
-                    server_files.append(
+                            self.output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log"
+                        ),
                         os.path.join(
-                            self.output_dir, f"trtllm-serve.{server_idx}.GEN_{gen_idx}.log"
+                            self.output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.error.log"
+                        ),
+                    ]
+                    + [
+                        os.path.join(
+                            self.output_dir, f"trtllm-serve.CTX_{ctx_idx}.{server_idx}.log"
                         )
-                    )
+                        for ctx_idx in range(self.num_ctx_servers)
+                    ]
+                    + [
+                        os.path.join(
+                            self.output_dir, f"trtllm-serve.GEN_{gen_idx}.{server_idx}.log"
+                        )
+                        for gen_idx in range(self.num_gen_servers)
+                    ]
+                )
                 wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
                     timeout=self.timeout,
@@ -796,20 +828,27 @@ class DisaggTestCmds(NamedTuple):
                     benchmark_file_path = os.path.join(
                         self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
                     )
+                    benchmark_error_file_path = os.path.join(
+                        self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.error.log"
+                    )
 
                     client_cmd_with_port = add_host_port_to_cmd(
                         client_cmd, disagg_server_hostname, disagg_server_port
                     )
                     print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
 
-                    output = subprocess.check_output(
+                    result = subprocess.run(
                         client_cmd_with_port,
+                        capture_output=True,
                         env=copy.deepcopy(os.environ),
-                        stderr=subprocess.STDOUT,
-                    ).decode()
+                        check=True,
+                    )
+                    output = result.stdout.decode()
 
                     with open(benchmark_file_path, "w") as benchmark_ctx:
                         benchmark_ctx.write(output)
+                    with open(benchmark_error_file_path, "w") as benchmark_err_ctx:
+                        benchmark_err_ctx.write(result.stderr.decode())
                     outputs.append(output)
 
             finally:
@@ -1197,11 +1236,21 @@ class PerfSanityTestConfig:
 
             except Exception as e:
                 print_error(f"Test command failed for server {server_idx}. Error: {e}")
-                if isinstance(e, subprocess.CalledProcessError):
-                    print_error("--- stdout ---")
-                    if e.stdout:
-                        print_error(e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout)
-                    print_error("--------------")
+                # Print content of trtllm-serve error log files
+                error_log_pattern = os.path.join(
+                    commands.output_dir, f"trtllm-serve*{server_idx}.error.log"
+                )
+                error_log_files = glob.glob(error_log_pattern)
+                for error_log_file in error_log_files:
+                    if os.path.exists(error_log_file):
+                        print_error(f"--- {error_log_file} ---")
+                        with open(error_log_file, "r") as f:
+                            content = f.read()
+                            if content.strip():
+                                print_error(content)
+                            else:
+                                print_error("(empty)")
+                        print_error("-" * len(f"--- {error_log_file} ---"))
                 outputs[server_idx] = []
 
         return outputs
