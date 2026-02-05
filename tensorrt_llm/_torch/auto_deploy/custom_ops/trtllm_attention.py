@@ -245,13 +245,28 @@ class TrtllmAttentionGlobalState:
 
     def _init_shared_tensors(
         self, max_num_requests: int, max_context_length: int, tokens_per_block: int
-    ) -> None:
-        """Initialize shared tensors used by all layers."""
-        if self._shared_tensors_initialized:
-            return
+    ) -> bool:
+        """Initialize shared tensors used by all layers.
 
+        Supports reallocation if a larger batch size is needed after initial allocation.
+        This handles the case where attention ops are created with default max_batch_size
+        but the actual batch size from AD's cache config is larger.
+
+        Returns:
+            True if (re)allocation was performed, False if already sufficient.
+        """
         device = "cuda"
         max_blocks_per_seq = (max_context_length + tokens_per_block - 1) // tokens_per_block
+
+        # Check if reallocation is needed (current size < requested size)
+        needs_realloc = (
+            self._shared_tensors_initialized
+            and self._shared_sequence_length is not None
+            and self._shared_sequence_length.shape[0] < max_num_requests
+        )
+
+        if self._shared_tensors_initialized and not needs_realloc:
+            return False
 
         # Shared device tensors
         self._shared_sequence_length = torch.zeros(
@@ -287,10 +302,21 @@ class TrtllmAttentionGlobalState:
         )
 
         self._shared_tensors_initialized = True
+        return True
 
     def _init_cpu_buffers(self, max_seqs: int) -> None:
-        """Initialize pre-allocated CPU buffers to avoid tensor allocation in hot path."""
-        if self._cpu_buffers_initialized:
+        """Initialize pre-allocated CPU buffers to avoid tensor allocation in hot path.
+
+        Supports reallocation if a larger size is needed.
+        """
+        # Check if reallocation is needed
+        needs_realloc = (
+            self._cpu_buffers_initialized
+            and self._cpu_input_seq_lens is not None
+            and self._cpu_input_seq_lens.shape[0] < max_seqs
+        )
+
+        if self._cpu_buffers_initialized and not needs_realloc:
             return
 
         # Pre-allocate pinned CPU buffers for intermediate computations
@@ -312,8 +338,21 @@ class TrtllmAttentionGlobalState:
         self._cpu_buffers_initialized = True
 
     def _init_gpu_buffers(self, max_pages: int, max_seqs: int) -> None:
-        """Initialize pre-allocated GPU buffers for vectorized operations."""
-        if self._gpu_buffers_initialized:
+        """Initialize pre-allocated GPU buffers for vectorized operations.
+
+        Supports reallocation if a larger size is needed.
+        """
+        # Check if reallocation is needed
+        needs_realloc = (
+            self._gpu_buffers_initialized
+            and self._gpu_cu_pages is not None
+            and (
+                self._gpu_cu_pages.shape[0] < max_seqs + 1
+                or self._gpu_page_positions.shape[0] < max_pages
+            )
+        )
+
+        if self._gpu_buffers_initialized and not needs_realloc:
             return
 
         # Pre-allocate buffers with max sizes to avoid per-call allocations
@@ -395,9 +434,16 @@ class TrtllmAttentionGlobalState:
         num_layers: int = 0,
     ) -> TrtllmLayerState:
         """Get or create per-layer state."""
-        # Initialize shared tensors once (used by all layers)
-        if not self._shared_tensors_initialized:
-            self._init_shared_tensors(max_num_requests, max_context_length, tokens_per_block)
+        # Initialize or reallocate shared tensors if needed
+        # Returns True if (re)allocation happened
+        did_realloc = self._init_shared_tensors(
+            max_num_requests, max_context_length, tokens_per_block
+        )
+
+        # Re-link existing layer states only if reallocation happened
+        if did_realloc:
+            for state in self._layer_states.values():
+                state.init_from_shared(self)
 
         if layer_idx not in self._layer_states:
             state = TrtllmLayerState(
@@ -645,6 +691,22 @@ def _prepare_trtllm_metadata(
     # Check if in CUDA graph capture mode
     is_capturing = torch.cuda.is_current_stream_capturing()
 
+    # Extract batch info early - needed for capacity check
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+
+    # Check if shared tensors need reallocation (batch size > allocated size)
+    # This handles the case where attention ops were created with a smaller max_batch_size
+    # than the actual batch size from AD's cache config
+    if state.sequence_length is not None and state.sequence_length.shape[0] < num_seq:
+        # Trigger reallocation with the actual batch size
+        did_realloc = _global_state._init_shared_tensors(
+            num_seq, state.max_context_length, state.tokens_per_block
+        )
+        if did_realloc:
+            # Re-link this state to the new shared tensors
+            state.init_from_shared(_global_state)
+
     # FAST PATH: If host_prepare has run and not capturing, just return pre-computed tensors
     # This is the key optimization - each layer does almost no work during replay
     if _global_state._host_prepare_called and not is_capturing:
@@ -661,10 +723,6 @@ def _prepare_trtllm_metadata(
             state.host_kv_cache_pool_pointers,
             state.host_kv_cache_pool_mapping,
         )
-
-    # Extract batch info
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-    num_seq = num_prefill + num_decode
 
     # CUDA GRAPH CAPTURE: Set host tensors to MAX (kernel requirement)
     if is_capturing:
