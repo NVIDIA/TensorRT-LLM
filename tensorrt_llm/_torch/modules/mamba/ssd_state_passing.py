@@ -23,12 +23,21 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
+        # Small dim configs with higher parallelism
+        triton.Config({"BLOCK_SIZE": 64}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 128}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 256}, num_stages=2, num_warps=4),
+        # Medium dim configs
+        triton.Config({"BLOCK_SIZE": 512}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 512}, num_stages=2, num_warps=8),
+        # Large dim configs
+        triton.Config({"BLOCK_SIZE": 1024}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 2048}, num_stages=3, num_warps=8),
+        # Original configs for fallback
         triton.Config({"BLOCK_SIZE": 64}),
         triton.Config({"BLOCK_SIZE": 128}),
         triton.Config({"BLOCK_SIZE": 256}),
         triton.Config({"BLOCK_SIZE": 512}),
-        triton.Config({"BLOCK_SIZE": 1024}),
-        triton.Config({"BLOCK_SIZE": 2048}),
     ],
     key=["dim"],
 )

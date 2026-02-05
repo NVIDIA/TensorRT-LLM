@@ -26,6 +26,124 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 @triton.autotune(
     configs=[
+        # =================================================================
+        # Higher warp count configs for better latency hiding
+        # More warps = more instructions in flight = better memory latency hiding
+        # =================================================================
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=8,  # 8 warps = 256 threads per block
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=8,  # 8 warps for better latency hiding
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=8,
+        ),
+        # Smaller tiles with more stages for software pipelining
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        # =================================================================
+        # Low register pressure configs (num_stages=1) for large dstate
+        # =================================================================
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=1,
+            num_warps=4,
+        ),
+        # num_stages=2 configs - moderate register pressure
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        # Original configs for smaller dstate values
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
@@ -355,14 +473,17 @@ def _chunk_scan_fwd_kernel(
 
             if not HAS_INITSTATES:
                 # - this is for continuous batching where there is no init states
-                scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m),
+                # Use exp2 for faster computation: exp(x) = exp2(x * log2(e))
+                scale_m = tl.where(seq_idx_m == seq_idx_prev,
+                                   tl.math.exp2(dA_cs_m * 1.4426950408889634),
                                    0.0)
             else:
                 # - if there is initstates, we will rely on prev_states, no zeroing
                 #   required.
-                scale_m = tl.exp(dA_cs_m - dA_cs_m_boundary)
+                scale_m = tl.math.exp2(
+                    (dA_cs_m - dA_cs_m_boundary) * 1.4426950408889634)
         else:
-            scale_m = tl.exp(dA_cs_m)
+            scale_m = tl.math.exp2(dA_cs_m * 1.4426950408889634)
         if BLOCK_SIZE_DSTATE <= 128:
             C = tl.load(
                 C_ptrs,
@@ -421,7 +542,9 @@ def _chunk_scan_fwd_kernel(
                           other=0.0).to(tl.float32)
         # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
         # So we don't need masking wrt seq_idx here.
-        cb *= tl.exp(dA_cs_m[:, None] - dA_cs_k[None, :])
+        # Use exp2 for faster computation: exp(x) = exp2(x * log2(e))
+        cb *= tl.math.exp2(
+            (dA_cs_m[:, None] - dA_cs_k[None, :]) * 1.4426950408889634)
         dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k,
                        other=0.0).to(tl.float32)
         cb *= dt_k
