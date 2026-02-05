@@ -57,6 +57,7 @@ Given a diffusion model implemented in native PyTorch or HuggingFace Diffusers p
 ### Cosmos
 | Model Name | Resolution | Parameters | Description |
 |------------|------------|------------|-------------|
+| nvidia/Cosmos-Predict2.5-2B | - | 2B | Video/text-to-world |
 | nvidia/Cosmos-Predict2.5-2B-Base | - | 2B | Text-to-image |
 | nvidia/Cosmos-Predict2-2B-Video2World | - | 2B | Video-to-world |
 | nvidia/Cosmos-Predict2-14B-Video2World | - | 14B | Video-to-world |

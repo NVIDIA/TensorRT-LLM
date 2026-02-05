@@ -19,6 +19,7 @@ We provides state-of-the-art diffusion model capabilities with optimized inferen
 | Flux.1 [dev] | `black-forest-labs/FLUX.1-dev` | 12B | **Text-to-Image** |
 | FLUX.2 [dev] | `black-forest-labs/FLUX.2-dev` | 32B | **Text-to-Image** |
 | HunyuanImage2.1 | `tencent/HunyuanImage-2.1` | 17B | **Text-to-Image** |
+| Cosmos | `nvidia/Cosmos-Predict2.5-2B` | 2B | **Video/text-to-World** |
 | Cosmos | `nvidia/Cosmos-Predict2-2B-Video2World` | 2B | **Video-to-World** |
 | Cosmos | `nvidia/Cosmos-Predict2-14B-Video2World` | 14B | **Video-to-World** |
 | Cosmos | `nvidia/Cosmos-Predict2-2B-Text2Image` | 2B | **Text-to-Image** |
@@ -91,6 +92,16 @@ torchrun --nproc-per-node 4 hunyuan_image2.1.py  --attn_type flash-attn3 --linea
 ```
 
 #### Cosmos
+
+**Cosmos Predict2.5 2B Image2World**
+```bash
+python cosmos2_5_predict.py --model_path "nvidia/Cosmos-Predict2.5-2B" --height 704 --width 1280 --num_frames 93 --enable_teacache
+```
+
+**Cosmos Predict2.5 2B Text2World**
+```bash
+python cosmos2_5_predict.py --model_path "nvidia/Cosmos-Predict2.5-2B" --image "" --height 704 --width 1280 --num_frames 93 --enable_teacache
+```
 
 **Cosmos Predict2 2B Video2World**
 ```bash

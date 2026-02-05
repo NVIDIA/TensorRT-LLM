@@ -30,7 +30,13 @@ from typing import Callable, Dict, List, Optional, Union
 import numpy as np
 import torch
 import torch.cuda.nvtx as nvtx
-from diffusers import Cosmos2TextToImagePipeline, Cosmos2VideoToWorldPipeline, CosmosTextToWorldPipeline
+import torchvision.transforms.functional as F2
+from diffusers import (
+    Cosmos2TextToImagePipeline,
+    Cosmos2VideoToWorldPipeline,
+    Cosmos2_5_PredictBasePipeline,
+    CosmosTextToWorldPipeline,
+)
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.cosmos.pipeline_cosmos_video2world import CosmosPipelineOutput, retrieve_timesteps
@@ -46,6 +52,286 @@ from visual_gen.utils.logger import get_logger
 from .base_pipeline import ditBasePipeline
 
 logger = get_logger(__name__)
+
+
+class ditCosmos2_5_PredictBasePipeline(Cosmos2_5_PredictBasePipeline, ditBasePipeline):
+    def _after_load(self, pretrained_model_name_or_path, *args, **kwargs) -> None:
+        logger.debug(f"TeaCache config: {TeaCacheConfig.get_instance().to_dict()}")
+        pipe_config = kwargs.get("pipeline", {})
+        pipe_config["transformer_type"] = "ditCosmosTransformer3DModel"
+        PipelineConfig.set_config(**pipe_config)
+        if not isinstance(self.transformer, ditCosmosTransformer3DModel):
+            logger.debug("Loading ditCosmosTransformer3DModel from diffusers transformer")
+            torch_dtype = kwargs.get("torch_dtype", torch.float32)
+            self.transformer = ditCosmosTransformer3DModel.from_pretrained(
+                pretrained_model_name_or_path,
+                revision=kwargs.get('revision', None),
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+        logger.debug("Post-load hook completed")
+
+        # unlike other models, Cosmos2.5' final denoising t-range: [0.75, 1.0] has a very different
+        # input-output correlation pattern. Generally speaking, output would change drastically even
+        # when input delta is relatively small. This model-specific switch is to block use of
+        # TeaCache for the specific t-range.
+        self.teacache_allowed_t_thres = 0.75
+        self.transformer.teacache_coefficients = [
+            1.00000000e+02, # Mathematical soundness: Keep highest order coeffs positive. Not part of the fit
+            -1.1689676e+03,
+            4.07797856e+02,
+            -4.3215575e+01,
+            1.55959631e+00,
+            1.02673255e-01,
+        ]
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        image: PipelineImageInput = None,
+        video: List[PipelineImageInput] = None,
+        prompt: Union[str, List[str]] = None,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        height: int = 704,
+        width: int = 1280,
+        num_frames: int = 93,
+        num_inference_steps: int = 36,
+        guidance_scale: float = 7.0,
+        num_videos_per_prompt: Optional[int] = 1,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.Tensor] = None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback_on_step_end: Optional[
+            Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
+        ] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        max_sequence_length: int = 512,
+        conditional_frame_timestep: float = 0.1,
+    ):
+        if False:  # self.safety_checker is None:
+            raise ValueError(
+                f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
+                "[NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
+                f"Please ensure that you are compliant with the license agreement."
+            )
+
+        if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
+            callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
+
+        # Check inputs. Raise error if not correct
+        self.check_inputs(prompt, height, width, prompt_embeds, callback_on_step_end_tensor_inputs)
+
+        self._guidance_scale = guidance_scale
+        self._current_timestep = None
+        self._interrupt = False
+
+        device = "cuda"  # self._execution_device
+
+        if self.safety_checker is not None:
+            self.safety_checker.to(device)
+            if prompt is not None:
+                prompt_list = [prompt] if isinstance(prompt, str) else prompt
+                for p in prompt_list:
+                    if not self.safety_checker.check_text_safety(p):
+                        raise ValueError(
+                            f"Cosmos Guardrail detected unsafe text in the prompt: {p}. Please ensure that the "
+                            f"prompt abides by the NVIDIA Open Model License Agreement."
+                        )
+
+        # Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        # Encode input prompt
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+        ) = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            num_videos_per_prompt=num_videos_per_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            device=device,
+            max_sequence_length=max_sequence_length,
+        )
+
+        vae_dtype = self.vae.dtype
+        transformer_dtype = self.transformer.dtype
+
+        num_frames_in = None
+        if image is not None:
+            if batch_size != 1:
+                raise ValueError(f"batch_size must be 1 for image input (given {batch_size})")
+
+            image = F2.to_tensor(image).unsqueeze(0)
+            video = torch.cat([image, torch.zeros_like(image).repeat(num_frames - 1, 1, 1, 1)], dim=0)
+            video = video.unsqueeze(0)
+            num_frames_in = 1
+        elif video is None:
+            video = torch.zeros(batch_size, num_frames, 3, height, width, dtype=torch.uint8)
+            num_frames_in = 0
+        else:
+            num_frames_in = len(video)
+
+            if batch_size != 1:
+                raise ValueError(f"batch_size must be 1 for video input (given {batch_size})")
+
+        assert video is not None
+        video = self.video_processor.preprocess_video(video, height, width)
+
+        # pad with last frame (for video2world)
+        num_frames_out = num_frames
+        if video.shape[2] < num_frames_out:
+            n_pad_frames = num_frames_out - num_frames_in
+            last_frame = video[0, :, -1:, :, :]  # [C, T==1, H, W]
+            pad_frames = last_frame.repeat(1, 1, n_pad_frames, 1, 1)  # [B, C, T, H, W]
+            video = torch.cat((video, pad_frames), dim=2)
+
+        assert num_frames_in <= num_frames_out, f"expected ({num_frames_in=}) <= ({num_frames_out=})"
+
+        video = video.to(device=device, dtype=vae_dtype)
+
+        num_channels_latents = self.transformer.config.in_channels - 1
+        latents, cond_latent, cond_mask, cond_indicator = self.prepare_latents(
+            video=video,
+            batch_size=batch_size * num_videos_per_prompt,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames_in=num_frames_in,
+            num_frames_out=num_frames,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+            latents=latents,
+        )
+        cond_timestep = torch.ones_like(cond_indicator) * conditional_frame_timestep
+        cond_mask = cond_mask.to(transformer_dtype)
+
+        padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)
+
+        # Denoising loop
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+        self._num_timesteps = len(timesteps)
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        gt_velocity = (latents - cond_latent) * cond_mask
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                self._current_timestep = t.cpu().item()
+
+                # NOTE: assumes sigma(t) \in [0, 1]
+                sigma_t = (
+                    torch.tensor(self.scheduler.sigmas[i].item())
+                    .unsqueeze(0)
+                    .to(device=device, dtype=transformer_dtype)
+                )
+
+                in_latents = cond_mask * cond_latent + (1 - cond_mask) * latents
+                in_latents = in_latents.to(transformer_dtype)
+                in_timestep = cond_indicator * cond_timestep + (1 - cond_indicator) * sigma_t
+
+                cfg_positive_inputs = {
+                    "hidden_states": in_latents,
+                    "condition_mask": cond_mask,
+                    "timestep": in_timestep,
+                    "encoder_hidden_states": prompt_embeds,
+                    "padding_mask": padding_mask,
+                    "return_dict": False,
+                    "disallow_teacache": i > num_inference_steps * self.teacache_allowed_t_thres,
+                }
+                cfg_negative_inputs = None
+                if self.do_classifier_free_guidance:
+                    cfg_negative_inputs = {
+                        "hidden_states": in_latents,
+                        "condition_mask": cond_mask,
+                        "timestep": in_timestep,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "padding_mask": padding_mask,
+                        "return_dict": False,
+                        "disallow_teacache": i > num_inference_steps * self.teacache_allowed_t_thres,
+                    }
+
+                noise_pred, noise_pred_uncond = self.visual_gen_transformer(
+                    self.transformer,
+                    current_denoising_step=i,
+                    num_inference_steps=num_inference_steps,
+                    do_classifier_free_guidance=self.do_classifier_free_guidance,
+                    cfg_positive_inputs=cfg_positive_inputs,
+                    cfg_negative_inputs=cfg_negative_inputs,
+                )
+
+                # NOTE: replace velocity (noise_pred) with gt_velocity for conditioning inputs only
+                noise_pred = gt_velocity + noise_pred * (1 - cond_mask)
+
+                if self.do_classifier_free_guidance:
+                    assert noise_pred_uncond is not None, "noise_pred_uncond is required"
+                    noise_pred_uncond = gt_velocity + noise_pred_uncond * (1 - cond_mask)
+                    noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
+
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+        self._current_timestep = None
+
+        if not output_type == "latent":
+            latents_mean = self.latents_mean.to(latents.device, latents.dtype)
+            latents_std = self.latents_std.to(latents.device, latents.dtype)
+            latents = latents * latents_std + latents_mean
+            video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
+            video = self._match_num_frames(video, num_frames)
+
+            # assert self.safety_checker is not None
+            # self.safety_checker.to(device)
+            video = self.video_processor.postprocess_video(video, output_type="np")
+            video = (video * 255).astype(np.uint8)
+            video_batch = []
+            for vid in video:
+                # vid = self.safety_checker.check_video_safety(vid)
+                video_batch.append(vid)
+            video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
+            video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
+            video = self.video_processor.postprocess_video(video, output_type=output_type)
+        else:
+            video = latents
+
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (video,)
+
+        return CosmosPipelineOutput(frames=video)
 
 
 class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipeline):
