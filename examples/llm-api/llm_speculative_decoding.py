@@ -55,9 +55,6 @@ def run_ngram():
     spec_config = NGramDecodingConfig(
         max_draft_len=3,
         max_matching_ngram_size=3,
-        is_keep_all=True,
-        is_use_oldest=True,
-        is_public_pool=True,
     )
 
     llm = LLM(

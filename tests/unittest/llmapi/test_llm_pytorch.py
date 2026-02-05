@@ -956,9 +956,6 @@ def test_min_tokens(use_speculative: bool):
         spec_config = NGramDecodingConfig(
             max_draft_len=4,
             max_matching_ngram_size=2,
-            is_keep_all=True,
-            is_use_oldest=True,
-            is_public_pool=True,
         )
         llm = LLM(**llm_common_config, speculative_config=spec_config)
     else:

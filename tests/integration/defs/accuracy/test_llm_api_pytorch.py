@@ -321,9 +321,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         spec_config = NGramDecodingConfig(
             max_draft_len=4,
             max_matching_ngram_size=2,
-            is_keep_all=True,
-            is_use_oldest=True,
-            is_public_pool=True,
         )
 
         with LLM(model=self.MODEL_PATH,

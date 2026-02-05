@@ -573,9 +573,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "decoding_type": "NGram",
             "max_draft_len": 4,
             "max_matching_ngram_size": 4,
-            "is_keep_all": True,
-            "is_use_oldest": True,
-            "is_public_pool": True
         }
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,

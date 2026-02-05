@@ -245,9 +245,6 @@ def setup_llm(args, **kwargs):
         spec_config = NGramDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             max_matching_ngram_size=args.max_matching_ngram_size,
-            is_keep_all=True,
-            is_use_oldest=True,
-            is_public_pool=True,
         )
     elif spec_decode_algo == "AUTO":
         spec_config = AutoDecodingConfig()
