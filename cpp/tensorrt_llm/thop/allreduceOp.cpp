@@ -545,6 +545,8 @@ private:
         else
         {
             // Buffer already registered - use it directly
+            TLLM_LOG_DEBUG("[runNCCLAllReduceSymmetric] Using registered input buffer for %p (size=%zu bytes)",
+                input.data_ptr(), bufferSizeBytes);
             inputPtr = windowBuffer0.ptr;
         }
 
