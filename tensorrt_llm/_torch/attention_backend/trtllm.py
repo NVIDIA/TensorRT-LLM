@@ -209,7 +209,6 @@ class TrtllmAttentionWrapper:
         softmax_stats_tensor: Optional[torch.Tensor] = None,
         is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
-        _actual_spec_decoding_enabled: Optional[bool] = None,
         is_spec_dec_tree: bool = False,
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
@@ -330,9 +329,6 @@ class TrtllmAttentionWrapper:
             )
         self.is_spec_decoding_enabled = is_spec_decoding_enabled
         self.use_spec_decoding = use_spec_decoding
-        self._actual_spec_decoding_enabled = (
-            _actual_spec_decoding_enabled if _actual_spec_decoding_enabled
-            is not None else is_spec_decoding_enabled)
         self.is_spec_dec_tree = is_spec_dec_tree
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
@@ -530,7 +526,7 @@ class TrtllmAttentionWrapper:
                 position_shift_enabled=False,
                 sink_token_length=self.sink_token_length,
                 cross_attention=False,
-                is_spec_decoding=self._actual_spec_decoding_enabled,
+                is_spec_decoding=self.is_spec_decoding_enabled,
                 is_mla_enable=self.is_mla_enable,
                 is_fused_qkv=is_fused_qkv,
                 update_kv_cache=update_kv_cache,
@@ -776,9 +772,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_decoding_enabled: bool = False
     # use_spec_decoding determines if the attention layer should be run in spec-dec mode at the specific step / layer.
     use_spec_decoding: bool = False
-    # Track the actual spec decoding state (before SM100 modification) for backend selection
-    # This is used to correctly bypass trtllm-gen when spec decoding is actually enabled
-    _actual_spec_decoding_enabled: bool = False
 
     # if spec-dec tree is a tree or a chain (linear tree)
     is_spec_dec_tree: bool = False
@@ -1413,8 +1406,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             spec_decoding_packed_mask = None
             spec_decoding_generation_lengths = None
 
-        self._actual_spec_decoding_enabled = is_spec_decoding_enabled
-
         # spec_dec mode should only be enabled for non-sm100 machines and when there's a spec-dec tree.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
             not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()))
@@ -1859,8 +1850,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             softmax_stats_tensor=softmax_stats_tensor,
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
-            _actual_spec_decoding_enabled=metadata.
-            _actual_spec_decoding_enabled,
             is_spec_dec_tree=metadata.is_spec_dec_tree,
             spec_decoding_position_offsets=metadata.
             spec_decoding_position_offsets,

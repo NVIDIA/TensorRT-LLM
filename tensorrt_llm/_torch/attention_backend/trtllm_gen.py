@@ -51,9 +51,6 @@ WORKSPACE_ALIGNMENT = 256
 # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
 DEFAULT_KV_LAYOUT = "HND"
 
-# Default backend name for flashinfer
-DEFAULT_BACKEND = "trtllm-gen"
-
 
 @dataclass
 class TrtllmGenAttentionConfig:
