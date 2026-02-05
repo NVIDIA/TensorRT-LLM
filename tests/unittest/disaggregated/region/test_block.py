@@ -45,12 +45,11 @@ def make_rankinfo(
         enable_attention_dp=False,
         is_mla=is_mla,
         layer_num_per_pp=[1],
-        kv_ptrs=[],
-        aux_ptrs=[],
         server_endpoint="",
         self_endpoint="",
         transfer_engine_info=b"",
         aux_meta=None,
+        kv_pool_attrs=None,
     )
 
 

@@ -9,7 +9,30 @@ from tensorrt_llm._torch.disaggregation.native.region.block import (
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVPoolAttrs,
     KVRegionExtractorV1,
+    LayerGroupAttrs,
+    PoolRole,
 )
+
+
+def make_kv_pool_attrs(pool_ptrs=None, block_bytes=None):
+    """Create a KVPoolAttrs for testing."""
+    if pool_ptrs is None:
+        pool_ptrs = [1234]
+    if block_bytes is None:
+        block_bytes = [1024]
+    layer_group_attrs = LayerGroupAttrs(
+        group_id=0,
+        pool_base_ptrs=pool_ptrs,
+        pool_sizes=[0],
+        roles_to_pool_idx={PoolRole.KV_CACHE: 0},
+        block_bytes_per_pool=block_bytes,
+        global_layer_ids=[0],
+        kv_head_num_per_rank=2,
+    )
+    return KVPoolAttrs(
+        layer_to_group_id={0: 0},
+        layer_group_attrs_list=[layer_group_attrs],
+    )
 
 
 def make_rankinfo(
@@ -30,6 +53,7 @@ def make_rankinfo(
     is_mla=False,
     enable_attention_dp=False,
     layer_num_per_pp=None,
+    kv_pool_attrs=None,
 ):
     if layer_num_per_pp is None:
         layer_num_per_pp = [2] * pp_size
@@ -52,19 +76,40 @@ def make_rankinfo(
         enable_attention_dp=enable_attention_dp,
         is_mla=is_mla,
         layer_num_per_pp=layer_num_per_pp,
-        kv_ptrs=[],
-        aux_ptrs=[],
         server_endpoint="",
         self_endpoint="",
         transfer_engine_info=b"",
         aux_meta=None,
+        kv_pool_attrs=kv_pool_attrs,
     )
 
 
 def _make_peer_registrar_and_peer_ri(self_ri, peer_ri):
-    pool_attrs = KVPoolAttrs(pool_ptrs=[1234], block_bytes=[1024])
+    pool_attrs = make_kv_pool_attrs()
     real_kv_extractor = KVRegionExtractorV1(pool_attrs)
     reg = PeerRegistrar(self_ri, real_kv_extractor)
+    # Ensure peer_ri has kv_pool_attrs for registration
+    if peer_ri.kv_pool_attrs is None:
+        peer_ri = make_rankinfo(
+            instance_name=peer_ri.instance_name,
+            instance_rank=peer_ri.instance_rank,
+            tp_size=peer_ri.tp_size,
+            tp_rank=peer_ri.tp_rank,
+            pp_size=peer_ri.pp_size,
+            pp_rank=peer_ri.pp_rank,
+            dp_size=peer_ri.dp_size,
+            dp_rank=peer_ri.dp_rank,
+            cp_size=peer_ri.cp_size,
+            cp_rank=peer_ri.cp_rank,
+            kv_heads_per_rank=peer_ri.kv_heads_per_rank,
+            tokens_per_block=peer_ri.tokens_per_block,
+            dims_per_head=peer_ri.dims_per_head,
+            element_bytes=peer_ri.element_bytes,
+            is_mla=peer_ri.is_mla,
+            enable_attention_dp=peer_ri.enable_attention_dp,
+            layer_num_per_pp=peer_ri.layer_num_per_pp,
+            kv_pool_attrs=make_kv_pool_attrs(),
+        )
     return reg, peer_ri
 
 
@@ -215,7 +260,7 @@ def test_multiple_overlap():
 
 
 def _make_peer_registrar(self_rankinfo):
-    pool_attrs = KVPoolAttrs(pool_ptrs=[1234], block_bytes=[1024])
+    pool_attrs = make_kv_pool_attrs()
     real_kv_extractor = KVRegionExtractorV1(pool_attrs)
     reg = PeerRegistrar(self_rankinfo, real_kv_extractor)
     return reg
@@ -224,7 +269,12 @@ def _make_peer_registrar(self_rankinfo):
 def test_peer_registrar_register_and_get():
     self_rankinfo = make_rankinfo(instance_name="local")
     reg = _make_peer_registrar(self_rankinfo)
-    peer_ri = make_rankinfo(instance_name="peer", instance_rank=1, layer_num_per_pp=[2])
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        kv_pool_attrs=make_kv_pool_attrs(),
+    )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
 
@@ -232,7 +282,12 @@ def test_peer_registrar_register_and_get():
 def test_peer_registrar_unregister():
     self_rankinfo = make_rankinfo(instance_name="local")
     reg = _make_peer_registrar(self_rankinfo)
-    peer_ri = make_rankinfo(instance_name="peer", instance_rank=1, layer_num_per_pp=[2])
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        kv_pool_attrs=make_kv_pool_attrs(),
+    )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     reg.unregister(peer_ri.instance_name, peer_ri.instance_rank)
     with pytest.raises(KeyError):
@@ -242,7 +297,9 @@ def test_peer_registrar_unregister():
 def test_peer_registrar_incompatible_peer_raises():
     self_rankinfo = make_rankinfo(instance_name="local")
     reg = _make_peer_registrar(self_rankinfo)
-    peer_ri = make_rankinfo(instance_name="peer", instance_rank=3, is_mla=True)
+    peer_ri = make_rankinfo(
+        instance_name="peer", instance_rank=3, is_mla=True, kv_pool_attrs=make_kv_pool_attrs()
+    )
     with pytest.raises(ValueError):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
@@ -256,7 +313,12 @@ def test_peer_registrar_self_rank_info_property():
 def test_peer_registrar_get_kv_map_identity():
     self_rankinfo = make_rankinfo(instance_name="local")
     reg = _make_peer_registrar(self_rankinfo)
-    peer_ri = make_rankinfo(instance_name="peer", instance_rank=1, layer_num_per_pp=[2])
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        kv_pool_attrs=make_kv_pool_attrs(),
+    )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     mapper = reg.get_kv_map(peer_ri)
     assert isinstance(mapper, IdentityMapper)
@@ -273,6 +335,7 @@ def test_peer_registrar_get_kv_map_head_match():
         layer_num_per_pp=[1, 1],
         tokens_per_block=16,
         dims_per_head=8,
+        kv_pool_attrs=make_kv_pool_attrs(),
     )
     mapper = reg.get_kv_map(peer_ri)
     assert isinstance(mapper, HeadMatchMapper)
@@ -292,6 +355,7 @@ def test_peer_registrar_get_kv_map_head_mismatch():
         tokens_per_block=16,
         dims_per_head=8,
         layer_num_per_pp=[2],
+        kv_pool_attrs=make_kv_pool_attrs(),
     )
     mapper = reg.get_kv_map(peer_ri)
     assert isinstance(mapper, HeadMismatchMapper)

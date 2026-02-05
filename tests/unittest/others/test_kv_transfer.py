@@ -1,6 +1,10 @@
+"""Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
+
 import random
 import time
 import uuid
+from dataclasses import dataclass
+from typing import List, Optional
 
 import pytest
 import torch
@@ -14,9 +18,29 @@ from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionSta
 from tensorrt_llm._torch.disaggregation.native.region.aux import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2, Role
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
+
+
+@dataclass
+class KvCacheConfigV2:
+    """KvCacheConfig wrapper with max_util_for_resume for KVCacheManagerV2."""
+
+    max_tokens: Optional[int] = None
+    enable_block_reuse: bool = False
+    max_attention_window: Optional[List[int]] = None
+    sink_token_length: Optional[int] = None
+    free_gpu_memory_fraction: Optional[float] = None
+    host_cache_size: Optional[int] = None
+    onboard_blocks: bool = True
+    cross_kv_cache_fraction: Optional[float] = None
+    secondary_offload_min_priority: Optional[int] = None
+    event_buffer_max_size: int = 0
+    max_gpu_total_bytes: Optional[int] = None
+    # V2 specific field
+    max_util_for_resume: float = 0.95
 
 
 def create_transfer_worker_setup(
@@ -27,8 +51,13 @@ def create_transfer_worker_setup(
     gen_pp: int,
     gen_enable_dp: bool,
     is_mla: bool = False,
+    use_v2: bool = False,
 ):
-    """Helper function to set up transfer workers for testing."""
+    """Helper function to set up transfer workers for testing.
+
+    Args:
+        use_v2: If True, use KVCacheManagerV2 (Python-side). Otherwise use KVCacheManager (C++ bindings).
+    """
     ctx_mappings = []
     for i in range(ctx_pp):
         for j in range(ctx_tp):
@@ -67,6 +96,7 @@ def create_transfer_worker_setup(
     max_seq_len = 256
     max_batch_size = 4
     dtype = DataType.FLOAT
+    vocab_size = 32000  # V2 requires vocab_size
     ctx_transfer_workers = []
     ctx_kv_cache_managers = []
     device_id = 0
@@ -77,37 +107,93 @@ def create_transfer_worker_setup(
 
     for i in range(ctx_instance_num):
         ctx_aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
-        ctx_kv_cache_manager = KVCacheManager(
-            trtllm.KvCacheConfig(
-                max_tokens=2048,
-                enable_block_reuse=False,
-            ),
+        cache_type = (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
             if not is_mla
-            else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            mapping=ctx_mappings[i],
-            dtype=dtype,
-        )
-        random_seed = 0 if is_mla else None
-        ctx_block_data_pool = ctx_kv_cache_manager.get_unique_primary_pool()
-        if random_seed is not None:
-            generator = torch.Generator(device=ctx_block_data_pool.device).manual_seed(random_seed)
-        else:
-            generator = None
-        random_values = torch.rand(
-            ctx_block_data_pool.shape,
-            dtype=torch.float32,
-            device=ctx_block_data_pool.device,
-            generator=generator,
+            else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY
         )
 
-        ctx_block_data_pool.copy_(random_values)
+        if use_v2:
+            ctx_kv_cache_manager = KVCacheManagerV2(
+                KvCacheConfigV2(
+                    max_tokens=2048,
+                    enable_block_reuse=False,
+                ),
+                cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=ctx_mappings[i],
+                dtype=dtype,
+                vocab_size=vocab_size,
+            )
+            # V2: Initialize pool using TensorWrapper
+            random_seed = 0 if is_mla else None
+            kv_factor = ctx_kv_cache_manager.kv_factor
+            pool_base_ptr = int(ctx_kv_cache_manager.impl.get_mem_pool_base_address(0, Role.KEY))
+            page_stride = ctx_kv_cache_manager.impl.get_page_stride(0, Role.KEY)
+            num_pages = ctx_kv_cache_manager.impl.get_page_index_upper_bound(0, Role.KEY)
+            pool_size_bytes = num_pages * page_stride * kv_factor
+            element_size = (
+                page_stride
+                * kv_factor
+                // (
+                    ctx_kv_cache_manager.tokens_per_block
+                    * ctx_kv_cache_manager.num_kv_heads_per_layer[0]
+                    * ctx_kv_cache_manager.head_dim
+                )
+            )
+            pool_size_elements = pool_size_bytes // element_size
+            pool_tensor = convert_to_torch_tensor(
+                TensorWrapper(pool_base_ptr, ctx_kv_cache_manager.dtype, [pool_size_elements])
+            )
+            if random_seed is not None:
+                generator = torch.Generator(device=pool_tensor.device).manual_seed(random_seed)
+            else:
+                generator = None
+            random_values = torch.rand(
+                pool_tensor.shape,
+                dtype=torch.float32,
+                device=pool_tensor.device,
+                generator=generator,
+            )
+            pool_tensor.copy_(random_values)
+        else:
+            ctx_kv_cache_manager = KVCacheManager(
+                trtllm.KvCacheConfig(
+                    max_tokens=2048,
+                    enable_block_reuse=False,
+                ),
+                cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=ctx_mappings[i],
+                dtype=dtype,
+            )
+            # V1: Initialize pool using get_unique_primary_pool
+            random_seed = 0 if is_mla else None
+            ctx_block_data_pool = ctx_kv_cache_manager.get_unique_primary_pool()
+            if random_seed is not None:
+                generator = torch.Generator(device=ctx_block_data_pool.device).manual_seed(
+                    random_seed
+                )
+            else:
+                generator = None
+            random_values = torch.rand(
+                ctx_block_data_pool.shape,
+                dtype=torch.float32,
+                device=ctx_block_data_pool.device,
+                generator=generator,
+            )
+            ctx_block_data_pool.copy_(random_values)
+
         ctx_kv_cache_managers.append(ctx_kv_cache_manager)
         ctx_transfer_workers.append(
             TransferWorker(
@@ -138,23 +224,45 @@ def create_transfer_worker_setup(
     gen_kv_cache_managers = []
     for i in range(gen_instance_num):
         gen_aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
-        gen_kv_cache_manager = KVCacheManager(
-            trtllm.KvCacheConfig(
-                max_tokens=2048,
-                enable_block_reuse=False,
-            ),
+        cache_type = (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
             if not is_mla
-            else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            mapping=gen_mappings[i],
-            dtype=dtype,
+            else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY
         )
+
+        if use_v2:
+            gen_kv_cache_manager = KVCacheManagerV2(
+                KvCacheConfigV2(
+                    max_tokens=2048,
+                    enable_block_reuse=False,
+                ),
+                cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=gen_mappings[i],
+                dtype=dtype,
+                vocab_size=vocab_size,
+            )
+        else:
+            gen_kv_cache_manager = KVCacheManager(
+                trtllm.KvCacheConfig(
+                    max_tokens=2048,
+                    enable_block_reuse=False,
+                ),
+                cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=gen_mappings[i],
+                dtype=dtype,
+            )
         gen_kv_cache_managers.append(gen_kv_cache_manager)
         gen_transfer_workers.append(
             TransferWorker(
@@ -194,12 +302,46 @@ def create_transfer_worker_setup(
         "gen_pp": gen_pp,
         "gen_enable_dp": gen_enable_dp,
         "is_mla": is_mla,
+        "use_v2": use_v2,
         "num_layers": num_layers,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
         "tokens_per_block": tokens_per_block,
         "request_len": request_len,
     }
+
+
+def get_block_data_via_buffers(
+    kv_cache_manager: KVCacheManagerV2,
+    block_ids: List[int],
+) -> torch.Tensor:
+    """Get block data from KVCacheManagerV2 using get_buffers API.
+
+    V2 memory layout: [slot][layer][kv_factor][page_data]
+    Returns tensor with shape [num_slots, num_layers, kv_factor, page_data]
+    to match V1's get_unique_primary_pool format.
+    """
+    num_local_layers = kv_cache_manager.num_local_layers
+    all_slot_data = []
+
+    for slot_id in block_ids:
+        slot_layers = []
+        for local_layer_idx in range(num_local_layers):
+            # Use global layer index from pp_layers, not local 0-based index
+            global_layer_idx = kv_cache_manager.pp_layers[local_layer_idx]
+            layer_buffer = kv_cache_manager.get_buffers(layer_idx=global_layer_idx, kv_layout="HND")
+            # V2 indexing: slot S is at buffer index S * num_layers
+            buffer_idx = slot_id * num_local_layers
+            # get_buffers returns shape: [kv_factor, num_kv_heads, tokens_per_block, head_dim]
+            slot_layer_data = layer_buffer[buffer_idx]
+            # Flatten last 3 dims to match V1 format: [kv_factor, num_kv_heads * tokens_per_block * head_dim]
+            slot_layer_data = slot_layer_data.reshape(slot_layer_data.shape[0], -1)
+            slot_layers.append(slot_layer_data)
+        # Stack layers for this slot: [num_layers, kv_factor, flat_dim]
+        all_slot_data.append(torch.stack(slot_layers, dim=0))
+
+    # Stack all slots: [num_slots, num_layers, kv_factor, flat_dim]
+    return torch.stack(all_slot_data, dim=0)
 
 
 def add_and_verify_request(
@@ -220,6 +362,7 @@ def add_and_verify_request(
     gen_pp = setup["gen_pp"]
     gen_enable_dp = setup["gen_enable_dp"]
     is_mla = setup["is_mla"]
+    use_v2 = setup["use_v2"]
     num_layers = setup["num_layers"]
     num_kv_heads = setup["num_kv_heads"]
     head_dim = setup["head_dim"]
@@ -271,10 +414,20 @@ def add_and_verify_request(
         12 + ctx_request_id,
     ]
 
-    for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
-        ctx_kv_cache_manager.impl.add_sequence(
-            ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
-        )
+    # Add sequence to ctx KV cache managers
+    ctx_kv_caches = []  # V2: Store kv_cache objects for cleanup
+    if use_v2:
+        for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
+            kv_cache = ctx_kv_cache_manager._create_kv_cache(ctx_request.py_request_id, None, None)
+            success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
+            assert success, "Failed to resume kv_cache for ctx request"
+            kv_cache.resize(ctx_request.prompt_len)
+            ctx_kv_caches.append(kv_cache)
+    else:
+        for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
+            ctx_kv_cache_manager.impl.add_sequence(
+                ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
+            )
 
     gen_request = LlmRequest(
         request_id=gen_request_id,
@@ -292,20 +445,40 @@ def add_and_verify_request(
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
     )
-    for gen_kv_cache_manager in valid_gen_kv_cache_managers:
-        gen_kv_cache_manager.impl.add_sequence(
-            gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
-        )
+    # Add sequence to gen KV cache managers
+    gen_kv_caches = []  # V2: Store kv_cache objects for cleanup
+    if use_v2:
+        for gen_kv_cache_manager in valid_gen_kv_cache_managers:
+            kv_cache = gen_kv_cache_manager._create_kv_cache(gen_request.py_request_id, None, None)
+            success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
+            assert success, "Failed to resume kv_cache for gen request"
+            kv_cache.resize(gen_request.prompt_len)
+            gen_kv_caches.append(kv_cache)
+    else:
+        for gen_kv_cache_manager in valid_gen_kv_cache_managers:
+            gen_kv_cache_manager.impl.add_sequence(
+                gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
+            )
 
-    ctx_block_ids = [
+    ctx_block_ids_raw = [
         ctx_kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
         for ctx_kv_cache_manager in valid_ctx_kv_cache_managers
     ]
+    # V2: Filter out invalid block ids (BAD_PAGE_INDEX = -1)
+    if use_v2:
+        ctx_block_ids = [[bid for bid in block_ids if bid >= 0] for block_ids in ctx_block_ids_raw]
+    else:
+        ctx_block_ids = ctx_block_ids_raw
 
-    gen_block_ids = [
+    gen_block_ids_raw = [
         gen_kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
         for gen_kv_cache_manager in valid_gen_kv_cache_managers
     ]
+    # V2: Filter out invalid block ids (BAD_PAGE_INDEX = -1)
+    if use_v2:
+        gen_block_ids = [[bid for bid in block_ids if bid >= 0] for block_ids in gen_block_ids_raw]
+    else:
+        gen_block_ids = gen_block_ids_raw
 
     if send_first:
         sender_sessions = [
@@ -392,14 +565,33 @@ def add_and_verify_request(
             f"sync_session_status={sync_session_status} send_first={send_first}"
         )
 
-    ctx_block_datas = [
-        ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_id]
-        for ctx_kv_cache_manager, ctx_block_id in zip(valid_ctx_kv_cache_managers, ctx_block_ids)
-    ]
-    gen_block_datas = [
-        gen_kv_cache_manager.get_unique_primary_pool()[gen_block_id]
-        for gen_kv_cache_manager, gen_block_id in zip(valid_gen_kv_cache_managers, gen_block_ids)
-    ]
+    # Get block data for verification
+    if use_v2:
+        ctx_block_datas = [
+            get_block_data_via_buffers(ctx_kv_cache_manager, ctx_block_id)
+            for ctx_kv_cache_manager, ctx_block_id in zip(
+                valid_ctx_kv_cache_managers, ctx_block_ids
+            )
+        ]
+        gen_block_datas = [
+            get_block_data_via_buffers(gen_kv_cache_manager, gen_block_id)
+            for gen_kv_cache_manager, gen_block_id in zip(
+                valid_gen_kv_cache_managers, gen_block_ids
+            )
+        ]
+    else:
+        ctx_block_datas = [
+            ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_id]
+            for ctx_kv_cache_manager, ctx_block_id in zip(
+                valid_ctx_kv_cache_managers, ctx_block_ids
+            )
+        ]
+        gen_block_datas = [
+            gen_kv_cache_manager.get_unique_primary_pool()[gen_block_id]
+            for gen_kv_cache_manager, gen_block_id in zip(
+                valid_gen_kv_cache_managers, gen_block_ids
+            )
+        ]
 
     valid_ctx_tp = 1 if ctx_enable_dp else ctx_tp
     valid_gen_tp = 1 if gen_enable_dp else gen_tp
@@ -467,6 +659,14 @@ def add_and_verify_request(
     for transfer_worker, sender_session in zip(valid_ctx_transfer_workers, sender_sessions):
         transfer_worker.clear_session(sender_session)
 
+    # V2: Close kv_caches to release slots (required for KVCacheManagerV2)
+    if use_v2:
+        torch.cuda.current_stream().synchronize()
+        for kv_cache in ctx_kv_caches:
+            kv_cache.close()
+        for kv_cache in gen_kv_caches:
+            kv_cache.close()
+
 
 # Test configurations as pytest parameters
 PARALLEL_TEST_CONFIGS = [
@@ -493,13 +693,11 @@ PARALLEL_TEST_CONFIGS = [
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in PARALLEL_TEST_CONFIGS],
     ids=[c[7] for c in PARALLEL_TEST_CONFIGS],
 )
-def test_transfer_worker_with_parallel(
-    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla
-):
+def test_transfer_worker_v1(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla):
+    """Test transfer worker with KVCacheManager (V1)."""
     tensorrt_llm.logger.set_level("info")
+    logger.info("Test transfer worker V1 with parallel configurations")
 
-    logger.info(" test transfer worker with parallel configurations")
-    """Test transfer worker with various parallel configurations."""
     setup = create_transfer_worker_setup(
         ctx_tp=ctx_tp,
         ctx_pp=ctx_pp,
@@ -508,9 +706,42 @@ def test_transfer_worker_with_parallel(
         gen_pp=gen_pp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
+        use_v2=False,
     )
 
     request_len = setup["request_len"]
     add_and_verify_request(setup, 0, 1, request_len, send_first=True)
     add_and_verify_request(setup, 2, 3, request_len, send_first=True)
     add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in PARALLEL_TEST_CONFIGS],
+    ids=[c[7] for c in PARALLEL_TEST_CONFIGS],
+)
+def test_transfer_worker_v2(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla):
+    """Test transfer worker with KVCacheManagerV2 (V2)."""
+    tensorrt_llm.logger.set_level("info")
+    logger.info("Test transfer worker V2 with parallel configurations")
+
+    setup = create_transfer_worker_setup(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=is_mla,
+        use_v2=True,
+    )
+
+    request_len = setup["request_len"]
+    add_and_verify_request(setup, 0, 1, request_len, send_first=True)
+    add_and_verify_request(setup, 2, 3, request_len, send_first=True)
+    add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
+
+
+if __name__ == "__main__":
+    test_transfer_worker_v1(1, 1, False, 1, 1, False, False)

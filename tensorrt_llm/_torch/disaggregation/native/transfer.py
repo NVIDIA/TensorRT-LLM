@@ -1504,6 +1504,11 @@ class TransferWorker:
             layer_num_per_pp=layer_num_per_pp,
             sender_endpoints=sender_endpoints,
         )
+        # Create KV pool attributes from manager (works for both V1 and V2)
+        kv_pool_attrs = KVRegionExtractorV1.create_kv_pool_attrs_from_manager(
+            self._kv_cache_manager
+        )
+
         self._rank_info = RankInfo(
             instance_name=instance_name,
             instance_rank=rank,
@@ -1523,26 +1528,34 @@ class TransferWorker:
             enable_attention_dp=enable_attention_dp,
             is_mla=is_mla,
             layer_num_per_pp=layer_num_per_pp,
-            kv_ptrs=[self._kv_cache_manager.get_unique_primary_pool().data_ptr()],
-            aux_ptrs=[],
             server_endpoint="",
             self_endpoint="",
             transfer_engine_info=bytes(),
             aux_meta=self._aux_buffer.meta if self._aux_buffer is not None else None,
+            kv_pool_attrs=kv_pool_attrs,
         )
 
     def _register_kv_cache(self):
-        memory_pool = self._kv_cache_manager.get_unique_primary_pool()
-        memory_desc = (
-            memory_pool.data_ptr(),
-            memory_pool.numel() * memory_pool.element_size(),
-            self._device_id,
-            "kv_cache_memory",
-        )
-        reg_memory_desc = RegMemoryDescs("VRAM", [memory_desc])
-        self._agent.register_memory(reg_memory_desc)
-        logger.debug(f"Registered KV cache memory with transfer agent: {memory_desc}")
-        self._registered_mem.append(reg_memory_desc)
+        # Get pool information from kv_pool_attrs (works for both V1 and V2 managers)
+        kv_pool_attrs = self._rank_info.kv_pool_attrs
+        memory_descs = []
+
+        for layer_group_attrs in kv_pool_attrs.layer_group_attrs_list:
+            for pool_idx, pool_ptr in enumerate(layer_group_attrs.pool_base_ptrs):
+                pool_size = layer_group_attrs.pool_sizes[pool_idx]
+                memory_desc = (
+                    pool_ptr,
+                    pool_size,
+                    self._device_id,
+                    f"kv_cache_memory_group{layer_group_attrs.group_id}_pool{pool_idx}",
+                )
+                memory_descs.append(memory_desc)
+
+        if memory_descs:
+            reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
+            self._agent.register_memory(reg_memory_desc)
+            logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
+            self._registered_mem.append(reg_memory_desc)
 
     def _register_aux_buffer(self):
         aux_meta = self._aux_buffer.meta

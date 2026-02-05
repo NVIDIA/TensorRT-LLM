@@ -9,10 +9,7 @@ from tensorrt_llm._torch.disaggregation.native.region.block import (
     IdentityMapper,
     RegionMapperBase,
 )
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-    KVPoolAttrs,
-    KVRegionExtractorV1,
-)
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 
 
 @dataclass
@@ -55,11 +52,8 @@ class PeerRegistrar:
         key = self._unique_key(peer_name, peer_rank)
         self._peer_ri_cache[key] = peer_ri
         peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
-        layer_num = peer_ri.layer_num_per_pp[peer_ri.pp_rank]
-        block_size = self._block_size(layer_num, peer_ri)
-        extractor = KVRegionExtractorV1(
-            KVPoolAttrs(pool_ptrs=peer_ri.kv_ptrs, block_bytes=[block_size])
-        )
+        # Use kv_pool_attrs from RankInfo (already serialized V2 format)
+        extractor = KVRegionExtractorV1(peer_ri.kv_pool_attrs)
         self._peer_ext_cache[key] = extractor
 
     def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
