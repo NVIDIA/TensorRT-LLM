@@ -27,7 +27,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
-                                             MoEAllReduce, MoEAllReduceParams)
+                                             MiniMaxAllReduceRMS, MoEAllReduce,
+                                             MoEAllReduceParams)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
@@ -694,6 +695,86 @@ def test_moe_finalize_allreduce_no_residual(mpi_pool_executor):
         *zip(*[(tensor_parallel_size, run_moe_finalize_allreduce_no_residual_op,
                 fc2_output, shared_expert_output, expanded_idx_to_permuted_idx,
                 scale)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
+def run_minimax_allreduce_rms_op(input: torch.Tensor, tensor_parallel_size: int,
+                                 tensor_parallel_rank: int,
+                                 rms_weights: torch.Tensor, eps: float):
+    torch.manual_seed(42)
+
+    total_tokens = input.shape[0]
+    origin_dtype = input.dtype
+
+    input = input.cuda()
+    rms_weights = rms_weights.cuda()
+
+    input = input.reshape(total_tokens, tensor_parallel_size,
+                          -1).to(torch.float32)
+    rms_weights = rms_weights.reshape(tensor_parallel_size,
+                                      -1).to(torch.float32)
+    rank_input = input[:, tensor_parallel_rank, :]
+    rank_rms_weights = rms_weights[tensor_parallel_rank, :]
+    # firstly, calculate the reference output for each rank
+    ref_output = rms_norm(input, rms_weights, eps)
+    ref_output = ref_output.reshape(total_tokens, tensor_parallel_size,
+                                    -1).to(origin_dtype)
+    ref_output = ref_output[:, tensor_parallel_rank, :]
+
+    # then, calculate the minimax allreduce output
+    minimax_allreduce_rms = MiniMaxAllReduceRMS(mapping=Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    ))
+    minimax_output = minimax_allreduce_rms(
+        input=rank_input,
+        rms_weights=rank_rms_weights,
+        eps=eps,
+    )
+
+    # finally, verify the results
+    torch.testing.assert_close(minimax_output, ref_output, rtol=0.2, atol=0.2)
+
+    return rank_input
+
+
+@torch.inference_mode()
+def run_minimax_allreduce_rms_single_rank(tensor_parallel_size,
+                                          single_rank_forward_func, input,
+                                          rms_weights, eps):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        single_rank_forward_func(input, tensor_parallel_size, rank, rms_weights,
+                                 eps)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_minimax_allreduce_rms(mpi_pool_executor):
+    torch.manual_seed(42)
+
+    seq_len = 16
+    hidden_size = 7168
+    dtype = torch.bfloat16
+    tensor_parallel_size = mpi_pool_executor.num_workers
+
+    token_input = torch.randn((seq_len, hidden_size), dtype=dtype)
+    rms_weights = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
+    eps = 1e-5
+
+    results = mpi_pool_executor.map(
+        run_minimax_allreduce_rms_single_rank,
+        *zip(*[(tensor_parallel_size, run_minimax_allreduce_rms_op, token_input,
+                rms_weights, eps)] * tensor_parallel_size),
     )
     for r in results:
         assert r is True
