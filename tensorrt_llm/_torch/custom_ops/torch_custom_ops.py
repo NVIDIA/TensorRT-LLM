@@ -1689,6 +1689,9 @@ class AllReduceRunner(TunableRunner):
     @classmethod
     def _maybe_preallocate_buffers(cls, input_tensor: torch.Tensor,
                                    group: List[int]) -> None:
+        if not AutoTuner.get().is_tuning_mode or not AutoTuner.get(
+        )._is_preparation:
+            return
         if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
             return
         if input_tensor.numel() == 0 or input_tensor.size(0) == 0:
@@ -1701,46 +1704,22 @@ class AllReduceRunner(TunableRunner):
                 # If capture status can't be queried, avoid prealloc to be safe.
                 return
 
-        if not cls.tuning_config.dynamic_tensor_specs:
-            opt_shapes = [int(input_tensor.size(0))]
-        else:
-            spec = cls.tuning_config.dynamic_tensor_specs[0]
-            base_val = int(input_tensor.size(spec.dim_idx))
-            if callable(spec.gen_tuning_buckets):
-                if cls.tuning_config.tune_max_num_tokens is None:
-                    opt_shapes = spec.gen_tuning_buckets(base_val)
-                else:
-                    opt_shapes = spec.gen_tuning_buckets(
-                        cls.tuning_config.tune_max_num_tokens)
-            else:
-                opt_shapes = spec.gen_tuning_buckets
-
-            opt_shapes = set(opt_shapes)
-            if cls.tuning_config.tune_max_num_tokens is not None:
-                opt_shapes.add(
-                    min(cls.tuning_config.tune_max_num_tokens, base_val))
-            else:
-                opt_shapes.add(base_val)
-
-        input_shape = list(input_tensor.shape)
+        num_tokens = int(input_tensor.size(0))
+        if num_tokens <= 0:
+            return
         group_key = tuple(group)
-        for tokens in sorted([int(v) for v in opt_shapes if v > 0]):
-            cache_key = (group_key, tokens)
-            with cls._prealloc_lock:
-                if cache_key in cls._prealloc_done:
-                    continue
-                cls._prealloc_done.add(cache_key)
+        cache_key = (group_key, num_tokens)
+        with cls._prealloc_lock:
+            if cache_key in cls._prealloc_done:
+                return
+            cls._prealloc_done.add(cache_key)
 
-            logger.debug(
-                "[tunable_allreduce] Pre-allocating NCCL window buffers: "
-                "tokens=%d group=%s", tokens, list(group))
-            if tokens == input_shape[0]:
-                prealloc_input = input_tensor
-            else:
-                prealloc_shape = [tokens] + input_shape[1:]
-                prealloc_input = input_tensor.new_empty(prealloc_shape)
-            torch.ops.trtllm.preallocate_nccl_window_buffer(
-                prealloc_input, group, 2)
+        logger.debug(
+            "[tunable_allreduce] Pre-allocating NCCL window buffers: "
+            "tokens=%d group=%s", num_tokens, list(group))
+        prealloc_input = input_tensor
+        torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
+                                                        2)
 
     def get_valid_tactics(
         self,

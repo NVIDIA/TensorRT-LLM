@@ -733,6 +733,7 @@ class AutoTuner:
         self._active_capture: Optional['AutoTuner.TacticsCapture'] = None
         # Last captured choose_one() contexts
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
+        self._is_preparation = False
 
         # Dsitributed tuning state
         self._dist: Optional[Distributed] = None
@@ -1033,12 +1034,16 @@ class AutoTuner:
             valid_tactics = self._maybe_parallelize_tactics(
                 all_valid_tactics, tuning_config.distributed_tuning_strategy)
             if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
-                runner(
-                    input_tensors,
-                    tactic=-1,
-                    do_preparation=True,
-                    **kwargs,
-                )
+                self._is_preparation = True
+                try:
+                    runner(
+                        input_tensors,
+                        tactic=-1,
+                        do_preparation=True,
+                        **kwargs,
+                    )
+                finally:
+                    self._is_preparation = False
 
             for tac in valid_tactics:
                 try:
