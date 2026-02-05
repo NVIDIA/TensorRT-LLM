@@ -162,15 +162,16 @@ transforms:
   visualize_namespace:
     stage: visualize
     enabled: false
-  ############################################################################################
+  ###########################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
-  ############################################################################################
+  ###########################################################################################
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer
   insert_cached_mla_attention:
     stage: cache_init
-    backend: MultiHeadLatentAttention
+    requires_shape_prop: true
+    backend: flashinfer_mla
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm
