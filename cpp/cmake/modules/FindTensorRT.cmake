@@ -21,7 +21,8 @@ set(TensorRT_WELL_KNOWN_ROOT /usr/local/tensorrt)
 find_path(
   TensorRT_INCLUDE_DIR
   NAMES NvInfer.h
-  PATHS ${TensorRT_WELL_KNOWN_ROOT}/include)
+  PATHS ${TensorRT_WELL_KNOWN_ROOT}/include ${TensorRT_ROOT}/include
+        ${TensorRT_ROOT}/include/tensorrt)
 
 function(_tensorrt_get_version)
   unset(TensorRT_VERSION_STRING PARENT_SCOPE)
@@ -70,7 +71,8 @@ endmacro(_tensorrt_find_dll)
 find_library(
   TensorRT_LIBRARY
   NAMES "nvinfer_${TensorRT_VERSION_MAJOR}" nvinfer
-  PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib)
+        "libnvinfer.so.${TensorRT_VERSION_MAJOR}"
+  PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib ${TensorRT_ROOT})
 
 if(WIN32)
   _tensorrt_find_dll(TensorRT_DLL "nvinfer_${TensorRT_VERSION_MAJOR}.dll"
@@ -88,12 +90,13 @@ if(TensorRT_FIND_COMPONENTS)
     find_path(
       TensorRT_OnnxParser_INCLUDE_DIR
       NAMES NvOnnxParser.h
-      PATHS ${TensorRT_WELL_KNOWN_ROOT}/include)
+      PATHS ${TensorRT_WELL_KNOWN_ROOT}/include ${TensorRT_INCLUDE_DIR})
 
     find_library(
       TensorRT_OnnxParser_LIBRARY
-      NAMES "nvonnxparser_${TensorRT_VERSION_MAJOR}" nvonnxparser
-      PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib)
+      NAMES "nvonnxparser_${TensorRT_VERSION_MAJOR}"
+            "libnvonnxparser.so.${TensorRT_VERSION_MAJOR}" nvonnxparser
+      PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib ${TensorRT_ROOT})
     if(TensorRT_OnnxParser_LIBRARY AND TensorRT_LIBRARIES)
       set(TensorRT_LIBRARIES ${TensorRT_LIBRARIES}
                              ${TensorRT_OnnxParser_LIBRARY})
@@ -111,12 +114,13 @@ if(TensorRT_FIND_COMPONENTS)
     find_path(
       TensorRT_Plugin_INCLUDE_DIR
       NAMES NvInferPlugin.h
-      PATHS ${TensorRT_WELL_KNOWN_ROOT}/include)
+      PATHS ${TensorRT_WELL_KNOWN_ROOT}/include ${TensorRT_INCLUDE_DIR})
 
     find_library(
       TensorRT_Plugin_LIBRARY
       NAMES "nvinfer_plugin_${TensorRT_VERSION_MAJOR}" nvinfer_plugin
-      PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib)
+            "libnvinfer_plugin.so.${TensorRT_VERSION_MAJOR}"
+      PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib ${TensorRT_ROOT})
 
     if(TensorRT_Plugin_LIBRARY AND TensorRT_LIBRARIES)
       set(TensorRT_LIBRARIES ${TensorRT_LIBRARIES} ${TensorRT_Plugin_LIBRARY})
