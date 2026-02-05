@@ -1656,6 +1656,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             "w3_weight",
             "w1_input_scale",
             "w2_input_scale",
+            "w3_input_scale",
             "w1_weight_scale",
             "w2_weight_scale",
             "w3_weight_scale",
@@ -1677,20 +1678,52 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         if is_gated_mlp:
             # For gated MLP, concatenate w1 and w3 as [w3, w1]
             fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
-            # Expect w3 input scale and alpha to be the same as w1
-            fc1_act_scale = w1_input_scale_stacked
-            fc1_alpha_stacked = w1_alpha_stacked
             fc1_weight_blockscale_fp8_stacked = torch.cat(
                 [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
             ).contiguous()
+
+            # Check if all w1 and w3 input scales are identical across experts
+            all_scales_equal = (
+                torch.all(w1_input_scale_stacked == w1_input_scale_stacked[0])
+                and torch.all(w3_input_scale_stacked == w3_input_scale_stacked[0])
+                and torch.all(w1_input_scale_stacked == w3_input_scale_stacked)
+            )
+
+            if all_scales_equal:
+                # All scales are identical, no need for min() or alpha recomputation
+                fc1_act_scale = w1_input_scale_stacked[0]
+                fc1_alpha_stacked = w1_alpha_stacked
+            else:
+                # Scales differ across experts - use global min scale and recompute alpha
+                # Use min() because scales are in kernel format (2688/amax): smaller scale = larger amax.
+                fc1_act_scale = torch.minimum(
+                    w1_input_scale_stacked.min(), w3_input_scale_stacked.min()
+                )
+                # Recompute alpha using global input scale instead of per-expert input scale.
+                # Formula: new_alpha = old_alpha * per_expert_input_scale / global_input_scale
+                # This ensures alpha is consistent with the global fc1_act_scale used by the kernel.
+                fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
         else:
             fc1_expert_weights = w1_stacked
-            fc1_act_scale = w1_input_scale_stacked
-            fc1_alpha_stacked = w1_alpha_stacked
             fc1_weight_blockscale_fp8_stacked = w1_weight_blockscale_fp8_stacked
 
+            # Check if all w1 input scales are identical across experts
+            all_scales_equal = torch.all(w1_input_scale_stacked == w1_input_scale_stacked[0])
+
+            if all_scales_equal:
+                # All scales are identical, no need for min() or alpha recomputation
+                fc1_act_scale = w1_input_scale_stacked[0]
+                fc1_alpha_stacked = w1_alpha_stacked
+            else:
+                # Scales differ across experts - use global min scale and recompute alpha
+                fc1_act_scale = w1_input_scale_stacked.min()
+                fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
+
         fc2_expert_weights = w2_stacked
+        # Keep fc2_act_scale per-expert (no global scale aggregation for fc2)
         fc2_act_scale = w2_input_scale_stacked
+        # No alpha recomputation needed since fc2 uses per-expert input scales
+        fc2_alpha_stacked = w2_alpha_stacked
         fc2_weight_blockscale_fp8_stacked = w2_weight_blockscale_fp8_stacked
 
         new_key_fc1_expert_weights = f"nvfp4_moe_w3_w1_stacked_{fused_key_counter}"
@@ -1761,7 +1794,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         _register_parameter(gm, new_key_fc1_act_scale, fc1_act_scale)
         _register_parameter(gm, new_key_fc2_act_scale, fc2_act_scale)
         _register_parameter(gm, new_key_fc1_alpha, fc1_alpha_stacked)
-        _register_parameter(gm, new_key_fc2_alpha, w2_alpha_stacked)
+        _register_parameter(gm, new_key_fc2_alpha, fc2_alpha_stacked)
 
         with graph.inserting_before(node):
             args = (
@@ -1801,6 +1834,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             w3_list,
             w1_input_scale,
             w2_input_scale,
+            w3_input_scale,
             w1_weight_scale,
             w2_weight_scale,
             w3_weight_scale,
@@ -1819,6 +1853,12 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         # Scales are buffers, not parameters
         w1_input_scale_stacked = _stack(w1_input_scale, dim=0)
         w2_input_scale_stacked = _stack(w2_input_scale, dim=0)
+        w3_input_scale_stacked = _stack(
+            w3_input_scale,
+            dim=0,
+            device=w1_input_scale_stacked.device,
+            dtype=w1_input_scale_stacked.dtype,
+        )
 
         # Use .view() not .to() to reinterpret bytes as float8, not value conversion
         w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).view(torch.float8_e4m3fn)
