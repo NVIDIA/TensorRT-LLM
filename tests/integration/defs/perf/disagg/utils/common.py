@@ -3,49 +3,42 @@
 import os
 
 # GPU resource configuration - centralized config for all GPU-specific parameters
-# job_name_prefix: SLURM job name format is {prefix}-{base} (e.g., coreai_comparch_trtllm-unified.benchmark)
 GPU_RESOURCE_CONFIG = {
     "GB200": {  # OCI GB200
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": True,
         "lock_freq_graphics_mhz": 2062,
         "lock_freq_memory_mhz": 3996,
-        "job_name_prefix": "coreai_comparch_trtllm",
     },
     "GB200_LYRIS": {  # Lyris GB200
         "slurm_extra_args": "",
         "set_segment": True,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
-        "job_name_prefix": "coreai_comparch_trtllm",
     },
     "GB300": {  # Lyris GB300
         "slurm_extra_args": "",
         "set_segment": True,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
-        "job_name_prefix": "coreai_comparch_trtllm",
     },
     "H100": {
         "slurm_extra_args": "",
         "set_segment": False,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
-        "job_name_prefix": "",
     },
     "B200": {  # OCI B200
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
-        "job_name_prefix": "",
     },
     "B300": {  # OCI B300
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
-        "job_name_prefix": "",
     },
 }
 
@@ -67,17 +60,18 @@ class EnvManager:
 
     @staticmethod
     def get_slurm_job_name() -> str:
-        """Get SLURM job name based on GPU type configuration.
-
-        Format: {prefix}-{base} or just {base} if no prefix.
-        Example: coreai_comparch_trtllm-unified.benchmark
-
-        Customize via SLURM_JOB_BASE_NAME env var (default: unified.benchmark)
+        """Get SLURM job name: {SLURM_ACCOUNT}-{base}.
+        
+        Example: myaccount-unified.benchmark
+        Customize base via SLURM_JOB_BASE_NAME env var (default: unified.benchmark)
         """
-        gpu_type = EnvManager.get_gpu_type()
-        prefix = GPU_RESOURCE_CONFIG.get(gpu_type, {}).get("job_name_prefix", "")
+        account = EnvManager.get_slurm_account()
         base = os.getenv("SLURM_JOB_BASE_NAME", "unified.benchmark")
-        return f"{prefix}-{base}" if prefix else base
+        
+        # Only use account as prefix if it's set and not a placeholder
+        if account and not account.startswith("<"):
+            return f"{account}-{base}"
+        return base
 
     @staticmethod
     def get_slurm_set_segment() -> bool:
