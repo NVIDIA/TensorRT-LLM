@@ -976,8 +976,8 @@ def test_nvfp4_moe_different_input_scales(allow_different_input_scales, scales_i
         w2_input_scale.append(inp_scale)
 
         # Alpha = 1 / (input_scale * weight_scale_2)
-        w1_alpha.append((inp_scale * w1_scale_2).to(torch.float32))
-        w2_alpha.append((inp_scale * w2_scale_2).to(torch.float32))
+        w1_alpha.append((1.0 / (inp_scale * w1_scale_2)).to(torch.float32))
+        w2_alpha.append((1.0 / (inp_scale * w2_scale_2)).to(torch.float32))
 
     # Create a module with the NVFP4 MoE op
     module = NVFP4MoEModuleForInputScaleTest(
