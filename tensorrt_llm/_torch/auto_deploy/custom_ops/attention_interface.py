@@ -1105,15 +1105,20 @@ class PagedResourceHandler(ManagedResourceHandler):
     The PagedResourceHandler can be used to handle resources that support paging such as kv-caches.
     """
 
-    def __init__(self, *token_shape: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self, *token_shape: int, dtype: torch.dtype, kv_layout: Literal["NHD", "HND"] = "NHD"
+    ) -> None:
         """Initialize the PagedResourceHandler.
 
         Args:
-            page_shape: The shape of a single page of the resource.
+            token_shape: The shape of a single token's worth of data in the resource.
             dtype: The dtype of the resource.
+            kv_layout: Memory layout for KV cache. "NHD" = [blocks, tokens, kv_factor, heads, dim],
+                       "HND" = [blocks, kv_factor, heads, tokens, dim]. Default is "NHD".
         """
         self.token_shape = token_shape
         self.dtype = dtype
+        self.kv_layout = kv_layout
 
 
 class StateResourceHandler(ManagedResourceHandler):

@@ -20,6 +20,12 @@ from ..custom_ops.attention_interface import (
     SequenceInfo,
     StateResourceHandler,
 )
+
+# Import trtllm_attention config to configure it when pool info is available
+try:
+    from ..custom_ops.trtllm_attention import _trtllm_config as trtllm_attn_config
+except ImportError:
+    trtllm_attn_config = None
 from ..distributed.common import all_gather_object, get_world_size
 from ..distributed.common import is_initialized as is_distributed_initialized
 from ..utils.cuda_mem_tracker import bytes_to, get_mem_info
@@ -126,6 +132,20 @@ class CachedSequenceInterface:
         """Add a resource handler to the cache interface."""
         self._resource_lookup[name] = resource_handler
 
+    @staticmethod
+    def _torch_dtype_to_binding(dtype: torch.dtype) -> "DataType":
+        """Convert torch dtype to TensorRT-LLM binding DataType."""
+        dtype_map = {
+            torch.float16: DataType.HALF,
+            torch.bfloat16: DataType.BF16,
+            torch.float32: DataType.FLOAT,
+            torch.float8_e4m3fn: DataType.FP8,
+            torch.int8: DataType.INT8,
+        }
+        if dtype not in dtype_map:
+            raise ValueError(f"Unsupported dtype for KVCacheManager: {dtype}")
+        return dtype_map[dtype]
+
     def _create_kv_cache_manager(self, max_tokens: Optional[int] = None) -> int:
         """Create KVCacheManager or MambaHybridCacheManager with multi-layer byte-level params.
 
@@ -196,29 +216,67 @@ class CachedSequenceInterface:
         if kv_cache_config.free_gpu_memory_fraction == 0.0:
             kv_cache_config.free_gpu_memory_fraction = None
 
-        # Common KV cache parameters
-        kv_cache_kwargs = {
-            "kv_cache_config": kv_cache_config,
-            "kv_cache_type": CacheTypeCpp.SELFKONLY,  # kv_factor=1, treat K, V separately
-            "num_layers": len(self._paged_cache_order),  # correct num layers
-            "num_kv_heads": num_kv_heads_per_layer,  # per-layer bytes_per_token
-            "head_dim": 1,  # all bytes in num_kv_heads
-            "tokens_per_block": kv_cache_config.tokens_per_block,
-            "max_seq_len": self.info.max_seq_len,
-            "max_batch_size": self.info.max_batch_size,
-            "mapping": Mapping(),
-            # NOTE (lucaslie): this is the only 1-byte dtype currently supported by the
-            # KVCacheManager. Ideally, we would use the typical uint8 dtype for byte-level
-            # abstraction, but this is not supported.
-            "dtype": DataType.FP8,  # 1-byte dtype for byte-level abstraction
-            "layer_mask": None,
-            # NOTE (lucaslie): we can always run with False here since when we are estimating, we
-            # are explicitly setting the max_tokens in which case it's okay to use False here since
-            # we don't rely on free_gpu_memory_fraction inside the KVCacheManager. This is similar
-            # to _torch.pyexecutor._util.KVCacheCreator, which explicitly estimates the max_tokens
-            # outside of the KVCacheManager.
-            "is_estimating_kv_cache": False,
-        }
+        # Check if all handlers want native HND layout (e.g., TrtllmKVResourceHandler)
+        # If so, use SELF cache type with kv_factor=2 for direct HND allocation without copy
+        use_native_hnd = all(
+            getattr(h, "kv_layout", "NHD") == "HND" and getattr(h, "kv_factor", 1) == 2
+            for h in self._paged_cache_order.values()
+        )
+
+        if use_native_hnd and len(self._paged_cache_order) > 0:
+            # Use SELF cache type for native HND layout (kv_factor=2, no copy needed)
+            first_handler = next(iter(self._paged_cache_order.values()))
+            # For HND mode, use actual num_kv_heads per layer (not bytes)
+            native_num_kv_heads = [
+                getattr(h, "num_kv_heads", h.token_shape[1])
+                for h in self._paged_cache_order.values()
+            ]
+            native_head_dim = getattr(first_handler, "head_dim", first_handler.token_shape[2])
+            native_dtype = self._torch_dtype_to_binding(first_handler.dtype)
+
+            kv_cache_kwargs = {
+                "kv_cache_config": kv_cache_config,
+                "kv_cache_type": CacheTypeCpp.SELF,  # kv_factor=2, K+V interleaved
+                "num_layers": len(self._paged_cache_order),
+                "num_kv_heads": native_num_kv_heads,  # actual num_kv_heads per layer
+                "head_dim": native_head_dim,  # actual head_dim
+                "tokens_per_block": kv_cache_config.tokens_per_block,
+                "max_seq_len": self.info.max_seq_len,
+                "max_batch_size": self.info.max_batch_size,
+                "mapping": Mapping(),
+                "dtype": native_dtype,  # actual dtype
+                "layer_mask": None,
+                "is_estimating_kv_cache": False,
+            }
+            ad_logger.info(
+                f"Using native HND layout with SELF cache type: "
+                f"num_kv_heads={native_num_kv_heads[0]}, head_dim={native_head_dim}, "
+                f"dtype={first_handler.dtype}"
+            )
+        else:
+            # Default: SELFKONLY mode for byte-level abstraction
+            kv_cache_kwargs = {
+                "kv_cache_config": kv_cache_config,
+                "kv_cache_type": CacheTypeCpp.SELFKONLY,  # kv_factor=1, treat K, V separately
+                "num_layers": len(self._paged_cache_order),  # correct num layers
+                "num_kv_heads": num_kv_heads_per_layer,  # per-layer bytes_per_token
+                "head_dim": 1,  # all bytes in num_kv_heads
+                "tokens_per_block": kv_cache_config.tokens_per_block,
+                "max_seq_len": self.info.max_seq_len,
+                "max_batch_size": self.info.max_batch_size,
+                "mapping": Mapping(),
+                # NOTE (lucaslie): this is the only 1-byte dtype currently supported by the
+                # KVCacheManager. Ideally, we would use the typical uint8 dtype for byte-level
+                # abstraction, but this is not supported.
+                "dtype": DataType.FP8,  # 1-byte dtype for byte-level abstraction
+                "layer_mask": None,
+                # NOTE (lucaslie): we can always run with False here since when we are estimating, we
+                # are explicitly setting the max_tokens in which case it's okay to use False here since
+                # we don't rely on free_gpu_memory_fraction inside the KVCacheManager. This is similar
+                # to _torch.pyexecutor._util.KVCacheCreator, which explicitly estimates the max_tokens
+                # outside of the KVCacheManager.
+                "is_estimating_kv_cache": False,
+            }
 
         # update args if we are just doing a dummy cache manager
         if not len(self._paged_cache_order):
@@ -262,9 +320,30 @@ class CachedSequenceInterface:
 
         # Create paged resource views from per-layer buffers
         for layer_idx, (name, handler) in enumerate(self._paged_cache_order.items()):
-            view = self._kv_cache_manager.get_buffers(layer_idx, kv_layout="NHD")
-            view = view.view(blocks_in_primary_pool, tokens_per_block, -1).view(handler.dtype)
-            view = view.view(blocks_in_primary_pool, tokens_per_block, *handler.token_shape)
+            kv_layout = getattr(handler, "kv_layout", "NHD")
+
+            if use_native_hnd and kv_layout == "HND":
+                # Native HND mode: get_buffers returns HND layout directly (no copy!)
+                # Shape: [blocks, kv_factor=2, num_kv_heads, tokens_per_block, head_dim]
+                view = self._kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+            else:
+                # SELFKONLY byte-level mode: need to reshape from bytes
+                view = self._kv_cache_manager.get_buffers(layer_idx, kv_layout="NHD")
+
+                # Reshape from byte buffer to handler's desired layout
+                # Raw from get_buffers: [blocks, 1, bytes_per_token, tokens_per_block, 1]
+                # Flatten to: [blocks, tokens_per_block, total_bytes]
+                view = view.view(blocks_in_primary_pool, tokens_per_block, -1).view(handler.dtype)
+
+                if kv_layout == "NHD":
+                    # NHD: [blocks, tokens_per_block, *token_shape]
+                    view = view.view(blocks_in_primary_pool, tokens_per_block, *handler.token_shape)
+                else:
+                    # HND: requires permute + contiguous (memory copy)
+                    # token_shape is (kv_factor, num_kv_heads, head_dim)
+                    # We need [blocks, kv_factor, num_kv_heads, tokens_per_block, head_dim]
+                    view = view.view(blocks_in_primary_pool, tokens_per_block, *handler.token_shape)
+                    view = view.permute(0, 2, 3, 1, 4).contiguous()
 
             # Sanity check on contiguity of individual pages
             view_one_page = view[0]
@@ -292,6 +371,18 @@ class CachedSequenceInterface:
             assert view[0].is_contiguous(), f"Per-slot state for {name} cache is not contiguous"
 
             self._caches[name] = view
+
+        # Set pool pointers and mapping on SequenceInfo for attention backends
+        # that need to know the physical memory layout (e.g., trtllm_attention)
+        if hasattr(self._kv_cache_manager, "kv_cache_pool_pointers"):
+            self.info.set_kv_cache_pool_info(
+                pool_pointers=self._kv_cache_manager.kv_cache_pool_pointers,
+                pool_mapping=self._kv_cache_manager.kv_cache_pool_mapping,
+            )
+            # Also configure trtllm_attention's global config with SequenceInfo
+            # so it can access pool pointers/mapping during attention execution
+            if trtllm_attn_config is not None:
+                trtllm_attn_config.configure(self.info)
 
         # Patch shutdown to clear cache views before pool release
         self._kv_cache_manager.shutdown = with_pre_callback(

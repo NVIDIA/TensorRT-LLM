@@ -57,6 +57,7 @@ from .attention_interface import (
     CacheConfig,
     Constant,
     MHACallable,
+    PagedResourceHandler,
     PrepareMetadataCallable,
     PrepareMetadataHostCallable,
     ResourceHandler,
@@ -84,14 +85,14 @@ class TrtllmWorkspaceResourceHandler(ResourceHandler):
         return buffer
 
 
-class TrtllmKVResourceHandler(ResourceHandler):
+class TrtllmKVResourceHandler(PagedResourceHandler):
     """Resource handler for TRT-LLM unified KV cache.
 
-    Uses ResourceHandler (not PagedResourceHandler) so the interface calls allocate()
-    directly, allowing us to create the cache with the exact layout thop.attention expects.
+    Extends PagedResourceHandler so the cache interface recognizes it as a paged resource
+    and creates a proper KVCacheManager with correct parameters (num_layers, num_kv_heads, etc.).
 
-    Uses kv_factor=2 (unified K+V) and kv_layout="HND" to match what thop.attention expects.
-    The cache is allocated with shape [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim].
+    Uses kv_layout="HND" to request HND format from AD's cache manager.
+    The cache is converted to HND format in interface.py via permute+contiguous.
     """
 
     def __init__(
@@ -103,44 +104,32 @@ class TrtllmKVResourceHandler(ResourceHandler):
         trtllm_config: "TrtllmAttentionGlobalState",
         cache_config: CacheConfig,
     ) -> None:
-        # Store attributes for TRT-LLM attention
+        # Initialize parent class with token_shape = (2, num_kv_heads, head_dim)
+        # The 2 is kv_factor for unified K+V cache
+        # Use HND layout for thop.attention kernel compatibility
+        super().__init__(2, num_kv_heads, head_dim, dtype=dtype, kv_layout="HND")
+
+        # Store additional attributes for TRT-LLM attention
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.dtype = dtype
         self.kv_factor = 2  # Unified K+V cache
-        self.kv_layout = "HND"  # Matches thop.attention kernel's per-block layout
         self.layer_idx = layer_idx
         self._trtllm_config = trtllm_config
         self._cache_config = cache_config
 
-    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
-        """Allocate cache via KVCacheManager or simple allocation."""
-        # Configure global state first (first time only)
-        if not self._trtllm_config.is_configured:
-            self._trtllm_config.configure(sequence_info)
+    def __eq__(self, other: "TrtllmKVResourceHandler") -> bool:
+        """Check compatibility for KVCacheManager resource grouping.
 
-        # Set model config for FP8 KV cache support (first time only)
-        if self._trtllm_config._num_layers == 0:
-            cache_dtype = self.dtype
-            self._trtllm_config.set_model_config(
-                num_layers=len(TrtllmAttention._num_kv_heads_per_layer),
-                num_kv_heads_per_layer=TrtllmAttention._num_kv_heads_per_layer,
-                head_dim=TrtllmAttention._head_dim,
-                dtype=cache_dtype,
-            )
-
-        # Allocate unified KV cache with correct layout for thop.attention
-        # Shape: [num_blocks, kv_factor=2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
-        cache = torch.empty(
-            sequence_info.num_blocks,
-            self.kv_factor,  # 2 for K and V
-            self.num_kv_heads,
-            sequence_info.tokens_per_block,
-            self.head_dim,
-            device=sequence_info.device,
-            dtype=self.dtype,
+        Return True so KVCacheManager manages all layers' KV caches together.
+        """
+        if not isinstance(other, TrtllmKVResourceHandler):
+            return False
+        return (
+            self.head_dim == other.head_dim
+            and self.dtype == other.dtype
+            and self.kv_factor == other.kv_factor
+            and self.kv_layout == other.kv_layout
         )
-        return cache
 
 
 @dataclass
@@ -175,8 +164,15 @@ class TrtllmLayerState:
 
     def __post_init__(self):
         """Initialize tensors - use shared tensors from global state where possible."""
-        # Pool mapping needs to be pre-allocated before init_from_shared
-        # Other tensors will come from shared state via init_from_shared()
+        # Pool pointers and mapping are per-layer (each layer has its own cache buffer)
+        # These are NOT shared across layers
+        if self.host_kv_cache_pool_pointers is None:
+            # Pool pointers: [num_pools, 2] for K and V pointers
+            # With per-layer caches, each layer uses pool 0 which points to its own buffer
+            self.host_kv_cache_pool_pointers = torch.zeros(
+                1, 2, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+
         if self.host_kv_cache_pool_mapping is None:
             # Pool mapping: 2D [num_layers, 2] format expected by thop.attention
             max_layers = 256
@@ -185,8 +181,13 @@ class TrtllmLayerState:
             )
 
     def init_from_shared(self, global_state: "TrtllmAttentionGlobalState") -> None:
-        """Initialize layer to use shared tensors from global state."""
-        # All layers share the same tensors (single KV cache pool)
+        """Initialize layer to use shared tensors from global state.
+
+        NOTE: Pool pointers (host_kv_cache_pool_pointers) are NOT shared because each layer
+        has its own cache buffer with a different data_ptr(). These are initialized in
+        __post_init__ and set per-layer in _prepare_trtllm_metadata.
+        """
+        # All layers share sequence/batch metadata tensors
         self.sequence_length = global_state._shared_sequence_length
         self.context_lengths = global_state._shared_context_lengths
         self.kv_cache_block_offsets = global_state._shared_kv_cache_block_offsets
@@ -194,8 +195,8 @@ class TrtllmLayerState:
         self.host_context_lengths = global_state._shared_host_context_lengths
         self.host_request_types = global_state._shared_host_request_types
         self.host_total_kv_lens = global_state._shared_host_total_kv_lens
-        self.host_kv_cache_pool_pointers = global_state._shared_host_kv_cache_pool_pointers
-        # Keep host_kv_cache_pool_mapping from __post_init__ - it's layer-specific
+        # NOTE: host_kv_cache_pool_pointers is NOT shared - each layer has its own from __post_init__
+        # NOTE: host_kv_cache_pool_mapping is NOT shared - each layer has its own from __post_init__
 
 
 class TrtllmAttentionGlobalState:
@@ -324,32 +325,63 @@ class TrtllmAttentionGlobalState:
         self._gpu_buffers_initialized = True
 
     def _init_pool_pointers(
-        self, ad_pool_pointers: torch.Tensor, ad_pool_mapping: torch.Tensor, num_layers: int
+        self,
+        ad_pool_pointers: Optional[torch.Tensor],
+        ad_pool_mapping: Optional[torch.Tensor],
+        num_layers: int,
+        fallback_kv_cache_ptr: Optional[int] = None,
     ) -> None:
-        """Initialize pool pointers once from AD's KVCacheManager.
+        """Initialize pool pointers once from AD's KVCacheManager or fallback.
 
         This is called once during first host_prepare to set up the static pool info.
         Pool pointers don't change between requests - only block offsets do.
+
+        Args:
+            ad_pool_pointers: Pool pointers from SequenceInfo (if available)
+            ad_pool_mapping: Pool mapping from SequenceInfo (if available)
+            num_layers: Number of transformer layers
+            fallback_kv_cache_ptr: Fallback KV cache data pointer (if AD pool not available)
         """
         if self._pool_pointers_initialized:
             return
 
-        if ad_pool_pointers is None or ad_pool_mapping is None:
-            return
+        # Check if AD pool pointers are valid
+        use_ad_pool = (
+            ad_pool_pointers is not None
+            and ad_pool_mapping is not None
+            and ad_pool_pointers.numel() > 0
+            and ad_pool_pointers[0, 0].item() != 0
+        )
 
-        if ad_pool_pointers.numel() == 0 or ad_pool_pointers[0, 0].item() == 0:
-            return
+        if use_ad_pool:
+            # Use AD's pool pointers directly
+            # K and V are interleaved in blocks, so only K ptr is needed
+            # V ptr is set to 0 - kernel uses block offsets to find V
+            self._shared_host_kv_cache_pool_pointers[0, 0] = ad_pool_pointers[0, 0].item()
+            self._shared_host_kv_cache_pool_pointers[0, 1] = 0
 
-        # Set pool pointers (these are static for the lifetime of the cache)
-        self._shared_host_kv_cache_pool_pointers[0, 0] = ad_pool_pointers[0, 0].item()
-        self._shared_host_kv_cache_pool_pointers[0, 1] = 0  # v_ptr=0 for interleaved
+            # Set pool mapping for all layers
+            for layer_i in range(min(num_layers, ad_pool_mapping.shape[0])):
+                self._shared_host_kv_cache_pool_mapping[layer_i, 0] = ad_pool_mapping[
+                    layer_i, 0
+                ].item()
+                self._shared_host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[
+                    layer_i, 1
+                ].item()
 
-        # Set pool mapping for all layers
-        for layer_i in range(min(num_layers, ad_pool_mapping.shape[0])):
-            self._shared_host_kv_cache_pool_mapping[layer_i, 0] = ad_pool_mapping[layer_i, 0].item()
-            self._shared_host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[layer_i, 1].item()
+            self._pool_pointers_initialized = True
+        elif fallback_kv_cache_ptr is not None and fallback_kv_cache_ptr != 0:
+            # Fallback: Use kv_cache tensor's data pointer directly
+            # V ptr is set to 0 - kernel uses block offsets to find V
+            self._shared_host_kv_cache_pool_pointers[0, 0] = fallback_kv_cache_ptr  # K ptr
+            self._shared_host_kv_cache_pool_pointers[0, 1] = 0  # V ptr = 0
 
-        self._pool_pointers_initialized = True
+            # All layers map to pool 0 with layer offset
+            for layer_i in range(num_layers):
+                self._shared_host_kv_cache_pool_mapping[layer_i, 0] = 0  # pool index
+                self._shared_host_kv_cache_pool_mapping[layer_i, 1] = layer_i  # layer offset
+
+            self._pool_pointers_initialized = True
 
     def get_or_create_layer_state(
         self,
@@ -527,7 +559,8 @@ class TrtllmAttentionGlobalState:
                 )
                 page_in_seq = global_state._gpu_page_idx[:total_pages]
 
-                # base_offsets on GPU
+                # Block offsets: multiplier = num_layers * kv_factor for interleaved K/V
+                # K and V have different offsets: K = base, V = base + 1
                 kv_factor = 2
                 multiplier = num_layers * kv_factor
                 torch.mul(
@@ -540,10 +573,10 @@ class TrtllmAttentionGlobalState:
                 # Fill block offsets using advanced indexing (only zero the slice we need)
                 global_state._shared_kv_cache_block_offsets[:, :num_seq, :, :].zero_()
                 global_state._shared_kv_cache_block_offsets[0, seq_indices, 0, page_in_seq] = (
-                    base_offsets
+                    base_offsets  # K
                 )
                 global_state._shared_kv_cache_block_offsets[0, seq_indices, 1, page_in_seq] = (
-                    base_offsets + 1
+                    base_offsets + 1  # V
                 )
 
             # Mark that host_prepare has run
@@ -665,7 +698,13 @@ def _prepare_trtllm_metadata(
             f"Expected kv_cache shape [pages, 2, heads, tokens, dim], got {kv_cache.shape}"
         )
 
-    num_layers = state.num_layers if state.num_layers > 0 else 32
+    # Get num_layers - prefer from pool_mapping (accurate) over state.num_layers (may be stale)
+    if ad_pool_mapping is not None and ad_pool_mapping.numel() > 0:
+        num_layers = ad_pool_mapping.shape[0]
+    elif state.num_layers > 0:
+        num_layers = state.num_layers
+    else:
+        num_layers = 32
 
     # Compute input sequence lengths from cumulative sums
     input_seq_lens = (cu_seqlen_host[1 : num_seq + 1] - cu_seqlen_host[:num_seq]).int()
@@ -686,7 +725,7 @@ def _prepare_trtllm_metadata(
     state.sequence_length[:num_seq].copy_(seq_len_with_cache.cuda())
     state.context_lengths[:num_seq].copy_(input_seq_lens.cuda())
 
-    # Set up KV cache pool pointers
+    # Set up KV cache pool pointers - use AD's pool pointers
     use_ad_pool = (
         ad_pool_pointers is not None
         and ad_pool_mapping is not None
@@ -709,12 +748,18 @@ def _prepare_trtllm_metadata(
         state.host_kv_cache_pool_mapping[layer_i, 0] = ad_pool_mapping[layer_i, 0].item()
         state.host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[layer_i, 1].item()
 
+    # Mark pool pointers as initialized in global state to skip redundant init in host_prepare_fn
+    _global_state._pool_pointers_initialized = True
+
     # Block offsets: convert flat cache_loc to per-sequence block indices
     pages_per_seq = (cu_num_pages_host[1 : num_seq + 1] - cu_num_pages_host[:num_seq]).int()
     max_blocks = pages_per_seq.max().item() if num_seq > 0 else 1
     _global_state.set_max_blocks_per_seq(max_blocks)
 
     # Fill block offsets
+    # AD's cache_loc contains LOGICAL block indices from KVCacheManager
+    # Multiplier = num_layers * kv_factor for interleaved K/V layout
+    # K and V have different offsets: K = base, V = base + 1
     kv_factor = 2
     multiplier = num_layers * kv_factor
     state.kv_cache_block_offsets.zero_()
@@ -723,8 +768,8 @@ def _prepare_trtllm_metadata(
         n_pages = pages_per_seq[i].item()
         if n_pages > 0:
             base_offsets = cache_loc[offset : offset + n_pages] * multiplier
-            state.kv_cache_block_offsets[0, i, 0, :n_pages] = base_offsets
-            state.kv_cache_block_offsets[0, i, 1, :n_pages] = base_offsets + 1
+            state.kv_cache_block_offsets[0, i, 0, :n_pages] = base_offsets  # K
+            state.kv_cache_block_offsets[0, i, 1, :n_pages] = base_offsets + 1  # V
             offset += n_pages
 
     # Return tensors
@@ -793,13 +838,31 @@ def trtllm_mha_with_cache(
     if not kv_cache.is_cuda:
         raise RuntimeError(f"kv_cache must be on CUDA, got {kv_cache.device}")
 
-    # Validate unified KV cache format
-    # Expected shape: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
-    # This shape is created by TrtllmKVResourceHandler.allocate() which permutes the base allocation
+    # Validate KV cache format
+    # TrtllmKVResourceHandler configures AD to allocate cache in HND format:
+    # [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]
+    # This matches what thop.attention expects.
     assert kv_cache.dim() == 5, f"kv_cache must be 5D, got {kv_cache.dim()}D"
     assert kv_cache.shape[1] == 2, (
-        f"kv_cache.shape[1] must be 2 (kv_factor), got {kv_cache.shape[1]}"
+        f"kv_cache must be in HND format [B, 2, H, T, D] with shape[1]=2, "
+        f"got shape {kv_cache.shape}. Ensure TrtllmKVResourceHandler is used."
     )
+
+    # Lazy initialization of model config (done once on first attention call)
+    if _trtllm_config._num_layers == 0:
+        # Track layer config
+        TrtllmAttention._track_layer_config(num_kv_heads, head_dim, kv_cache.dtype)
+
+        # Once all layers have been seen, set model config
+        # We infer num_layers from layer_idx (assumes layers are processed in order)
+        expected_num_layers = len(TrtllmAttention._num_kv_heads_per_layer)
+        if layer_idx == expected_num_layers - 1 or expected_num_layers >= 32:
+            _trtllm_config.set_model_config(
+                num_layers=expected_num_layers,
+                num_kv_heads_per_layer=TrtllmAttention._num_kv_heads_per_layer,
+                head_dim=head_dim,
+                dtype=kv_cache.dtype,
+            )
 
     # Get batch dimensions
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
