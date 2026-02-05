@@ -639,7 +639,16 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[0] == w_scale_shape[0]
     assert w_shape[1] * 2 == w_scale_shape[1] * 32
     assert w_shape[2] == w_scale_shape[2]
-    w = maybe_update_stride(w)
+
+    # OOM fix: save reference to original storage before maybe_update_stride
+    # makes a copy. We free the original to make room for convert_layout output.
+    original_w_storage = w.data.untyped_storage()
+
+    w = maybe_update_stride(w)  # creates new tensor (transpose+contiguous+transpose)
+
+    # Free original parameter storage - maybe_update_stride already made a copy
+    original_w_storage.resize_(0)
+    torch.cuda.empty_cache()
     #num_warps = 4 if batch <= 512 else 8
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
