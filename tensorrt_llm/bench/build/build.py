@@ -269,7 +269,7 @@ def build_command(
     checkpoint_path = bench_env.checkpoint_path or model_name
     model_config = get_model_config(model_name, bench_env.checkpoint_path)
     engine_dir = Path(bench_env.workspace, model_name,
-                      f"tp_{tp_size}_pp_{pp_size}_cp_{cp_size}")
+                      f"tp_{tp_size}_pp_{pp_size}")
 
     # Set the compute quantization.
     quant_algo = QuantAlgo(quantization) if quantization is not None else None
