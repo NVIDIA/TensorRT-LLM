@@ -357,9 +357,21 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     )
 
 
+def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
+    return not params.use_beam_search
+
+
 def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
+    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
+    # resolve it on every iteration.
+    if hasattr(request, "py_sampling_strategy"):
+        return request.py_sampling_strategy
+
     params = _request_get_sampling_params(request)
-    return resolve_sampling_strategy(params, vocab_size=vocab_size)
+    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    if _request_sampling_params_cachable(params):
+        request.py_sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    return sampling_strategy
 
 
 def _group_requests_by_strategy_key(
