@@ -568,7 +568,7 @@ class AggrTestCmds(NamedTuple):
             wait_for_endpoint_ready(
                 f"http://{server_hostname}:{server_port}/health",
                 timeout=self.timeout,
-                check_files=[server_file_path],
+                check_files=[server_file_path, server_error_file_path],
                 server_proc=server_proc,
             )
 
@@ -797,19 +797,14 @@ class DisaggTestCmds(NamedTuple):
                 )
                 server_files = [
                     os.path.join(self.output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log"),
+                    os.path.join(self.output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.error.log"),
+                ] + [
+                    os.path.join(self.output_dir, f"trtllm-serve.CTX_{ctx_idx}.{server_idx}.log")
+                    for ctx_idx in range(self.num_ctx_servers)
+                ] + [
+                    os.path.join(self.output_dir, f"trtllm-serve.GEN_{gen_idx}.{server_idx}.log")
+                    for gen_idx in range(self.num_gen_servers)
                 ]
-                for ctx_idx in range(self.num_ctx_servers):
-                    server_files.append(
-                        os.path.join(
-                            self.output_dir, f"trtllm-serve.CTX_{ctx_idx}.{server_idx}.log"
-                        )
-                    )
-                for gen_idx in range(self.num_gen_servers):
-                    server_files.append(
-                        os.path.join(
-                            self.output_dir, f"trtllm-serve.GEN_{gen_idx}.{server_idx}.log"
-                        )
-                    )
                 wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
                     timeout=self.timeout,
