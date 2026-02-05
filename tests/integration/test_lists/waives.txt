@@ -354,3 +354,5 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False] SKIP (https://nvbugs/5863806)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-trtllm-auto] SKIP (https://nvbugs/5596343)
 test_e2e.py::test_trtllm_multimodal_benchmark_serving SKIP (https://nvbugs/5864769)
+accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tp4ep4_cudagraph_overlap] (https://nvbugs/5874687)
+accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass] (https://nvbugs/5874687)
