@@ -1983,8 +1983,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         #     Since read-caching is expected to help in typical cases, option (ii) is implemented here.
 
         # Track which logits require logit bias application
-        logits_bias_mask = torch.zeros((logits.size(0),), dtype=torch.bool, pin_memory=True)
-
+        request_steps_list = request_steps.tolist()
+        logits_bias_masks = [False] * logits.size(0)
         _next_bias_index = 0
 
         def provision_bias_index() -> int:
@@ -2004,11 +2004,11 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         # Collect bias information
         req_bias = None
-        for i, (req, steps) in enumerate(zip(requests, request_steps)):
-            steps = int(steps.item())
+        for i, (req, steps) in enumerate(zip(requests, request_steps_list)):
             req_bias = req._py_embedding_bias_1d
             if req_bias is not None:
-                logits_bias_mask[i : (i + steps)] = True
+                for j in range(i, i + steps):
+                    logits_bias_masks[j] = True
                 req_bias_index = bias_to_index[req_bias]
                 bias_gather_indices.extend(repeat(req_bias_index, steps))
 
@@ -2019,7 +2019,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         bias_gather_indices_cuda = torch.tensor(
             bias_gather_indices, pin_memory=True, dtype=torch.int32
         ).to(logits.device, non_blocking=True)
-        logits_bias_mask_cuda = logits_bias_mask.to(logits.device, non_blocking=True)
+        logits_bias_mask_cuda = torch.tensor(
+            logits_bias_masks, pin_memory=True, dtype=torch.bool
+        ).to(logits.device, non_blocking=True)
         biases_tensor = torch.empty((len(bias_to_index), *req_bias.shape), pin_memory=True)
         biases_tensor = torch.stack(
             tuple(bias_to_index.keys()),
