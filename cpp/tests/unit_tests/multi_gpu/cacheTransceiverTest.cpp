@@ -552,9 +552,10 @@ protected:
                 mCpSize = genCp;
             }
 
-            mTpRank = mRankInInstance % mTpSize;
+            // Rank formula must match targetIRanks: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank.
+            mCpRank = mRankInInstance % mCpSize;
+            mTpRank = (mRankInInstance / mCpSize) % mTpSize;
             mPpRank = mRankInInstance / (mTpSize * mCpSize);
-            mCpRank = (mRankInInstance % (mTpSize * mCpSize)) / mTpSize;
             mContextRankSize = contextRanks;
             mGenRankSize = genRanks;
             mContextTpSize = contextTp;
@@ -1804,6 +1805,63 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*genPp*/ testing::Values(2),
         /*genCp*/ testing::Values(2),
         /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests high context PP with TP and CP variations on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1, 2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(5, 6, 7),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests high context PP with PP and CP on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(2),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(5, 6, 7),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests high context PP with pure CP on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(4),
+        /*numLayers*/ testing::Values(5, 6, 7),
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
