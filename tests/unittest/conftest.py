@@ -216,6 +216,12 @@ def pytest_sessionstart(session):
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
 
+    # Setup Triton cache directory to avoid "No such file or directory" errors
+    from pathlib import Path
+    triton_cache_dir = os.environ.get('TRITON_CACHE_DIR', '/tmp/triton_cache')
+    Path(triton_cache_dir).mkdir(parents=True, exist_ok=True)
+    os.environ['TRITON_CACHE_DIR'] = triton_cache_dir
+
     # To counter TransformerEngine v2.3's lazy_compile deferral,
     # which will cause Pytest thinks there's a thread leakage.
     import torch._inductor.async_compile  # noqa: F401
