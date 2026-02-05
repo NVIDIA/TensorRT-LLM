@@ -486,17 +486,6 @@ class ModelLoader:
             if hasattr(self.llm_args, "speculative_model")
             and self.llm_args.speculative_model else None)
 
-        # Apply model-specific defaults if the model class provides them
-        if hasattr(model_cls, 'get_model_defaults'):
-            model_defaults = model_cls.get_model_defaults(self.llm_args)
-
-            if model_defaults:
-                applied_defaults = apply_model_defaults_to_llm_args(
-                    self.llm_args, model_defaults)
-                if applied_defaults:
-                    logger.info("Applied model defaults for %s: %s",
-                                model_cls.__name__, applied_defaults)
-
         prequantized = self._update_from_hf_quant_config()
 
         # FP4 Gemm force to use plugin.
