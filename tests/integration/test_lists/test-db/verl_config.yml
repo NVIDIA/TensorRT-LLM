@@ -1,0 +1,7 @@
+verl_config:
+  repo_url: "https://github.com/verl-project/verl.git"
+  commit: "COMMIT_HASH_HERE"  # User to provide specific commit hash
+  install_commands:
+    - "pip3 install -e ."
+    # Additional commands to be specified by user
+  test_dir: "tests"
