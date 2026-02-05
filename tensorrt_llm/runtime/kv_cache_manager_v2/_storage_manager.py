@@ -46,6 +46,7 @@ from ._storage._core import (
     PoolGroupBase,
     PoolGroupIndex,
     PoolIndex,
+    PoolIndex0,
     Slot,
     SlotId,
 )
@@ -159,7 +160,7 @@ class StorageManager:
     )
     _life_cycles: LifeCycleRegistry
     _layer_to_life_cycle_ids: dict[LayerId, LifeCycleId]
-    _slot_to_page_indices: TypedIndexList[LifeCycleId, int]
+    _slot_to_page_indices: TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]]
     _buffer_attr: dict[BufferId, BufferAttr]
     _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
@@ -480,7 +481,8 @@ class StorageManager:
         self, lc_id: LifeCycleId, pages: Iterator[Page | None]
     ) -> Iterator[int | None]:
         "Reference implementation. Not fast enough for production."
-        scale = self._slot_to_page_indices[lc_id]
+        scale = self._slot_to_page_indices[lc_id][PoolIndex0]
+        assert all(scale == s for s in self._slot_to_page_indices[lc_id])
         return (map_optional(page, lambda p: scale * int(p.slot_id)) for page in pages)
 
     def get_buffer_attr(self, layer_id: LayerId, data_role: DataRole) -> BufferAttr:
@@ -492,8 +494,8 @@ class StorageManager:
         return self._levels[level].storage.slot_address(pg_idx, pool_idx, slot_id)
 
     def get_page_indices_for_slot(self, life_cycle: LifeCycleId, slot_id: SlotId) -> PageIndex:
-        scale = self._slot_to_page_indices[life_cycle]
-        return PageIndex(scale * slot_id)
+        scale = self._slot_to_page_indices[life_cycle][PoolIndex0]
+        return PageIndex(scale * int(slot_id))
 
     def get_statistics(
         self, level: CacheLevel = GPU_LEVEL
