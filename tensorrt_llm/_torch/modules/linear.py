@@ -469,6 +469,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output = F.linear(input, module.weight, bias)
         return output
 
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], out: torch.Tensor):
+        if module.use_custom_cublas_mm:
+            output = torch.ops.trtllm.cublas_mm_out(input, module.weight.t(),
+                                                    bias, out)
+        else:
+            torch.matmul(input, module.weight.t(), out=out)
+            if bias is not None:
+                out += bias
+            output = out
+        return output
+
     def load_weights_vanilla(self,
                              module: Linear,
                              weights: List[Dict],
@@ -2633,6 +2645,47 @@ class Linear(nn.Module):
                 output = output + lora_result
         return output
 
+    def _should_use_nccl_window_output(
+            self, input: torch.Tensor,
+            all_reduce_params: Optional[AllReduceParams],
+            lora_params: Optional[dict]) -> bool:
+        if mpi_disabled():
+            return False
+        if self.all_reduce is None:
+            return False
+        if self.all_reduce.strategy not in (AllReduceStrategy.AUTO,
+                                            AllReduceStrategy.NCCL_SYMMETRIC):
+            return False
+        if all_reduce_params is not None and not all_reduce_params.enable_allreduce:
+            return False
+        if self.lora is not None and bool(lora_params):
+            return False
+        if not isinstance(input, torch.Tensor) or input.numel() == 0:
+            return False
+        return True
+
+    def _maybe_create_nccl_window_output(
+        self,
+        input: torch.Tensor,
+        all_reduce_params: Optional[AllReduceParams],
+        lora_params: Optional[dict],
+    ) -> Optional[torch.Tensor]:
+        if not self._should_use_nccl_window_output(input, all_reduce_params,
+                                                   lora_params):
+            return None
+        output_shape = list(input.shape)
+        if not output_shape:
+            return None
+        output_shape[-1] = self.out_features
+        try:
+            out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
+                self.mapping.tp_group, output_shape, input.dtype)
+        except Exception:
+            return None
+        if not bool(is_valid) or out is None or out.numel() == 0:
+            return None
+        return out
+
     def apply_linear_allreduce(self,
                                input,
                                bias,
@@ -2680,8 +2733,16 @@ class Linear(nn.Module):
                     fuse_bias = self._maybe_fuse_bias_into_allreduce(
                         bias, all_reduce_params)
                     bias = None if fuse_bias else bias
-                    output = self.apply_linear(input, bias, lora_params,
-                                               layer_idx)
+                    window_out = None
+                    if hasattr(self.quant_method, "apply_out"):
+                        window_out = self._maybe_create_nccl_window_output(
+                            input, all_reduce_params, lora_params)
+                    if window_out is not None:
+                        output = self.quant_method.apply_out(
+                            self, input, bias, window_out)
+                    else:
+                        output = self.apply_linear(input, bias, lora_params,
+                                                   layer_idx)
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
             else:
