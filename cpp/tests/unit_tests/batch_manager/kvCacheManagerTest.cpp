@@ -4094,6 +4094,61 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
     }
 }
 
+TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr numBlocks = 8;
+    auto constexpr maxAttentionWindow = 32;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr beamWidth = 1;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    SizeType32 constexpr maxNewTokens = 4;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    tle::RetentionPriority constexpr highPriority = 80;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {numBlocks, 0}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, dtype, 0, stream,
+        maxAttentionWindow, true);
+    kvCacheManager.allocatePools(false);
+
+    // Create a sequence and set a custom priority
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+    auto llmRequest = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+
+    // Set high priority for context blocks
+    llmRequest->setKvCacheRetentionConfig(KvCacheRetentionConfig(
+        {KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, highPriority)}, highPriority));
+
+    kvCacheManager.addSequence(0, inputLength, beamWidth, llmRequest);
+    kvCacheManager.storeContextBlocks(*llmRequest);
+
+    // Get block IDs for the sequence
+    auto const& seq = kvCacheManager.getSequence(0);
+    auto cacheBlockIds = seq.getCacheBlockIds(maxAttentionWindow).at(0);
+    ASSERT_GE(cacheBlockIds.size(), 1);
+
+    // Test 1: Valid block ID should return the set priority
+    auto const validBlockId = cacheBlockIds[0];
+    auto const retrievedPriority = kvCacheManager.getPriorityByBlockId(validBlockId, maxAttentionWindow);
+    EXPECT_EQ(retrievedPriority, highPriority);
+
+    // Test 2: Invalid block ID (negative) should return default priority
+    auto const invalidNegative = kvCacheManager.getPriorityByBlockId(-1, maxAttentionWindow);
+    EXPECT_EQ(invalidNegative, KvCacheRetentionConfig::kDefaultRetentionPriority);
+
+    // Test 3: Invalid block ID (out of range) should return default priority
+    auto const invalidOutOfRange = kvCacheManager.getPriorityByBlockId(9999, maxAttentionWindow);
+    EXPECT_EQ(invalidOutOfRange, KvCacheRetentionConfig::kDefaultRetentionPriority);
+}
+
 TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksBasicNoPartial)
 {
     using namespace tensorrt_llm::batch_manager::kv_cache_manager;
