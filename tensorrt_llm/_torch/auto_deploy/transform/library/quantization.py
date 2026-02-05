@@ -17,8 +17,8 @@ from ...custom_ops.quant import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import (
-    extract_weight_nodes,
     get_quantization_params_from_linear_node,
+    get_weight_info,
     is_bmm_op,
     is_linear_op,
 )
@@ -141,9 +141,10 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
-        weight_nodes = extract_weight_nodes(node)
-        assert len(weight_nodes.weights) == 1, "Expected exactly one weight node"
-        lin_weight = weight_nodes.weights[0]
+        lin_weight = get_weight_info(node)
+        if lin_weight is None:
+            raise ValueError(f"Linear node {node.name} has no weight")
+
         new_param = nn.Parameter(self.quantize_weight(lin_weight.tensor), requires_grad=False)
         modname, _, attrname = lin_weight.node_key.rpartition(".")
 

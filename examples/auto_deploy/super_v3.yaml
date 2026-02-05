@@ -44,3 +44,5 @@ transforms:
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
+  insert_cached_ssm_attention:
+    backend: flashinfer_ssm
