@@ -1,0 +1,8 @@
+Distributed LLM Generation
+==========================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/910c070e88366f7d9c7f8474fe080ada90eb4df3/examples/llm-api/llm_inference_distributed.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_inference_distributed.py
+    :lines: 4-44
+    :language: python
+    :linenos:
