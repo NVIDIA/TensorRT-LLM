@@ -29,7 +29,17 @@ set(SRCS
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
-nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
+set(TRTLLM_NB_MODULE_ARGS ${TRTLLM_NB_MODULE})
+
+if(BOLT_COMPATIBLE AND NOT WIN32)
+  # BOLT-compatible libraries need to not be stripped and should not be
+  # optimized for size
+  list(APPEND TRTLLM_NB_MODULE_ARGS NOSTRIP NOMINSIZE)
+endif()
+
+list(APPEND TRTLLM_NB_MODULE_ARGS ${SRCS})
+
+nanobind_add_module(${TRTLLM_NB_MODULE_ARGS})
 
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 

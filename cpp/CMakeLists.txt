@@ -45,6 +45,7 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(BOLT_COMPATIBLE "Ensure that TRT-LLM libraries are BOLT-compatible" OFF)
 option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
 option(CUBLAS_DYNAMIC_LINKING
        "Link against the dynamic cublas/cublasLt libraries" ON)
@@ -196,6 +197,59 @@ else()
 
   set(CURAND_LIB CUDA::curand_static)
   list(APPEND CUDA_TOOLKIT_COMPONENTS curand_static)
+endif()
+
+if(BOLT_COMPATIBLE AND NOT WIN32)
+  message(STATUS "BOLT-compatible flags enabled")
+
+  #
+  # Add extra CFLAGS
+  #
+  include(CheckCCompilerFlag)
+
+  # Add -fno-plt if supported
+  check_c_compiler_flag("-fno-plt" HAS_C_FNO_PLT)
+  if(HAS_C_FNO_PLT)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:-fno-plt>)
+  endif()
+
+  # Add -fno-reorder-blocks-and-partition if supported
+  check_c_compiler_flag("-fno-reorder-blocks-and-partition"
+                        HAS_C_FNO_REORDER_BLOCKS_AND_PARTITION)
+  if(HAS_C_FNO_REORDER_BLOCKS_AND_PARTITION)
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:C>:-fno-reorder-blocks-and-partition>)
+  endif()
+
+  #
+  # Add extra CXXFLAGS
+  #
+  include(CheckCXXCompilerFlag)
+
+  # Add -fno-plt if supported
+  check_cxx_compiler_flag("-fno-plt" HAS_CXX_FNO_PLT)
+  if(HAS_CXX_FNO_PLT)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-plt>)
+  endif()
+
+  # Add -fno-reorder-blocks-and-partition if supported
+  check_cxx_compiler_flag("-fno-reorder-blocks-and-partition"
+                          HAS_CXX_FNO_REORDER_BLOCKS_AND_PARTITION)
+  if(HAS_CXX_FNO_REORDER_BLOCKS_AND_PARTITION)
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:CXX>:-fno-reorder-blocks-and-partition>)
+  endif()
+
+  #
+  # Add extra LDFLAGS
+  #
+  include(CheckLinkerFlag)
+
+  # Add -Wl,-q if supported
+  check_linker_flag(CXX "-Wl,-q" HAS_LINK_WL_Q)
+  if(HAS_LINK_WL_Q)
+    add_link_options("-Wl,-q")
+  endif()
 endif()
 
 if(NVRTC_DYNAMIC_LINKING)

@@ -491,6 +491,7 @@ def main(*,
          generate_fmha: bool = False,
          no_venv: bool = False,
          nvrtc_dynamic_linking: bool = False,
+         bolt_compatible: bool = False,
          mypyc: bool = False):
 
     if clean:
@@ -594,6 +595,11 @@ def main(*,
 
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
+
+    if bolt_compatible:
+        # bolt_compatible implies nvrtc_dynamic_linking
+        nvrtc_dynamic_linking = True
+        cmake_def_args.append(f'-DBOLT_COMPATIBLE=ON')
 
     if nvrtc_dynamic_linking:
         cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
@@ -1110,6 +1116,10 @@ def add_arguments(parser: ArgumentParser):
         "--nvrtc_dynamic_linking",
         action="store_true",
         help="Link against dynamic NVRTC libraries instead of static ones")
+    parser.add_argument(
+        "--bolt_compatible",
+        action="store_true",
+        help="Ensure that TRT-LLM libraries are BOLT-compatible")
     parser.add_argument("--mypyc",
                         action="store_true",
                         help="Compile kv_cache_manager_v2 with mypyc")

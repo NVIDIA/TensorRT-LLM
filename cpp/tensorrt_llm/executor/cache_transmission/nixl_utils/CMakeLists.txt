@@ -67,7 +67,17 @@ if(NIXL_ENABLED OR MOONCAKE_ENABLED)
   set(AGENT_BINDING_SOURCES "")
   list(APPEND AGENT_BINDING_SOURCES agentBindings.cpp)
 
-  nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET} ${AGENT_BINDING_SOURCES})
+  set(TRANSFER_AGENT_BINDING_ARGS ${TRANSFER_AGENT_BINDING_TARGET})
+
+  if(BOLT_COMPATIBLE AND NOT WIN32)
+    # BOLT-compatible libraries need to not be stripped and should not be
+    # optimized for size
+    list(APPEND TRANSFER_AGENT_BINDING_ARGS NOSTRIP NOMINSIZE)
+  endif()
+
+  list(APPEND TRANSFER_AGENT_BINDING_ARGS ${AGENT_BINDING_SOURCES})
+
+  nanobind_add_module(${TRANSFER_AGENT_BINDING_ARGS})
   message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
 
   target_compile_options(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE -Wno-error)
