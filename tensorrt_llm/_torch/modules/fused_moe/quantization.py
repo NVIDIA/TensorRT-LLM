@@ -1014,7 +1014,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
     def post_load_weights(self, module: torch.nn.Module):
         if is_sm_100f():
-            # Batch resmooth shared experts before registering shared weights
+            # Resmooth shared experts before registering shared weights
             if self.need_load_shared_weights(module):
                 local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
                 )
@@ -1034,41 +1034,42 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                     local_shared_w2_scale_tensors = getattr(
                         module, 'local_shared_w2_scale_tensors')
 
-                    # Batch resmooth shared w3_w1 (in-place for shared tensors)
-                    shared_w3_w1_weight, shared_w3_w1_scale = resmooth_to_fp8_e8m0(
+                    resmoothed_shared_w3_w1_weight, resmoothed_shared_w3_w1_scale = resmooth_to_fp8_e8m0(
                         local_shared_w3_w1_tensors,
                         local_shared_w3_w1_scale_tensors)
-                    local_shared_w3_w1_tensors.copy_(shared_w3_w1_weight)
-                    local_shared_w3_w1_scale_tensors.copy_(shared_w3_w1_scale)
+                    transformed_shared_w3_w1_scale = transform_sf_into_required_layout(
+                        resmoothed_shared_w3_w1_scale,
+                        mn=module.w3_w1_weight.shape[1],
+                        k=module.w3_w1_weight.shape[2],
+                        recipe=(1, 128, 128),
+                        num_groups=local_shared_w3_w1_tensors.shape[0],
+                        is_sfa=False)
+                    setattr(module, 'local_shared_w3_w1_tensors',
+                            resmoothed_shared_w3_w1_weight.cpu())
+                    setattr(module, 'local_shared_w3_w1_scale_tensors',
+                            transformed_shared_w3_w1_scale.cpu())
 
-                    # Batch resmooth shared w2 (in-place for shared tensors)
-                    shared_w2_weight, shared_w2_scale = resmooth_to_fp8_e8m0(
+                    resmoothed_shared_w2_weight, resmoothed_shared_w2_scale = resmooth_to_fp8_e8m0(
                         local_shared_w2_tensors, local_shared_w2_scale_tensors)
-                    local_shared_w2_tensors.copy_(shared_w2_weight)
-                    local_shared_w2_scale_tensors.copy_(shared_w2_scale)
+                    transformed_shared_w2_scale = transform_sf_into_required_layout(
+                        resmoothed_shared_w2_scale,
+                        mn=module.w2_weight.shape[1],
+                        k=module.w2_weight.shape[2],
+                        recipe=(1, 128, 128),
+                        num_groups=local_shared_w2_tensors.shape[0],
+                        is_sfa=False)
+                    setattr(module, 'local_shared_w2_tensors',
+                            resmoothed_shared_w2_weight.cpu())
+                    setattr(module, 'local_shared_w2_scale_tensors',
+                            transformed_shared_w2_scale.cpu())
 
         # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
         super().post_load_weights(module)
 
         if is_sm_100f():
             logger.debug("Resmoothing FP8 weights in post_load_weights")
-
-            # Batch resmooth w3_w1: replace weight, save scale for later transform
             resmoothed_w3_w1_weight, resmoothed_w3_w1_scale = resmooth_to_fp8_e8m0(
                 module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
-            replace_parameter_and_save_metadata(
-                module, "w3_w1_weight",
-                nn.Parameter(resmoothed_w3_w1_weight, requires_grad=False),
-                module.rebuild_tensor_metadata)
-
-            # Batch resmooth w2: replace weight, save scale for later transform
-            resmoothed_w2_weight, resmoothed_w2_scale = resmooth_to_fp8_e8m0(
-                module.w2_weight, module.w2_weight_scaling_factor)
-            replace_parameter_and_save_metadata(
-                module, "w2_weight",
-                nn.Parameter(resmoothed_w2_weight, requires_grad=False),
-                module.rebuild_tensor_metadata)
-            # Transform scale layout for SM100 using resmoothed scales directly
             transfromed_w3_w1_scale = transform_sf_into_required_layout(
                 resmoothed_w3_w1_scale,
                 mn=module.w3_w1_weight.shape[1],
@@ -1076,11 +1077,22 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                 recipe=(1, 128, 128),
                 num_groups=module.w3_w1_weight.shape[0],
                 is_sfa=False)
+            replace_parameter_and_save_metadata(
+                module, "w3_w1_weight",
+                nn.Parameter(resmoothed_w3_w1_weight, requires_grad=False),
+                module.rebuild_tensor_metadata)
             transformed_w3_w1_weight_scaling_factor = nn.Parameter(
                 transfromed_w3_w1_scale, requires_grad=False)
             replace_parameter_and_save_metadata(
                 module, "w3_w1_weight_scaling_factor",
                 transformed_w3_w1_weight_scaling_factor,
+                module.rebuild_tensor_metadata)
+
+            resmoothed_w2_weight, resmoothed_w2_scale = resmooth_to_fp8_e8m0(
+                module.w2_weight, module.w2_weight_scaling_factor)
+            replace_parameter_and_save_metadata(
+                module, "w2_weight",
+                nn.Parameter(resmoothed_w2_weight, requires_grad=False),
                 module.rebuild_tensor_metadata)
             transfromed_w2_scale = transform_sf_into_required_layout(
                 resmoothed_w2_scale,
