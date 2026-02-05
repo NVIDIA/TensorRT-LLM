@@ -91,10 +91,8 @@ class NGramPoolManager(BaseResourceManager):
             List of draft token IDs
         """
         prefix_len = len(prefix)
-        max_draft_len = min(
-            self.max_total_draft_tokens,
-            max_sequence_length - 1 - prefix_len
-        )
+        max_draft_len = min(self.max_total_draft_tokens,
+                            max_sequence_length - 1 - prefix_len)
 
         if max_draft_len <= 0:
             return []
@@ -137,8 +135,7 @@ class NGramPoolManager(BaseResourceManager):
             accepted_tokens,
             num_accepted_tokens,
             max_draft_len,
-            max_ngram_size=self.max_matching_ngram_size
-        )
+            max_ngram_size=self.max_matching_ngram_size)
 
         # Extract results from tensors
         match_length = match_len[0].item()
@@ -162,12 +159,9 @@ class NGramPoolManager(BaseResourceManager):
             logger.debug(f"  Request {request_id}: {token_count} tokens")
 
     def prepare_batch_draft_tokens(
-        self,
-        request_ids: List[int],
-        accepted_tokens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        max_draft_len: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+            self, request_ids: List[int], accepted_tokens: torch.Tensor,
+            num_accepted_tokens: torch.Tensor,
+            max_draft_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Batched draft token generation using the CUDA kernel.
 
@@ -195,8 +189,7 @@ class NGramPoolManager(BaseResourceManager):
             accepted_tokens,
             num_accepted_tokens,
             max_draft_len,
-            max_ngram_size=self.max_matching_ngram_size
-        )
+            max_ngram_size=self.max_matching_ngram_size)
 
 
 class NGramDrafter(Drafter):

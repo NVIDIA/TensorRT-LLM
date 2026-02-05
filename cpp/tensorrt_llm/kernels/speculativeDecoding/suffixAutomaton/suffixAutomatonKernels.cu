@@ -86,8 +86,8 @@ void invokeSuffixAutomatonExtend(SuffixAutomatonExtendParams const& params, cuda
 }
 
 __global__ void suffixAutomatonExtendNgramKernel(int batchSize, int draftLength, int maxNgramSize,
-    SuffixAutomaton* slots, int const* batchIndices, int* matchLenOut, int* draftTokensOut,
-    int const* acceptedTokensIn, int const* acceptedLensIn)
+    SuffixAutomaton* slots, int const* batchIndices, int* matchLenOut, int* draftTokensOut, int const* acceptedTokensIn,
+    int const* acceptedLensIn)
 {
     // Only one thread per block does the work
     if (threadIdx.x > 0)

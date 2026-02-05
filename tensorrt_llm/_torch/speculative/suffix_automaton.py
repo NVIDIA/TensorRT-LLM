@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 _sa_native = None
 try:
     from tensorrt_llm.bindings.internal import suffix_automaton as _sa_native
+
     logger.info("Native suffix automaton kernel available")
 except ImportError:
     logger.warning(
@@ -114,7 +115,7 @@ class SuffixAutomatonState:
             # Search for this suffix in the earlier text (only in recent window)
             search_start = max(0, n - suffix_len - 1024)  # Limit search window
             for pos in range(search_start, n - suffix_len):
-                if text[pos:pos + suffix_len] == suffix:
+                if text[pos : pos + suffix_len] == suffix:
                     if suffix_len > best_len:
                         best_len = suffix_len
                         best_pos = pos + suffix_len  # Position after the match
@@ -149,7 +150,7 @@ class SuffixAutomatonState:
         # Search range excludes current suffix position to avoid self-match
         search_end = len(self.tokens) - target_len
         for pos in range(0, search_end):
-            if self.tokens[pos:pos + target_len] == suffix:
+            if self.tokens[pos : pos + target_len] == suffix:
                 # Return position after the match (where continuation starts)
                 return (pos + target_len, target_len)
 
@@ -218,21 +219,19 @@ class SuffixAutomatonManager:
     def _ensure_workspace(self, max_draft_len: int):
         """Ensure GPU workspace is allocated."""
         if not self._workspace_allocated:
-            self._gpu_match_len = torch.zeros((self.max_num_requests,),
-                                              dtype=torch.int32,
-                                              device='cuda')
+            self._gpu_match_len = torch.zeros(
+                (self.max_num_requests,), dtype=torch.int32, device="cuda"
+            )
             self._gpu_draft_tokens = torch.zeros(
-                (self.max_num_requests, max_draft_len),
-                dtype=torch.int32,
-                device='cuda')
-            self._gpu_batch_indices = torch.zeros((self.max_num_requests,),
-                                                  dtype=torch.int32,
-                                                  device='cuda')
+                (self.max_num_requests, max_draft_len), dtype=torch.int32, device="cuda"
+            )
+            self._gpu_batch_indices = torch.zeros(
+                (self.max_num_requests,), dtype=torch.int32, device="cuda"
+            )
 
             if self._use_native:
                 # Allocate GPU workspace for SA states
-                self._gpu_slots = _sa_native.allocate_workspace(
-                    self.max_num_requests)
+                self._gpu_slots = _sa_native.allocate_workspace(self.max_num_requests)
 
             self._workspace_allocated = True
 
@@ -248,8 +247,9 @@ class SuffixAutomatonManager:
             # Request already exists, rebuild its state
             slot = self._request_to_slot[request_id]
             if self._use_native:
-                self._host_states_native[request_id] = \
-                    _sa_native.build_automaton_host(context_tokens)
+                self._host_states_native[request_id] = _sa_native.build_automaton_host(
+                    context_tokens
+                )
                 self._pending_copies.add(request_id)
             else:
                 state = self._host_states[request_id]
@@ -266,8 +266,7 @@ class SuffixAutomatonManager:
 
         if self._use_native:
             # Build SA state on host using native code
-            self._host_states_native[request_id] = \
-                _sa_native.build_automaton_host(context_tokens)
+            self._host_states_native[request_id] = _sa_native.build_automaton_host(context_tokens)
             self._pending_copies.add(request_id)
         else:
             # Create Python SA state
@@ -310,9 +309,7 @@ class SuffixAutomatonManager:
                 if rid in self._host_states_native and rid in self._request_to_slot:
                     slot = self._request_to_slot[rid]
                     _sa_native.copy_state_to_slot(
-                        self._host_states_native[rid],
-                        self._gpu_slots,
-                        slot
+                        self._host_states_native[rid], self._gpu_slots, slot
                     )
             self._pending_copies.clear()
 
@@ -320,15 +317,19 @@ class SuffixAutomatonManager:
         batch_indices = torch.tensor(
             [self._request_to_slot.get(rid, 0) for rid in request_ids],
             dtype=torch.int32,
-            pin_memory=True)
+            pin_memory=True,
+        )
 
         num_requests = len(request_ids)
-        self._gpu_batch_indices[:num_requests].copy_(batch_indices,
-                                                     non_blocking=True)
+        self._gpu_batch_indices[:num_requests].copy_(batch_indices, non_blocking=True)
 
-    def extend(self, request_ids: List[int], accepted_tokens: torch.Tensor,
-               num_accepted_tokens: torch.Tensor,
-               max_draft_len: int) -> tuple:
+    def extend(
+        self,
+        request_ids: List[int],
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        max_draft_len: int,
+    ) -> tuple:
         """
         Extend suffix automaton states with accepted tokens and get draft tokens.
 
@@ -369,16 +370,16 @@ class SuffixAutomatonManager:
                 match_len,
                 draft_tokens,
                 accepted_tokens,
-                num_accepted_tokens
+                num_accepted_tokens,
             )
 
             return match_len, draft_tokens
         else:
             # Python fallback - NOT CUDA graph compatible
-            match_len = torch.zeros((batch_size,), dtype=torch.int32, device='cuda')
-            draft_tokens = torch.zeros((batch_size, max_draft_len),
-                                       dtype=torch.int32,
-                                       device='cuda')
+            match_len = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
+            draft_tokens = torch.zeros(
+                (batch_size, max_draft_len), dtype=torch.int32, device="cuda"
+            )
 
             # Skip CPU operations during CUDA graph capture - they are not supported
             if torch.cuda.is_current_stream_capturing():
@@ -413,9 +414,14 @@ class SuffixAutomatonManager:
 
             return match_len, draft_tokens
 
-    def extend_ngram(self, request_ids: List[int], accepted_tokens: torch.Tensor,
-                     num_accepted_tokens: torch.Tensor, max_draft_len: int,
-                     max_ngram_size: int = -1) -> tuple:
+    def extend_ngram(
+        self,
+        request_ids: List[int],
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        max_draft_len: int,
+        max_ngram_size: int = -1,
+    ) -> tuple:
         """
         Extend suffix automaton states with accepted tokens and get draft tokens
         using ngram matching.
@@ -459,16 +465,16 @@ class SuffixAutomatonManager:
                 match_len,
                 draft_tokens,
                 accepted_tokens,
-                num_accepted_tokens
+                num_accepted_tokens,
             )
 
             return match_len, draft_tokens
         else:
             # Python fallback - NOT CUDA graph compatible
-            match_len = torch.zeros((batch_size,), dtype=torch.int32, device='cuda')
-            draft_tokens = torch.zeros((batch_size, max_draft_len),
-                                       dtype=torch.int32,
-                                       device='cuda')
+            match_len = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
+            draft_tokens = torch.zeros(
+                (batch_size, max_draft_len), dtype=torch.int32, device="cuda"
+            )
 
             # Skip CPU operations during CUDA graph capture - they are not supported
             if torch.cuda.is_current_stream_capturing():
@@ -554,8 +560,7 @@ class SuffixAutomatonManager:
         state = self._host_states[request_id]
         return state.lookup_fixed(target_len)
 
-    def get_draft_tokens(self, request_id: int, start_pos: int,
-                         num_tokens: int) -> List[int]:
+    def get_draft_tokens(self, request_id: int, start_pos: int, num_tokens: int) -> List[int]:
         """
         Get draft tokens for a specific request starting from a position.
 
@@ -613,7 +618,8 @@ class SAResourceManager(BaseResourceManager):
         sa_config = SAConfig(
             max_seq_len=262144,
             max_slots=max_num_requests,
-            threshold=getattr(config, 'sa_spec_threshold', 4))
+            threshold=getattr(config, "sa_spec_threshold", 4),
+        )
 
         # Initialize the SA manager
         self.sa_manager = SuffixAutomatonManager(sa_config, max_num_requests)
@@ -667,18 +673,22 @@ class SAResourceManager(BaseResourceManager):
         """Prepare batch indices for extend operation."""
         self.sa_manager.prepare(request_ids, max_draft_len)
 
-    def extend_and_get_drafts(self, request_ids: List[int],
-                              accepted_tokens: torch.Tensor,
-                              num_accepted_tokens: torch.Tensor,
-                              max_draft_len: int) -> tuple:
+    def extend_and_get_drafts(
+        self,
+        request_ids: List[int],
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        max_draft_len: int,
+    ) -> tuple:
         """
         Extend SA states and get draft tokens.
 
         Returns:
             Tuple of (match_len, draft_tokens) tensors
         """
-        return self.sa_manager.extend(request_ids, accepted_tokens,
-                                      num_accepted_tokens, max_draft_len)
+        return self.sa_manager.extend(
+            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len
+        )
 
 
 # Module-level interface for compatibility with existing sa_spec usage
@@ -735,8 +745,12 @@ def prepare(request_ids: List[int], max_draft_len: int = 8):
     _global_sa_manager.prepare(request_ids, max_draft_len)
 
 
-def extend(match_len_out: torch.Tensor, draft_tokens_out: torch.Tensor,
-           accepted_tokens: torch.Tensor, num_accepted_tokens: torch.Tensor):
+def extend(
+    match_len_out: torch.Tensor,
+    draft_tokens_out: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+):
     """
     Extend SA states and populate output tensors.
 
@@ -763,10 +777,9 @@ def extend(match_len_out: torch.Tensor, draft_tokens_out: torch.Tensor,
     # In the actual integration, these will come from SpecMetadata
     request_ids = list(range(batch_size))
 
-    match_len, draft_tokens = _global_sa_manager.extend(request_ids,
-                                                        accepted_tokens,
-                                                        num_accepted_tokens,
-                                                        max_draft_len)
+    match_len, draft_tokens = _global_sa_manager.extend(
+        request_ids, accepted_tokens, num_accepted_tokens, max_draft_len
+    )
 
     match_len_out.copy_(match_len)
     draft_tokens_out.copy_(draft_tokens)

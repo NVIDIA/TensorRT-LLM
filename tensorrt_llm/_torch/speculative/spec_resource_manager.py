@@ -35,7 +35,7 @@ class SpecResourceManager(BaseResourceManager):
     def __init__(
         self,
         primary_manager: Optional[BaseResourceManager] = None,
-        sa_manager: Optional['SAResourceManager'] = None
+        sa_manager: Optional["SAResourceManager"] = None,
     ):
         """
         Args:
@@ -56,13 +56,12 @@ class SpecResourceManager(BaseResourceManager):
     # Forward common attributes from primary manager
     def __getattr__(self, name: str):
         """Forward attribute access to primary manager for compatibility."""
-        if name in ('primary_manager', 'sa_manager', 'has_primary', 'has_sa'):
+        if name in ("primary_manager", "sa_manager", "has_primary", "has_sa"):
             raise AttributeError(name)
         if self.primary_manager is not None:
             return getattr(self.primary_manager, name)
         raise AttributeError(
-            f"'{type(self).__name__}' has no attribute '{name}' "
-            f"(primary_manager is None)"
+            f"'{type(self).__name__}' has no attribute '{name}' (primary_manager is None)"
         )
 
     def get_max_resource_count(self) -> int:
@@ -74,8 +73,7 @@ class SpecResourceManager(BaseResourceManager):
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         if self.primary_manager is not None:
-            return self.primary_manager.get_needed_resource_to_completion(
-                request)
+            return self.primary_manager.get_needed_resource_to_completion(request)
         return 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -108,14 +106,13 @@ class SpecResourceManager(BaseResourceManager):
 
     def shutdown(self):
         """Shutdown both managers."""
-        if self.primary_manager is not None and hasattr(self.primary_manager,
-                                                         'shutdown'):
+        if self.primary_manager is not None and hasattr(self.primary_manager, "shutdown"):
             self.primary_manager.shutdown()
         if self.sa_manager is not None:
             self.sa_manager.shutdown()
 
     # SA-specific methods for external access
-    def get_sa_manager(self) -> Optional['SAResourceManager']:
+    def get_sa_manager(self) -> Optional["SAResourceManager"]:
         """Get the SA manager for SA-specific operations."""
         return self.sa_manager
 
@@ -134,7 +131,7 @@ class SpecResourceManager(BaseResourceManager):
         request_ids: List[int],
         accepted_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
-        max_draft_len: int
+        max_draft_len: int,
     ) -> Optional[tuple]:
         """Extend SA states and get draft tokens."""
         if self.sa_manager is not None:

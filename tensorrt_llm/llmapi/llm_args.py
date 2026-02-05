@@ -1126,8 +1126,7 @@ class NGramDecodingConfig(DecodingBaseConfig):
         if self.max_matching_ngram_size == 0:
             raise ValueError(
                 "max_matching_ngram_size must be > 0 (fixed-size ngram) or -1 (longest match). "
-                "Got 0 which is invalid."
-            )
+                "Got 0 which is invalid.")
 
         return self
 
@@ -1169,14 +1168,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
     use_sa_spec: Optional[bool] = Field(
         default=False,
         status="beta",
-        description="Combine with Suffix Automaton Decoding"
-    )
+        description="Combine with Suffix Automaton Decoding")
     sa_spec_threshold: int = Field(
         default=4,
         description="The threshold for the Suffix Automaton Decoding. If the"
-                     " length of the suffix match exceeds the threshold, use"
-                     " the suffix automaton output for the next draft tokens."
-    )
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.

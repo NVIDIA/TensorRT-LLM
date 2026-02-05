@@ -93,7 +93,8 @@ def test_ngram_config_invalid_zero():
 def test_ngram_config_deprecated_options():
     """Test that deprecated options raise errors."""
     # Test is_public_pool
-    with pytest.raises(ValueError, match="is_public_pool=True is not supported"):
+    with pytest.raises(ValueError,
+                       match="is_public_pool=True is not supported"):
         NGramDecodingConfig(
             max_draft_len=4,
             max_matching_ngram_size=2,

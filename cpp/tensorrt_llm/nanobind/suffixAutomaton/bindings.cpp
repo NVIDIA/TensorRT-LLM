@@ -145,8 +145,8 @@ void initBindings(nb::module_& m)
             sa::invokeSuffixAutomatonExtendNgram(params, stream);
         },
         nb::arg("batch_size"), nb::arg("draft_length"), nb::arg("max_ngram_size"), nb::arg("slots"),
-        nb::arg("batch_indices"), nb::arg("match_len_out"), nb::arg("draft_tokens_out"),
-        nb::arg("accepted_tokens_in"), nb::arg("accepted_lens_in"),
+        nb::arg("batch_indices"), nb::arg("match_len_out"), nb::arg("draft_tokens_out"), nb::arg("accepted_tokens_in"),
+        nb::arg("accepted_lens_in"),
         "Invoke suffix automaton extend CUDA kernel with ngram support. "
         "If max_ngram_size == -1, uses longest match. "
         "If max_ngram_size > 0, tries ngram sizes from max down to 1.");
@@ -210,8 +210,8 @@ void initBindings(nb::module_& m)
                 "hostState is too small for a SuffixAutomaton state");
 
             size_t offset = static_cast<size_t>(slotIndex) * stateSize;
-            TORCH_CHECK(offset + stateSize <= static_cast<size_t>(gpuSlots.numel()),
-                "slotIndex is out of bounds for gpuSlots");
+            TORCH_CHECK(
+                offset + stateSize <= static_cast<size_t>(gpuSlots.numel()), "slotIndex is out of bounds for gpuSlots");
 
             // Async copy from host to device
             cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -230,8 +230,8 @@ void initBindings(nb::module_& m)
 
             size_t stateSize = sa::getSuffixAutomatonStateSize();
             size_t offset = static_cast<size_t>(slotIndex) * stateSize;
-            TORCH_CHECK(offset + stateSize <= static_cast<size_t>(gpuSlots.numel()),
-                "slotIndex is out of bounds for gpuSlots");
+            TORCH_CHECK(
+                offset + stateSize <= static_cast<size_t>(gpuSlots.numel()), "slotIndex is out of bounds for gpuSlots");
 
             // Zero out the slot
             cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();

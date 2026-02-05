@@ -42,12 +42,14 @@ class TestSuffixAutomatonBasic:
 
         # Create input tensors
         batch_size = 1
-        accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+        accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         # Create output tensors
-        match_len_out = torch.zeros((batch_size,), dtype=torch.int32, device='cuda')
-        draft_tokens_out = torch.zeros((batch_size, max_draft_len), dtype=torch.int32, device='cuda')
+        match_len_out = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
+        draft_tokens_out = torch.zeros(
+            (batch_size, max_draft_len), dtype=torch.int32, device="cuda"
+        )
 
         # Extend
         sa.extend(match_len_out, draft_tokens_out, accepted_tokens, num_accepted_tokens)
@@ -107,8 +109,8 @@ class TestSuffixAutomatonManager:
         manager.prepare(request_ids, max_draft_len)
 
         # Extend
-        accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+        accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         match_len, draft_tokens = manager.extend(
             request_ids, accepted_tokens, num_accepted_tokens, max_draft_len
@@ -123,10 +125,7 @@ class TestSuffixAutomatonManager:
 class TestCUDAGraphCompatibility:
     """Tests for CUDA graph compatibility."""
 
-    @pytest.mark.skipif(
-        not sa.is_native_available(),
-        reason="Native kernel not available"
-    )
+    @pytest.mark.skipif(not sa.is_native_available(), reason="Native kernel not available")
     def test_cuda_graph_capture_native(self):
         """Test that native extend works during CUDA graph capture."""
         config = sa.SAConfig(max_seq_len=1024, max_slots=16)
@@ -142,8 +141,8 @@ class TestCUDAGraphCompatibility:
         manager.prepare(request_ids, max_draft_len)
 
         # Create input/output tensors
-        accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+        accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         # Warmup
         for _ in range(3):
@@ -186,8 +185,8 @@ class TestCUDAGraphCompatibility:
             manager.prepare(request_ids, max_draft_len)
 
             # Create input tensors
-            accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-            num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+            accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+            num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
             # Warmup
             for _ in range(3):
@@ -393,13 +392,16 @@ class TestExtendNgram:
         # New sequence: [1, 2, 3, 4, 5, 1, 2, 3, 4]
         # Suffix [1, 2, 3, 4] matches at position 0-3
         # Continuation starts at position 4, draft tokens are [5, 1, 2, 3]
-        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         # Use longest match mode
         match_len, draft_tokens = manager.extend_ngram(
-            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len,
-            max_ngram_size=-1  # Longest match
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,  # Longest match
         )
 
         print(f"extend_ngram (longest): match_len={match_len}, draft_tokens={draft_tokens}")
@@ -433,14 +435,17 @@ class TestExtendNgram:
 
         # Extend with token 4 - continues the pattern
         # New sequence: [1, 2, 3, 4, 5, 1, 2, 3, 4]
-        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         # Use fixed-size ngram mode (max_ngram_size=3 means try 3, 2, 1)
         # Should find 3-gram [2, 3, 4] matching at position 1-3
         match_len, draft_tokens = manager.extend_ngram(
-            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len,
-            max_ngram_size=3  # Try 3-gram, 2-gram, 1-gram
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=3,  # Try 3-gram, 2-gram, 1-gram
         )
 
         print(f"extend_ngram (fixed 3): match_len={match_len}, draft_tokens={draft_tokens}")
@@ -473,12 +478,11 @@ class TestExtendNgram:
 
         # Extend with unique token 99 - no pattern will match
         # New sequence: [1, 2, 3, 4, 5, 1, 2, 3, 99]
-        accepted_tokens = torch.tensor([[99, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+        accepted_tokens = torch.tensor([[99, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         match_len, draft_tokens = manager.extend_ngram(
-            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len,
-            max_ngram_size=-1
+            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len, max_ngram_size=-1
         )
 
         print(f"extend_ngram (no match): match_len={match_len}, draft_tokens={draft_tokens}")
@@ -508,16 +512,19 @@ class TestExtendNgram:
         manager.prepare(request_ids, max_draft_len)
 
         # Extend with tokens that create patterns for requests 0 and 1
-        accepted_tokens = torch.tensor([
-            [4, 0, 0, 0, 0],    # Continues [1,2,3,4] pattern
-            [30, 0, 0, 0, 0],   # Continues [10,20,30] pattern
-            [500, 0, 0, 0, 0]   # Unique, no match
-        ], dtype=torch.int32, device='cuda')
-        num_accepted_tokens = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
+        accepted_tokens = torch.tensor(
+            [
+                [4, 0, 0, 0, 0],  # Continues [1,2,3,4] pattern
+                [30, 0, 0, 0, 0],  # Continues [10,20,30] pattern
+                [500, 0, 0, 0, 0],  # Unique, no match
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        num_accepted_tokens = torch.tensor([1, 1, 1], dtype=torch.int32, device="cuda")
 
         match_len, draft_tokens = manager.extend_ngram(
-            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len,
-            max_ngram_size=-1
+            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len, max_ngram_size=-1
         )
 
         print(f"extend_ngram batch: match_len={match_len}")
@@ -543,10 +550,7 @@ class TestExtendNgram:
 
         manager.shutdown()
 
-    @pytest.mark.skipif(
-        not sa.is_native_available(),
-        reason="Native kernel not available"
-    )
+    @pytest.mark.skipif(not sa.is_native_available(), reason="Native kernel not available")
     def test_extend_ngram_cuda_graph(self):
         """Test that extend_ngram works with CUDA graph capture (native only)."""
         config = sa.SAConfig(max_seq_len=1024, max_slots=16)
@@ -562,13 +566,14 @@ class TestExtendNgram:
         manager.prepare(request_ids, max_draft_len)
 
         # Create input/output tensors - use token 4 to create pattern match
-        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         # Warmup - each call extends SA state, so we'll reset after
         for _ in range(3):
-            manager.extend_ngram(request_ids, accepted_tokens, num_accepted_tokens,
-                                max_draft_len, max_ngram_size=3)
+            manager.extend_ngram(
+                request_ids, accepted_tokens, num_accepted_tokens, max_draft_len, max_ngram_size=3
+            )
 
         # Reset the request state after warmup (warmup extends SA multiple times)
         manager.remove_request(0)
@@ -579,8 +584,7 @@ class TestExtendNgram:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             match_len, draft_tokens = manager.extend_ngram(
-                request_ids, accepted_tokens, num_accepted_tokens,
-                max_draft_len, max_ngram_size=3
+                request_ids, accepted_tokens, num_accepted_tokens, max_draft_len, max_ngram_size=3
             )
 
         # Replay
@@ -622,21 +626,24 @@ class TestExtendNgram:
 
             # Extend with token 4 to create pattern match
             # New sequence: [1, 2, 3, 4, 5, 1, 2, 3, 4]
-            accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device='cuda')
-            num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device='cuda')
+            accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+            num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
             # Test with longest match - should find [1, 2, 3, 4] match (length 4)
             match_len, draft_tokens = manager.extend_ngram(
-                request_ids, accepted_tokens, num_accepted_tokens, max_draft_len,
-                max_ngram_size=-1
+                request_ids, accepted_tokens, num_accepted_tokens, max_draft_len, max_ngram_size=-1
             )
             print(f"Fallback longest: match_len={match_len}, draft_tokens={draft_tokens}")
 
             # Verify longest match result
             match_len_val = match_len[0].item()
-            assert match_len_val == 4, f"Fallback longest: expected match_len=4, got {match_len_val}"
+            assert match_len_val == 4, (
+                f"Fallback longest: expected match_len=4, got {match_len_val}"
+            )
             draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
-            assert draft_list == [5, 1, 2, 3], f"Fallback longest: expected [5,1,2,3], got {draft_list}"
+            assert draft_list == [5, 1, 2, 3], (
+                f"Fallback longest: expected [5,1,2,3], got {draft_list}"
+            )
 
             # Need to re-add request since state was modified
             manager.remove_request(0)
@@ -645,8 +652,7 @@ class TestExtendNgram:
 
             # Test with fixed-size ngram - should find 3-gram match
             match_len, draft_tokens = manager.extend_ngram(
-                request_ids, accepted_tokens, num_accepted_tokens, max_draft_len,
-                max_ngram_size=3
+                request_ids, accepted_tokens, num_accepted_tokens, max_draft_len, max_ngram_size=3
             )
             print(f"Fallback fixed 3: match_len={match_len}, draft_tokens={draft_tokens}")
 
@@ -654,7 +660,9 @@ class TestExtendNgram:
             match_len_val = match_len[0].item()
             assert match_len_val == 3, f"Fallback fixed: expected match_len=3, got {match_len_val}"
             draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
-            assert draft_list == [5, 1, 2, 3], f"Fallback fixed: expected [5,1,2,3], got {draft_list}"
+            assert draft_list == [5, 1, 2, 3], (
+                f"Fallback fixed: expected [5,1,2,3], got {draft_list}"
+            )
 
             manager.shutdown()
         finally:
@@ -673,6 +681,7 @@ class TestNativeKernelAvailability:
         if available:
             # Verify we can access the native module
             from tensorrt_llm.bindings.internal import suffix_automaton as native
+
             print(f"MAX_SEQUENCE_LENGTH: {native.MAX_SEQUENCE_LENGTH}")
             print(f"MAX_SLOTS: {native.MAX_SLOTS}")
             print(f"STATE_SIZE_BYTES: {native.STATE_SIZE_BYTES}")
