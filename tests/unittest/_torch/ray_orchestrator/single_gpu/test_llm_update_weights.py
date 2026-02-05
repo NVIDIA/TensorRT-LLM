@@ -9,6 +9,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
+from utils.util import skip_no_hopper
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.utils import get_device_uuid
@@ -119,6 +120,7 @@ def run_generate(
     return llm_logits, ref_logits
 
 
+@skip_no_hopper
 @pytest.mark.parametrize(
     "model_dir",
     [
@@ -167,6 +169,7 @@ def test_llm_update_weights(model_dir):
     compare_logits(llm_logits, ref_logits)
 
 
+@skip_no_hopper
 @pytest.mark.parametrize(
     "model_dir",
     [
@@ -233,6 +236,7 @@ def test_llm_partial_update_weights(model_dir):
     compare_logits(llm_logits, ref_logits)
 
 
+@skip_no_hopper
 @pytest.mark.parametrize(
     "model_dir, fp8_model_dir",
     [
