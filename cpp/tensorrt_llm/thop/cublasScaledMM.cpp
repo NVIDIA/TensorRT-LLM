@@ -328,10 +328,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
         " ScalarType? out_dtype, bool to_userbuffers=False) -> (Tensor out)");
     m.def("cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype) -> (Tensor out)");
+    m.def("cublas_mm_out(Tensor mat_a, Tensor mat_b, Tensor? bias, Tensor out) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("cublas_scaled_mm", &tensorrt_llm::torch_ext::cublas_scaled_mm);
     m.impl("cublas_mm", &tensorrt_llm::torch_ext::cublas_mm);
+    m.impl("cublas_mm_out", &tensorrt_llm::torch_ext::cublas_mm_out);
 }
