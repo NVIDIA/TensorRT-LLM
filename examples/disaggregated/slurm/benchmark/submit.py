@@ -198,7 +198,8 @@ def submit_job(config, log_dir, dry_run):
     gen_pp_size = worker_config['gen'].get('pipeline_parallel_size', 1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
-
+    ucx_warmup_requests = 2 * ctx_world_size * \
+        gen_world_size if benchmark_config['mode'] == "e2e" else 0
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
@@ -343,14 +344,14 @@ def submit_job(config, log_dir, dry_run):
     if benchmark_config['use_nv_sa_benchmark']:
         benchmark_cmd = [
             f"bash {env_config['work_dir']}/run_benchmark_nv_sa.sh",
-            f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
+            f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
             f"&> {log_dir}/6_bench.log"
         ]
         client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
     else:
         benchmark_cmd = [
             f"bash {env_config['work_dir']}/run_benchmark.sh",
-            f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
+            f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
             f"&> {log_dir}/6_bench.log"
         ]
         client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
