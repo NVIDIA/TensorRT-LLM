@@ -13,11 +13,8 @@ Key components:
 - SuffixAutomatonManager: Manages per-request suffix automaton states
 - SAResourceManager: Integrates with TRT-LLM's resource management
 
-The module provides two implementations:
-1. Native C++/CUDA kernel (GPU-native, CUDA graph compatible)
-2. Python fallback (CPU-based, NOT CUDA graph compatible)
-
-The native kernel is preferred and will be used automatically when available.
+This module requires the native C++/CUDA kernel for GPU-native, CUDA graph
+compatible operations.
 """
 
 import logging
@@ -35,16 +32,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Try to import native suffix automaton bindings
+# Import native suffix automaton bindings (required)
 _sa_native = None
 try:
     from tensorrt_llm.bindings.internal import suffix_automaton as _sa_native
 
     logger.info("Native suffix automaton kernel available")
 except ImportError:
-    logger.warning(
+    logger.error(
         "Native suffix automaton kernel not available. "
-        "Using Python fallback which is NOT CUDA graph compatible."
+        "The suffix automaton module requires the native C++/CUDA kernel."
     )
 
 
@@ -62,110 +59,6 @@ class SAConfig:
     threshold: int = 4
 
 
-class SuffixAutomatonState:
-    """
-    Represents the state of a suffix automaton for a single request.
-
-    This is a Python-side placeholder that will be replaced by the native
-    C++ SuffixAutomaton when pybind bindings are available.
-    """
-
-    def __init__(self, max_seq_len: int):
-        self.max_seq_len = max_seq_len
-        self.tokens: List[int] = []
-
-    def extend(self, token: int):
-        """Extend the automaton with a new token."""
-        self.tokens.append(token)
-
-    def extend_batch(self, tokens: List[int]):
-        """Extend the automaton with multiple tokens."""
-        self.tokens.extend(tokens)
-
-    def lookup(self, max_suffix_search: int = 64) -> Optional[tuple]:
-        """
-        Find the longest suffix that appears earlier in the text.
-
-        Args:
-            max_suffix_search: Maximum suffix length to search (limits O(n^2) complexity)
-
-        Returns:
-            Optional tuple of (position, length) if a match is found,
-            None otherwise.
-        """
-        if len(self.tokens) < 2:
-            return None
-
-        # Simple O(n*m) implementation where m = max_suffix_search
-        # Will be replaced by efficient C++ implementation
-        text = self.tokens
-        n = len(text)
-
-        best_pos = None
-        best_len = 0
-
-        # Limit search to avoid O(n^2) worst case during warmup with large contexts
-        max_search = min(max_suffix_search, n - 1)
-
-        # Look for the longest suffix ending before the current position
-        for suffix_len in range(1, n):
-            suffix_start = n - suffix_len
-            suffix = text[suffix_start:]
-
-            # Search for this suffix in the earlier text (only in recent window)
-            search_start = max(0, n - suffix_len - 1024)  # Limit search window
-            for pos in range(search_start, n - suffix_len):
-                if text[pos : pos + suffix_len] == suffix:
-                    if suffix_len > best_len:
-                        best_len = suffix_len
-                        best_pos = pos + suffix_len  # Position after the match
-                    break
-
-        if best_pos is not None:
-            return (best_pos, best_len)
-        return None
-
-    def lookup_fixed(self, target_len: int) -> Optional[tuple]:
-        """
-        Find suffix of exactly target_len that appears earlier in the text.
-
-        This is used for fixed-size ngram matching where we want to find
-        a match of a specific length rather than the longest possible match.
-
-        Args:
-            target_len: The exact length of suffix to match
-
-        Returns:
-            Optional tuple of (continuation_start_pos, match_len) if found,
-            None otherwise. continuation_start_pos is the position right after
-            the matched pattern where draft tokens should be read from.
-        """
-        if len(self.tokens) < target_len + 1:
-            return None
-
-        # Get the target suffix (last target_len tokens)
-        suffix = self.tokens[-target_len:]
-
-        # Search for this exact suffix earlier in the text
-        # Search range excludes current suffix position to avoid self-match
-        search_end = len(self.tokens) - target_len
-        for pos in range(0, search_end):
-            if self.tokens[pos : pos + target_len] == suffix:
-                # Return position after the match (where continuation starts)
-                return (pos + target_len, target_len)
-
-        return None
-
-    def get_draft_tokens(self, start_pos: int, num_tokens: int) -> List[int]:
-        """Get draft tokens starting from a position."""
-        end_pos = min(start_pos + num_tokens, len(self.tokens))
-        return self.tokens[start_pos:end_pos]
-
-    def clear(self):
-        """Clear the automaton state."""
-        self.tokens = []
-
-
 class SuffixAutomatonManager:
     """
     Manages suffix automaton states for multiple requests.
@@ -175,20 +68,20 @@ class SuffixAutomatonManager:
     - Copying SA states from host (pinned) to device memory
     - Batch operations for efficient GPU utilization
 
-    When native kernel is available:
-    - SA states are built on CPU using native code
-    - States are copied to GPU during prepare()
-    - extend() runs entirely on GPU (CUDA graph compatible)
-
-    When using Python fallback:
-    - SA states are Python objects on CPU
-    - extend() requires CPU-GPU sync (NOT CUDA graph compatible)
+    SA states are built on CPU using native code, then copied to GPU during
+    prepare(). The extend() and extend_ngram() methods run entirely on GPU
+    and are CUDA graph compatible.
     """
 
     def __init__(self, config: SAConfig, max_num_requests: int):
+        if _sa_native is None:
+            raise RuntimeError(
+                "Native suffix automaton kernel is required but not available. "
+                "Please ensure the native bindings are properly built."
+            )
+
         self.config = config
         self.max_num_requests = max_num_requests
-        self._use_native = _sa_native is not None
 
         # Request ID -> slot index mapping
         self._request_to_slot: Dict[int, int] = {}
@@ -196,21 +89,16 @@ class SuffixAutomatonManager:
         # Free slots for reuse
         self._free_slots: List[int] = list(range(max_num_requests))
 
-        if self._use_native:
-            # Native mode: use C++/CUDA kernel
-            # Host-side SA states as pinned memory tensors
-            self._host_states_native: Dict[int, torch.Tensor] = {}
+        # Host-side SA states as pinned memory tensors
+        self._host_states_native: Dict[int, torch.Tensor] = {}
 
-            # GPU workspace for SA states
-            self._gpu_slots: Optional[torch.Tensor] = None
+        # GPU workspace for SA states
+        self._gpu_slots: Optional[torch.Tensor] = None
 
-            # Track which slots need to be copied to GPU
-            self._pending_copies: Set[int] = set()
-        else:
-            # Fallback mode: use Python SA states
-            self._host_states: Dict[int, SuffixAutomatonState] = {}
+        # Track which slots need to be copied to GPU
+        self._pending_copies: Set[int] = set()
 
-        # GPU output buffers - used by both modes
+        # GPU output buffers
         self._workspace_allocated = False
         self._gpu_match_len: Optional[torch.Tensor] = None
         self._gpu_draft_tokens: Optional[torch.Tensor] = None
@@ -229,9 +117,8 @@ class SuffixAutomatonManager:
                 (self.max_num_requests,), dtype=torch.int32, device="cuda"
             )
 
-            if self._use_native:
-                # Allocate GPU workspace for SA states
-                self._gpu_slots = _sa_native.allocate_workspace(self.max_num_requests)
+            # Allocate GPU workspace for SA states
+            self._gpu_slots = _sa_native.allocate_workspace(self.max_num_requests)
 
             self._workspace_allocated = True
 
@@ -245,16 +132,10 @@ class SuffixAutomatonManager:
         """
         if request_id in self._request_to_slot:
             # Request already exists, rebuild its state
-            slot = self._request_to_slot[request_id]
-            if self._use_native:
-                self._host_states_native[request_id] = _sa_native.build_automaton_host(
-                    context_tokens
-                )
-                self._pending_copies.add(request_id)
-            else:
-                state = self._host_states[request_id]
-                state.clear()
-                state.extend_batch(context_tokens)
+            self._host_states_native[request_id] = _sa_native.build_automaton_host(
+                context_tokens
+            )
+            self._pending_copies.add(request_id)
             return
 
         if not self._free_slots:
@@ -264,15 +145,11 @@ class SuffixAutomatonManager:
         slot = self._free_slots.pop()
         self._request_to_slot[request_id] = slot
 
-        if self._use_native:
-            # Build SA state on host using native code
-            self._host_states_native[request_id] = _sa_native.build_automaton_host(context_tokens)
-            self._pending_copies.add(request_id)
-        else:
-            # Create Python SA state
-            state = SuffixAutomatonState(self.config.max_seq_len)
-            state.extend_batch(context_tokens)
-            self._host_states[request_id] = state
+        # Build SA state on host using native code
+        self._host_states_native[request_id] = _sa_native.build_automaton_host(
+            context_tokens
+        )
+        self._pending_copies.add(request_id)
 
     def remove_request(self, request_id: int):
         """Remove a request and free its resources."""
@@ -282,20 +159,18 @@ class SuffixAutomatonManager:
         slot = self._request_to_slot.pop(request_id)
         self._free_slots.append(slot)
 
-        if self._use_native:
-            self._host_states_native.pop(request_id, None)
-            self._pending_copies.discard(request_id)
-            # Clear the GPU slot
-            if self._gpu_slots is not None:
-                _sa_native.clear_slot(self._gpu_slots, slot)
-        else:
-            self._host_states.pop(request_id, None)
+        self._host_states_native.pop(request_id, None)
+        self._pending_copies.discard(request_id)
+
+        # Clear the GPU slot
+        if self._gpu_slots is not None:
+            _sa_native.clear_slot(self._gpu_slots, slot)
 
     def prepare(self, request_ids: List[int], max_draft_len: int):
         """
         Prepare batch indices for the upcoming extend() call.
 
-        For native mode, this also copies pending host states to GPU.
+        This copies pending host states to GPU.
 
         Args:
             request_ids: List of request IDs in the current batch
@@ -303,8 +178,8 @@ class SuffixAutomatonManager:
         """
         self._ensure_workspace(max_draft_len)
 
-        # Copy pending host states to GPU (native mode only)
-        if self._use_native and self._pending_copies:
+        # Copy pending host states to GPU
+        if self._pending_copies:
             for rid in list(self._pending_copies):
                 if rid in self._host_states_native and rid in self._request_to_slot:
                     slot = self._request_to_slot[rid]
@@ -338,6 +213,8 @@ class SuffixAutomatonManager:
         2. Performs lookup to find longest matching suffix
         3. Returns draft tokens based on the match
 
+        CUDA graph compatible.
+
         Args:
             request_ids: List of request IDs in the batch
             accepted_tokens: [batch_size, max_draft_len + 1] accepted token tensor
@@ -351,68 +228,28 @@ class SuffixAutomatonManager:
 
         batch_size = len(request_ids)
 
-        if self._use_native:
-            # Native GPU kernel - CUDA graph compatible
-            match_len = self._gpu_match_len[:batch_size]
-            draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
+        # Native GPU kernel - CUDA graph compatible
+        match_len = self._gpu_match_len[:batch_size]
+        draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
 
-            # Ensure accepted_tokens is contiguous and int32
-            if accepted_tokens.dtype != torch.int32:
-                accepted_tokens = accepted_tokens.to(torch.int32)
-            if num_accepted_tokens.dtype != torch.int32:
-                num_accepted_tokens = num_accepted_tokens.to(torch.int32)
+        # Ensure accepted_tokens is contiguous and int32
+        if accepted_tokens.dtype != torch.int32:
+            accepted_tokens = accepted_tokens.to(torch.int32)
+        if num_accepted_tokens.dtype != torch.int32:
+            num_accepted_tokens = num_accepted_tokens.to(torch.int32)
 
-            _sa_native.invoke_extend(
-                batch_size,
-                max_draft_len,
-                self._gpu_slots,
-                self._gpu_batch_indices[:batch_size],
-                match_len,
-                draft_tokens,
-                accepted_tokens,
-                num_accepted_tokens,
-            )
+        _sa_native.invoke_extend(
+            batch_size,
+            max_draft_len,
+            self._gpu_slots,
+            self._gpu_batch_indices[:batch_size],
+            match_len,
+            draft_tokens,
+            accepted_tokens,
+            num_accepted_tokens,
+        )
 
-            return match_len, draft_tokens
-        else:
-            # Python fallback - NOT CUDA graph compatible
-            match_len = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
-            draft_tokens = torch.zeros(
-                (batch_size, max_draft_len), dtype=torch.int32, device="cuda"
-            )
-
-            # Skip CPU operations during CUDA graph capture - they are not supported
-            if torch.cuda.is_current_stream_capturing():
-                return match_len, draft_tokens
-
-            # Process each request on CPU
-            accepted_tokens_cpu = accepted_tokens.cpu()
-            num_accepted_cpu = num_accepted_tokens.cpu()
-
-            for i, rid in enumerate(request_ids):
-                if rid not in self._host_states:
-                    continue
-
-                state = self._host_states[rid]
-                num_new = num_accepted_cpu[i].item()
-
-                # Extend with accepted tokens
-                for j in range(num_new):
-                    token = accepted_tokens_cpu[i, j].item()
-                    state.extend(token)
-
-                # Lookup longest suffix
-                result = state.lookup()
-                if result is not None:
-                    pos, length = result
-                    match_len[i] = length
-
-                    # Get draft tokens
-                    drafts = state.get_draft_tokens(pos, max_draft_len)
-                    for j, tok in enumerate(drafts):
-                        draft_tokens[i, j] = tok
-
-            return match_len, draft_tokens
+        return match_len, draft_tokens
 
     def extend_ngram(
         self,
@@ -427,7 +264,7 @@ class SuffixAutomatonManager:
         using ngram matching.
 
         This method supports both longest match mode and fixed-size ngram matching.
-        CUDA graph compatible when using native kernel.
+        CUDA graph compatible.
 
         Args:
             request_ids: List of request IDs in the batch
@@ -445,153 +282,38 @@ class SuffixAutomatonManager:
 
         batch_size = len(request_ids)
 
-        if self._use_native:
-            # Native GPU kernel - CUDA graph compatible
-            match_len = self._gpu_match_len[:batch_size]
-            draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
+        # Native GPU kernel - CUDA graph compatible
+        match_len = self._gpu_match_len[:batch_size]
+        draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
 
-            # Ensure accepted_tokens is contiguous and int32
-            if accepted_tokens.dtype != torch.int32:
-                accepted_tokens = accepted_tokens.to(torch.int32)
-            if num_accepted_tokens.dtype != torch.int32:
-                num_accepted_tokens = num_accepted_tokens.to(torch.int32)
+        # Ensure accepted_tokens is contiguous and int32
+        if accepted_tokens.dtype != torch.int32:
+            accepted_tokens = accepted_tokens.to(torch.int32)
+        if num_accepted_tokens.dtype != torch.int32:
+            num_accepted_tokens = num_accepted_tokens.to(torch.int32)
 
-            _sa_native.invoke_extend_ngram(
-                batch_size,
-                max_draft_len,
-                max_ngram_size,
-                self._gpu_slots,
-                self._gpu_batch_indices[:batch_size],
-                match_len,
-                draft_tokens,
-                accepted_tokens,
-                num_accepted_tokens,
-            )
+        _sa_native.invoke_extend_ngram(
+            batch_size,
+            max_draft_len,
+            max_ngram_size,
+            self._gpu_slots,
+            self._gpu_batch_indices[:batch_size],
+            match_len,
+            draft_tokens,
+            accepted_tokens,
+            num_accepted_tokens,
+        )
 
-            return match_len, draft_tokens
-        else:
-            # Python fallback - NOT CUDA graph compatible
-            match_len = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
-            draft_tokens = torch.zeros(
-                (batch_size, max_draft_len), dtype=torch.int32, device="cuda"
-            )
-
-            # Skip CPU operations during CUDA graph capture - they are not supported
-            if torch.cuda.is_current_stream_capturing():
-                return match_len, draft_tokens
-
-            # Process each request on CPU
-            accepted_tokens_cpu = accepted_tokens.cpu()
-            num_accepted_cpu = num_accepted_tokens.cpu()
-
-            for i, rid in enumerate(request_ids):
-                if rid not in self._host_states:
-                    continue
-
-                state = self._host_states[rid]
-                num_new = num_accepted_cpu[i].item()
-
-                # Extend with accepted tokens
-                for j in range(num_new):
-                    token = accepted_tokens_cpu[i, j].item()
-                    state.extend(token)
-
-                # Perform lookup based on max_ngram_size
-                result = None
-                if max_ngram_size == -1:
-                    # Longest match mode
-                    result = state.lookup()
-                else:
-                    # Fixed-size ngram mode - try sizes from max down to 1
-                    for size in range(max_ngram_size, 0, -1):
-                        result = state.lookup_fixed(size)
-                        if result is not None:
-                            break
-
-                if result is not None:
-                    pos, length = result
-                    match_len[i] = length
-
-                    # Get draft tokens
-                    drafts = state.get_draft_tokens(pos, max_draft_len)
-                    for j, tok in enumerate(drafts):
-                        draft_tokens[i, j] = tok
-
-            return match_len, draft_tokens
-
-    def lookup(self, request_id: int) -> Optional[tuple]:
-        """
-        Find the longest suffix that appears earlier for a specific request.
-
-        Note: This method uses Python fallback state for position-based queries.
-        For CUDA graph compatible batched operations, use extend_ngram() instead
-        which returns (match_len, draft_tokens) directly.
-
-        Args:
-            request_id: The request ID to perform lookup for
-
-        Returns:
-            Optional tuple of (continuation_start_pos, match_len) if found,
-            None otherwise.
-        """
-        if request_id not in self._host_states:
-            return None
-        state = self._host_states[request_id]
-        return state.lookup()
-
-    def lookup_fixed(self, request_id: int, target_len: int) -> Optional[tuple]:
-        """
-        Find suffix of exactly target_len that appears earlier for a specific request.
-
-        Note: This method uses Python fallback state for position-based queries.
-        For CUDA graph compatible batched operations, use extend_ngram() instead
-        which returns (match_len, draft_tokens) directly.
-
-        Args:
-            request_id: The request ID to perform lookup for
-            target_len: The exact length of suffix to match
-
-        Returns:
-            Optional tuple of (continuation_start_pos, match_len) if found,
-            None otherwise.
-        """
-        if request_id not in self._host_states:
-            return None
-        state = self._host_states[request_id]
-        return state.lookup_fixed(target_len)
-
-    def get_draft_tokens(self, request_id: int, start_pos: int, num_tokens: int) -> List[int]:
-        """
-        Get draft tokens for a specific request starting from a position.
-
-        Note: This method uses Python fallback state for position-based access.
-        For CUDA graph compatible batched operations, use extend_ngram() instead
-        which returns draft tokens directly.
-
-        Args:
-            request_id: The request ID
-            start_pos: Starting position in the token sequence
-            num_tokens: Maximum number of tokens to return
-
-        Returns:
-            List of draft token IDs
-        """
-        if request_id not in self._host_states:
-            return []
-        state = self._host_states[request_id]
-        return state.get_draft_tokens(start_pos, num_tokens)
+        return match_len, draft_tokens
 
     def shutdown(self):
         """Clean up all resources."""
         self._request_to_slot.clear()
         self._free_slots = list(range(self.max_num_requests))
 
-        if self._use_native:
-            self._host_states_native.clear()
-            self._pending_copies.clear()
-            self._gpu_slots = None
-        else:
-            self._host_states.clear()
+        self._host_states_native.clear()
+        self._pending_copies.clear()
+        self._gpu_slots = None
 
         # Free GPU memory
         self._gpu_match_len = None
@@ -705,24 +427,24 @@ def init(max_num_requests: int = 256, max_seq_len: int = 262144):
     """
     Initialize the global SA manager.
 
-    If native kernel is available, uses GPU-native CUDA graph compatible mode.
-    Otherwise falls back to Python implementation (not CUDA graph compatible).
+    Requires native kernel to be available.
     """
     global _global_sa_manager, _seen_requests
+
+    if _sa_native is None:
+        raise RuntimeError(
+            "Native suffix automaton kernel is required but not available. "
+            "Please ensure the native bindings are properly built."
+        )
+
     config = SAConfig(max_seq_len=max_seq_len, max_slots=max_num_requests)
     _global_sa_manager = SuffixAutomatonManager(config, max_num_requests)
     _seen_requests = set()
 
-    if _sa_native is not None:
-        logger.info(
-            f"SA manager initialized with native kernel "
-            f"(max_slots={max_num_requests}, max_seq_len={max_seq_len})"
-        )
-    else:
-        logger.warning(
-            "SA manager initialized with Python fallback. "
-            "CUDA graph capture will skip SA operations."
-        )
+    logger.info(
+        f"SA manager initialized with native kernel "
+        f"(max_slots={max_num_requests}, max_seq_len={max_seq_len})"
+    )
 
 
 def add_request(request_id: int, context_tokens: List[int]):
@@ -737,7 +459,7 @@ def prepare(request_ids: List[int], max_draft_len: int = 8):
     """
     Prepare batch for processing.
 
-    For native mode, this copies pending host states to GPU.
+    This copies pending host states to GPU.
     """
     global _global_sa_manager
     if _global_sa_manager is None:
@@ -755,14 +477,7 @@ def extend(
     Extend SA states and populate output tensors.
 
     This matches the interface of the external sa_spec.extend() function.
-
-    For native mode:
-    - Runs entirely on GPU using CUDA kernel
-    - CUDA graph compatible
-
-    For Python fallback:
-    - Requires CPU-GPU sync
-    - Returns zeros during CUDA graph capture
+    Runs entirely on GPU using CUDA kernel. CUDA graph compatible.
     """
     global _global_sa_manager
     if _global_sa_manager is None:
