@@ -1540,14 +1540,7 @@ def _stack_fp8_moe_weights(
         ).item()
 
         if not w1_input_scales_identical or not w2_input_scales_identical:
-            if allow_different_input_scales:
-                # Issue warning once and continue - max() will be used
-                ad_logger.warning_once(
-                    "Input scales differ across experts. Using max(input_scale) for quantization. "
-                    "This may impact accuracy if scales differ significantly.",
-                    key="different_input_scales",
-                )
-            else:
+            if not allow_different_input_scales:
                 # Fail with assertion
                 assert w1_input_scales_identical, (
                     "All w1 input scales should have the same value. "
@@ -1557,6 +1550,12 @@ def _stack_fp8_moe_weights(
                     "All w2 input scales should have the same value. "
                     "Set allow_different_input_scales=True to allow different scales (uses max)."
                 )
+            # Issue warning once and continue - max() will be used
+            ad_logger.warning_once(
+                "FP8 MoE: Input scales differ across experts. Using max(input_scale) for quantization. "
+                "This may impact accuracy if scales differ significantly.",
+                key="fp8_moe_different_input_scales",
+            )
 
         w1_weight_scale_stacked = _stack(w1_weight_scale, dim=0).to(torch.float32)
         w2_weight_scale_stacked = _stack(w2_weight_scale, dim=0).to(torch.float32)
