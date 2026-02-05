@@ -549,11 +549,15 @@ class AggrTestCmds(NamedTuple):
             server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, server_port)
 
             server_file_path = os.path.join(self.output_dir, f"trtllm-serve.{server_idx}.log")
-            server_error_file_path = os.path.join(self.output_dir, f"trtllm-serve.{server_idx}.error.log")
+            server_error_file_path = os.path.join(
+                self.output_dir, f"trtllm-serve.{server_idx}.error.log"
+            )
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
-            with open(server_file_path, "w") as server_ctx, \
-                 open(server_error_file_path, "w") as server_err_ctx:
+            with (
+                open(server_file_path, "w") as server_ctx,
+                open(server_error_file_path, "w") as server_err_ctx,
+            ):
                 server_proc = subprocess.Popen(
                     server_cmd_with_port,
                     stdout=server_ctx,
@@ -744,8 +748,10 @@ class DisaggTestCmds(NamedTuple):
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
                 )
-                with open(server_file_path, "w") as server_ctx, \
-                     open(server_error_file_path, "w") as server_err_ctx:
+                with (
+                    open(server_file_path, "w") as server_ctx,
+                    open(server_error_file_path, "w") as server_err_ctx,
+                ):
                     server_proc = subprocess.Popen(
                         server_cmd,
                         stdout=server_ctx,
@@ -768,8 +774,10 @@ class DisaggTestCmds(NamedTuple):
             try:
                 self._generate_disagg_server_config(server_idx, port)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
-                with open(disagg_server_file_path, "w") as disagg_server_ctx, \
-                     open(disagg_server_error_file_path, "w") as disagg_server_err_ctx:
+                with (
+                    open(disagg_server_file_path, "w") as disagg_server_ctx,
+                    open(disagg_server_error_file_path, "w") as disagg_server_err_ctx,
+                ):
                     disagg_server_proc = subprocess.Popen(
                         disagg_cmd,
                         stdout=disagg_server_ctx,
