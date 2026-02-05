@@ -1584,6 +1584,8 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             self.max_attention_window_vec = [None]
 
+        self._scheduler_prepared_resources = False  # Track if scheduler handled resources
+
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
                 (num_kv_heads + tp_size - 1) // tp_size
@@ -1883,6 +1885,24 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        """
+        Prepare resources for scheduled requests.
+
+        For MAX_UTILIZATION policy, resources are already allocated by the scheduler's
+        prepare_resources method, so we check the flag and skip allocation.
+        For other policies (GUARANTEED_NO_EVICT), we allocate resources here.
+        """
+        # Check if the scheduler already prepared resources this round
+        if self._scheduler_prepared_resources:
+            # Reset flag for next round
+            self._scheduler_prepared_resources = False
+        else:
+            # Resources not allocated by scheduler, do it here (GUARANTEED_NO_EVICT path)
+            self._prepare_resources_guaranteed_no_evict(scheduled_batch)
+
+    def _prepare_resources_guaranteed_no_evict(
+            self, scheduled_batch: ScheduledRequests):
+        """Prepare resources for GUARANTEED_NO_EVICT scheduling policy."""
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
             generation_batch = scheduled_batch.generation_requests
