@@ -3284,11 +3284,6 @@ def launchTestJobs(pipeline, testFilter)
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
-        "DGX_H100_PCIe-PyTorch-1": ["dgx-h100-oci", "l0_h100", 1, 4],
-        "DGX_H100_PCIe-PyTorch-2": ["dgx-h100-oci", "l0_h100", 2, 4],
-        "DGX_H100_PCIe-PyTorch-3": ["dgx-h100-oci", "l0_h100", 3, 4],
-        "DGX_H100_PCIe-PyTorch-4": ["dgx-h100-oci", "l0_h100", 4, 4],
-        "DGX_H100_PCIe-PyTorch-Post-Merge-1": ["dgx-h100-oci", "l0_h100", 1, 2],
         "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 4],
         "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 4],
         "DGX_H100-PyTorch-3": ["auto:dgx-h100-x1", "l0_h100", 3, 4],
