@@ -28,9 +28,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
 
-_nccl_prealloc_lock = threading.Lock()
-_nccl_prealloc_done = set()
-
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
@@ -1659,6 +1656,8 @@ def _(
 
 
 class AllReduceRunner(TunableRunner):
+    _prealloc_lock = threading.Lock()
+    _prealloc_done = set()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -1687,12 +1686,69 @@ class AllReduceRunner(TunableRunner):
             self.op,
         )
 
+    @classmethod
+    def _maybe_preallocate_buffers(cls, input_tensor: torch.Tensor,
+                                   group: List[int]) -> None:
+        if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
+            return
+        if input_tensor.numel() == 0 or input_tensor.size(0) == 0:
+            return
+        if hasattr(torch.cuda, "is_current_stream_capturing"):
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except Exception:
+                # If capture status can't be queried, avoid prealloc to be safe.
+                return
+
+        if not cls.tuning_config.dynamic_tensor_specs:
+            opt_shapes = [int(input_tensor.size(0))]
+        else:
+            spec = cls.tuning_config.dynamic_tensor_specs[0]
+            base_val = int(input_tensor.size(spec.dim_idx))
+            if callable(spec.gen_tuning_buckets):
+                if cls.tuning_config.tune_max_num_tokens is None:
+                    opt_shapes = spec.gen_tuning_buckets(base_val)
+                else:
+                    opt_shapes = spec.gen_tuning_buckets(
+                        cls.tuning_config.tune_max_num_tokens)
+            else:
+                opt_shapes = spec.gen_tuning_buckets
+
+            opt_shapes = set(opt_shapes)
+            if cls.tuning_config.tune_max_num_tokens is not None:
+                opt_shapes.add(
+                    min(cls.tuning_config.tune_max_num_tokens, base_val))
+            else:
+                opt_shapes.add(base_val)
+
+        input_shape = list(input_tensor.shape)
+        group_key = tuple(group)
+        for tokens in sorted([int(v) for v in opt_shapes if v > 0]):
+            cache_key = (group_key, tokens)
+            with cls._prealloc_lock:
+                if cache_key in cls._prealloc_done:
+                    continue
+                cls._prealloc_done.add(cache_key)
+
+            logger.debug(
+                "[tunable_allreduce] Pre-allocating NCCL window buffers: "
+                "tokens=%d group=%s", tokens, list(group))
+            if tokens == input_shape[0]:
+                prealloc_input = input_tensor
+            else:
+                prealloc_shape = [tokens] + input_shape[1:]
+                prealloc_input = input_tensor.new_empty(prealloc_shape)
+            torch.ops.trtllm.preallocate_nccl_window_buffer(
+                prealloc_input, group, 2)
+
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
+        self._maybe_preallocate_buffers(inputs[0], self.group)
         valid_strategies = [
             AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
@@ -1763,46 +1819,6 @@ def tunable_allreduce(
         eps,
         trigger_completion_at_end,
     )
-
-    if hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
-        if input.numel() > 0 and input.size(0) > 0:
-            spec = AllReduceRunner.tuning_config.dynamic_tensor_specs[0]
-            base_val = int(input.size(spec.dim_idx))
-            if callable(spec.gen_tuning_buckets):
-                if AllReduceRunner.tuning_config.tune_max_num_tokens is None:
-                    opt_shapes = spec.gen_tuning_buckets(base_val)
-                else:
-                    opt_shapes = spec.gen_tuning_buckets(
-                        AllReduceRunner.tuning_config.tune_max_num_tokens)
-            else:
-                opt_shapes = spec.gen_tuning_buckets
-
-            opt_shapes = set(opt_shapes)
-            if AllReduceRunner.tuning_config.tune_max_num_tokens is not None:
-                opt_shapes.add(
-                    min(AllReduceRunner.tuning_config.tune_max_num_tokens,
-                        base_val))
-            else:
-                opt_shapes.add(base_val)
-
-                input_shape = list(input.shape)
-            group_key = tuple(group)
-            for tokens in sorted([int(v) for v in opt_shapes if v > 0]):
-                cache_key = (group_key, tokens)
-                with _nccl_prealloc_lock:
-                    if cache_key in _nccl_prealloc_done:
-                        continue
-                    _nccl_prealloc_done.add(cache_key)
-                    logger.debug(
-                        "[tunable_allreduce] Pre-allocating NCCL window buffers: "
-                        "tokens=%d group=%s", tokens, list(group))
-                    if tokens == input_shape[0]:
-                        prealloc_input = input
-                    else:
-                        prealloc_shape = [tokens] + input_shape[1:]
-                        prealloc_input = input.new_empty(prealloc_shape)
-                    torch.ops.trtllm.preallocate_nccl_window_buffer(
-                        prealloc_input, group, 2)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
