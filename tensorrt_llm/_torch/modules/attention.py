@@ -1163,17 +1163,20 @@ class MLA(nn.Module):
                 num_tokens = partial_o.shape[0]
                 cp_size = self.mapping.cp_size
 
-                # Reshape for FIFO-based all-to-all.
+                # Reshape for FIFO-based all-to-all. Overlap the two .contiguous() calls on separate streams.
                 # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
                 # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
-
-                partial_o = partial_o.view(
-                    num_tokens, cp_size, self.num_heads_tp_cp,
-                    kv_lora_rank).transpose(1, 2).contiguous()
-                softmax_stats = softmax_stats.view(num_tokens, cp_size,
-                                                   self.num_heads_tp_cp,
-                                                   2).transpose(1,
-                                                                2).contiguous()
+                partial_o, softmax_stats = maybe_execute_in_parallel(
+                    lambda: partial_o.view(
+                        num_tokens, cp_size, self.num_heads_tp_cp,
+                        kv_lora_rank).transpose(1, 2).contiguous(),
+                    lambda: softmax_stats.view(
+                        num_tokens, cp_size, self.num_heads_tp_cp,
+                        2).transpose(1, 2).contiguous(),
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    self.aux_stream,
+                )
 
                 # Call FIFO-based helixAllToAll.
                 partial_o_out, softmax_stats_out = helix.alltoall_native(
