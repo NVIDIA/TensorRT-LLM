@@ -152,16 +152,16 @@ The following figures plot **speedup vs. achieved sparsity**, on top of the base
     <td style="width: 50%; padding: 0 8px; vertical-align: top;">
       <p align="center"><b>Hopper (H200)</b></p>
       <p align="center"><b>Prefill</b></p>
-      <img src="../media/tech_blog16_hopper_prefill.png" alt="Hopper prefill speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <img src="../media/tech_blog16_hopper_prefill.png" alt="Hopper prefill kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
       <p align="center"><b>Decode</b></p>
-      <img src="../media/tech_blog16_hopper_decode.png" alt="Hopper decode speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <img src="../media/tech_blog16_hopper_decode.png" alt="Hopper decode kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
     </td>
     <td style="width: 50%; padding: 0 8px; vertical-align: top;">
       <p align="center"><b>Blackwell (B200)</b></p>
       <p align="center"><b>Prefill</b></p>
-      <img src="../media/tech_blog16_blackwell_prefill.png" alt="Blackwell prefill speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <img src="../media/tech_blog16_blackwell_prefill.png" alt="Blackwell prefill kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
       <p align="center"><b>Decode</b></p>
-      <img src="../media/tech_blog16_blackwell_decode.png" alt="Blackwell decode speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <img src="../media/tech_blog16_blackwell_decode.png" alt="Blackwell decode kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
     </td>
   </tr>
 </table>
@@ -277,4 +277,4 @@ throughput --dataset ${OUTPUT_DIR}/dumped_ids.json \
 
 
 ## Conclusion
-Skip Softmax Attention is a kernel-based solution for accelerating the attention. Due to the design that BMM1 ($Q \cdot K^T$) in the attention kernel is not skipped, the performance gain is capped to 1.8x at kernel level. Nevertheless, it excels at achieving high sparsity with minimal accuracy degradation, and is especially effective in the medium-to-long context (10k-100k) scenarios where previous methods like MInference cannot well handle. The drop-in nature of Skip Softmax Attention makes it a flexible, easy-to-use method for accelerating long-context inference. MLA support for Skip Softmax Attention will be added in the future, and the Skip Softmax Attention kernels will be available in FlashInfer for adoptions by the open-source community.
+Skip Softmax Attention is a kernel-based solution for accelerating the attention. Due to the design that BMM1 ($Q \cdot K^T$) in the attention kernel is not skipped, the performance gain is capped to 1.8x at kernel level. Nevertheless, it excels at achieving high sparsity with minimal accuracy degradation, and is especially effective in the medium-to-long context scenarios where previous methods like MInference cannot well handle, because the introduced runtime overhead may not pay off the speedup of the attention kernel. The drop-in nature of Skip Softmax Attention makes it a flexible, easy-to-use method for accelerating long-context inference. The Skip Softmax Attention kernels will also be available in FlashInfer for adoptions by the open-source community.
