@@ -1257,7 +1257,6 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Return model-specific LLM API defaults."""
         return {"kv_cache_config": {"enable_block_reuse": False}}
 
     def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):

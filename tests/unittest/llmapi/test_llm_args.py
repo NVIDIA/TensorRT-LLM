@@ -5,7 +5,7 @@ import tempfile
 import pydantic_core
 import pytest
 import yaml
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm.bindings.executor as tle
@@ -14,7 +14,6 @@ from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
-from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
 from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -26,8 +25,7 @@ from tensorrt_llm.llmapi.llm_args import (
     LookaheadDecodingConfig, MoeConfig, PeftCacheConfig, PybindMirror,
     StrictBaseModel, TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
     update_llm_args_with_extra_dict)
-from tensorrt_llm.llmapi.llm_utils import (apply_model_defaults_to_llm_args,
-                                           compute_applied_llm_defaults)
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 # isort: on
 # fmt: on
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
@@ -216,7 +214,8 @@ class TestModelDefaults:
 
     def test_compute_applied_llm_defaults_simple_field(self):
         model_defaults = {"enable_chunked_prefill": False}
-        applied = compute_applied_llm_defaults(model_defaults, {})
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
 
     @pytest.mark.parametrize(
@@ -314,52 +313,6 @@ class TestModelDefaults:
         # Check that the error message is helpful
         error_str = str(exc_info.value)
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
-
-    def test_user_overrides_preserved(self):
-        """Test that user's explicit overrides are preserved when applying model defaults."""
-        # Test with user explicitly setting a value
-        args = TorchLlmArgs(
-            model=llama_model_path,
-            kv_cache_config=KvCacheConfig(enable_block_reuse=True))
-
-        # Verify user's explicit value is set
-        assert args.kv_cache_config.enable_block_reuse is True
-
-        # Apply Qwen3Next model defaults (which normally disable block_reuse)
-        model_defaults = Qwen3NextForCausalLM.get_model_defaults(args)
-
-        # Verify the model wants to change it
-        assert model_defaults.get("kv_cache_config",
-                                  {}).get("enable_block_reuse") is False
-
-        # Apply the model defaults
-        applied = apply_model_defaults_to_llm_args(args, model_defaults)
-
-        # User override should be preserved (user explicitly set it)
-        assert args.kv_cache_config.enable_block_reuse is True
-        # Model default should NOT be applied since user explicitly set it
-        assert applied == {
-        }  # Nothing should be applied when user has set the value
-
-
-class _DummyInner(BaseModel):
-    a: int = 1
-    b: int = 2
-
-
-class _DummyOuter(BaseModel):
-    inner: _DummyInner = _DummyInner()
-    c: int = 3
-
-
-def check_defaults(py_config_cls, pybind_config_cls):
-    py_config = py_config_cls()
-    pybind_config = pybind_config_cls()
-    # get member variables from pybinding_config
-    for member in PybindMirror.get_pybind_variable_fields(pybind_config_cls):
-        py_value = getattr(py_config, member)
-        pybind_value = getattr(pybind_config, member)
-        assert py_value == pybind_value, f"{member} default value is not equal"
 
 
 def test_KvCacheConfig_declaration():

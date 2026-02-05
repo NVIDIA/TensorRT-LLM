@@ -1,9 +1,6 @@
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
-
-if TYPE_CHECKING:
-    pass
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig

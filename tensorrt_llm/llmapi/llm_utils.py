@@ -989,7 +989,6 @@ __all__ = [
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',
     'apply_model_defaults_to_llm_args',
-    'compute_applied_llm_defaults',
 ]
 
 
@@ -1031,32 +1030,23 @@ def apply_model_defaults_to_llm_args(
     for field_name in llm_args.model_fields:
         setattr(llm_args, field_name, getattr(new_args, field_name))
 
-    applied_defaults = compute_applied_llm_defaults(model_defaults_dict,
-                                                    user_overrides)
+    def _compute_applied(defaults: Dict[str, Any],
+                         overrides: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively compute applied defaults."""
+        applied = {}
+        for key, default_value in defaults.items():
+            if isinstance(default_value, dict):
+                user_override = overrides.get(key, {})
+                if isinstance(user_override, dict):
+                    nested_applied = _compute_applied(default_value,
+                                                      user_override)
+                    if nested_applied:
+                        applied[key] = nested_applied
+                elif key not in overrides:
+                    applied[key] = default_value
+            else:
+                if key not in overrides:
+                    applied[key] = default_value
+        return applied
 
-    logger.info(f"Applied model defaults: {applied_defaults}")
-
-    return applied_defaults
-
-
-def compute_applied_llm_defaults(
-        model_defaults_dict: Dict[str, Any],
-        user_overrides: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the subset of model_defaults_dict that will be applied."""
-    applied = {}
-
-    for key, default_value in model_defaults_dict.items():
-        if isinstance(default_value, dict):
-            user_override = user_overrides.get(key, {})
-            if isinstance(user_override, dict):
-                nested_applied = compute_applied_llm_defaults(
-                    default_value, user_override)
-                if nested_applied:
-                    applied[key] = nested_applied
-            elif key not in user_overrides:
-                applied[key] = default_value
-        else:
-            if key not in user_overrides:
-                applied[key] = default_value
-
-    return applied
+    return _compute_applied(model_defaults_dict, user_overrides)

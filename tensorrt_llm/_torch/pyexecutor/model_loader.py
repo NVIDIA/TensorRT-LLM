@@ -221,22 +221,15 @@ class ModelLoader:
         if checkpoint_loader is None:
             return llm_args
 
-        # Pass relevant context from llm_args to config loader so that
-        # _resolve_class can correctly determine the model class
         config_kwargs = {
             'trust_remote_code': True,
             'mm_encoder_only': llm_args.mm_encoder_only,
         }
-
-        # Add mapping if available
-        if hasattr(llm_args, 'parallel_config') and llm_args.parallel_config:
+        if llm_args.parallel_config:
             config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
 
-        # Add spec_config if available
-        if hasattr(llm_args, 'decoding_config') and llm_args.decoding_config:
-            # The decoding_config attribute contains the actual spec_config
-            config_kwargs[
-                'spec_config'] = llm_args.decoding_config.decoding_config
+        if llm_args.speculative_config:
+            config_kwargs['spec_config'] = llm_args.speculative_config
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
@@ -248,8 +241,8 @@ class ModelLoader:
                 applied_defaults = apply_model_defaults_to_llm_args(
                     llm_args, model_defaults)
                 if applied_defaults:
-                    logger.debug("Applied model defaults for %s: %s",
-                                 model_cls.__name__, applied_defaults)
+                    logger.info("Applied model defaults for %s: %s",
+                                model_cls.__name__, applied_defaults)
 
         return llm_args
 

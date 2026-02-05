@@ -48,6 +48,7 @@ def create_nemotron_h_llm(model_folder,
         kwargs["load_format"] = load_format
 
     # Only override SSM cache dtype if different from default
+    # This tests if model-specific defaults application path
     if mamba_ssm_cache_dtype is not None and mamba_ssm_cache_dtype != "auto":
         kwargs["kv_cache_config"] = KvCacheConfig(
             mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)

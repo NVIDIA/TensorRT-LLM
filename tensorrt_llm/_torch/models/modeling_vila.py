@@ -1148,7 +1148,6 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
 
 
 @register_auto_model(VilaConfig.model_architecture)
-@register_auto_model("LlavaLlamaForCausalLM")
 @register_input_processor(
     VilaInputProcessor,
     model_type="llava_llama",

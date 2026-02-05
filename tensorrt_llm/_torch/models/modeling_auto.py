@@ -18,6 +18,14 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
 
         model_arch = pretrained_config.architectures[0]
 
+        if config.mm_encoder_only:
+            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                model_arch)
+            if vision_encoder_info is None:
+                return None
+            vision_encoder_cls, _ = vision_encoder_info
+            return vision_encoder_cls
+
         # Hack to detect eagle3 checkpoints. TODO: should we provide
         # our own checkpoints with the correct arch? It would let us
         # avoid nasty stuff like this.
@@ -31,14 +39,6 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                 "ExaoneMoEForCausalLM"
         ) and config.spec_config is not None and config.spec_config.max_draft_len == 0:
             model_arch = "MTPDraftModelForCausalLM"
-
-        if config.mm_encoder_only:
-            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                model_arch)
-            if vision_encoder_info is None:
-                return None
-            vision_encoder_cls, _ = vision_encoder_info
-            return vision_encoder_cls
 
         return MODEL_CLASS_MAPPING.get(model_arch)
 
