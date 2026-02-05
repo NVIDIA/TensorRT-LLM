@@ -2724,7 +2724,7 @@ class Linear(nn.Module):
 
 
 class TwoNVFP4LinearMethod(NVFP4LinearMethod):
-    self.residual_dim = 128
+    residual_dim = 128
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
