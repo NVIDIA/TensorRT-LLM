@@ -23,6 +23,7 @@ from transformers import AutoConfig, PretrainedConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.utils import ActivationType, relu2
+from tensorrt_llm.logger import logger
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce
@@ -322,6 +323,17 @@ class NemotronHLayer(DecoderLayer):
         self.is_nvfp4 = (model_config.quant_config is not None
                          and model_config.quant_config.quant_mode is not None
                          and model_config.quant_config.quant_mode.has_nvfp4())
+        # The fused RMSNorm+NVFP4 CUDA kernel requires hidden_size to be
+        # a supported tile size. Non-power-of-2 hidden sizes within tile
+        # ranges may cause kernel hangs. Disable fused NVFP4 for such cases.
+        # Supported tile sizes: 2048, 4096, 8192, 16384
+        _SUPPORTED_NVFP4_HIDDEN_SIZES = {2048, 4096, 8192, 16384}
+        if self.is_nvfp4 and config.hidden_size not in _SUPPORTED_NVFP4_HIDDEN_SIZES:
+            logger.warning_once(
+                f"Layer {layer_idx}: Disabling fused NVFP4 RMSNorm for hidden_size={config.hidden_size}. "
+                f"Supported sizes: {_SUPPORTED_NVFP4_HIDDEN_SIZES}. Using non-fused path.",
+                key=f"disable_nvfp4_rmsnorm_with_{config.hidden_size}")
+            self.is_nvfp4 = False
 
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -330,9 +342,9 @@ class NemotronHLayer(DecoderLayer):
             # Enable fused NVFP4 quantization if possible.
             # It might be overridden in `_try_attach_nvfp4_scale` function.
             quantize_type="nvfp4" if self.is_nvfp4 else None,
-            # Enable high precision output for MoE layer.
+            # Enable high precision output for MoE layer (only with NVFP4).
             # It might be overridden in `_try_attach_nvfp4_scale` function.
-            return_hp_output=layer_type == "E",
+            return_hp_output=layer_type == "E" and self.is_nvfp4,
         )
 
         if layer_type == "M":
@@ -423,7 +435,7 @@ class NemotronHLayer(DecoderLayer):
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
-                                                      hidden_states, None)
+                                                      hidden_states, residual)
 
         return hidden_states, residual
 
