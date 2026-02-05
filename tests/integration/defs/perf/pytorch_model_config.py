@@ -270,7 +270,7 @@ def get_model_yaml_config(model_label: str,
                     'max_batch_size': 720,
                 },
                 'moe_config': {
-                    'backend': 'CUTLASS'
+                    'backend': 'TRTLLM'
                 },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
