@@ -457,16 +457,17 @@ class MPIDist(Distributed):
         self._tp_comm = None
         self._pp_comm = None
 
-        # Validate that all ranks in the mapping are within the MPI world size
-        # to prevent segfaults when creating sub-communicators
+    def _validate_world_size(self):
+        """Validate world size before creating sub-communicators to prevent segfaults."""
+
         if ENABLE_MULTI_DEVICE:
             actual_world_size = mpi_world_size()
-            max_rank_needed = mapping.world_size
+            max_rank_needed = self.mapping.world_size
 
             if max_rank_needed > actual_world_size:
                 raise RuntimeError(
                     f"Mapping requires world_size={max_rank_needed} "
-                    f"(tp_size={mapping.tp_size} * pp_size={mapping.pp_size} * cp_size={mapping.cp_size}), "
+                    f"(tp_size={self.mapping.tp_size} * pp_size={self.mapping.pp_size} * cp_size={self.mapping.cp_size}), "
                     f"but MPI world size is only {actual_world_size}. ")
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
@@ -506,6 +507,7 @@ class MPIDist(Distributed):
     @property
     def tp_comm(self):
         if self._tp_comm is None:
+            self._validate_world_size()
             mapping = self.mapping
             new_group = mpi_comm().group.Incl(mapping.tp_group)
             self._tp_comm = mpi_comm().Create_group(new_group)
@@ -514,6 +516,7 @@ class MPIDist(Distributed):
     @property
     def pp_comm(self):
         if self._pp_comm is None:
+            self._validate_world_size()
             mapping = self.mapping
             new_group = mpi_comm().group.Incl(mapping.pp_group)
             self._pp_comm = mpi_comm().Create_group(new_group)
@@ -522,6 +525,7 @@ class MPIDist(Distributed):
     @property
     def cp_comm(self):
         if self._cp_comm is None:
+            self._validate_world_size()
             new_group = mpi_comm().group.Incl(self.mapping.cp_group)
             self._cp_comm = mpi_comm().Create_group(new_group)
         return self._cp_comm
