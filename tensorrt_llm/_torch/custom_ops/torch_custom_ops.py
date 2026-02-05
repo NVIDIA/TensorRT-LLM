@@ -1,4 +1,5 @@
 import threading
+from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
@@ -1820,10 +1821,31 @@ def tunable_allreduce(
         trigger_completion_at_end,
     )
 
+    def _inputs_pre_hook_register_nccl_window(
+            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        if not inputs:
+            return inputs
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor,
+                          torch.Tensor) or not input_tensor.is_cuda:
+            return inputs
+        window_tensor, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
+            group, list(input_tensor.size()), input_tensor.dtype)
+        if not is_valid:
+            return inputs
+        window_tensor.copy_(input_tensor)
+        new_inputs = list(inputs)
+        new_inputs[0] = window_tensor
+        return new_inputs
+
+    tuning_config = replace(
+        AllReduceRunner.tuning_config,
+        inputs_pre_hook=_inputs_pre_hook_register_nccl_window)
+
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
         [allreduce_runner],
-        AllReduceRunner.tuning_config,
+        tuning_config,
         [input, residual, norm_weight, scale, bias, workspace],
     )
 
