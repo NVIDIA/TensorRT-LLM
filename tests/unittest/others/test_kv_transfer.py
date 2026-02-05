@@ -461,7 +461,9 @@ def add_and_verify_request(
             )
 
     ctx_block_ids_raw = [
-        ctx_kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
+        ctx_kv_cache_manager.get_batch_cache_indices(
+            [ctx_request.py_request_id], layer_id=ctx_kv_cache_manager.pp_layers[0]
+        )[0]
         for ctx_kv_cache_manager in valid_ctx_kv_cache_managers
     ]
     # V2: Filter out invalid block ids (BAD_PAGE_INDEX = -1)
@@ -479,7 +481,9 @@ def add_and_verify_request(
         ctx_block_ids = ctx_block_ids_raw
 
     gen_block_ids_raw = [
-        gen_kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
+        gen_kv_cache_manager.get_batch_cache_indices(
+            [gen_request.py_request_id], layer_id=gen_kv_cache_manager.pp_layers[0]
+        )[0]
         for gen_kv_cache_manager in valid_gen_kv_cache_managers
     ]
     # V2: Filter out invalid block ids (BAD_PAGE_INDEX = -1)
@@ -503,7 +507,8 @@ def add_and_verify_request(
         ]
 
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=ctx_block_id) for ctx_block_id in ctx_block_ids
+            KVSlice(is_last_slice=True, block_ids_per_layer_groups=[ctx_block_id])
+            for ctx_block_id in ctx_block_ids
         ]
         send_slice_tasks = [
             sender_session._kv_tasks[sender_session.send(send_kv_slice)]
@@ -518,7 +523,8 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=gen_block_id) for gen_block_id in gen_block_ids
+            KVSlice(is_last_slice=True, block_ids_per_layer_groups=[gen_block_id])
+            for gen_block_id in gen_block_ids
         ]
         recv_slice_tasks = [
             receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
@@ -531,7 +537,8 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=gen_block_id) for gen_block_id in gen_block_ids
+            KVSlice(is_last_slice=True, block_ids_per_layer_groups=[gen_block_id])
+            for gen_block_id in gen_block_ids
         ]
         recv_slice_tasks = [
             receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
@@ -551,7 +558,8 @@ def add_and_verify_request(
             assert sender_session.state.status != SessionStatus.INIT
 
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=ctx_block_id) for ctx_block_id in ctx_block_ids
+            KVSlice(is_last_slice=True, block_ids_per_layer_groups=[ctx_block_id])
+            for ctx_block_id in ctx_block_ids
         ]
         send_slice_tasks = [
             sender_session._kv_tasks[sender_session.send(send_kv_slice)]

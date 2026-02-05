@@ -54,7 +54,7 @@ class RecvReqInfo:
     sender_req_id: int
     instance_name: str
     instance_rank: int
-    block_ids: list[int]
+    block_ids_per_layer_groups: list[list[int]]  # Block IDs per layer group
     unique_rid: int
     start_token_idx: Optional[int] = None
     aux_slot: Optional[int] = None
@@ -341,32 +341,47 @@ class KVSendTask:
             )
 
         dst_device_id = peer_ri.device_id
-        dst_block_ids = req_info.block_ids
-        src_block_ids = self._slice.block_ids
-
-        if len(src_block_ids) + 1 == len(dst_block_ids):
-            # FIXME: this is a temporary solution, need to be fixed for the draft tokens
-            logger.warning(
-                "src_block_num is one less than dst_block_num, maybe it is due to draft tokens,"
-                " remove the last block from dst_block_ids "
-            )
-            dst_block_ids = dst_block_ids[:-1]
-        src_block_ids, dst_block_ids = self._filter_kv_blocks(src_block_ids, dst_block_ids)
+        dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
+        src_block_ids_per_groups = self._slice.block_ids_per_layer_groups
 
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
             peer_ri.instance_name, peer_ri.instance_rank
         )
 
-        src_region = extractor.extract(src_block_ids)
-        dst_region = peer_extractor.extract(dst_block_ids)
-        mapper = self._registrar.get_kv_map(peer_ri)
-        region_pair = mapper.map(src_region, dst_region)
+        # Get group mapping: self_group_id -> peer_group_id
+        group_mapping = self._registrar.get_group_id_mapping(peer_ri)
 
-        src_frags = region_pair.src.memory.ptrs
-        dst_frags = region_pair.dst.memory.ptrs
-        frag_size = region_pair.src.memory.bytes_per_region
-        kv_sizes = [frag_size] * len(src_frags)
+        # Aggregate fragments from all matching layer groups
+        src_frags: List[int] = []
+        dst_frags: List[int] = []
+        kv_sizes: List[int] = []
+
+        for self_group_id, peer_group_id in group_mapping.items():
+            src_block_ids = src_block_ids_per_groups[self_group_id]
+            dst_block_ids = dst_block_ids_per_groups[peer_group_id]
+
+            if len(src_block_ids) + 1 == len(dst_block_ids):
+                # FIXME: this is a temporary solution, need to be fixed for the draft tokens
+                logger.warning(
+                    "src_block_num is one less than dst_block_num, maybe it is due to draft tokens,"
+                    " remove the last block from dst_block_ids "
+                )
+                dst_block_ids = dst_block_ids[:-1]
+            src_block_ids, dst_block_ids = self._filter_kv_blocks(src_block_ids, dst_block_ids)
+
+            # Extract regions for this layer group
+            src_region = extractor.extract(src_block_ids, layer_group_id=self_group_id)
+            dst_region = peer_extractor.extract(dst_block_ids, layer_group_id=peer_group_id)
+
+            # Get mapper for this layer group pair
+            mapper = self._registrar.get_kv_map(peer_ri, self_group_id, peer_group_id)
+            region_pair = mapper.map(src_region, dst_region)
+
+            src_frags.extend(region_pair.src.memory.ptrs)
+            dst_frags.extend(region_pair.dst.memory.ptrs)
+            frag_size = region_pair.src.memory.bytes_per_region
+            kv_sizes.extend([frag_size] * len(region_pair.src.memory.ptrs))
 
         if self._perf_timer is not None:
             transfer_total_size = frag_size * len(src_frags)
@@ -1000,7 +1015,7 @@ class KVRecvTask:
             sender_req_id=self._params.ctx_request_id,
             instance_name=self._registrar.self_rank_info.instance_name,
             instance_rank=self._registrar.self_rank_info.instance_rank,
-            block_ids=self._kv_slice.block_ids,
+            block_ids_per_layer_groups=self._kv_slice.block_ids_per_layer_groups,
             unique_rid=self._unique_rid,
             aux_slot=self._aux_slot,
         )
@@ -1540,16 +1555,27 @@ class TransferWorker:
         kv_pool_attrs = self._rank_info.kv_pool_attrs
         memory_descs = []
 
+        # Use dict to deduplicate pools (different layer_groups may share the same pool)
+        # Key: (pool_ptr, pool_size), Value: pool_idx for naming
+        unique_pools: dict[tuple[int, int], int] = {}
+        pool_counter = 0
+
         for layer_group_attrs in kv_pool_attrs.layer_group_attrs_list:
             for pool_idx, pool_ptr in enumerate(layer_group_attrs.pool_base_ptrs):
                 pool_size = layer_group_attrs.pool_sizes[pool_idx]
-                memory_desc = (
-                    pool_ptr,
-                    pool_size,
-                    self._device_id,
-                    f"kv_cache_memory_group{layer_group_attrs.group_id}_pool{pool_idx}",
-                )
-                memory_descs.append(memory_desc)
+                pool_key = (pool_ptr, pool_size)
+                if pool_key not in unique_pools:
+                    unique_pools[pool_key] = pool_counter
+                    pool_counter += 1
+
+        for (pool_ptr, pool_size), idx in unique_pools.items():
+            memory_desc = (
+                pool_ptr,
+                pool_size,
+                self._device_id,
+                f"kv_cache_memory_pool{idx}",
+            )
+            memory_descs.append(memory_desc)
 
         if memory_descs:
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)

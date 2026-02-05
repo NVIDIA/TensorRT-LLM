@@ -14,23 +14,26 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 )
 
 
-def make_kv_pool_attrs(pool_ptrs=None, block_bytes=None):
+def make_kv_pool_attrs(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
     """Create a KVPoolAttrs for testing."""
     if pool_ptrs is None:
         pool_ptrs = [1234]
     if block_bytes is None:
         block_bytes = [1024]
+    if global_layer_ids is None:
+        global_layer_ids = [0]
     layer_group_attrs = LayerGroupAttrs(
         group_id=0,
         pool_base_ptrs=pool_ptrs,
         pool_sizes=[0],
         roles_to_pool_idx={PoolRole.KV_CACHE: 0},
         block_bytes_per_pool=block_bytes,
-        global_layer_ids=[0],
+        global_layer_ids=global_layer_ids,
         kv_head_num_per_rank=2,
     )
+    layer_to_group_id = {lid: 0 for lid in global_layer_ids}
     return KVPoolAttrs(
-        layer_to_group_id={0: 0},
+        layer_to_group_id=layer_to_group_id,
         layer_group_attrs_list=[layer_group_attrs],
     )
 
@@ -137,7 +140,6 @@ def test_basic_overlap():
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
     overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
     assert overlap.overlap_pp_size == 2
-    assert overlap.target_peer_pp_layer_num == [1, 1]
     assert overlap.overlap_tp_size == 1
     assert overlap.ranks == [0, 1]
 
@@ -166,7 +168,6 @@ def test_no_overlap():
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
     overlap = reg.get_peer_overlap(peer_ri, 0)
     assert overlap.overlap_pp_size == 0
-    assert overlap.target_peer_pp_layer_num == []
     assert overlap.ranks == []
 
 
@@ -194,7 +195,6 @@ def test_pp_ratio_peer_smaller():
     reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
     overlap = reg.get_peer_overlap(peer_ri, 0)
     assert overlap.overlap_pp_size > 0
-    assert sum(overlap.target_peer_pp_layer_num) > 0
     assert all(r >= 0 for r in overlap.ranks)
 
 
@@ -253,14 +253,15 @@ def test_multiple_overlap():
         overlap_cp_size=2,
         duplicate_head_factor=1,
         peer_duplicate_head_factor=2,
-        target_peer_pp_layer_num=[1, 1],
         ranks=[26, 27, 30, 31, 42, 43, 46, 47],
     )
     assert overlap == expected_overlap
 
 
 def _make_peer_registrar(self_rankinfo):
-    pool_attrs = make_kv_pool_attrs()
+    pool_attrs = (
+        self_rankinfo.kv_pool_attrs if self_rankinfo.kv_pool_attrs else make_kv_pool_attrs()
+    )
     real_kv_extractor = KVRegionExtractorV1(pool_attrs)
     reg = PeerRegistrar(self_rankinfo, real_kv_extractor)
     return reg
@@ -325,7 +326,12 @@ def test_peer_registrar_get_kv_map_identity():
 
 
 def test_peer_registrar_get_kv_map_head_match():
-    self_rankinfo = make_rankinfo(instance_name="local")
+    # Self has 2 layers [0, 1], peer has only layer [1]
+    # Overlap is [1], but self has more layers -> HeadMatchMapper needed for layer offset
+    self_rankinfo = make_rankinfo(
+        instance_name="local",
+        kv_pool_attrs=make_kv_pool_attrs(global_layer_ids=[0, 1]),
+    )
     reg = _make_peer_registrar(self_rankinfo)
     peer_ri = make_rankinfo(
         instance_name="peer",
@@ -335,9 +341,13 @@ def test_peer_registrar_get_kv_map_head_match():
         layer_num_per_pp=[1, 1],
         tokens_per_block=16,
         dims_per_head=8,
-        kv_pool_attrs=make_kv_pool_attrs(),
+        kv_pool_attrs=make_kv_pool_attrs(global_layer_ids=[1]),
     )
-    mapper = reg.get_kv_map(peer_ri)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    # self has layers [0,1], peer has layer [1], overlap is [1]
+    # transfer_layers=1, self_group_layer_count=2, peer_group_layer_count=1
+    # 1 != 2, so HeadMatchMapper is returned
+    mapper = reg.get_kv_map(peer_ri, self_layer_group_id=0, peer_layer_group_id=0)
     assert isinstance(mapper, HeadMatchMapper)
 
 
@@ -351,11 +361,12 @@ def test_peer_registrar_get_kv_map_head_mismatch():
         pp_rank=0,
         tp_size=1,
         tp_rank=0,
-        kv_heads_per_rank=4,
+        kv_heads_per_rank=4,  # Different from self (default is 2)
         tokens_per_block=16,
         dims_per_head=8,
         layer_num_per_pp=[2],
         kv_pool_attrs=make_kv_pool_attrs(),
     )
-    mapper = reg.get_kv_map(peer_ri)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    mapper = reg.get_kv_map(peer_ri, self_layer_group_id=0, peer_layer_group_id=0)
     assert isinstance(mapper, HeadMismatchMapper)

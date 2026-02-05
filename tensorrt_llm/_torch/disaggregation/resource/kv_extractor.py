@@ -185,6 +185,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
     @staticmethod
     def _attrs_from_manager_v2(manager: KVCacheManagerV2) -> KVPoolAttrs:
         """Convert a KVCacheManagerV2 into KVPoolAttrs."""
+
         layer_group_attrs_list: List[LayerGroupAttrs] = []
         global_layer_to_group_id: Dict[int, int] = {}
 
@@ -193,16 +194,13 @@ class KVRegionExtractorV1(RegionExtractorBase):
         for group_id, local_layer_ids in enumerate(manager.impl.layer_grouping):
             first_local_layer = local_layer_ids[0]
 
-            key_base_ptr = int(manager.impl.get_mem_pool_base_address(first_local_layer, Role.KEY))
-
-            # MLA mode (kv_factor=1): only KEY, no VALUE
-            if manager.kv_factor == 1:
-                pool_base_ptr = key_base_ptr
-            else:
-                value_base_ptr = int(
-                    manager.impl.get_mem_pool_base_address(first_local_layer, Role.VALUE)
-                )
-                pool_base_ptr = min(key_base_ptr, value_base_ptr)
+            # get_mem_pool_base_address returns (slot_address + offset), we need to subtract offset
+            # to get the true pool base address (important when different layer_groups share a pool)
+            key_addr_with_offset = int(
+                manager.impl.get_mem_pool_base_address(first_local_layer, Role.KEY)
+            )
+            key_attr = manager.impl._storage.get_buffer_attr(first_local_layer, Role.KEY)
+            pool_base_ptr = key_addr_with_offset - key_attr.offset
 
             page_stride_key = manager.impl.get_page_stride(first_local_layer, Role.KEY)
             num_pages = manager.impl.get_page_index_upper_bound(first_local_layer, Role.KEY)
@@ -265,6 +263,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
         base_ptr = int(layer_group_attrs.pool_base_ptrs[pool_idx])
         block_size = int(layer_group_attrs.block_bytes_per_pool[pool_idx])
 
-        ptrs = [base_ptr + block_size * int(bid) for bid in region_ids]
+        # Filter out invalid block_ids (BAD_PAGE_INDEX = -1)
+        ptrs = [base_ptr + block_size * int(bid) for bid in region_ids if bid >= 0]
         memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=block_size)
         return SpecRegion(memory=memory)
