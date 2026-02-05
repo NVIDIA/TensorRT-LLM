@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import weakref
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional, Union
 
 import torch
 import zmq
@@ -21,7 +21,8 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest,
+                      TruncateKVCacheRequest)
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import get_unique_ipc_addr
@@ -359,6 +360,23 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._handle_background_error()
 
         return result
+
+    def set_kv_cache_hints(
+        self,
+        action: Literal["truncate"],
+        messages_to_retain: List[int],
+        messages: List[int],
+    ) -> None:
+        if action == "truncate":
+            request = TruncateKVCacheRequest(
+                messages_to_retain=messages_to_retain,
+                messages=messages,
+            )
+        else:
+            raise ValueError(f"Invalid action: {action}")
+
+        with nvtx_range_debug("request_queue.put"):
+            self.request_queue.put(request)
 
     def get_stats(self, timeout: float) -> List[dict]:
         """Get iteration statistics from the runtime via RPC.

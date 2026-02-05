@@ -1,9 +1,13 @@
 import asyncio
 import copy
+import os
+import types
 from abc import ABC
-from typing import Callable, Optional
+from enum import Enum
+from typing import Callable, List, Optional
 
 import openai
+import requests
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
@@ -12,9 +16,16 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .result import ScaffoldingOutput
-from .task import GenerationTask, StreamGenerationTask, Task, TaskStatus
+from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
+                   MCPCallTask, StreamGenerationTask, Task, TaskStatus)
 
 ExecutorCls = GenerationExecutor
+
+
+# Helper function to check if deterministic mode is enabled
+def is_deterministic_mode():
+    """Check if SCAFFOLDING_DETERMINISTIC environment variable is set to enable deterministic inference."""
+    return int(os.environ.get("SCAFFOLDING_DETERMINISTIC", 0)) == 1
 
 
 class Worker(ABC):
@@ -33,6 +44,9 @@ class Worker(ABC):
     task_handlers = {}
 
     def shutdown(self):
+        pass
+
+    async def async_shutdown(self):
         pass
 
     def __enter__(self):
@@ -67,17 +81,62 @@ class OpenaiWorker(Worker):
         self,
         async_client: openai.AsyncOpenAI,
         model: str,
+        kv_cache_hint_enabled: bool = False,
     ):
+        # Dynamic patch to support KV cache hint
+        async def send_kv_cache_hint(self, task: DropKVCacheTask, params: dict):
+            base_url = str(self.base_url)
+            if not base_url.endswith("/"):
+                base_url += "/"
+            url = base_url + "kv_cache_hints"
+
+            headers = {}
+            if self.api_key is not None:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            kv_cache_hint_params = {
+                "action":
+                "truncate",
+                "messages":
+                [message.to_dict() for message in task.chat_task.messages],
+                "messages_to_retain":
+                [message.to_dict() for message in task.messages_to_retain],
+            }
+
+            # Spread extra_body contents into the request (like OpenAI client does)
+            extra_body = params.pop("extra_body", {})
+            kv_cache_hint_params.update(params)
+            kv_cache_hint_params.update(
+                extra_body)  # Spread extra_body contents
+
+            return requests.post(
+                url,
+                json=kv_cache_hint_params,
+                headers=headers,
+            )
+
+        async_client.create_kv_cache_hint = types.MethodType(
+            send_kv_cache_hint, async_client)
+
         self.model = model
         self.async_client = async_client
+        self.kv_cache_hint_enabled = kv_cache_hint_enabled
 
-    def convert_task_params(self, task: GenerationTask):
+    def convert_task_params(self, task: GenerationTask | ChatTask):
         params = {
             "model": self.model,
-            "prompt": task.input_str,
+            "extra_body": {},
         }
+
+        if hasattr(task, "sub_request_markers") and os.environ.get(
+                'DEBUG_AGENT_HIERARCHY') == '1':
+            print(f"task.sub_request_markers is {task.sub_request_markers}")
+
+        if not isinstance(task, ChatTask):
+            params["prompt"] = task.input_str
+            add_param_if_not_none(params, "echo", [task.echo])
+
         add_param_if_not_none(params, "best_of", [task.best_of])
-        add_param_if_not_none(params, "echo", [task.echo])
         add_param_if_not_none(params, "frequency_penalty",
                               [task.frequency_penalty])
         add_param_if_not_none(params, "logit_bias", [task.logit_bias])
@@ -93,12 +152,28 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "top_p", [task.top_p])
         add_param_if_not_none(params, "user", [task.user])
 
+        # Override parameters for deterministic inference
+        if is_deterministic_mode():
+            params["temperature"] = 0.0  # Deterministic sampling
+            params["top_p"] = 1.0  # Disable nucleus sampling
+            params["n"] = 1  # Only return one result
+            if "seed" not in params or params["seed"] is None:
+                params["seed"] = 42  # Fixed seed for reproducibility
+
+        if hasattr(task, "sub_request_markers") and len(
+                task.sub_request_markers) > 0:
+            params["extra_body"]["agent_hierarchy"] = [
+                task.sub_request_markers[-1]
+            ]
+
         return params
 
     def fill_generation_task_with_response(self, task: GenerationTask,
                                            response: openai.Completion):
         task.output_str = response.choices[0].text
         task.output_tokens = response.choices[0].token_ids
+        task.finish_reason = response.choices[0].finish_reason
+        task.logprobs = response.choices[0].logprobs
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         params = self.convert_task_params(task)
@@ -115,11 +190,58 @@ class OpenaiWorker(Worker):
             print('Openai client get exception: ' + str(e))
             return TaskStatus.WORKER_EXECEPTION
 
-    def shutdown(self):
-        # OpenAI client doesn't require explicit cleanup
-        pass
+    async def chat_handler(self, task: ChatTask) -> TaskStatus:
+        params = self.convert_task_params(task)
+        params["messages"] = task.messages_to_dict_content()
+        params["model"] = self.model
+        if task.tools is not None:
+            params["tools"] = [tool.to_dict() for tool in task.tools]
 
-    task_handlers = {GenerationTask: generation_handler}
+        try:
+            response = await self.async_client.chat.completions.create(**params)
+            task.finish_reason = response.choices[0].finish_reason
+            content = response.choices[0].message.content
+            reasoning = response.choices[0].message.reasoning
+            reasoning_content = response.choices[0].message.reasoning_content
+            tool_calls = response.choices[0].message.tool_calls
+            task.messages.append(
+                AssistantMessage(content, reasoning, reasoning_content,
+                                 tool_calls))
+            if task.enable_token_counting:
+                task.prompt_tokens_num = response.usage.prompt_tokens
+                task.completion_tokens_num = response.usage.completion_tokens
+                if hasattr(
+                        response.usage, "completion_tokens_details"
+                ) and response.usage.completion_tokens_details is not None:
+                    task.reasoning_tokens_num = response.usage.completion_tokens_details.reasoning_tokens
+
+            return TaskStatus.SUCCESS
+
+        except Exception as e:
+            # Handle errors
+            print('Openai chat client get exception: ' + str(e))
+            return TaskStatus.WORKER_EXECEPTION
+
+    async def drop_kv_cache_handler(self, task: DropKVCacheTask) -> TaskStatus:
+        if not self.kv_cache_hint_enabled:
+            return TaskStatus.SUCCESS
+
+        params = self.convert_task_params(task.chat_task)
+        params["messages"] = task.chat_task.messages_to_dict_content()
+        params["model"] = self.model
+        if task.chat_task.tools is not None:
+            params["tools"] = [tool.to_dict() for tool in task.chat_task.tools]
+
+        response = await self.async_client.create_kv_cache_hint(task, params)
+        if response.status_code != 200:
+            return TaskStatus.WORKER_EXECEPTION
+        return TaskStatus.SUCCESS
+
+    task_handlers = {
+        GenerationTask: generation_handler,
+        ChatTask: chat_handler,
+        DropKVCacheTask: drop_kv_cache_handler
+    }
 
 
 # worker inherit from OpenaiWorker
@@ -129,7 +251,7 @@ class TRTOpenaiWorker(OpenaiWorker):
     def convert_task_params(self, task: GenerationTask):
         params = super().convert_task_params(task)
         if task.top_k is not None:
-            params["extra_body"] = {"top_k": task.top_k}
+            params["extra_body"]["top_k"] = task.top_k
         return params
 
 
@@ -229,7 +351,7 @@ class TRTLLMWorker(Worker):
         else:
             result = await self.llm.generate_async(
                 task.input_str, sampling_params=sampling_params)
-        #task.result = result
+
         self.fill_task_with_result(task, result)
 
         # TODO: error handle
@@ -265,3 +387,126 @@ class TRTLLMWorker(Worker):
         GenerationTask: generation_handler,
         StreamGenerationTask: stream_generation_handler
     }
+
+
+import asyncio
+import json
+
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+
+class MCPWorker(Worker):
+
+    class ToolCall:
+
+        def __init__(self, tool_name: str, args: dict):
+            self.tool_name = tool_name
+            self.args = args
+            self.ready = asyncio.Event()
+            self.result = None
+
+        def set_result(self, result: Optional[str]):
+            self.result = result
+            self.ready.set()
+
+    def __init__(
+        self,
+        urls: List[str],
+    ):
+        self.urls = urls
+        self.queues = [asyncio.Queue() for _ in urls]
+        self._background_tasks: List[asyncio.Task] = []
+
+    @classmethod
+    def init_with_urls(cls, urls: List[str]):
+        worker = cls(urls)
+        return worker
+
+    async def _main_loop_async_client_iter(self, url: str, index: int):
+
+        class TaskType(Enum):
+            TOOL_CALL = "tool_call"
+            WAIT_QUEUE = "wait_queue"
+
+        async with sse_client(url) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                response = await session.list_tools()
+                tools = response.tools
+                pending_dict = {
+                    asyncio.create_task(self.queues[index].get()):
+                    (TaskType.WAIT_QUEUE, None)
+                }
+                pending = pending_dict.keys()
+                while True:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED)
+
+                    for task in done:
+                        task_type, obj = pending_dict[task]
+                        if task_type == TaskType.TOOL_CALL:
+                            response = task.result()
+                            tool_call = obj
+                            tool_call.set_result(response.content[0].text)
+                        else:  # TaskType.WAIT_QUEUE
+                            queue_obj = task.result()
+                            if queue_obj is None:
+                                # Shutdown signal received
+                                # Cancel all pending tasks before exit to avoid blocking
+                                for pending_task in pending:
+                                    pending_task.cancel()
+                                if pending:
+                                    await asyncio.gather(*pending,
+                                                         return_exceptions=True)
+                                return
+                            else:
+                                tool_name = queue_obj.tool_name
+                                args = queue_obj.args
+                                if tool_name in [tool.name for tool in tools]:
+                                    new_task = asyncio.create_task(
+                                        session.call_tool(tool_name, args))
+                                    pending_dict[new_task] = (
+                                        TaskType.TOOL_CALL, queue_obj)
+                                    pending.add(new_task)
+                                else:
+                                    queue_obj.set_result(None)
+                                # Wait next queue object
+                                new_wait_queue_task = asyncio.create_task(
+                                    self.queues[index].get())
+                                pending_dict[new_wait_queue_task] = (
+                                    TaskType.WAIT_QUEUE, None)
+                                pending.add(new_wait_queue_task)
+
+    async def init_in_asyncio_event_loop(self):
+        for index in range(len(self.urls)):
+            task = asyncio.create_task(
+                self._main_loop_async_client_iter(self.urls[index], index))
+            self._background_tasks.append(task)
+
+    async def async_shutdown(self):
+        """Async shutdown MCP worker and wait for all background tasks to complete."""
+        # Signal all background tasks to stop
+        for queue in self.queues:
+            queue.put_nowait(None)
+        # Wait for all background tasks to complete
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks,
+                                 return_exceptions=True)
+            self._background_tasks.clear()
+
+    async def call_handler(self, task: MCPCallTask) -> TaskStatus:
+        tool_name = task.tool_name
+        tool_args = json.loads(task.args)
+        for index in range(len(self.urls)):
+            tool_call = self.ToolCall(tool_name, tool_args)
+            self.queues[index].put_nowait(tool_call)
+            await tool_call.ready.wait()
+            result = tool_call.result
+            if result is not None:
+                task.result_str = result
+                break
+
+        return TaskStatus.SUCCESS
+
+    task_handlers = {MCPCallTask: call_handler}

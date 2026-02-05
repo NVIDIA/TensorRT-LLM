@@ -2,6 +2,7 @@ from .._torch.async_llm import AsyncLLM
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
+from ..scheduling_params import SchedulingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
@@ -14,6 +15,7 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
+                       ResortRequestPolicyConfig,
                        RocketSparseAttentionConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
                        SkipSoftmaxAttentionConfig, TorchCompileConfig,
@@ -68,6 +70,8 @@ __all__ = [
     'LoRARequest',
     'SaveHiddenStatesDecodingConfig',
     'RocketSparseAttentionConfig',
+    'ResortRequestPolicyConfig',
     'DeepSeekSparseAttentionConfig',
+    'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
 ]

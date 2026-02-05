@@ -16,11 +16,16 @@
  */
 
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
+#include "tensorrt_llm/batch_manager/agentTree.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -276,7 +281,6 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     // Otherwise, add just check that we can add pending requests.
     if (!StaticBatchScheduling || scheduledRequests.size() == 0)
     {
-        // Now check if we can add pending requests
         auto availablePeftPages = maxPeftCachePages - claimedPeftPages;
 
         // Loop over pending requests and add them if they can be scheduled
@@ -485,32 +489,49 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     }
 }
 
+void CapacityScheduler::setAgentTreeResortPolicy(
+    float agentPercentage, std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum)
+{
+    batch_scheduler::AgentTreeConfig config;
+    config.agentPercentage = agentPercentage;
+    config.agentTypes = std::move(agentTypes);
+    config.agentInflightSeqNum = agentInflightSeqNum;
+
+    mResortPolicy = std::make_unique<agent_tree::AgentTreePolicy>(std::move(config));
+}
+
 std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::operator()(RequestList const& activeRequests,
     OptionalRef<kv_cache_manager::BaseKVCacheManager> kvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager,
     OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager) const
 {
     NVTX3_SCOPED_RANGE(capacitySchedulerScheduling);
+
+    // Apply resort policy if set
+    RequestList requestsToSchedule = mResortPolicy
+        ? mResortPolicy->resortRequests(activeRequests)
+        : activeRequests;
+
     return std::visit(
-        [&activeRequests, &kvCacheManager, &crossKvCacheManager, &peftCacheManager](
+        [&requestsToSchedule, &kvCacheManager, &crossKvCacheManager, &peftCacheManager](
             auto const& scheduler) -> std::tuple<RequestVector, RequestVector, RequestVector>
         {
             RequestVector tmpFittingRequests;
             RequestVector pausedRequests;
             if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, MaxRequestsScheduler>)
             {
-                std::tie(tmpFittingRequests, pausedRequests) = scheduler(activeRequests);
+                std::tie(tmpFittingRequests, pausedRequests) = scheduler(requestsToSchedule);
             }
             else if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, MaxUtilizationScheduler>)
             {
                 std::tie(tmpFittingRequests, pausedRequests)
-                    = scheduler(*kvCacheManager, peftCacheManager, activeRequests);
+                    = scheduler(*kvCacheManager, peftCacheManager, requestsToSchedule);
             }
             else if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, GuaranteedNoEvictScheduler>
                 || std::is_same_v<std::decay_t<decltype(scheduler)>, StaticBatchScheduler>)
             {
                 std::tie(tmpFittingRequests, pausedRequests)
-                    = scheduler(*kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);
+                    = scheduler(*kvCacheManager, crossKvCacheManager, peftCacheManager, requestsToSchedule);
             }
             else
             {

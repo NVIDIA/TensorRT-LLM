@@ -1669,8 +1669,29 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
     DeepSeekSparseAttentionConfig,
-    SkipSoftmaxAttentionConfig,
 ]
+
+
+class ResortRequestPolicyConfig(StrictBaseModel):
+    """
+    Configuration for request resorting policy.
+    """
+    policy_name: Optional[str] = Field(
+        default=None, description="The name of the request resorting policy.")
+    policy_args: Dict[str, Any] = Field(
+        default={},
+        description="The arguments of the request resorting policy.")
+
+
+class ResortRequestPolicyConfig(StrictBaseModel):
+    """
+    Configuration for request resorting policy.
+    """
+    policy_name: Optional[str] = Field(
+        default=None, description="The name of the request resorting policy.")
+    policy_args: Dict[str, Any] = Field(
+        default={},
+        description="The arguments of the request resorting policy.")
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -3050,6 +3071,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    resort_policy_config: Optional[ResortRequestPolicyConfig] = Field(
+        default=None,
+        description="The request resorting policy to use.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -3398,6 +3425,80 @@ class TorchLlmArgs(BaseLlmArgs):
         executor_config.mm_encoder_only = self.mm_encoder_only
         return executor_config
 
+    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
+    def get_pytorch_backend_config(self) -> "PyTorchConfig":
+        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+
+        return PyTorchConfig(
+            extra_resource_managers=self.extra_resource_managers,
+            use_cuda_graph=bool(self.cuda_graph_config is not None),
+            cuda_graph_batch_sizes=self.cuda_graph_config.batch_sizes
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['batch_sizes'].default,
+            cuda_graph_max_batch_size=self.cuda_graph_config.max_batch_size
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['max_batch_size'].default,
+            cuda_graph_padding_enabled=self.cuda_graph_config.enable_padding
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['enable_padding'].default,
+            disable_overlap_scheduler=self.disable_overlap_scheduler,
+            moe_max_num_tokens=self.moe_config.max_num_tokens,
+            moe_load_balancer=self.moe_config.load_balancer,
+            attn_backend=self.attn_backend,
+            moe_backend=self.moe_config.backend,
+            use_low_precision_moe_combine=self.moe_config.
+            use_low_precision_moe_combine,
+            sampler_type=self.sampler_type,
+            kv_cache_dtype=self.kv_cache_config.dtype,
+            mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
+            enable_iter_perf_stats=self.enable_iter_perf_stats,
+            enable_iter_req_stats=self.enable_iter_req_stats,
+            print_iter_log=self.print_iter_log,
+            torch_compile_enabled=bool(self.torch_compile_config is not None),
+            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
+            if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_fullgraph'].default,
+            torch_compile_inductor_enabled=self.torch_compile_config.
+            enable_inductor if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_inductor'].default,
+            torch_compile_piecewise_cuda_graph=self.torch_compile_config.
+            enable_piecewise_cuda_graph
+            if self.torch_compile_config is not None else TorchCompileConfig.
+            model_fields['enable_piecewise_cuda_graph'].default,
+            torch_compile_piecewise_cuda_graph_num_tokens=self.
+            torch_compile_config.capture_num_tokens
+            if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['capture_num_tokens'].default,
+            torch_compile_enable_userbuffers=self.torch_compile_config.
+            enable_userbuffers if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_userbuffers'].default,
+            torch_compile_max_num_streams=self.torch_compile_config.
+            max_num_streams if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['max_num_streams'].default,
+            enable_autotuner=self.enable_autotuner,
+            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
+            load_format=self.load_format,
+            enable_min_latency=self.enable_min_latency,
+            moe_disable_finalize_fusion=self.moe_config.disable_finalize_fusion,
+            stream_interval=self.stream_interval,
+            force_dynamic_quantization=self.force_dynamic_quantization,
+            allreduce_strategy=self.allreduce_strategy,
+            attention_dp_enable_balance=bool(
+                self.attention_dp_config is not None
+                and self.attention_dp_config.enable_balance),
+            attention_dp_time_out_iters=self.attention_dp_config.timeout_iters
+            if self.attention_dp_config is not None else
+            AttentionDpConfig.model_fields['timeout_iters'].default,
+            attention_dp_batching_wait_iters=self.attention_dp_config.
+            batching_wait_iters if self.attention_dp_config is not None else
+            AttentionDpConfig.model_fields['batching_wait_iters'].default,
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            batch_wait_timeout_iters=self.batch_wait_timeout_iters,
+            batch_wait_max_tokens_ratio=self.batch_wait_max_tokens_ratio,
+            enable_sleep=self.enable_sleep,
+            resort_policy_config=self.resort_policy_config,
+        )
+
 
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
@@ -3425,6 +3526,7 @@ def update_llm_args_with_extra_dict(
         "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
         "sparse_attention_config": BaseSparseAttentionConfig,
+        "resort_policy_config": ResortRequestPolicyConfig,
         "kv_cache_config": KvCacheConfig,
     }
     for field_name, field_type in field_mapping.items():

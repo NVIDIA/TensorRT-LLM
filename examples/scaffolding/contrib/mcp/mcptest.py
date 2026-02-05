@@ -67,7 +67,7 @@ async def main():
     llm.shutdown()
     print(f'worker shutting down...')
     qwen_worker.shutdown()
-    mcp_worker.shutdown()
+    await mcp_worker.shutdown()
 
     print(f'main shut down done')
     return

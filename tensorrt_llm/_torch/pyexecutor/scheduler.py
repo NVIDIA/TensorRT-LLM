@@ -263,7 +263,8 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1])
 
         self.impl = tb_internal.algorithms.MicroBatchScheduler(
-            ctx_chunk_config_cpp, max_num_tokens)
+            ctx_chunk_config=ctx_chunk_config_cpp,
+            max_context_length=max_num_tokens)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]

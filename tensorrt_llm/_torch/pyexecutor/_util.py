@@ -890,6 +890,13 @@ def create_py_executor_instance(
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
+        resort_policy_config = llm_args.resort_policy_config
+        if resort_policy_config is not None:
+            assert resort_policy_config.policy_name == "AgentTree", "Resort policy only supports AgentTree for now"
+            capacity_scheduler.impl.set_agent_tree_resort_policy(
+                resort_policy_config.policy_args["agent_percentage"],
+                resort_policy_config.policy_args["agent_types"],
+                resort_policy_config.policy_args["agent_inflight_seq_num"])
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config

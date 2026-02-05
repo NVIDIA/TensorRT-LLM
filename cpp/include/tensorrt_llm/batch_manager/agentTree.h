@@ -1,0 +1,338 @@
+/*
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/batch_manager/resortPolicy.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace tensorrt_llm::batch_manager
+{
+
+namespace batch_scheduler
+{
+
+struct AgentTreeConfig
+{
+    AgentTreeConfig() = default;
+
+    // normal range is [0.0, 1.0], -1.0 means random schedule between agent and chatbot.
+    float agentPercentage{-1.0f};
+
+    // agent types to schedule.
+    std::optional<std::vector<std::string>> agentTypes;
+
+    // max number of inflight sequences for agent requests.
+    runtime::SizeType32 agentInflightSeqNum{std::numeric_limits<runtime::SizeType32>::max()};
+};
+
+} // namespace batch_scheduler
+
+namespace agent_tree
+{
+
+using LlmRequestPtr = std::shared_ptr<LlmRequest>;
+using SizeType32 = runtime::SizeType32;
+
+enum class NodeType : SizeType32
+{
+    kCHATBOT = 0,
+    kAGENT_CHATBOT = 1,
+    kAGENT_LATENCY = 2,
+    kAGENT_DEEP_RESEARCH = 3
+};
+
+using AgentHierarchyVector = std::vector<std::pair<NodeType, SizeType32>>;
+
+// Forward declarations
+class AgentTreeNode;
+class NodeParams;
+
+// Node factory with auto-registration support
+class NodeFactory
+{
+public:
+    using Creator = std::function<std::shared_ptr<AgentTreeNode>(SizeType32, std::shared_ptr<NodeParams>)>;
+
+    static NodeFactory& instance()
+    {
+        static NodeFactory factory;
+        return factory;
+    }
+
+    void registerNode(std::string const& name, NodeType type, Creator creator)
+    {
+        mStringToType[name] = type;
+        mCreators[type] = std::move(creator);
+    }
+
+    NodeType stringToNodeType(std::string const& typeStr) const
+    {
+        auto it = mStringToType.find(typeStr);
+        if (it != mStringToType.end())
+        {
+            return it->second;
+        }
+        TLLM_CHECK_WITH_INFO(false, "Unknown NodeType string '%s'", typeStr.c_str());
+        return NodeType::kCHATBOT;
+    }
+
+    std::shared_ptr<AgentTreeNode> createNode(NodeType type, SizeType32 level, std::shared_ptr<NodeParams> params) const
+    {
+        auto it = mCreators.find(type);
+        if (it != mCreators.end())
+        {
+            return it->second(level, params);
+        }
+        TLLM_CHECK_WITH_INFO(false, "No creator registered for node type: %d", static_cast<SizeType32>(type));
+        return nullptr;
+    }
+
+private:
+    std::unordered_map<std::string, NodeType> mStringToType;
+    std::unordered_map<NodeType, Creator> mCreators;
+};
+
+inline NodeType stringToNodeType(std::string const& typeStr)
+{
+    return NodeFactory::instance().stringToNodeType(typeStr);
+}
+
+inline std::vector<NodeType> convertAgentTypes(std::optional<std::vector<std::string>> const& agentTypes)
+{
+    if (!agentTypes.has_value())
+    {
+        return {};
+    }
+
+    std::vector<NodeType> result;
+    result.reserve(agentTypes->size());
+
+    for (auto const& typeStr : agentTypes.value())
+    {
+        result.emplace_back(stringToNodeType(typeStr));
+    }
+
+    return result;
+}
+
+class NodeParams
+{
+public:
+    virtual ~NodeParams() = default;
+};
+
+class AgentChatbotNodeParams : public NodeParams
+{
+public:
+    AgentChatbotNodeParams(float agentRatio, std::vector<NodeType> const& childNodeTypes)
+        : mAgentRatio(agentRatio)
+        , mChildNodeTypes(childNodeTypes)
+    {
+        TLLM_CHECK_WITH_INFO(agentRatio >= 0.0f && agentRatio <= 1.0f, "Invalid agent ratio: %f", agentRatio);
+    }
+
+    [[nodiscard]] float getAgentRatio() const noexcept
+    {
+        return mAgentRatio;
+    }
+
+    [[nodiscard]] std::vector<NodeType> const& getChildNodeTypes() const noexcept
+    {
+        return mChildNodeTypes;
+    }
+
+private:
+    float mAgentRatio;
+    std::vector<NodeType> mChildNodeTypes;
+};
+
+class AgentTreeNode
+{
+public:
+    using NodePtr = std::shared_ptr<AgentTreeNode>;
+    using NodeMap = std::unordered_map<NodeType, NodePtr>;
+
+    explicit AgentTreeNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr)
+        : mLevel(level)
+        , mMaxRequests(std::numeric_limits<SizeType32>::max())
+    {
+    }
+
+    virtual ~AgentTreeNode() = default;
+
+    [[nodiscard]] RequestVector getRequests();
+
+    void insertRequest(LlmRequestPtr const& request);
+
+    void clear();
+
+    [[nodiscard]] SizeType32 getLevel() const noexcept
+    {
+        return mLevel;
+    }
+
+    void setMaxRequests(SizeType32 maxRequests) noexcept
+    {
+        mMaxRequests = maxRequests;
+    }
+
+    [[nodiscard]] SizeType32 getMaxRequests() const noexcept
+    {
+        return mMaxRequests;
+    }
+
+protected:
+    [[nodiscard]] virtual RequestVector mergeNodesSequence(
+        std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs)
+        = 0;
+
+    [[nodiscard]] virtual std::shared_ptr<NodeParams> getChildNodeParams(
+        NodeType childNodeType, std::shared_ptr<NodeParams> const& nodeParams);
+
+    NodeMap mTypeToChild;
+    RequestVector mReqs;
+    SizeType32 mLevel;
+    SizeType32 mMaxRequests;
+};
+
+class AgentChatbotNode : public AgentTreeNode
+{
+public:
+    explicit AgentChatbotNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams);
+
+protected:
+    [[nodiscard]] RequestVector mergeNodesSequence(
+        std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs) override;
+
+    [[nodiscard]] std::shared_ptr<NodeParams> getChildNodeParams(
+        NodeType childNodeType, std::shared_ptr<NodeParams> const& nodeParams) override;
+
+private:
+    [[nodiscard]] static RequestVector mergeRequestsByReqId(std::vector<RequestVector const*> const& reqVectors);
+
+    [[nodiscard]] static RequestVector mixRequestsByRatio(
+        RequestVector const& primary, RequestVector const& secondary, float primaryRatio);
+
+    float mAgentRatio;
+};
+
+class AgentLatencyNode : public AgentTreeNode
+{
+public:
+    explicit AgentLatencyNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
+
+protected:
+    [[nodiscard]] RequestVector mergeNodesSequence(
+        std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs) override;
+};
+
+class AgentDeepResearchNode : public AgentTreeNode
+{
+public:
+    explicit AgentDeepResearchNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
+
+protected:
+    [[nodiscard]] RequestVector mergeNodesSequence(
+        std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs) override;
+};
+
+class ChatbotNode : public AgentTreeNode
+{
+public:
+    explicit ChatbotNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
+
+protected:
+    [[nodiscard]] RequestVector mergeNodesSequence(
+        std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs) override;
+};
+
+[[nodiscard]] std::shared_ptr<AgentTreeNode> createNode(
+    NodeType nodeType, SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
+
+[[nodiscard]] std::shared_ptr<AgentTreeNode> createAgentTreeRoot(
+    std::optional<batch_scheduler::AgentTreeConfig> const& agentTreeConfig);
+
+/// @brief Sort requests by agent tree hierarchy and truncate to (maxRequests - reservedCount) limit.
+/// @param root The agent tree root node.
+/// @param requests The requests to sort (should only contain non-generation requests).
+/// @param reservedCount The number of requests already reserved (e.g., generation requests
+///        that must be scheduled). The truncation limit will be (maxRequests - reservedCount).
+/// @note This function should only be called with non-generation requests.
+///       Generation requests (isGenerationInProgressState) must always be scheduled
+///       and should not be subject to truncation in overlap scheduler mode.
+[[nodiscard]] RequestVector sortAndTruncateRequestsByAgentTree(
+    std::shared_ptr<AgentTreeNode> const& root, RequestVector const& requests, SizeType32 reservedCount);
+
+[[nodiscard]] SizeType32 getLevelNum(LlmRequestPtr const& request);
+
+[[nodiscard]] NodeType getNodeType(LlmRequestPtr const& request, SizeType32 level);
+
+[[nodiscard]] SizeType32 getNodeId(LlmRequestPtr const& request, SizeType32 level);
+
+// Auto-registration macro: call this in .cpp after all class definitions
+// Usage: REGISTER_NODE_TYPE(ChatbotNode, NodeType::kCHATBOT, "chatbot")
+#define REGISTER_NODE_TYPE(ClassName, EnumType, StringName)                                                            \
+    namespace                                                                                                          \
+    {                                                                                                                  \
+    struct ClassName##Registrar                                                                                        \
+    {                                                                                                                  \
+        ClassName##Registrar()                                                                                         \
+        {                                                                                                              \
+            NodeFactory::instance().registerNode(StringName, EnumType,                                                 \
+                [](SizeType32 level, std::shared_ptr<NodeParams> params) -> std::shared_ptr<AgentTreeNode>             \
+                { return std::make_shared<ClassName>(level, params); });                                               \
+        }                                                                                                              \
+    };                                                                                                                 \
+    static ClassName##Registrar g_##ClassName##_registrar;                                                             \
+    }
+
+/// @brief Resort policy that uses agent tree hierarchy to sort and truncate requests.
+/// This policy partitions requests into generation and non-generation requests,
+/// sorts/truncates non-generation requests using the agent tree, then combines them.
+class AgentTreePolicy : public ResortPolicy
+{
+public:
+    /// @brief Constructs an AgentTreePolicy with the given agent tree configuration.
+    /// @param agentTreeConfig The configuration for creating the agent tree root.
+    explicit AgentTreePolicy(std::optional<batch_scheduler::AgentTreeConfig> agentTreeConfig);
+
+    /// @brief Reorders requests by partitioning generation requests first,
+    ///        then sorting/truncating non-generation requests using the agent tree.
+    /// @param requests The vector of requests to be reordered.
+    /// @return The reordered vector of requests.
+    [[nodiscard]] RequestVector resortRequests(RequestVector const& requests) const override;
+
+private:
+    std::optional<batch_scheduler::AgentTreeConfig> mAgentTreeConfig;
+    std::shared_ptr<AgentTreeNode> mAgentTreeRoot;
+};
+
+} // namespace agent_tree
+} // namespace tensorrt_llm::batch_manager

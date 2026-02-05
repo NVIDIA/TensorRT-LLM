@@ -3,6 +3,7 @@ import datetime
 import functools
 import os
 import pickle  # nosec B403
+import queue
 import threading
 import time
 import traceback
@@ -33,6 +34,8 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.executor.request import (KVCacheHintRequest,
+                                           TruncateKVCacheRequest)
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -462,6 +465,9 @@ class PyExecutor:
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
 
+        # Control queue for the executor loop
+        self.control_queue: queue.Queue[KVCacheHintRequest] = queue.Queue()
+
         self.stats_lock = threading.Lock()
         self.stats = []
         self.gather_all_responses = False
@@ -716,6 +722,9 @@ class PyExecutor:
             with self.response_cv:
                 self.result_wait_queues[req_id] = result_wait_queue
         return req_id
+
+    def enqueue_kv_cache_hint_request(self, request: KVCacheHintRequest):
+        self.control_queue.put(request)
 
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
@@ -1528,6 +1537,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                self._sync_and_process_control_queue()
+
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
 
@@ -1675,6 +1686,35 @@ class PyExecutor:
             self.control_action_done.wait()
             self.control_action_done.clear()
 
+    def _sync_and_process_control_queue(self):
+        """
+        Synchronizes and processes control queue items across all ranks.
+
+        This method ensures that control queue items (like TruncateKVCacheRequest)
+        are broadcast from rank 0 to all other ranks, so that all ranks execute
+        the same control operations for consistency (e.g., KV cache truncation).
+        """
+        # Rank 0 collects items from the control queue
+        if self.dist.rank == 0:
+            control_requests = []
+            while self.control_queue.qsize() > 0:
+                request = self.control_queue.get_nowait()
+                if request is not None:
+                    control_requests.append(request)
+        else:
+            control_requests = None
+
+        # Broadcast control requests to all ranks
+        control_requests = self.dist.broadcast(control_requests, root=0)
+
+        # All ranks process the control requests
+        for request in control_requests:
+            if isinstance(request, TruncateKVCacheRequest):
+                self.kv_cache_manager.truncate_blocks(
+                    request.messages, len(request.messages_to_retain))
+            else:
+                raise ValueError(f"Invalid request type: {type(request)}.")
+
     @contextmanager
     def control_action(self):
         """
@@ -1717,6 +1757,8 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                self._sync_and_process_control_queue()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()

@@ -22,9 +22,10 @@ class ScaffoldingRequest:
 class ScaffoldingLlm:
 
     def __init__(
-            self,
-            prototype_controller: Controller,
-            workers: Mapping[str, Worker],  # map of role to worker instance
+        self,
+        prototype_controller: Controller,
+        workers: Mapping[str, Worker],  # map of role to worker instance,
+        max_parallel_requests: int = 64,
     ):
         self.prototype_controller = prototype_controller
         self.workers = workers
@@ -41,7 +42,7 @@ class ScaffoldingLlm:
 
         # For top scheduler
         self.running_req_count = 0
-        self.max_parallel_requests = 64
+        self.max_parallel_requests = max_parallel_requests
         self.pending_queue = deque()
 
         self.output_task_collection = False
@@ -221,6 +222,8 @@ class ScaffoldingLlm:
         async def stop_task_on_loop():
             await self.task_queue.put(None)
             await self.main_loop_stop_event.wait()
+            for worker in self.workers.values():
+                await worker.async_shutdown()
 
         asyncio.run_coroutine_threadsafe(stop_task_on_loop(), self.loop)
 
