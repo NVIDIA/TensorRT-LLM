@@ -95,17 +95,6 @@ int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, i
 namespace state_specific_detail
 {
 
-// ============ Context Parallelism ============
-inline SizeType32 getContextParallelism(kv_cache::CacheState::ParallelConfig const& config)
-{
-    return config.mContextParallelism;
-}
-
-inline SizeType32 getContextParallelism(rnn_cache::RnnCacheState::ParallelConfig const&)
-{
-    return 1; // RNN has no CP
-}
-
 // ============ Layer Num Per PP ============
 inline std::vector<SizeType32> const& getLayerNumPerPP(kv_cache::CacheState::ParallelConfig const& config)
 {
@@ -142,8 +131,8 @@ TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheSta
     auto const selfPPNum = selfParConfig.mPipelineParallelism;
     auto const peerTPNum = peerParConfig.mTensorParallelism;
     auto const selfTPNum = selfParConfig.mTensorParallelism;
-    auto const peerCPNum = state_specific_detail::getContextParallelism(peerParConfig);
-    auto const selfCPNum = state_specific_detail::getContextParallelism(selfParConfig);
+    auto const peerCPNum = peerParConfig.mContextParallelism;
+    auto const selfCPNum = selfParConfig.mContextParallelism;
 
     auto const selfCPRank = selfRank % selfCPNum;
     auto const selfTPRank = (selfRank % (selfTPNum * selfCPNum)) / selfCPNum;

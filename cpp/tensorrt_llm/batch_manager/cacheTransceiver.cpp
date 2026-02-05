@@ -453,7 +453,6 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     }
 
     // Handle KV cache size separately - gather all sizes to the leader rank
-    // TODO(shreyasm)
     std::size_t localKVCacheSize = request->getKvCacheSize();
     std::vector<std::size_t> allKVCacheSizes(worldSize, 0);
 

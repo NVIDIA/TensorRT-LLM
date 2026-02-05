@@ -2312,7 +2312,7 @@ TEST(targetTest, CacheStateContextDP)
             tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
             genEnableDP, generationDPRank, genTP};
 
-        auto const contextTragetInfo
+        auto const contextTargetInfo
             = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
@@ -2419,7 +2419,7 @@ TEST(targetTest, CacheStateContextDP)
             tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
             genEnableDP, generationDPRank, genTP};
 
-        auto const contextTragetInfo
+        auto const contextTargetInfo
             = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, generationRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);

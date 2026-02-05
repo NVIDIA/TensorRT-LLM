@@ -162,7 +162,6 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto convStates = mRnnStateManager->getConvStates(); // [numLocalLayers, maxBatchSize, convDim, dConv-1]
     auto ssmStates = mRnnStateManager->getSsmStates();   // [numLocalLayers, maxBatchSize, numHeads, headDim, dState]
 
-    // Check if loop over targetNum is needed
     inputConvBlocks.push_back(convStates);
     inputSsmBlocks.push_back(ssmStates);
 
@@ -296,7 +295,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
     for (size_t i = 0; i < sourceNum; i++)
     {
-        SizeType32 layersFromSource = sourceInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(i));
+        SizeType32 layersFromSource = sourceInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(localRankIndices[i]));
         bufferSizesPerSource[i] = layersFromSource * (convBytesPerLayer + ssmBytesPerLayer) / validTpSources;
     }
 
@@ -454,7 +453,6 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
 bool RnnCacheFormatter::inquireSupport(RnnCacheState const& selfConfig, RnnCacheState const& destConfig) const
 {
-    // TODO: check for same dimensions across all layers
     if (selfConfig.getConvStateDataType() != destConfig.getConvStateDataType())
     {
         TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: conv state data type mismatch (self=%d, dest=%d)",
