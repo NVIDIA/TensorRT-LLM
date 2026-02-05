@@ -140,7 +140,7 @@ class TransformConfig(BaseModel):
         description="The stage of the transformation pipeline where this transform should run.",
     )
 
-    ### OPTIONAL CONFIG ###########################################################################
+    ### OPTIONAL CONFIG TO CONFIGURE TRANSFORM BEHAVIOR ############################################
     run_per_gm: bool = Field(
         description="Whether to run the transform per graph (sub)module or on whole module.",
         default=True,
@@ -153,23 +153,9 @@ class TransformConfig(BaseModel):
         default=False,
         description="Whether to skip the transform if an error occurs.",
     )
-
-    run_graph_cleanup: bool = Field(
-        default=True,
-        description="Whether to run graph cleanup/canonicalization after this transform.",
-    )
-    run_shape_prop: bool = Field(
+    expect_mem_change: bool = Field(
         default=False,
-        description="Whether to run shape propagation after this transform.",
-    )
-
-    requires_clean_graph: bool = Field(
-        default=True,
-        description="Whether this transform requires the graph to be clean before it is applied.",
-    )
-    requires_shape_prop: bool = Field(
-        default=False,
-        description="Whether this transform requires shape propagation before it is applied.",
+        description="Whether this transform is expected to cause changes in CUDA memory stats.",
     )
     debug_visualize_dir: Optional[str] = Field(
         default=None,
@@ -177,9 +163,37 @@ class TransformConfig(BaseModel):
         "or a path string to specify the output directory.",
     )
 
-    expect_mem_change: bool = Field(
+    ### OPTIONAL CONFIG TO CONFIGURE GRAPH CLEANUP AND SHAPE PROPAGATION BEFORE TRANSFORM ##########
+    pre_graph_cleanup: bool = Field(
+        default=True,
+        description="Whether this transform requires the graph to be clean before it is applied.",
+    )
+    pre_shape_prop: bool = Field(
         default=False,
-        description="Whether this transform is expected to cause changes in CUDA memory stats.",
+        description="Whether this transform requires shape propagation before it is applied."
+        "Note that pre_shape_prop=True implies pre_graph_cleanup=True since it is required.",
+    )
+    pre_recompile_forward: bool = Field(
+        default=False,
+        description="Whether this transform requires forward() to be callable. "
+        "If True, ensures recompile is run before the transform. "
+        "Note that pre_recompile_forward=True implies pre_graph_cleanup=True since it is required.",
+    )
+
+    ### OPTIONAL CONFIG TO CONFIGURE GRAPH CLEANUP AND SHAPE PROPAGATION AFTER TRANSFORM ###########
+    post_graph_cleanup: bool = Field(
+        default=True,
+        description="Whether to run graph cleanup/canonicalization AFTER this transform.",
+    )
+    post_shape_prop: bool = Field(
+        default=False,
+        description="Whether to run shape propagation AFTER this transform."
+        "Note that post_shape_prop=True implies post_graph_cleanup=True since it is required.",
+    )
+    post_recompile_forward: bool = Field(
+        default=False,
+        description="Whether to run recompile AFTER this transform to sync forward() with graph."
+        "Note that post_recompile_forward=True implies post_graph_cleanup=True since it is required.",
     )
 
 
@@ -217,6 +231,11 @@ class TransformInfo(BaseModel):
         "information of the graph. In other words, the transform does not change the shapes of the "
         "tensors in the graph and it preserves the has_valid_shapes flag of the last transform.",
     )
+    is_recompiled: bool = Field(
+        default=False,
+        description="Whether the module forward code is synced with the graph. "
+        "Only True after recompile() has been called since the last graph modification.",
+    )
 
     @classmethod
     def from_last_info(cls, info: "TransformInfo") -> "TransformInfo":
@@ -224,6 +243,7 @@ class TransformInfo(BaseModel):
         return cls(
             is_clean=info.is_clean,
             has_valid_shapes=info.has_valid_shapes,
+            is_recompiled=info.is_recompiled,
         )
 
     def __or__(self, other: "TransformInfo") -> "TransformInfo":
@@ -233,6 +253,7 @@ class TransformInfo(BaseModel):
             num_matches=self.num_matches + other.num_matches,
             is_clean=self.is_clean or other.is_clean,
             has_valid_shapes=self.has_valid_shapes or other.has_valid_shapes,
+            is_recompiled=self.is_recompiled or other.is_recompiled,
         )
 
     def __and__(self, other: "TransformInfo") -> "TransformInfo":
@@ -242,6 +263,7 @@ class TransformInfo(BaseModel):
             num_matches=self.num_matches + other.num_matches,
             is_clean=self.is_clean and other.is_clean,
             has_valid_shapes=self.has_valid_shapes and other.has_valid_shapes,
+            is_recompiled=self.is_recompiled and other.is_recompiled,
         )
 
     # implement + addition operator for TransformInfo
@@ -411,11 +433,12 @@ class BaseTransform(ABC):
             elapsed_time_pre_cleanup = -time.time()
             info = info | self._run_cleanup(
                 mod,
-                self.config.requires_clean_graph,
-                self.config.requires_shape_prop,
+                self.config.pre_graph_cleanup,
+                self.config.pre_shape_prop,
+                self.config.pre_recompile_forward,
                 info.is_clean,
                 info.has_valid_shapes,
-                phase="pre",
+                info.is_recompiled,
             )
             elapsed_time_pre_cleanup += time.time()
 
@@ -447,11 +470,12 @@ class BaseTransform(ABC):
             elapsed_time_post_cleanup = -time.time()
             info = info | self._run_cleanup(
                 mod,
-                self.config.run_graph_cleanup,
-                self.config.run_shape_prop,
+                self.config.post_graph_cleanup,
+                self.config.post_shape_prop,
+                self.config.post_recompile_forward,
                 info.is_clean,
                 info.has_valid_shapes,
-                phase="post",
+                info.is_recompiled,
             )
             elapsed_time_post_cleanup += time.time()
 
@@ -714,42 +738,49 @@ class BaseTransform(ABC):
         mod: nn.Module,
         clean_graph: bool,
         clean_shape: bool,
+        needs_recompile: bool,
         is_clean: bool,
         has_valid_shapes: bool,
-        phase: str,
+        is_recompiled: bool,
     ) -> TransformInfo:
-        """Run graph cleanup before or after the transform.
+        """Run graph cleanup before/after the transform.
 
         Args:
             mod: The model to run cleanup on.
             clean_graph: Whether we want a clean graph after the transform.
             clean_shape: Whether we want clean shapes after the transform.
+            needs_recompile: Whether we need recompile to sync forward() with graph.
             is_clean: The current cleanup status.
             has_valid_shapes: The current shape propagation status.
-            phase: The phase of cleanup ("pre" or "post").
+            is_recompiled: Whether the module forward code is currently synced with graph.
 
         Returns:
             An info object indicating the cleanup status after this function is called.
         """
+        # Determine if we actually need to run recompile
+        run_recompile = needs_recompile and not is_recompiled
+
         # check if run cleanup depending on the config and info
         if clean_shape and not (is_clean and has_valid_shapes):
-            self._log_cleanup_status(phase, "ran", "graph canonicalization + shape_prop")
-            canonicalize_graph(mod)
+            self._log_info(f"running graph cleanup (with shape_prop, recompile={run_recompile})")
+            canonicalize_graph(mod, run_recompile=run_recompile)
             with lift_to_meta(mod) if placeholders_on_meta(mod) else nullcontext():
                 run_shape_prop(mod)
             is_clean = True
             has_valid_shapes = True
-        elif clean_graph and not is_clean:
-            self._log_cleanup_status(phase, "ran", "graph canonicalization")
-            canonicalize_graph(mod)
+            if run_recompile:
+                is_recompiled = True
+        elif (clean_graph and not is_clean) or run_recompile:
+            self._log_info(f"running graph cleanup (no shape_prop, recompile={run_recompile})")
+            canonicalize_graph(mod, run_recompile=run_recompile)
             is_clean = True
             has_valid_shapes = False
-        elif not clean_graph and not clean_shape:
-            self._log_cleanup_status(phase, "skipped", "disabled")
-        else:
-            self._log_cleanup_status(phase, "skipped", "graph already clean")
+            if run_recompile:
+                is_recompiled = True
 
-        return TransformInfo(is_clean=is_clean, has_valid_shapes=has_valid_shapes)
+        return TransformInfo(
+            is_clean=is_clean, has_valid_shapes=has_valid_shapes, is_recompiled=is_recompiled
+        )
 
     def _apply(
         self,

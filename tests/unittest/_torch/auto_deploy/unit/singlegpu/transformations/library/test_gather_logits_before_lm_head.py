@@ -204,6 +204,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
             "gather_logits_before_lm_head": {
                 "stage": "post_load_fusion",
                 "max_batch_size": max_batch_size,
+                "post_recompile_forward": True,
             }
         }
         optimizer = InferenceOptimizer(None, transform_config)
@@ -264,6 +265,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
             "gather_logits_before_lm_head": {
                 "stage": "post_load_fusion",
                 "max_batch_size": max_batch_size,
+                "post_recompile_forward": True,
             }
         }
         optimizer = InferenceOptimizer(None, transform_config)

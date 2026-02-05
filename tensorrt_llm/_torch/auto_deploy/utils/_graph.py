@@ -249,12 +249,13 @@ def lint(gm: GraphModule) -> None:
     gm.graph.lint()
 
 
-def _canonicalize_single_gm(gm: GraphModule) -> None:
+def _canonicalize_single_gm(gm: GraphModule, run_recompile: bool = True) -> None:
     # clean up graph (needs to be done repeatedly until no more dead code)
     eliminate_dead_code(gm, is_impure_node=_is_impure_node)
 
-    # recompile to propagate all graph changes to the graph module
-    recompile(gm)
+    # recompile to propagate all graph changes to the graph module (optional)
+    if run_recompile:
+        recompile(gm)
 
     # clean up graph module
     delete_all_unused_submodules(gm)
@@ -263,18 +264,18 @@ def _canonicalize_single_gm(gm: GraphModule) -> None:
     lint(gm)
 
 
-def canonicalize_graph(mod: nn.Module) -> None:
+def canonicalize_graph(mod: nn.Module, run_recompile: bool = True) -> None:
     """Canonicalize the graph of the given GraphModule.
 
     Args:
         mod: The model containing GraphModules to canonicalize.
-    Returns:
-        The canonicalized (cleaned-up) model.
+        run_recompile: If True, run recompile to sync forward() with graph.
+                       If False, skip recompile (forward() may be stale).
     """
     ad_logger.debug(f"Before canonicalizing: {mod}")
 
     for _, subgm in reversed(list(named_graphmodules(mod))):
-        _canonicalize_single_gm(subgm)
+        _canonicalize_single_gm(subgm, run_recompile=run_recompile)
 
     ad_logger.debug(f"After canonicalizing: {mod}")
 
@@ -370,9 +371,13 @@ def add_graph_input(
     else:
         assert in_spec_for_args.type is tuple
 
+    # get all placeholder nodes and check that the name is not already used
+    placeholder_nodes = graph.find_nodes(op="placeholder", sort=True)
+    if any(node.target == name for node in placeholder_nodes):
+        raise ValueError(f"Placeholder name {name} already exists")
+
     # insert input node after currently last input node
-    node_last_input = graph.find_nodes(op="placeholder", sort=True)[-1]
-    with graph.inserting_after(node_last_input):
+    with graph.inserting_after(placeholder_nodes[-1]):
         in_node = graph.placeholder(name)
         in_spec_for_args.children_specs.append(_LEAF_SPEC)
         orig_args.append(name)

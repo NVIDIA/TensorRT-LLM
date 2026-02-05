@@ -317,6 +317,7 @@ def test_moe_matching(quant_type, expected_op, atol, rtol):
                 },
                 "match_nvfp4_moe_pattern": {
                     "stage": "pattern_matcher",
+                    "post_recompile_forward": True,
                 },
             },
         )(None, gm)
@@ -344,6 +345,7 @@ def test_moe_fusion():
         {
             "fuse_moe": {
                 "stage": "post_load_fusion",
+                "post_recompile_forward": True,
             },
         },
     )(None, gm)
@@ -401,8 +403,8 @@ def test_fuse_moe_cleanup():
         {
             "fuse_moe": {
                 "stage": "post_load_fusion",
-                "run_graph_cleanup": False,  # verify cleanup is done as part of the transformation
-                "run_shape_prop": False,  # shape_prop can also trigger cleanup
+                "post_graph_cleanup": False,  # verify cleanup is done as part of the transformation
+                "post_shape_prop": False,  # shape_prop can also trigger cleanup
             },
         },
     )(None, gm)
@@ -636,6 +638,7 @@ def test_nvfp4_moe_fusion(is_gated_mlp, hidden_size, intermediate_size):
         {
             "fuse_nvfp4_moe": {
                 "stage": "post_load_fusion",
+                "post_recompile_forward": True,
             },
         },
     )(None, gm)

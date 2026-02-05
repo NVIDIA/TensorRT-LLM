@@ -72,6 +72,7 @@ def test_quantize_moe_transformation(quant_algo, expected_op):
             },
             "quantize_nvfp4_moe": {
                 "stage": "pattern_matcher",
+                "post_recompile_forward": True,
             },
         },
     )(None, gm)
