@@ -6,12 +6,11 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import (Any, Callable, Dict, List, Optional, Tuple, Type, Union,
-                    get_args, get_origin)
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import transformers
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from tqdm import tqdm
 
 from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
@@ -31,10 +30,9 @@ from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 # yapf: disable
-from .llm_args import (BaseLlmArgs, CalibConfig, CudaGraphConfig,
-                       DraftTargetDecodingConfig, Eagle3DecodingConfig,
-                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
-                       LookaheadDecodingConfig, MedusaDecodingConfig,
+from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
+                       Eagle3DecodingConfig, EagleDecodingConfig, KvCacheConfig,
+                       LlmArgs, LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
                        TorchLlmArgs, UserProvidedDecodingConfig,
                        _ModelFormatKind, _ModelWrapper, _ParallelConfig,
@@ -493,9 +491,6 @@ class ModelLoader:
             model_defaults = model_cls.get_model_defaults(self.llm_args)
 
             if model_defaults:
-                model_defaults = validate_model_defaults(
-                    model_defaults, self.llm_args)
-
                 applied_defaults = apply_model_defaults_to_llm_args(
                     self.llm_args, model_defaults)
                 if applied_defaults:
@@ -1004,208 +999,80 @@ __all__ = [
     'Eagle3DecodingConfig',
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',
-    'extract_llm_args_overrides',
-    'validate_model_defaults',
     'apply_model_defaults_to_llm_args',
-    'merge_llm_configs_with_defaults',
     'compute_applied_llm_defaults',
 ]
 
 
-def extract_llm_args_overrides(
-        llm_args: Union[Dict[str, Any], 'BaseLlmArgs']) -> Dict[str, Any]:
-    """Extract user-provided overrides from a Pydantic model or dict."""
-    if isinstance(llm_args, dict):
-        return llm_args
+def _deep_merge(base: Dict[str, Any], *overlays: Dict[str,
+                                                      Any]) -> Dict[str, Any]:
+    """Deep merge multiple dictionaries with right-side precedence."""
+    result = base.copy()
 
-    fields_set = getattr(llm_args, "model_fields_set", None)
-    if fields_set is None:
-        return {}
+    for overlay in overlays:
+        if not overlay:
+            continue
 
-    overrides = {}
-    for field in fields_set:
-        value = getattr(llm_args, field)
-        if isinstance(value, BaseModel):
-            nested = extract_llm_args_overrides(value)
-            overrides[field] = nested
-        else:
-            overrides[field] = value
-    return overrides
+        for key, value in overlay.items():
+            if key in result and isinstance(result[key], dict) and isinstance(
+                    value, dict):
+                result[key] = _deep_merge(result[key], value)
+            else:
+                result[key] = value
 
-
-def validate_model_defaults(defaults_dict: Dict, llm_args: BaseLlmArgs) -> Dict:
-    """Validate model defaults against LlmArgs schema using setattr.
-
-    Uses Pydantic's built-in validation when setting attributes.
-    Returns the validated defaults dict.
-
-    Args:
-        defaults_dict: Dictionary of model-specific defaults to validate
-        llm_args: The LlmArgs instance to validate against
-
-    Returns:
-        The validated defaults dictionary
-
-    Raises:
-        ValueError: If any field name is invalid or value has wrong type
-    """
-    if not defaults_dict:
-        return defaults_dict
-
-    # Create a temporary copy to test validation
-    temp_args = llm_args.model_copy(deep=True)
-
-    for key, value in defaults_dict.items():
-        try:
-            # This triggers Pydantic validation!
-            setattr(temp_args, key, value)
-        except (ValidationError, AttributeError) as e:
-            raise ValueError(
-                f"Invalid model default field '{key}' with value {value}. Error: {e}"
-            ) from e
-
-    return defaults_dict
+    return result
 
 
 def apply_model_defaults_to_llm_args(
-        llm_args: 'BaseLlmArgs', model_defaults: Dict[str,
-                                                      Any]) -> Dict[str, Any]:
+        llm_args: 'TorchLlmArgs',
+        model_defaults_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Apply model defaults to a Pydantic LlmArgs instance.
 
     Returns the defaults that were actually applied.
     """
     if getattr(llm_args, "_model_defaults_applied", False):
         return {}
-    if not model_defaults:
+
+    if not model_defaults_dict:
         return {}
 
-    llm_args_dict = llm_args.model_dump()
-    user_overrides = extract_llm_args_overrides(llm_args)
-    merged_args = merge_llm_configs_with_defaults(llm_args_dict,
-                                                  model_defaults,
-                                                  user_overrides=user_overrides,
-                                                  llm_args_class=type(llm_args))
+    user_overrides = llm_args.model_dump(exclude_unset=True)
+    base_state = llm_args.model_dump()
+    merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
 
-    for key in model_defaults:
-        if key in merged_args:
-            try:
-                setattr(llm_args, key, merged_args[key])
-            except AttributeError:
-                logger.warning(
-                    f"Cannot set attribute {key} on {type(llm_args).__name__}")
+    llm_args_class = type(llm_args)
+    new_args = llm_args_class(**merged_state)
 
-    applied = compute_applied_llm_defaults(model_defaults, user_overrides)
+    for field_name in llm_args.model_fields:
+        setattr(llm_args, field_name, getattr(new_args, field_name))
+
     llm_args._model_defaults_applied = True
-    return applied
+    applied_defaults = compute_applied_llm_defaults(model_defaults_dict,
+                                                    user_overrides)
 
+    logger.debug(f"Applied model defaults: {applied_defaults}")
 
-def _get_pydantic_config_fields(
-        llm_args_class: Type[BaseModel]) -> Dict[str, Type]:
-    """Dynamically discover all Pydantic BaseModel fields nested in an LlmArgs class."""
-    config_fields = {}
-
-    for field_name, field_info in llm_args_class.model_fields.items():
-        field_type = field_info.annotation
-
-        # Handle Optional[Type] and Type | None
-        origin = get_origin(field_type)
-        if origin is Union or (
-                origin is not None
-                and str(origin).startswith("<class 'types.UnionType'>")):
-            args = get_args(field_type)
-            non_none_types = [arg for arg in args if arg is not type(None)]
-            if non_none_types:
-                field_type = non_none_types[0]
-
-        if isinstance(field_type, type) and issubclass(field_type, BaseModel):
-            config_fields[field_name] = field_type
-
-    return config_fields
-
-
-def merge_llm_configs_with_defaults(
-    llm_args: Dict[str, Any],
-    model_defaults: Dict[str, Any],
-    user_overrides: Optional[Dict[str, Any]] = None,
-    llm_args_class: Optional[Type['BaseLlmArgs']] = None,
-) -> Dict[str, Any]:
-    """Merge model-specific defaults into llm_args using Pydantic.
-
-    Args:
-        llm_args: Configuration dict that may contain mixed types
-        model_defaults: Model-specific defaults to apply
-        user_overrides: User-provided overrides that prevent defaults
-        llm_args_class: The LlmArgs class to use for field discovery (defaults to TorchLlmArgs)
-
-    Returns:
-        Merged configuration dict with Pydantic validation applied
-    """
-    if llm_args_class is None:
-        llm_args_class = TorchLlmArgs
-    config_classes = _get_pydantic_config_fields(llm_args_class)
-
-    if user_overrides is None:
-        user_overrides = llm_args if isinstance(llm_args, dict) else {}
-    else:
-        user_overrides = user_overrides or {}
-    for key, default_value in model_defaults.items():
-        if key in config_classes:
-            config_class = config_classes[key]
-
-            existing = llm_args.get(key, {})
-            if isinstance(existing, BaseModel):
-                existing = existing.model_dump()
-            elif not isinstance(existing, dict):
-                logger.warning(
-                    f"Skipping model default for {key}: existing value {type(existing).__name__} "
-                    f"is not a dict or Pydantic model")
-                continue
-
-            override_value = user_overrides.get(key, {})
-            if isinstance(override_value, BaseModel):
-                override_value = override_value.model_dump(exclude_unset=True)
-            if not isinstance(override_value, dict):
-                logger.warning(
-                    f"Invalid override type for {key}: expected dict or Pydantic model, "
-                    f"got {type(override_value).__name__}")
-                override_value = {}
-
-            merged = existing.copy()
-            for sub_key, sub_default in default_value.items():
-                if sub_key not in override_value:
-                    merged[sub_key] = sub_default
-            llm_args[key] = config_class.model_validate(merged)
-        else:
-            if key not in user_overrides:
-                llm_args[key] = default_value
-
-    return llm_args
+    return applied_defaults
 
 
 def compute_applied_llm_defaults(
-        model_defaults: Dict[str, Any],
+        model_defaults_dict: Dict[str, Any],
         user_overrides: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the subset of model_defaults that will be applied."""
+    """Return the subset of model_defaults_dict that will be applied."""
+    applied = {}
 
-    def _compute(defaults: Dict, overrides: Dict) -> Dict:
-        applied = {}
-        overrides = overrides or {}
-        for key, default_value in defaults.items():
-            if isinstance(default_value, dict):
-                override_value = overrides.get(key) if isinstance(
-                    overrides, dict) else None
-                if isinstance(override_value, BaseModel):
-                    override_value = override_value.model_dump(
-                        exclude_unset=True)
-                if isinstance(override_value, dict):
-                    nested = _compute(default_value, override_value)
-                    if nested:
-                        applied[key] = nested
-                else:
-                    applied[key] = default_value
-            else:
-                if not isinstance(overrides, dict) or key not in overrides:
-                    applied[key] = default_value
-        return applied
+    for key, default_value in model_defaults_dict.items():
+        if isinstance(default_value, dict):
+            user_override = user_overrides.get(key, {})
+            if isinstance(user_override, dict):
+                nested_applied = compute_applied_llm_defaults(
+                    default_value, user_override)
+                if nested_applied:
+                    applied[key] = nested_applied
+            elif key not in user_overrides:
+                applied[key] = default_value
+        else:
+            if key not in user_overrides:
+                applied[key] = default_value
 
-    return _compute(model_defaults, user_overrides or {})
+    return applied

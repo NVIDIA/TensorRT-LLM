@@ -106,12 +106,17 @@ def is_non_default_or_required(param_name, value, backend):
     if value is None:
         return False
 
-    llm_args_class = TrtLlmArgs if backend == "tensorrt" else TorchLlmArgs
+    if backend == "tensorrt":
+        llm_args_class = TrtLlmArgs
+    elif backend == "_autodeploy":
+        from tensorrt_llm._torch.auto_deploy.llm_args import \
+            LlmArgs as AutoDeployLlmArgs
+        llm_args_class = AutoDeployLlmArgs
+    else:
+        llm_args_class = TorchLlmArgs
 
     field_info = llm_args_class.model_fields.get(param_name)
     if not field_info:
-        if param_name in {"fail_fast_on_attention_window_too_large"}:
-            return True
         return False
 
     default = field_info.default

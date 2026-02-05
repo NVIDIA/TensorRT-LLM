@@ -2075,12 +2075,6 @@ class BaseLlmArgs(StrictBaseModel):
         description="The format to load the model.",
         json_schema_extra={"type": "Literal['auto', 'dummy']"})
 
-    fail_fast_on_attention_window_too_large: bool = Field(
-        default=False,
-        description=
-        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
-        status="prototype")
-
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
@@ -2456,6 +2450,12 @@ class TrtLlmArgs(BaseLlmArgs):
 
     workspace: Optional[str] = Field(default=None,
                                      description="The workspace for the model.")
+
+    fail_fast_on_attention_window_too_large: bool = Field(
+        default=False,
+        description=
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
+        status="prototype")
 
     # Once set, the model will reuse the build_cache
     enable_build_cache: object = Field(

@@ -12,6 +12,8 @@ import torch
 from strenum import StrEnum
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    ModelLoader, _construct_checkpoint_loader)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,

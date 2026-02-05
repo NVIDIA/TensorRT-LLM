@@ -10,8 +10,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-from tensorrt_llm.llmapi.llm_utils import (apply_model_defaults_to_llm_args,
-                                           validate_model_defaults)
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -246,8 +245,6 @@ class ModelLoader:
         if model_cls and hasattr(model_cls, "get_model_defaults"):
             model_defaults = model_cls.get_model_defaults(llm_args)
             if model_defaults:
-                model_defaults = validate_model_defaults(
-                    model_defaults, llm_args)
                 applied_defaults = apply_model_defaults_to_llm_args(
                     llm_args, model_defaults)
                 if applied_defaults:
