@@ -369,6 +369,30 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-relax")
 endif()
 
+# ==== BOLT Compatible Flags ====
+# These flags enable LLVM BOLT binary compatible:
+# -fno-reorder-blocks-and-partition: Prevents compiler from splitting hot/cold
+# blocks -fno-plt: Removes PLT stubs for additional performance
+# -Wl,--emit-relocs (or -Wl,-q): Preserves relocation info for BOLT Note:
+# Binaries should NOT be stripped for BOLT to work Usage: cmake
+# -DENABLE_BOLT_COMPATIBLE=ON ...
+option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
+if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
+  message(STATUS "BOLT compatible flags enabled")
+  # Compiler flags for C/C++
+  set(CMAKE_C_FLAGS
+      "${CMAKE_C_FLAGS} -fno-reorder-blocks-and-partition -fno-plt")
+  set(CMAKE_CXX_FLAGS
+      "${CMAKE_CXX_FLAGS} -fno-reorder-blocks-and-partition -fno-plt")
+  # Linker flags - include MODULE for pybind11/nanobind Python bindings
+  set(CMAKE_SHARED_LINKER_FLAGS
+      "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--emit-relocs")
+  set(CMAKE_MODULE_LINKER_FLAGS
+      "${CMAKE_MODULE_LINKER_FLAGS} -Wl,--emit-relocs")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--emit-relocs")
+endif()
+# ==== End BOLT Compatible Flags ====
+
 # Disable deprecated declarations warnings
 if(NOT WIN32)
   set(CMAKE_CXX_FLAGS "-Wno-deprecated-declarations ${CMAKE_CXX_FLAGS}")
