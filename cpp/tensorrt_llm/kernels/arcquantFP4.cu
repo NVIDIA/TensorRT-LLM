@@ -37,6 +37,12 @@ __forceinline__ __device__ float local_abs_max(U* vec, float maxv)
     return maxv;
 }
 
+__forceinline__ __device__ int get_sf_offset(int row_id, int pos, int bdx)
+{
+    return (row_id % 32) * 16 + ((row_id / 32) % 4) * 4 + (row_id / 128) * (32 * 16 * bdx / 4) + (pos % 4) * 1
+        + (pos / 4) * 512;
+}
+
 struct PackFp4
 {
     int8_t low : 4;
@@ -53,7 +59,7 @@ template <typename T, int GROUP_SIZE>
 __global__ void reorder_activationn_nvfp4_kernel(
     T* hidden_states, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int KQ, int KE)
 {
-    int const hidden_dim = KQ + KE;
+    int const hidden_dim = KQ;
     int const bdx = hidden_dim / GROUP_SIZE;
     constexpr int elements_per_thread = GROUP_SIZE;
     cg::thread_block cta = cg::this_thread_block();
@@ -61,7 +67,7 @@ __global__ void reorder_activationn_nvfp4_kernel(
     cutlass::bfloat16_t* input = reinterpret_cast<cutlass::bfloat16_t*>(hidden_states);
     cutlass::float_ue4m3_t* q_scale_tensor = reinterpret_cast<cutlass::float_ue4m3_t*>(q_scale);
     // One block solves one row of hidden states.
-    __shared__ uint8_t smem[1024 * sizeof(cutlass::bfloat16_t)];
+    __shared__ uint8_t smem[4096 * sizeof(cutlass::bfloat16_t)];
     cutlass::bfloat16_t* input_smem = reinterpret_cast<cutlass::bfloat16_t*>(smem);
     // Local memory stores the reordered hidden states.
     cutlass::bfloat16_t input_frag[elements_per_thread];
@@ -115,7 +121,7 @@ __global__ void reorder_activationn_nvfp4_kernel(
     upper_bound = FP4_MAX;
     scale = clamp(maxv / FP4_MAX, SCALE_EPS, FP8_MAX);
     int pos = tid + max(0, tid - GROUP_NUM(KQ - KE));
-    // SF (((_32,_4),M/128),((_16,_4),K/4),(_1,1)):(((_16,_4),32*16*hidden_dim/4),((_0,_1),_512),(_0,total_padded))
+    // SF (((_32,_4),M/128),((_16,_4),K/4),(_1,1)):(((_16,_4),32*16*bdx/4),((_0,_1),_512),(_0,total_padded))
     // auto logical_coord0 = make_coord(make_coord(row_id % 32, (row_id / 32) % 4), row_id / 128);
     // auto logical_coord1 = make_coord(make_coord(0, pos % 4), pos / 4);
     // auto logical_coord2 = make_coord(0, 0);
@@ -123,7 +129,7 @@ __global__ void reorder_activationn_nvfp4_kernel(
     // q_scale_tensor(make_coord(logical_coord0, logical_coord1, logical_coord2)) = Float2Ue4m3(scale);
     int sf_offset = (row_id % 32) * 16 + ((row_id / 32) % 4) * 4 + (row_id / 128) * (32 * 16 * hidden_dim / 64);
     sf_offset += (pos % 4) * 1 + (pos / 4) * 512;
-    q_scale_tensor[0] = Float2Ue4m3(scale);
+    q_scale_tensor[sf_offset] = Float2Ue4m3(scale);
     // Use reverse scale to replace division by multiplication
     r_scale = 1.0 / Ue4m32Float(Float2Ue4m3(scale));
     // Quantize each thread's value
@@ -201,7 +207,7 @@ void run_reorder_activation_nvfp4(
     int16_t* hidden_states, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int seq_len, int KQ, int KE)
 {
     dim3 grids(seq_len);
-    int hidden_dim = KQ + KE;
+    int hidden_dim = KQ;
     dim3 blocks(hidden_dim / group_size);
     if (std::is_same_v<T, __nv_bfloat16>)
     {

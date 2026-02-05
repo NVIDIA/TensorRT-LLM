@@ -257,10 +257,10 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
                                         : tensorrt_llm::computeLinearLayoutSFSize(M, K / 16);
     auto SFX = at::detail::empty_cuda({SFSize}, SF_DTYPE, X.device(), std::nullopt);
 
-    auto ptr_X = X.data_ptr<int16_t>();
-    auto ptr_idx = reorder_index.data_ptr<int16_t>();
-    auto ptr_QX = QX.data_ptr<uint8_t>();
-    auto ptr_SFX = SFX.data_ptr<uint8_t>();
+    auto ptr_X = reinterpret_cast<int16_t*>(X.data_ptr());
+    auto ptr_idx = reinterpret_cast<int16_t*>(reorder_index.data_ptr());
+    auto ptr_QX = reinterpret_cast<uint8_t*>(QX.data_ptr());
+    auto ptr_SFX = reinterpret_cast<uint8_t*>(SFX.data_ptr());
     tensorrt_llm::kernels::run_reorder_activation_nvfp4<__nv_bfloat16, 16>(ptr_X, ptr_idx, ptr_QX, ptr_SFX, M, KQ, KE);
     return std::make_tuple(QX, SFX);
 }
