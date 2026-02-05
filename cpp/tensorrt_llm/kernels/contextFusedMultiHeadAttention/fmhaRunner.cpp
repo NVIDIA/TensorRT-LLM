@@ -389,9 +389,10 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     }
     // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
     // Only supports packed_qkv input + padding/causal mask.
+    // Does not support attention sinks.
     else if (isSm90 && !separateQKvInput && paddingOrCausalMask
         && (mFixedParams.headSize == 32 || mFixedParams.headSize == 64) && runnerParams.qSeqLen <= 256
-        && !common::getEnvForceDeterministicAttention())
+        && !common::getEnvForceDeterministicAttention() && runnerParams.attentionSinksPtr == nullptr)
     {
         mLaunchParams.flash_attention = false;
         // get max sequence length for non-flash-attention.
