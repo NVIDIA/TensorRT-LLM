@@ -200,6 +200,33 @@ struct SAFlatGraph
         return mNodes.at(nodeId).data;
     }
 
+    //! \brief Const version of edge lookup (read-only, never inserts)
+    SA_CUDA_CALLABLE NodeIndex const* at(NodeIndex nodeId, Key key) const
+    {
+        assert(nodeId < mNodes.size());
+
+        auto const& node = mNodes.at(nodeId);
+
+        if (node.mIsEmpty)
+        {
+            return nullptr;
+        }
+
+        if (node.mIsInlined)
+        {
+            if (node.mInlinedKey == key)
+            {
+                return &node.mInlinedNodeIndex;
+            }
+            return nullptr;
+        }
+
+        // Lookup in hashmap
+        typename Allocator::Ptr const& edgesPtr = node.edgesPtr;
+        HashMap const& edges = mAllocator.at(edgesPtr);
+        return edges.at(key);
+    }
+
     SA_CUDA_CALLABLE NodeData& pushBack()
     {
         return mNodes.pushBack(Node{}).data;

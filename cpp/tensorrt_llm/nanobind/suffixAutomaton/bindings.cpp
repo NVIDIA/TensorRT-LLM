@@ -48,6 +48,21 @@ struct SuffixAutomatonExtendParams
 };
 
 void invokeSuffixAutomatonExtend(SuffixAutomatonExtendParams const& params, cudaStream_t stream);
+
+struct SuffixAutomatonExtendNgramParams
+{
+    int batchSize{0};
+    int draftLength{0};
+    int maxNgramSize{-1};
+    SuffixAutomaton* slots{nullptr};
+    int const* batchIndices{nullptr};
+    int* matchLenOut{nullptr};
+    int* draftTokensOut{nullptr};
+    int const* acceptedTokensIn{nullptr};
+    int const* acceptedLensIn{nullptr};
+};
+
+void invokeSuffixAutomatonExtendNgram(SuffixAutomatonExtendNgramParams const& params, cudaStream_t stream);
 size_t getSuffixAutomatonStateSize();
 size_t getSuffixAutomatonMaxSlots();
 size_t getSuffixAutomatonMaxSeqLen();
@@ -100,6 +115,41 @@ void initBindings(nb::module_& m)
         nb::arg("batch_size"), nb::arg("draft_length"), nb::arg("slots"), nb::arg("batch_indices"),
         nb::arg("match_len_out"), nb::arg("draft_tokens_out"), nb::arg("accepted_tokens_in"),
         nb::arg("accepted_lens_in"), "Invoke suffix automaton extend CUDA kernel");
+
+    // Export the extend function with ngram support that invokes the CUDA kernel
+    m.def(
+        "invoke_extend_ngram",
+        [](int batchSize, int draftLength, int maxNgramSize, at::Tensor slots, at::Tensor batchIndices,
+            at::Tensor matchLenOut, at::Tensor draftTokensOut, at::Tensor acceptedTokensIn, at::Tensor acceptedLensIn)
+        {
+            // Validate inputs
+            TORCH_CHECK(slots.is_cuda(), "slots must be a CUDA tensor");
+            TORCH_CHECK(batchIndices.is_cuda(), "batchIndices must be a CUDA tensor");
+            TORCH_CHECK(matchLenOut.is_cuda(), "matchLenOut must be a CUDA tensor");
+            TORCH_CHECK(draftTokensOut.is_cuda(), "draftTokensOut must be a CUDA tensor");
+            TORCH_CHECK(acceptedTokensIn.is_cuda(), "acceptedTokensIn must be a CUDA tensor");
+            TORCH_CHECK(acceptedLensIn.is_cuda(), "acceptedLensIn must be a CUDA tensor");
+
+            sa::SuffixAutomatonExtendNgramParams params;
+            params.batchSize = batchSize;
+            params.draftLength = draftLength;
+            params.maxNgramSize = maxNgramSize;
+            params.slots = reinterpret_cast<sa::SuffixAutomaton*>(slots.data_ptr());
+            params.batchIndices = batchIndices.data_ptr<int>();
+            params.matchLenOut = matchLenOut.data_ptr<int>();
+            params.draftTokensOut = draftTokensOut.data_ptr<int>();
+            params.acceptedTokensIn = static_cast<int const*>(acceptedTokensIn.data_ptr<int>());
+            params.acceptedLensIn = static_cast<int const*>(acceptedLensIn.data_ptr<int>());
+
+            cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+            sa::invokeSuffixAutomatonExtendNgram(params, stream);
+        },
+        nb::arg("batch_size"), nb::arg("draft_length"), nb::arg("max_ngram_size"), nb::arg("slots"),
+        nb::arg("batch_indices"), nb::arg("match_len_out"), nb::arg("draft_tokens_out"),
+        nb::arg("accepted_tokens_in"), nb::arg("accepted_lens_in"),
+        "Invoke suffix automaton extend CUDA kernel with ngram support. "
+        "If max_ngram_size == -1, uses longest match. "
+        "If max_ngram_size > 0, tries ngram sizes from max down to 1.");
 
     // Helper function to allocate workspace for suffix automaton states
     m.def(

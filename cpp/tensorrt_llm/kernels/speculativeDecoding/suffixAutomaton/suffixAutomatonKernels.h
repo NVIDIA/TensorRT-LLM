@@ -82,6 +82,62 @@ struct SuffixAutomatonExtendParams
 //! \param stream The CUDA stream to run the kernel on
 void invokeSuffixAutomatonExtend(SuffixAutomatonExtendParams const& params, cudaStream_t stream);
 
+//! \brief Parameters for the suffix automaton extend kernel with ngram support
+struct SuffixAutomatonExtendNgramParams
+{
+    //! Number of sequences in the batch
+    int batchSize{0};
+
+    //! Number of draft tokens to generate per sequence
+    int draftLength{0};
+
+    //! Maximum ngram size for matching, or -1 for longest match mode
+    int maxNgramSize{-1};
+
+    //! Pointer to the suffix automaton states on GPU [maxSlots]
+    SuffixAutomaton* slots{nullptr};
+
+    //! Batch indices mapping external batch idx to workspace slot [batchSize]
+    int const* batchIndices{nullptr};
+
+    //! Output: match lengths for each sequence [batchSize]
+    int* matchLenOut{nullptr};
+
+    //! Output: draft tokens for each sequence [batchSize, draftLength]
+    int* draftTokensOut{nullptr};
+
+    //! Input: accepted tokens for each sequence [batchSize, draftLength + 1]
+    int const* acceptedTokensIn{nullptr};
+
+    //! Input: number of accepted tokens for each sequence [batchSize]
+    int const* acceptedLensIn{nullptr};
+
+    void checkParams() const
+    {
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(draftLength > 0);
+        TLLM_CHECK(slots != nullptr);
+        TLLM_CHECK(batchIndices != nullptr);
+        TLLM_CHECK(matchLenOut != nullptr);
+        TLLM_CHECK(draftTokensOut != nullptr);
+        TLLM_CHECK(acceptedTokensIn != nullptr);
+        TLLM_CHECK(acceptedLensIn != nullptr);
+    }
+};
+
+//! \brief Invokes the suffix automaton extend kernel with ngram support
+//!
+//! This kernel updates the suffix automaton states for each sequence in the batch
+//! with the newly accepted tokens, then performs lookup based on maxNgramSize:
+//! - If maxNgramSize == -1: finds the longest suffix match
+//! - If maxNgramSize > 0: tries ngram sizes from maxNgramSize down to 1 until a match is found
+//!
+//! This kernel is CUDA graph compatible.
+//!
+//! \param params The parameters for the kernel
+//! \param stream The CUDA stream to run the kernel on
+void invokeSuffixAutomatonExtendNgram(SuffixAutomatonExtendNgramParams const& params, cudaStream_t stream);
+
 //! \brief Get the size in bytes of a single SuffixAutomaton state
 //! \return Size in bytes
 size_t getSuffixAutomatonStateSize();

@@ -208,6 +208,86 @@ struct SuffixAutomaton
         return SAOptional<LookupResult>(result);
     }
 
+    /**
+     * @brief Find suffix of exactly targetLen that appears earlier in the text.
+     *
+     * This is used for fixed-size ngram matching where we want to find
+     * a match of a specific length rather than the longest possible match.
+     *
+     * Uses O(L) complexity by walking suffix links. Each state in the SA covers
+     * a range of lengths [link.len + 1, state.len]. If targetLen falls within
+     * this range and the state has an earlier occurrence, we have a match.
+     *
+     * @param targetLen The exact length of suffix to match
+     * @return Optional LookupResult with position after match and length,
+     *         or empty if no match found
+     */
+    SA_CUDA_CALLABLE SAOptional<LookupResult> lookupFixed(int targetLen) const
+    {
+        if (mStates.empty() || targetLen <= 0)
+        {
+            return SAOptional<LookupResult>();
+        }
+
+        int textLen = +mTokens.size();
+
+        // Need at least targetLen + 1 tokens to have a non-self match
+        if (textLen < targetLen + 1)
+        {
+            return SAOptional<LookupResult>();
+        }
+
+        NodeIndex state = mLast;
+
+        // Walk up suffix links to find a state that covers our target length
+        while (state != NodeIndex(0))
+        {
+            auto& nodeData = mStates.at(state);
+
+            // Determine the minimum length this state covers
+            // Each state covers lengths [minLen, nodeData.len]
+            int minLen = 1; // Default for states linked directly from root
+            auto linkOpt = nodeData.link;
+            if (linkOpt.hasValue() && *linkOpt != NodeIndex(0))
+            {
+                minLen = mStates.at(*linkOpt).len + 1;
+            }
+
+            // Check if this state covers our target length
+            if (nodeData.len >= targetLen && minLen <= targetLen)
+            {
+                SAOptional<TextIndex> posOpt = nodeData.pos;
+                if (posOpt.hasValue())
+                {
+                    TextIndex pos = *posOpt;
+                    // Check if this is an earlier occurrence (not at current suffix end)
+                    // pos is the END position of an occurrence
+                    if (+pos < textLen - 1)
+                    {
+                        LookupResult result;
+                        result.pos = TextIndex(+pos + 1); // Continuation starts after match
+                        result.len = targetLen;
+                        return SAOptional<LookupResult>(result);
+                    }
+                }
+            }
+
+            // If we've gone below target length entirely, stop searching
+            if (nodeData.len < targetLen)
+            {
+                break;
+            }
+
+            if (!linkOpt.hasValue())
+            {
+                break;
+            }
+            state = *linkOpt;
+        }
+
+        return SAOptional<LookupResult>();
+    }
+
     SA_CUDA_CALLABLE void getDraftTokens(Token::ValueType* buf, int bufLen, TextIndex startPos) const
     {
         int availableLen = +mTokens.size() - +startPos;

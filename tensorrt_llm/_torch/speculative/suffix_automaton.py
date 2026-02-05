@@ -124,6 +124,37 @@ class SuffixAutomatonState:
             return (best_pos, best_len)
         return None
 
+    def lookup_fixed(self, target_len: int) -> Optional[tuple]:
+        """
+        Find suffix of exactly target_len that appears earlier in the text.
+
+        This is used for fixed-size ngram matching where we want to find
+        a match of a specific length rather than the longest possible match.
+
+        Args:
+            target_len: The exact length of suffix to match
+
+        Returns:
+            Optional tuple of (continuation_start_pos, match_len) if found,
+            None otherwise. continuation_start_pos is the position right after
+            the matched pattern where draft tokens should be read from.
+        """
+        if len(self.tokens) < target_len + 1:
+            return None
+
+        # Get the target suffix (last target_len tokens)
+        suffix = self.tokens[-target_len:]
+
+        # Search for this exact suffix earlier in the text
+        # Search range excludes current suffix position to avoid self-match
+        search_end = len(self.tokens) - target_len
+        for pos in range(0, search_end):
+            if self.tokens[pos:pos + target_len] == suffix:
+                # Return position after the match (where continuation starts)
+                return (pos + target_len, target_len)
+
+        return None
+
     def get_draft_tokens(self, start_pos: int, num_tokens: int) -> List[int]:
         """Get draft tokens starting from a position."""
         end_pos = min(start_pos + num_tokens, len(self.tokens))
@@ -381,6 +412,169 @@ class SuffixAutomatonManager:
                         draft_tokens[i, j] = tok
 
             return match_len, draft_tokens
+
+    def extend_ngram(self, request_ids: List[int], accepted_tokens: torch.Tensor,
+                     num_accepted_tokens: torch.Tensor, max_draft_len: int,
+                     max_ngram_size: int = -1) -> tuple:
+        """
+        Extend suffix automaton states with accepted tokens and get draft tokens
+        using ngram matching.
+
+        This method supports both longest match mode and fixed-size ngram matching.
+        CUDA graph compatible when using native kernel.
+
+        Args:
+            request_ids: List of request IDs in the batch
+            accepted_tokens: [batch_size, max_draft_len + 1] accepted token tensor
+            num_accepted_tokens: [batch_size] number of accepted tokens per request
+            max_draft_len: Maximum draft length
+            max_ngram_size: Max ngram size for matching:
+                           -1 = longest match mode (default)
+                           >0 = try ngram sizes from max down to 1
+
+        Returns:
+            Tuple of (match_len, draft_tokens) tensors
+        """
+        self._ensure_workspace(max_draft_len)
+
+        batch_size = len(request_ids)
+
+        if self._use_native:
+            # Native GPU kernel - CUDA graph compatible
+            match_len = self._gpu_match_len[:batch_size]
+            draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
+
+            # Ensure accepted_tokens is contiguous and int32
+            if accepted_tokens.dtype != torch.int32:
+                accepted_tokens = accepted_tokens.to(torch.int32)
+            if num_accepted_tokens.dtype != torch.int32:
+                num_accepted_tokens = num_accepted_tokens.to(torch.int32)
+
+            _sa_native.invoke_extend_ngram(
+                batch_size,
+                max_draft_len,
+                max_ngram_size,
+                self._gpu_slots,
+                self._gpu_batch_indices[:batch_size],
+                match_len,
+                draft_tokens,
+                accepted_tokens,
+                num_accepted_tokens
+            )
+
+            return match_len, draft_tokens
+        else:
+            # Python fallback - NOT CUDA graph compatible
+            match_len = torch.zeros((batch_size,), dtype=torch.int32, device='cuda')
+            draft_tokens = torch.zeros((batch_size, max_draft_len),
+                                       dtype=torch.int32,
+                                       device='cuda')
+
+            # Skip CPU operations during CUDA graph capture - they are not supported
+            if torch.cuda.is_current_stream_capturing():
+                return match_len, draft_tokens
+
+            # Process each request on CPU
+            accepted_tokens_cpu = accepted_tokens.cpu()
+            num_accepted_cpu = num_accepted_tokens.cpu()
+
+            for i, rid in enumerate(request_ids):
+                if rid not in self._host_states:
+                    continue
+
+                state = self._host_states[rid]
+                num_new = num_accepted_cpu[i].item()
+
+                # Extend with accepted tokens
+                for j in range(num_new):
+                    token = accepted_tokens_cpu[i, j].item()
+                    state.extend(token)
+
+                # Perform lookup based on max_ngram_size
+                result = None
+                if max_ngram_size == -1:
+                    # Longest match mode
+                    result = state.lookup()
+                else:
+                    # Fixed-size ngram mode - try sizes from max down to 1
+                    for size in range(max_ngram_size, 0, -1):
+                        result = state.lookup_fixed(size)
+                        if result is not None:
+                            break
+
+                if result is not None:
+                    pos, length = result
+                    match_len[i] = length
+
+                    # Get draft tokens
+                    drafts = state.get_draft_tokens(pos, max_draft_len)
+                    for j, tok in enumerate(drafts):
+                        draft_tokens[i, j] = tok
+
+            return match_len, draft_tokens
+
+    def lookup(self, request_id: int) -> Optional[tuple]:
+        """
+        Find the longest suffix that appears earlier for a specific request.
+
+        Note: This method uses Python fallback state for position-based queries.
+        For CUDA graph compatible batched operations, use extend_ngram() instead
+        which returns (match_len, draft_tokens) directly.
+
+        Args:
+            request_id: The request ID to perform lookup for
+
+        Returns:
+            Optional tuple of (continuation_start_pos, match_len) if found,
+            None otherwise.
+        """
+        if request_id not in self._host_states:
+            return None
+        state = self._host_states[request_id]
+        return state.lookup()
+
+    def lookup_fixed(self, request_id: int, target_len: int) -> Optional[tuple]:
+        """
+        Find suffix of exactly target_len that appears earlier for a specific request.
+
+        Note: This method uses Python fallback state for position-based queries.
+        For CUDA graph compatible batched operations, use extend_ngram() instead
+        which returns (match_len, draft_tokens) directly.
+
+        Args:
+            request_id: The request ID to perform lookup for
+            target_len: The exact length of suffix to match
+
+        Returns:
+            Optional tuple of (continuation_start_pos, match_len) if found,
+            None otherwise.
+        """
+        if request_id not in self._host_states:
+            return None
+        state = self._host_states[request_id]
+        return state.lookup_fixed(target_len)
+
+    def get_draft_tokens(self, request_id: int, start_pos: int,
+                         num_tokens: int) -> List[int]:
+        """
+        Get draft tokens for a specific request starting from a position.
+
+        Note: This method uses Python fallback state for position-based access.
+        For CUDA graph compatible batched operations, use extend_ngram() instead
+        which returns draft tokens directly.
+
+        Args:
+            request_id: The request ID
+            start_pos: Starting position in the token sequence
+            num_tokens: Maximum number of tokens to return
+
+        Returns:
+            List of draft token IDs
+        """
+        if request_id not in self._host_states:
+            return []
+        state = self._host_states[request_id]
+        return state.get_draft_tokens(start_pos, num_tokens)
 
     def shutdown(self):
         """Clean up all resources."""

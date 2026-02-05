@@ -1069,32 +1069,67 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 class NGramDecodingConfig(DecodingBaseConfig):
     """
-    Configuration for NGram drafter speculative decoding.
+    Configuration for NGram drafter speculative decoding using suffix automaton.
+
+    The ngram drafter uses a suffix automaton (SA) to efficiently find matching
+    patterns in previously generated tokens to predict future tokens. This provides
+    CUDA graph compatible pattern matching with O(L) lookup complexity.
 
     Arguments:
         max_draft_len: int
-                The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
+            The maximum number of draft tokens to generate.
 
         max_matching_ngram_size: int
-            The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
+            The ngram size for pattern matching:
+            - Positive value (e.g., 3): Fixed-size ngram matching. Tries to match
+              ngrams of size N, N-1, ..., 1 until a match is found.
+            - -1: Use suffix automaton for longest possible match (most flexible).
+            - 0: Invalid, will raise an error.
 
-        is_keep_all: bool = True
-            Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
-
-        is_use_oldest: bool = True
-            Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
-
-        is_public_pool: bool = True
-            Whether to use a common pool for all requests, or the pool is private for each request if False.
+    Deprecated Options (will raise error if set to non-default):
+        is_keep_all: No longer supported. SA returns a single match.
+        is_use_oldest: No longer supported. SA returns the match stored in its state.
+        is_public_pool: No longer supported. SA maintains per-request state.
     """
     max_matching_ngram_size: int = 0
-    is_keep_all: bool = True
-    is_use_oldest: bool = True
-    is_public_pool: bool = True
+
+    # Deprecated options - will raise error if set to non-default values
+    is_keep_all: bool = False
+    is_use_oldest: bool = False
+    is_public_pool: bool = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.max_total_draft_tokens = self.max_draft_len  # Current NGram only support linear tree
+
+    @model_validator(mode='after')
+    def validate_ngram_config(self) -> 'NGramDecodingConfig':
+        """Validate NGram configuration and reject deprecated options."""
+        # Reject deprecated options
+        if self.is_public_pool:
+            raise ValueError(
+                "is_public_pool=True is not supported. NGram now uses suffix automaton "
+                "which maintains per-request state. Remove this option from your config."
+            )
+        if self.is_keep_all:
+            raise ValueError(
+                "is_keep_all=True is not supported. NGram now uses suffix automaton "
+                "which returns a single match. Remove this option from your config."
+            )
+        if self.is_use_oldest:
+            raise ValueError(
+                "is_use_oldest=True is not supported. NGram now uses suffix automaton "
+                "which returns the match stored in the SA state. Remove this option from your config."
+            )
+
+        # Validate ngram size
+        if self.max_matching_ngram_size == 0:
+            raise ValueError(
+                "max_matching_ngram_size must be > 0 (fixed-size ngram) or -1 (longest match). "
+                "Got 0 which is invalid."
+            )
+
+        return self
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -3096,7 +3131,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
-                assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
+                # max_matching_ngram_size: >0 for fixed-size ngram, -1 for longest match mode
+                assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size != 0
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."

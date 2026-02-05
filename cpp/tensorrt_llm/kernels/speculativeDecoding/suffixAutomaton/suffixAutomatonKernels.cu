@@ -85,6 +85,83 @@ void invokeSuffixAutomatonExtend(SuffixAutomatonExtendParams const& params, cuda
         params.batchIndices, params.matchLenOut, params.draftTokensOut, params.acceptedTokensIn, params.acceptedLensIn);
 }
 
+__global__ void suffixAutomatonExtendNgramKernel(int batchSize, int draftLength, int maxNgramSize,
+    SuffixAutomaton* slots, int const* batchIndices, int* matchLenOut, int* draftTokensOut,
+    int const* acceptedTokensIn, int const* acceptedLensIn)
+{
+    // Only one thread per block does the work
+    if (threadIdx.x > 0)
+    {
+        return;
+    }
+
+    int i = blockIdx.x;
+    if (i >= batchSize)
+    {
+        return;
+    }
+
+    int batchIndex = batchIndices[i];
+    assert(batchIndex >= 0 && batchIndex < static_cast<int>(SAConfig::MAX_SLOTS));
+
+    SuffixAutomaton& slot = slots[batchIndex];
+
+    int numNewTokens = acceptedLensIn[i];
+
+    // Extend the automaton with accepted tokens
+    for (int j = 0; j < numNewTokens; j++)
+    {
+        slot.extend(Token(acceptedTokensIn[i * (draftLength + 1) + j]));
+    }
+
+    // Perform lookup based on maxNgramSize
+    SAOptional<SuffixAutomaton::LookupResult> result;
+
+    if (maxNgramSize == -1)
+    {
+        // Longest match mode
+        result = slot.lookup();
+    }
+    else
+    {
+        // Fixed-size ngram mode - try sizes from maxNgramSize down to 1
+        for (int size = maxNgramSize; size >= 1; size--)
+        {
+            result = slot.lookupFixed(size);
+            if (result.hasValue())
+            {
+                break;
+            }
+        }
+    }
+
+    if (result.hasValue())
+    {
+        matchLenOut[i] = result->len;
+        slot.getDraftTokens(&draftTokensOut[i * draftLength], draftLength, result->pos);
+    }
+    else
+    {
+        matchLenOut[i] = 0;
+    }
+}
+
+void invokeSuffixAutomatonExtendNgram(SuffixAutomatonExtendNgramParams const& params, cudaStream_t stream)
+{
+    params.checkParams();
+
+    int batchSize = params.batchSize;
+    if (batchSize > static_cast<int>(SAConfig::MAX_SLOTS))
+    {
+        batchSize = static_cast<int>(SAConfig::MAX_SLOTS);
+    }
+
+    // Launch one block per sequence, one thread per block
+    suffixAutomatonExtendNgramKernel<<<batchSize, 1, 0, stream>>>(batchSize, params.draftLength, params.maxNgramSize,
+        params.slots, params.batchIndices, params.matchLenOut, params.draftTokensOut, params.acceptedTokensIn,
+        params.acceptedLensIn);
+}
+
 size_t getSuffixAutomatonStateSize()
 {
     return sizeof(SuffixAutomaton);

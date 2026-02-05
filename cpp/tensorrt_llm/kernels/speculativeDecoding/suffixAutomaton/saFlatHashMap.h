@@ -212,6 +212,11 @@ struct SAHashMapAllocator
         return reinterpret_cast<HashMap&>(mMem.at(ptr));
     }
 
+    SA_CUDA_CALLABLE HashMap const& at(Ptr ptr) const
+    {
+        return reinterpret_cast<HashMap const&>(mMem.at(ptr));
+    }
+
     SA_CUDA_CALLABLE Ptr alloc(size_t capacity)
     {
         // no available pointers, allocate a new one
