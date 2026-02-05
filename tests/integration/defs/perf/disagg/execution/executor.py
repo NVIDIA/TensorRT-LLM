@@ -219,6 +219,7 @@ class JobManager:
 
             # Write temporary config file with replaced environment variables
             logger.info(f"Creating temporary config: {temp_config_path}")
+
             with open(temp_config_path, "w") as f:
                 yaml.dump(
                     test_config.config_data,
