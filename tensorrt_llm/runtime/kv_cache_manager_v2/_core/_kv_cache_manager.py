@@ -132,7 +132,8 @@ class KVCacheManager:
     # memory pool utilization. For now, we use a simpler approach based on sequence length.
     # But this ignores the fact that some pages are shared among multiple sequences.
     _avg_reused_length: MovingAverage
-    # use squared because longer requests also lives for longer and is sampled more times.
+    # use squared because longer requests also lives for longer but we only update this on
+    # request closing, use squared average to compensate that.
     _avg_sqr_capacity: MovingAverage
     _avg_sqr_history_length: MovingAverage
     _target_ratio_list_gpu: TypedIndexList[PoolGroupIndex, float]
@@ -363,6 +364,7 @@ class KVCacheManager:
                 base, current_end - current_start, stride, lc, tuple(current_buffers)
             )
 
+    @property
     def _current_gpu_ratio(self) -> TypedIndexList[PoolGroupIndex, float]:
         return self._storage.get_ratio_list(GPU_LEVEL)
 
@@ -477,8 +479,10 @@ class KVCacheManager:
         avg_reused_length: int = round(self._avg_reused_length.value)
         avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)
         avg_history_length: int = round(self._avg_sqr_history_length.value**0.5)
-        self._target_ratio_list_gpu = ratio_from_length(avg_history_length, avg_capacity)
-        self._target_ratio_list_other = ratio_from_length(avg_reused_length, avg_reused_length)
+        if avg_capacity > 0:
+            self._target_ratio_list_gpu = ratio_from_length(avg_history_length, avg_capacity)
+        if avg_reused_length > 0:
+            self._target_ratio_list_other = ratio_from_length(avg_reused_length, avg_reused_length)
 
     # @TODO: need updating when dynamic resizing is supported.
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int:

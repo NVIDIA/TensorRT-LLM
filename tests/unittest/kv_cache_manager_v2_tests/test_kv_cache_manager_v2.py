@@ -1057,5 +1057,46 @@ class TestComplexModels(unittest.TestCase):
         del manager
 
 
+class TestResizeQuota(TestKVCacheManagerV2):
+    def test_resize_quota(self) -> None:
+        self.prepare(64 << 20, 128 << 20, 0, 36, 128, 1, kv_buf_size=32768)
+        # if we have n blocks, we need 8192*2*18*(1+5+n) bytes of memory. For the (1+5+n), 1 is for sink
+        # blocks, 5 is for SWA (window=128), n is for full attention.
+        max_seq_len = 32 * 22  # 23 blocks will require more than 32MB memory
+        seq_len = max_seq_len
+        kv_cache_lst = [self.manager.create_kv_cache() for _ in range(2)]
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        for kv_cache in kv_cache_lst:
+            success = kv_cache.resume(stream)
+            assert success
+            kv_cache.stop_committing()
+            success = kv_cache.resize(seq_len, seq_len)
+            assert success
+        for kv_cache in kv_cache_lst:
+            kv_cache.suspend()
+        # Shrink the gpu quota
+        success = self.manager.resize(cast(CacheLevel, GPU_LEVEL), 32 << 20)
+        assert success
+        success = kv_cache_lst[0].resume(stream)
+        assert success
+        # After shrinking, GPU memory can hold only one request, so expect
+        # for resuming of the second request.
+        success = kv_cache_lst[1].resume(stream)
+        assert not success
+
+        kv_cache_lst[0].suspend()
+        # Expand it back to the original size
+        success = self.manager.resize(cast(CacheLevel, GPU_LEVEL), 64 << 20)
+        # Now both requests can resume
+        for kv_cache in kv_cache_lst:
+            success = kv_cache.resume(stream)
+            assert success
+
+        for kv_cache in kv_cache_lst:
+            kv_cache.close()
+        self.manager.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()
