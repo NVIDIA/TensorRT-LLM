@@ -102,12 +102,24 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
     def _create_kv_slice(self, req: LlmRequest):
         # Get block_ids for each layer group
         block_ids_per_layer_groups: List[List[int]] = []
+        tokens_per_block = self.kv_cache_manager.tokens_per_block
 
         for group_attrs in self.kv_pool_attrs.layer_group_attrs_list:
             first_global_layer_id = group_attrs.global_layer_ids[0]
             block_ids = self.kv_cache_manager.get_batch_cache_indices(
                 [req.py_request_id], layer_id=first_global_layer_id
             )[0]
+
+            # Filter out invalid block_ids (block_id >= 0) for V2
+            block_ids = [bid for bid in block_ids if bid >= 0]
+
+            # Filter by window_size if request_len > window_size
+            window_size = group_attrs.sliding_window_size
+            if window_size is not None:
+                max_blocks_in_window = window_size // tokens_per_block + 1
+                if len(block_ids) > max_blocks_in_window:
+                    block_ids = block_ids[-max_blocks_in_window:]
+
             block_ids_per_layer_groups.append(list(block_ids))
 
         return KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_layer_groups)
@@ -300,8 +312,8 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                 f"cp_size: {self.mapping.cp_size}"
             )
 
-        if self.kv_cache_manager.is_vswa:
-            raise ValueError("PyNativeCacheTransceiver: _check_compatible: VSWA is not supported")
+        # if self.kv_cache_manager.is_vswa:
+        #     raise ValueError("PyNativeCacheTransceiver: _check_compatible: VSWA is not supported")
         return
 
     def get_context_state(self):

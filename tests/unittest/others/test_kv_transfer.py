@@ -21,6 +21,9 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestTyp
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2, Role
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings import LayerType as LayerTypeCpp
+from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 
 
@@ -52,11 +55,13 @@ def create_transfer_worker_setup(
     gen_enable_dp: bool,
     is_mla: bool = False,
     use_v2: bool = False,
+    max_attention_window_vec: Optional[List[int]] = None,
 ):
     """Helper function to set up transfer workers for testing.
 
     Args:
         use_v2: If True, use KVCacheManagerV2 (Python-side). Otherwise use KVCacheManager (C++ bindings).
+        max_attention_window_vec: List of window sizes, e.g. [max_seq_len] or [max_seq_len, small_window].
     """
     ctx_mappings = []
     for i in range(ctx_pp):
@@ -93,10 +98,14 @@ def create_transfer_worker_setup(
     head_dim = 128
     num_kv_heads = 4 if not is_mla else 1
     tokens_per_block = 8
-    max_seq_len = 256
+    max_seq_len = 1024
     max_batch_size = 4
     dtype = DataType.FLOAT
     vocab_size = 32000  # V2 requires vocab_size
+
+    # Default max_attention_window_vec to [max_seq_len] if not specified
+    if max_attention_window_vec is None:
+        max_attention_window_vec = [max_seq_len]
     ctx_transfer_workers = []
     ctx_kv_cache_managers = []
     device_id = 0
@@ -118,6 +127,7 @@ def create_transfer_worker_setup(
                 KvCacheConfigV2(
                     max_tokens=2048,
                     enable_block_reuse=False,
+                    max_attention_window=max_attention_window_vec,
                 ),
                 cache_type,
                 num_layers=num_layers,
@@ -130,26 +140,107 @@ def create_transfer_worker_setup(
                 dtype=dtype,
                 vocab_size=vocab_size,
             )
-            # V2: Initialize pool using TensorWrapper
+            # V2: Initialize pools for ALL layer_groups
             random_seed = 0 if is_mla else None
             kv_factor = ctx_kv_cache_manager.kv_factor
-            pool_base_ptr = int(ctx_kv_cache_manager.impl.get_mem_pool_base_address(0, Role.KEY))
-            page_stride = ctx_kv_cache_manager.impl.get_page_stride(0, Role.KEY)
-            num_pages = ctx_kv_cache_manager.impl.get_page_index_upper_bound(0, Role.KEY)
-            pool_size_bytes = num_pages * page_stride * kv_factor
-            element_size = (
-                page_stride
-                * kv_factor
-                // (
-                    ctx_kv_cache_manager.tokens_per_block
-                    * ctx_kv_cache_manager.num_kv_heads_per_layer[0]
-                    * ctx_kv_cache_manager.head_dim
+
+            # First pass: collect maximum num_pages for each pool across all layer_groups
+            pool_info = {}  # pool_base_ptr -> (max_num_pages, page_stride, first_local_layer)
+            for group_id, local_layer_ids in enumerate(ctx_kv_cache_manager.impl.layer_grouping):
+                first_local_layer = local_layer_ids[0]
+                pool_base_ptr = int(
+                    ctx_kv_cache_manager.impl.get_mem_pool_base_address(first_local_layer, Role.KEY)
                 )
+                page_stride = ctx_kv_cache_manager.impl.get_page_stride(first_local_layer, Role.KEY)
+                num_pages = ctx_kv_cache_manager.impl.get_page_index_upper_bound(
+                    first_local_layer, Role.KEY
+                )
+
+                if pool_base_ptr not in pool_info:
+                    pool_info[pool_base_ptr] = (num_pages, page_stride, first_local_layer)
+                else:
+                    # Keep the maximum num_pages for this pool
+                    existing_num_pages, existing_page_stride, existing_layer = pool_info[
+                        pool_base_ptr
+                    ]
+                    if num_pages > existing_num_pages:
+                        pool_info[pool_base_ptr] = (num_pages, page_stride, first_local_layer)
+
+            # Second pass: initialize each pool with the maximum required size
+            for pool_base_ptr, (num_pages, page_stride, first_local_layer) in pool_info.items():
+                pool_size_bytes = num_pages * page_stride * kv_factor
+                element_size = (
+                    page_stride
+                    * kv_factor
+                    // (
+                        ctx_kv_cache_manager.tokens_per_block
+                        * ctx_kv_cache_manager.num_kv_heads_per_layer[first_local_layer]
+                        * ctx_kv_cache_manager.head_dim
+                    )
+                )
+                pool_size_elements = pool_size_bytes // element_size
+                pool_tensor = convert_to_torch_tensor(
+                    TensorWrapper(pool_base_ptr, ctx_kv_cache_manager.dtype, [pool_size_elements])
+                )
+                if random_seed is not None:
+                    generator = torch.Generator(device=pool_tensor.device).manual_seed(random_seed)
+                else:
+                    generator = None
+                random_values = torch.rand(
+                    pool_tensor.shape,
+                    dtype=torch.float32,
+                    device=pool_tensor.device,
+                    generator=generator,
+                )
+                pool_tensor.copy_(random_values)
+        else:
+            # Construct model_config for VSWA (Variable Sliding Window Attention)
+            is_vswa = max_attention_window_vec and len(set(max_attention_window_vec)) > 1
+            model_config = None
+            if is_vswa:
+                model_config = ModelConfigCpp(
+                    vocab_size=vocab_size,
+                    num_layers=num_layers,
+                    num_attention_layers=num_layers,
+                    num_rnn_layers=0,
+                    num_heads=num_kv_heads,
+                    hidden_size=num_kv_heads * head_dim,
+                    data_type=dtype,
+                )
+                model_config.layer_types = [LayerTypeCpp.ATTENTION] * num_layers
+                model_config.set_num_kv_heads(num_kv_heads)
+                model_config.size_per_head = head_dim
+                model_config.tokens_per_block = tokens_per_block
+
+            # Use KvCacheConfig from llmapi for VSWA, trtllm.KvCacheConfig otherwise
+            if is_vswa:
+                kv_cache_cfg = KvCacheConfig(
+                    max_tokens=2048,
+                    enable_block_reuse=False,
+                    max_attention_window=max_attention_window_vec,
+                )
+            else:
+                kv_cache_cfg = trtllm.KvCacheConfig(
+                    max_tokens=2048,
+                    enable_block_reuse=False,
+                    max_attention_window=max_attention_window_vec,
+                )
+            ctx_kv_cache_manager = KVCacheManager(
+                kv_cache_cfg,
+                cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=ctx_mappings[i],
+                dtype=dtype,
+                model_config=model_config,
             )
-            pool_size_elements = pool_size_bytes // element_size
-            pool_tensor = convert_to_torch_tensor(
-                TensorWrapper(pool_base_ptr, ctx_kv_cache_manager.dtype, [pool_size_elements])
-            )
+            # V1: Initialize pool using get_unique_primary_pool
+            random_seed = 0 if is_mla else None
+            pool_tensor = ctx_kv_cache_manager.get_unique_primary_pool()
             if random_seed is not None:
                 generator = torch.Generator(device=pool_tensor.device).manual_seed(random_seed)
             else:
@@ -161,38 +252,6 @@ def create_transfer_worker_setup(
                 generator=generator,
             )
             pool_tensor.copy_(random_values)
-        else:
-            ctx_kv_cache_manager = KVCacheManager(
-                trtllm.KvCacheConfig(
-                    max_tokens=2048,
-                    enable_block_reuse=False,
-                ),
-                cache_type,
-                num_layers=num_layers,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                tokens_per_block=tokens_per_block,
-                max_seq_len=max_seq_len,
-                max_batch_size=max_batch_size,
-                mapping=ctx_mappings[i],
-                dtype=dtype,
-            )
-            # V1: Initialize pool using get_unique_primary_pool
-            random_seed = 0 if is_mla else None
-            ctx_block_data_pool = ctx_kv_cache_manager.get_unique_primary_pool()
-            if random_seed is not None:
-                generator = torch.Generator(device=ctx_block_data_pool.device).manual_seed(
-                    random_seed
-                )
-            else:
-                generator = None
-            random_values = torch.rand(
-                ctx_block_data_pool.shape,
-                dtype=torch.float32,
-                device=ctx_block_data_pool.device,
-                generator=generator,
-            )
-            ctx_block_data_pool.copy_(random_values)
 
         ctx_kv_cache_managers.append(ctx_kv_cache_manager)
         ctx_transfer_workers.append(
@@ -235,6 +294,7 @@ def create_transfer_worker_setup(
                 KvCacheConfigV2(
                     max_tokens=2048,
                     enable_block_reuse=False,
+                    max_attention_window=max_attention_window_vec,
                 ),
                 cache_type,
                 num_layers=num_layers,
@@ -248,11 +308,39 @@ def create_transfer_worker_setup(
                 vocab_size=vocab_size,
             )
         else:
-            gen_kv_cache_manager = KVCacheManager(
-                trtllm.KvCacheConfig(
+            # Construct model_config for VSWA (Variable Sliding Window Attention)
+            is_vswa = max_attention_window_vec and len(set(max_attention_window_vec)) > 1
+            model_config = None
+            if is_vswa:
+                model_config = ModelConfigCpp(
+                    vocab_size=vocab_size,
+                    num_layers=num_layers,
+                    num_attention_layers=num_layers,
+                    num_rnn_layers=0,
+                    num_heads=num_kv_heads,
+                    hidden_size=num_kv_heads * head_dim,
+                    data_type=dtype,
+                )
+                model_config.layer_types = [LayerTypeCpp.ATTENTION] * num_layers
+                model_config.set_num_kv_heads(num_kv_heads)
+                model_config.size_per_head = head_dim
+                model_config.tokens_per_block = tokens_per_block
+
+            # Use KvCacheConfig from llmapi for VSWA, trtllm.KvCacheConfig otherwise
+            if is_vswa:
+                kv_cache_cfg = KvCacheConfig(
                     max_tokens=2048,
                     enable_block_reuse=False,
-                ),
+                    max_attention_window=max_attention_window_vec,
+                )
+            else:
+                kv_cache_cfg = trtllm.KvCacheConfig(
+                    max_tokens=2048,
+                    enable_block_reuse=False,
+                    max_attention_window=max_attention_window_vec,
+                )
+            gen_kv_cache_manager = KVCacheManager(
+                kv_cache_cfg,
                 cache_type,
                 num_layers=num_layers,
                 num_kv_heads=num_kv_heads,
@@ -262,6 +350,7 @@ def create_transfer_worker_setup(
                 max_batch_size=max_batch_size,
                 mapping=gen_mappings[i],
                 dtype=dtype,
+                model_config=model_config,
             )
         gen_kv_cache_managers.append(gen_kv_cache_manager)
         gen_transfer_workers.append(
@@ -308,40 +397,94 @@ def create_transfer_worker_setup(
         "head_dim": head_dim,
         "tokens_per_block": tokens_per_block,
         "request_len": request_len,
+        "max_attention_window_vec": max_attention_window_vec,
     }
 
 
-def get_block_data_via_buffers(
-    kv_cache_manager: KVCacheManagerV2,
+def get_block_data(
+    kv_cache_manager,
     block_ids: List[int],
+    layer_group_id: int,
+    use_v2: bool,
 ) -> torch.Tensor:
-    """Get block data from KVCacheManagerV2 using get_buffers API.
+    """Unified block data retrieval for both V1 and V2 KVCacheManager.
 
-    V2 memory layout: [slot][layer][kv_factor][page_data]
-    Returns tensor with shape [num_slots, num_layers, kv_factor, page_data]
-    to match V1's get_unique_primary_pool format.
+    Returns tensor with shape [num_slots, num_layers_in_group, kv_factor, flat_dim]
+
+    Args:
+        kv_cache_manager: KVCacheManager (V1) or KVCacheManagerV2 instance
+        block_ids: Block IDs to retrieve
+        layer_group_id: Layer group ID (required for both V1 and V2)
+        use_v2: Whether using KVCacheManagerV2
     """
-    num_local_layers = kv_cache_manager.num_local_layers
-    all_slot_data = []
+    if use_v2:
+        # V2: Use get_buffers API
+        layer_grouping = kv_cache_manager.impl.layer_grouping
+        local_layer_indices = layer_grouping[layer_group_id]
+        layers_for_indexing = len(local_layer_indices)
 
-    for slot_id in block_ids:
-        slot_layers = []
-        for local_layer_idx in range(num_local_layers):
-            # Use global layer index from pp_layers, not local 0-based index
-            global_layer_idx = kv_cache_manager.pp_layers[local_layer_idx]
-            layer_buffer = kv_cache_manager.get_buffers(layer_idx=global_layer_idx, kv_layout="HND")
-            # V2 indexing: slot S is at buffer index S * num_layers
-            buffer_idx = slot_id * num_local_layers
-            # get_buffers returns shape: [kv_factor, num_kv_heads, tokens_per_block, head_dim]
-            slot_layer_data = layer_buffer[buffer_idx]
-            # Flatten last 3 dims to match V1 format: [kv_factor, num_kv_heads * tokens_per_block * head_dim]
-            slot_layer_data = slot_layer_data.reshape(slot_layer_data.shape[0], -1)
-            slot_layers.append(slot_layer_data)
-        # Stack layers for this slot: [num_layers, kv_factor, flat_dim]
-        all_slot_data.append(torch.stack(slot_layers, dim=0))
+        all_slot_data = []
+        for slot_id in block_ids:
+            slot_layers = []
+            for local_layer_idx in local_layer_indices:
+                global_layer_idx = kv_cache_manager.pp_layers[local_layer_idx]
+                layer_buffer = kv_cache_manager.get_buffers(
+                    layer_idx=global_layer_idx, kv_layout="HND"
+                )
+                buffer_idx = slot_id * layers_for_indexing
+                slot_layer_data = layer_buffer[buffer_idx]
+                slot_layer_data = slot_layer_data.reshape(slot_layer_data.shape[0], -1)
+                slot_layers.append(slot_layer_data)
+            all_slot_data.append(torch.stack(slot_layers, dim=0))
+        return torch.stack(all_slot_data, dim=0)
+    else:
+        # V1: Use get_unique_primary_pool (single window only, VSWA tests are skipped)
+        pool_tensor = kv_cache_manager.get_unique_primary_pool()
+        # V1 pool shape: [num_blocks, num_layers, kv_factor, blockSize]
+        # where blockSize = tokens_per_block * num_kv_heads * head_dim
+        block_datas = pool_tensor[block_ids]
+        # Shape: [num_slots, num_layers, kv_factor, blockSize]
+        return block_datas
 
-    # Stack all slots: [num_slots, num_layers, kv_factor, flat_dim]
-    return torch.stack(all_slot_data, dim=0)
+
+def get_block_ids_per_layer_groups(
+    kv_cache_manager, transfer_worker, request_id: int, use_v2: bool, tokens_per_block: int
+) -> List[List[int]]:
+    """Get block_ids for each layer group with window_size filtering.
+
+    Args:
+        kv_cache_manager: KVCacheManager or KVCacheManagerV2 instance
+        transfer_worker: TransferWorker instance (to access kv_pool_attrs)
+        request_id: Request ID
+        use_v2: Whether using KVCacheManagerV2
+        tokens_per_block: Tokens per block
+
+    Returns:
+        List of block_ids for each layer_group
+    """
+    kv_pool_attrs = transfer_worker._rank_info.kv_pool_attrs
+    block_ids_per_layer_groups: List[List[int]] = []
+
+    for group_attrs in kv_pool_attrs.layer_group_attrs_list:
+        first_global_layer_id = group_attrs.global_layer_ids[0]
+        block_ids = kv_cache_manager.get_batch_cache_indices(
+            [request_id], layer_id=first_global_layer_id
+        )[0]
+
+        # V2: Filter out invalid block_ids (block_id >= 0)
+        if use_v2:
+            block_ids = [bid for bid in block_ids if bid >= 0]
+
+        # Filter by window_size if request_len > window_size
+        window_size = group_attrs.sliding_window_size
+        if window_size is not None:
+            max_blocks_in_window = window_size // tokens_per_block + 1
+            if len(block_ids) > max_blocks_in_window:
+                block_ids = block_ids[-max_blocks_in_window:]
+
+        block_ids_per_layer_groups.append(list(block_ids))
+
+    return block_ids_per_layer_groups
 
 
 def add_and_verify_request(
@@ -353,8 +496,6 @@ def add_and_verify_request(
     gen_transfer_workers = setup["gen_transfer_workers"]
     gen_kv_cache_managers = setup["gen_kv_cache_managers"]
     ctx_info_endpoint = setup["ctx_info_endpoint"]
-    ctx_layer_num_per_pp = setup["ctx_layer_num_per_pp"]
-    gen_layer_num_per_pp = setup["gen_layer_num_per_pp"]
     ctx_tp = setup["ctx_tp"]
     ctx_pp = setup["ctx_pp"]
     ctx_enable_dp = setup["ctx_enable_dp"]
@@ -363,7 +504,6 @@ def add_and_verify_request(
     gen_enable_dp = setup["gen_enable_dp"]
     is_mla = setup["is_mla"]
     use_v2 = setup["use_v2"]
-    num_layers = setup["num_layers"]
     num_kv_heads = setup["num_kv_heads"]
     head_dim = setup["head_dim"]
     tokens_per_block = setup["tokens_per_block"]
@@ -460,45 +600,35 @@ def add_and_verify_request(
                 gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
             )
 
-    ctx_block_ids_raw = [
-        ctx_kv_cache_manager.get_batch_cache_indices(
-            [ctx_request.py_request_id], layer_id=ctx_kv_cache_manager.pp_layers[0]
-        )[0]
-        for ctx_kv_cache_manager in valid_ctx_kv_cache_managers
+    # Get block_ids per layer_group with window_size filtering
+    ctx_block_ids_per_groups = [
+        get_block_ids_per_layer_groups(
+            ctx_kv_cache_manager,
+            ctx_transfer_worker,
+            ctx_request.py_request_id,
+            use_v2,
+            tokens_per_block,
+        )
+        for ctx_kv_cache_manager, ctx_transfer_worker in zip(
+            valid_ctx_kv_cache_managers, valid_ctx_transfer_workers
+        )
     ]
-    # V2: Filter out invalid block ids (BAD_PAGE_INDEX = -1)
-    if use_v2:
-        ctx_block_ids = [[bid for bid in block_ids if bid >= 0] for block_ids in ctx_block_ids_raw]
-        # Verify V2 block count matches expected: ceil(request_len / tokens_per_block)
-        expected_block_count = (request_len + tokens_per_block - 1) // tokens_per_block
-        for block_ids in ctx_block_ids:
-            assert len(block_ids) == expected_block_count, (
-                f"V2 ctx block count mismatch: got {len(block_ids)}, "
-                f"expected {expected_block_count} for request_len={request_len}, "
-                f"tokens_per_block={tokens_per_block}"
-            )
-    else:
-        ctx_block_ids = ctx_block_ids_raw
 
-    gen_block_ids_raw = [
-        gen_kv_cache_manager.get_batch_cache_indices(
-            [gen_request.py_request_id], layer_id=gen_kv_cache_manager.pp_layers[0]
-        )[0]
-        for gen_kv_cache_manager in valid_gen_kv_cache_managers
+    gen_block_ids_per_groups = [
+        get_block_ids_per_layer_groups(
+            gen_kv_cache_manager,
+            gen_transfer_worker,
+            gen_request.py_request_id,
+            use_v2,
+            tokens_per_block,
+        )
+        for gen_kv_cache_manager, gen_transfer_worker in zip(
+            valid_gen_kv_cache_managers, valid_gen_transfer_workers
+        )
     ]
-    # V2: Filter out invalid block ids (BAD_PAGE_INDEX = -1)
-    if use_v2:
-        gen_block_ids = [[bid for bid in block_ids if bid >= 0] for block_ids in gen_block_ids_raw]
-        # Verify V2 block count matches expected: ceil(request_len / tokens_per_block)
-        expected_block_count = (request_len + tokens_per_block - 1) // tokens_per_block
-        for block_ids in gen_block_ids:
-            assert len(block_ids) == expected_block_count, (
-                f"V2 gen block count mismatch: got {len(block_ids)}, "
-                f"expected {expected_block_count} for request_len={request_len}, "
-                f"tokens_per_block={tokens_per_block}"
-            )
-    else:
-        gen_block_ids = gen_block_ids_raw
+
+    # Determine number of layer_groups
+    num_layer_groups = len(ctx_block_ids_per_groups[0]) if ctx_block_ids_per_groups else 1
 
     if send_first:
         sender_sessions = [
@@ -507,8 +637,8 @@ def add_and_verify_request(
         ]
 
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=[ctx_block_id])
-            for ctx_block_id in ctx_block_ids
+            KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
+            for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
         send_slice_tasks = [
             sender_session._kv_tasks[sender_session.send(send_kv_slice)]
@@ -523,8 +653,8 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=[gen_block_id])
-            for gen_block_id in gen_block_ids
+            KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
+            for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
         recv_slice_tasks = [
             receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
@@ -537,8 +667,8 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=[gen_block_id])
-            for gen_block_id in gen_block_ids
+            KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
+            for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
         recv_slice_tasks = [
             receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
@@ -558,8 +688,8 @@ def add_and_verify_request(
             assert sender_session.state.status != SessionStatus.INIT
 
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=[ctx_block_id])
-            for ctx_block_id in ctx_block_ids
+            KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
+            for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
         send_slice_tasks = [
             sender_session._kv_tasks[sender_session.send(send_kv_slice)]
@@ -590,79 +720,112 @@ def add_and_verify_request(
         )
 
     # Get block data for verification
-    if use_v2:
-        ctx_block_datas = [
-            get_block_data_via_buffers(ctx_kv_cache_manager, ctx_block_id)
-            for ctx_kv_cache_manager, ctx_block_id in zip(
-                valid_ctx_kv_cache_managers, ctx_block_ids
-            )
-        ]
-        gen_block_datas = [
-            get_block_data_via_buffers(gen_kv_cache_manager, gen_block_id)
-            for gen_kv_cache_manager, gen_block_id in zip(
-                valid_gen_kv_cache_managers, gen_block_ids
-            )
-        ]
-    else:
-        ctx_block_datas = [
-            ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_id]
-            for ctx_kv_cache_manager, ctx_block_id in zip(
-                valid_ctx_kv_cache_managers, ctx_block_ids
-            )
-        ]
-        gen_block_datas = [
-            gen_kv_cache_manager.get_unique_primary_pool()[gen_block_id]
-            for gen_kv_cache_manager, gen_block_id in zip(
-                valid_gen_kv_cache_managers, gen_block_ids
-            )
-        ]
-
     valid_ctx_tp = 1 if ctx_enable_dp else ctx_tp
     valid_gen_tp = 1 if gen_enable_dp else gen_tp
     if is_mla:
         valid_ctx_tp = 1
         valid_gen_tp = 1
-    ctx_block_data_merge = torch.zeros(
-        size=(
-            ctx_block_datas[0].shape[0],
-            num_layers,
-            2 if not is_mla else 1,
-            ctx_block_datas[0].shape[3] * valid_ctx_tp,
-        )
-    )
-    for pp_rank in range(ctx_pp):
-        for tp_rank in range(valid_ctx_tp):
-            layer_start_idx = sum(ctx_layer_num_per_pp[:pp_rank])
-            layer_end_idx = layer_start_idx + ctx_layer_num_per_pp[pp_rank]
-            head_dim_per_rank = num_kv_heads // valid_ctx_tp * head_dim * tokens_per_block
-            start_head_offset = tp_rank * head_dim_per_rank
-            end_head_offset = start_head_offset + head_dim_per_rank
-            block_id = pp_rank * valid_ctx_tp + tp_rank
-            ctx_block_data_merge[
-                :, layer_start_idx:layer_end_idx, :, start_head_offset:end_head_offset
-            ] = ctx_block_datas[block_id]
 
-    gen_block_data_merge = torch.zeros(
-        size=(
-            gen_block_datas[0].shape[0],
-            num_layers,
-            2 if not is_mla else 1,
-            gen_block_datas[0].shape[3] * valid_gen_tp,
-        )
-    )
-    for pp_rank in range(gen_pp):
-        for tp_rank in range(valid_gen_tp):
-            layer_start_idx = sum(gen_layer_num_per_pp[:pp_rank])
-            layer_end_idx = layer_start_idx + gen_layer_num_per_pp[pp_rank]
-            head_dim_per_rank = num_kv_heads // valid_gen_tp * head_dim * tokens_per_block
-            start_head_offset = tp_rank * head_dim_per_rank
-            end_head_offset = start_head_offset + head_dim_per_rank
-            block_id = pp_rank * valid_gen_tp + tp_rank
-            gen_block_data_merge[
-                :, layer_start_idx:layer_end_idx, :, start_head_offset:end_head_offset
-            ] = gen_block_datas[block_id]
+    # Unified per-layer-group verification for both V1 and V2
+    def get_layers_in_group_per_pp(kv_cache_managers, pp_size, tp_size, group_id, is_v2):
+        """Get the number of layers in a group for each PP rank."""
+        layers_per_pp = []
+        for pp_rank in range(pp_size):
+            mgr = kv_cache_managers[pp_rank * tp_size]
+            if is_v2:
+                layers_per_pp.append(len(mgr.impl.layer_grouping[group_id]))
+            else:
+                window_to_layers = mgr._get_window_size_to_layers()
+                sorted_windows = sorted(window_to_layers.keys(), key=lambda x: (x is None, x))
+                window_size = sorted_windows[group_id]
+                layers_per_pp.append(len(window_to_layers[window_size]))
+        return layers_per_pp
 
-    assert ctx_block_data_merge.equal(gen_block_data_merge)
+    for layer_group_id in range(num_layer_groups):
+        # Get block_ids for this layer_group
+        ctx_group_block_ids = [groups[layer_group_id] for groups in ctx_block_ids_per_groups]
+        gen_group_block_ids = [groups[layer_group_id] for groups in gen_block_ids_per_groups]
+
+        # Get data using unified get_block_data function
+        ctx_block_datas = [
+            get_block_data(mgr, bids, layer_group_id, use_v2)
+            for mgr, bids in zip(valid_ctx_kv_cache_managers, ctx_group_block_ids)
+        ]
+        gen_block_datas = [
+            get_block_data(mgr, bids, layer_group_id, use_v2)
+            for mgr, bids in zip(valid_gen_kv_cache_managers, gen_group_block_ids)
+        ]
+
+        # Get layers per PP rank for this group
+        ctx_layers_per_pp = get_layers_in_group_per_pp(
+            valid_ctx_kv_cache_managers, ctx_pp, valid_ctx_tp, layer_group_id, use_v2
+        )
+        gen_layers_per_pp = get_layers_in_group_per_pp(
+            valid_gen_kv_cache_managers, gen_pp, valid_gen_tp, layer_group_id, use_v2
+        )
+
+        ctx_layers_in_group = sum(ctx_layers_per_pp)
+        gen_layers_in_group = sum(gen_layers_per_pp)
+
+        assert ctx_layers_in_group == gen_layers_in_group, (
+            f"Layer group {layer_group_id}: ctx has {ctx_layers_in_group} layers, "
+            f"gen has {gen_layers_in_group}"
+        )
+        num_layers_in_group = ctx_layers_in_group
+
+        # Create merge tensors for ctx
+        ctx_block_data_merge = torch.zeros(
+            size=(
+                ctx_block_datas[0].shape[0],  # num_slots
+                num_layers_in_group,
+                ctx_block_datas[0].shape[2],  # kv_factor
+                ctx_block_datas[0].shape[3] * valid_ctx_tp,  # heads
+            )
+        )
+        ctx_layer_offset = 0
+        for pp_rank in range(ctx_pp):
+            pp_layers_in_group = ctx_layers_per_pp[pp_rank]
+            for tp_rank in range(valid_ctx_tp):
+                head_dim_per_rank = num_kv_heads // valid_ctx_tp * head_dim * tokens_per_block
+                start_head_offset = tp_rank * head_dim_per_rank
+                end_head_offset = start_head_offset + head_dim_per_rank
+                block_idx = pp_rank * valid_ctx_tp + tp_rank
+                ctx_block_data_merge[
+                    :,
+                    ctx_layer_offset : ctx_layer_offset + pp_layers_in_group,
+                    :,
+                    start_head_offset:end_head_offset,
+                ] = ctx_block_datas[block_idx]
+            ctx_layer_offset += pp_layers_in_group
+
+        # Create merge tensors for gen
+        gen_block_data_merge = torch.zeros(
+            size=(
+                gen_block_datas[0].shape[0],  # num_slots
+                num_layers_in_group,
+                gen_block_datas[0].shape[2],  # kv_factor
+                gen_block_datas[0].shape[3] * valid_gen_tp,  # heads
+            )
+        )
+        gen_layer_offset = 0
+        for pp_rank in range(gen_pp):
+            pp_layers_in_group = gen_layers_per_pp[pp_rank]
+            for tp_rank in range(valid_gen_tp):
+                head_dim_per_rank = num_kv_heads // valid_gen_tp * head_dim * tokens_per_block
+                start_head_offset = tp_rank * head_dim_per_rank
+                end_head_offset = start_head_offset + head_dim_per_rank
+                block_idx = pp_rank * valid_gen_tp + tp_rank
+                gen_block_data_merge[
+                    :,
+                    gen_layer_offset : gen_layer_offset + pp_layers_in_group,
+                    :,
+                    start_head_offset:end_head_offset,
+                ] = gen_block_datas[block_idx]
+            gen_layer_offset += pp_layers_in_group
+
+        assert ctx_block_data_merge.equal(gen_block_data_merge), (
+            f"Layer group {layer_group_id} data mismatch"
+        )
 
     if not send_first:
         for pp_rank in range(gen_pp):
@@ -708,6 +871,23 @@ PARALLEL_TEST_CONFIGS = [
     (1, 4, False, 2, 2, True, False, "tp1_pp4_to_tp2_pp2_dp"),
     (2, 1, False, 2, 1, True, True, "tp2_pp1_to_tp2_pp1_dp_mla"),
     (2, 1, True, 2, 1, False, True, "tp2_pp1_dp_to_tp2_pp1_mla"),
+]
+
+# Window size test configurations
+# max_seq_len=1024 (hardcoded), tokens_per_block=8
+# small_window=24 (3 blocks)
+# Test with request_len: 16 (< 24), 32 (> 24), 64 (>> 24)
+WINDOW_SIZE_TEST_CONFIGS = [
+    # (ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla,
+    #  max_attention_window_vec, test_id)
+    # No window (full attention only)
+    (1, 1, False, 1, 1, False, False, [1024], "no_window"),
+    # With window: [max_seq_len, small_window]
+    (1, 1, False, 1, 1, False, False, [1024, 24], "with_window"),
+    # Different PP + window
+    (1, 2, False, 1, 1, False, False, [1024, 24], "pp2_to_pp1_window"),
+    (1, 1, False, 1, 2, False, False, [1024, 24], "pp1_to_pp2_window"),
+    (1, 2, False, 2, 1, False, False, [1024, 24], "pp2_to_tp2_window"),
 ]
 
 
@@ -765,6 +945,74 @@ def test_transfer_worker_v2(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
     add_and_verify_request(setup, 0, 1, request_len, send_first=True)
     add_and_verify_request(setup, 2, 3, request_len, send_first=True)
     add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,max_attention_window_vec",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in WINDOW_SIZE_TEST_CONFIGS],
+    ids=[c[8] for c in WINDOW_SIZE_TEST_CONFIGS],
+)
+def test_transfer_worker_v1_with_window(
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, max_attention_window_vec
+):
+    """Test V1 transfer worker with sliding window attention."""
+    pytest.skip("V1 with VSWA (Variable Sliding Window Attention) not supported in unit test")
+
+    tensorrt_llm.logger.set_level("info")
+    logger.info("Test transfer worker V1 with sliding window attention")
+
+    setup = create_transfer_worker_setup(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=is_mla,
+        use_v2=False,
+        max_attention_window_vec=max_attention_window_vec,
+    )
+
+    # Test multiple requests with different lengths
+    # small_window=24, tokens_per_block=8
+    # 16 tokens = 2 blocks (< small_window)
+    # 32 tokens = 4 blocks (> small_window, need last 4 blocks for sliding window layers)
+    # 64 tokens = 8 blocks (>> small_window, need last 4 blocks for sliding window layers)
+    add_and_verify_request(setup, 0, 1, request_len=16, send_first=True)
+    add_and_verify_request(setup, 2, 3, request_len=32, send_first=True)
+    add_and_verify_request(setup, 4, 5, request_len=64, send_first=False)
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,max_attention_window_vec",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in WINDOW_SIZE_TEST_CONFIGS],
+    ids=[c[8] for c in WINDOW_SIZE_TEST_CONFIGS],
+)
+def test_transfer_worker_v2_with_window(
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, max_attention_window_vec
+):
+    """Test V2 transfer worker with sliding window attention."""
+    tensorrt_llm.logger.set_level("info")
+    logger.info("Test transfer worker V2 with sliding window attention")
+
+    setup = create_transfer_worker_setup(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=is_mla,
+        use_v2=True,
+        max_attention_window_vec=max_attention_window_vec,
+    )
+
+    # Test multiple requests with different lengths
+    add_and_verify_request(setup, 0, 1, request_len=16, send_first=True)
+    add_and_verify_request(setup, 2, 3, request_len=32, send_first=True)
+    add_and_verify_request(setup, 4, 5, request_len=64, send_first=False)
 
 
 if __name__ == "__main__":
