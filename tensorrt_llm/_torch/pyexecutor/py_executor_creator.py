@@ -363,6 +363,7 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
+            checkpoint_loader=checkpoint_loader,
         )
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
