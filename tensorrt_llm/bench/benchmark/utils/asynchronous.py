@@ -12,6 +12,7 @@ from zmq.asyncio import Context
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.bench.benchmark.utils.energy_monitor import EnergyMonitor
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -259,6 +260,7 @@ async def async_benchmark(
     outbox = asyncio.Queue()
     statistics = StatsKeeper()
     submit_finished = asyncio.Event()
+    monitor = EnergyMonitor(llm.args.parallel_config.world_size)
 
     logger.info("Starting benchmarking async task.")
     backend = LlmManager(llm,
@@ -275,6 +277,7 @@ async def async_benchmark(
                              post_proc_params, submit_finished))
 
         logger.info("Starting benchmark...")
+        monitor.start()
         pbar = tqdm.tqdm(total=len(requests), desc="Benchmarking")
         finished_requests = 0
 
@@ -290,6 +293,7 @@ async def async_benchmark(
                 logger.debug("No items in queue. Continuing.")
 
         assert finished_requests == len(requests), "Benchmark failed"
+        monitor.stop(statistics, llm.args.parallel_config.world_size)
         logger.info("Benchmark complete.")
 
         return statistics
