@@ -352,7 +352,7 @@ class PyExecutor:
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         self.enable_partial_reuse_for_disagg = (
-            self.enable_kv_cache_reuse and self.kv_cache_manager is not None
+            self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse)
 
         self.max_input_len = max_input_len
