@@ -390,7 +390,13 @@ if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   set(CMAKE_MODULE_LINKER_FLAGS
       "${CMAKE_MODULE_LINKER_FLAGS} -Wl,--emit-relocs")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--emit-relocs")
+  # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
+  set(CMAKE_STRIP
+      ""
+      CACHE STRING "Disabled for BOLT compatibility" FORCE)
+  message(STATUS "BOLT: Disabled CMAKE_STRIP to prevent binary stripping")
 endif()
+# Note: For nanobind modules, use NOSTRIP option in nanobind_add_module()
 # ==== End BOLT Compatible Flags ====
 
 # Disable deprecated declarations warnings
