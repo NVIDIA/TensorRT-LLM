@@ -17,7 +17,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
-from tensorrt_llm._torch.pyexecutor.waiting_queue import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 
 
 class MockPyExecutor:

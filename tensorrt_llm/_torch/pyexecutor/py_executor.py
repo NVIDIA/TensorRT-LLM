@@ -6,7 +6,6 @@ import pickle  # nosec B403
 import threading
 import time
 import traceback
-from collections import deque
 from contextlib import contextmanager
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -57,12 +56,12 @@ from .model_engine import ModelEngine
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests,
                             schedule_attention_dp_requests)
-from .waiting_queue import WaitingQueue, create_waiting_queue
 from .resource_manager import ResourceManager
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
-                        SerializableSchedulerOutput)
+                        SerializableSchedulerOutput, WaitingQueue,
+                        create_waiting_queue)
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -241,31 +240,32 @@ class AsyncTransferManager:
 
 class PyExecutor:
 
-    def __init__(self,
-                 resource_manager,
-                 scheduler: RequestScheduler,
-                 model_engine: ModelEngine,
-                 sampler: Sampler,
-                 dist: Distributed,
-                 max_num_sequences: int,
-                 drafter: Optional[Drafter] = None,
-                 disable_overlap_scheduler: bool = False,
-                 max_input_len: int = 0x7fffffff,
-                 max_batch_size: int = 8,
-                 max_beam_width: int = 1,
-                 max_draft_len: int = 0,
-                 max_total_draft_tokens: int = 0,
-                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-                 guided_decoder: Optional[GuidedDecoder] = None,
-                 garbage_collection_gen0_threshold: Optional[int] = None,
-                 start_worker: bool = True,
-                 kv_connector_manager: Optional[KvCacheConnectorManager] = None,
-                 max_seq_len: Optional[int] = None,
-                 peft_cache_config: Optional[PeftCacheConfig] = None,
-                 virtual_memory_pools: Optional[dict] = None,
-                 hang_detection_timeout: Optional[int] = None,
-                 execution_stream: Optional[torch.cuda.Stream] = None,
-                 waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
+    def __init__(
+            self,
+            resource_manager,
+            scheduler: RequestScheduler,
+            model_engine: ModelEngine,
+            sampler: Sampler,
+            dist: Distributed,
+            max_num_sequences: int,
+            drafter: Optional[Drafter] = None,
+            disable_overlap_scheduler: bool = False,
+            max_input_len: int = 0x7fffffff,
+            max_batch_size: int = 8,
+            max_beam_width: int = 1,
+            max_draft_len: int = 0,
+            max_total_draft_tokens: int = 0,
+            kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
+            guided_decoder: Optional[GuidedDecoder] = None,
+            garbage_collection_gen0_threshold: Optional[int] = None,
+            start_worker: bool = True,
+            kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+            max_seq_len: Optional[int] = None,
+            peft_cache_config: Optional[PeftCacheConfig] = None,
+            virtual_memory_pools: Optional[dict] = None,
+            hang_detection_timeout: Optional[int] = None,
+            execution_stream: Optional[torch.cuda.Stream] = None,
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -2051,8 +2051,7 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
-    def _fetch_and_enqueue_requests(self,
-                                    waiting_queue: WaitingQueue,
+    def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
         # Block new requests while control requests are pending

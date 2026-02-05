@@ -12,7 +12,7 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
-from .llm_request import LlmRequest, LlmRequestState
+from ..llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
 

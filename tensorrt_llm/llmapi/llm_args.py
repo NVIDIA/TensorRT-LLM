@@ -1489,9 +1489,6 @@ class WaitingQueuePolicy(StrEnum):
     """Waiting queue scheduling policy for managing pending requests."""
 
     FCFS = "fcfs"  # First-Come-First-Served
-    PRIORITY = "priority"  # By request's priority parameter
-    SHORTEST_FIRST = "shortest_first"  # By input length (SJF)
-    CACHE_AWARE = "cache_aware"  # By KV cache hit rate
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)

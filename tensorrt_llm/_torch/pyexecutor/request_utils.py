@@ -2,11 +2,11 @@
 
 import heapq
 import os
-from collections import deque, namedtuple
+from collections import namedtuple
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
-    from .waiting_queue import WaitingQueue
+    from .scheduler import WaitingQueue
 
 import torch
 
