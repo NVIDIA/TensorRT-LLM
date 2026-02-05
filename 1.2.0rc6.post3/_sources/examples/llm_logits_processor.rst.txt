@@ -1,0 +1,8 @@
+Control generated text using logits processor
+=============================================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/7c6df0e19f92c7eba91fe58d67d64e968aa909e5/examples/llm-api/llm_logits_processor.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_logits_processor.py
+    :lines: 4-128
+    :language: python
+    :linenos:
