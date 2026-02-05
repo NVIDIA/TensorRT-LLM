@@ -1122,9 +1122,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w3_w1_weight, tmp_w3_w1_weight_scale = swizzle_weight_and_scale(
             module.w3_w1_weight.data, tmp_w3_w1_weight_scale)
 
-        module._parameters.pop('w3_w1_weight', None)
-        module._parameters.pop('fc31_dequant', None)
-        torch.cuda.empty_cache()
+        # Instantly release memory by resizing storage to 0 to avoid OOM
+        _popped = module._parameters.pop('w3_w1_weight', None)
+        _popped.data.storage().resize_(0)
+        _popped = module._parameters.pop('fc31_dequant', None)
+        _popped.data.storage().resize_(0)
 
         module.w3_w1_weight = tmp_w3_w1_weight
         module.fc31_dequant = tmp_w3_w1_weight_scale
@@ -1133,9 +1135,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w2_weight, tmp_w2_weight_scale = swizzle_weight_and_scale(
             module.w2_weight.data, tmp_w2_weight_scale)
 
-        module._parameters.pop('w2_weight', None)
-        module._parameters.pop('fc2_dequant', None)
-        torch.cuda.empty_cache()
+        # Instantly release memory by resizing storage to 0 to avoid OOM
+        _popped = module._parameters.pop('w2_weight', None)
+        _popped.data.storage().resize_(0)
+        _popped = module._parameters.pop('fc2_dequant', None)
+        _popped.data.storage().resize_(0)
 
         module.w2_weight = tmp_w2_weight
         module.fc2_dequant = tmp_w2_weight_scale
