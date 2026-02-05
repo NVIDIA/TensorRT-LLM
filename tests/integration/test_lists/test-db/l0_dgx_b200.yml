@@ -220,7 +220,9 @@ l0_dgx_b200:
       backend: autodeploy
       orchestrator: mpi
   tests:
-  - unittest/_torch/auto_deploy/unit/multigpu
+  - unittest/auto_deploy/multigpu/custom_ops
+  - unittest/auto_deploy/multigpu/smoke
+  - unittest/auto_deploy/multigpu/transformations
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16

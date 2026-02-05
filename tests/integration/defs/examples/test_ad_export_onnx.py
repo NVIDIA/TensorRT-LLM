@@ -7,8 +7,7 @@ import pytest
 
 # Import utility from unittest directory
 sys.path.insert(
-    0,
-    str(Path(__file__).parent.parent.parent.parent / "unittest/_torch/auto_deploy/_utils_test"),
+    0, str(Path(__file__).parent.parent.parent.parent / "unittest/auto_deploy/_utils_test")
 )
 from _model_test_utils import get_small_model_config
 
