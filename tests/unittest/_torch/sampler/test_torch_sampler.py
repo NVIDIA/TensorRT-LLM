@@ -35,7 +35,6 @@ import torch
 from scipy.stats import power_divergence
 from utils.util import assert_no_cuda_sync, force_ampere
 
-from tensorrt_llm._torch.pyexecutor import sampling_utils_flashinfer
 from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
 from tensorrt_llm._torch.pyexecutor.sampler import (
     GREEDY,
@@ -1563,11 +1562,10 @@ class TestBatchedSampling:
                 return_probs: bool,
                 group_metadata: StrategyMetadata | None = None,
             ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-                assert issubclass(group_key, sampling_utils_flashinfer._StrategyImpls.StrategyImpl)
                 assert generator is sampler.get_generator(logits.device)
                 nonlocal flashinfer_keys_seen
-                assert group_key not in flashinfer_keys_seen
-                flashinfer_keys_seen.add(group_key)
+                assert (group_key, return_probs) not in flashinfer_keys_seen
+                flashinfer_keys_seen.add((group_key, return_probs))
                 return sample_grouped_strategies_orig(
                     group_key,
                     strategies,
