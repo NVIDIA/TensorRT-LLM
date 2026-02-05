@@ -17,8 +17,90 @@ import math
 from typing import Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+
+
+@triton.jit
+def _cu_seqlens_triton_kernel(
+    cu_seqlens_ptr,  # [num_seqs + 1]
+    chunk_indices_ptr,  # [N] output
+    chunk_offsets_ptr,  # [N] output
+    num_seqs: tl.constexpr,
+    chunk_size: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Computes chunk_indices and chunk_offsets in a single kernel launch."""
+    pid = tl.program_id(0)
+    chunk_start = pid * BLOCK_SIZE
+    offsets = chunk_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    chunk_indices = offsets.to(tl.int64)
+    chunk_offsets = tl.zeros([BLOCK_SIZE], dtype=tl.int64)
+
+    p = 0
+    for seq_idx in range(num_seqs - 1):
+        seq_start = tl.load(cu_seqlens_ptr + seq_idx + 1).to(tl.int64)
+        seq_end = tl.load(cu_seqlens_ptr + seq_idx + 2).to(tl.int64)
+        is_misaligned = (seq_start % chunk_size) > 0
+        p = p + is_misaligned
+        s_chunk = seq_start // chunk_size + p
+        e_chunk = seq_end // chunk_size + p + ((seq_end % chunk_size) > 0)
+        in_range = (offsets >= s_chunk) & (offsets < e_chunk)
+        chunk_indices = tl.where(in_range & mask, chunk_indices - p,
+                                 chunk_indices)
+        is_start = (offsets == s_chunk)
+        chunk_offsets = tl.where(is_start & mask, seq_start % chunk_size,
+                                 chunk_offsets)
+
+    tl.store(chunk_indices_ptr + offsets, chunk_indices.to(tl.int32), mask=mask)
+    tl.store(chunk_offsets_ptr + offsets, chunk_offsets.to(tl.int32), mask=mask)
+
+
+def cu_seqlens_to_chunk_indices_offsets_triton(
+        cu_seqlens: torch.Tensor,
+        chunk_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimized version of cu_seqlens_to_chunk_indices_offsets."""
+    device = cu_seqlens.device
+    num_seqs = cu_seqlens.numel() - 1
+
+    if num_seqs == 0:
+        return (torch.empty(0, dtype=torch.int, device=device),
+                torch.empty(0, dtype=torch.int, device=device))
+
+    cu = cu_seqlens.to(dtype=torch.int64)
+    total_seqlens = cu[-1].item()
+
+    if num_seqs == 1:
+        # Fast path for single sequence (no boundaries to process)
+        N = (total_seqlens + chunk_size - 1) // chunk_size
+        return (torch.arange(N, device=device, dtype=torch.int),
+                torch.zeros(N, device=device, dtype=torch.int))
+
+    seq_starts = cu[1:-1]
+    misaligned = ((seq_starts % chunk_size) > 0).to(torch.int64)
+    p = torch.cumsum(misaligned, dim=0)
+    extra_chunks = p[-1].item() if p.numel() > 0 else 0
+    N = (total_seqlens + chunk_size - 1) // chunk_size + extra_chunks
+    chunk_indices = torch.empty(N, device=device, dtype=torch.int)
+    chunk_offsets = torch.empty(N, device=device, dtype=torch.int)
+
+    BLOCK_SIZE = 256
+    grid = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE, )
+    _cu_seqlens_triton_kernel[grid](
+        cu,
+        chunk_indices,
+        chunk_offsets,
+        num_seqs=num_seqs,
+        chunk_size=chunk_size,
+        N=N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return chunk_indices, chunk_offsets
 
 
 def cu_seqlens_to_chunk_indices_offsets(
@@ -107,6 +189,15 @@ class Mamba2Metadata:
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
+        # Pre-allocated buffers.
+        self._arange_buffer = torch.arange(max_batch_size + 1,
+                                           dtype=torch.int,
+                                           device="cuda")
+        self._arange_buffer_long = self._arange_buffer.to(torch.long)
+        self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
+                                            dtype=torch.long,
+                                            device="cuda")
+
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
@@ -118,38 +209,32 @@ class Mamba2Metadata:
                          dtype=torch.int,
                          out=self.cu_seqlens[1:num_contexts + 1])
             torch.add(self.cu_seqlens[num_contexts],
-                      torch.arange(1,
-                                   batch_size - num_contexts + 1,
-                                   dtype=self.cu_seqlens.dtype,
-                                   device=self.cu_seqlens.device),
+                      self._arange_buffer[1:batch_size - num_contexts + 1],
                       out=self.cu_seqlens[num_contexts + 1:batch_size + 1])
             # Need both `query_start_loc` and `query_start_loc_long` because `causal_conv1d_fn`
             # accepts only `int32` while `chunk_gated_delta_rule` accepts only `long`.
             self.query_start_loc = self.cu_seqlens[:batch_size + 1]
-            self.query_start_loc_long = self.query_start_loc.to(torch.long)
+            self._cu_seqlens_long[:batch_size + 1].copy_(self.query_start_loc)
+            self.query_start_loc_long = self._cu_seqlens_long[:batch_size + 1]
             self.seq_idx = torch.repeat_interleave(
-                torch.arange(num_contexts,
-                             dtype=torch.int,
-                             device=self.cu_seqlens.device),
+                self._arange_buffer[:num_contexts],
                 repeats=context_lens,
                 output_size=num_ctx_tokens).unsqueeze(0)
 
             num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
-            self.has_initial_states[:num_contexts] = torch.tensor(
-                num_cached_tokens_per_seq[:num_contexts]) > 0
-            # precomputed bool to avoid host<->device syncs during forward pass
-            self.use_initial_states = torch.any(
-                self.has_initial_states[:num_contexts]).item()
+            initial_states = [
+                num_cached_tokens_per_seq[i] > 0 for i in range(num_contexts)
+            ]
+            self.use_initial_states = any(initial_states)
             if self.use_initial_states:
-                self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
+                self.has_initial_states[:num_contexts] = torch.tensor(
+                    initial_states, dtype=torch.bool)
+                self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
                     self.cu_seqlens[:num_contexts + 1], self.chunk_size)
             else:
                 self.chunk_indices = None
                 self.chunk_offsets = None
         else:
             self.query_start_loc = None
-            self.query_start_loc_long = torch.arange(
-                0,
-                batch_size + 1,
-                dtype=torch.long,
-                device=self.cu_seqlens.device)
+            self.query_start_loc_long = self._arange_buffer_long[:batch_size +
+                                                                 1]
