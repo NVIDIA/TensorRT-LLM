@@ -84,6 +84,9 @@ class TestStrategySelection:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
 
+        def __init__(self):
+            self._py_sampling_strategy: Strategy | None = None
+
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
@@ -1561,8 +1564,12 @@ class TestBatchedSampling:
                 generator: Optional[torch.Generator] = None,
                 return_probs: bool,
                 group_metadata: StrategyMetadata | None = None,
-            ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
                 assert generator is sampler.get_generator(logits.device)
+                if isinstance(group_key, tuple):
+                    assert isinstance(group_key[0], str)
+                else:
+                    assert isinstance(group_key, str)
                 nonlocal flashinfer_keys_seen
                 assert (group_key, return_probs) not in flashinfer_keys_seen
                 flashinfer_keys_seen.add((group_key, return_probs))
