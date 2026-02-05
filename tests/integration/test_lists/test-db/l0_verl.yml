@@ -1,0 +1,20 @@
+version: 0.0.1
+l0_verl:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: verl
+      orchestrator: mpi
+  tests:
+  # Tests from verl repo - use verl:: prefix to indicate tests from the verl repository
+  # The verl:: prefix will be transformed to the actual verl path during test execution
+  - verl::tests/test_example.py::TestClass::test_method
