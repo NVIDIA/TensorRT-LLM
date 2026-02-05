@@ -10,6 +10,8 @@ mpi4py
 numpy<2
 onnx>=1.18.0,<1.20.0
 onnx_graphsurgeon>=0.5.2
+onnxscript==0.5.4
+graphviz
 openai
 polygraphy
 psutil
@@ -35,7 +37,6 @@ pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf
 pillow
-wheel<=0.45.1
 optimum
 # evaluate needs datasets>=2.0.0 which triggers datasets>3.1.0 which is not stable: https://github.com/huggingface/datasets/issues/7467
 datasets==3.1.0
@@ -80,4 +81,5 @@ mistral-common==1.8.6
 torchao>=0.14.1
 cuda-core
 llist
-dynamic_path_manager
+cuda-tile>=1.0.1
+nvidia-cuda-tileiras>=13.1

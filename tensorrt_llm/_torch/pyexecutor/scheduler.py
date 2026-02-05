@@ -168,6 +168,68 @@ class BindCapacityScheduler(CapacityScheduler):
                          self.peft_cache_manager)
 
 
+class KVCacheV2DummyScheduler(CapacityScheduler):
+    # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
+    no_schedule_until_state = LlmRequestState.CONTEXT_INIT
+    no_schedule_after_state = LlmRequestState.GENERATION_COMPLETE
+
+    def __init__(self, max_num_requests: int, kv_cache_manager):
+        super(KVCacheV2DummyScheduler, self).__init__()
+        self.max_num_requests = max_num_requests
+        self.kv_cache_manager = kv_cache_manager
+
+    def schedule_request(
+        self, active_requests: RequestList
+    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
+        scheduled_requests = []
+        scheduled_disagg_gen_init_requests = []
+        pending_requests = []
+        reserved_blocks = 0
+        max_blocks = self.kv_cache_manager.get_max_resource_count()
+        for request in active_requests:
+            req_state = request.state
+            # if request cannot be scheduled yet or request should no longer be scheduled, skip
+            if not req_state == LlmRequestState.DISAGG_GENERATION_INIT and (
+                    req_state.value < self.no_schedule_until_state.value
+                    or req_state.value >= self.no_schedule_after_state.value):
+                continue
+
+            if len(scheduled_requests
+                   ) >= self.max_num_requests or reserved_blocks >= max_blocks:
+                break
+            elif req_state == LlmRequestState.GENERATION_IN_PROGRESS or req_state == LlmRequestState.GENERATION_TO_COMPLETE:
+                scheduled_requests.append(request)
+                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(
+                    request)
+            elif req_state == LlmRequestState.DISAGG_GENERATION_INIT:
+                scheduled_disagg_gen_init_requests.append(request)
+                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(
+                    request)
+            else:
+                pending_requests.append(request)
+
+        avaiable_blocks = max_blocks - reserved_blocks
+        for request in pending_requests:
+            req_state = request.state
+            if len(scheduled_requests) >= self.max_num_requests:
+                break
+            elif req_state == LlmRequestState.CONTEXT_INIT:
+                needed_blocks = self.kv_cache_manager.get_needed_resource_to_completion(
+                    request)
+                if needed_blocks <= avaiable_blocks:
+                    scheduled_requests.append(request)
+                    avaiable_blocks -= needed_blocks
+                elif needed_blocks > avaiable_blocks:
+                    # If one requests fails to be scheduled, break
+                    break
+
+        assert len(scheduled_requests) + len(
+            scheduled_disagg_gen_init_requests) > 0, (
+                "no pending request can get enough resource to complete, "
+                "please increase KV cache pool size.")
+        return scheduled_requests, scheduled_disagg_gen_init_requests, []
+
+
 class MicroBatchScheduler(ABC):
 
     @abstractmethod

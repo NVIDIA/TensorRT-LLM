@@ -424,3 +424,45 @@ async def test_server_health_check(mock_metadata_server, router_class):
         live_servers = await router.check_servers_health(servers)
         assert len(live_servers) == 1, "Should have one healthy server"
         assert server_url2 in live_servers, "Second server should still be present"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+async def test_get_next_server_exclude_server(router_class):
+    servers = ["server1", "server2", "server3"]
+    router = router_class(server_role="context", servers=servers)
+    exclude_server2 = {server: 0 for server in servers}
+    exclude_server3 = {server: 0 for server in servers}
+    for _ in range(0, 10):
+        server, _ = await router.get_next_server(CompletionRequest(
+            model="TinyLlama", prompt=[[10] * 10]),
+                                                 exclude_server="server2")
+        exclude_server2[server] += 1
+        server, _ = await router.get_next_server(CompletionRequest(
+            model="TinyLlama", prompt=[[10] * 10]),
+                                                 exclude_server="server3")
+        exclude_server3[server] += 1
+    if router_class == KvCacheAwareRouter:
+        # KvCacheAwareRouter is not load-balanced
+        assert exclude_server2["server2"] == 0
+        assert exclude_server3["server3"] == 0
+    else:
+        assert exclude_server2["server1"] > 0 and exclude_server2[
+            "server2"] == 0 and exclude_server2["server3"] > 0, exclude_server2
+        assert exclude_server3["server1"] > 0 and exclude_server3[
+            "server2"] > 0 and exclude_server3["server3"] == 0, exclude_server3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+async def test_get_next_server_exclude_server_insufficient(router_class):
+    servers = ["server1"]
+    router = router_class(server_role="context",
+                          servers=servers,
+                          use_tokens=False)
+    with pytest.raises(Exception):
+        await router.get_next_server(CompletionRequest(model="TinyLlama",
+                                                       prompt=[[10] * 10]),
+                                     exclude_server=servers[0])

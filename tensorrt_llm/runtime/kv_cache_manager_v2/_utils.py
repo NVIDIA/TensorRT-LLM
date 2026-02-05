@@ -21,12 +21,14 @@ import itertools
 import operator
 import os
 import platform
+import sys
 import traceback
 import warnings
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Set
+from contextlib import contextmanager
 from ctypes.util import find_library
 from itertools import pairwise
 from typing import (
@@ -610,7 +612,7 @@ class SimplePool(Generic[T]):
         if self._max_size is not None and len(self.items) >= self._max_size:
             self._destroy_func(item)
         else:
-            self.items.appendleft(item)
+            self.items.append(item)
 
     @property
     def outstanding_count(self) -> int:
@@ -781,6 +783,9 @@ class CachedCudaStream(ItemHolderBase[CudaStream]):
     def __cuda_stream__(self) -> tuple[int, int]:
         return 0, int(self.get())
 
+    def synchronize(self) -> None:
+        _unwrap(drv.cuStreamSynchronize(self.handle))
+
     @property
     def pool(self) -> SimplePool[CudaStream]:
         if CachedCudaStream._pool is None:
@@ -943,3 +948,15 @@ class CudaStreamWrapper:
 
     def __cuda_stream__(self) -> tuple[int, int]:
         return 0, int(self._stream)
+
+
+@contextmanager
+def temporary_sys_path(path: str) -> Iterator[None]:
+    already_in_path = path in sys.path
+    if not already_in_path:
+        sys.path.insert(0, path)
+    try:
+        yield
+    finally:
+        if not already_in_path:
+            sys.path.remove(path)

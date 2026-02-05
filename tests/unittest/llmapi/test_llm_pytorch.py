@@ -30,8 +30,8 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        prompts, run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
-                        skip_gpu_memory_less_than_40gb,
+from utils.util import (force_ampere, similar, similarity_score,
+                        skip_fp8_pre_ada, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
@@ -627,6 +627,42 @@ def test_llama_3_1_8b_fp8_with_bf16_lora(cuda_graph_config) -> None:
     finally:
         llm.shutdown()
     assert similar(output.outputs[0].text, reference)
+
+
+@skip_ray  # https://nvbugs/5682551
+@skip_gpu_memory_less_than_80gb
+def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
+    skip_fp8_pre_ada(use_fp8=True)
+
+    model_dir = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
+    lora_dir = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8-lora-adapter_NIM_r8"
+
+    prompt = "What is the capital of the United States?"
+    expected_output = " Washington, D.C.\nWhat is the capital of the United States? Washington, D.C."
+
+    lora_config = LoraConfig(lora_dir=[lora_dir],
+                             max_lora_rank=8,
+                             max_loras=2,
+                             max_cpu_loras=2)
+    lora_req = LoRARequest("squad-lora", 0, lora_dir)
+
+    llm = LLM(model_dir,
+              tensor_parallel_size=2,
+              lora_config=lora_config,
+              cuda_graph_config=None)
+
+    try:
+        output = llm.generate(prompt,
+                              SamplingParams(max_tokens=50, temperature=0.0),
+                              lora_request=[lora_req])
+        generated_text = output.outputs[0].text
+        print(f"Generated output: {repr(generated_text)}")
+
+        similarity = similarity_score(generated_text, expected_output)
+        assert similar(generated_text, expected_output, threshold=0.8), \
+            f"Output similarity too low (similarity={similarity:.2%})!\nExpected: {repr(expected_output)}\nGot: {repr(generated_text)}"
+    finally:
+        llm.shutdown()
 
 
 @skip_gpu_memory_less_than_80gb

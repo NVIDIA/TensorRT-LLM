@@ -746,7 +746,11 @@ def module_timer(request):
 # - 128-alignment requirements for quantization
 #
 # =============================================================================
+<<<<<<< test
 # @pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
+=======
+@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
+>>>>>>> main
 @pytest.mark.parametrize(
     "dtype_activation,backend_type,quant_algo,seq_len,model_config,swiglu_alpha,swiglu_beta,swiglu_limit",
     TEST_PARAMS,

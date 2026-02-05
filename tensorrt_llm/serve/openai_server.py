@@ -290,6 +290,9 @@ class OpenAIServer:
         self.app.add_api_route("/update_weights",
                                 self.update_weights,
                                 methods=["POST"])
+        self.app.add_api_route("/server_info",
+                                self.get_server_info,
+                                methods=["GET"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -345,6 +348,13 @@ class OpenAIServer:
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
+        extra_args = {}
+        if self.llm.args.max_beam_width > 1:
+            extra_args = dict(
+                use_beam_search=True,
+                best_of=self.llm.args.max_beam_width,
+                n=1,
+            )
         try:
             # Create a minimal chat request
             health_request = ChatCompletionRequest(
@@ -352,7 +362,8 @@ class OpenAIServer:
                 model=self.model,
                 max_completion_tokens=1, # Request only 1 token out
                 stream=False,
-                temperature=0.0 # Deterministic output
+                temperature=0.0, # Deterministic output
+                **extra_args,
             )
 
             # Call the chat completion logic
@@ -1130,6 +1141,9 @@ class OpenAIServer:
         assert isinstance(self.llm, AsyncLLM), "/update_weights endpoint is only supported with AsyncLLM()"
         await self.llm.collective_rpc('update_weights', args=(request.weights,))
         return JSONResponse(content={"status": "success"})
+
+    async def get_server_info(self) -> JSONResponse:
+        return JSONResponse(content={"disaggregated_params": self.llm.disaggregated_params})
 
     async def __call__(self, host, port, sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration
