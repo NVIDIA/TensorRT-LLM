@@ -1019,9 +1019,6 @@ def apply_model_defaults_to_llm_args(
 
     Returns the defaults that were actually applied.
     """
-    if getattr(llm_args, "_model_defaults_applied", False):
-        return {}
-
     if not model_defaults_dict:
         return {}
 
@@ -1029,17 +1026,15 @@ def apply_model_defaults_to_llm_args(
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
 
-    llm_args_class = type(llm_args)
-    new_args = llm_args_class(**merged_state)
+    new_args = TorchLlmArgs(**merged_state)
 
     for field_name in llm_args.model_fields:
         setattr(llm_args, field_name, getattr(new_args, field_name))
 
-    llm_args._model_defaults_applied = True
     applied_defaults = compute_applied_llm_defaults(model_defaults_dict,
                                                     user_overrides)
 
-    logger.debug(f"Applied model defaults: {applied_defaults}")
+    logger.info(f"Applied model defaults: {applied_defaults}")
 
     return applied_defaults
 

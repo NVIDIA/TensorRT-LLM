@@ -2237,7 +2237,6 @@ class BaseLlmArgs(StrictBaseModel):
 
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
-    _model_defaults_applied: bool = PrivateAttr(default=False)
 
     @property
     def parallel_config(self) -> _ParallelConfig:
