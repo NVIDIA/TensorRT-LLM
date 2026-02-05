@@ -78,29 +78,36 @@ The actual threshold value equals the `threshold_scale_factor` divided by the co
 | Target Sparsity | Threshold Scale Factor (Prefill) | Threshold Scale Factor (Decode) |
 |:---------------:|:----------------------------:|:----------------------------:|
 | 0.0             | 0.0                          | 0.0                          |
-| 0.5             | 85.97                        | 55.48                        |
-| 0.6             | 333.81                       | 118.90                       |
-| 0.7             | 469.03                       | 254.23                       |
-| 0.8             | 718.14                       | 418.73                       |
-| 0.9             | 1418.14                      | 863.14                       |
+| 0.1             | 18.76                        | 0.32                         |
+| 0.2             | 44.37                        | 0.86                         |
+| 0.3             | 104.97                       | 2.30                         |
+| 0.4             | 248.40                       | 6.17                         |
+| 0.5             | 587.18                       | 16.52                        |
+| 0.6             | 1390.63                      | 44.26                        |
+| 0.7             | 3293.04                      | 118.62                       |
+| 0.8             | 7799.91                      | 317.99                       |
+| 0.9             | 18471.56                     | 852.20                       |
 
 ## Accuracy Evaluation
 We evaluate the accuracy of Skip Softmax Attention using LongBench V1 and V2. LongBench V1 is a comprehensive benchmark for medium-to-long context understanding, with average sequence length of 10k tokens. LongBench V2 is a harder benchmark that contains longer sequences, and we pick its `medium` subset and truncate the prompt length to 256k due to the limit of the native context window of the model. The average sequence length of LongBench V2 is 130k tokens.
 
-The evaluation results are summarized in the table below:
+The evaluation results (on H200) are summarized in the table below:
 
 | Target Sparsity | LongBench V1 Overall Accuracy | LongBench V2 Overall Accuracy |
 |:---------------:|:----------------------------:|:----------------------------:|
-| 0.0             | 47.77                        | 36.28                        |
-| 0.5             | 47.43                        | 38.14                        |
-| 0.6             | 47.47                       | 39.53                        |
-| 0.7             | 47.21                     | 39.53                        |
-| 0.8             | 46.50                     | 37.21                        |
-| 0.9             | 45.97                       | 37.21                        |
+| 0.0             | 47.79                    |          35.81              |
+| 0.1             | 47.92                       |       40.00                 |
+| 0.2             | 47.80                        |      38.14                  |
+| 0.3             | 47.84                        |       38.60                 |
+| 0.4             | 47.84                       |        39.53                |
+| 0.5             | 46.87                       |       37.67              |
+| 0.6             | 46.45                       |       36.28                 |
+| 0.7             | 45.56                     |         34.88               |
+| 0.8             | 43.38                     |         36.74              |
+| 0.9             | 39.84                       |        39.07            |
 
 Note that the number of samples in LongBench V2 is very small (~200), so the result is subject to large variance. You will see non-monotonic relationship between sparsity and accuracy. We recommend to look at LongBench V1 (~5000 samples) for inspecting the accuracy loss trend.
 
-These results demonstrate that Skip Softmax Attention is safe to use without significant accuracy degradation.
 
 
 ## Performance Benchmark
@@ -116,27 +123,27 @@ As a reference, the baseline performance data **without** Skip Softmax Attention
 
 | GPU | Seqlen | Precision | TFLOP/s | Duration µs |
 |:---:|:-----:|:---------:|--------:|--------------:|
-| H200 | 16k | BF16 | 594.05 | 7403.50 |
-| H200 | 16k | FP8  | 852.81 | 5157.12 |
-| H200 | 64k | BF16 | 610.30 | 115301.89 |
-| H200 | 64k | FP8  | 873.60 | 80550.30 |
-| B200 | 16k | BF16 | 1029.13 | 4273.56 |
-| B200 | 16k | FP8  | 1523.57 | 2886.67 |
-| B200 | 64k | BF16 | 1038.26 | 67775.65 |
-| B200 | 64k | FP8  | 1621.41  | 43399.72 |
+| H200 | 16k | BF16 | 594.05 | 7403 |
+| H200 | 16k | FP8  | 852.81 | 5157 |
+| H200 | 64k | BF16 | 610.30 | 115301 |
+| H200 | 64k | FP8  | 873.60 | 80550 |
+| B200 | 16k | BF16 | 1029.13 | 4273 |
+| B200 | 16k | FP8  | 1523.57 | 2886 |
+| B200 | 64k | BF16 | 1038.26 | 67775 |
+| B200 | 64k | FP8  | 1621.41  | 43399 |
 
 **Decode Baseline (we report memory bandwidth in TB/s):**
 
 | GPU | Seqlen | Precision | TB/s | Duration µs |
 |:---:|:-----:|:---------:|-----------------:|--------------:|
-| H200 | 16k | BF16 | 4.391 | 489.06 |
-| H200 | 16k | FP8  | 3.158 | 340.01 |
-| H200 | 64k | BF16 | 4.410 | 1947.83 |
-| H200 | 64k | FP8  | 3.221 | 1333.43 |
-| B200 | 16k | BF16 | 7.082 | 303.23 |
-| B200 | 16k | FP8  | 5.457 | 196.76 |
-| B200 | 64k | BF16 | 7.102 | 1209.51 |
-| B200 | 64k | FP8  | 5.683 | 755.76 |
+| H200 | 16k | BF16 | 4.31 | 498 |
+| H200 | 16k | FP8  | 4.03 | 266 |
+| H200 | 64k | BF16 | 4.37 | 1962 |
+| H200 | 64k | FP8  | 4.10 | 1045 |
+| B200 | 16k | BF16 | 7.08 | 303 |
+| B200 | 16k | FP8  | 5.46 | 196 |
+| B200 | 64k | BF16 | 7.10 | 1209 |
+| B200 | 64k | FP8  | 5.68 | 755 |
 
 The following figures plot **speedup vs. achieved sparsity**, on top of the baseline performance:
 
@@ -170,12 +177,16 @@ We benchmark the end-to-end performance to demonstrate the benefit of Skip Softm
 
 | Target Sparsity | TTFT/ms (H200) | TPOT/ms (H200) | TTFT/ms (B200) | TPOT/ms (B200) |
 |:--------------:|------------------:|-----------------:|--------------------:|--------------------:|
-| 0.0            | 9419.61           | 1731.80          | 4997.07             | 955.49              |
-| 0.5            | 9321.41           | 1712.62          | 4701.96             | 899.31              |
-| 0.6            | 9226.75           | 1701.59          | 4680.72             | 895.33              |
-| 0.7            | 9065.09           | 1672.45          | 4634.84             | 889.68              |
-| 0.8            | 8778.14           | 1622.27          | 4531.42             | 870.22              |
-| 0.9            | 8618.86           | 1596.62          | 4475.78             | 861.18              |
+| 0.0            | 9419.61           | 1731.80          | 4854.55             | 928.45              |
+| 0.1            | 9519.40           | 1746.73          | 4758.06             | 909.08              |
+| 0.2            | 9417.36           | 1729.74          | 4794.23             | 916.64              |
+| 0.3            | 9304.48           | 1711.27          | 4770.26             | 913.51              |
+| 0.4            | 9139.85           | 1684.78          | 4672.09             | 896.25              |
+| 0.5            | 8847.43           | 1633.08          | 4548.07             | 873.80              |
+| 0.6            | 8437.45           | 1560.64          | 4459.08             | 858.60              |
+| 0.7            | 8134.72           | 1508.60          | 4385.12             | 846.64              |
+| 0.8            | 8107.73           | 1507.82          | 4348.80             | 831.88              |
+| 0.9            | 8130.39           | 1516.16          | 4150.44             | 798.93              |
 
 LongBench V1 results are reported with concurrency 64. Due to the nature of in-flight batching, the decoding requests might be piggybacked with the prefilling requests, so the TPOT is relatively high.
 
@@ -183,12 +194,16 @@ LongBench V1 results are reported with concurrency 64. Due to the nature of in-f
 
 | Target Sparsity | TTFT/ms (H200) | TPOT/ms (H200) | TTFT/ms (B200) | TPOT/ms (B200) |
 |:--------------:|------------------:|-----------------:|--------------------:|--------------------:|
-| 0.0            | 16277.58          | 9.32             | 7370.71             | 6.34                |
-| 0.5            | 15487.28          | 8.57             | 6655.98             | 6.30                |
-| 0.6            | 15020.24          | 8.57             | 6431.65             | 6.25                |
-| 0.7            | 14921.12          | 8.42             | 6355.43             | 6.24                |
-| 0.8            | 14465.74          | 8.41             | 6192.77             | 6.26                |
-| 0.9            | 13791.37          | 8.40             | 6043.06             | 6.27                |
+| 0.0            | 16486.70          | 9.34             | 6990.59             | 6.30                |
+| 0.1            | 16487.54          | 8.61             | 7024.50             | 6.30                |
+| 0.2            | 16169.69          | 8.61             | 6687.21             | 6.34                |
+| 0.3            | 15750.17          | 8.46             | 6616.12             | 6.33                |
+| 0.4            | 15288.68          | 8.61             | 6432.32             | 6.27                |
+| 0.5            | 14554.04          | 8.45             | 6193.92             | 6.29                |
+| 0.6            | 14323.08          | 8.44             | 5966.53             | 6.32                |
+| 0.7            | 13871.32          | 8.42             | 5769.19             | 6.31                |
+| 0.8            | 12922.99          | 8.58             | 5605.66             | 6.23                |
+| 0.9            | 12507.95          | 8.58             | 5276.67             | 6.29                |
 
 Due to the extremely long context length, we only run LongBench V2 with concurrency 1. In this scenario, the prefilling/decoding is better separated and we can observe how is TTFT/TPOT affected by the sparsity. Note that the speedup for decoding is less pronounced under small batch size. Small batch size and small number of heads (with TP) are more close to real-world usage for long-context serving due to the limit of SLO, and we are actively optimizing the decoding performance under such scenarios.
 
@@ -197,7 +212,6 @@ Due to the extremely long context length, we only run LongBench V2 with concurre
 We provide the commands to reproduce the results in the previous context, as a showcase of how to evaluate the accuracy and benchmark the performance for Skip Softmax Attention.
 
 ### Accuracy evaluation (LongBench V1/V2)
-> Please manually `pip install lm_eval==0.4.9.2` before reproducing the results. There is a known bug in the current version of `lm_eval` in `requirements-dev.txt`.
 
 Both LongBench V1 and V2 are integrated into the TensorRT-LLM accuracy test suite, `trtllm-eval`. Here are the example scripts to run the accuracy evaluation:
 
@@ -261,8 +275,6 @@ throughput --dataset ${OUTPUT_DIR}/dumped_ids.json \
 --report_json ${OUTPUT_DIR}/report.json
 ```
 
-
-TODO: Compare with MInference.
 
 ## Conclusion
 Skip Softmax Attention is a kernel-based solution for accelerating the attention. Due to the design that BMM1 ($Q \cdot K^T$) in the attention kernel is not skipped, the performance gain is capped to 1.8x at kernel level. Nevertheless, it excels at achieving high sparsity with minimal accuracy degradation, and is especially effective in the medium-to-long context (10k-100k) scenarios where previous methods like MInference cannot well handle. The drop-in nature of Skip Softmax Attention makes it a flexible, easy-to-use method for accelerating long-context inference. MLA support for Skip Softmax Attention will be added in the future, and the Skip Softmax Attention kernels will be available in FlashInfer for adoptions by the open-source community.
