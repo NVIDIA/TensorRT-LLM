@@ -1459,10 +1459,8 @@ def deep_gemm_gen_tuning_buckets(x: int):
 
 
 class fp8SwapABGemmRunner(TunableRunner):
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
-    )
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, deep_gemm_gen_tuning_buckets), ), )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool):
         self.output_dtype = output_dtype

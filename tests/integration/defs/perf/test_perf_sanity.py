@@ -795,16 +795,28 @@ class DisaggTestCmds(NamedTuple):
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
                 )
-                server_files = [
-                    os.path.join(self.output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log"),
-                    os.path.join(self.output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.error.log"),
-                ] + [
-                    os.path.join(self.output_dir, f"trtllm-serve.CTX_{ctx_idx}.{server_idx}.log")
-                    for ctx_idx in range(self.num_ctx_servers)
-                ] + [
-                    os.path.join(self.output_dir, f"trtllm-serve.GEN_{gen_idx}.{server_idx}.log")
-                    for gen_idx in range(self.num_gen_servers)
-                ]
+                server_files = (
+                    [
+                        os.path.join(
+                            self.output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log"
+                        ),
+                        os.path.join(
+                            self.output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.error.log"
+                        ),
+                    ]
+                    + [
+                        os.path.join(
+                            self.output_dir, f"trtllm-serve.CTX_{ctx_idx}.{server_idx}.log"
+                        )
+                        for ctx_idx in range(self.num_ctx_servers)
+                    ]
+                    + [
+                        os.path.join(
+                            self.output_dir, f"trtllm-serve.GEN_{gen_idx}.{server_idx}.log"
+                        )
+                        for gen_idx in range(self.num_gen_servers)
+                    ]
+                )
                 wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
                     timeout=self.timeout,
