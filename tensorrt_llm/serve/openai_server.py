@@ -146,6 +146,18 @@ class OpenAIServer:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
 
+        # Usage statistics collection
+        from tensorrt_llm.usage import report_usage
+
+        # Extract pretrained_config if model_config exists
+        pretrained_config = None
+        if self.model_config is not None and hasattr(self.model_config, 'pretrained_config'):
+            pretrained_config = self.model_config.pretrained_config
+
+        # Start background collection (non-blocking)
+        report_usage(llm_args=self.llm.args,
+                     pretrained_config=pretrained_config)
+
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
         disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
