@@ -1782,13 +1782,15 @@ class PyExecutor:
                     break
 
                 self._terminate_requests(scheduled_batch.paused_requests)
+                self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
 
-                can_queue, _ = self._can_queue(scheduled_batch)
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
-                if can_queue: 
+
+                can_queue, _ = self._can_queue(scheduled_batch)
+                if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -2038,10 +2040,11 @@ class PyExecutor:
 
                 self._terminate_requests(scheduled_batch.paused_requests)
 
-                can_queue, can_queue_this_rank = self._can_queue(
-                    scheduled_batch)
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
+
+                can_queue, can_queue_this_rank = self._can_queue(
+                    scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
