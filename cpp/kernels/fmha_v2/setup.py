@@ -6943,6 +6943,11 @@ def enumerate_kernels():
                   and (kspec.head_size == 128 or kspec.head_size == 256 or not kspec.enable_attn_logit_softcapping)]
     # yapf: enable
 
+    # A separate more aggressive filter for building the fmha.exe binary. Can be ignored for building the cubins.
+    if "FMHA_FILTER_ARCH" in os.environ:
+        archs = [int(x) for x in os.environ["FMHA_FILTER_ARCH"].split(",")]
+        specs_names = [kspec for kspec in specs_names if kspec[0].sm in archs]
+
     generate_files(specs_names)
 
 
