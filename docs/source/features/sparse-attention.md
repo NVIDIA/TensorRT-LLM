@@ -5,7 +5,7 @@
 - [Quick Start](#quick-start)
   - [Python API](#python-api)
   - [Configure via YAML file](#configure-via-yaml-file)
-- [Algorithms Introduction](#algorithms-introduction)
+- [Sparse Attention Implementation](#sparse-attention-implementation)
   - [Framework-Level Sparse Attention](#framework-level-sparse-attention)
     - [Overview](#overview)
     - [Architecture](#architecture)
@@ -26,13 +26,12 @@ As Large Language Models (LLMs) are applied to increasingly complex tasks such a
 *   **Context Phase**: Processing long prompts requires substantial memory bandwidth and computation, affecting time-to-first-token (TTFT). Since the context phase is typically compute-bound, reducing the computational load here is critical.
 *   **Generation Phase**: The Key-Value (KV) cache grows with every generated token, consuming vast amounts of GPU memory and bandwidth. Since the generation phase is usually memory-bound, reducing the memory footprint directly alleviates memory pressure, improves token-to-token latency (TPOT), and allows for larger batch sizes.
 
-Sparse attention methods aim to exploit structure/sparsity in attention to accelerate long-context inference, while balancing performance gains with acceptable approximation error and system complexity.
-
+Sparse attention methods aim to exploit structured sparsity in attention. Especially, exploiting the token sparsity in the sequence dimension to concentrate on the most important query-key pairs is very common. The goal of sparse attention is accelerating long-context inference, while balancing performance gains with acceptable approximation error and system complexity.
 
 ## Algorithm Overview
-The design space of sparse attention is quite large, so we cannot assume there is a single implementation strategy that covers all variants. TensorRT-LLM uses `sparse_attention_config` in the `LLM` API as a unified interface for **describing and enabling** different sparse attention algorithms, while allowing each technique to choose the most suitable implementation path. Each *algorithm* has its own configuration class inheriting from `BaseSparseAttentionConfig`.
+The design space of sparse attention is quite large, so we cannot assume there is a single implementation strategy that covers all variants. TensorRT LLM uses `sparse_attention_config` in the `LLM` API as a unified interface for **describing and enabling** different sparse attention algorithms, while allowing each technique to choose the most suitable implementation path. Each *algorithm* has its own configuration class inheriting from `BaseSparseAttentionConfig`.
 
-TensorRT-LLM currently exposes the following algorithms differentiated by `sparse_attention_config.algorithm`:
+TensorRT LLM currently exposes the following algorithms differentiated by `sparse_attention_config.algorithm`:
 
 - **RocketKV** (`algorithm: rocket`, `RocketSparseAttentionConfig`, [ref](https://arxiv.org/pdf/2502.14051)): A two-stage algorithm, where the first stage performs permanent KV cache eviction and the second stage performs dynamic token selection.
 - **DeepSeek Sparse Attention (DSA)** (`algorithm: dsa`, `DeepSeekSparseAttentionConfig`, [ref](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf)): DeepSeek's model-native sparse attention solution, introduced in DeepSeek V3.2.
@@ -153,26 +152,26 @@ For example, users can evaluate a model with trtllm-eval on LongBenchV2 task lik
 trtllm-eval --model <path_to_model> --config extra_config.yaml longbench_v2 --max_output_length 1024 ...
 ```
 
-## Algorithms Introduction
+## Sparse Attention Implementation
 
-This section provides deeper technical details on how each algorithm of sparse attention is implemented in TensorRT-LLM. If you just want to enable sparse attention, see [Quick Start](#quick-start) above.
+This section provides deeper technical details on how each algorithm of sparse attention is implemented in TensorRT LLM. If you just want to enable sparse attention, see [Quick Start](#quick-start) above.
 
 Ideologically, the current available sparse attention algorithms can be categorized into two types:
 
-- **Framework-level sparse attention**: uses TensorRT-LLM's sparse-attention framework (prediction hooks + metadata) to drive sparse computation and/or KV-cache behavior. Examples: **RocketKV**, **DSA**.
+- **Framework-level sparse attention**: uses TensorRT LLM's sparse-attention framework (prediction hooks + metadata) to drive sparse computation and/or KV-cache behavior. Examples: **RocketKV**, **DSA**.
 - **Kernel-level sparse attention**: implemented directly inside the attention kernels, with no extra modification on the runtime logic. Example: **Skip Softmax Attention**.
 
 ### Framework-Level Sparse Attention
 
-Framework-level sparse attention refers to methods that use TensorRT-LLM's extensible sparse-attention framework—a set of prediction hooks and metadata interfaces that drive sparse computation and/or KV-cache behavior. Currently, **RocketKV** is supported in both the PyTorch backend and the TRTLLM backend, while **DSA** is supported in the TRTLLM backend.
+Framework-level sparse attention refers to methods that use TensorRT LLM's extensible sparse-attention framework—a set of prediction hooks and metadata interfaces that drive sparse computation and/or KV-cache behavior. Currently, **RocketKV** and **DSA** are the supported framework-level sparse attention algorithms in TensorRT LLM.
 
 #### Overview
 
-Attention scores often exhibit strong structure and sparsity: for many queries, only a small fraction of the historical tokens meaningfully contribute to the output. To exploit this, a wide range of approximate sparse-attention methods have been proposed. These methods can introduce sparsity along different dimensions (e.g., sequence, head, hidden). TensorRT-LLM’s **framework-level** support for sparse attention primarily targets approaches that leverage **token/sequence sparsity** into a GPU-friendly, structured way.
+Attention scores often exhibit strong structure and sparsity: for many queries, only a small fraction of the historical tokens meaningfully contribute to the output. To exploit this, a wide range of approximate sparse-attention methods have been proposed. These methods can introduce sparsity along different dimensions (e.g., sequence, head, hidden). TensorRT LLM’s **framework-level** support for sparse attention primarily targets approaches that leverage **token/sequence sparsity** into a GPU-friendly, structured way.
 
 #### Architecture
 
-This section describes the framework architecture and guides developers on how to implement new framework-level sparse attention algorithms in TensorRT-LLM.
+This section describes the framework architecture and guides developers on how to implement new framework-level sparse attention algorithms in TensorRT LLM.
 
 <div align="center">
 <figure>
@@ -319,7 +318,7 @@ For tighter integration, you can manage the auxiliary memory within the C++ `KVC
 
 Unlike framework-level methods, **kernel-level sparse attention** is implemented directly inside the attention kernels. There is no external prediction/gather workflow—the kernel itself decides what to skip based on runtime criteria.
 
-**Skip Softmax Attention (BLASST)** is TensorRT-LLM's kernel-level sparse attention method, supported on both **Hopper** and **Blackwell** GPUs for MHA/GQA/MLA, in both prefill and decode phases. It dynamically skips Softmax and BMM2 computation for KV blocks whose contribution falls below a threshold. Because the logic lives entirely inside the kernel, it requires no auxiliary data structures or framework hooks—just set `threshold_scale_factor` in the config. As a result, the runtime overhead is zero and the attention kernel performance improvement could be directly reflected in the end-to-end speedup.
+**Skip Softmax Attention (BLASST)** is TensorRT LLM's kernel-level sparse attention method, supported on both **Hopper** and **Blackwell** GPUs for MHA/GQA/MLA, in both prefill and decode phases. It dynamically skips Softmax and BMM2 computation for KV blocks whose contribution falls below a threshold. Because the logic lives entirely inside the kernel, it requires no auxiliary data structures or framework hooks—just set `threshold_scale_factor` in the config. As a result, the runtime overhead is zero and the attention kernel performance improvement could be directly reflected in the end-to-end speedup.
 
 For algorithm details and end-to-end results, please refer to the following resources:
 - **Paper**: [BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/pdf/2512.12087)
@@ -334,7 +333,7 @@ Skip Softmax Attention is supported only with the **trtllm** attention backend, 
 
 ### Summary
 
-The following table compares the three sparse attention algorithms available in TensorRT-LLM:
+The following table compares the three sparse attention algorithms available in TensorRT LLM:
 
 | Aspect | RocketKV | DSA | Skip Softmax |
 |--------|----------|-----|--------------|
