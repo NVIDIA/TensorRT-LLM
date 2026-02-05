@@ -836,12 +836,16 @@ class NVFP4MoEModuleForInputScaleTest(nn.Module):
         num_experts,
         w1_weight,
         w2_weight,
+        w3_weight,
         w1_input_scale,
         w2_input_scale,
+        w3_input_scale,
         w1_weight_scale,
         w2_weight_scale,
+        w3_weight_scale,
         w1_alpha,
         w2_alpha,
+        w3_alpha,
         is_gated_mlp,
         act_fn,
     ):
@@ -859,6 +863,11 @@ class NVFP4MoEModuleForInputScaleTest(nn.Module):
             self.register_buffer(f"w2_wscale_{i}", w2_weight_scale[i])
             self.register_buffer(f"w1_alpha_{i}", w1_alpha[i])
             self.register_buffer(f"w2_alpha_{i}", w2_alpha[i])
+            if is_gated_mlp:
+                self.register_buffer(f"w3_{i}", w3_weight[i])
+                self.register_buffer(f"w3_iscale_{i}", w3_input_scale[i])
+                self.register_buffer(f"w3_wscale_{i}", w3_weight_scale[i])
+                self.register_buffer(f"w3_alpha_{i}", w3_alpha[i])
 
     def forward(self, x, selected_experts, routing_weights):
         return torch.ops.auto_deploy.torch_quant_nvfp4_moe(
@@ -867,16 +876,24 @@ class NVFP4MoEModuleForInputScaleTest(nn.Module):
             routing_weights,
             [getattr(self, f"w1_{i}") for i in range(self.num_experts)],
             [getattr(self, f"w2_{i}") for i in range(self.num_experts)],
-            [],  # w3 is empty for non-gated MLP
+            [getattr(self, f"w3_{i}") for i in range(self.num_experts)]
+            if self.is_gated_mlp
+            else [],
             [getattr(self, f"w1_iscale_{i}") for i in range(self.num_experts)],
             [getattr(self, f"w2_iscale_{i}") for i in range(self.num_experts)],
-            [],  # w3 input scale is empty for non-gated MLP
+            [getattr(self, f"w3_iscale_{i}") for i in range(self.num_experts)]
+            if self.is_gated_mlp
+            else [],
             [getattr(self, f"w1_wscale_{i}") for i in range(self.num_experts)],
             [getattr(self, f"w2_wscale_{i}") for i in range(self.num_experts)],
-            [],  # w3 weight scale is empty for non-gated MLP
+            [getattr(self, f"w3_wscale_{i}") for i in range(self.num_experts)]
+            if self.is_gated_mlp
+            else [],
             [getattr(self, f"w1_alpha_{i}") for i in range(self.num_experts)],
             [getattr(self, f"w2_alpha_{i}") for i in range(self.num_experts)],
-            [],  # w3 alpha is empty for non-gated MLP
+            [getattr(self, f"w3_alpha_{i}") for i in range(self.num_experts)]
+            if self.is_gated_mlp
+            else [],
             is_gated_mlp=self.is_gated_mlp,
             act_fn=self.act_fn,
         )
@@ -885,119 +902,132 @@ class NVFP4MoEModuleForInputScaleTest(nn.Module):
 @skip_pre_hopper
 @pytest.mark.parametrize("allow_different_input_scales", [False, True])
 @pytest.mark.parametrize("scales_identical", [True, False])
+@pytest.mark.parametrize("is_gated_mlp", [False, True])
 @pytest.mark.skipif(
-    not fp4_compatible() or not trtllm_ops_available(),
-    reason="Requires fp4 and trtllm support",
+    not trtllm_ops_available(),
+    reason="Requires trtllm ops",
 )
-def test_nvfp4_moe_different_input_scales(allow_different_input_scales, scales_identical):
+def test_nvfp4_moe_different_input_scales(
+    allow_different_input_scales, scales_identical, is_gated_mlp
+):
     """
     Test NVFP4 MoE behavior with different/identical input scales via _stack_nvfp4_moe_weights.
 
-    Tests the allow_different_input_scales config option:
+    Tests the allow_different_input_scales config option for both gated and non-gated MLP:
     - When scales_identical=True: should always work
     - When scales_identical=False and allow_different_input_scales=False: should fail with assertion
     - When scales_identical=False and allow_different_input_scales=True: should work (uses min)
 
     Note: NVFP4 uses min() (not max like FP8) because scales are in kernel format (2688/amax):
     smaller scale = larger amax = larger dynamic range.
+
+    This test uses mock tensors to test the transform logic without running the actual NVFP4 kernel.
     """
     from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_nvfp4_moe_weights
 
     torch.manual_seed(0)
 
-    batch_size, num_experts, top_k = 4, 2, 2
+    num_experts = 2
     hidden_size, intermediate_size = 128, 128
-    # Use non-gated MLP (Relu2)
-    is_gated_mlp = False
-    act_fn = ActivationType.Relu2
+    act_fn = ActivationType.Silu if is_gated_mlp else ActivationType.Relu2
 
     # NVFP4 constants
     FP4_GLOBAL_SCALE_MAX = 448 * 6  # 2688
+    NVFP4_BLOCK_SIZE = 16
 
-    # Generate test data
-    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.5
-
-    # Simple routing: distribute tokens across experts
-    selected_experts = torch.zeros((batch_size, top_k), dtype=torch.int64, device="cuda")
-    for i in range(batch_size):
-        selected_experts[i, 0] = i % num_experts
-        selected_experts[i, 1] = (i + 1) % num_experts
-    routing_weights = torch.ones((batch_size, top_k), device="cuda", dtype=torch.float32) / top_k
-
-    # Create per-expert weights and scales (non-gated MLP, no w3)
-    w1_weight, w2_weight = [], []
-    w1_input_scale, w2_input_scale = [], []
-    w1_weight_scale, w2_weight_scale = [], []
-    w1_alpha, w2_alpha = [], []
+    # Create per-expert mock weights and scales
+    # We use mock tensors with correct shapes to test the transform logic
+    # without needing actual FP4 quantization (which requires SM>=100)
+    w1_weight, w2_weight, w3_weight = [], [], []
+    w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
+    w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
+    w1_alpha, w2_alpha, w3_alpha = [], [], []
 
     for expert_id in range(num_experts):
-        # Create random weights and quantize them to FP4
-        w1_rand = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float32)
-        w2_rand = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=torch.float32)
+        # Mock FP4 weights (uint8 packed, half the size in last dim)
+        w1_fp4 = torch.randint(
+            0, 255, (intermediate_size, hidden_size // 2), dtype=torch.uint8, device="cuda"
+        )
+        w2_fp4 = torch.randint(
+            0, 255, (hidden_size, intermediate_size // 2), dtype=torch.uint8, device="cuda"
+        )
 
-        # Compute weight scale using fp4_global_scale
-        w1_scale_2 = fp4_global_scale(w1_rand)
-        w2_scale_2 = fp4_global_scale(w2_rand)
-
-        # Quantize weights to FP4
-        w1_fp4, w1_block_scale = torch.ops.trtllm.fp4_quantize(w1_rand, w1_scale_2, 16)
-        w2_fp4, w2_block_scale = torch.ops.trtllm.fp4_quantize(w2_rand, w2_scale_2, 16)
-
-        # Swizzle block scales for cutlass
-        w1_block_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
-            w1_block_scale.view(torch.uint8).cpu().contiguous()
-        ).view(torch.float8_e4m3fn)
-        w2_block_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
-            w2_block_scale.view(torch.uint8).cpu().contiguous()
-        ).view(torch.float8_e4m3fn)
+        # Mock block scales (2D): shape (m, n // NVFP4_BLOCK_SIZE)
+        # With 128x128 dims, no padding needed (already multiples of 128 and 8)
+        w1_block_scale = torch.randn(
+            intermediate_size, hidden_size // NVFP4_BLOCK_SIZE, dtype=torch.float32, device="cuda"
+        ).to(torch.float8_e4m3fn)
+        w2_block_scale = torch.randn(
+            hidden_size, intermediate_size // NVFP4_BLOCK_SIZE, dtype=torch.float32, device="cuda"
+        ).to(torch.float8_e4m3fn)
 
         w1_weight.append(w1_fp4)
         w2_weight.append(w2_fp4)
-        w1_weight_scale.append(w1_block_scale_swizzled.cuda())
-        w2_weight_scale.append(w2_block_scale_swizzled.cuda())
+        w1_weight_scale.append(w1_block_scale)
+        w2_weight_scale.append(w2_block_scale)
 
         # Input scales: either identical or different per expert
         # For NVFP4, scale = FP4_GLOBAL_SCALE_MAX / amax
         if scales_identical:
             # Same amax for all experts -> same input scale
-            inp_scale = torch.tensor(
-                [FP4_GLOBAL_SCALE_MAX / 1.0], dtype=torch.float32, device="cuda"
-            )
+            inp_scale = torch.tensor(FP4_GLOBAL_SCALE_MAX / 1.0, dtype=torch.float32, device="cuda")
         else:
             # Different amax per expert -> different input scales
             # Expert 0: amax=1.0, scale=2688/1.0=2688
             # Expert 1: amax=2.0, scale=2688/2.0=1344
             amax = 1.0 + expert_id
             inp_scale = torch.tensor(
-                [FP4_GLOBAL_SCALE_MAX / amax], dtype=torch.float32, device="cuda"
+                FP4_GLOBAL_SCALE_MAX / amax, dtype=torch.float32, device="cuda"
             )
 
         w1_input_scale.append(inp_scale)
         w2_input_scale.append(inp_scale)
 
+        # Mock weight_scale_2 (global scale for this expert's weights)
+        w1_scale_2 = torch.tensor(100.0, dtype=torch.float32, device="cuda")
+        w2_scale_2 = torch.tensor(100.0, dtype=torch.float32, device="cuda")
+
         # Alpha = 1 / (input_scale * weight_scale_2)
         w1_alpha.append((1.0 / (inp_scale * w1_scale_2)).to(torch.float32))
         w2_alpha.append((1.0 / (inp_scale * w2_scale_2)).to(torch.float32))
+
+        # For gated MLP, create w3 weights/scales/alpha (same shape as w1)
+        if is_gated_mlp:
+            w3_fp4 = torch.randint(
+                0, 255, (intermediate_size, hidden_size // 2), dtype=torch.uint8, device="cuda"
+            )
+            w3_block_scale = torch.randn(
+                intermediate_size,
+                hidden_size // NVFP4_BLOCK_SIZE,
+                dtype=torch.float32,
+                device="cuda",
+            ).to(torch.float8_e4m3fn)
+            w3_weight.append(w3_fp4)
+            w3_weight_scale.append(w3_block_scale)
+            # w3 uses the same input scale as w1 (they process the same input)
+            w3_input_scale.append(inp_scale)
+            w3_scale_2 = torch.tensor(100.0, dtype=torch.float32, device="cuda")
+            w3_alpha.append((1.0 / (inp_scale * w3_scale_2)).to(torch.float32))
 
     # Create a module with the NVFP4 MoE op
     module = NVFP4MoEModuleForInputScaleTest(
         num_experts,
         w1_weight,
         w2_weight,
+        w3_weight,
         w1_input_scale,
         w2_input_scale,
+        w3_input_scale,
         w1_weight_scale,
         w2_weight_scale,
+        w3_weight_scale,
         w1_alpha,
         w2_alpha,
+        w3_alpha,
         is_gated_mlp,
         act_fn,
     ).cuda()
     gm = fx.symbolic_trace(module)
-
-    # Compute reference output from original graph before transformation
-    with torch.inference_mode():
-        ref_output = gm(x, selected_experts, routing_weights)
 
     # Expected behavior:
     # - scales_identical=True: always works
@@ -1019,26 +1049,28 @@ def test_nvfp4_moe_different_input_scales(allow_different_input_scales, scales_i
 
         # Verify that min() is used when scales differ
         if not scales_identical:
-            expected_min_w1_input_scale = torch.stack(w1_input_scale).min()
-            actual_w1_input = getattr(gm, "nvfp4_moe_w3_w1_input_scale_stacked_0")
+            # For gated MLP, global scale = min(w1_scales.min(), w3_scales.min())
+            # For non-gated MLP, global scale = w1_scales.min()
+            if is_gated_mlp:
+                expected_min_input_scale = torch.minimum(
+                    torch.stack(w1_input_scale).min(),
+                    torch.stack(w3_input_scale).min(),
+                )
+            else:
+                expected_min_input_scale = torch.stack(w1_input_scale).min()
 
-            assert torch.allclose(actual_w1_input, expected_min_w1_input_scale), (
-                f"w1 input scale min mismatch. Got {actual_w1_input}, expected {expected_min_w1_input_scale}"
+            actual_input_scale = getattr(gm, "nvfp4_moe_w3_w1_input_scale_stacked_0")
+
+            assert torch.allclose(actual_input_scale, expected_min_input_scale), (
+                f"FC1 input scale min mismatch. Got {actual_input_scale}, expected {expected_min_input_scale}"
             )
 
             # Verify alpha was recomputed correctly
             # new_alpha = old_alpha * per_expert_input_scale / global_input_scale
             expected_alpha = (
-                torch.stack(w1_alpha) * torch.stack(w1_input_scale) / expected_min_w1_input_scale
+                torch.stack(w1_alpha) * torch.stack(w1_input_scale) / expected_min_input_scale
             )
             actual_alpha = getattr(gm, "nvfp4_moe_w1_alpha_stacked_0")
             assert torch.allclose(actual_alpha, expected_alpha, rtol=1e-5, atol=1e-5), (
                 f"Alpha recomputation mismatch. Got {actual_alpha}, expected {expected_alpha}"
-            )
-
-        # Run the transformed graph and compare to reference output
-        with torch.inference_mode():
-            output = gm(x, selected_experts, routing_weights)
-            assert output.shape == ref_output.shape, (
-                f"Output shape mismatch: {output.shape} vs {ref_output.shape}"
             )
