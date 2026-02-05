@@ -42,6 +42,7 @@ streaming=$8
 log_path=$9
 hostname=${10}
 port=${11}
+ucx_warmup_requests=${12}
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
@@ -58,6 +59,23 @@ if [ -d "${BENCH_SERVING_DIR}" ]; then
 fi
 echo "Cloning benchmark repository..."
 git clone "${BENCH_SERVING_REPO}" "${BENCH_SERVING_DIR}"
+
+# warmup requests for ucx connections
+if [ "${ucx_warmup_requests}" -gt 0 ]; then
+    echo "warming up ucx connections with small requests... ${ucx_warmup_requests}"
+    python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model ${model_name} \
+        --dataset-name random \
+        --random-ids \
+        --random-input-len 100 \
+        --random-output-len 10 \
+        --num-prompts ${ucx_warmup_requests} \
+        --host ${hostname} \
+        --port ${port} \
+        --ignore-eos \
+        --non-streaming
+    echo "UCX warmup done"
+fi
 
 # Run benchmarks
 echo "Starting benchmark..."
