@@ -534,6 +534,9 @@ private:
                 }
                 else
                 {
+                    TLLM_LOG_DEBUG(
+                        "[runNCCLAllReduceSymmetric] Copying input into symmetric buffer %p (size=%zu bytes)",
+                        symmetricBuffer0.ptr, bufferSizeBytes);
                     TLLM_CUDA_CHECK(cudaMemcpyAsync(
                         symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
 
