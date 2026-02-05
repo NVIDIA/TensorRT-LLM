@@ -180,9 +180,11 @@ class StorageManager:
         self._slot_to_page_indices = config.slot_to_page_indices()
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
-        slot_size_lists = [pg.slot_size_list for pg in config.slot_desc_list]
+        slot_size_lists = typed_map(config.slot_desc_list, lambda pg: pg.slot_size_list)
         # @TODO: accept an optional avg_seq_len param and consider sliding window.
-        init_ratio = [float(sum(pg.slot_size_list) * len(pg.slots)) for pg in config.pool_groups]
+        init_ratio = typed_map(
+            config.slot_desc_list, lambda pg: float(sum(pg.slot_size_list) * len(pg.variants))
+        )
         total = sum(init_ratio)
         init_ratio = typed_map(init_ratio, lambda x: x / total)
         num_levels = CacheLevel(len(config.cache_tiers))
@@ -412,9 +414,12 @@ class StorageManager:
         src_level: CacheLevel,
         src_pages: Sequence[Page],
         update_src: bool,
+        defrag: bool = False,  # we are doing defragmentation
     ) -> Sequence[Slot] | None:
         "Free slots must be prepared before calling this function."
-        assert dst_level != src_level, "dst_level and src_level must be different"
+        assert defrag or dst_level != src_level, (
+            "dst_level and src_level must be different unless performing defragmentation"
+        )
         num_slots = len(src_pages)
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
@@ -429,7 +434,7 @@ class StorageManager:
                 lambda _: list[CopyTask](), num_pools
             )
             for src, dst in zip(src_pages, dst_slots):
-                assert src.node_ref is None
+                assert defrag or src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
                 dst_addresses = dst_pool_group.slot_address(dst.slot_id)
                 src_addresses = src_pool_group.slot_address(src.slot_id)
@@ -589,8 +594,11 @@ class StorageManager:
         assert NDEBUG or all(p.cache_level == level for p in overflow_pages), (
             "Some pages are not overflowed"
         )
-        self._batched_migrate(pg_idx, level, level, overflow_pages, update_src=True)
-        assert len(allocator._overflow_slots) == allocator._target_capacity - allocator._capacity
+        self._batched_migrate(pg_idx, level, level, overflow_pages, update_src=True, defrag=True)
+        assert (
+            len(allocator._overflow_slots)
+            == allocator._num_active_slots - allocator._target_capacity
+        )
         allocator.finish_shrink()
         pool_group.resize_pools(new_num_slots)
 

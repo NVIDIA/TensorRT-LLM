@@ -436,9 +436,11 @@ class SlotAllocator:
                 len(set(s.slot_id for s in self._overflow_slots)) == len(self._overflow_slots)
                 and len(self._overflow_slots) == self._num_active_slots - self._target_capacity
             ), "Some slots are still in use."
+            for ev in set(s.ready_event for s in self._overflow_slots):
+                ev.synchronize()
             for slot in self._overflow_slots:
-                slot.ready_event.synchronize()
                 slot.ready_event = CachedCudaEvent.NULL
+                slot._slot_id = None
             self._overflow_slots.clear()
             self._capacity = self._target_capacity
             self._num_active_slots = min(self._num_active_slots, self._capacity)
