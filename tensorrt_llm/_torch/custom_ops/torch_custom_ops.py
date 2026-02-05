@@ -1748,7 +1748,6 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        self._maybe_preallocate_buffers(inputs[0], self.group)
         valid_strategies = [
             AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
@@ -1775,8 +1774,17 @@ class AllReduceRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
         input, residual, norm_weight, scale, bias, workspace = inputs
+        if do_preparation:
+            valid_tactics = self.get_valid_tactics(inputs,
+                                                   OptimizationProfile(),
+                                                   **kwargs)
+            if AllReduceStrategy.NCCL_SYMMETRIC.value in valid_tactics:
+                self._maybe_preallocate_buffers(input, self.group)
+            return input
         if tactic == -1:
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
