@@ -632,7 +632,7 @@ class Sender:
         )
 
         skip_send = len(src_kv_list) == 0
-        logger.debug(f"Submitting transfer request to transfer agent: {request}")
+        logger.debug("Submitting transfer request to transfer agent: %s", request)
         agent_handler = None
         if task._perf_timer is not None:
             task._perf_timer.record_transfer_start(agent_args.peer_rank)
@@ -777,7 +777,7 @@ class Sender:
         self._registrar.register(ri.instance_name, ri.instance_rank, ri)
 
         agent_name = ri.instance_name + str(ri.instance_rank)
-        logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
+        logger.debug("Loading remote transfer agent descriptor for peer '%s'", agent_name)
         self._agent.load_remote_agent(
             ri.instance_name + str(ri.instance_rank),
             ri.transfer_engine_info,
@@ -1087,7 +1087,7 @@ class Receiver:
 
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
-        logger.debug(f"Preparing async data transfer request for disagg_params={params}")
+        logger.debug("Preparing async data transfer request for disagg_params=%s", params)
         receiver_req = task._create_req_info()
         sender_dp_rank = params.ctx_dp_rank
         if sender_dp_rank is None:
@@ -1554,7 +1554,7 @@ class TransferWorker:
         if memory_descs:
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
             self._agent.register_memory(reg_memory_desc)
-            logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
+            logger.debug("Registered KV cache memory with transfer agent: %s", memory_descs)
             self._registered_mem.append(reg_memory_desc)
 
     def _register_aux_buffer(self):
@@ -1565,7 +1565,7 @@ class TransferWorker:
             ptr_descs.append((aux_meta.ptrs[i], aux_meta.size[i], 0, f"aux_buffer_ptr_{i}"))
         reg_memory_desc = RegMemoryDescs("DRAM", ptr_descs)
         self._agent.register_memory(reg_memory_desc)
-        logger.debug(f"Registered auxiliary buffer memory with transfer agent: {reg_memory_desc}")
+        logger.debug("Registered auxiliary buffer memory with transfer agent: %s", reg_memory_desc)
         self._registered_mem.append(reg_memory_desc)
 
     # pack the aux data to the meta buffer

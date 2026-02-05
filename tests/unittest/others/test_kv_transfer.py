@@ -467,6 +467,14 @@ def add_and_verify_request(
     # V2: Filter out invalid block ids (BAD_PAGE_INDEX = -1)
     if use_v2:
         ctx_block_ids = [[bid for bid in block_ids if bid >= 0] for block_ids in ctx_block_ids_raw]
+        # Verify V2 block count matches expected: ceil(request_len / tokens_per_block)
+        expected_block_count = (request_len + tokens_per_block - 1) // tokens_per_block
+        for block_ids in ctx_block_ids:
+            assert len(block_ids) == expected_block_count, (
+                f"V2 ctx block count mismatch: got {len(block_ids)}, "
+                f"expected {expected_block_count} for request_len={request_len}, "
+                f"tokens_per_block={tokens_per_block}"
+            )
     else:
         ctx_block_ids = ctx_block_ids_raw
 
@@ -477,6 +485,14 @@ def add_and_verify_request(
     # V2: Filter out invalid block ids (BAD_PAGE_INDEX = -1)
     if use_v2:
         gen_block_ids = [[bid for bid in block_ids if bid >= 0] for block_ids in gen_block_ids_raw]
+        # Verify V2 block count matches expected: ceil(request_len / tokens_per_block)
+        expected_block_count = (request_len + tokens_per_block - 1) // tokens_per_block
+        for block_ids in gen_block_ids:
+            assert len(block_ids) == expected_block_count, (
+                f"V2 gen block count mismatch: got {len(block_ids)}, "
+                f"expected {expected_block_count} for request_len={request_len}, "
+                f"tokens_per_block={tokens_per_block}"
+            )
     else:
         gen_block_ids = gen_block_ids_raw
 
