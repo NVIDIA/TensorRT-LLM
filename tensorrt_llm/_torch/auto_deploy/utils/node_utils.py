@@ -152,10 +152,11 @@ def get_all_weights_in_subgraph(
 
 
 def extract_weight_name(node: Node) -> Union[str, bool]:
-    weight_nodes = extract_weight_nodes(node)
-    if len(weight_nodes.weights) == 0:
+    try:
+        weight_node = get_weight_node(node)
+    except ValueError:
         return False
-    return weight_nodes.weights[0].node_key
+    return weight_node.target
 
 
 def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
@@ -349,10 +350,21 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
     return WeightNodes(weights=weight_nodes, biases=bias_nodes)
 
 
+def get_weight_node(node: Node) -> Node:
+    """Get the primary weight node for a compute node."""
+    weight_nodes = extract_weight_nodes(node)
+    if len(weight_nodes.weights) == 0:
+        raise ValueError(f"Node {node.name} has no weight")
+    return weight_nodes.weights[0].node
+
+
 def num_users_of_weight_node(node: Node) -> int:
     """Returns the number of users of the weight node of the given parametrized node."""
-    weight_node = extract_weight_nodes(node).weights[0].node
-    return len(weight_node.users) if weight_node is not None else 0
+    try:
+        weight_node = get_weight_node(node)
+    except ValueError:
+        return 0
+    return len(weight_node.users)
 
 
 def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverloadPacket:
@@ -1184,6 +1196,8 @@ def shape(node: Node) -> Tuple[int, ...]:
 def get_weight_tensor(node: Node) -> torch.Tensor:
     """Extract the weight tensor from a node within a GraphModule."""
     weight_nodes = extract_weight_nodes(node)
+    if len(weight_nodes.weights) == 0:
+        raise ValueError(f"Node {node.name} has no weight")
     return weight_nodes.weights[0].tensor
 
 
