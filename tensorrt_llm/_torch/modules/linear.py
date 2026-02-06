@@ -2737,12 +2737,26 @@ class Linear(nn.Module):
                     if hasattr(self.quant_method, "apply_out"):
                         window_out = self._maybe_create_nccl_window_output(
                             input, all_reduce_params, lora_params)
-                    if window_out is not None:
+                    window_success = window_out is not None
+                    window_info = ""
+                    if window_success:
+                        window_bytes = window_out.numel(
+                        ) * window_out.element_size()
+                        window_info = " (size_bytes=%d, ptr=%s, shape=%s)" % (
+                            window_bytes,
+                            hex(window_out.data_ptr()),
+                            tuple(window_out.shape),
+                        )
                         output = self.quant_method.apply_out(
                             self, input, bias, window_out)
                     else:
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)
+                    logger.debug(
+                        "Linear GEMM NCCL window output buffer: %s%s",
+                        "success" if window_success else "failure",
+                        window_info,
+                    )
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
             else:
