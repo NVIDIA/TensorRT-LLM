@@ -13,8 +13,10 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.ops import (
     quantize_fp8_blockwise,
     quantize_fp8_per_tensor,
+    quantize_nvfp4,
 )
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.utils import fp4_utils
 
 
 class DynamicLinearWeightLoader:
@@ -155,6 +157,12 @@ class DynamicLinearWeightLoader:
                 return False  # Already quantized
             return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
 
+        # For NVFP4: quantize if weight is high precision
+        if quant_algo == QuantAlgo.NVFP4:
+            if weight.dtype == fp4_utils.float4_e2m1x2:
+                return False  # Already quantized
+            return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
+
         return False
 
     def _maybe_dynamic_quantize(
@@ -172,13 +180,24 @@ class DynamicLinearWeightLoader:
 
         if quant_algo == QuantAlgo.FP8:
             qweight, scale = quantize_fp8_per_tensor(weight)
+            return {**weight_dict, "weight": qweight, "weight_scale": scale}
         elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             block_size = self.quant_config.group_size if self.quant_config else 128
             qweight, scale = quantize_fp8_blockwise(weight, block_size=block_size)
+            return {**weight_dict, "weight": qweight, "weight_scale": scale}
+        elif quant_algo == QuantAlgo.NVFP4:
+            qweight, weight_scale, weight_scale_2 = quantize_nvfp4(weight)
+            return {
+                **weight_dict,
+                "weight": qweight,
+                "weight_scale": weight_scale,
+                "weight_scale_2": weight_scale_2,
+                # Flag to skip block_scale_interleave - dynamic quant scales are already
+                # in correct LINEAR layout from fp4_quantize kernel
+                "_skip_scale_interleave": True,
+            }
         else:
             return weight_dict
-
-        return {**weight_dict, "weight": qweight, "weight_scale": scale}
 
     def load_linear_weights(
         self, module: Linear, name: str, weight_dicts: List[Dict[str, torch.Tensor]]

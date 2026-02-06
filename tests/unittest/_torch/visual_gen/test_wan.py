@@ -841,6 +841,48 @@ class TestWanPipeline:
 
         assert found_fp8, f"No FP8 Linear modules found for {quant_algo}"
 
+    def test_load_wan_pipeline_with_nvfp4_quantization(self, checkpoint_exists):
+        """Test loading Wan with NVFP4 dynamic quantization."""
+        if not checkpoint_exists:
+            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH.")
+        if not is_wan21_checkpoint():
+            pytest.skip(
+                "This test requires Wan 2.1 checkpoint. Use DIFFUSION_MODEL_PATH with '2.1' in the path."
+            )
+
+        from tensorrt_llm.quantization.utils import fp4_utils
+
+        args = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+            quant_config={
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+            },
+        )
+        pipeline = PipelineLoader(args).load()
+
+        # Verify NVFP4 weights in transformer blocks
+        found_nvfp4 = False
+        for name, module in pipeline.transformer.named_modules():
+            if isinstance(module, Linear):
+                if "blocks." in name and hasattr(module, "weight") and module.weight is not None:
+                    # NVFP4 uses packed FP4 format (float4_e2m1x2)
+                    assert module.weight.dtype == fp4_utils.float4_e2m1x2, (
+                        f"Linear {name} should have NVFP4 weight, got {module.weight.dtype}"
+                    )
+                    assert hasattr(module, "weight_scale"), f"Linear {name} missing weight_scale"
+                    assert hasattr(module, "weight_scale_2"), (
+                        f"Linear {name} missing weight_scale_2"
+                    )
+                    found_nvfp4 = True
+                    print(f"[NVFP4] NVFP4 layer {name}: weight {module.weight.shape}")
+                    break
+
+        assert found_nvfp4, "No NVFP4 Linear modules found"
+
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_fp8_vs_bf16_numerical_correctness(self, checkpoint_exists, quant_algo):
         """Test FP8 vs BF16 numerical accuracy on real checkpoint weights.
@@ -964,6 +1006,109 @@ class TestWanPipeline:
 
         # Cleanup
         del pipeline_bf16, pipeline_fp8
+        torch.cuda.empty_cache()
+
+    def test_nvfp4_vs_bf16_numerical_correctness(self, checkpoint_exists):
+        """Test NVFP4 vs BF16 numerical accuracy on real checkpoint weights.
+
+        Similar to FP8 test but with relaxed tolerances since NVFP4 is 4-bit quantization.
+        """
+        if not checkpoint_exists:
+            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH.")
+        if not is_wan21_checkpoint():
+            pytest.skip(
+                "This test requires Wan 2.1 checkpoint. Use DIFFUSION_MODEL_PATH with '2.1' in the path."
+            )
+
+        # Load BF16 Pipeline (Reference)
+        print("\n[Compare NVFP4] Loading BF16 pipeline...")
+        args_bf16 = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+        )
+        pipeline_bf16 = PipelineLoader(args_bf16).load()
+
+        # Load NVFP4 Pipeline
+        print("[Compare NVFP4] Loading NVFP4 pipeline...")
+        args_nvfp4 = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            quant_config={
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+            },
+        )
+        pipeline_nvfp4 = PipelineLoader(args_nvfp4).load()
+
+        # Get Linear Layers from Both Pipelines
+        attn_bf16 = pipeline_bf16.transformer.blocks[0].attn1
+        attn_nvfp4 = pipeline_nvfp4.transformer.blocks[0].attn1
+
+        if hasattr(attn_bf16, "qkv_proj"):
+            linear_bf16 = attn_bf16.qkv_proj
+            linear_nvfp4 = attn_nvfp4.qkv_proj
+            layer_name = "blocks.0.attn1.qkv_proj"
+        elif hasattr(attn_bf16, "attn") and hasattr(attn_bf16.attn, "qkv_proj"):
+            linear_bf16 = attn_bf16.attn.qkv_proj
+            linear_nvfp4 = attn_nvfp4.attn.qkv_proj
+            layer_name = "blocks.0.attn1.attn.qkv_proj"
+        else:
+            linear_bf16 = pipeline_bf16.transformer.blocks[0].ffn.net[0]["proj"]
+            linear_nvfp4 = pipeline_nvfp4.transformer.blocks[0].ffn.net[0]["proj"]
+            layer_name = "blocks.0.ffn.net.0.proj"
+
+        # Get BF16 weights and bias for F.linear reference
+        weight_bf16 = linear_bf16.weight.data.clone()
+        bias_bf16 = linear_bf16.bias.data.clone() if linear_bf16.bias is not None else None
+
+        # Create Test Input
+        torch.manual_seed(42)
+        hidden_size = linear_bf16.in_features
+        batch_size = 1
+        seq_len = 14040
+
+        input_tensor = torch.randn(
+            batch_size * seq_len, hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        print(f"[Compare] Input shape: {input_tensor.shape}")
+
+        # Compute Reference Output: F.linear (ground truth)
+        with torch.no_grad():
+            expected = F.linear(input_tensor, weight_bf16, bias_bf16)
+
+        # Compute NVFP4 Output
+        with torch.no_grad():
+            result_nvfp4 = linear_nvfp4(input_tensor)
+
+        # Compute BF16 Layer Output
+        with torch.no_grad():
+            result_bf16 = linear_bf16(input_tensor)
+
+        # Verify BF16 layer matches F.linear reference
+        assert torch.allclose(result_bf16, expected, rtol=1e-5, atol=1e-6), (
+            "BF16 layer should match F.linear reference exactly"
+        )
+
+        # Compare NVFP4 vs Reference
+        max_diff = torch.max(torch.abs(result_nvfp4 - expected)).item()
+        cos_sim = F.cosine_similarity(
+            result_nvfp4.flatten().float(), expected.flatten().float(), dim=0
+        )
+        mse = F.mse_loss(result_nvfp4.flatten().float(), expected.flatten().float())
+
+        print(
+            f"\n[{layer_name}] max_diff={max_diff:.6f}, "
+            f"cos_sim={cos_sim.item():.6f}, mse={mse.item():.6f}"
+        )
+
+        # NVFP4 has lower precision than FP8, so use relaxed tolerances
+        assert cos_sim > 0.95, f"NVFP4 cosine similarity too low: {cos_sim.item()}"
+        assert mse < 5.0, f"NVFP4 MSE too high: {mse.item()}"
+
+        # Cleanup
+        del pipeline_bf16, pipeline_nvfp4
         torch.cuda.empty_cache()
 
     def test_fp8_vs_bf16_memory_comparison(self, checkpoint_exists):
@@ -1194,6 +1339,146 @@ class TestWanPipeline:
 
         # Cleanup
         del pipeline_bf16, pipeline_fp8, transformer_bf16, transformer_fp8
+        torch.cuda.empty_cache()
+
+    def test_nvfp4_vs_bf16_full_transformer_e2e(self, checkpoint_exists):
+        """End-to-end test: Compare full Wan transformer NVFP4 vs BF16 output.
+
+        Similar to FP8 e2e test but with more relaxed tolerances for 4-bit quantization.
+        """
+        if not checkpoint_exists:
+            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH.")
+        if not is_wan21_checkpoint():
+            pytest.skip(
+                "This test requires Wan 2.1 checkpoint. Use DIFFUSION_MODEL_PATH with '2.1' in the path."
+            )
+
+        # Load BF16 Transformer (Reference)
+        print("\n[E2E NVFP4] Loading BF16 transformer...")
+        args_bf16 = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+        )
+        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        transformer_bf16 = pipeline_bf16.transformer
+
+        # Load NVFP4 Transformer
+        print("[E2E NVFP4] Loading NVFP4 transformer...")
+        args_nvfp4 = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            quant_config={
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+            },
+        )
+        pipeline_nvfp4 = PipelineLoader(args_nvfp4).load()
+        transformer_nvfp4 = pipeline_nvfp4.transformer
+
+        # Create Realistic Inputs
+        torch.manual_seed(42)
+        batch_size = 1
+        num_frames = 1
+        height, width = 64, 64
+        in_channels = 16
+        text_seq_len = 128
+        text_dim = 4096
+
+        hidden_states = torch.randn(
+            batch_size,
+            in_channels,
+            num_frames,
+            height,
+            width,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        timestep = torch.tensor([500], dtype=torch.long, device="cuda")
+        encoder_hidden_states = torch.randn(
+            batch_size,
+            text_seq_len,
+            text_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+        print("[E2E NVFP4] Input shapes:")
+        print(f"  hidden_states: {hidden_states.shape}")
+        print(f"  timestep: {timestep.shape}")
+        print(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
+
+        # Run Full Transformer Forward Pass
+        print("[E2E NVFP4] Running BF16 transformer forward...")
+        with torch.no_grad():
+            output_bf16 = transformer_bf16(
+                hidden_states=hidden_states.clone(),
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states.clone(),
+            )
+
+        print("[E2E NVFP4] Running NVFP4 transformer forward...")
+        with torch.no_grad():
+            output_nvfp4 = transformer_nvfp4(
+                hidden_states=hidden_states.clone(),
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states.clone(),
+            )
+
+        # Verify Outputs
+        assert output_bf16.shape == output_nvfp4.shape, (
+            f"Output shape mismatch: BF16={output_bf16.shape}, NVFP4={output_nvfp4.shape}"
+        )
+        print(f"[E2E NVFP4] Output shape: {output_bf16.shape}")
+
+        assert not torch.isnan(output_bf16).any(), "BF16 output contains NaN"
+        assert not torch.isinf(output_bf16).any(), "BF16 output contains Inf"
+        assert not torch.isnan(output_nvfp4).any(), "NVFP4 output contains NaN"
+        assert not torch.isinf(output_nvfp4).any(), "NVFP4 output contains Inf"
+
+        # Compare Numerical Accuracy
+        output_bf16_float = output_bf16.float()
+        output_nvfp4_float = output_nvfp4.float()
+
+        max_diff = torch.max(torch.abs(output_nvfp4_float - output_bf16_float)).item()
+        mean_diff = torch.mean(torch.abs(output_nvfp4_float - output_bf16_float)).item()
+        cos_sim = F.cosine_similarity(
+            output_nvfp4_float.flatten(), output_bf16_float.flatten(), dim=0
+        ).item()
+        mse = F.mse_loss(output_nvfp4_float, output_bf16_float).item()
+        rel_error = mean_diff / (output_bf16_float.abs().mean().item() + 1e-8)
+
+        print(f"\n{'=' * 60}")
+        print("END-TO-END TRANSFORMER COMPARISON (NVFP4 vs BF16)")
+        print(f"{'=' * 60}")
+        print(f"Number of layers: {len(transformer_bf16.blocks)}")
+        print(f"Output shape: {output_bf16.shape}")
+        print(f"Max absolute difference: {max_diff:.6f}")
+        print(f"Mean absolute difference: {mean_diff:.6f}")
+        print(f"Relative error: {rel_error:.6f}")
+        print(f"Cosine similarity: {cos_sim:.6f}")
+        print(f"MSE loss: {mse:.6f}")
+        print(f"BF16 output range: [{output_bf16_float.min():.4f}, {output_bf16_float.max():.4f}]")
+        print(
+            f"NVFP4 output range: [{output_nvfp4_float.min():.4f}, {output_nvfp4_float.max():.4f}]"
+        )
+        print(f"{'=' * 60}")
+
+        # NVFP4 is 4-bit, so expect more error than FP8
+        assert cos_sim > 0.90, (
+            f"Cosine similarity too low for NVFP4 full transformer: {cos_sim:.6f} (expected >0.90)"
+        )
+        assert rel_error < 0.25, (
+            f"Relative error too high for NVFP4: {rel_error:.6f} (expected <0.25)"
+        )
+
+        print("\n[PASS] NVFP4 full transformer output matches BF16 within tolerance!")
+        print(f"  Cosine similarity: {cos_sim:.4f} (>0.90)")
+        print(f"  Relative error: {rel_error:.4f} (<0.25)")
+
+        # Cleanup
+        del pipeline_bf16, pipeline_nvfp4, transformer_bf16, transformer_nvfp4
         torch.cuda.empty_cache()
 
     def test_attention_backend_comparison(self, checkpoint_exists):
