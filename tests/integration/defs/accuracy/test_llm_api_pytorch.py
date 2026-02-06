@@ -335,7 +335,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM"])
-    def test_nvfp4_kv(self, attn_backend, torch_compile):
+    @parametrize_with_ids("v2_kv_cache", [True, False])
+    def test_nvfp4_kv(self, attn_backend, torch_compile, v2_kv_cache):
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -344,7 +345,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
-        pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="nvfp4")
+        pytorch_config["kv_cache_config"] = KvCacheConfig(
+            dtype="nvfp4", use_kv_cache_manager_v2=v2_kv_cache)
         with LLM(f"{llm_models_root()}/Llama-3_1-8B-Instruct_fp8_kv_nvfp4",
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
