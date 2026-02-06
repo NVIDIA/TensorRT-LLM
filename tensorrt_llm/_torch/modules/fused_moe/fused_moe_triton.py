@@ -1127,6 +1127,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         _popped.data.storage().resize_(0)
         _popped = module._parameters.pop('fc31_dequant', None)
         _popped.data.storage().resize_(0)
+        torch.cuda.empty_cache()
 
         module.w3_w1_weight = tmp_w3_w1_weight
         module.fc31_dequant = tmp_w3_w1_weight_scale
@@ -1140,6 +1141,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         _popped.data.storage().resize_(0)
         _popped = module._parameters.pop('fc2_dequant', None)
         _popped.data.storage().resize_(0)
+        torch.cuda.empty_cache()
 
         module.w2_weight = tmp_w2_weight
         module.fc2_dequant = tmp_w2_weight_scale
