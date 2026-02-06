@@ -426,7 +426,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     ```
     """
 
-    MODEL_NAME = "zai-org/GLM-4.7-Flash"
+    # MODEL_NAME = "zai-org/GLM-4.7-Flash"
+    MODEL_NAME = "DeepInfra/GLM-4.7-Flash-NVFP4"
     MODEL_PATH = MODEL_NAME  # Model is in HF_CACHE
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
