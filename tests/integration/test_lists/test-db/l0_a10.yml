@@ -38,6 +38,10 @@ l0_a10:
   - unittest/disaggregated/test_messenger.py
   - unittest/disaggregated/test_disagg_cluster_manager_worker.py
   - unittest/disaggregated/test_cluster_storage.py
+  - unittest/disaggregated/test_extractor.py
+  - unittest/disaggregated/test_extractor_v2.py
+  - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/region/test_block.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]

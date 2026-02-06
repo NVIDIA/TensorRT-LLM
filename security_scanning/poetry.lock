@@ -1406,14 +1406,14 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.2"
+version = "0.6.3"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.2-py3-none-any.whl", hash = "sha256:8c3bc7d961d85697d12b8c52097ccf093ab722447494d087ee71bc4585ebca51"},
-    {file = "flashinfer_python-0.6.2.tar.gz", hash = "sha256:6f787ae77c351657630fbe40c4904c61a78ec5b786944a8e3df9d5348e3bd6bb"},
+    {file = "flashinfer_python-0.6.3-py3-none-any.whl", hash = "sha256:0fe2de934a4b3690c543dafb03f38d7bb4a762431abe8ae4f7292d6fef10c65d"},
+    {file = "flashinfer_python-0.6.3.tar.gz", hash = "sha256:84a762538247a86bc52ff31d9505d161ce1ec059174c1821c87c3ed1e44670fc"},
 ]
 
 [package.dependencies]
@@ -3871,14 +3871,14 @@ typing_extensions = ">=4.10"
 
 [[package]]
 name = "openai"
-version = "2.16.0"
+version = "2.17.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "openai-2.16.0-py3-none-any.whl", hash = "sha256:5f46643a8f42899a84e80c38838135d7038e7718333ce61396994f887b09a59b"},
-    {file = "openai-2.16.0.tar.gz", hash = "sha256:42eaa22ca0d8ded4367a77374104d7a2feafee5bd60a107c3c11b5243a11cd12"},
+    {file = "openai-2.17.0-py3-none-any.whl", hash = "sha256:4f393fd886ca35e113aac7ff239bcd578b81d8f104f5aedc7d3693eb2af1d338"},
+    {file = "openai-2.17.0.tar.gz", hash = "sha256:47224b74bd20f30c6b0a6a329505243cb2f26d5cf84d9f8d0825ff8b35e9c999"},
 ]
 
 [package.dependencies]
@@ -6986,4 +6986,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "779f58c322f69fd69395351ad98711515ba90e77e33e66c81d03990cd0956b9a"
+content-hash = "5415064a9bf7faee176fff6ecad5eb2b69541b7584e08e99443a6f7bc7f513ab"

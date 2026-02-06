@@ -588,14 +588,17 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             input_ids_ctx: Prepared context input IDs
         """
-        input_prompt_ids = input_ids[:num_ctx_tokens]
-        input_ids_ctx = torch.empty_like(input_prompt_ids,
-                                         dtype=torch.int32,
-                                         device="cuda")
-        input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
-        input_ids_ctx[
-            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
-        return input_ids_ctx
+        if num_ctx_tokens > 0:
+            input_prompt_ids = input_ids[:num_ctx_tokens]
+            input_ids_ctx = torch.empty_like(input_prompt_ids,
+                                             dtype=torch.int32,
+                                             device="cuda")
+            input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
+            input_ids_ctx[
+                gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+            return input_ids_ctx
+        else:
+            return torch.empty(0, dtype=torch.int32, device="cuda")
 
     def _sample_tokens_for_batch(
         self,
