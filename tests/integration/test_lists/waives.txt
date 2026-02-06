@@ -345,7 +345,6 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[Fals
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-trtllm-fp8] SKIP (https://nvbugs/5850183)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-trtllm-fp8] SKIP (https://nvbugs/5850183)
 examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate SKIP (https://nvbugs/5855540)
-unittest/_torch/auto_deploy/unit/singlegpu/test_ad_speculative_decoding.py::test_ad_speculative_decoding_smoke[False] SKIP (https://nvbugs/5859869)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_autotune_fp8_fp4[RoutingDSlite-384-1024-1] SKIP (https://nvbugs/5859881)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[disable_skip_indexer] SKIP (https://nvbugs/5859886)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-tp4-cutlass-fp8] SKIP (https://nvbugs/5651865)
