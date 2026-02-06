@@ -243,16 +243,23 @@ class Parameter:
 
         self.value = v
 
-    def set_name(self, name: str, network):
+    def set_name(self, name: str, network: Network):
         self._name = name
         if self.is_managed(network):
             self._get_weights(network).name = name
             return True
         else:
-            return network.trt_network.set_weights_name(
-                self._get_weights(network), name)
+            weights = self._get_weights(network)
+            # TensorRT bindings may return numpy array instead of trt.Weights
+            if isinstance(weights, np.ndarray):
+                trt_dtype = np_dtype_to_trt(
+                    weights.dtype
+                ) if weights.dtype != np.object_ else self._dtype
+                trt_count = int(np.prod(weights.shape))
+                weights = trt.Weights(trt_dtype, weights.ctypes.data, trt_count)
+            return network.trt_network.set_weights_name(weights, name)
 
-    def _get_weights(self, network) -> trt.Weights | Tensor | None:
+    def _get_weights(self, network: Network) -> trt.Weights | Tensor | None:
         tensor = network.get_parameter_tensor(self)
         if self.is_managed(network):
             return tensor
