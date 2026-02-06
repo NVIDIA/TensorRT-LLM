@@ -245,10 +245,8 @@ class InfoPrinter:
         logger.info(f"GPU_TYPE:          {EnvManager.get_gpu_type()}")
         logger.info(f"SLURM_PARTITION:   {EnvManager.get_slurm_partition()}")
         logger.info(f"SLURM_ACCOUNT:     {EnvManager.get_slurm_account()}")
-        logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")       
-        if config_path and test_id:
-            log_dir = os.path.join(EnvManager.get_output_path(), "slurm_logs", test_id.replace(":", "-"))
-            logger.info(f"# Reproduce Steps: python3 submit.py -c {config_path} --log-dir {log_dir}")
+        logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")
+        logger.info(f"Reproduce: cd <TensorRT-LLM> && python3 examples/disaggregated/slurm/benchmark/submit.py -c {config_path[config_path.find('tests/integration/defs/perf/disagg/test_configs/'):]} --log-dir <YOUR_OUTPUT_DIR>")
 
 
 CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")
