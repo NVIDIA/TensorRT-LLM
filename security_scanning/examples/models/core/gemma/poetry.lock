@@ -376,27 +376,6 @@ files = [
 ]
 
 [[package]]
-name = "chex"
-version = "0.1.90"
-description = "Chex: Testing made fun, in JAX!"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-files = [
-    {file = "chex-0.1.90-py3-none-any.whl", hash = "sha256:fce3de82588f72d4796e545e574a433aa29229cbdcf792555e41bead24b704ae"},
-    {file = "chex-0.1.90.tar.gz", hash = "sha256:d3c375aeb6154b08f1cccd2bee4ed83659ee2198a6acf1160d2fe2e4a6c87b5c"},
-]
-
-[package.dependencies]
-absl-py = ">=0.9.0"
-jax = ">=0.4.27"
-jaxlib = ">=0.4.27"
-numpy = ">=1.24.1"
-setuptools = {version = "*", markers = "python_version >= \"3.12\""}
-toolz = ">=0.9.0"
-typing_extensions = ">=4.2.0"
-
-[[package]]
 name = "click"
 version = "8.3.1"
 description = "Composable command line interface toolkit"
@@ -1552,19 +1531,18 @@ files = [
 
 [[package]]
 name = "optax"
-version = "0.2.6"
+version = "0.2.7"
 description = "A gradient processing and optimization library in JAX."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "optax-0.2.6-py3-none-any.whl", hash = "sha256:f875251a5ab20f179d4be57478354e8e21963373b10f9c3b762b94dcb8c36d91"},
-    {file = "optax-0.2.6.tar.gz", hash = "sha256:ba8d1e12678eba2657484d6feeca4fb281b8066bdfd5efbfc0f41b87663109c0"},
+    {file = "optax-0.2.7-py3-none-any.whl", hash = "sha256:241f2dfa104eab4fec2e16e7919f88df24a3da1481f95e264b3db396b30d4ff6"},
+    {file = "optax-0.2.7.tar.gz", hash = "sha256:8b6b2e5bd62bcc6c11f6172a1aff0d86da0eaeecbd5465b2b366b5d3d64f6efc"},
 ]
 
 [package.dependencies]
 absl-py = ">=0.7.1"
-chex = ">=0.1.87"
 jax = ">=0.5.3"
 jaxlib = ">=0.5.3"
 numpy = ">=1.18.0"
@@ -2734,28 +2712,6 @@ test = ["pytest"]
 testpaths = ["test"]
 
 [[package]]
-name = "setuptools"
-version = "80.10.2"
-description = "Easily download, build, install, upgrade, and uninstall Python packages"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-markers = "python_version == \"3.12\""
-files = [
-    {file = "setuptools-80.10.2-py3-none-any.whl", hash = "sha256:95b30ddfb717250edb492926c92b5221f7ef3fbcc2b07579bcd4a27da21d0173"},
-    {file = "setuptools-80.10.2.tar.gz", hash = "sha256:8b0e9d10c784bf7d262c4e5ec5d4ec94127ce206e8738f29a437945fbc219b70"},
-]
-
-[package.extras]
-check = ["pytest-checkdocs (>=2.4)", "pytest-ruff (>=0.2.1) ; sys_platform != \"cygwin\"", "ruff (>=0.8.0) ; sys_platform != \"cygwin\""]
-core = ["importlib_metadata (>=6) ; python_version < \"3.10\"", "jaraco.functools (>=4)", "jaraco.text (>=3.7)", "more_itertools", "more_itertools (>=8.8)", "packaging (>=24.2)", "platformdirs (>=4.2.2)", "tomli (>=2.0.1) ; python_version < \"3.11\"", "wheel (>=0.43.0)"]
-cover = ["pytest-cov"]
-doc = ["furo", "jaraco.packaging (>=9.3)", "jaraco.tidelift (>=1.4)", "pygments-github-lexers (==0.0.5)", "pyproject-hooks (!=1.1)", "rst.linker (>=1.9)", "sphinx (>=3.5)", "sphinx-favicon", "sphinx-inline-tabs", "sphinx-lint", "sphinx-notfound-page (>=1,<2)", "sphinx-reredirects", "sphinxcontrib-towncrier", "towncrier (<24.7)"]
-enabler = ["pytest-enabler (>=2.2)"]
-test = ["build[virtualenv] (>=1.0.3)", "filelock (>=3.4.0)", "ini2toml[lite] (>=0.14)", "jaraco.develop (>=7.21) ; python_version >= \"3.9\" and sys_platform != \"cygwin\"", "jaraco.envs (>=2.2)", "jaraco.path (>=3.7.2)", "jaraco.test (>=5.5)", "packaging (>=24.2)", "pip (>=19.1)", "pyproject-hooks (!=1.1)", "pytest (>=6,!=8.1.*)", "pytest-home (>=0.5)", "pytest-perf ; sys_platform != \"cygwin\"", "pytest-subprocess", "pytest-timeout", "pytest-xdist (>=3)", "tomli-w (>=1.0.0)", "virtualenv (>=13.0.0)", "wheel (>=0.44.0)"]
-type = ["importlib_metadata (>=7.0.2) ; python_version < \"3.10\"", "jaraco.develop (>=7.21) ; sys_platform != \"cygwin\"", "mypy (==1.14.*)", "pytest-mypy"]
-
-[[package]]
 name = "shellingham"
 version = "1.5.4"
 description = "Tool to Detect Surrounding Shell"
@@ -2974,18 +2930,6 @@ files = [
 [package.dependencies]
 ml_dtypes = ">=0.5.0"
 numpy = ">=1.22.0"
-
-[[package]]
-name = "toolz"
-version = "1.1.0"
-description = "List processing tools and functional utilities"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-files = [
-    {file = "toolz-1.1.0-py3-none-any.whl", hash = "sha256:15ccc861ac51c53696de0a5d6d4607f99c210739caf987b5d2054f3efed429d8"},
-    {file = "toolz-1.1.0.tar.gz", hash = "sha256:27a5c770d068c110d9ed9323f24f1543e83b2f300a687b7891c1a6d56b697b5b"},
-]
 
 [[package]]
 name = "tqdm"
