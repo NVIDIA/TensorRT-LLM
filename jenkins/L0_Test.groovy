@@ -1224,7 +1224,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     def scriptContent = """
                         ${scriptLaunchPrefix}
-                        srun --kill-on-bad-exit=1 ${srunArgs.join(" ")} ${scriptRunPathNode}
+                        srun ${srunArgs.join(" ")} ${scriptRunPathNode}
                     """.replaceAll("(?m)^\\s*", "")
                     pipeline.writeFile(file: scriptLaunchPathLocal, text: scriptContent)
                 }
