@@ -377,7 +377,6 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
-        is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
 
@@ -418,7 +417,6 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             dtype=dtype,
             spec_config=spec_config,
             layer_mask=layer_mask,
-            is_estimating_kv_cache=is_estimating_kv_cache,
             execution_stream=execution_stream,
         )
 
