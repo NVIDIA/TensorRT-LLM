@@ -672,6 +672,7 @@ class DeepseekV3Linear(Linear):
         reduce_output: bool = True,  # ROW parallel only
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
+        use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
         super().__init__(
@@ -688,6 +689,7 @@ class DeepseekV3Linear(Linear):
             skip_create_weights_in_init,
             use_custom_cublas_mm,
             lora,
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
         )
 
     def apply_linear(self,
@@ -748,7 +750,10 @@ class DeepseekV3Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            use_cute_dsl_blockscaling_mm=model_config.
+            use_cute_dsl_blockscaling_mm,
+        )
 
 
 class DeepseekV32Attention(MLA):
@@ -925,6 +930,7 @@ class Deepseekv3MoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
+        self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
         gate_cls = DeepseekV3Gate
         if hasattr(model_config.pretrained_config, "gate_cls"):
             gate_cls = model_config.pretrained_config.gate_cls
@@ -977,7 +983,9 @@ class Deepseekv3MoE(nn.Module):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=shared_tp_size,
-            reduce_output=False)
+            reduce_output=False,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+        )
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
@@ -1262,13 +1270,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
             self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
-            self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                                intermediate_size=config.intermediate_size,
-                                bias=False,
-                                dtype=config.torch_dtype,
-                                config=model_config,
-                                overridden_tp_size=self.mlp_tp_size,
-                                reduce_output=has_mlp_tp)
+            self.mlp = GatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                config=model_config,
+                overridden_tp_size=self.mlp_tp_size,
+                reduce_output=has_mlp_tp,
+                use_cute_dsl_blockscaling_mm=model_config.
+                use_cute_dsl_blockscaling_mm,
+            )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -1564,6 +1576,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 dtype=config.torch_dtype,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.
+                use_cute_dsl_blockscaling_mm,
             )
         else:
             self.eh_proj = Linear(
@@ -1576,6 +1590,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 reduce_output=True,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.
+                use_cute_dsl_blockscaling_mm,
             )
 
         self.shared_head = DeepseekV3MTPHead(model_config)

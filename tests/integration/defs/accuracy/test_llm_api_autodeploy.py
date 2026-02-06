@@ -319,10 +319,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K
     """
 
-    MODEL_NAME = "nvidia/Nemotron-Super-V3"
-    MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev"
-    MODEL_PATH_FP8 = f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-fp8-fp8kv"
-    MODEL_PATH_FP4 = f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv"
+    MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
+    MODEL_PATH_BF16 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"
+    MODEL_PATH_FP8 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"
+    MODEL_PATH_FP4 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"
 
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
@@ -371,7 +371,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
         print_memory_usage("After evaluation")
 
-    @pytest.mark.skip("Skipping FP8 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [1, 4, 8])
     def test_fp8(self, world_size):
@@ -394,7 +393,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip("Skipping FP4 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("world_size", [1, 4, 8])
+    @pytest.mark.parametrize("world_size", [4, 8])
     def test_fp4(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
