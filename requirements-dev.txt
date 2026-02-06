@@ -40,3 +40,4 @@ aiperf==0.3.0
 nanobind>=2.9.0
 nixl==0.8.0
 hf-transfer==0.1.9
+line_profiler

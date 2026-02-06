@@ -37,6 +37,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
+    host_profiler_context
 
 from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
@@ -557,8 +559,12 @@ class PyExecutor:
 
     def _event_loop_wrapper(self):
         try:
-            with customized_gc_thresholds(
-                    self.garbage_collection_gen0_threshold):
+            # Skip line profiler during warmup/memory estimation phase to avoid
+            # saving incomplete results that would be overwritten anyway
+            enable_profiler = bool(os.environ.get(
+                "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
+            with host_profiler_context(enable=enable_profiler), \
+                 customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
         except Exception as e:
             logger.error(f"Error in event loop: {e}")
