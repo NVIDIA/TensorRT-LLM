@@ -199,6 +199,86 @@ class DynamicLinearWeightLoader:
         else:
             return weight_dict
 
+    def _is_fused_nvfp4_dynamic(
+        self,
+        weight_dicts: List[Dict[str, torch.Tensor]],
+        quant_algo: Optional[QuantAlgo],
+        name: str,
+    ) -> bool:
+        """Check if this is a fused weight that needs NVFP4 dynamic quantization."""
+        if len(weight_dicts) <= 1:
+            return False
+        if quant_algo != QuantAlgo.NVFP4:
+            return False
+        # Check if any weight needs dynamic quantization
+        return any(self._should_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts)
+
+    def _quantize_fused_nvfp4(
+        self, weight_dicts: List[Dict[str, torch.Tensor]]
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Quantize fused weights (Q,K,V or gate,up) together as a single tensor.
+
+        For NVFP4 dynamic quantization, fused weights MUST be quantized together
+        to ensure consistent global scale. Quantizing separately then concatenating
+        causes each component to use different global scales, leading to incorrect
+        dequantization.
+
+        Returns:
+            List of weight dicts with quantized weights that can be concatenated
+            correctly by the linear module's load_weights method.
+        """
+        # Extract and concatenate BF16 weights
+        bf16_weights = []
+        for wd in weight_dicts:
+            weight = wd.get("weight")
+            if weight is None:
+                raise ValueError("Missing weight in fused weight dict")
+            if weight.device.type != "cuda":
+                weight = weight.cuda()
+            bf16_weights.append(weight)
+
+        fused_weight = torch.cat(bf16_weights, dim=0)
+
+        # Quantize the fused weight as a single tensor
+        qweight, weight_scale, weight_scale_2 = quantize_nvfp4(fused_weight)
+
+        # Split quantized weight back into components
+        # The quantized weight has shape [total_out, in//2]
+        split_sizes = [w.shape[0] for w in bf16_weights]
+        qweight_splits = torch.split(qweight, split_sizes, dim=0)
+
+        # Split weight_scale (block scales) proportionally
+        # weight_scale is 1D with size proportional to out_features
+        total_scale_size = weight_scale.numel()
+        total_out = sum(split_sizes)
+        scale_per_row = total_scale_size / ((total_out + 127) // 128 * 128)
+
+        # Simpler approach: split based on output feature ratio
+        weight_scale_splits = []
+        scale_offset = 0
+        for i, size in enumerate(split_sizes):
+            padded_size = (size + 127) // 128 * 128
+            num_scales = int(padded_size * scale_per_row)
+            weight_scale_splits.append(weight_scale[scale_offset : scale_offset + num_scales])
+            scale_offset += num_scales
+
+        # Build output weight dicts - each component gets:
+        # - Its portion of the quantized weight
+        # - Its portion of the block scales
+        # - The SAME global scale (weight_scale_2) for all - this is the key fix!
+        result = []
+        for i, wd in enumerate(weight_dicts):
+            new_wd = {
+                **wd,
+                "weight": qweight_splits[i],
+                "weight_scale": weight_scale_splits[i],
+                "weight_scale_2": weight_scale_2,  # Same for all components!
+                "_skip_scale_interleave": True,
+            }
+            result.append(new_wd)
+
+        return result
+
     def load_linear_weights(
         self, module: Linear, name: str, weight_dicts: List[Dict[str, torch.Tensor]]
     ) -> None:
@@ -209,8 +289,14 @@ class DynamicLinearWeightLoader:
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
 
-        quantized_weight_dicts = [
-            self._maybe_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts
-        ]
+        # Special handling for fused NVFP4 dynamic quantization
+        # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
+        # to ensure consistent global scale
+        if self._is_fused_nvfp4_dynamic(weight_dicts, quant_algo, name):
+            quantized_weight_dicts = self._quantize_fused_nvfp4(weight_dicts)
+        else:
+            quantized_weight_dicts = [
+                self._maybe_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts
+            ]
 
         module.load_weights(quantized_weight_dicts)
