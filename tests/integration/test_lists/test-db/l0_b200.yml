@@ -179,4 +179,6 @@ l0_b200:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[torch-True-1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
+  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_bf16[False]
+  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_nvfp4[False]
   - unittest/_torch/auto_deploy/unit/singlegpu
