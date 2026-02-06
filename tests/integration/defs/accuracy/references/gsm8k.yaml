@@ -324,6 +324,11 @@ zai-org/GLM-4.5-Air:
     spec_dec_algo: MTP
     kv_cache_quant_algo: FP8
     accuracy: 88.2
+GLM-4.7-Flash:
+  - accuracy: 83.434
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 81.046
 bigcode/starcoder2-3b:
   - accuracy: 20.2
 bigcode/starcoder2-7b:
