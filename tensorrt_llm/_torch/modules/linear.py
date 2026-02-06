@@ -2679,7 +2679,7 @@ class Linear(nn.Module):
         output_shape[-1] = self.out_features
         try:
             out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
-                self.mapping.tp_group, output_shape, input.dtype)
+                input, self.mapping.tp_group, output_shape)
         except Exception:
             return None
         if not bool(is_valid) or out is None or out.numel() == 0:

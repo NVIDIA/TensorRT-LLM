@@ -1830,7 +1830,7 @@ def tunable_allreduce(
                           torch.Tensor) or not input_tensor.is_cuda:
             return inputs
         window_tensor, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
-            group, list(input_tensor.size()), input_tensor.dtype)
+            input_tensor, group)
         if not is_valid:
             return inputs
         window_tensor.copy_(input_tensor)
