@@ -44,15 +44,6 @@ else:
     logger.debug(f"Debug mode: Skipping atexit handler: {EnvManager.get_debug_job_id()}")
 
 
-def _log_env_info():
-    """Log environment information at session start."""
-    logger.info(f"\n{'=' * 60}")
-    logger.info("Environment Information")
-    logger.info(f"{'=' * 60}")
-    InfoPrinter.print()
-    logger.info(f"{'=' * 60}")
-
-
 @pytest.fixture(scope="session", autouse=True)
 def session_lifecycle():
     """Session lifecycle management."""
@@ -62,9 +53,6 @@ def session_lifecycle():
     JobTracker.record_pid()
 
     session_tracker.start()
-    
-    # Log environment information at session start
-    _log_env_info()
     
     try:
         yield
@@ -108,7 +96,7 @@ class TestDisaggBenchmark:
             logger.info(f"Benchmark: {test_config.benchmark_type}")
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
-            InfoPrinter.print_short()
+            InfoPrinter.print(test_config.config_path, test_config.test_id)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
@@ -188,7 +176,7 @@ class TestDisaggBenchmark:
 
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
-            InfoPrinter.print_short()
+            InfoPrinter.print(test_config.config_path, test_config.test_id)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
@@ -270,7 +258,7 @@ class TestDisaggBenchmark:
 
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
-            InfoPrinter.print_short()
+            InfoPrinter.print(test_config.config_path, test_config.test_id)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():

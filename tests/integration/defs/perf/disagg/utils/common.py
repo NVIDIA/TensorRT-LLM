@@ -217,45 +217,38 @@ class EnvManager:
     def get_docker_image() -> str:
         return os.getenv("DOCKER_IMAGE", "default")
 
+    @staticmethod
+    def get_wheel_url() -> str:
+        return os.getenv("WHEEL_URL", "")
+
+    @staticmethod
+    def get_cluster_llm_data() -> str:
+        return os.getenv("CLUSTER_LLM_DATA", "")
+
 
 class InfoPrinter:
     """Print environment information for CI/CD and debugging."""
 
     @staticmethod
-    def print():
+    def print(config_path: str = None, test_id: str = None):
+        """Print environment information and optional reproduce command."""
         from utils.logger import logger
 
-        trtllm_branch = EnvManager.get_trtllm_branch()
-        trtllm_repo = EnvManager.get_trtllm_repo()
-        trtllm_version = EnvManager.get_trtllm_version()
-        commit_hash = EnvManager.get_commit_hash()
-        commit_time = EnvManager.get_commit_time()
-        docker_image = EnvManager.get_docker_image()
-        install_mode = EnvManager.get_install_mode()
-        gpu_type = EnvManager.get_gpu_type()
-        slurm_partition = EnvManager.get_slurm_partition()
-        slurm_account = EnvManager.get_slurm_account()
-
-        logger.info(f"TRT_LLM_BRANCH:    {trtllm_branch}")
-        logger.info(f"TRT_LLM_REPO:      {trtllm_repo}")
-        logger.info(f"TRT_LLM_VERSION:   {trtllm_version}")
-        logger.info(f"COMMIT_HASH:       {commit_hash}")
-        logger.info(f"COMMIT_TIME:       {commit_time}")
-        logger.info(f"DOCKER_IMAGE:      {docker_image}")
-        logger.info(f"INSTALL_MODE:      {install_mode}")
-        logger.info(f"GPU_TYPE:          {gpu_type}")
-        logger.info(f"SLURM_PARTITION:   {slurm_partition}")
-        logger.info(f"SLURM_ACCOUNT:     {slurm_account}")
-
-    @staticmethod
-    def print_short():
-        """Print key environment fields only (for per-test logging)."""
-        from utils.logger import logger
-
-        logger.info(f"GPU_TYPE:          {EnvManager.get_gpu_type()}")
+        logger.info(f"TRT_LLM_REPO:      {EnvManager.get_trtllm_repo()}")
+        logger.info(f"TRT_LLM_BRANCH:    {EnvManager.get_trtllm_branch()}")   
         logger.info(f"TRT_LLM_VERSION:   {EnvManager.get_trtllm_version()}")
         logger.info(f"COMMIT_HASH:       {EnvManager.get_commit_hash()}")
+        logger.info(f"COMMIT_TIME:       {EnvManager.get_commit_time()}")
         logger.info(f"DOCKER_IMAGE:      {EnvManager.get_docker_image()}")
+        logger.info(f"INSTALL_MODE:      {EnvManager.get_install_mode()}")
+        logger.info(f"WHEEL_URL:         {EnvManager.get_wheel_url()}")
+        logger.info(f"GPU_TYPE:          {EnvManager.get_gpu_type()}")
+        logger.info(f"SLURM_PARTITION:   {EnvManager.get_slurm_partition()}")
+        logger.info(f"SLURM_ACCOUNT:     {EnvManager.get_slurm_account()}")
+        logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")       
+        if config_path and test_id:
+            log_dir = os.path.join(EnvManager.get_output_path(), "slurm_logs", test_id.replace(":", "-"))
+            logger.info(f"# Reproduce: python3 submit.py -c {config_path} --log-dir {log_dir}")
 
 
 CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")
