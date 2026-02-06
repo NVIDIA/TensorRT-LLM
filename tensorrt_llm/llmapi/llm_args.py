@@ -3050,6 +3050,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    # fp8 cute dsl configs
+    use_cute_dsl_blockscaling_mm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling mm implementation.",
+        status="prototype",
+    )
+    use_cute_dsl_blockscaling_bmm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
