@@ -1082,7 +1082,7 @@ def get_layer_after_linear_node(
 
     def filter_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
-            if is_any_lin_op(node):
+            if is_any_lin_op(node) and node.meta["lin_node_shape"] is not None:
                 return node.meta["lin_node_shape"][dim] == embd
             return False
         else:
