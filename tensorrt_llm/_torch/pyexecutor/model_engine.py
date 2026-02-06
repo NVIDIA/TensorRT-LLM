@@ -2697,7 +2697,8 @@ class PyTorchModelEngine(ModelEngine):
                 #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
                 # Convert to GPU tensor to avoid implicit sync
                 gen_request_seq_slots_tensor = torch.tensor(
-                    gen_request_seq_slots, dtype=torch.long, device='cuda')
+                    gen_request_seq_slots, dtype=torch.long,
+                    pin_memory=True).to(device='cuda', non_blocking=True)
                 self.cache_indirection_attention[:num_generation_requests].copy_(
                     cache_indirection_buffer[gen_request_seq_slots_tensor])
             if cache_indirection_buffer is not None or is_cuda_graph_during_warmup:
