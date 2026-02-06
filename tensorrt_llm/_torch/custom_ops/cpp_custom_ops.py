@@ -1014,3 +1014,18 @@ def _register_fake():
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
         return normed_output_fp4, output, sf_out
+
+    @torch.library.register_fake("trtllm::fused_relu2_quantize")
+    def _(
+        input: torch.Tensor,
+        sf_scale: torch.Tensor,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # input: 2D tensor [M, N] (bf16 or fp16)
+        # output_fp4: [M, N/2] (packed FP4 values, 2 values per byte)
+        # output_sf: swizzled scale factors
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf

@@ -413,11 +413,13 @@ class NemotronHLayer(DecoderLayer):
         self,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = torch.zeros_like(hidden_states)
 
         if self.norm.is_nvfp4 and not hasattr(self.norm, 'nvfp4_scale'):
             self._try_attach_nvfp4_scale()
