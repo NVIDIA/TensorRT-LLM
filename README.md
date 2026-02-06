@@ -23,6 +23,12 @@ This branch is a prototype and not stable for production use. PRs are not accept
 
 ## Tech Blogs
 
+* [02/06] Accelerating Long-Context Inference with Skip Softmax Attention
+✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html)
+
+* [01/09] Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs
+✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs)
+
 * [10/13] Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)
 ✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html)
 
