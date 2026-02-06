@@ -23,6 +23,9 @@ from packaging import version
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
+# log2(e) constant for exp(x) = exp2(x * LOG2_E) optimization in Triton kernels
+LOG2_E = 1.4426950408889634
+
 
 @triton.autotune(
     configs=[
@@ -475,15 +478,13 @@ def _chunk_scan_fwd_kernel(
                 # - this is for continuous batching where there is no init states
                 # Use exp2 for faster computation: exp(x) = exp2(x * log2(e))
                 scale_m = tl.where(seq_idx_m == seq_idx_prev,
-                                   tl.math.exp2(dA_cs_m * 1.4426950408889634),
-                                   0.0)
+                                   tl.math.exp2(dA_cs_m * LOG2_E), 0.0)
             else:
                 # - if there is initstates, we will rely on prev_states, no zeroing
                 #   required.
-                scale_m = tl.math.exp2(
-                    (dA_cs_m - dA_cs_m_boundary) * 1.4426950408889634)
+                scale_m = tl.math.exp2((dA_cs_m - dA_cs_m_boundary) * LOG2_E)
         else:
-            scale_m = tl.math.exp2(dA_cs_m * 1.4426950408889634)
+            scale_m = tl.math.exp2(dA_cs_m * LOG2_E)
         if BLOCK_SIZE_DSTATE <= 128:
             C = tl.load(
                 C_ptrs,
@@ -543,8 +544,7 @@ def _chunk_scan_fwd_kernel(
         # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
         # So we don't need masking wrt seq_idx here.
         # Use exp2 for faster computation: exp(x) = exp2(x * log2(e))
-        cb *= tl.math.exp2(
-            (dA_cs_m[:, None] - dA_cs_k[None, :]) * 1.4426950408889634)
+        cb *= tl.math.exp2((dA_cs_m[:, None] - dA_cs_k[None, :]) * LOG2_E)
         dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k,
                        other=0.0).to(tl.float32)
         cb *= dt_k

@@ -395,6 +395,10 @@ class NemotronHLayer(DecoderLayer):
         if self.norm.is_nvfp4 and not hasattr(self.norm, "nvfp4_scale"):
             self._try_attach_nvfp4_scale()
 
+        # Call post_load_weights on mixer if it has the method (e.g., Mamba2Mixer)
+        if hasattr(self.mixer, 'post_load_weights'):
+            self.mixer.post_load_weights()
+
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from mixer's first linear to norm for fused RMSNorm+Quant."""
         # Normal handling for Mamba, MLP, and Attention layers.
