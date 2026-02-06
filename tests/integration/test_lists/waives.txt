@@ -214,7 +214,6 @@ full:RTXPro6000D/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::tes
 full:sm89/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2] SKIP (https://nvbugs/5596337)
 full:sm89/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2] SKIP (https://nvbugs/5596337)
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
-test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5744432)
 cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-mpi_kvcache-90] SKIP (https://nvbugs/5755941)
 examples/test_granite.py::test_llm_granite[granite-3.0-1b-a400m-instruct-bfloat16] SKIP (https://nvbugs/5608979)
 examples/test_granite.py::test_llm_granite[granite-3.0-2b-instruct-bfloat16] SKIP (https://nvbugs/5608979)
