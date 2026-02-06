@@ -35,6 +35,7 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache` | Triton flattened MHA with cache |
 | `torch.ops.auto_deploy.triton_attention_fused_flattened_mla_with_cache` | Triton fused flattened Multi-head Latent Attention with cache support |
 | `torch.ops.auto_deploy.triton_rope_on_flattened_inputs` | Triton RoPE on flattened inputs |
+| `torch.ops.auto_deploy.triton_rope_on_interleaved_qk_inputs` | Triton fused RoPE on interleaved QK inputs (position lookup + de-interleave + RoPE) |
 | `torch.ops.auto_deploy.triton_rope_with_input_pos` | Triton RoPE with input positions |
 | `torch.ops.auto_deploy.trtllm_moe_fused` | TensorRT LLM fused MoE implementation |
 | `torch.ops.auto_deploy.trtllm_dist_all_gather` | Distributed all-gather operation (TRT-LLM backend, MPI mode) |
