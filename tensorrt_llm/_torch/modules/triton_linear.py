@@ -11,7 +11,7 @@ from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
-from .fused_moe.fused_moe_triton import (maybe_update_stride,
+from .fused_moe.fused_moe_triton import (update_weight_stride,
                                          swizzle_weight_and_scale)
 from .linear import (Linear, LinearMethodBase, TensorParallelMode,
                      WeightsLoadingConfig, copy_weight, load_weight_shard,
@@ -55,7 +55,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         load_weights_vanilla_helper(module, weights, **self.param_transform)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -65,7 +65,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (q_weight, k_weight, v_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -75,7 +75,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (gate_weight, up_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
 
 class TritonFP8QDQLinearMethod(LinearMethodBase):
@@ -158,7 +158,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             # Dynamic quantization
             module.input_scale = None
         copy_weight(module.weight_scale, weight_scale[0])
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -183,7 +183,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -206,7 +206,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
 
 class TritonMXFP4LinearMethod(LinearMethodBase):
