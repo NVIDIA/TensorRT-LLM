@@ -234,8 +234,7 @@ trtllm-eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
  --max_batch_size 64 --max_num_tokens 100000 \
  --extra_llm_api_options extra_llm_api_options.yaml \
  longbench_v1 \
- # Dump dataset for perf benching
- --output_dir ${OUTPUT_DIR}
+ --output_dir ${OUTPUT_DIR}  # Dump dataset for perf benching
 ```
 
 ```bash
@@ -244,12 +243,9 @@ trtllm-eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
 --max_batch_size 1 --max_num_tokens 262144 \
 --extra_llm_api_options extra_llm_api_options.yaml \
 longbench_v2 \
-# Medium subset of LongBench V2
---length medium \
-# Truncate the prompt length to 256k
---max_input_length 256000 \
-# Dump dataset for perf benching
---output_dir ${OUTPUT_DIR}
+--length medium \  # Medium subset of LongBench V2
+--max_input_length 256000 \  # Truncate the prompt length to 256k
+--output_dir ${OUTPUT_DIR}  # Dump dataset for perf benching
 ```
 
 ### End-to-end performance (TTFT/TPOT)
