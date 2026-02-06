@@ -188,7 +188,7 @@ class TritonEPRouter():
                                       n_expts_local, n_expts_act)
 
 
-def maybe_update_stride(weight):
+def update_weight_stride(weight):
     assert weight.dim() == 3
     # For the latest Triton kernels, w.stride(-2)==1 works universally
     return weight.transpose(1, 2).contiguous().transpose(1, 2)
@@ -307,8 +307,9 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
+        module.w3_w1_weight.data = update_weight_stride(
+            module.w3_w1_weight.data)
+        module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -531,8 +532,9 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
+        module.w3_w1_weight.data = update_weight_stride(
+            module.w3_w1_weight.data)
+        module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -640,13 +642,14 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[1] * 2 == w_scale_shape[1] * 32
     assert w_shape[2] == w_scale_shape[2]
 
-    # OOM fix: save reference to original storage before maybe_update_stride
+    # OOM fix: save reference to original storage before update_weight_stride
     # makes a copy. We free the original to make room for convert_layout output.
     original_w_storage = w.data.untyped_storage()
 
-    w = maybe_update_stride(w)  # creates new tensor (transpose+contiguous+transpose)
+    w = update_weight_stride(
+        w)  # creates new tensor (transpose+contiguous+transpose)
 
-    # Free original parameter storage - maybe_update_stride already made a copy
+    # Free original parameter storage - update_weight_stride already made a copy
     original_w_storage.resize_(0)
     torch.cuda.empty_cache()
     #num_warps = 4 if batch <= 512 else 8
