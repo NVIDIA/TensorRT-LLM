@@ -392,12 +392,6 @@ class CachedSequenceInterface:
                 "max_batch_size": self.info.max_batch_size,
                 "mapping": Mapping(),
                 "layer_mask": None,
-                # NOTE (lucaslie): we can always run with False here since when we are estimating,
-                # we are explicitly setting the max_tokens in which case it's okay to use False here
-                # since we don't rely on free_gpu_memory_fraction inside the KVCacheManager. This is
-                # similar to _torch.pyexecutor._util.KVCacheCreator, which explicitly estimates the
-                # max_tokens outside of the KVCacheManager.
-                "is_estimating_kv_cache": False,
             }
         )
 
