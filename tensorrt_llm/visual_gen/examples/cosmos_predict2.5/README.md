@@ -2,7 +2,7 @@
 
 ## Overview
 
-This example shows how to integrate our plug-and-play feature to quickly support Cosmos Predict2.5, which is not a diffusers dependent model.
+This example shows how to integrate our plug-and-play feature to quickly support the non-diffusers version of Cosmos Predict2.5. For the diffusers version of Cosmos-Predict2.5 will full feature support, please try `examples/cosmos2_5_predict.py` instead.
 
 ## APIs
 We supported it with a few APIs. 

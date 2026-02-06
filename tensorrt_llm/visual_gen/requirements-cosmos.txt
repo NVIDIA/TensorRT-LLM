@@ -1,0 +1,3 @@
+cosmos-guardrail @ git+https://github.com/codeJRV/cosmos-guardrail.git
+diffusers @ git+https://github.com/huggingface/diffusers.git
+transformers~=4.57

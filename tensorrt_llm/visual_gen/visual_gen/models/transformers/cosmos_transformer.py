@@ -128,6 +128,9 @@ class ditCosmosTransformer3DModel(CosmosTransformer3DModel, ditBaseTransformer):
         rope_scale: Tuple[float, float, float] = (2.0, 1.0, 1.0),
         concat_padding_mask: bool = True,
         extra_pos_embed_type: Optional[str] = "learnable",
+        use_crossattn_projection: bool = False,
+        crossattn_proj_in_channels: int = 1024,
+        encoder_hidden_states_channels: int = 1024,
     ) -> None:
         super(ditCosmosTransformer3DModel, self).__init__(
             in_channels=in_channels,
@@ -143,6 +146,9 @@ class ditCosmosTransformer3DModel(CosmosTransformer3DModel, ditBaseTransformer):
             rope_scale=rope_scale,
             concat_padding_mask=concat_padding_mask,
             extra_pos_embed_type=extra_pos_embed_type,
+            use_crossattn_projection=use_crossattn_projection,
+            crossattn_proj_in_channels=crossattn_proj_in_channels,
+            encoder_hidden_states_channels=encoder_hidden_states_channels,
         )
         self._post_init()
 
@@ -211,6 +217,7 @@ class ditCosmosTransformer3DModel(CosmosTransformer3DModel, ditBaseTransformer):
         padding_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        disallow_teacache: bool = False,
         **extra_transformer_kwargs,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
 
@@ -280,7 +287,10 @@ class ditCosmosTransformer3DModel(CosmosTransformer3DModel, ditBaseTransformer):
         else:
             raise AssertionError(f"Unsupported timestep ndim: {timestep.ndim}")
 
-        if TeaCacheConfig.enable_teacache():
+        if self.config.use_crossattn_projection:
+            encoder_hidden_states = self.crossattn_proj(encoder_hidden_states)
+
+        if TeaCacheConfig.enable_teacache() and not disallow_teacache:
             with disable_weight_management():
                 if extra_pos_emb is not None:
                     modulated_inp, _ = self.transformer_blocks[0].norm1(

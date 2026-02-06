@@ -1,0 +1,4 @@
+# Library files compiled by `pip install -e`
+*.cpython-*.so
+# Output videos from running examples
+*.mp4
