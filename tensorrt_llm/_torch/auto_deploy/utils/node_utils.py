@@ -224,6 +224,18 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             ],
             biases=[],
         )
+    elif is_weight_node(node):
+        return WeightNodes(
+            weights=[
+                WeightNode(
+                    node=node,
+                    node_key=node.target,
+                    tensor=get_param_or_buffer(node.target, gm),
+                    submod=gm.get_submodule(node.target.rpartition(".")[0]),
+                )
+            ],
+            biases=[],
+        )
     # for other parametrized nodes, we need to find the weight node
     else:
         all_weight_nodes = [
@@ -424,6 +436,15 @@ def is_any_attention_op(node: Node) -> bool:
     )
 
 
+def is_any_mla_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_mla,
+        ],
+    )
+
+
 def is_linear_op(node: Node) -> bool:
     """Check if the node is a linear op.
 
@@ -506,6 +527,13 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
             continue
 
         is_bias = node.target.endswith("bias")
+        # This is reflective - weight node "belongs" to itself.
+        if is_bias:
+            node.meta["bias_nodes"] = []
+            node.meta["bias_nodes"].append(node)
+        else:
+            node.meta["weight_nodes"] = []
+            node.meta["weight_nodes"].append(node)
 
         # Find the consumer compute node by traversing through auxiliary ops
         current = node
@@ -1158,6 +1186,7 @@ def get_layer_after_linear_node(
     ]
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
+    mla_nodes = list(filtered_nodes(interior_nodes, is_any_mla_op))
     intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
     intermediate_weight_nodes = list(
         filtered_nodes(
@@ -1170,23 +1199,15 @@ def get_layer_after_linear_node(
     ####################################################
 
     def classify_layer_type() -> [LayerType, int]:
-        if len(ssm_nodes) + len(attention_nodes) > 1:
+        if len(ssm_nodes) + len(attention_nodes) + len(mla_nodes) > 1:
+            # ambiguous layer type
             return LayerType.UNKNOWN, 1
 
         if len(attention_nodes) == 1:
             head_size = shape(attention_nodes[0])[-1]
-            # check if this is MLA:
-            # these two intermediate linear nodes are the latent q and kv projections.
-            if len(intermediate_lin_nodes) == 2:
-                # MLA has a RMS norm inside, so it should have one (or two, couning biaas)
-                # intermediate weight nodes
-                if len(intermediate_weight_nodes) not in [1, 2]:
-                    return LayerType.UNKNOWN, 1
-                return LayerType.MLA, head_size
-            else:
-                if len(intermediate_lin_nodes) != 0:
-                    return LayerType.UNKNOWN, 1
-                return LayerType.ATTENTION, head_size
+            if len(intermediate_lin_nodes) > 0:
+                return LayerType.UNKNOWN, 1
+            return LayerType.ATTENTION, head_size
 
         if len(ssm_nodes) == 1:
             head_size = shape(ssm_nodes[0])[-1]
@@ -1203,6 +1224,16 @@ def get_layer_after_linear_node(
             if len(intermediate_weight_nodes) not in list(range(3, 7)):
                 return LayerType.UNKNOWN, 1
             return LayerType.SSM, head_size
+
+        if len(mla_nodes) == 1:
+            head_size = shape(mla_nodes[0])[-1]
+            # MLA should have two intermediate linear nodes:
+            # kv_b_proj and q_b_proj, but:
+            # - kv_b_proj may be absorbed by the MLA op
+            # - q_b_proj is skipped if q_lora_rank is None
+            if len(intermediate_lin_nodes) > 2:
+                return LayerType.UNKNOWN, 1
+            return LayerType.MLA, head_size
 
         # if we reach here, it means the layer is a MLP.
         # MLP should not have any intermediate linear or weight nodes.

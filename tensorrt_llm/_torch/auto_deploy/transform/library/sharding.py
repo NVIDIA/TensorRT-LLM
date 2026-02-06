@@ -49,6 +49,7 @@ from ...utils.node_utils import (
     is_any_moe_op,
     is_any_ssm_op,
     is_op,
+    is_weight_node,
     num_users_of_weight_node,
     shape,
     subgraph,
@@ -1844,6 +1845,7 @@ def _process_mla_sharding(
     - q_a_proj: # gather (simple shard, output is replicated)
     - q_b_proj: # column-sharding  (output is head-distributed)
     - kv_a_proj # gather (simple shard, output is replicated)
+    # This one is actually absorbed by the MLA kernel.
     - kv_b_proj # column-sharding (output is head-distributed)
     - o_proj # row-sharding + all-reduce
 
@@ -1858,8 +1860,41 @@ def _process_mla_sharding(
     q_a_proj, kv_a_proj = layer_subgraph.opening_nodes
     # extract q_b_proj and kv_b_proj nodes
     lin_nodes = list(filtered_nodes(layer_subgraph.subgraph_nodes, is_any_lin_op))
-    assert len(lin_nodes) == 2, "Expecting exactly two linear nodes in the interior of the subgraph"
-    q_b_proj, kv_b_proj = lin_nodes
+    assert len(lin_nodes) <= 2, (
+        "Expecting at most two linear nodes in the interior of the MLA layer"
+    )
+
+    if len(lin_nodes) == 1:
+        # we don't have explicit kv_b projection. Instead, it is
+        # absorbed by the MLA kernel.
+        mla_node = list(
+            filtered_nodes(layer_subgraph.subgraph_nodes, ops=torch.ops.auto_deploy.torch_mla)
+        )
+        assert len(mla_node) == 1, "Expecting exactly one MLA node"
+        mla_node = mla_node[0]
+        # torch_mla args:
+        # q_nope: [B, S, N, qk_nope_head_dim]
+        # q_pe: [B, S, N, qk_rope_head_dim]
+        # compressed_kv: [B, S, kv_lora_rank]
+        # kpe: [B, S, 1, qk_rope_head_dim]
+        # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+        # is_causal: bool
+        # scale: float
+        # layout: str
+
+        # we need to shard 4th argument: kv_b_proj_weight
+        assert is_weight_node(mla_node.args[4]), "Expecting weight node for kv_b_proj_weight"
+        # column-shard it
+        transform_container.add(
+            WeightShardingInfo.from_node(
+                mla_node.args[4],
+                split_dim=SplitDimension.COLUMN,
+                config=transform_container.config,
+                dist_op=None,
+                min_local_shape=1,
+                layer_type=LayerType.MLA,
+            )
+        )
 
     # extract o_proj node
     o_proj = layer_subgraph.terminating_node
@@ -1874,21 +1909,18 @@ def _process_mla_sharding(
 
     # extract the sub-subgraph from q_b_proj and kv_b_proj to o_proj
     sub_subgraph = subgraph(
-        sources=[q_b_proj, kv_b_proj],
+        sources=lin_nodes,
         boundary_condition=is_any_lin_op,
     )
     attention_subgraph = LayerSubgraph(
-        opening_nodes=[q_b_proj, kv_b_proj],
+        opening_nodes=lin_nodes,
         subgraph_nodes=sub_subgraph,
         terminating_node=o_proj,
         layer_type=LayerType.MLA,
         min_local_shape=layer_subgraph.min_local_shape,
     )
     # shard q_b_proj and kv_b_proj nodes
-    num_column_row_shards = _process_column_sharding(attention_subgraph, transform_container)
-    if num_column_row_shards < 2:
-        # it means that "someone else" already sharded these nodes. Skipping.
-        return 0
+    _process_column_sharding(attention_subgraph, transform_container)
 
     # update "empty" and "expand" nodes' args. Reference in modeling_deepseek.py:
     # query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
@@ -1914,6 +1946,27 @@ def _process_mla_sharding(
                 target_node=node_to_update.name, config=transform_container.config, args=tuple(args)
             )
         )
+
+    # update reshape nodes' args. Reference in modeling_deepseek.py:
+    # Output: [B, S, N, v_head_dim] -> [B, S, N * v_head_dim]
+    # attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+    # attn_output = self.o_proj(attn_output)
+    candidate_reshape = layer_subgraph.terminating_node.args[0]
+    if is_op(candidate_reshape, [torch.ops.aten.reshape]):
+        # reshape args are (attn_output, [bsz, q_len, num_heads * v_head_dim])
+        # set 3rd arg (num_heads * v_head_dim) to -1
+        reshape_args = list(candidate_reshape.args)
+        reshape_sizes = list(reshape_args[1])
+        reshape_sizes[2] = reshape_sizes[2] // world_size
+        reshape_args[1] = tuple(reshape_sizes)
+        transform_container.add(
+            ParameterUpdateInfo(
+                target_node=candidate_reshape.name,
+                config=transform_container.config,
+                args=tuple(reshape_args),
+            )
+        )
+        ad_logger.debug(f"\nUpdated reshape node {candidate_reshape} arguments to {reshape_args}")
 
     # shard o_proj node
     transform_container.add(
