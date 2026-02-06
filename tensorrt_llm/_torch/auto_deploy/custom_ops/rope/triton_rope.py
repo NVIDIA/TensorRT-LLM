@@ -192,6 +192,9 @@ def apply_rope_on_interleaved_qk_inputs(
 
     B, S, H_Q, D = q.shape
     _, _, H_K, _ = k.shape
+    assert k.shape[0] == B and k.shape[1] == S, "Q and K must have same batch and seq dims"
+    assert position_ids.shape == (B, S), f"position_ids must be [B, S], got {position_ids.shape}"
+    assert H_Q >= H_K, f"H_Q ({H_Q}) must be >= H_K ({H_K}) for grid sizing"
 
     # Allocate contiguous outputs
     # The kernel computes contiguous strides internally for output writes
@@ -203,7 +206,7 @@ def apply_rope_on_interleaved_qk_inputs(
     BLOCK_SIZE_S = min(triton.next_power_of_2(S), 32)
 
     # Grid: (B, cdiv(H_Q, BLOCK_SIZE_H), cdiv(S, BLOCK_SIZE_S))
-    # Note: We use H_Q for grid since H_Q >= H_K typically
+    # H_Q >= H_K is enforced above; K heads are masked within each block
     grid = (
         B,
         triton.cdiv(H_Q, BLOCK_SIZE_H),
