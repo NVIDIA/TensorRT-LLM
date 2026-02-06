@@ -17,7 +17,7 @@ namespace
 #define FP4_MAX 6
 #define FP8_MAX 448
 #define SCALE_EPS 0.001953125
-#define MAX_HIDDEN_DIM 32768
+#define MAX_HIDDEN_DIM 12288
 #define GROUP_NUM(x) ((x) / 16)
 
 __forceinline__ __device__ __host__ float clamp(float x, float a, float b)
@@ -67,7 +67,7 @@ __global__ void reorder_activationn_nvfp4_kernel(
     cutlass::bfloat16_t* input = reinterpret_cast<cutlass::bfloat16_t*>(hidden_states);
     cutlass::float_ue4m3_t* q_scale_tensor = reinterpret_cast<cutlass::float_ue4m3_t*>(q_scale);
     // One block solves one row of hidden states.
-    __shared__ uint8_t smem[4096 * sizeof(cutlass::bfloat16_t)];
+    __shared__ uint8_t smem[MAX_HIDDEN_DIM * sizeof(cutlass::bfloat16_t)];
     cutlass::bfloat16_t* input_smem = reinterpret_cast<cutlass::bfloat16_t*>(smem);
     // Local memory stores the reordered hidden states.
     cutlass::bfloat16_t input_frag[elements_per_thread];
