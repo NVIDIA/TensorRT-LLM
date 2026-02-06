@@ -1025,7 +1025,7 @@ def apply_model_defaults_to_llm_args(
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
 
-    new_args = TorchLlmArgs(**merged_state)
+    new_args = llm_args.__class__(**merged_state)
 
     for field_name in llm_args.model_fields:
         setattr(llm_args, field_name, getattr(new_args, field_name))

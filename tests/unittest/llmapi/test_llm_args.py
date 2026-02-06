@@ -1048,7 +1048,7 @@ class TestPyTorchBackendModelDefaults:
         # Use local model path if available, otherwise use HuggingFace ID
         model_root = llm_models_root()
         if model_root:
-            local_path = model_root / "llm-models/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+            local_path = model_root / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
             if local_path.exists():
                 return str(local_path)
 
