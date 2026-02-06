@@ -366,8 +366,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     else:
         cuda_graph_config = None
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-    kv_cache_config.free_gpu_memory_fraction = 0.5
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
     llm_spec = LLM(model=target_model_dir,
                    speculative_config=spec_config,
                    max_batch_size=1,
