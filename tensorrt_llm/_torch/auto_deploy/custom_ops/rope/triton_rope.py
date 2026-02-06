@@ -12,11 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Tuple
 
 import torch
 import triton
 
-from .triton_rope_kernel import rope_fwd_flattened_kernel, rope_fwd_kernel
+from .triton_kernels.rope import (
+    rope_fwd_flattened_kernel,
+    rope_fwd_interleaved_kernel,
+    rope_fwd_kernel,
+)
 
 
 @torch.library.custom_op("auto_deploy::triton_rope_with_input_pos", mutates_args=())
@@ -147,3 +152,102 @@ def apply_rope_on_flattened_inputs(
 @apply_rope_on_flattened_inputs.register_fake
 def apply_rope_on_flattened_inputs_fake(x, freqs_cis, input_pos, seq_lens, seq_start_indices):
     return torch.empty_like(x)
+
+
+@torch.library.custom_op("auto_deploy::triton_rope_on_interleaved_qk_inputs", mutates_args=())
+def apply_rope_on_interleaved_qk_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused RoPE for DeepSeek-style interleaved Q/K inputs.
+
+    This kernel fuses:
+    1. Position ID lookup for cos/sin from cache
+    2. De-interleaving of Q/K
+    3. RoPE application
+
+    Args:
+        q: Query tensor with interleaved layout [B, S, H_Q, D]
+           Input: [q0_r, q0_i, q1_r, q1_i, ...]
+        k: Key tensor with interleaved layout [B, S, H_K, D]
+           Typically H_K=1 for MQA
+        cos_cache: Cosine cache [max_seq_len, D]
+        sin_cache: Sine cache [max_seq_len, D]
+        position_ids: Position indices [B, S]
+
+    Returns:
+        Tuple of (q_rotated, k_rotated) with layout [B, S, H, D]
+        Output: [y0, y1, ..., y_{D/2-1}, y_{D/2}, ..., y_{D-1}]
+        where y_first = a*cos - b*sin, y_second = b*cos + a*sin
+    """
+    assert q.dim() == 4, f"Q must be 4D [B, S, H, D], got {q.dim()}D"
+    assert k.dim() == 4, f"K must be 4D [B, S, H, D], got {k.dim()}D"
+    assert q.shape[-1] % 2 == 0, "Head dimension must be even"
+    assert q.shape[-1] == k.shape[-1], "Q and K must have same head dimension"
+    assert cos_cache.shape == sin_cache.shape, "cos and sin cache must have same shape"
+
+    B, S, H_Q, D = q.shape
+    _, _, H_K, _ = k.shape
+
+    # Allocate contiguous outputs
+    # The kernel computes contiguous strides internally for output writes
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+
+    # Block sizes
+    BLOCK_SIZE_H = 32
+    BLOCK_SIZE_S = min(triton.next_power_of_2(S), 32)
+
+    # Grid: (B, cdiv(H_Q, BLOCK_SIZE_H), cdiv(S, BLOCK_SIZE_S))
+    # Note: We use H_Q for grid since H_Q >= H_K typically
+    grid = (
+        B,
+        triton.cdiv(H_Q, BLOCK_SIZE_H),
+        triton.cdiv(S, BLOCK_SIZE_S),
+    )
+
+    rope_fwd_interleaved_kernel[grid](
+        q,
+        k,
+        cos_cache,
+        sin_cache,
+        position_ids,
+        q_out,
+        k_out,
+        B,
+        S,
+        H_Q,
+        H_K,
+        D,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        position_ids.stride(0),
+        position_ids.stride(1),
+        cos_cache.stride(0),
+        cos_cache.stride(1),
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+        BLOCK_SIZE_S=BLOCK_SIZE_S,
+    )
+
+    return q_out, k_out
+
+
+@apply_rope_on_interleaved_qk_inputs.register_fake
+def apply_rope_on_interleaved_qk_inputs_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k)
