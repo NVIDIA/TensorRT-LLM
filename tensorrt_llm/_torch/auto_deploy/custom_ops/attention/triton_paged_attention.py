@@ -540,8 +540,18 @@ def triton_paged_decode(
 
 
 # =============================================================================
-# TRITON KERNELS - CONTEXT/PREFILL (page-aligned)
+# TRITON KERNELS - CONTEXT/PREFILL (page-aligned, causal skip, autotuned)
 # =============================================================================
+@triton.autotune(
+    configs=[
+        triton.Config({"Q_BLOCK": 32}, num_stages=2, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=3, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
+    ],
+    key=["HEAD_DIM", "PAGE_SIZE"],
+)
 @triton.jit
 def _paged_context_kernel(
     # Inputs
@@ -564,18 +574,25 @@ def _paged_context_kernel(
     cache_stride_kv: tl.constexpr,
     cache_stride_head: tl.constexpr,
     cache_stride_token: tl.constexpr,
+    # Autotuned
+    Q_BLOCK: tl.constexpr,
     # Constants
     SM_SCALE: tl.constexpr,
     N_HEADS: tl.constexpr,
     N_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    Q_BLOCK: tl.constexpr,
 ):
-    """Context/prefill attention with paged KV cache, causal masking, and page-aligned iteration.
+    """Context/prefill attention with paged KV cache, causal skip, and page-aligned iteration.
 
-    Page-aligned iteration benefits over arbitrary KV_BLOCK:
-    - 1 scalar page table load per page
+    Grid: (num_seq, n_heads, num_q_blocks)
+
+    Optimizations:
+    - Page-aligned iteration: 1 scalar page table load per page, no div/mod,
+      contiguous KV memory access within each page.
+    - Causal skip: pages entirely beyond the last Q position are skipped,
+      saving ~50% of KV loads on average for causal attention.
+    - Autotuned Q_BLOCK, num_stages, num_warps for best tile/pipeline config.
     """
     batch_id = tl.program_id(axis=0)
     head_id = tl.program_id(axis=1)
@@ -617,57 +634,51 @@ def _paged_context_kernel(
 
     page_offsets = tl.arange(0, PAGE_SIZE)
 
+    # Causal skip boundary: last Q position in full sequence coordinates
+    max_q_pos = q_block_start + Q_BLOCK - 1 + cache_len
+
     # Page-aligned iteration: one page per loop iteration
     for page_idx in range(num_kv_pages):
-        # Single scalar page table load (vs vector load of KV_BLOCK entries)
-        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
-
-        # Valid tokens in this page
         kv_base_pos = page_idx * PAGE_SIZE
-        valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
-        page_mask = page_offsets < valid_tokens
 
-        # Contiguous KV load: all tokens in a page are adjacent in memory
-        cache_base = (
-            physical_page.to(tl.int64) * cache_stride_block
-            + kv_head_id * cache_stride_head
-            + page_offsets[:, None] * cache_stride_token
-            + dhead_offsets[None, :]
-        )
-        page_mask_2d = page_mask[:, None]
+        # Causal skip: if entire page is beyond last Q position, skip it.
+        # Triton doesn't support break, so we guard the body instead.
+        if kv_base_pos <= max_q_pos:
+            physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+            valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
+            page_mask = page_offsets < valid_tokens
 
-        k = tl.load(kv_cache_ptr + cache_base, mask=page_mask_2d, other=0.0)
-        v = tl.load(
-            kv_cache_ptr + cache_base + cache_stride_kv,
-            mask=page_mask_2d,
-            other=0.0,
-        )
+            cache_base = (
+                physical_page.to(tl.int64) * cache_stride_block
+                + kv_head_id * cache_stride_head
+                + page_offsets[:, None] * cache_stride_token
+                + dhead_offsets[None, :]
+            )
+            page_mask_2d = page_mask[:, None]
+            k = tl.load(kv_cache_ptr + cache_base, mask=page_mask_2d, other=0.0)
+            v = tl.load(
+                kv_cache_ptr + cache_base + cache_stride_kv,
+                mask=page_mask_2d,
+                other=0.0,
+            )
 
-        # QK^T: [Q_BLOCK, HEAD_DIM] @ [HEAD_DIM, PAGE_SIZE] -> [Q_BLOCK, PAGE_SIZE]
-        qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            q_positions = q_offsets[:, None] + cache_len
+            kv_positions = kv_base_pos + page_offsets[None, :]
+            causal_mask = q_positions >= kv_positions
+            full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
+            qk = tl.where(full_mask, qk, float("-inf"))
 
-        # Causal mask: q_pos (in full sequence) >= kv_pos
-        q_positions = q_offsets[:, None] + cache_len
-        kv_positions = kv_base_pos + page_offsets[None, :]
-        causal_mask = q_positions >= kv_positions
-
-        full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
-        qk = tl.where(full_mask, qk, float("-inf"))
-
-        # Online softmax update
-        m_ij = tl.max(qk, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(qk - m_i_new[:, None])
-
-        # P@V: [Q_BLOCK, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM] -> [Q_BLOCK, HEAD_DIM]
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_i_new
+            m_ij = tl.max(qk, axis=1)
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new[:, None])
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_i_new
 
     l_i = tl.where(l_i == 0.0, 1.0, l_i)
     o = acc / l_i[:, None]
-
     o_store_offsets = (
         (q_start + q_offsets[:, None]) * o_stride_token
         + head_id * o_stride_head
@@ -694,16 +705,17 @@ def triton_paged_context(
 
     output = out if out is not None else torch.empty_like(q)
 
-    Q_BLOCK = 32
-
     q_lens = qo_indptr[1:] - qo_indptr[:-1]
     max_q_len = int(q_lens.max().item()) if num_seq > 0 else 0
-    num_q_blocks = (max_q_len + Q_BLOCK - 1) // Q_BLOCK
 
     if num_seq == 0 or max_q_len == 0:
         return output
 
-    grid = (num_seq, n_heads, num_q_blocks)
+    # Grid depends on autotuned Q_BLOCK, so use a lambda
+    def grid(meta):
+        q_block = meta["Q_BLOCK"]
+        num_q_blocks = (max_q_len + q_block - 1) // q_block
+        return (num_seq, n_heads, num_q_blocks)
 
     _paged_context_kernel[grid](
         q,
@@ -727,7 +739,6 @@ def triton_paged_context(
         N_KV_HEADS=n_kv_heads,
         HEAD_DIM=head_dim,
         PAGE_SIZE=page_size,
-        Q_BLOCK=Q_BLOCK,
     )
 
     return output
