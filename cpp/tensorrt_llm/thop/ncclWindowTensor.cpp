@@ -27,10 +27,14 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-std::tuple<torch::Tensor, bool> createNcclWindowTensorOp(
-    torch::List<int64_t> const& group, at::IntArrayRef shape, torch::ScalarType dtype)
+std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
+    torch::Tensor const& like, torch::List<int64_t> const& group, c10::optional<at::IntArrayRef> shape)
 {
 #if ENABLE_MULTI_DEVICE
+    if (!like.defined() || !like.is_cuda())
+    {
+        return {torch::Tensor(), false};
+    }
     if (group.size() == 0)
     {
         return {torch::Tensor(), false};
@@ -49,7 +53,9 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorOp(
         return {torch::Tensor(), false};
     }
 
-    auto [tensor, buffer] = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(*commPtr, shape, dtype);
+    at::IntArrayRef const outShape = (shape.has_value() && !shape->empty()) ? *shape : like.sizes();
+    auto [tensor, buffer]
+        = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(*commPtr, outShape, like.scalar_type());
     if (!tensor.defined() || buffer.invalid())
     {
         return {torch::Tensor(), false};
@@ -58,8 +64,8 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorOp(
     return {tensor, true};
 #else
     (void) group;
+    (void) like;
     (void) shape;
-    (void) dtype;
     return {torch::Tensor(), false};
 #endif
 }
@@ -70,10 +76,10 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("create_nccl_window_tensor(int[] group, int[] shape, ScalarType dtype) -> (Tensor out, bool is_valid)");
+    m.def("create_nccl_window_tensor(Tensor like, int[] group, int[]? shape=None) -> (Tensor out, bool is_valid)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("create_nccl_window_tensor", &tensorrt_llm::torch_ext::createNcclWindowTensorOp);
+    m.impl("create_nccl_window_tensor", &tensorrt_llm::torch_ext::createNcclWindowTensorLikeOp);
 }

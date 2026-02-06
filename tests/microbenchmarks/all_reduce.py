@@ -262,7 +262,7 @@ def allreduce_benchmark(
             elif strategy == AllReduceStrategy.NCCL_SYMMETRIC:
                 try:
                     window_out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
-                        mapping.tp_group, list(input.shape), input.dtype)
+                        input, mapping.tp_group)
                 except Exception:
                     window_out, is_valid = None, False
                 if bool(is_valid) and window_out is not None:
