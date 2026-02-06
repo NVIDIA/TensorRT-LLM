@@ -898,6 +898,8 @@ class AsyncWorkerMixin:
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     DEFAULT_MAX_TOPK_LOGPROBS = 20
 
+    SampleState = SampleStateTorch
+
     @override
     def get_cache_indirection(self) -> torch.Tensor | None:
         return self.store.cache_indirection
