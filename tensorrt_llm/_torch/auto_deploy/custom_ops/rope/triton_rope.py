@@ -17,7 +17,7 @@ from typing import Tuple
 import torch
 import triton
 
-from .triton_kernels.rope import (
+from .triton_rope_kernel import (
     rope_fwd_flattened_kernel,
     rope_fwd_interleaved_kernel,
     rope_fwd_kernel,
