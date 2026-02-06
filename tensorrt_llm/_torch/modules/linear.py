@@ -2680,9 +2680,23 @@ class Linear(nn.Module):
         try:
             out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
                 input, self.mapping.tp_group, output_shape)
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "create_nccl_window_tensor raised: %s (shape=%s, group=%s)",
+                type(exc).__name__,
+                tuple(output_shape),
+                tuple(self.mapping.tp_group),
+            )
             return None
         if not bool(is_valid) or out is None or out.numel() == 0:
+            logger.debug(
+                "create_nccl_window_tensor invalid (is_valid=%s, out_defined=%s, numel=%d, shape=%s, group=%s)",
+                bool(is_valid),
+                out is not None,
+                0 if out is None else out.numel(),
+                tuple(output_shape),
+                tuple(self.mapping.tp_group),
+            )
             return None
         return out
 
