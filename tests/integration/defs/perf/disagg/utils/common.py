@@ -248,7 +248,7 @@ class InfoPrinter:
         logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")       
         if config_path and test_id:
             log_dir = os.path.join(EnvManager.get_output_path(), "slurm_logs", test_id.replace(":", "-"))
-            logger.info(f"# Reproduce: python3 submit.py -c {config_path} --log-dir {log_dir}")
+            logger.info(f"# Reproduce Steps: python3 submit.py -c {config_path} --log-dir {log_dir}")
 
 
 CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")
