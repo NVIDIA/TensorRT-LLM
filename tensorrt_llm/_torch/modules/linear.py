@@ -2742,20 +2742,29 @@ class Linear(nn.Module):
                     if window_success:
                         window_bytes = window_out.numel(
                         ) * window_out.element_size()
-                        window_info = " (size_bytes=%d, ptr=%s, shape=%s)" % (
-                            window_bytes,
-                            hex(window_out.data_ptr()),
-                            tuple(window_out.shape),
-                        )
+                        window_info = (
+                            f" (size_bytes={window_bytes}, ptr={hex(window_out.data_ptr())}, "
+                            f"shape={tuple(window_out.shape)})")
                         output = self.quant_method.apply_out(
                             self, input, bias, window_out)
                     else:
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)
+                        try:
+                            output_shape = list(input.shape)
+                            if output_shape:
+                                output_shape[-1] = self.out_features
+                            output_bytes = math.prod(
+                                output_shape) * input.element_size()
+                            capture = torch.cuda.is_current_stream_capturing()
+                            window_info = (
+                                f" (capture={capture}, size_bytes={output_bytes})"
+                            )
+                        except Exception:
+                            pass
                     logger.debug(
-                        "Linear GEMM NCCL window output buffer: %s%s",
-                        "success" if window_success else "failure",
-                        window_info,
+                        f"Linear GEMM NCCL window output buffer: "
+                        f"{'success' if window_success else 'failure'}{window_info}"
                     )
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
