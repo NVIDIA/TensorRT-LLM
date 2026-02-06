@@ -194,7 +194,6 @@ test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-ll
 accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[False] SKIP (https://nvbugs/5629792)
 llmapi/test_llm_examples.py::test_llmapi_example_multilora SKIP (https://nvbugs/5636857)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False] SKIP (https://nvbugs/5616182)
-unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEPLowLatency] SKIP (https://nvbugs/5808500)
 unittest/_torch/auto_deploy/unit/multigpu/test_ad_build_small_multi.py::test_build_ad[meta-llama/Meta-Llama-3.1-8B-Instruct-llm_extra_args0-2] SKIP (https://nvbugs/5680755)
 full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)
 test_e2e.py::test_openai_completions_example[trt] SKIP (https://nvbugs/5701450)
