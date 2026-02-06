@@ -1373,12 +1373,16 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("moe_backend", [
-    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
+    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL",
+    "DENSEGEMM"
 ])
 @pytest.mark.parametrize(
     "finalize_fusion", [True, False],
     ids=["enable_finalize_fusion", "disable_finalize_fusion"])
-def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion):
+def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion, mocker):
+    # Disable fused fc2 alpha path for DENSEGEMM without finalize_fusion
+    if moe_backend == "DENSEGEMM" and not finalize_fusion:
+        mocker.patch.dict(os.environ, {"TRTLLM_MOE_FUSED_FC2_ALPHA": "0"})
 
     run_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion)
 
@@ -1424,13 +1428,18 @@ def run_fused_moe_nvfp4(dtype,
         if finalize_fusion:
             pytest.skip(
                 "TRTLLM NVFP4 MoE backend does not support fused finalize yet")
-    if moe_backend == "CUTEDSL":
+    if moe_backend in ["CUTEDSL", "DENSEGEMM"]:
         if dtype == torch.float16:
             pytest.skip(
                 "CUTEDSL NVFP4 MoE backend does not support float16 yet")
         if get_sm_version() not in (100, 103):
             pytest.skip(
                 "CUTEDSL NVFP4 MoE backend supports SM 100 (B200) and SM 103 (B300) only"
+            )
+    if moe_backend == "DENSEGEMM":
+        if finalize_fusion:
+            pytest.skip(
+                "DENSEGEMM NVFP4 MoE backend does not use finalize_fusion parameter"
             )
 
     test_all_kernels = True
@@ -2995,3 +3004,17 @@ def test_nvfp4_cutlass_get_weights_shapes(hidden_size, intermediate_size,
     assert intermediate_size_expand_aligned % NVFP4_ROW_ALIGNMENT == 0, (
         f"intermediate_size_expand_aligned {intermediate_size_expand_aligned} "
         f"not aligned to {NVFP4_ROW_ALIGNMENT}")
+
+
+if __name__ == "__main__":
+    import os
+    from unittest.mock import MagicMock
+
+    os.environ["ENABLE_CONFIGURABLE_MOE"] = "0"
+
+    mocker = MagicMock()
+    test_fused_moe_nvfp4(torch.bfloat16,
+                         "DENSEGEMM",
+                         finalize_fusion=False,
+                         enable_configurable_moe=0,
+                         mocker=mocker)
