@@ -517,8 +517,6 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
             if not users:
                 break
 
-            # Check if any user is a compute node (not an auxiliary op)
-            consumer_found = None
             aux_node = None
 
             for user in users:
@@ -541,15 +539,8 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
                 if user.target in _WEIGHT_AUX_OPS:
                     # This is an auxiliary op, continue traversing
                     aux_node = user
-                else:
-                    # This is a potential consumer compute node
-                    consumer_found = user
-                    break
 
-            if consumer_found is not None:
-                # Found the consumer, return
-                break
-            elif aux_node is not None and aux_node not in visited:
+            if aux_node is not None and aux_node not in visited:
                 # Continue through auxiliary op
                 current = aux_node
                 visited.add(current)
@@ -743,6 +734,8 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
             shape = get_weight_shape(lin_node)
             if shape is not None:
                 lin_node.meta["lin_node_shape"] = shape
+            else:
+                lin_node.meta["lin_node_shape"] = None
 
     # Find the embedding size from the first linear node
     embd = get_weight_shape(linear_nodes[0], dim=-1)
@@ -1072,7 +1065,7 @@ def get_layer_after_linear_node(
 
     def boundary_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
-            if is_any_lin_op(node):
+            if is_any_lin_op(node) and node.meta["lin_node_shape"] is not None:
                 return node.meta["lin_node_shape"][dim] == embd
             return (
                 is_any_moe_op(node)
