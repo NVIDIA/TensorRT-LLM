@@ -1257,6 +1257,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+        # TODO: Remove enable_block_reuse=False once KV cache block reuse
+        # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
 
     def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):

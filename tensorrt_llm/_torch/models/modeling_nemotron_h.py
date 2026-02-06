@@ -597,6 +597,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel, NemotronH
 
         Disables block reuse due to SSM/hybrid architecture constraints.
         """
+        # TODO: Remove enable_block_reuse=False once KV cache block reuse
+        # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
 
 
