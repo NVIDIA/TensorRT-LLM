@@ -1893,7 +1893,8 @@ class KVCacheManagerV2(BaseResourceManager):
         prepare_resources method, so we check the flag and skip allocation.
         For other policies (GUARANTEED_NO_EVICT), we allocate resources here.
         """
-        # Check if the scheduler already prepared resources this round
+        # Check if the scheduler already prepared resources
+        # TODO: remove this flag and make it assertion after kv_cache_v2 dummy scheduler is removed
         if self._scheduler_prepared_resources:
             # Reset flag for next round
             self._scheduler_prepared_resources = False
@@ -2069,14 +2070,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         evicted_requests: List[LlmRequest] = []
 
-        # Create a ScheduledRequests-like object for context management
-        class ScheduledBatch:
-
-            def __init__(self, ctx_reqs, gen_reqs):
-                self.context_requests = ctx_reqs
-                self.generation_requests = gen_reqs
-
-        scheduled_batch = ScheduledBatch(context_requests, generation_requests)
+        # Create a ScheduledRequest object for context management
+        scheduled_batch = ScheduledRequests()
+        scheduled_batch.context_requests = list(context_requests)
+        scheduled_batch.generation_requests = list(generation_requests)
 
         with request_context(self.is_draft, scheduled_batch):
             new_generation_batch: List[LlmRequest] = []
