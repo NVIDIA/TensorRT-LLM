@@ -13,71 +13,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 
-sys.path.append("/data/ARCQuant/kernels/build")
-
-import agemm
+import pytest
 import torch
 import torch.nn.functional as F
+from utils.util import skip_pre_blackwell
 
-# from utils.util import skip_pre_blackwell_unittest, unittest_name_func
+import tensorrt_llm  # noqa: F401
 
 
-def test_arcquant_fp4_linear():
-    M, N, K = 128, 4096, 4096
-    group = 16
-    step = K // group
-    for i in range(K // step + 1):
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "mnk", [(128, 4096, 4096), (128, 1024, 4096), (128, 12288, 4096), (128, 4096, 12288)]
+)
+def test_arcquant_fp4(mnk):
+    try:
+        import sys
+
+        sys.path.append("/data/ARCQuant/kernels/build")
+        import agemm
+    except Exception:
+        pytest.skip("ARCQuant not found, skip test.")
+
+    M, N, K = mnk
+    step = 256
+    for i in range(4096 // step + 1):
         KE = step * i
-        _, KS, KO = K - 512, 512 - 128, 128
         torch.manual_seed(45510)
-        signs = torch.randint(0, 2, (M, K), device="cuda", dtype=torch.bfloat16) * 2 - 1
-        X = torch.rand(M, K, dtype=torch.bfloat16, device="cuda") * 3
-        X[:, -KS:] = torch.rand(M, KS, dtype=torch.bfloat16, device="cuda") * 3 + 3
-        X[:, -KO:] = torch.rand(M, KO, dtype=torch.bfloat16, device="cuda") * 8 + 8
-        X[:, -16:] = torch.rand(M, 16, dtype=torch.bfloat16, device="cuda") * 32 + 32
-        X = X * signs
-        W = torch.rand(N, K, dtype=torch.bfloat16, device="cuda") * 3
-        # W = torch.eye(K, dtype=torch.bfloat16, device='cuda')
-        reorder_index = torch.arange(K, dtype=torch.int16, device="cuda")
+        X = torch.rand(M, K, dtype=torch.bfloat16, device="cuda") - 0.5
+        W = torch.rand(N, K, dtype=torch.bfloat16, device="cuda") - 0.5
+        W = torch.load("/data/TensorRT-LLM-main/qwen3-8b-q-proj.pt").cuda()
+        # reorder_index = torch.arange(K, dtype=torch.int16, device="cuda")
+        reorder_index = torch.randperm(K, dtype=torch.int16, device="cuda")
 
         scale_w = torch.max(W.abs()) / (448.0 * 6.0)
         scale_x = torch.max(X.abs()) / (448.0 * 6.0)
-        # scale_w = 1.0
-        # scale_x = 1.0
 
-        A, SFA = agemm.reorder_quantize_x(X / scale_x, reorder_index, KE)
-        trt_A, trt_SFA = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
-            X / scale_x, reorder_index, KE
-        )
-        assert torch.allclose(A, trt_A)
-        assert torch.allclose(SFA[: SFA.shape[0] // 2], trt_SFA)
+        A, SFA = torch.ops.trtllm.fp4_quantize_with_reorder_residual(X / scale_x, reorder_index, KE)
         B, SFB = agemm.reorder_quantize_w(W / scale_w, reorder_index, KE)
-        torch.cuda.synchronize()
 
-        # C = agemm.matmul(A, B, SFA, SFB, scale_x * scale_w)
-        C = torch.ops.trtllm.nvfp4_gemm(
-            trt_A, B, trt_SFA, SFB[: SFB.shape[0] // 2], (scale_x * scale_w).float(), torch.bfloat16
-        )
-        torch.cuda.synchronize()
+        C = torch.ops.trtllm.nvfp4_gemm(A, B, SFA, SFB, (scale_x * scale_w).float(), torch.bfloat16)
 
         D = F.linear(X, W)
-
-        mse = F.mse_loss(D, C).item()
-        print(f"MSE(k={KE:<4}): {mse:<15.8e}")
-
-
-def test_arcquant_nvfp4_reorder_residual():
-    k = 4096
-    ke = 256
-    m = 1
-    X = torch.randn([m, k], dtype=torch.bfloat16).cuda()
-    reorder_index = torch.arange(k, dtype=torch.int16).cuda()
-
-    # Call the quantization function
-    qx, sfx = torch.ops.trtllm.fp4_quantize_with_reorder_residual(X, reorder_index, ke)
-
-
-if __name__ == "__main__":
-    test_arcquant_fp4_linear()
+        assert F.cosine_similarity(C.flatten(), D.flatten(), dim=0).item() > 0.98

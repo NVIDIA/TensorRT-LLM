@@ -2404,7 +2404,10 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
-        return NVFP4LinearMethod()
+        if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
+            return NVFP4ARCLinearMethod()
+        else:
+            return NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
         return W4A8NVFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
@@ -2723,15 +2726,15 @@ class Linear(nn.Module):
         self.quant_method.pre_reload_weights(self)
 
 
-class TwoNVFP4LinearMethod(NVFP4LinearMethod):
-    residual_dim = 128
+class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
-        out_features_with_residule = out_features + self.residual_dim
+        self.residual_dim = 256
+        self.in_features_with_residual = in_features + self.residual_dim
         self.reorder_index = torch.arange(in_features, dtype=torch.int16)
-        super().create_weights(module, in_features, out_features_with_residule,
-                               bias, dtype)
+        super().create_weights(module, self.in_features_with_residual,
+                               out_features, bias, dtype)
 
     def _input_prepare(self, module: Linear, input: torch.Tensor):
         if isinstance(input, Fp4QuantizedTensor) or isinstance(input, tuple):
@@ -2743,8 +2746,19 @@ class TwoNVFP4LinearMethod(NVFP4LinearMethod):
                 input = input * module.pre_quant_scale
 
             # TODO: fuse global scale.
-            input_scale = input.abs().max() / (448.0 * 6.0)
-            input = input / input_scale
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_residual(
-                input, self.reorder_index)
+            input = (input * module.input_scale).to(torch.bfloat16)
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
+                input, self.reorder_index, self.residual_dim)
         return act_fp4, act_sf
+
+    def load_weights(self,
+                     module: Linear,
+                     weights: List[Dict],
+                     weight_mode: WeightMode,
+                     allow_partial_loading: bool = False):
+        """
+        Load weights from the checkpoint.
+        """
+        super().load_weights(module, weights, weight_mode,
+                             allow_partial_loading)
+        self.reorder_index = weights[0]['reorder_index']
