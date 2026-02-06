@@ -12,6 +12,7 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
+from ..cute_dsl_kernels.argmax import argmax as cute_argmax
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import BaseResourceManager
 
@@ -150,11 +151,12 @@ class SpeculativeDecodingMode(IntEnum):
                               TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
-            self,
-            spec_resource_manager: Optional[BaseResourceManager],
-            is_draft_model: bool,
-            attention_backend: Type[AttentionBackend],
-            use_chain_drafter: bool,  # CDL
+        self,
+        spec_resource_manager: Optional[BaseResourceManager],
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
+        use_chain_drafter: bool,  # CDL
+        is_mla: bool,
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
@@ -167,7 +169,7 @@ class SpeculativeDecodingMode(IntEnum):
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
-        xqa_supported = get_sm_version() < 120
+        xqa_supported = not is_mla or get_sm_version() < 120
         use_case_1 = self.use_one_engine() and xqa_supported
         # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
         # the target model (verification) or on the first draft for CDL based speculation.
@@ -534,7 +536,8 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             draft_tokens: [num_tokens] - Sampled draft token ids (int32)
         """
-        draft_tokens = torch.argmax(logits, dim=-1)
+        # cute_argmax returns (M, 2) where col 0 = max value, col 1 = argmax index
+        draft_tokens = cute_argmax(logits)[:, 1].long()
 
         # Apply d2t (offsets between draft and target model dictionaries)
         if d2t is not None:
@@ -636,6 +639,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 seed=self.seed,
                 offset=self.offset)
         else:
-            sampled_tokens = torch.argmax(logits, dim=-1)
+            # cute_argmax returns (M, 2) where col 0 = max value, col 1 = argmax index
+            sampled_tokens = cute_argmax(logits)[:, 1].long()
 
         return sampled_tokens

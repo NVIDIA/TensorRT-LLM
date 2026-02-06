@@ -6,17 +6,31 @@ from torch_attention_reference import TorchAttentionReference
 from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import _GlobalFlashInferPlanner
 
 
+def _create_combined_kv_cache(k_cache: torch.Tensor, v_cache: torch.Tensor) -> torch.Tensor:
+    """Create combined KV cache in HND layout from separate K and V caches.
+
+    Input shapes (NHD layout): [num_blocks, tokens_per_block, num_heads, head_dim]
+    Output shape (HND layout): [num_blocks, 2, num_heads, tokens_per_block, head_dim]
+    """
+    # Input: [num_blocks, tokens_per_block, num_heads, head_dim]
+    # Permute to: [num_blocks, num_heads, tokens_per_block, head_dim]
+    k_hnd = k_cache.permute(0, 2, 1, 3)
+    v_hnd = v_cache.permute(0, 2, 1, 3)
+    # Stack along kv dimension: [num_blocks, 2, num_heads, tokens_per_block, head_dim]
+    return torch.stack([k_hnd, v_hnd], dim=1)
+
+
 def _attention_with_fp8_kv_cache(
-    q, k, v, k_cache, v_cache, k_scale, v_scale, prefill_seq_len, causal, mask
+    q, k, v, kv_cache, k_scale, v_scale, prefill_seq_len, causal, mask
 ):
     """Simulates attention for fp8 kv cache with q,k,v outputs of GEMM in fp16"""
     batch_size, seq_len, _ = k.shape
-    # Quantize k and v
-    # k = (k / k_scale).to(torch.float8_e4m3fn)
-    # v = (v / v_scale).to(torch.float8_e4m3fn)
-    # Append to kv cache
-    # k_cache[0:batch_size, prefill_seq_len : prefill_seq_len + seq_len, :, :] = k
-    # v_cache[0:batch_size, prefill_seq_len : prefill_seq_len + seq_len, :, :] = v
+    # kv_cache shape: [num_blocks, 2, num_heads, tokens_per_block, head_dim] (HND layout)
+    # Extract k and v, convert back to NHD layout for reference
+    k_cache_hnd = kv_cache[:, 0, :, :, :]  # [num_blocks, num_heads, tokens_per_block, head_dim]
+    v_cache_hnd = kv_cache[:, 1, :, :, :]
+    k_cache = k_cache_hnd.permute(0, 2, 1, 3)  # [num_blocks, tokens_per_block, num_heads, head_dim]
+    v_cache = v_cache_hnd.permute(0, 2, 1, 3)
 
     # Compute attention
     # Step 1: Retrieve KV cache
@@ -75,22 +89,19 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
     k = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
     v = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
 
-    # Setup KV Cache. KV cache is empty, context phase
-    k_cache = torch.zeros(
-        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
-    )
-    v_cache = torch.zeros(
-        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
+    # Setup KV Cache in HND layout: [num_blocks, 2, num_heads, tokens_per_block, head_dim]
+    # For unpaged case: num_blocks=MAX_BATCH_SIZE, tokens_per_block=MAX_SEQ_LEN
+    kv_cache = torch.zeros(
+        (MAX_BATCH_SIZE, 2, N_HEADS, MAX_SEQ_LEN, D_HEAD), dtype=DTYPE, device=device
     )
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
         flashinfer.get_seq_lens(
-            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+            paged_kv_indptr, paged_kv_last_page_len, page_size=kv_cache.shape[3]
         ),
         BATCH_SIZE * SEQ_LEN,
     )
@@ -115,16 +126,18 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         # EXTRA METADATA
         batch_indices,
         positions,
-        # CACHES
-        k_cache,
-        v_cache,
-        # BUFFERS
-        workspace,
+        # CACHES - combined KV cache in HND layout
+        kv_cache,
         # CONSTANTS
         None,
         1.0,
         1.0,
     )
+
+    # Extract k_cache and v_cache for reference computation (convert HND to NHD)
+    # Need .contiguous() after permute() for later operations
+    k_cache = kv_cache[:, 0, :, :, :].permute(0, 2, 1, 3).contiguous()  # [batch, seq, heads, dim]
+    v_cache = kv_cache[:, 1, :, :, :].permute(0, 2, 1, 3).contiguous()
 
     # Use torch backend as clean reference
     q_reshaped = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
@@ -188,26 +201,23 @@ def test_flashinfer_attention_op_decode(
     k = torch.ones(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
     v = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
 
-    # Setup KV Cache. KV cache is partially filled from the context phase
-    k_cache = torch.zeros(
+    # Setup KV Cache in HND layout: [num_blocks, 2, num_heads, tokens_per_block, head_dim]
+    kv_cache = torch.zeros(
+        (MAX_BATCH_SIZE, 2, N_HEADS, MAX_SEQ_LEN, D_HEAD), dtype=DTYPE, device=device
+    )
+
+    # Initialize prefilled portion (zeros in this test)
+    # kv_cache is already zeros
+
+    # Generate reference cache in NHD layout for comparison
+    k_cache_ref = torch.zeros(
         (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
     )
-    v_cache = torch.zeros(
+    v_cache_ref = torch.zeros(
         (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
     )
 
-    k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.zeros(
-        BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-    )
-    v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.zeros(
-        BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
-    )
-
-    # Generate reference cache
-    k_cache_ref = k_cache.clone()
-    v_cache_ref = v_cache.clone()
-
-    # Apply RoPE to k_cache
+    # Fill expected values after append
     k_cache_ref[0:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = k.view(
         BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD
     )
@@ -215,27 +225,13 @@ def test_flashinfer_attention_op_decode(
         BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD
     )
 
-    assert not torch.allclose(
-        k_cache_ref.to(torch.float32),
-        k_cache.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    assert not torch.allclose(
-        v_cache_ref.to(torch.float32),
-        v_cache.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
         flashinfer.get_seq_lens(
-            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+            paged_kv_indptr, paged_kv_last_page_len, page_size=kv_cache.shape[3]
         ),
         BATCH_SIZE * SEQ_LEN,
     )
@@ -259,16 +255,18 @@ def test_flashinfer_attention_op_decode(
         # EXTRA METADATA
         batch_indices,
         positions,
-        # CACHES
-        k_cache,
-        v_cache,
-        # BUFFERS
-        workspace,
+        # CACHES - combined KV cache in HND layout
+        kv_cache,
         # CONSTANTS
         None,
         1.0,
         1.0,
     )
+
+    # Extract k_cache and v_cache for reference (convert HND to NHD)
+    # Need .contiguous() after permute() for later operations
+    k_cache = kv_cache[:, 0, :, :, :].permute(0, 2, 1, 3).contiguous()  # [batch, seq, heads, dim]
+    v_cache = kv_cache[:, 1, :, :, :].permute(0, 2, 1, 3).contiguous()
 
     assert torch.allclose(
         k_cache_ref.to(torch.float32),
@@ -286,8 +284,8 @@ def test_flashinfer_attention_op_decode(
     # Generate reference outputs
     q_ref = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
 
-    k_ref = k_cache[:BATCH_SIZE, : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
-    v_ref = v_cache[:BATCH_SIZE, : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
+    k_ref = k_cache[:BATCH_SIZE, : PREFILL_SEQ_LEN + SEQ_LEN, :, :].clone()
+    v_ref = v_cache[:BATCH_SIZE, : PREFILL_SEQ_LEN + SEQ_LEN, :, :].clone()
     k_ref[:, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = k.view(
         BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD
     )
@@ -352,22 +350,18 @@ def test_flashinfer_attention_context_and_generate(
     k_1 = torch.randn(BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
     v_1 = torch.randn(BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
 
-    # Setup KV Cache. KV cache is empty, context phase
-    k_cache = torch.zeros(
-        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
-    )
-    v_cache = torch.zeros(
-        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
+    # Setup KV Cache in HND layout: [num_blocks, 2, num_heads, tokens_per_block, head_dim]
+    kv_cache = torch.zeros(
+        (MAX_BATCH_SIZE, 2, N_HEADS, MAX_SEQ_LEN, D_HEAD), dtype=DTYPE, device=device
     )
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
         flashinfer.get_seq_lens(
-            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+            paged_kv_indptr, paged_kv_last_page_len, page_size=kv_cache.shape[3]
         ),
         BATCH_SIZE * PREFILL_SEQ_LEN,
     )
@@ -392,21 +386,23 @@ def test_flashinfer_attention_context_and_generate(
         # EXTRA METADATA
         batch_indices,
         positions,
-        # CACHES
-        k_cache,
-        v_cache,
-        # BUFFERS
-        workspace,
+        # CACHES - combined KV cache in HND layout
+        kv_cache,
         # CONSTANTS
         None,
         1.0,
         1.0,
     )
 
+    # Extract k_cache and v_cache for reference (convert HND to NHD)
+    # Need .contiguous() after permute() for later operations
+    k_cache = kv_cache[:, 0, :, :, :].permute(0, 2, 1, 3).contiguous()  # [batch, seq, heads, dim]
+    v_cache = kv_cache[:, 1, :, :, :].permute(0, 2, 1, 3).contiguous()
+
     # Generate reference outputs
     q_ref = q_1
-    k_ref = k_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :]
-    v_ref = v_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :]
+    k_ref = k_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :].clone()
+    v_ref = v_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :].clone()
 
     # Use torch backend as clean reference
     ref = TorchAttentionReference.basic_mha_with_cache(
@@ -428,6 +424,7 @@ def test_flashinfer_attention_context_and_generate(
         rtol=1e-2,
     )
 
+    # Update k_cache view (which reflects changes to kv_cache)
     k_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = k_ref
 
     # Generate output
@@ -454,12 +451,12 @@ def test_flashinfer_attention_context_and_generate(
     v_3 = torch.randn(BATCH_SIZE, 1, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
 
     # Create FlashInferAttention class before calling the custom op
-    _GlobalFlashInferPlanner.reset()
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
         flashinfer.get_seq_lens(
-            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+            paged_kv_indptr, paged_kv_last_page_len, page_size=kv_cache.shape[3]
         ),
         BATCH_SIZE * 1,
     )
@@ -482,21 +479,23 @@ def test_flashinfer_attention_context_and_generate(
         # EXTRA METADATA
         batch_indices,
         positions,
-        # CACHES
-        k_cache,
-        v_cache,
-        # BUFFERS
-        workspace,
+        # CACHES - combined KV cache in HND layout
+        kv_cache,
         # CONSTANTS
         None,
         1.0,
         1.0,
     )
 
+    # Re-extract k_cache and v_cache (may have changed)
+    # Need .contiguous() after permute() for later operations
+    k_cache = kv_cache[:, 0, :, :, :].permute(0, 2, 1, 3).contiguous()
+    v_cache = kv_cache[:, 1, :, :, :].permute(0, 2, 1, 3).contiguous()
+
     # Generate reference outputs
     q_ref = torch.cat([q_1, q_3], dim=-2)
-    k_ref = k_cache[:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + 1, :, :]
-    v_ref = v_cache[:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + 1, :, :]
+    k_ref = k_cache[:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + 1, :, :].clone()
+    v_ref = v_cache[:BATCH_SIZE, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + 1, :, :].clone()
 
     ref = torch.nn.functional.scaled_dot_product_attention(
         q_3.view(BATCH_SIZE, 1, N_HEADS, D_HEAD).transpose(1, 2),
@@ -566,33 +565,30 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
     k = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
     v = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
 
-    # Setup KV Cache. KV cache is partially filled from the context phase
-    k_cache = torch.zeros(
-        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
-    )
-    v_cache = torch.zeros(
-        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
+    # Setup KV Cache in HND layout: [num_blocks, 2, num_heads, tokens_per_block, head_dim]
+    kv_cache = torch.zeros(
+        (MAX_BATCH_SIZE, 2, N_HEADS, MAX_SEQ_LEN, D_HEAD), dtype=DTYPE, device=device
     )
 
     # Initialize the prefilled portion of the cache with random data
     # This simulates a chunked prefill scenario where previous chunks have already
     # populated the cache at positions 0:PREFILL_SEQ_LEN
     if PREFILL_SEQ_LEN > 0:
-        k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.randn(
-            BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD, dtype=DTYPE, device=device
+        # HND layout: [batch, kv, heads, seq, dim] - fill k and v separately
+        kv_cache[0:BATCH_SIZE, 0, :, 0:PREFILL_SEQ_LEN, :] = torch.randn(
+            BATCH_SIZE, N_HEADS, PREFILL_SEQ_LEN, D_HEAD, dtype=DTYPE, device=device
         )
-        v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.randn(
-            BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD, dtype=DTYPE, device=device
+        kv_cache[0:BATCH_SIZE, 1, :, 0:PREFILL_SEQ_LEN, :] = torch.randn(
+            BATCH_SIZE, N_HEADS, PREFILL_SEQ_LEN, D_HEAD, dtype=DTYPE, device=device
         )
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
         flashinfer.get_seq_lens(
-            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+            paged_kv_indptr, paged_kv_last_page_len, page_size=kv_cache.shape[3]
         ),
         BATCH_SIZE * SEQ_LEN,
     )
@@ -617,24 +613,26 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         # EXTRA METADATA
         batch_indices,
         positions,
-        # CACHES
-        k_cache,
-        v_cache,
-        # BUFFERS
-        workspace,
+        # CACHES - combined KV cache in HND layout
+        kv_cache,
         # CONSTANTS
         None,
         1.0,
         1.0,
     )
 
+    # Extract k_cache and v_cache for reference (convert HND to NHD)
+    # Need .contiguous() after permute() for later operations
+    k_cache = kv_cache[:, 0, :, :, :].permute(0, 2, 1, 3).contiguous()  # [batch, seq, heads, dim]
+    v_cache = kv_cache[:, 1, :, :, :].permute(0, 2, 1, 3).contiguous()
+
     # Generate ref
     q_ref = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
-    k_ref = k_cache[0:BATCH_SIZE, 0 : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
-    v_ref = v_cache[0:BATCH_SIZE, 0 : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
+    k_ref = k_cache[0:BATCH_SIZE, 0 : PREFILL_SEQ_LEN + SEQ_LEN, :, :].contiguous()
+    v_ref = v_cache[0:BATCH_SIZE, 0 : PREFILL_SEQ_LEN + SEQ_LEN, :, :].contiguous()
 
     q_ref = q_ref.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
-    k_ref = k_ref.view(BATCH_SIZE, PREFILL_SEQ_LEN + SEQ_LEN, N_HEADS, D_HEAD)
+    k_ref = k_ref.reshape(BATCH_SIZE, PREFILL_SEQ_LEN + SEQ_LEN, N_HEADS, D_HEAD)
     mask = torch.cat(
         [
             torch.ones(SEQ_LEN, PREFILL_SEQ_LEN, device=device, dtype=torch.bool),
@@ -709,24 +707,21 @@ def test_flashinfer_attention_with_fp8_cache(
     k = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
     v = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
 
-    # Setup KV Cache. KV cache is empty, context phase
-    k_cache = torch.zeros(
-        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
-    )
-    v_cache = torch.zeros(
-        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
+    # Setup KV Cache in HND layout: [num_blocks, 2, num_heads, tokens_per_block, head_dim]
+    kv_cache = torch.zeros(
+        (MAX_BATCH_SIZE, 2, N_HEADS, MAX_SEQ_LEN, D_HEAD), dtype=DTYPE, device=device
     )
 
     if PREFILL_SEQ_LEN > 0:
-        k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.randn(
-            BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
+        # HND layout: [batch, kv, heads, seq, dim]
+        kv_cache[0:BATCH_SIZE, 0, :, 0:PREFILL_SEQ_LEN, :] = torch.randn(
+            BATCH_SIZE, N_HEADS, PREFILL_SEQ_LEN, D_HEAD
         )
-        v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.randn(
-            BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD
+        kv_cache[0:BATCH_SIZE, 1, :, 0:PREFILL_SEQ_LEN, :] = torch.randn(
+            BATCH_SIZE, N_HEADS, PREFILL_SEQ_LEN, D_HEAD
         )
 
-        k_cache = k_cache / K_SCALE
-        v_cache = v_cache / V_SCALE
+        kv_cache = kv_cache / K_SCALE
 
         # Set causal mask to false if its a partially filled kv_cache
         causal = False
@@ -744,17 +739,15 @@ def test_flashinfer_attention_with_fp8_cache(
         causal = True
         mask = None
 
-    k_cache = k_cache.to(torch.float8_e4m3fn)
-    v_cache = v_cache.to(torch.float8_e4m3fn)
+    kv_cache = kv_cache.to(torch.float8_e4m3fn)
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
         flashinfer.get_seq_lens(
-            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+            paged_kv_indptr, paged_kv_last_page_len, page_size=kv_cache.shape[3]
         ),
         BATCH_SIZE * SEQ_LEN,
     )
@@ -779,11 +772,8 @@ def test_flashinfer_attention_with_fp8_cache(
         # EXTRA METADATA
         batch_indices,
         positions,
-        # CACHES
-        k_cache,
-        v_cache,
-        # BUFFERS
-        workspace,
+        # CACHES - combined KV cache in HND layout
+        kv_cache,
         # CONSTANTS
         None,
         K_SCALE,
@@ -794,7 +784,7 @@ def test_flashinfer_attention_with_fp8_cache(
     q = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
 
     ref = _attention_with_fp8_kv_cache(
-        q, k, v, k_cache, v_cache, K_SCALE, V_SCALE, PREFILL_SEQ_LEN, causal, mask
+        q, k, v, kv_cache, K_SCALE, V_SCALE, PREFILL_SEQ_LEN, causal, mask
     )
 
     assert torch.allclose(
@@ -826,9 +816,10 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     k = torch.randn(1, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
     v = torch.randn(1, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
 
-    # Setup KV Cache. KV cache is empty, context phase
-    k_cache = torch.zeros((MAX_NUM_PAGES, PAGE_SIZE, N_HEADS, D_HEAD), dtype=DTYPE, device=device)
-    v_cache = torch.zeros((MAX_NUM_PAGES, PAGE_SIZE, N_HEADS, D_HEAD), dtype=DTYPE, device=device)
+    # Setup KV Cache in HND layout: [num_pages, 2, num_heads, page_size, head_dim]
+    kv_cache = torch.zeros(
+        (MAX_NUM_PAGES, 2, N_HEADS, PAGE_SIZE, D_HEAD), dtype=DTYPE, device=device
+    )
     offsets = torch.zeros(BATCH_SIZE, device=device, dtype=torch.int)
 
     # assign pages
@@ -859,13 +850,12 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
 
     # make sure planner is initialized
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    _GlobalFlashInferPlanner.init_workspace(workspace)
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
         flashinfer.get_seq_lens(
-            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+            paged_kv_indptr, paged_kv_last_page_len, page_size=kv_cache.shape[3]
         ),
         SEQ_LEN,
     )
@@ -888,11 +878,8 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # EXTRA METADATA
         batch_indices,
         positions,
-        # CACHES
-        k_cache,
-        v_cache,
-        # BUFFERS
-        workspace,
+        # CACHES - combined KV cache in HND layout
+        kv_cache,
         # CONSTANTS
         None,
         1.0,
@@ -956,12 +943,12 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     seq_len_with_cache2_host = (offsets2 + seq_len_tensor2).cpu()
 
     # Create FlashInferAttention class before calling the custom op
-    _GlobalFlashInferPlanner.reset()
+    _GlobalFlashInferPlanner.reset(torch.device(device))
 
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr2,
         flashinfer.get_seq_lens(
-            paged_kv_indptr2, paged_kv_last_page_len2, page_size=k_cache.shape[1]
+            paged_kv_indptr2, paged_kv_last_page_len2, page_size=kv_cache.shape[3]
         ),
         BATCH_SIZE * 1,
     )
@@ -984,11 +971,8 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # EXTRA METADATA
         batch_indices,
         positions,
-        # CACHES
-        k_cache,
-        v_cache,
-        # BUFFERS
-        workspace,
+        # CACHES - combined KV cache in HND layout
+        kv_cache,
         # CONSTANTS
         None,
         1.0,

@@ -21,7 +21,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
-from ..pyexecutor.resource_manager import KVCacheManager
+from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from ..utils import get_model_extra_attrs
 
 try:
@@ -63,7 +63,7 @@ class AttentionMetadata:
     # The max number of sequences in a single batch.
     max_num_sequences: Optional[int] = None
     # The KV cache manager.
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2]
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False

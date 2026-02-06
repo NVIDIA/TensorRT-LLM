@@ -448,15 +448,13 @@ class BaseWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        if self._is_pytorch_backend:
-            if not self.llm_args.disable_overlap_scheduler:
-                is_disaggregated = self.engine.kv_cache_transceiver is not None
-                if is_disaggregated and (
-                        request_type
-                        == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
-                    raise ValueError(
-                        "Context only requests are not supported in pytorch backend when overlap is enabled."
-                    )
+        if self._is_pytorch_backend and not self.llm_args.disable_overlap_scheduler \
+                and self.llm_args.kv_cache_config.enable_block_reuse \
+                and self.engine.kv_cache_transceiver is not None \
+                and request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY:
+            raise ValueError(
+                "Context only requests are not supported in pytorch backend when overlap is enabled with block reuse."
+            )
 
         assert request.id is not None
 
@@ -568,6 +566,9 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
 
+            # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
+            if self._is_pytorch_backend and request.disaggregated_params is not None:
+                executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
                     # NOTE: Deserialize SharedTensor handle to actual tensor
@@ -652,6 +653,12 @@ class BaseWorker(GenerationExecutor):
         if self.engine is not None and self.engine.can_enqueue_requests():
             self.engine.shutdown()
             self.engine = None
+
+    def get_disaggregated_params(self) -> dict:
+        if self.engine is None or self.engine.kv_cache_transceiver is None:
+            logger.warning("Engine or kv cache transceiver is not initialized")
+            return {}
+        return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
     # Define a Callable to join iteration and request stats
     @staticmethod

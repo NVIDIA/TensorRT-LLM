@@ -31,8 +31,8 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
         backend: "openai"
+        dataset_file: datasets/perf-ci/deepseek_v32-1k1k-20480-ratio-1_for_serve.json
 
   # 1k1k configs - DEP4 with CUTLASS, MTP1
   - name: "v32_fp4_dep4_mtp1_1k1k"
@@ -66,8 +66,8 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
         backend: "openai"
+        dataset_file: datasets/perf-ci/deepseek_v32-1k1k-20480-ratio-1_for_serve.json
 
   # 8k1k configs - TEP4 with TRTLLM, MTP3
   - name: "v32_fp4_tep4_mtp3_8k1k"
@@ -97,8 +97,8 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.2
         backend: "openai"
+        dataset_file: datasets/perf-ci/deepseek_v32-8k1k-20480-ratio-1_for_serve.json
 
   # 8k1k configs - DEP4 with CUTLASS, MTP1
   - name: "v32_fp4_dep4_mtp1_8k1k"
@@ -132,5 +132,5 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.2
         backend: "openai"
+        dataset_file: datasets/perf-ci/deepseek_v32-8k1k-20480-ratio-1_for_serve.json

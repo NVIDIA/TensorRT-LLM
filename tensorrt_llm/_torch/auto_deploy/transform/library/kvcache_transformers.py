@@ -16,7 +16,7 @@ from ...export.library.unified_attn import HF_ATTN_KWARGS_MAPPING
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
-from .kvcache import InsertCachedAttention
+from .kvcache import _InsertCachedOperator
 
 
 def fake_profiler_mha(
@@ -163,8 +163,8 @@ def get_cached_attn(
             query,
             key,
             value,
-            # metadata+caches+buffers with name lookup set up during kvcache transform
-            *[kwargs[k] for k in module._node_ref.meta["metadata_cache_buffer_keys"]],
+            # metadata+caches with name lookup set up during kvcache transform
+            *[kwargs[k] for k in module._node_ref.meta["metadata_cache_keys"]],
             # constants set up during kvcache transform
             *module._node_ref.meta["constants"],
         )
@@ -202,7 +202,7 @@ def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
 # TODO: how running different kv cache transforms look like? This one below wouldn't work if we
 # had multiple types attention to replace...
 @TransformRegistry.register("transformers_replace_cached_attn")
-class HFReplaceCachedAttn(InsertCachedAttention):
+class HFReplaceCachedAttn(_InsertCachedOperator):
     """Replace cached attention for the factory model, update inputs and outputs, and patch the gm forward."""
 
     def _add_or_retrieve_input(
@@ -242,17 +242,11 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
-        buffer_nodes: List[Node],
         constants: List[Constant],
     ):
         """Here we now need to actually do the correct mapping of the cached attn nodes."""
-        # store reference to metadata, caches, buffers, and constants for this attn node
-        attn_node.meta["metadata_cache_buffer_keys"] = (
-            *meta_nodes_std,
-            *meta_nodes_extra,
-            *cache_nodes,
-            *buffer_nodes,
-        )
+        # store reference to metadata, caches, and constants for this attn node
+        attn_node.meta["metadata_cache_keys"] = (*meta_nodes_std, *meta_nodes_extra, *cache_nodes)
         attn_node.meta["constants"] = constants
 
     def _apply_to_full_model(

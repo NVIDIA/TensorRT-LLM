@@ -436,7 +436,6 @@ def test_beam_search_sampling_batch_basic():
             beam_width_out=beam_width,
             beam_search_args=beam_search_args,
             temperature=temperature,
-            generator=None,
             return_probs=True,
         )
 

@@ -18,8 +18,12 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-filter_cuda_archs("100" SRC_CPP)
+filter_source_cuda_architectures(
+  SOURCE_LIST SRC_CPP
+  ARCHS 100 103 100f
+  TARGET trtllm_gen_fmha_interface)
 
 add_library(trtllm_gen_fmha OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET trtllm_gen_fmha PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fmha PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_link_libraries(trtllm_gen_fmha PUBLIC trtllm_gen_fmha_interface)

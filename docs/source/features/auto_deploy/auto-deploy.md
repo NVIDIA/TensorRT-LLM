@@ -60,6 +60,8 @@ The exported graph then undergoes a series of automated transformations, includi
 - [Incorporating AutoDeploy into Your Own Workflow](./advanced/workflow.md)
 - [Expert Configurations](./advanced/expert_configurations.md)
 - [Performance Benchmarking](./advanced/benchmarking_with_trtllm_bench.md)
+- [KV Cache Architecture](./advanced/kv_cache_architecture.md)
+- [Export ONNX for EdgeLLM](./advanced/export_onnx.md)
 
 ## Roadmap
 

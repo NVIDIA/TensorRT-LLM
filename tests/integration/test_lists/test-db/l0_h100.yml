@@ -49,6 +49,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler
+  - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_disable_overlap_scheduler
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=TRTLLM] TIMEOUT (90)
@@ -401,6 +402,7 @@ l0_h100:
   - unittest/trt/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
   - unittest/trt/attention/test_gpt_attention_no_cache.py
   - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
+  - unittest/kv_cache_manager_v2_tests/ # 4 min
 - condition:
     ranges:
       system_gpu_count:
@@ -431,12 +433,17 @@ l0_h100:
       orchestrator: mpi
   tests:
   - unittest/_torch/auto_deploy/unit/singlegpu
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-True-1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[flashinfer_ssm-False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16[1]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
+  - examples/test_ad_speculative_decoding.py::test_eagle_model_with_weights
+  - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[1]
+  - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[2]
+  - examples/test_ad_export_onnx.py::test_ad_export_onnx[Qwen/Qwen2.5-3B-Instruct-/tmp/test_ad_export_onnx_qwen2.5-3b-36]

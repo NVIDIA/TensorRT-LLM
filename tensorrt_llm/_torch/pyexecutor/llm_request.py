@@ -1,10 +1,14 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm.bindings
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.sampler import Strategy
+
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
@@ -567,6 +571,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
+        self.py_disaggregated_params = None
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -581,6 +586,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             chunk_size=self.py_logits_chunk_size,
             additional_outputs=additional_outputs)
         self.child_requests = []
+
+        self._py_sampling_strategy: "Strategy | None" = None
 
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
@@ -831,6 +838,10 @@ def executor_request_to_llm_request(
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
                               LogprobMode.RAW),
     )
+
+    llm_request.py_disaggregated_params = getattr(executor_request,
+                                                  "py_disaggregated_params",
+                                                  None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

@@ -24,6 +24,7 @@ from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
@@ -281,16 +282,12 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
-        if not spec_config.allow_advanced_sampling:
-            logger.warning(
-                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
-                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
-            )
-        elif spec_config.spec_dec_mode.is_mtp_one_model():
-            logger.warning(
-                "Advanced sampling is not supported for MTP yet - this will be added soon."
-            )
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine(
+    ) and not spec_config.allow_advanced_sampling:
+        logger.warning(
+            f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
+            "want to use non-greedy sampling, please set allow_advanced_sampling=True."
+        )
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -353,6 +350,15 @@ def create_py_executor(
         )
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
+
+    calibrator = get_calibrator()
+    layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
+    calibrator.init(layer_wise_benchmarks_config.calibration_mode,
+                    layer_wise_benchmarks_config.calibration_file_path,
+                    layer_wise_benchmarks_config.calibration_layer_indices,
+                    mapping=mapping,
+                    dist=dist)
+    model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT,
@@ -442,6 +448,10 @@ def create_py_executor(
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
+
+    # Set default value for cache_transceiver_config.max_tokens_in_buffer
+    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
+        cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
@@ -554,9 +564,14 @@ def create_py_executor(
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
-        elif spec_config is not None:
+
+        max_attention_window = kv_cache_config.max_attention_window
+        if max_attention_window is not None and len(
+                set(max_attention_window)) > 1:
             raise NotImplementedError(
-                "KV connector is not supported with speculative decoding.")
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+            )
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)

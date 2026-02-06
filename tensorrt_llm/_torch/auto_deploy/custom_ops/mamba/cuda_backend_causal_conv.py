@@ -33,16 +33,16 @@ from torch.fx import Node
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
+from .....llmapi.llm_args import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    CacheConfig,
-    CacheInitializerDict,
+    CausalConvResourceHandler,
     Constant,
     MHACallable,
-    SequenceInfo,
+    ResourceHandlerDict,
 )
 
 
@@ -165,10 +165,6 @@ def cuda_cached_causal_conv1d_wrapper(input: torch.Tensor, *args, **kwargs) -> t
 @AttentionRegistry.register("cuda_causal_conv")
 class CudaBackendCausalConv(AttentionDescriptor):
     @classmethod
-    def is_paged(cls) -> bool:
-        return True
-
-    @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         # Hidden states follow [b, s, c]
         return "bsnd"
@@ -193,24 +189,23 @@ class CudaBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]
 
         in_channels = inp_fake.shape[-1]
         kernel_size = w_fake.shape[-1]
 
-        def _get_conv_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_state_slots,
-                in_channels,
-                max(1, kernel_size - 1),
-                device=si.device,
-                dtype=inp_fake.dtype,
-            )
-
-        return {"conv_state_cache": _get_conv_cache}
+        # NOTE: cuda backend stores kernel_size - 1 elements in state.
+        # CausalConvResourceHandler.state_shape = (conv_dim, d_conv - 1), so d_conv = kernel_size.
+        # Ensure d_conv >= 1 (state_shape[-1] >= 0).
+        conv_state_handler = CausalConvResourceHandler(
+            conv_dim=in_channels,
+            d_conv=max(1, kernel_size),  # state_shape[-1] = d_conv - 1 = kernel_size - 1
+            dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
+        )
+        return {"conv_state_cache": conv_state_handler}
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
