@@ -448,7 +448,7 @@ def create_py_executor(
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer
     if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
-        cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
+        cache_transceiver_config.max_tokens_in_buffer = max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
