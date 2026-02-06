@@ -444,6 +444,8 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16[1]
+  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_bf16[False]
+  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_bf16[True]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate

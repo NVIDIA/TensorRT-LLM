@@ -414,20 +414,12 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for GLM-4.7-Flash.
+    """Accuracy regression tests for GLM-4.7-Flash variants"""
 
-    TODO: enable in CI, see https://github.com/NVIDIA/TensorRT-LLM/issues/11117
+    MODEL_NAME = "GLM-4.7-Flash"
+    MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
+    MODEL_PATH_NVFP4 = hf_id_to_local_model_dir("DeepInfra/GLM-4.7-Flash-NVFP4")
 
-    In the meantime, you should run this test locally:
-
-    ```
-    cd tests/integration/defs
-    TRTLLM_ACCURACY_NO_REFERENCE=1 pytest -svv "accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[True]"
-    ```
-    """
-
-    MODEL_NAME = "zai-org/GLM-4.7-Flash"
-    MODEL_PATH = MODEL_NAME  # Model is in HF_CACHE
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
@@ -471,9 +463,26 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
+        with AutoDeployLLM(model=self.MODEL_PATH_BF16,
+                           tokenizer=self.MODEL_PATH_BF16,
                            **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
+    def test_nvfp4(self, enable_chunked_prefill):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
+                           tokenizer=self.MODEL_PATH_NVFP4,
+                           **kwargs) as llm:
+            # Manually set quant_config for NVFP4 model to get the accuracy threshold
+            llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
