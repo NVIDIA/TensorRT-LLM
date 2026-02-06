@@ -14,7 +14,7 @@
 # limitations under the License.
 
 try:
-    import fused_qk_norm_rope
+    import visual_gen.csrc.fused_qk_norm_rope
 except:
     print("fused_qk_norm_rope is not available")
 
