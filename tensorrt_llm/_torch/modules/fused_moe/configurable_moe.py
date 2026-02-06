@@ -202,7 +202,7 @@ class ConfigurableMoE(MoE):
 
         self.validate_backend(backend)
         self.backend = backend
-
+        self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
         # Sync critical attributes from ConfigurableMoE to backend
         # ConfigurableMoE's super().__init__() was called with real layer_idx and initialized load balancer.
         # Backend was created with init_load_balancer=False and without_comm=True to avoid
@@ -395,6 +395,7 @@ class ConfigurableMoE(MoE):
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
+            use_flashinfer=self.use_flashinfer,
         )
 
     def forward_impl(
