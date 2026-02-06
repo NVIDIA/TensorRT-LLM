@@ -366,11 +366,13 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     else:
         cuda_graph_config = None
 
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
     llm_spec = LLM(model=target_model_dir,
                    speculative_config=spec_config,
                    max_batch_size=1,
                    cuda_graph_config=cuda_graph_config,
-                   disable_overlap_scheduler=True)
+                   disable_overlap_scheduler=True,
+                   kv_cache_config=self.kv_cache_config)
 
     prompt = [", ".join(str(i) for i in range(1000))]
 
