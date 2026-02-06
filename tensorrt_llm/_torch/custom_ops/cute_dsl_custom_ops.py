@@ -318,6 +318,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
+    from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
+        Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -2789,3 +2791,714 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
+    # =============================================================================
+    # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
+    # =============================================================================
+
+    class CuteDSLNVFP4DenseGemmSwigluRunner(TunableRunner):
+        """Runner for Dense GEMM with SwiGLU fusion (MoE FC1 layer as dense GEMM).
+
+        This kernel performs: C = SwiGLU(alpha * (SFA * A) @ (SFB * B))
+        where SwiGLU(x) = up * silu(gate), with up/gate extracted from interleaved output.
+
+        Input shapes:
+        - A: (M, K) - activation tensor
+        - B: (N, K, L) - weight tensor (L is typically 1 for dense)
+        - alpha: (expert_count,) - per-expert scaling, indexed by weight_per_expert
+
+        Output shape:
+        - C: (M, N//2) - N//2 due to SwiGLU fusion
+        """
+
+        kernel_class = DenseGemmSwigluKernel
+        kernel_cache = dict()
+        tuning_config_cache = dict()
+
+        def __init__(
+            self,
+            expert_count: int,
+            weight_per_expert: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+        ):
+            super().__init__()
+            self.expert_count = expert_count
+            self.weight_per_expert = weight_per_expert
+            self.output_dtype = output_dtype
+            self.scaling_vector_size = scaling_vector_size
+
+        def unique_id(self):
+            return (
+                self.expert_count,
+                self.weight_per_expert,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
+        def __hash__(self):
+            return hash(self.unique_id())
+
+        def __eq__(self, other):
+            if not isinstance(other, CuteDSLNVFP4DenseGemmSwigluRunner):
+                return False
+            return self.unique_id() == other.unique_id()
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+            """Return valid (mma_tiler_mn, cluster_shape_mn) combinations."""
+            # Check SM version - only supports SM 100 and SM 103
+            major, minor = torch.cuda.get_device_capability()
+            if not (major == 10 and minor in [0, 3]):
+                return []
+
+            a = inputs[0]
+            b = inputs[1]
+            # a: [m, k//2] (fp4 packed), b: [num_expert, weight_per_expert, k//2]
+            m = a.shape[0]
+            k = a.shape[1] * 2  # fp4 packed in k dimension
+            n = b.shape[0] * b.shape[1]  # num_expert * weight_per_expert
+            l = 1  # dense GEMM
+
+            # Define candidates together
+            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
+            cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4)]
+
+            # Map torch dtype to cutlass dtype
+            c_cutlass_dtype = {
+                torch.bfloat16: cutlass.BFloat16,
+                torch.float16: cutlass.Float16,
+                torch.float32: cutlass.Float32,
+                torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
+            }.get(self.output_dtype, cutlass.BFloat16)
+
+            tactics = []
+            for mma_tiler_mn, cluster_shape_mn in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+                if self.kernel_class.can_implement(
+                        cutlass.Float4E2M1FN,  # ab_dtype
+                        cutlass.Float8E4M3FN,  # sf_dtype
+                        self.scaling_vector_size,
+                        c_cutlass_dtype,  # c_dtype
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        m,
+                        n,
+                        k,
+                        l,
+                        "k",  # a_major
+                        "k",  # b_major
+                        "n",  # c_major
+                        self.expert_count,
+                        self.weight_per_expert,
+                ):
+                    tactics.append((mma_tiler_mn, cluster_shape_mn))
+
+            return tactics
+
+        def get_tuning_config(self) -> TuningConfig:
+            key = self.unique_id()
+            if key not in self.tuning_config_cache:
+                self.tuning_config_cache[key] = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        0, 0, get_last_power_of_2_num_tokens_buckets,
+                        last_positive_power_of_2), ),
+                    constraint_specs=(ConstraintSpec(2, 0,
+                                                     fp4_scale_infer_shape), ),
+                    use_cold_l2_cache=True,
+                    tune_max_num_tokens=256,
+                    distributed_tuning_strategy=DistributedTuningStrategy.
+                    PARALLEL,
+                )
+            return self.tuning_config_cache[key]
+
+        def forward(
+            self,
+            inputs: List[Optional[torch.Tensor]],
+            tactic: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            """Execute the dense GEMM with SwiGLU fusion.
+
+            Args:
+                inputs: [a, b, a_sf, b_sf, alpha, alpha_post, norm_const]
+                    - alpha_post can be None to skip post-SwiGLU scaling
+                tactic: ((mma_m, mma_n), (cluster_m, cluster_n))
+
+            Returns:
+                Tuple of (output, output_scale_factor)
+            """
+            a, b, a_sf, b_sf, alpha, alpha_post, norm_const = inputs[:7]
+
+            # Get dimensions
+            # a: [m, k//2] (fp4 packed), b: [num_expert, weight_per_expert, k//2]
+            m = a.shape[0]
+            k = a.shape[1] * 2  # fp4 packed in k dimension
+            n = b.shape[0] * b.shape[1]  # num_expert * weight_per_expert
+            l = 1  # dense GEMM
+            n_out = n // 2  # SwiGLU output
+
+            # Default tactic if not provided
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+
+            # Allocate output tensor
+            c_dtype = self.output_dtype
+            if c_dtype == torch.float4_e2m1fn_x2:
+                # FP4 packed: 2 elements per byte, so shape is (m, n_out // 2)
+                c = torch.empty((m, n_out // 2), dtype=c_dtype, device=a.device)
+            else:
+                c = torch.empty((m, n_out), dtype=c_dtype, device=a.device)
+
+            # Allocate output scale factor (for FP4 output quantization)
+            # Shape: (32, 4, pad_up(m, 128) // 128, 4, scale_n_out // 4, l)
+            scale_n_out = n_out // self.scaling_vector_size
+            c_sf_shape = (32, 4, pad_up(m, 128) // 128, 4, scale_n_out // 4, l)
+            c_sf = torch.empty(c_sf_shape, dtype=torch.uint8, device=a.device)
+
+            # Get CUDA stream
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            # Map torch dtype to cutlass dtype
+            c_cutlass_dtype = {
+                torch.bfloat16: cutlass.BFloat16,
+                torch.float16: cutlass.Float16,
+                torch.float32: cutlass.Float32,
+                torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
+            }.get(c_dtype, cutlass.BFloat16)
+
+            # Create pointers for kernel
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            c_ptr = make_ptr(c_cutlass_dtype,
+                             c.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            c_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                c_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                 cute.AddressSpace.gmem)
+            alpha_post_ptr = None
+            if alpha_post is not None:
+                alpha_post_ptr = make_ptr(cutlass.Float32,
+                                          alpha_post.data_ptr(),
+                                          cute.AddressSpace.gmem)
+            norm_const_ptr = make_ptr(cutlass.Float32, norm_const.data_ptr(),
+                                      cute.AddressSpace.gmem)
+
+            # Cache key for compiled kernel
+            cache_key = (
+                self.weight_per_expert,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.scaling_vector_size,
+                self.expert_count,
+                alpha_post is not None,  # Whether alpha_post is enabled
+            )
+
+            if cache_key not in self.__class__.kernel_cache:
+                # Get max active clusters only when compiling kernel
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                kernel = self.kernel_class(
+                    sf_vec_size=self.scaling_vector_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    weight_per_expert=self.weight_per_expert,
+                )
+
+                # Compile the kernel and cache it
+                compiled_gemm = cute.compile(
+                    kernel.wrapper,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    c_sf_ptr,
+                    alpha_ptr,
+                    alpha_post_ptr,
+                    norm_const_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    expert_count=self.expert_count,
+                    scaling_vector_size=self.scaling_vector_size,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Call the compiled kernel
+            compiled_gemm(
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                c_sf_ptr,
+                alpha_ptr,
+                alpha_post_ptr,
+                norm_const_ptr,
+                m,
+                n,
+                k,
+                l,
+                stream=stream,
+            )
+
+            return c, c_sf
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_blackwell",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        alpha_post: Optional[torch.Tensor],
+        norm_const: torch.Tensor,
+        expert_count: int,
+        weight_per_expert: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Dense GEMM with SwiGLU fusion for MoE FC1 layer.
+
+        Computes: C = alpha_post * SwiGLU(alpha * (input @ weight.T))
+        When alpha_post is None: C = SwiGLU(alpha * (input @ weight.T))
+
+        Args:
+            input: Input activation tensor (M, K//2) in fp4 packed format
+            weight: Weight tensor [num_expert, weight_per_expert, k//2] in fp4 packed format
+            input_scale: Scale factor for input
+            weight_scale: Scale factor for weight
+            alpha: Per-expert alpha scale (expert_count,)
+            alpha_post: Per-token per-expert alpha scale (M, expert_count) applied after SwiGLU,
+                or None to skip post-SwiGLU scaling
+            norm_const: Normalization constant for SFC generation
+            expert_count: Number of experts
+            weight_per_expert: Number of weight columns per expert
+            output_dtype: Output data type (bfloat16 or float16)
+            scaling_vector_size: Block scaling vector size (default: 16)
+
+        Returns:
+            Tuple of (output, output_scale_factor)
+        """
+        runner = CuteDSLNVFP4DenseGemmSwigluRunner(
+            expert_count=expert_count,
+            weight_per_expert=weight_per_expert,
+            output_dtype=output_dtype,
+            scaling_vector_size=scaling_vector_size,
+        )
+
+        inputs = [
+            input, weight, input_scale, weight_scale, alpha, alpha_post,
+            norm_const
+        ]
+
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+
+        output, output_sf = runner(inputs, tactic=best_tactic)
+        return output, output_sf
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_blackwell")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        alpha_post: Optional[torch.Tensor],
+        norm_const: torch.Tensor,
+        expert_count: int,
+        weight_per_expert: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # weight: [num_expert, weight_per_expert, k//2] (fp4 packed)
+        m = input.shape[0]
+        n = weight.shape[0] * weight.shape[1]  # num_expert * weight_per_expert
+        n_out = n // 2  # SwiGLU output
+        l = 1  # dense GEMM
+
+        if output_dtype == torch.float4_e2m1fn_x2:
+            # FP4 packed: 2 elements per byte
+            output = input.new_empty((m, n_out // 2), dtype=output_dtype)
+        else:
+            output = input.new_empty((m, n_out), dtype=output_dtype)
+
+        # Output scale factor shape
+        scale_n_out = n_out // scaling_vector_size
+        c_sf_shape = (32, 4, pad_up(m, 128) // 128, 4, scale_n_out // 4, l)
+        output_sf = input.new_empty(c_sf_shape, dtype=torch.uint8)
+
+        return output, output_sf
+
+    # Import FC2 kernel
+    from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc2 import \
+        Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmFC2Kernel
+
+    class CuteDSLNVFP4DenseGemmFC2Runner(TunableRunner):
+        """Runner for Dense GEMM FC2 layer (MoE second projection).
+
+        This kernel performs: C = (A * SFA) @ (B * SFB) * alpha_scale
+        where alpha_scale has shape (m, expert_count) for per-token-per-expert scaling.
+
+        Input shapes:
+        - A: (M, K) - activation tensor, K = weight_per_expert * expert_count
+        - B: (N, K) - weight tensor
+        - alpha_scale: (M, expert_count) - per-token-per-expert scaling
+
+        Output shape:
+        - C: (M, N)
+        """
+
+        kernel_class = DenseGemmFC2Kernel
+        kernel_cache = dict()
+        tuning_config_cache = dict()
+
+        def __init__(
+            self,
+            expert_count: int,
+            weight_per_expert: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+        ):
+            super().__init__()
+            self.expert_count = expert_count
+            self.weight_per_expert = weight_per_expert
+            self.output_dtype = output_dtype
+            self.scaling_vector_size = scaling_vector_size
+
+        def unique_id(self):
+            return (
+                self.expert_count,
+                self.weight_per_expert,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
+        def __hash__(self):
+            return hash(self.unique_id())
+
+        def __eq__(self, other):
+            if not isinstance(other, CuteDSLNVFP4DenseGemmFC2Runner):
+                return False
+            return self.unique_id() == other.unique_id()
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+            """Return valid (mma_tiler_mn, cluster_shape_mn) combinations."""
+            # Check SM version - only supports SM 100 and SM 103
+            major, minor = torch.cuda.get_device_capability()
+            if not (major == 10 and minor in [0, 3]):
+                return []
+
+            a = inputs[0]
+            b = inputs[1]
+            # a: [m, k//2] (fp4 packed), b: [n, k//2]
+            m = a.shape[0]
+            k = a.shape[1] * 2  # fp4 packed in k dimension
+            n = b.shape[0]
+            l = 1  # dense GEMM
+
+            # Define candidates together
+            mma_tiler_mn_candidates = [(128, 64), (128, 128), (128, 256)]
+            cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4)]
+
+            # Map torch dtype to cutlass dtype
+            c_cutlass_dtype = {
+                torch.bfloat16: cutlass.BFloat16,
+                torch.float16: cutlass.Float16,
+                torch.float32: cutlass.Float32,
+            }.get(self.output_dtype, cutlass.BFloat16)
+
+            tactics = []
+            for mma_tiler_mn, cluster_shape_mn in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+                if self.kernel_class.can_implement(
+                        cutlass.Float4E2M1FN,  # ab_dtype
+                        cutlass.Float8E4M3FN,  # sf_dtype
+                        self.scaling_vector_size,
+                        c_cutlass_dtype,  # c_dtype
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        m,
+                        n,
+                        k,
+                        l,
+                        "k",  # a_major
+                        "k",  # b_major
+                        "n",  # c_major
+                        self.expert_count,
+                        self.weight_per_expert,
+                ):
+                    tactics.append((mma_tiler_mn, cluster_shape_mn))
+
+            return tactics
+
+        def get_tuning_config(self) -> TuningConfig:
+            key = self.unique_id()
+            if key not in self.tuning_config_cache:
+                self.tuning_config_cache[key] = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        0, 0, get_last_power_of_2_num_tokens_buckets,
+                        last_positive_power_of_2), ),
+                    constraint_specs=(
+                        ConstraintSpec(2, 0, fp4_scale_infer_shape),
+                        ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),
+                    ),
+                    use_cold_l2_cache=True,
+                    tune_max_num_tokens=256,
+                    distributed_tuning_strategy=DistributedTuningStrategy.
+                    PARALLEL,
+                )
+            return self.tuning_config_cache[key]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
+        ) -> torch.Tensor:
+            """Execute the dense GEMM FC2.
+
+            Args:
+                inputs: [a, b, a_sf, b_sf, alpha_scale]
+                tactic: ((mma_m, mma_n), (cluster_m, cluster_n))
+
+            Returns:
+                Output tensor
+            """
+            a, b, a_sf, b_sf, alpha_scale = inputs[:5]
+
+            # Get dimensions
+            # a: [m, k//2] (fp4 packed), b: [n, k//2]
+            m = a.shape[0]
+            k = a.shape[1] * 2  # fp4 packed in k dimension
+            n = b.shape[0]
+            l = 1  # dense GEMM
+
+            # Default tactic if not provided
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+
+            # Allocate output tensor
+            c_dtype = self.output_dtype
+            c = torch.empty((m, n), dtype=c_dtype, device=a.device)
+
+            # Get CUDA stream
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            # Map torch dtype to cutlass dtype
+            c_cutlass_dtype = {
+                torch.bfloat16: cutlass.BFloat16,
+                torch.float16: cutlass.Float16,
+                torch.float32: cutlass.Float32,
+            }.get(c_dtype, cutlass.BFloat16)
+
+            # Create pointers for kernel
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_scale_ptr = make_ptr(cutlass.Float32,
+                                       alpha_scale.data_ptr(),
+                                       cute.AddressSpace.gmem,
+                                       assumed_align=4)
+            c_ptr = make_ptr(c_cutlass_dtype,
+                             c.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+
+            # Cache key for compiled kernel
+            cache_key = (
+                self.expert_count,
+                self.weight_per_expert,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.scaling_vector_size,
+            )
+
+            if cache_key not in self.__class__.kernel_cache:
+                # Get max active clusters only when compiling kernel
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                kernel = self.kernel_class(
+                    sf_vec_size=self.scaling_vector_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    expert_count=self.expert_count,
+                    weight_per_expert=self.weight_per_expert,
+                )
+
+                # Compile the kernel and cache it
+                compiled_gemm = cute.compile(
+                    kernel.wrapper,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    alpha_scale_ptr,
+                    c_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    expert_count=self.expert_count,
+                    scaling_vector_size=self.scaling_vector_size,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Call the compiled kernel
+            compiled_gemm(
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                alpha_scale_ptr,
+                c_ptr,
+                m,
+                n,
+                k,
+                l,
+                stream=stream,
+            )
+
+            return c
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_fc2_blackwell",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha_scale: torch.Tensor,
+        expert_count: int,
+        weight_per_expert: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> torch.Tensor:
+        """Dense GEMM FC2 for MoE second projection.
+
+        Performs: C = (A * SFA) @ (B * SFB) * alpha_scale
+
+        Args:
+            input: Input activation (M, K//2) in fp4 packed format
+            weight: Weight tensor (N, K//2) in fp4 packed format
+            input_scale: Scale factor for input (swizzled)
+            weight_scale: Scale factor for weight (swizzled)
+            alpha_scale: Per-token-per-expert scale (M, expert_count)
+            expert_count: Number of experts
+            weight_per_expert: Number of weights per expert
+            output_dtype: Output data type (bfloat16 or float16)
+            scaling_vector_size: Block scaling vector size (default: 16)
+
+        Returns:
+            Output tensor (M, N)
+        """
+        runner = CuteDSLNVFP4DenseGemmFC2Runner(
+            expert_count=expert_count,
+            weight_per_expert=weight_per_expert,
+            output_dtype=output_dtype,
+            scaling_vector_size=scaling_vector_size,
+        )
+
+        inputs = [input, weight, input_scale, weight_scale, alpha_scale]
+
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_fc2_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+
+        output = runner(inputs, tactic=best_tactic)
+        return output
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_fc2_blackwell")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha_scale: torch.Tensor,
+        expert_count: int,
+        weight_per_expert: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> torch.Tensor:
+        # input: [m, k//2] (fp4 packed), weight: [n, k//2]
+        m = input.shape[0]
+        n = weight.shape[0]
+
+        output = input.new_empty((m, n), dtype=output_dtype)
+        return output
