@@ -97,9 +97,7 @@ class FCFSWaitingQueue(deque, WaitingQueue):
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
         """Remove requests with the given IDs."""
-        filtered_requests = [
-            req for req in self if req.id not in request_ids
-        ]
+        filtered_requests = [req for req in self if req.id not in request_ids]
         self.clear()
         self.extend(filtered_requests)
 
