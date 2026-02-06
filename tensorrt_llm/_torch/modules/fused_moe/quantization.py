@@ -1913,6 +1913,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                  requires_grad=False)
         module.register_parameter("fc2_alpha", fc2_alpha)
 
+        # fc2_alpha_max is computed from fc2_alpha in load_weights for fused fc2_alpha optimization
+        # Default to 1.0 to match fc2_alpha default (torch.ones)
+        fc2_alpha_max = nn.Parameter(torch.ones(1, dtype=torch.float32),
+                                     requires_grad=False)
+        module.register_parameter("fc2_alpha_max", fc2_alpha_max)
+
         # Optional per-channel act scale for NVFP4_AWQ (pre_quant_scale support)
         # This will be initialized in load_quant_scales if pre_quant_scale exists
         module.register_parameter("fc31_act_scale", None)
