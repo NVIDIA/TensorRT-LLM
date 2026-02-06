@@ -217,6 +217,10 @@ if compile_svd:
 if compile_fused_qk_norm_rope:
     ext_modules.append(fused_qk_norm_rope_extension())
 requirements = load_requirements()
+requirements_ext = {
+    "cosmos": load_requirements("requirements-cosmos.txt"),
+    "dev": [],
+}
 setup(
     name="visual_gen",
     version=get_version(),
@@ -226,9 +230,7 @@ setup(
     packages=find_packages(include=["visual_gen*"]),
     python_requires=">=3.8",
     install_requires=requirements,
-    extras_require={
-        "dev": [],
-    },
+    extras_require=requirements_ext,
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Programming Language :: Python :: 3",
