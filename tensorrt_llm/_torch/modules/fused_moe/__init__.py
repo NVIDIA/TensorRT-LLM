@@ -9,7 +9,8 @@ from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import (MoeLoadBalancer,
                                 moe_load_balancer_set_repeated_for_next_layer)
 from .quantization import FusedMoEQuantScalesFP8
-from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
+from .routing import (AdaptiveKMoeRoutingMethod, BaseMoeRoutingMethod,
+                      DeepSeekV3MoeRoutingMethod,
                       DefaultMoeRoutingMethod,
                       Llama4RenormalizeMoeRoutingMethod,
                       LoadBalancedMoeRoutingMethod, MiniMaxM2MoeRoutingMethod,
@@ -19,6 +20,7 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       create_renormalize_expert_load_balanced_logits)
 
 __all__ = [
+    "AdaptiveKMoeRoutingMethod",
     "BaseMoeRoutingMethod",
     "create_renormalize_expert_load_balanced_logits",
     "create_moe",
