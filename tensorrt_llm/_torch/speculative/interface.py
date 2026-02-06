@@ -151,11 +151,12 @@ class SpeculativeDecodingMode(IntEnum):
                               TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
-            self,
-            spec_resource_manager: Optional[BaseResourceManager],
-            is_draft_model: bool,
-            attention_backend: Type[AttentionBackend],
-            use_chain_drafter: bool,  # CDL
+        self,
+        spec_resource_manager: Optional[BaseResourceManager],
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
+        use_chain_drafter: bool,  # CDL
+        is_mla: bool,
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
@@ -168,7 +169,7 @@ class SpeculativeDecodingMode(IntEnum):
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
-        xqa_supported = get_sm_version() < 120
+        xqa_supported = not is_mla or get_sm_version() < 120
         use_case_1 = self.use_one_engine() and xqa_supported
         # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
         # the target model (verification) or on the first draft for CDL based speculation.
@@ -587,14 +588,17 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             input_ids_ctx: Prepared context input IDs
         """
-        input_prompt_ids = input_ids[:num_ctx_tokens]
-        input_ids_ctx = torch.empty_like(input_prompt_ids,
-                                         dtype=torch.int32,
-                                         device="cuda")
-        input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
-        input_ids_ctx[
-            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
-        return input_ids_ctx
+        if num_ctx_tokens > 0:
+            input_prompt_ids = input_ids[:num_ctx_tokens]
+            input_ids_ctx = torch.empty_like(input_prompt_ids,
+                                             dtype=torch.int32,
+                                             device="cuda")
+            input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
+            input_ids_ctx[
+                gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+            return input_ids_ctx
+        else:
+            return torch.empty(0, dtype=torch.int32, device="cuda")
 
     def _sample_tokens_for_batch(
         self,

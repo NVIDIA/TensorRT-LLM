@@ -35,6 +35,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         exact_div,
         get_uniform_attribute,
         overlap,
+        temporary_sys_path,
         typed_range,
         value_or,
     )
@@ -55,15 +56,14 @@ else:
         exact_div,
         get_uniform_attribute,
         overlap,
+        temporary_sys_path,
         typed_range,
         value_or,
     )
 
 import os
 
-from dynamic_path_manager import DynamicPathManager
-
-with DynamicPathManager(os.path.dirname(os.path.abspath(__file__)), clear_cache=False):
+with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
     from kernels import check_values, fill_values
 
 
@@ -138,7 +138,12 @@ class FakeEngine:
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
-        pages = kv_cache.get_page_indices(lc_id, beam)
+        base_pages = kv_cache.get_base_page_indices(lc_id, beam)
+        page_scale = manager.get_page_index_scale(layer_id, role)
+        pages = [
+            BAD_PAGE_INDEX if base_page is BAD_PAGE_INDEX else base_page * page_scale
+            for base_page in base_pages
+        ]
         capacity = kv_cache.capacity
         history_len = len(history)
         assert len(history) == history_len
@@ -181,8 +186,13 @@ class FakeEngine:
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
-        pages = kv_cache.get_page_indices(lc_id, beam)[
+        base_pages = kv_cache.get_base_page_indices(lc_id, beam)[
             : div_up(history_len + len(input), tokens_per_block)
+        ]
+        page_scale = manager.get_page_index_scale(layer_id, role)
+        pages = [
+            BAD_PAGE_INDEX if base_page is BAD_PAGE_INDEX else base_page * page_scale
+            for base_page in base_pages
         ]
         capacity = kv_cache.capacity
         input_range = (history_len, history_len + len(input))

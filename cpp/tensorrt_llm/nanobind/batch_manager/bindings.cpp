@@ -166,6 +166,8 @@ void initBindings(nb::module_& m)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
+        .def("set_prepopulated_prompt_len", &GenLlmReq::setPrepopulatedPromptLen, nb::arg("prepopulated_prompt_len"),
+            nb::arg("kv_tokens_per_block"))
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
@@ -196,6 +198,7 @@ void initBindings(nb::module_& m)
         .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
         .def_prop_ro("is_child", &GenLlmReq::isChild)
         .def_prop_ro("cache_salt_id", &GenLlmReq::getCacheSaltID)
+        .def_prop_ro("kv_cache_retention_config", &GenLlmReq::getKvCacheRetentionConfig)
         .def_prop_ro("multimodal_hashes",
             [](GenLlmReq& self)
             {

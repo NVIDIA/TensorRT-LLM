@@ -104,6 +104,7 @@ TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         workspace (pathlib.Path): The directory to store intermediate files.
         llm_id (str): The unique ID of the LLM instance.
+        disaggregated_params (dict): The disaggregated parameters of the LLM instance.
 """
 
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -111,6 +112,7 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
     Attributes:
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         llm_id (str): The unique ID of the LLM instance.
+        disaggregated_params (dict): The disaggregated parameters of the LLM instance.
 """
 
 
@@ -135,6 +137,7 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
+        self._disaggregated_params = {}
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
@@ -262,6 +265,14 @@ class BaseLLM:
             self._llm_id = f"{hostname}-{pid}-{timestamp}"
 
         return self._llm_id
+
+    @property
+    @set_api_status("beta")
+    def disaggregated_params(self) -> dict:
+        if self._disaggregated_params is None:
+            self._disaggregated_params = self._executor.get_disaggregated_params(
+            ) if self._executor else {}
+        return self._disaggregated_params
 
     def generate(
         self,
@@ -513,6 +524,23 @@ class BaseLLM:
                 else:
                     # Convert to shared tensor handle to reduce IPC overhead
                     multimodal_params.to_handle("multimodal_data")
+                    if (disaggregated_params is not None) and (
+                            "mrope_config"
+                            in multimodal_params.multimodal_data):
+                        # Propagate mRoPE handles during context-only P -> D so decode-only
+                        # can rebuild mrope_config without raw multimodal inputs.
+                        mrope_config = multimodal_params.multimodal_data[
+                            "mrope_config"]
+                        mrope_position_ids = mrope_config.get(
+                            "mrope_position_ids")
+                        mrope_position_deltas = mrope_config.get(
+                            "mrope_position_deltas")
+                        if (mrope_position_ids is not None
+                                and mrope_position_deltas is not None):
+                            disaggregated_params.mrope_position_ids_handle = (
+                                mrope_position_ids)
+                            disaggregated_params.mrope_position_deltas_handle = (
+                                mrope_position_deltas)
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"

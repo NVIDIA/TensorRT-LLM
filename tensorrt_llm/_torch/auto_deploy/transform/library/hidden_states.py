@@ -21,13 +21,14 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import GraphModule, Node
 
+from .....llmapi.llm_args import KvCacheConfig
 from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    CacheConfig,
-    CacheInitializerDict,
     MHACallable,
+    ResourceHandler,
+    ResourceHandlerDict,
     SequenceInfo,
 )
 from ...models.factory import ModelFactory
@@ -40,7 +41,7 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-from .kvcache import InsertCachedAttention
+from .kvcache import _InsertCachedOperator
 
 
 @torch.library.custom_op("auto_deploy::residual_add_for_capture", mutates_args=())
@@ -195,12 +196,30 @@ class DetectHiddenStatesForCapture(BaseTransform):
         return gm, info
 
 
+class HiddenStatesResourceHandler(ResourceHandler):
+    """A resource handler for hidden states."""
+
+    def __init__(self, hidden_size: int, dtype: torch.dtype) -> None:
+        """Initialize the HiddenStatesResourceHandler.
+
+        Args:
+            hidden_size: The size of the hidden states resource.
+            dtype: The dtype of the hidden states resource.
+        """
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+
+    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.max_num_tokens,
+            self.hidden_size,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+
 @AttentionRegistry.register("cached_residual_add")
 class CachedResidualAdd(AttentionDescriptor):
-    @classmethod
-    def is_paged(cls) -> bool:
-        return True
-
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         return "bsnd"
@@ -219,15 +238,12 @@ class CachedResidualAdd(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         hidden_size = source_attn_node.meta["val"].shape[-1]
         hidden_type = source_attn_node.meta["val"].dtype
 
-        def _get_hidden_states_cache(si: SequenceInfo):
-            return torch.empty(si.max_num_tokens, hidden_size, device=si.device, dtype=hidden_type)
-
-        return {"hidden_states_cache": _get_hidden_states_cache}
+        return {"hidden_states_cache": HiddenStatesResourceHandler(hidden_size, dtype=hidden_type)}
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
@@ -235,5 +251,5 @@ class CachedResidualAdd(AttentionDescriptor):
 
 
 @TransformRegistry.register("insert_cached_residual_add")
-class InsertCachedResidualAdd(InsertCachedAttention):
+class InsertCachedResidualAdd(_InsertCachedOperator):
     """A transform to handle residual add cache operations."""

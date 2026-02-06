@@ -448,9 +448,12 @@ def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
             continue
 
         is_post_merge = new_data.get("b_is_post_merge", False)
-        baseline_id = history_baseline.get("_id", "")
-
-        info_parts = [f"baseline_id: {baseline_id}"]
+        info_parts = [
+            f"baseline_id: {history_baseline.get('_id', '')}",
+            f"baseline_branch: {history_baseline.get('s_branch', '')}",
+            f"baseline_commit: {history_baseline.get('s_commit', '')}",
+            f"baseline_date: {history_baseline.get('ts_created', '')}",
+        ]
         regressive_metrics = []
         # Check all metrics and build info string
         for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:

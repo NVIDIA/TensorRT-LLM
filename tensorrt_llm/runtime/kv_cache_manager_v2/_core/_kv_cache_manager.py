@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from collections.abc import Callable, Sequence
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import Any, Iterable, Iterator, cast
 
 from .._block_radix_tree import BlockRadixTree
 from .._common import (
@@ -31,8 +33,8 @@ from .._common import (
 )
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
-from .._storage._config import create_storage_config
-from .._storage._core import PoolGroupIndex
+from .._storage._config import BufferId, create_storage_config
+from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
 from .._utils import (
     HomoTuple,
@@ -41,11 +43,58 @@ from .._utils import (
     exact_div,
     filled_list,
     init_cuda_once,
-    typed_enumerate,
     typed_range,
     unwrap_rawref,
 )
 from ._kv_cache import _KVCache
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryPoolDesc:
+    base: MemAddress
+    page_size: int
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryPoolGroupDesc:
+    num_pages: int
+    pools: TypedIndexList[PoolIndex, MemoryPoolDesc]
+
+
+@dataclass(slots=True, frozen=True)
+class Range:
+    start: int
+    end: int
+
+    def __add__(self, offset: int) -> "Range":
+        return Range(self.start + offset, self.end + offset)
+
+    def __radd__(self, offset: int) -> "Range":
+        return self + offset
+
+
+@dataclass(slots=True, frozen=True)
+class BufferSlice:
+    buffer_id: BufferId
+    num_slices: int = 1
+    slice_index: int = 1
+
+    def __post_init__(self) -> None:
+        assert 0 <= self.slice_index < self.num_slices
+
+
+@dataclass(slots=True, frozen=True)
+class AggregatedPageDesc:
+    """
+    The data you need would be in the following byte ranges:
+        (base + stride * i + Range(0, size) for i in aggregated_page_indices)
+    """
+
+    base: MemAddress
+    size: int
+    stride: int
+    layer_group_id: LayerGroupId
+    buffers: Sequence[BufferSlice]
 
 
 class KVCacheManager:
@@ -103,6 +152,14 @@ class KVCacheManager:
         slot_size = pool_group.slot_size[pool_idx]
         return exact_div(slot_size, attr.size) * num_slots - exact_div(attr.offset, attr.size)
 
+    def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int:
+        """
+        The multiplier to convert from base page indices to page indices expected by operators/kernels.
+        """
+        storage = self._storage
+        attr = storage.get_buffer_attr(layer_id, data_role)
+        return storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
+
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,
@@ -158,20 +215,95 @@ class KVCacheManager:
     def enable_partial_match(self) -> bool:
         return True
 
+    @property
+    def num_layers(self) -> int:
+        return len(self._storage._layer_to_life_cycle_ids)
+
+    @property
+    def layer_ids(self) -> Iterator[LayerId]:
+        return iter(self._storage._layer_to_life_cycle_ids.keys())
+
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId:
         return self._storage._layer_to_life_cycle_ids[layer_id]
 
     @property
     def layer_grouping(self) -> HomoTuple[HomoTuple[LayerId]]:
+        """
+        Layers are divided into multiple groups.
+        Buffers in the same layer group for the same token block are always allocated/deallocated together.
+        """
         layer_to_life_cycle_ids = self._storage._layer_to_life_cycle_ids
         num_life_cycles = self._life_cycles.size
         grouping = dict[LifeCycleId, list[LayerId]]({i: [] for i in typed_range(num_life_cycles)})
-        for layer_id, life_cycle_id in typed_enumerate(layer_to_life_cycle_ids):
+        for layer_id, life_cycle_id in layer_to_life_cycle_ids.items():
             grouping[life_cycle_id].append(layer_id)
         return tuple(tuple(grouping[i]) for i in typed_range(num_life_cycles))
 
+    @property
+    def all_buffer_ids(self) -> Iterator[BufferId]:
+        return iter(self._storage._buffer_attr.keys())
+
+    def get_aggregated_pages(self, buffers: Iterable[BufferSlice]) -> Iterator[AggregatedPageDesc]:
+        """
+        Internally, we concatenate buffers into larger buffers.
+        This API takes a iterator of buffers (unordered), and try to find those that can form
+        contiguous aggregated buffers.
+        When we need data transfer, this helps us improve performance.
+        Args:
+            buffers: iterable of buffers to aggregate. Order does not matter.
+        Returns:
+            A iterator of aggregated buffers.
+        """
+        # Group by (life_cycle, pool_index)
+        groups = defaultdict[tuple[LifeCycleId, PoolIndex], list[tuple[Range, BufferSlice]]](
+            list[tuple[Range, BufferSlice]]
+        )
+        buffer_attr_map = self._storage._buffer_attr
+        for b in buffers:
+            attr = buffer_attr_map[b.buffer_id]
+            slice_size = exact_div(attr.size, b.num_slices)
+            start = attr.offset + slice_size * b.slice_index
+            key = (attr.life_cycle_id, attr.pool_index)
+            groups[key].append((Range(start, start + slice_size), b))
+
+        storage = self._storage._levels[GPU_LEVEL].storage
+        lc2pg = self._storage._life_cycle_grouping
+        for (lc, pool_idx), group in groups.items():
+            pg_idx = lc2pg[lc]
+            # Sort by start offset
+            group.sort(key=lambda x: x[0].start)
+            # Merge contiguous
+            current_start, current_end, current_buffers = (
+                group[0][0].start,
+                group[0][0].end,
+                [group[0][1]],
+            )
+            # cache stride and pool_base for this group
+            stride = storage.slot_size(pg_idx)[pool_idx]
+            pool_base = int(cast(int, storage.slot_address(pg_idx, pool_idx, SlotId(0))))
+            for i in range(1, len(group)):
+                next_range, next_buf = group[i]
+                if next_range.start == current_end:
+                    current_end = next_range.end
+                    current_buffers.append(next_buf)
+                else:
+                    base = MemAddress(pool_base + current_start)
+                    yield AggregatedPageDesc(
+                        base, current_end - current_start, stride, lc, tuple(current_buffers)
+                    )
+                    current_start, current_end, current_buffers = (
+                        next_range.start,
+                        next_range.end,
+                        [next_buf],
+                    )
+            # Flush last
+            base = MemAddress(pool_base + current_start)
+            yield AggregatedPageDesc(
+                base, current_end - current_start, stride, lc, tuple(current_buffers)
+            )
+
     # @TODO: need updating when dynamic resizing is supported.
-    def clamp_max_seq_len_for_mem(self, batch_size: int, model_max_seq_len: int) -> int:
+    def clamp_max_seq_len_for_mem(self, batch_size: int) -> int:
         "Get the max possible sequence length limited by the GPU memory pools."
         assert batch_size > 0
         tokens_per_block = self.tokens_per_block
@@ -206,13 +338,14 @@ class KVCacheManager:
 
         assert is_enough(1)
         lb = 1
-        ub = div_up(model_max_seq_len, tokens_per_block)
-        if is_enough(ub):
-            return model_max_seq_len
-        while lb < ub:
+        ub = lb
+        while is_enough(ub):
+            lb = ub
+            ub *= 2
+        while lb < ub - 1:
             mid = (lb + ub) // 2
             if is_enough(mid):
                 lb = mid
             else:
-                ub = mid - 1
-        return min(lb * tokens_per_block, model_max_seq_len)
+                ub = mid
+        return lb * tokens_per_block

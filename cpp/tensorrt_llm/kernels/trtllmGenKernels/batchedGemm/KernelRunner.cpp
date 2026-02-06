@@ -242,7 +242,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
         if (options.mUseDeepSeekFp8)
         {
-            if (!acceptIf(options.mUseShuffledMatrixA == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
+            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
             {
                 continue;
             }
@@ -256,6 +256,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             {
                 continue;
             }
+        }
+        if ((int64_t) options.mEltwiseActType != (int64_t) mOptions.eltwiseActType)
+        {
+            continue;
         }
 
         // FIXME: Disables a few static scheduler kernels (schedS) that appears to have issues;
@@ -412,6 +416,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? sfA : sfB;
     gemmData.mInputBuffers.mPtrScaleC = scaleC;
     gemmData.mInputBuffers.mPtrScaleGate = scaleGateC;
+    gemmData.mInputBuffers.mPtrScaleAct = scaleGateC;
     gemmData.mInputBuffers.mPtrPerTokenSfA = mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
     gemmData.mInputBuffers.mPtrPerTokenSfB = mOptions.transposeMmaOutput ? perTokensSfA : perTokensSfB;
     gemmData.mInputBuffers.mPtrBias = ptrBias;
@@ -452,7 +457,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        tensorrt_llm::common::getEnvEnablePDL(), globalTrtllmGenBatchedGemmModuleCache);
+        tensorrt_llm::common::getEnvEnablePDL(), nullptr, globalTrtllmGenBatchedGemmModuleCache);
 
     CUresult cuErr = static_cast<CUresult>(err);
     char const* cuErrStr = nullptr;

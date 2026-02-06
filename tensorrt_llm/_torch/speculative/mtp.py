@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -13,7 +14,7 @@ from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, SampleState,
+from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, Sampler, SampleState,
                                   SampleStateTensors, TorchSampler, add_token,
                                   int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -21,6 +22,11 @@ from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+if sys.version_info[:2] >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
 
 
 @dataclass(kw_only=True)
@@ -30,9 +36,8 @@ class SampleStateTensorsMTP(SampleStateTensors):
 
 
 @dataclass(kw_only=True)
-class SampleStateMTP(SampleState):
-    device: SampleStateTensorsMTP
-    host: SampleStateTensorsMTP
+class SampleStateMTP(SampleState[SampleStateTensorsMTP, SampleStateTensorsMTP]):
+    pass
 
 
 class MTPHiddenStatesManager(BaseResourceManager):
@@ -210,12 +215,16 @@ class MTPSpecMetadata(SpecMetadata):
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPSampler(TorchSampler):
+class MTPSampler(Sampler[SampleStateMTP]):
     """
     MTP sampler.
     """
 
     SampleState = SampleStateMTP
+
+    @override
+    def is_generation_model(self) -> bool:
+        return True
 
     @dataclass(kw_only=True)
     class Store(TorchSampler.Store):
@@ -224,10 +233,17 @@ class MTPSampler(TorchSampler):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
         max_total_draft_tokens: torch.Tensor
-        finish_reasons: None = None  # Necessary to satisfy the interface of TorchSampler.Store
+        # Necessary to satisfy the interface of TorchSampler.Store
+        finish_reasons: None = None
+        end_ids: None = None
+        max_lengths_tensor: None = None
 
         def __post_init__(self):
             pass  # finish_reasons has no size to compare against new_tokens in MTPSampler
+
+    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
+        # MTPSampler does not need to setup additional buffers before the sampler step
+        pass
 
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None

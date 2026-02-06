@@ -21,6 +21,7 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(SRCS
     allocateKvCache.cpp
     assignReqSeqSlots.cpp
+    baseTransBuffer.cpp
     cacheFormatter.cpp
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp

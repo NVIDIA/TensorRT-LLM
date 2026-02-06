@@ -20,6 +20,7 @@ referring to types like LlmRequest.
 
 import abc
 import sys
+from collections.abc import Hashable
 from dataclasses import dataclass
 from typing import Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
@@ -289,9 +290,8 @@ def beam_search_sampling_batch(
     beam_width_out: int,
     beam_search_args: BeamSearchMetadata,
     temperature: float | None,
-    generator: Optional[torch.Generator] = None,
     return_probs: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Sample <beam_width> tokens for each request in parallel.
     """
@@ -518,19 +518,18 @@ def sample(
                 beam_width_out=beam_width_out,
                 beam_search_args=group_metadata,
                 temperature=temperature,
-                generator=generator,
                 return_probs=return_probs,
             )
     return tokens, softmax, temperature
 
 
-GenericStrategyKeyType = TypeVar("GenericStrategyKeyType")
+GenericStrategyKeyType = TypeVar("GenericStrategyKeyType", bound=Hashable)
 
 
 class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
     @staticmethod
     @abc.abstractmethod
-    def strategy_grouping_key(strategy: Strategy, return_probs: bool) -> GenericStrategyKeyType:
+    def strategy_grouping_key(strategy: Strategy) -> GenericStrategyKeyType:
         raise NotImplementedError
 
     @staticmethod
@@ -552,6 +551,13 @@ class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, float | torch.Tensor | None]:
+        """Sample grouped strategies.
+
+        Returns:
+          - Sampled tokens
+          - Processed probs (whenever return_probs=True)
+          - Temperature (used to compute processed _log_ probs)
+        """
         raise NotImplementedError
 
 
@@ -560,7 +566,7 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
 
     @override
     @staticmethod
-    def strategy_grouping_key(strategy: Strategy, return_probs: bool) -> STRATEGY_KEY_TYPE:
+    def strategy_grouping_key(strategy: Strategy) -> STRATEGY_KEY_TYPE:
         return strategy
 
     @override
@@ -585,7 +591,7 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         generator: torch.Generator | None = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | torch.Tensor | None]:
         if group_key[0] == "beam_search":
             beam_width_in = group_key[1]
         else:

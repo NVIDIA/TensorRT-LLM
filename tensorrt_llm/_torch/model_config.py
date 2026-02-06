@@ -122,6 +122,10 @@ class ModelConfig(Generic[TConfig]):
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
+    # cute dsl op configs
+    use_cute_dsl_blockscaling_mm: bool = False
+    use_cute_dsl_blockscaling_bmm: bool = False
+
     _frozen: bool = field(default=False, init=False, repr=False)
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
@@ -228,6 +232,32 @@ class ModelConfig(Generic[TConfig]):
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
+
+    @staticmethod
+    def resolve_moe_backend(moe_backend: str, architecture: str) -> str:
+        """Resolve AUTO moe_backend to a specific backend based on model architecture.
+
+        Args:
+            moe_backend: The configured moe_backend (may be "AUTO")
+            architecture: The model architecture name (e.g., "GptOssForCausalLM")
+
+        Returns:
+            Resolved backend name (never "AUTO")
+        """
+        if moe_backend.upper() != "AUTO":
+            return moe_backend
+
+        if architecture == "GptOssForCausalLM":
+            sm_version = get_sm_version()
+            # Select the best performing backend based on SM version
+            if 100 <= sm_version < 120:  # Blackwell
+                return "TRTLLM"
+            elif 90 <= sm_version < 100:  # Hopper
+                return "TRITON"
+            else:
+                return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
+
+        return "CUTLASS"
 
     @staticmethod
     def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
@@ -528,13 +558,7 @@ class ModelConfig(Generic[TConfig]):
                     update_dict: Dictionary with values to update in the config
                 """
                 for key, value_new in update_dict.items():
-                    if not hasattr(config, key):
-                        logger.warning(
-                            f"model_kwargs key '{key}' not found in pretrained_config, ignoring."
-                        )
-                        continue
-
-                    target_value = getattr(config, key)
+                    target_value = getattr(config, key, None)
 
                     # Handle nested PretrainedConfig objects when value is a dict
                     if isinstance(value_new, dict) and isinstance(
@@ -566,7 +590,12 @@ class ModelConfig(Generic[TConfig]):
 
         quant_config = QuantConfig()
         layer_quant_config = None
-        moe_backend = kwargs.get('moe_backend', 'CUTLASS')
+        moe_backend = kwargs.get('moe_backend', 'AUTO')
+        # Resolve AUTO to specific backend based on model architecture
+        architecture = pretrained_config.architectures[
+            0] if pretrained_config.architectures else ""
+        moe_backend = cls.resolve_moe_backend(moe_backend, architecture)
+        kwargs['moe_backend'] = moe_backend
 
         # quantized ckpt in modelopt format
         if quant_config_file := cached_file(checkpoint_dir,

@@ -21,6 +21,17 @@ from ._common import MemAddress
 from ._utils import ItemHolderWithSharedPool, PooledFactoryBase, _unwrap, div_up
 
 
+def _is_prop_supported(prop: drv.CUmemAllocationProp) -> bool:
+    err, handle = drv.cuMemCreate(2 << 20, prop, 0)
+    if err == drv.CUresult.CUDA_ERROR_NOT_PERMITTED or err == drv.CUresult.CUDA_ERROR_NOT_SUPPORTED:
+        return False
+    elif err == drv.CUresult.CUDA_SUCCESS:
+        _unwrap(drv.cuMemRelease(handle))
+        return True
+    else:
+        raise ValueError(f"Unexpected error: {err}")
+
+
 # Physical memory
 class NativePhysMemAllocator:
     __slots__ = ("_device_id", "_size", "_prop", "_outstanding_handles")
@@ -37,6 +48,10 @@ class NativePhysMemAllocator:
         prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         prop.location.id = self._device_id
+        prop.allocFlags.gpuDirectRDMACapable = 1
+        prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        if not _is_prop_supported(prop):
+            prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
         self._prop = prop
         self._outstanding_handles = set()
 

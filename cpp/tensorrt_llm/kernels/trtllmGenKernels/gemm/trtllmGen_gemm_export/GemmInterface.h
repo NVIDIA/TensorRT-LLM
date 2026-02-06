@@ -317,7 +317,7 @@ GemmConfig const* GemmInterface::getGemmConfigs() const
 size_t GemmInterface::getNumGemmConfigs() const
 {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-    return tensorrt_llm::kernels::tllmGenGemmListLen;
+    return sizeof(tensorrt_llm::kernels::tllmGenGemmList) / sizeof(tensorrt_llm::kernels::tllmGenGemmList[0]);
 #else
     return 0;
 #endif

@@ -5,10 +5,9 @@ import shutil
 import pytest
 from transformers import AutoTokenizer
 from utils.llm_data import llm_models_root
+from utils.util import skip_no_hopper
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
 
 configs = """
@@ -48,11 +47,10 @@ def dump_config_json(dst_dir):
         json.dump(json_configs, f, indent=2, ensure_ascii=False)
 
 
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    ["CUTLASS", pytest.param("TRITON", marks=skip_no_hopper)])
 def test_gpt_oss_trtllmgen(moe_backend):
-    if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
-        pytest.skip("Triton kernels are not available")
-
     prompts = [
         "How are you?",
         "Hello, my name is",

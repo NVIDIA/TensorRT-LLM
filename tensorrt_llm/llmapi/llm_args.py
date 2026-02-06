@@ -444,10 +444,13 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA",
-                     "TRITON"] = Field(default='CUTLASS',
-                                       description="MoE backend to use.")
+    backend: Literal[
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
+        "TRITON"] = Field(
+            default='AUTO',
+            description="MoE backend to use. "
+            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+        )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -838,6 +841,37 @@ class KvCacheConnectorConfig(StrictBaseModel):
         ..., description="The class name of the scheduler within the module.")
     connector_worker_class: str = Field(
         ..., description="The class name of the worker within the module.")
+
+
+class LayerwiseBenchmarksConfig(StrictBaseModel):
+    """
+    Configuration for layer-wise benchmarks calibration.
+    """
+    calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
+        default="NONE",
+        description=
+        "Instruct the layer-wise benchmarks calibrator to work on MARK mode, or COLLECT mode",
+        status="prototype")
+
+    calibration_file_path: Optional[str] = Field(
+        default=None,
+        description=
+        "The file path which the layer-wise benchmarks calibrator saves to or loads from",
+        status="prototype")
+
+    calibration_layer_indices: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Layer indices to filter. If None, all layers are collected in COLLECT mode.",
+        status="prototype")
+
+    @model_validator(mode='after')
+    def validate_calibration_file_path(self) -> 'LayerwiseBenchmarksConfig':
+        if self.calibration_mode == "COLLECT" and not self.calibration_file_path:
+            raise ValueError(
+                f"Expect calibration_file_path not to be empty when work on {self.calibration_mode} mode"
+            )
+        return self
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
@@ -1726,6 +1760,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    use_kv_cache_manager_v2: bool = Field(
+        default=False,
+        status="prototype",
+        description="Whether to use the KV cache manager v2 (experimental).")
+
+    max_util_for_resume: float = Field(
+        default=0.95,
+        status="prototype",
+        description=
+        "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
+    )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1784,6 +1830,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive"
                 )
+        return v
+
+    @field_validator('max_util_for_resume')
+    @classmethod
+    def validate_max_util_for_resume(cls, v: float):
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
 
@@ -2147,6 +2201,12 @@ class BaseLlmArgs(StrictBaseModel):
     return_perf_metrics: bool = Field(default=False,
                                       description="Return perf metrics.",
                                       status="prototype")
+
+    perf_metrics_max_requests: int = Field(
+        default=0,
+        description=
+        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
+        status="prototype")
 
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
         default=None,
@@ -2864,12 +2924,6 @@ class TorchLlmArgs(BaseLlmArgs):
                                  description="Print iteration logs.",
                                  status="beta")
 
-    perf_metrics_max_requests: int = Field(
-        default=0,
-        description=
-        "The maximum number of requests for perf metrics. Must also set request_perf_metrics to true to get perf metrics.",
-        status="prototype")
-
     batch_wait_timeout_ms: float = Field(
         default=0,
         description=
@@ -2935,6 +2989,7 @@ class TorchLlmArgs(BaseLlmArgs):
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
                                    description="Allreduce strategy to use.",
                                    status="beta")
+
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description=
@@ -2995,6 +3050,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    # fp8 cute dsl configs
+    use_cute_dsl_blockscaling_mm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling mm implementation.",
+        status="prototype",
+    )
+    use_cute_dsl_blockscaling_bmm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -3010,6 +3077,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description="The max number of performance statistic entries.",
         status="prototype",
     )
+
+    layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
+        default_factory=LayerwiseBenchmarksConfig,
+        description="Configuration for layer-wise benchmarks calibration.",
+        status="prototype")
 
     @property
     def quant_config(self) -> QuantConfig:
