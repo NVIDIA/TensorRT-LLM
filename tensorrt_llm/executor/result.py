@@ -131,6 +131,9 @@ class CompletionOutput:
     additional_generation_outputs: Optional[Dict[str, torch.Tensor]] = None
     disaggregated_params: Optional[DisaggregatedParams] = None
     request_perf_metrics: Optional[tllm.RequestPerfMetrics] = None
+    # Time breakdown metrics for performance analysis
+    # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
+    time_breakdown_metrics: Optional[Dict] = None
 
     # hidden fields for tracking the diffs
     _last_text_len: int = field(default=0, init=False, repr=False)
@@ -318,6 +321,11 @@ class GenerationResultBase:
 
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
+
+        # Extract time_breakdown_metrics from LlmResult
+        if hasattr(response_tensors, 'time_breakdown_metrics'
+                   ) and response_tensors.time_breakdown_metrics is not None:
+            output.time_breakdown_metrics = response_tensors.time_breakdown_metrics
 
         # Check if this specific sequence is finished (not just if the entire request is done)
         # This is important for best_of > n sampling where sequences finish at different times
