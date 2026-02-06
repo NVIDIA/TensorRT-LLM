@@ -23,7 +23,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     WeightShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
 from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
@@ -139,6 +139,7 @@ class MLA_Block(nn.Module):
 
     Based on DeepSeek MLA architecture with KV compression.
     This is a minimal, self-contained implementation for testing sharding patterns.
+    Based on models/custom/modeling_deepseek.py:DeepSeekV3Attention
     """
 
     def __init__(
@@ -163,18 +164,24 @@ class MLA_Block(nn.Module):
 
         # KV compression path (not sharded - gather)
         self.kv_a_proj_with_mqa = nn.Linear(hidden_size, kv_lora_rank + qk_rope_head_dim, bias=bias)
+        self.kv_a_layernorm = nn.LayerNorm(kv_lora_rank)
 
-        # KV decompression (sharded column-wise)
-        self.kv_b_proj = nn.Linear(
-            kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim), bias=False
+        # KV decompression weight (absorbed into torch_mla, sharded column-wise)
+        # NOTE: This is nn.Parameter, not nn.Linear - the weight is passed directly to torch_mla
+        self.kv_b_proj_weight = nn.Parameter(
+            torch.randn(num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank)
         )
 
         # Query path (sharded column-wise)
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=bias)
         self.q_b_proj = nn.Linear(q_lora_rank, num_heads * self.qk_head_dim, bias=bias)
         self.q_a_layernorm = nn.LayerNorm(q_lora_rank)
+
         # Output projection (sharded row-wise)
         self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=bias)
+
+        # Softmax scale
+        self.softmax_scale = self.qk_head_dim ** (-0.5)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -182,22 +189,37 @@ class MLA_Block(nn.Module):
 
         # Compress KV to latent
         compressed_kv_rope = self.kv_a_proj_with_mqa(x)  # (b, s, kv_lora_rank + rope_dim)
-        compressed_kv = compressed_kv_rope[:, :, : self.kv_lora_rank]  # (b, s, kv_lora_rank)
+        compressed_kv, k_pe = torch.split(
+            compressed_kv_rope, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
 
-        # Decompress to full K and V
-        kv = self.kv_b_proj(compressed_kv)  # (b, s, num_heads * (qk_nope + v))
-        k_nope_v = kv.view(b, s, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = k_nope_v[:, :, :, : self.qk_nope_head_dim]
-        v = k_nope_v[:, :, :, self.qk_nope_head_dim :]
+        # Apply layernorm to compressed KV
+        compressed_kv = self.kv_a_layernorm(compressed_kv)  # (b, s, kv_lora_rank)
 
-        # Query projection
-        # q = q_b_proj @ (layernorm(q_a_proj @ x))
+        # k_pe: shared across heads for simplified version
+        k_pe = k_pe.view(b, s, 1, self.qk_rope_head_dim)  # (b, s, 1, qk_rope_head_dim)
+
+        # Query projection: q = q_b_proj @ (layernorm(q_a_proj @ x))
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))  # (b, s, num_heads * qk_head_dim)
         q = q.view(b, s, self.num_heads, self.qk_head_dim)
-        q_nope = q[:, :, :, : self.qk_nope_head_dim]
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        attn_out = torch.ops.auto_deploy.torch_attention(q_nope, k_nope, v, is_causal=True)
-        attn_out = attn_out.contiguous().view(b, s, -1)
+        # Call MLA kernel with compressed KV and kv_b_proj weight absorbed
+        # NOTE: kv_b_proj weight is passed directly to the kernel instead of calling Linear
+        attn_out = torch.ops.auto_deploy.torch_mla(
+            q_nope,  # [B, S, N, qk_nope_head_dim]
+            q_pe,  # [B, S, N, qk_rope_head_dim]
+            compressed_kv,  # [B, S, kv_lora_rank]
+            k_pe,  # [B, S, 1, qk_rope_head_dim]
+            self.kv_b_proj_weight,  # [N*(qk_nope+v), kv_lora_rank] - absorbed weight
+            True,  # is_causal
+            self.softmax_scale,  # softmax_scale
+            "bsnd",  # layout
+        )
+
+        # Output: [B, S, N, v_head_dim] -> [B, S, N * v_head_dim]
+        attn_out = attn_out.reshape(b, s, self.num_heads * self.v_head_dim)
+
         # Output projection
         output = self.o_proj(attn_out)
         return output
@@ -616,6 +638,16 @@ def _run_pattern_detection_job(
                             layer_type=LayerType.MLA,
                         )
                     )
+                if is_weight_node(node):
+                    if "kv_b_proj_weight" in node.name:
+                        expected_transformations.append(
+                            WeightShardingInfo(
+                                target_node=node.name,
+                                split_dim=SplitDimension.COLUMN,
+                                config=config,
+                                layer_type=LayerType.MLA,
+                            )
+                        )
 
     # get detected transformations
     optimizer = InferenceOptimizer(
