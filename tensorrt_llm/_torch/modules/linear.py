@@ -2672,6 +2672,17 @@ class Linear(nn.Module):
     ) -> Optional[torch.Tensor]:
         if not self._should_use_nccl_window_output(input, all_reduce_params,
                                                    lora_params):
+            logger.debug(
+                "create_nccl_window_tensor skipped (mpi_disabled=%s, has_all_reduce=%s, "
+                "strategy=%s, enable_allreduce=%s, has_lora=%s, valid_input=%s)",
+                mpi_disabled(),
+                self.all_reduce is not None,
+                None if self.all_reduce is None else self.all_reduce.strategy,
+                None if all_reduce_params is None else
+                all_reduce_params.enable_allreduce,
+                self.lora is not None and bool(lora_params),
+                isinstance(input, torch.Tensor) and input.numel() > 0,
+            )
             return None
         output_shape = list(input.shape)
         if not output_shape:
