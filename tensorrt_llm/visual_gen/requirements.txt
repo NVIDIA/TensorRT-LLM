@@ -1,5 +1,5 @@
 diffusers==0.36.0
-peft==0.17.0
+peft==0.18.1
 transformers>=4.52.1
 sentencepiece
 accelerate>=1.7.0
