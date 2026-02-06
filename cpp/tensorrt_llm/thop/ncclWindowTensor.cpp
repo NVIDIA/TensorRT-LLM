@@ -33,10 +33,13 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
 #if ENABLE_MULTI_DEVICE
     if (!like.defined() || !like.is_cuda())
     {
+        TLLM_LOG_DEBUG("[create_nccl_window_tensor] invalid input tensor; defined=%d cuda=%d", like.defined() ? 1 : 0,
+            like.is_cuda() ? 1 : 0);
         return {torch::Tensor(), false};
     }
     if (group.size() == 0)
     {
+        TLLM_LOG_DEBUG("[create_nccl_window_tensor] empty group; skipping allocation");
         return {torch::Tensor(), false};
     }
 
@@ -58,9 +61,13 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
         = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(*commPtr, outShape, like.scalar_type());
     if (!tensor.defined() || buffer.invalid())
     {
+        TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation failed; tensor_defined=%d buffer_valid=%d shape=%s",
+            tensor.defined() ? 1 : 0, buffer.isValid() ? 1 : 0, outShape);
         return {torch::Tensor(), false};
     }
 
+    TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation success; ptr=%p size_bytes=%zu shape=%s", buffer.ptr,
+        buffer.size, outShape);
     return {tensor, true};
 #else
     (void) group;
