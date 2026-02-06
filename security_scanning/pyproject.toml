@@ -20,7 +20,7 @@ dependencies = [
     "onnx-graphsurgeon (>=0.5.2)",
     "onnxscript (==0.5.4)",
     "graphviz (>=0.21,<0.22)",
-    "openai (>=2.16.0,<3.0.0)",
+    "openai (>=2.17.0,<3.0.0)",
     "polygraphy (>=0.49.26,<0.50.0)",
     "psutil (>=7.2.2,<8.0.0)",
     "nvidia-ml-py (>=13)",

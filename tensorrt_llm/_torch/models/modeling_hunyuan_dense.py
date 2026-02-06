@@ -6,6 +6,8 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.distributed import AllReduceParams
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    ConsumableWeightsDict
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -623,7 +625,7 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                          vocab_size=model_config.pretrained_config.vocab_size)
         self._execution_stats = None
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: ConsumableWeightsDict):
         tp_size = self.model_config.mapping.tp_size
         head_dim = getattr(
             self.config, "head_dim",
@@ -641,6 +643,10 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
             'gate_up_proj': ['gate_proj', 'up_proj']
         }
+
+        # Check if weights supports mark_consumed (ConsumableWeightsDict)
+        can_mark_consumed = hasattr(weights, 'mark_consumed')
+
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
             if len(module._parameters) > 0:
@@ -667,7 +673,13 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                             }
                         module_weights.append(fw)
                     module.load_weights(weights=module_weights)
+                    # Mark consumed source weights (e.g., q_proj, k_proj, v_proj)
+                    if can_mark_consumed:
+                        for src_name in params_map[names[-1]]:
+                            weights.mark_consumed('.'.join(names[:-1] +
+                                                           [src_name]))
                 else:
+                    original_name = name
                     name = name.replace('gate', 'gate.wg')
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):
@@ -678,6 +690,9 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                         for n, p in module._parameters.items():
                             if p is not None:
                                 p.data.copy_(module_weights[n][:])
+                    # Mark consumed weights
+                    if can_mark_consumed:
+                        weights.mark_consumed(original_name)
 
     def forward(
         self,

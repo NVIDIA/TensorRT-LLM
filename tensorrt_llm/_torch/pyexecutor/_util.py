@@ -691,7 +691,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
         )
     else:
-        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
+        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
         is_vswa = kv_cache_config.max_attention_window is not None and len(
             set(kv_cache_config.max_attention_window)) > 1
         binding_model_config = model_engine.model.model_config.get_bindings_model_config(
