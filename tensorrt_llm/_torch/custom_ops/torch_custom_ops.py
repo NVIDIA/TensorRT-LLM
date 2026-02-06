@@ -1782,6 +1782,15 @@ class AllReduceRunner(TunableRunner):
         )
 
 
+@torch.library.register_fake("trtllm::preallocate_nccl_window_buffer")
+def _(
+    input: torch.Tensor,
+    group: List[int],
+    count: int,
+) -> None:
+    return None
+
+
 @torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
 def tunable_allreduce(
     input: torch.Tensor,
