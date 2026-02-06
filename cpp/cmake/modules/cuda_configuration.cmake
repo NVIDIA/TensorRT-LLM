@@ -61,7 +61,8 @@ Functions
 
   ``all`` or unset
     Resolves to architectures TensorRT-LLM is optimized for and the
-    compiler supports (80, 86, 89, 90, 100, 103, 120 depending on CUDA version).
+    compiler supports (80, 86, 89, 90, 100, 103
+      110, 120 depending on CUDA version).
 
   ``all-major``
     Unsupported. Results in a fatal error.
@@ -351,7 +352,8 @@ function(setup_cuda_architectures)
       list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 100 120)
     endif()
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 103)
+      list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 103
+      110)
     endif()
   endif()
 
@@ -370,6 +372,7 @@ function(setup_cuda_architectures)
       90
       100
       103
+      110
       120)
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
     if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
@@ -406,7 +409,7 @@ function(setup_cuda_architectures)
   # is enabled to avoid perf regression when using 80 kernels.
   set(ARCHITECTURES_COMPATIBILITY_BASE 80 86 90 100 120)
   # Exclude Tegra architectures
-  set(ARCHITECTURES_NO_COMPATIBILITY 87 101)
+  set(ARCHITECTURES_NO_COMPATIBILITY 87 101 110)
 
   # Generate CMAKE_CUDA_ARCHITECTURES_NORMALIZED from
   # CMAKE_CUDA_ARCHITECTURES_ORIG

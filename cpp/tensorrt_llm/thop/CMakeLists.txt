@@ -44,7 +44,7 @@ add_library(
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
-  cuteDslMoeUtilsOp.cpp
+  
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
@@ -74,17 +74,17 @@ add_library(
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
-  moeOp.cpp
-  moeUtilOp.cpp
-  moeCommOp.cpp
-  moeAlltoAllOp.cpp
-  moeLoadBalanceOp.cpp
-  moeAlignOp.cpp
-  mxFp4BlockScaleMoe.cpp
-  mxFp8Quantize.cpp
-  fp8BlockScaleMoe.cpp
-  fp8PerTensorScaleMoe.cpp
-  fp4BlockScaleMoe.cpp
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   noAuxTcOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
@@ -94,7 +94,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  customMoeRoutingOp.cpp
+  
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp

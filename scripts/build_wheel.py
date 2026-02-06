@@ -196,7 +196,7 @@ def setup_venv(project_dir: Path, requirements_file: Path,
     print(
         f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
     )
-    build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
+# #     build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
     venv_conan = setup_conan(scripts_dir, venv_python)
 
@@ -529,7 +529,7 @@ def main(*,
                 " See https://docs.nvidia.com/deeplearning/tensorrt/install-guide/index.html#installing-zip for more details."
             )
         else:
-            error_msg += f" Please install tensorrt into the venv using \"`{venv_python}` -m pip install tensorrt\" and relaunch build_wheel.py"
+            pass
         raise RuntimeError(error_msg)
 
     if cuda_architectures is not None:
