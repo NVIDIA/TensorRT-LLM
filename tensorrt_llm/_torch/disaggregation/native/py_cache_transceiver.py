@@ -98,6 +98,8 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.send_req_id_to_request = {}  # request_id to request (for send)
         self.recv_req_id_to_request = {}  # request_id to request (for recv)
         self.kv_pool_attrs = self.transfer_worker._rank_info.kv_pool_attrs
+        # Check if using V2 manager (has kv_cache_map attribute)
+        self.is_v2_manager = hasattr(self.kv_cache_manager, "kv_cache_map")
 
     def _create_kv_slice(self, req: LlmRequest):
         # Get block_ids for each layer group
@@ -105,20 +107,25 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         tokens_per_block = self.kv_cache_manager.tokens_per_block
 
         for group_attrs in self.kv_pool_attrs.layer_group_attrs_list:
-            first_global_layer_id = group_attrs.global_layer_ids[0]
-            block_ids = self.kv_cache_manager.get_batch_cache_indices(
-                [req.py_request_id], layer_id=first_global_layer_id
-            )[0]
-
-            # Filter out invalid block_ids (block_id >= 0) for V2
-            block_ids = [bid for bid in block_ids if bid >= 0]
-
-            # Filter by window_size if request_len > window_size
-            window_size = group_attrs.sliding_window_size
-            if window_size is not None:
-                max_blocks_in_window = window_size // tokens_per_block + 1
-                if len(block_ids) > max_blocks_in_window:
-                    block_ids = block_ids[-max_blocks_in_window:]
+            if self.is_v2_manager:
+                # V2: Use get_aggregated_page_indices for efficient slot indices
+                block_ids = list(
+                    self.kv_cache_manager.kv_cache_map[
+                        req.py_request_id
+                    ].get_aggregated_page_indices(group_attrs.group_id, valid_only=True)
+                )
+            else:
+                # V1: Use get_batch_cache_indices
+                first_global_layer_id = group_attrs.global_layer_ids[0]
+                block_ids = self.kv_cache_manager.get_batch_cache_indices(
+                    [req.py_request_id], layer_id=first_global_layer_id
+                )[0]
+                # Filter by window_size if request_len > window_size
+                window_size = group_attrs.sliding_window_size
+                if window_size is not None:
+                    max_blocks_in_window = window_size // tokens_per_block + 1
+                    if len(block_ids) > max_blocks_in_window:
+                        block_ids = block_ids[-max_blocks_in_window:]
 
             block_ids_per_layer_groups.append(list(block_ids))
 

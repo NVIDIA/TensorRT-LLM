@@ -287,6 +287,23 @@ def create_transfer_worker_setup(
                 dtype=dtype,
                 vocab_size=vocab_size,
             )
+            # Initialize gen pool to zeros to verify transfer correctness
+            gen_pool_attrs = KVRegionExtractorV1.create_kv_pool_attrs_from_manager(
+                gen_kv_cache_manager
+            )
+            gen_unique_pools = {}
+            for layer_group_attrs in gen_pool_attrs.layer_group_attrs_list:
+                for pool_idx, pool_ptr in enumerate(layer_group_attrs.pool_base_ptrs):
+                    pool_size = layer_group_attrs.pool_sizes[pool_idx]
+                    if pool_ptr not in gen_unique_pools or pool_size > gen_unique_pools[pool_ptr]:
+                        gen_unique_pools[pool_ptr] = pool_size
+            gen_element_bytes = get_size_in_bytes(1, gen_kv_cache_manager.dtype)
+            for pool_base_ptr, pool_size in gen_unique_pools.items():
+                pool_size_elements = pool_size // gen_element_bytes
+                pool_tensor = convert_to_torch_tensor(
+                    TensorWrapper(pool_base_ptr, gen_kv_cache_manager.dtype, [pool_size_elements])
+                )
+                pool_tensor.zero_()
         else:
             # Construct model_config for VSWA (Variable Sliding Window Attention)
             is_vswa = max_attention_window_vec and len(set(max_attention_window_vec)) > 1
@@ -332,6 +349,9 @@ def create_transfer_worker_setup(
                 dtype=dtype,
                 model_config=model_config,
             )
+            # Initialize gen pool to zeros to verify transfer correctness
+            gen_pool_tensor = gen_kv_cache_manager.get_unique_primary_pool()
+            gen_pool_tensor.zero_()
         gen_kv_cache_managers.append(gen_kv_cache_manager)
         gen_transfer_workers.append(
             TransferWorker(
@@ -386,6 +406,7 @@ def get_block_data(
     block_ids: List[int],
     layer_group_id: int,
     use_v2: bool,
+    request_id: int = None,
 ) -> torch.Tensor:
     """Unified block data retrieval for both V1 and V2 KVCacheManager.
 
@@ -393,30 +414,49 @@ def get_block_data(
 
     Args:
         kv_cache_manager: KVCacheManager (V1) or KVCacheManagerV2 instance
-        block_ids: Block IDs to retrieve
+        block_ids: Block IDs to retrieve (used for V1 only)
         layer_group_id: Layer group ID (required for both V1 and V2)
         use_v2: Whether using KVCacheManagerV2
+        request_id: Request ID (required for V2, ignored for V1)
     """
     if use_v2:
-        # V2: Use get_buffers API
+        # V2: Use get_buffers with block_ids directly
+        # For V2, block_ids from get_aggregated_page_indices are slot indices
+        # We need to map them to buffer indices via get_batch_cache_indices
         layer_grouping = kv_cache_manager.impl.layer_grouping
         local_layer_indices = layer_grouping[layer_group_id]
-        layers_for_indexing = len(local_layer_indices)
 
-        all_slot_data = []
-        for slot_id in block_ids:
-            slot_layers = []
-            for local_layer_idx in local_layer_indices:
-                global_layer_idx = kv_cache_manager.pp_layers[local_layer_idx]
-                layer_buffer = kv_cache_manager.get_buffers(
-                    layer_idx=global_layer_idx, kv_layout="HND"
-                )
-                buffer_idx = slot_id * layers_for_indexing
-                slot_layer_data = layer_buffer[buffer_idx]
-                slot_layer_data = slot_layer_data.reshape(slot_layer_data.shape[0], -1)
-                slot_layers.append(slot_layer_data)
-            all_slot_data.append(torch.stack(slot_layers, dim=0))
-        return torch.stack(all_slot_data, dim=0)
+        all_layer_data = []
+        for local_layer_idx in local_layer_indices:
+            global_layer_idx = kv_cache_manager.pp_layers[local_layer_idx]
+            # Get all buffer indices for this layer
+            all_buffer_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id], layer_id=global_layer_idx
+            )[0]
+            # Filter to valid indices only
+            valid_buffer_indices = [idx for idx in all_buffer_indices if idx >= 0]
+            # Apply window filtering: block_ids specifies which valid slots to use
+            # block_ids are indices into the valid slots (0, 1, 2, ... N-1)
+            # For window filtering, we take the last N slots
+            num_valid = len(valid_buffer_indices)
+            num_requested = len(block_ids)
+            if num_requested < num_valid:
+                # Window filtering: take last num_requested slots
+                selected_indices = valid_buffer_indices[-num_requested:]
+            else:
+                selected_indices = valid_buffer_indices
+
+            layer_buffer = kv_cache_manager.get_buffers(layer_idx=global_layer_idx, kv_layout="HND")
+            # Get selected slots: shape [num_slots, kv_factor, ...]
+            layer_data = layer_buffer[selected_indices]
+            # Reshape to [num_slots, kv_factor, flat_dim]
+            layer_data = layer_data.reshape(layer_data.shape[0], layer_data.shape[1], -1)
+            all_layer_data.append(layer_data)
+
+        # Stack layers: [num_layers, num_slots, kv_factor, flat_dim]
+        # Then transpose to [num_slots, num_layers, kv_factor, flat_dim]
+        result = torch.stack(all_layer_data, dim=0).permute(1, 0, 2, 3)
+        return result
     else:
         # V1: Use get_unique_primary_pool (single window only, VSWA tests are skipped)
         pool_tensor = kv_cache_manager.get_unique_primary_pool()
@@ -446,14 +486,19 @@ def get_block_ids_per_layer_groups(
     block_ids_per_layer_groups: List[List[int]] = []
 
     for group_attrs in kv_pool_attrs.layer_group_attrs_list:
-        first_global_layer_id = group_attrs.global_layer_ids[0]
-        block_ids = kv_cache_manager.get_batch_cache_indices(
-            [request_id], layer_id=first_global_layer_id
-        )[0]
-
-        # V2: Filter out invalid block_ids (block_id >= 0)
         if use_v2:
-            block_ids = [bid for bid in block_ids if bid >= 0]
+            # V2: Use get_aggregated_page_indices for efficient slot indices
+            block_ids = list(
+                kv_cache_manager.kv_cache_map[request_id].get_aggregated_page_indices(
+                    group_attrs.group_id, valid_only=True
+                )
+            )
+        else:
+            # V1: Use get_batch_cache_indices
+            first_global_layer_id = group_attrs.global_layer_ids[0]
+            block_ids = kv_cache_manager.get_batch_cache_indices(
+                [request_id], layer_id=first_global_layer_id
+            )[0]
 
         # Filter by window_size if request_len > window_size
         window_size = group_attrs.sliding_window_size
@@ -728,11 +773,11 @@ def add_and_verify_request(
 
         # Get data using unified get_block_data function
         ctx_block_datas = [
-            get_block_data(mgr, bids, layer_group_id, use_v2)
+            get_block_data(mgr, bids, layer_group_id, use_v2, ctx_request.py_request_id)
             for mgr, bids in zip(valid_ctx_kv_cache_managers, ctx_group_block_ids)
         ]
         gen_block_datas = [
-            get_block_data(mgr, bids, layer_group_id, use_v2)
+            get_block_data(mgr, bids, layer_group_id, use_v2, gen_request.py_request_id)
             for mgr, bids in zip(valid_gen_kv_cache_managers, gen_group_block_ids)
         ]
 
