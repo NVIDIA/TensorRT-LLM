@@ -2759,22 +2759,54 @@ class Linear(nn.Module):
                         bias, all_reduce_params)
                     bias = None if fuse_bias else bias
                     window_out = None
+                    window_attempted = False
+                    window_path = "none"
                     if hasattr(self.quant_method, "apply_out"):
+                        window_attempted = True
+                        window_path = "apply_out"
                         window_out = self._maybe_create_nccl_window_output(
                             input, all_reduce_params, lora_params)
-                    window_success = window_out is not None
-                    window_info = ""
-                    if window_success:
-                        window_bytes = window_out.numel(
-                        ) * window_out.element_size()
-                        window_info = (
-                            f" (size_bytes={window_bytes}, ptr={hex(window_out.data_ptr())}, "
-                            f"shape={tuple(window_out.shape)})")
-                        output = self.quant_method.apply_out(
-                            self, input, bias, window_out)
+                        if window_out is not None:
+                            output = self.quant_method.apply_out(
+                                self, input, bias, window_out)
+                        else:
+                            output = self.apply_linear(input, bias, lora_params,
+                                                       layer_idx)
                     else:
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)
+                        if self._should_use_nccl_window_output(
+                                input, all_reduce_params, lora_params):
+                            window_attempted = True
+                            window_path = "fallback_copy"
+                            try:
+                                out_shape = list(output.shape)
+                                out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
+                                    output, self.mapping.tp_group, out_shape)
+                                if bool(
+                                        is_valid
+                                ) and out is not None and out.numel() > 0:
+                                    out.copy_(output)
+                                    window_out = out
+                                    output = window_out
+                            except Exception as exc:
+                                logger.debug(
+                                    "create_nccl_window_tensor fallback raised: %s (shape=%s, group=%s)",
+                                    type(exc).__name__,
+                                    tuple(output.shape),
+                                    tuple(self.mapping.tp_group),
+                                )
+                    window_success = window_attempted and window_out is not None
+                    window_info = ""
+                    if window_attempted:
+                        window_info = f" (path={window_path})"
+                    if window_success:
+                        window_bytes = window_out.numel(
+                        ) * window_out.element_size()
+                        window_info += (
+                            f" (size_bytes={window_bytes}, ptr={hex(window_out.data_ptr())}, "
+                            f"shape={tuple(window_out.shape)})")
+                    else:
                         try:
                             output_shape = list(input.shape)
                             if output_shape:
@@ -2782,11 +2814,13 @@ class Linear(nn.Module):
                             output_bytes = math.prod(
                                 output_shape) * input.element_size()
                             capture = torch.cuda.is_current_stream_capturing()
-                            window_info = (
+                            window_info += (
                                 f" (capture={capture}, size_bytes={output_bytes})"
                             )
                         except Exception:
                             pass
+                        if not window_attempted:
+                            window_info += " (attempted=False, reason=no_apply_out)"
                     logger.debug(
                         f"Linear GEMM NCCL window output buffer: "
                         f"{'success' if window_success else 'failure'}{window_info}"
