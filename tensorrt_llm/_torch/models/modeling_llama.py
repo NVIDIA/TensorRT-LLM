@@ -611,6 +611,11 @@ class Llama4DecoderLayer(DecoderLayer):
         elif self.next_layer_layernorm:
             hidden_states, residual = self.next_layer_layernorm(
                 hidden_states, residual)
+        else:
+            raise RuntimeError(
+                "Unexpected case: self.next_layer_layernorm is None. Did you forget to "
+                "call model.post_load_weights() after calling model.load_weights()?"
+            )
 
         return hidden_states, residual
 
@@ -889,6 +894,11 @@ class LlamaDecoderLayer(DecoderLayer):
 
             hidden_states, residual = self.next_layer_layernorm(
                 hidden_states, residual)
+        else:
+            raise RuntimeError(
+                "Unexpected case: self.next_layer_layernorm is None. Did you forget to "
+                "call model.post_load_weights() after calling model.load_weights()?"
+            )
 
         return hidden_states, residual
 
