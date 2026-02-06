@@ -451,7 +451,14 @@ class Runner:
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
                     )
                 else:
-                    hidden_states = layer(position_ids, hidden_states, attn_metadata, **kwargs)
+                    result = layer(
+                        position_ids, hidden_states, attn_metadata, residual=residual, **kwargs
+                    )
+                    # Some layers (e.g., NemotronH) return (hidden_states, residual) tuple
+                    if isinstance(result, tuple):
+                        hidden_states, residual = result
+                    else:
+                        hidden_states = result
             return hidden_states, residual
 
         model.forward = forward

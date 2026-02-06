@@ -52,9 +52,9 @@ namespace torch_ext
 //
 // NOTE: This kernel requires SM90 (Hopper) or SM100 (Blackwell) GPU architecture.
 // NOTE: Hidden dimension N must be >= 2048 and <= 16384.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_add_rms_norm_quant(at::Tensor const& input,
-    at::Tensor const& residual, at::Tensor const& gamma, std::optional<at::Tensor> const& sf_scale, bool use_rms_norm,
-    double eps, bool output_hp_norm)
+std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_add_rms_norm_quant(
+    at::Tensor const& input, at::Tensor const& residual, at::Tensor const& gamma,
+    std::optional<at::Tensor> const& sf_scale, bool use_rms_norm, double eps, bool output_hp_norm)
 {
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
@@ -118,7 +118,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_add_rms_norm_qu
     int64_t const sfSizePadded = tensorrt_llm::computeSwizzledLayoutSFSize(m_padded, n / sfVecSize);
     at::Tensor sf_out_padded = at::detail::empty_cuda({sfSizePadded}, SF_DTYPE, input.device(), std::nullopt);
     at::Tensor sf_out = (m_padded == m) ? sf_out_padded : sf_out_padded.narrow(0, 0, sfSize);
-    at::Tensor high_precision_normed_output;
+    std::optional<at::Tensor> high_precision_normed_output = std::nullopt;
     if (output_hp_norm)
     {
         at::Tensor hp_normed_output_padded
@@ -163,7 +163,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_add_rms_norm_qu
         param.gamma = reinterpret_cast<T const*>(gamma.data_ptr());                                                    \
         param.beta = nullptr;                                                                                          \
         param.high_precision_normed_output                                                                             \
-            = output_hp_norm ? reinterpret_cast<T*>(high_precision_normed_output.data_ptr()) : nullptr;                \
+            = output_hp_norm ? reinterpret_cast<T*>(high_precision_normed_output.value().data_ptr()) : nullptr;        \
         param.m = static_cast<int>(m);                                                                                 \
         param.n = static_cast<int>(n);                                                                                 \
         param.layernorm_eps = static_cast<float>(eps);                                                                 \
@@ -204,7 +204,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fused_add_rms_norm_quant(Tensor input, Tensor residual, Tensor gamma, "
         "Tensor? sf_scale, bool use_rms_norm=True, float eps=1e-6, bool output_hp_norm=False) -> (Tensor, Tensor, "
-        "Tensor, Tensor)");
+        "Tensor, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
