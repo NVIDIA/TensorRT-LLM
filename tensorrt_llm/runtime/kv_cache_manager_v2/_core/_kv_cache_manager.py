@@ -303,7 +303,7 @@ class KVCacheManager:
             )
 
     # @TODO: need updating when dynamic resizing is supported.
-    def clamp_max_seq_len_for_mem(self, batch_size: int) -> int:
+    def clamp_max_seq_len_for_mem(self, batch_size: int, model_max_seq_len: int) -> int:
         "Get the max possible sequence length limited by the GPU memory pools."
         assert batch_size > 0
         tokens_per_block = self.tokens_per_block
@@ -338,14 +338,13 @@ class KVCacheManager:
 
         assert is_enough(1)
         lb = 1
-        ub = lb
-        while is_enough(ub):
-            lb = ub
-            ub *= 2
+        ub = div_up(model_max_seq_len, tokens_per_block)
+        if is_enough(ub):
+            return model_max_seq_len
         while lb < ub - 1:
             mid = (lb + ub) // 2
             if is_enough(mid):
                 lb = mid
             else:
                 ub = mid
-        return lb * tokens_per_block
+        return min(lb * tokens_per_block, model_max_seq_len)

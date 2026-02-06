@@ -674,6 +674,7 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         curr_max_num_tokens = min(
             kv_cache_manager.get_num_available_tokens(
+                model_max_seq_len=self.max_seq_len,
                 max_num_draft_tokens=self.original_max_draft_len),
             self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
         max_batch_size = min(
@@ -726,6 +727,7 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         curr_max_num_tokens = min(
             kv_cache_manager.get_num_available_tokens(
+                model_max_seq_len=self.max_seq_len,
                 max_num_draft_tokens=self.original_max_draft_len),
             self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
 
@@ -958,6 +960,7 @@ class PyTorchModelEngine(ModelEngine):
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
 
         available_tokens = kv_cache_manager.get_num_available_tokens(
+            model_max_seq_len=self.max_seq_len,
             max_num_draft_tokens=self.runtime_draft_len)
         available_blocks = kv_cache_manager.get_num_free_blocks()
         if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
@@ -1101,7 +1104,9 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         available_tokens = kv_cache_manager.get_num_available_tokens(
-            batch_size=batch_size, max_num_draft_tokens=draft_len)
+            model_max_seq_len=self.max_seq_len,
+            batch_size=batch_size,
+            max_num_draft_tokens=draft_len)
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:

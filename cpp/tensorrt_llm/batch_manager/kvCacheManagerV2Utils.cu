@@ -189,7 +189,8 @@ CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, 
 template <bool COPY_V_IDX = true>
 __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ srcPtr,
     SizeType32* __restrict__ dstPtr, SizeType32 const srcMaxNumSequences, SizeType32 const dstMaxNumSequences,
-    SizeType32 numBlocksPerSeq, SizeType32 const* __restrict__ copyIndex)
+    SizeType32 numBlocksPerSeq, SizeType32 const* __restrict__ copyIndex, SizeType32 const* __restrict__ indexScales,
+    SizeType32 const* __restrict__ kvOffset)
 {
     constexpr uint32_t kvFactor = 2;
     constexpr auto elemPerAccess = sizeof(PackedInt) / sizeof(SizeType32);
@@ -224,19 +225,12 @@ __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict
             asm volatile("cp.async.wait_group %0;\n" ::"n"(copyBlocknbBufs - 1) : "memory");
             if (srcIdx < srcIdxEnd)
             {
-                dstK = src;
-                if (COPY_V_IDX)
-                {
-                    dstV = src;
-                }
-                else
-                {
 #pragma unroll
-                    for (uint32_t j = 0; j < elemPerAccess; j++)
-                    {
-                        auto const val = src.unpacked[j];
-                        dstV.unpacked[j] = (val == BAD_PAGE_INDEX) ? val : (val + 1);
-                    }
+                for (uint32_t j = 0; j < elemPerAccess; j++)
+                {
+                    auto const val = src.unpacked[j];
+                    dstK.unpacked[j] = (val == BAD_PAGE_INDEX) ? val : (indexScales[poolIdx] * val);
+                    dstV.unpacked[j] = (val == BAD_PAGE_INDEX) ? val : (indexScales[poolIdx] * val + kvOffset[poolIdx]);
                 }
             }
         }
@@ -256,8 +250,8 @@ __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict
 }
 
 // Host-side launcher
-void copyBatchBlockOffsetsToDevice(
-    ITensor const& input, ITensor& output, ITensor const& copyIndex, bool copyVIdx, CUstream stream) noexcept
+void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
+    ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept
 {
     using namespace tensorrt_llm::runtime;
 
@@ -265,6 +259,8 @@ void copyBatchBlockOffsetsToDevice(
     auto* dstPtr = bufferCast<tk::KVCacheIndex::UnderlyingType>(
         output); // [numPools, maxNumSequences, kvFactor, numBlocksPerSeq]
     auto const* copyIndexPtr = bufferCast<SizeType32 const>(copyIndex);
+    auto const* indexScalesPtr = bufferCast<SizeType32 const>(indexScales);
+    auto const* kvOffsetPtr = bufferCast<SizeType32 const>(kvOffset);
     auto const& srcShape = input.getShape();
     auto const& dstShape = output.getShape();
     auto const& copyIndexShape = copyIndex.getShape();
@@ -290,16 +286,8 @@ void copyBatchBlockOffsetsToDevice(
     dim3 gridDim(numPools, numSeqs, 1);
     dim3 blockDim(copyBlockCtaSize);
 
-    if (copyVIdx)
-    {
-        copyBatchBlockOffsetsToDeviceKernel<true><<<gridDim, blockDim, 0, stream>>>(
-            srcPtr, dstPtr, srcMaxNumSequences, dstMaxNumSequences, numBlocksPerSeq, copyIndexPtr);
-    }
-    else
-    {
-        copyBatchBlockOffsetsToDeviceKernel<false><<<gridDim, blockDim, 0, stream>>>(
-            srcPtr, dstPtr, srcMaxNumSequences, dstMaxNumSequences, numBlocksPerSeq, copyIndexPtr);
-    }
+    copyBatchBlockOffsetsToDeviceKernel<<<gridDim, blockDim, 0, stream>>>(srcPtr, dstPtr, srcMaxNumSequences,
+        dstMaxNumSequences, numBlocksPerSeq, copyIndexPtr, indexScalesPtr, kvOffsetPtr);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

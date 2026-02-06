@@ -7,7 +7,6 @@ from collections import OrderedDict, defaultdict, deque
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
 
-import numpy as np
 import torch
 from mpi4py import MPI
 
@@ -83,8 +82,8 @@ class ResourceManagerType(enum.Enum):
 class Role:
     KEY = DataRole("key")
     VALUE = DataRole("value")
-    KEY_BLOCK_QUANT = DataRole("key_block_quant")
-    VALUE_BLOCK_QUANT = DataRole("value_block_quant")
+    KEY_BLOCK_SCALE = DataRole("key_block_scale")
+    VALUE_BLOCK_SCALE = DataRole("value_block_scale")
     ALL = DataRole("all")
 
 
@@ -1524,7 +1523,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
 
-        assert self.dtype != DataType.NVFP4, "NVFP4 is not supported for KVCacheManagerV2"
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
 
@@ -1653,6 +1651,10 @@ class KVCacheManagerV2(BaseResourceManager):
         buffer_type = [Role.KEY]
         if kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
+        if kv_cache_config.dtype == "nvfp4":
+            buffer_type.append(Role.KEY_BLOCK_SCALE)
+            if kv_cache_type != CacheTypeCpp.SELFKONLY:
+                buffer_type.append(Role.VALUE_BLOCK_SCALE)
 
         config = KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
@@ -1696,20 +1698,54 @@ class KVCacheManagerV2(BaseResourceManager):
                                                    device="cpu",
                                                    pin_memory=True)
 
+        if kv_cache_config.dtype == "nvfp4":
+            self.kv_cache_pool_pointers = torch.stack([
+                self.kv_cache_pool_pointers,
+                torch.tensor([[
+                    self.impl.get_mem_pool_base_address(
+                        self.impl.layer_grouping[pool_id][0],
+                        Role.KEY_BLOCK_SCALE), 0
+                ] for pool_id in range(self.num_pools)],
+                             dtype=torch.int64,
+                             device="cpu",
+                             pin_memory=True)
+            ],
+                                                      dim=-1)
+
         kv_cache_pool_mapping_list = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
             layer_group_id = self.impl.get_layer_group_id(layer_id)
+            if kv_cache_config.dtype != "nvfp4":
+                addr_offset = self.impl.get_mem_pool_base_address(
+                    layer_id, Role.KEY) - int(
+                        self.kv_cache_pool_pointers[layer_group_id][0])
+            else:
+                addr_offset = self.impl.get_mem_pool_base_address(
+                    layer_id, Role.KEY) - int(
+                        self.kv_cache_pool_pointers[layer_group_id][0][0])
+                block_scale_addr_offset = self.impl.get_mem_pool_base_address(
+                    layer_id, Role.KEY_BLOCK_SCALE) - int(
+                        self.kv_cache_pool_pointers[layer_group_id][0][1])
+                block_scale_offset = exact_div(
+                    block_scale_addr_offset,
+                    self.get_cache_bytes_per_token(
+                        layer_id, Role.KEY_BLOCK_SCALE) * self.kv_factor *
+                    self.tokens_per_block)
             offset = exact_div(
-                self.impl.get_mem_pool_base_address(layer_id, Role.KEY) -
-                int(self.kv_cache_pool_pointers[layer_group_id][0]),
+                addr_offset,
                 self.get_cache_bytes_per_token(layer_id, Role.KEY) *
                 self.kv_factor * self.tokens_per_block)
+
+            if kv_cache_config.dtype == "nvfp4":
+                assert block_scale_offset == offset, "Block scale offset and offset should be the same"
+
             kv_cache_pool_mapping_list.append([layer_group_id, offset])
 
         self.kv_cache_pool_mapping = torch.tensor(kv_cache_pool_mapping_list,
                                                   dtype=torch.int32,
                                                   device="cpu",
                                                   pin_memory=True)
+
         # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel
         self.max_blocks_per_seq = (max_seq_len + tokens_per_block -
                                    1) // tokens_per_block
@@ -1718,7 +1754,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
 
-        max_num_tokens = self.get_num_available_tokens()
+        max_num_tokens = self.get_num_available_tokens(
+            model_max_seq_len=max_seq_len)
 
         if max_seq_len > max_num_tokens:
             logger.warning(
@@ -1731,6 +1768,25 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # Plus 1 for cuda graph dummy request
         self.index_mapper = IndexMapper(max_batch_size + 1, max_beam_width)
+        self.index_scales = torch.empty(self.num_pools,
+                                        dtype=torch.int32,
+                                        pin_memory=True,
+                                        device='cpu')
+        self.kv_offset = torch.empty(self.num_pools,
+                                     dtype=torch.int32,
+                                     pin_memory=True,
+                                     device='cpu')
+        for pool_id in range(self.num_pools):
+            layer_id = self.impl.layer_grouping[pool_id][0]
+            self.index_scales[pool_id] = self.impl.get_page_index_scale(
+                layer_id, Role.KEY)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                self.kv_offset[pool_id] = exact_div(
+                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE) -
+                    self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
+                    self.impl.get_page_stride(layer_id, Role.KEY))
+            else:
+                self.kv_offset[pool_id] = 0
 
         self.host_kv_cache_block_offsets = torch.empty(
             self.num_pools,
@@ -1793,13 +1849,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_num_available_tokens(self,
                                  *,
+                                 model_max_seq_len: int,
                                  batch_size: int = 1,
                                  max_num_draft_tokens: int = 0) -> int:
         if max_num_draft_tokens > 0:
             raise ValueError(
                 "max_num_draft_tokens is not supported for KVCacheManagerV2")
         return int(
-            self.impl.clamp_max_seq_len_for_mem(batch_size) *
+            self.impl.clamp_max_seq_len_for_mem(batch_size, model_max_seq_len) *
             self.kv_cache_manager_py_config.max_util_for_resume
         ) - self.num_extra_kv_tokens - max_num_draft_tokens
 
@@ -2007,10 +2064,17 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             div_factor = 1
 
-        return [
-            (np.asarray(self.kv_cache_map[req_id].get_page_indices(pool_id)) //
-             div_factor).tolist() for req_id in request_ids
-        ]
+        res = []
+
+        for req_id in request_ids:
+            idx_tensor = torch.as_tensor(
+                self.kv_cache_map[req_id].get_base_page_indices(pool_id))
+            res.append((torch.where(
+                idx_tensor != BAD_PAGE_INDEX,
+                idx_tensor * self.index_scales[pool_id] // div_factor,
+                BAD_PAGE_INDEX)).tolist())
+
+        return res
 
     def get_cache_bytes_per_token(
             self,
@@ -2028,10 +2092,10 @@ class KVCacheManagerV2(BaseResourceManager):
         if data_role == Role.ALL:
             kv_factor = self.kv_factor
         elif data_role in [
-                Role.KEY, Role.VALUE, Role.KEY_BLOCK_QUANT,
-                Role.VALUE_BLOCK_QUANT
+                Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE,
+                Role.VALUE_BLOCK_SCALE
         ]:
-            if data_role in [Role.KEY_BLOCK_QUANT, Role.VALUE_BLOCK_QUANT]:
+            if data_role in [Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE]:
                 assert self.dtype == DataType.NVFP4, "NVFP4 is the only supported dtype for block quant data roles"
             if data_role == Role.VALUE:
                 assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, "SELFKONLY is the only supported cache type for value data role"
@@ -2063,7 +2127,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 scaling_factor_dtype=DataType.FP8,
             )
 
-        if data_role in [Role.KEY_BLOCK_QUANT, Role.VALUE_BLOCK_QUANT]:
+        if data_role in [Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE]:
             return quant_size_per_token
 
         return cache_size_bytes_per_token + quant_size_per_token
@@ -2207,7 +2271,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets, dst_tensor, copy_idx,
-            self.kv_cache_type == CacheTypeCpp.SELFKONLY,
+            self.index_scales, self.kv_offset,
             torch.cuda.current_stream().cuda_stream)
 
     def _create_kv_cache(self, request_id: int, lora_task_id: int | None,
@@ -2220,8 +2284,8 @@ class KVCacheManagerV2(BaseResourceManager):
             for pool_idx in range(self.num_pools):
                 buffer: torch.Tensor = self.host_kv_cache_block_offsets[
                     pool_idx, index * self.max_beam_width + i, 0]
-                kv_cache.set_page_index_buf(i, pool_idx,
-                                            memoryview(buffer.numpy()))
+                kv_cache.set_base_page_index_buf(i, pool_idx,
+                                                 memoryview(buffer.numpy()))
         return kv_cache
 
 
