@@ -16,7 +16,7 @@ from typing import Tuple
 import torch
 from torch.fx import GraphModule
 
-from ...custom_ops.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
+from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
