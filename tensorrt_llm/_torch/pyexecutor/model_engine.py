@@ -2118,6 +2118,23 @@ class PyTorchModelEngine(ModelEngine):
                 request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
 
+                # Re-register mrope tensors for context-only requests (EPD disaggregated serving).
+                # This creates new IPC handles owned by the prefill worker, so the decode worker
+                # can access them even after the encode worker's GC deallocates the original memory.
+                # Without this, the decode worker would receive handles pointing to freed memory.
+                if (request.is_context_only_request and self.use_mrope and
+                        "mrope_config" in multimodal_params.multimodal_data):
+                    mrope_config = multimodal_params.multimodal_data[
+                        "mrope_config"]
+                    _mrope_position_ids = mrope_config.get("mrope_position_ids")
+                    _mrope_position_deltas = mrope_config.get(
+                        "mrope_position_deltas")
+                    if _mrope_position_ids is not None and _mrope_position_deltas is not None:
+                        # Clone to allocate new memory owned by this (prefill) worker.
+                        request.py_result.set_mrope_position(
+                            _mrope_position_ids.clone(),
+                            _mrope_position_deltas.clone())
+
             request.py_batch_idx = request.py_seq_slot
 
         if len(multimodal_params_list) > 0:
