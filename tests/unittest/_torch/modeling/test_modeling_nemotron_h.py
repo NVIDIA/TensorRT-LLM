@@ -55,7 +55,8 @@ def create_nemotron_h_llm(model_folder,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             mamba_ssm_cache_dtype="auto"
-            if mamba_ssm_cache_dtype is None else mamba_ssm_cache_dtype),
+            if mamba_ssm_cache_dtype is None else mamba_ssm_cache_dtype,
+            free_gpu_memory_fraction=0.5),
         sampler_type="TRTLLMSampler",
         enable_chunked_prefill=enable_chunked_prefill,
         **kwargs,
