@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -245,11 +245,12 @@ public:
     void recv(DataContext const& ctx, void* data, size_t size) const override;
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
         std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx);
-    void setSenderState(
-        std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx, std::pair<size_t, size_t> offsetRatio);
+    void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
+        std::vector<std::pair<size_t, size_t>> offsetRatios);
     void setActiveSenderBufferIdx(size_t bufferIdx);
     [[nodiscard]] size_t getSenderBufferCount() const;
     [[nodiscard]] std::optional<size_t> getCacheBufferId(size_t bufferIdx = 0) const;
+    [[nodiscard]] size_t getCacheBufferIdCount() const;
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
@@ -263,16 +264,18 @@ private:
     {
         std::vector<MemoryDesc> mCacheReceiverBufferDescs;
         int validSegmentIdx{0};
-        std::pair<size_t, size_t> mOffsetRatio{0, 1};
+        /// Per-buffer offset ratios. Index corresponds to mCacheReceiverBufferDescs / mActiveBufferIdx.
+        std::vector<std::pair<size_t, size_t>> mOffsetRatios;
         size_t mActiveBufferIdx{0};
         [[nodiscard]] MemoryDesc const& activeBufferDesc() const;
+        [[nodiscard]] std::pair<size_t, size_t> const& activeOffsetRatio() const;
         void setActiveBufferIdx(size_t bufferIdx);
         SenderState() = default;
     };
 
     AgentConnectionManager* mAgentConnectionManager;
 
-    std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> const& mCacheTransBufferManagers;
+    std::vector<batch_manager::BaseTransBufferManager*> const& mCacheTransBufferManagers;
     std::vector<std::optional<size_t>> mCacheBufferIds;
     SenderState mSenderState;
     bool mNeedSendMetadata{true};
@@ -282,17 +285,16 @@ private:
 class AgentConnectionManager : public ConnectionManager
 {
 public:
-    AgentConnectionManager(
-        std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> cacheTransBufferManagers,
-        CacheState cacheState, std::string const& backendType);
+    AgentConnectionManager(std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers,
+        CacheState cacheState, std::string const& backendType,
+        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
     AgentConnection const* recvConnectionAndRequestInfo(
         batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag);
-    [[nodiscard]] std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> const&
-    getCacheTransBufferManagers() const;
+    [[nodiscard]] std::vector<batch_manager::BaseTransBufferManager*> const& getCacheTransBufferManagers() const;
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;
     AgentConnection* connect(std::string const& remoteAgentName, std::string const& address,
@@ -314,7 +316,8 @@ private:
     std::mutex mConnectionsMutex;
     CommState mCommState;
     CacheState mCacheState;
-    std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> mCacheTransBufferManagers;
+    std::optional<CacheState::RnnCacheState> mRnnCacheState;
+    std::vector<batch_manager::BaseTransBufferManager*> mCacheTransBufferManagers;
     std::mutex mNotificationMutex;
     std::unordered_map<std::string, std::list<std::string>> mUnhandledNotifications;
     std::unique_ptr<BaseTransferAgent> m_Agent;

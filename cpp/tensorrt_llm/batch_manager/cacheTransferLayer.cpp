@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
 #include <algorithm>
@@ -95,6 +96,22 @@ void CacheTransferLayer::format(TransferSession& session) const
     mKvFormatter->format(session);
     if (mRnnFormatter)
     {
+        // For NIXL agent connections, switch the active buffer index to the RNN buffer
+        // before running the RNN formatter. The buffer descs are ordered [KV..., RNN],
+        // so the RNN buffer is always the last one.
+        auto const& sessionConnections = session.getConnections();
+        for (auto const* conn : sessionConnections)
+        {
+            if (conn != nullptr)
+            {
+                auto const* agentConn = dynamic_cast<executor::kv_cache::AgentConnection const*>(conn);
+                if (agentConn != nullptr && agentConn->getSenderBufferCount() > 1)
+                {
+                    size_t rnnBufferIdx = agentConn->getSenderBufferCount() - 1;
+                    const_cast<executor::kv_cache::AgentConnection*>(agentConn)->setActiveSenderBufferIdx(rnnBufferIdx);
+                }
+            }
+        }
         mRnnFormatter->format(session);
     }
 }
