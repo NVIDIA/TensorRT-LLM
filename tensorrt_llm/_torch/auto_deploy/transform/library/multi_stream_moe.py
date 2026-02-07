@@ -230,7 +230,7 @@ class MultiStreamMOE(BaseTransform):
             torch.ops.auto_deploy.trtllm_moe_fused,
             torch.ops.auto_deploy.triton_moe_fused,
             torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
-            torch.ops.auto_deploy.trtllm_quant_fp4_moe_fused,
+            torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused,
         ]
 
         # Ensure that aux stream and events for the current device are added to the CudaStreamManager.
@@ -243,4 +243,5 @@ class MultiStreamMOE(BaseTransform):
             is_clean=num_matches == 0,
             has_valid_shapes=num_matches == 0,
         )
+
         return gm, info
