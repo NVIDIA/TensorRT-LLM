@@ -236,9 +236,7 @@ class ModelLoader:
         model_cls = AutoModelForCausalLM._resolve_class(config)
 
         # model_cls is None when the architecture is unknown/unsupported.
-        # We skip defaults silently here — from_config() will anyways raise a
-        # descriptive ValueError during model instantiation shortly.
-        if model_cls:
+        if model_cls and hasattr(model_cls, 'get_model_defaults'):
             model_defaults = model_cls.get_model_defaults(llm_args)
             if model_defaults:
                 applied_defaults = apply_model_defaults_to_llm_args(
