@@ -4,12 +4,16 @@ import os
 
 import yaml
 
+DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
+
 
 def get_hardware_config(config, benchmark_mode):
     hardware = config.get("hardware", {})
     worker_config = config.get("worker_config", {})
 
-    num_ctx_servers = 0 if "gen_only" in benchmark_mode else hardware.get("num_ctx_servers")
+    num_ctx_servers = (
+        0 if "gen_only_no_context" in benchmark_mode else hardware.get("num_ctx_servers")
+    )
     num_gen_servers = hardware.get("num_gen_servers")
     gpus_per_node = hardware.get("gpus_per_node")
 
@@ -93,12 +97,10 @@ def get_env_config(config):
 def get_benchmark_config(config):
     benchmark = config.get("benchmark", {})
 
-    mode = benchmark.get("mode", "e2e")
     concurrency_str = benchmark.get("concurrency_list", "1")
     concurrency = int(concurrency_str) if isinstance(concurrency_str, str) else concurrency_str
 
     return {
-        "mode": mode,
         "concurrency": concurrency,
     }
 
@@ -220,7 +222,17 @@ def get_pytest_commands(script_prefix_lines):
     )
 
 
-def get_config_yaml(test_list_path, llm_src):
+def parse_test_case_name(test_list_path, llm_src):
+    """Parse test list to get config yaml path and benchmark mode.
+
+    Test formats for disagg:
+    - Disagg e2e: disagg_upload-e2e-{config_base}
+    - Disagg gen_only: disagg_upload-gen_only-{config_base}
+
+    Returns:
+        tuple: (config_yaml_path, benchmark_mode)
+            - benchmark_mode: "e2e" or "gen_only"
+    """
     with open(test_list_path, "r") as f:
         first_line = f.readline().strip()
 
@@ -230,32 +242,33 @@ def get_config_yaml(test_list_path, llm_src):
         )
     bracket_content = first_line.split("[")[-1].split("]")[0]
     parts = bracket_content.split("-")
-    if len(parts) < 2:
+
+    if len(parts) < 3:
         raise ValueError(
-            f"Invalid test name format. Expected format: prefix-config_name, got: {bracket_content}"
+            f"Invalid disagg test format. Expected: disagg-{{mode}}-{{config}}, "
+            f"got: {bracket_content}"
         )
 
-    # parts[0] is the prefix, parts[1:] is the config name
+    # parts[0] is the prefix, parts[1] is benchmark_mode, parts[2:] is the config name
     if "disagg" not in parts[0]:
         raise ValueError(
-            f"Invalid test name format. Expected format: disagg-config_name, got: {bracket_content}"
+            f"Invalid test name format. Expected format: disagg-mode-config_name, "
+            f"got: {bracket_content}"
         )
-    config_base_name = "-".join(parts[1:])
-    config_yaml_path = os.path.join(
-        llm_src,
-        "tests",
-        "integration",
-        "defs",
-        "perf",
-        "disagg",
-        "test_configs",
-        "disagg",
-        "perf-sanity",
-        f"{config_base_name}.yaml",
-    )
+
+    benchmark_mode = parts[1]  # e2e or gen_only
+    if benchmark_mode not in ("e2e", "gen_only"):
+        raise ValueError(
+            f"Invalid benchmark_mode for disagg: {benchmark_mode}. Expected 'e2e' or 'gen_only'."
+        )
+
+    config_base_name = "-".join(parts[2:])
+    config_yaml_path = os.path.join(llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml")
+
     if not os.path.exists(config_yaml_path):
         raise FileNotFoundError(f"Config file not found: {config_yaml_path}")
-    return config_yaml_path
+
+    return config_yaml_path, benchmark_mode
 
 
 def main():
@@ -293,7 +306,7 @@ def main():
 
     args = parser.parse_args()
 
-    config_yaml = get_config_yaml(args.test_list, args.llm_src)
+    config_yaml, benchmark_mode = parse_test_case_name(args.test_list, args.llm_src)
 
     with open(config_yaml, "r") as f:
         config = yaml.safe_load(f)
@@ -306,7 +319,6 @@ def main():
 
     benchmark_config = get_benchmark_config(config)
     print(f"Benchmark configuration: {benchmark_config}")
-    benchmark_mode = benchmark_config["mode"]
 
     hardware_config = get_hardware_config(config, benchmark_mode)
     print(f"Hardware configuration: {hardware_config}")
@@ -332,16 +344,18 @@ def main():
     # Build worker env vars, add extra env vars for gen_only mode
     worker_env_vars = env_config["worker_env_var"]
     server_env_vars = env_config["server_env_var"]
-    if "gen_only" in benchmark_config["mode"]:
-        concurrency = benchmark_config["concurrency"]
-        worker_env_vars = (
-            "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 "
-            f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-            f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {worker_env_vars}"
-        )
+    # Handle gen only mode
+    if "gen_only_no_context" in benchmark_mode:
+        worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {worker_env_vars}"
         server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
         script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
         srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
+    elif "gen_only" in benchmark_mode:
+        concurrency = benchmark_config.get("concurrency", 1)
+        worker_env_vars = (
+            f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
+            f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {worker_env_vars}"
+        )
 
     script_prefix_lines.extend(
         [
@@ -361,8 +375,8 @@ def main():
             f"export gpusPerGenServer={hardware_config['gpus_per_gen_server']}",
             f"export nodesPerCtxServer={hardware_config['nodes_per_ctx_server']}",
             f"export nodesPerGenServer={hardware_config['nodes_per_gen_server']}",
-            f"export gpusPerfNodePerfCtxServer={hardware_config['gpus_per_node_per_ctx_server']}",
-            f"export gpusPerfNodePerfGenServer={hardware_config['gpus_per_node_per_gen_server']}",
+            f"export gpusPerNodePerCtxServer={hardware_config['gpus_per_node_per_ctx_server']}",
+            f"export gpusPerNodePerGenServer={hardware_config['gpus_per_node_per_gen_server']}",
             f"export totalNodes={hardware_config['total_nodes']}",
             f"export totalGpus={hardware_config['total_gpus']}",
         ]

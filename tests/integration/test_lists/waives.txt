@@ -354,6 +354,7 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[cutlass-one_model-no_overlap_scheduler] SKIP (https://nvbugs/5809169)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-trtllm-auto] SKIP (https://nvbugs/5888588)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-deepseek-r1-fp4_1k1k_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] SKIP (https://nvbugs/5846166)
+perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k2-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] SKIP
 full:sm89/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram SKIP (https://nvbugs/5893116)
 full:sm89/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar] SKIP (https://nvbugs/5893116)
 full:sm89/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding[llguidance] SKIP (https://nvbugs/5893116)
