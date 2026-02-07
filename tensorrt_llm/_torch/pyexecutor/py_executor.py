@@ -351,6 +351,9 @@ class PyExecutor:
             ResourceManagerType.KV_CACHE_MANAGER)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        self.enable_partial_reuse_for_disagg = (
+            self.enable_kv_cache_reuse
+            and self.kv_cache_manager.enable_partial_reuse)
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -359,7 +362,7 @@ class PyExecutor:
         self.expected_num_active_requests = 0
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
-            should_store_blocks=self.enable_kv_cache_reuse
+            should_store_blocks=self.enable_partial_reuse_for_disagg
             and not self.kv_cache_manager.is_vswa)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
@@ -3003,7 +3006,7 @@ class PyExecutor:
                                 logger.debug(
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
-                if self.enable_kv_cache_reuse and not self.kv_cache_manager.is_vswa:
+                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa:
                     requests_to_terminate.append(request)
                 else:
                     if not request.is_disagg_context_transmission_state:

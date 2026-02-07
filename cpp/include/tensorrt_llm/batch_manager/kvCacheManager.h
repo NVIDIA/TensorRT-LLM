@@ -891,6 +891,11 @@ public:
         return mIsSWA;
     }
 
+    [[nodiscard]] bool isEnablePartialReuse() const
+    {
+        return mEnablePartialReuse;
+    }
+
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
     //! \brief Unpin blocks by block ids directly
@@ -1076,6 +1081,11 @@ public:
     [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
     {
         return mIndexerKCacheIndexHeadDim;
+    }
+
+    [[nodiscard]] bool isEnablePartialReuse() const
+    {
+        return mWindowBlockManagers.begin()->second.isEnablePartialReuse();
     }
 
     BlockManager(BlockManager const&) = delete;
@@ -1565,6 +1575,8 @@ public:
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
+    [[nodiscard]] virtual bool isEnablePartialReuse() const = 0;
+
     [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheQuantBlockSize() const = 0;
@@ -1910,6 +1922,11 @@ public:
     [[nodiscard]] bool isEnableBlockReuse() const override
     {
         return mEnableBlockReuse;
+    }
+
+    [[nodiscard]] bool isEnablePartialReuse() const override
+    {
+        return mBlockManager.isEnablePartialReuse();
     }
 
     [[nodiscard]] bool isEnableIndexerKCache() const override
