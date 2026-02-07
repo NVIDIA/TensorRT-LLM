@@ -6,10 +6,9 @@ from typing import Any, Callable, Dict, List, Tuple
 import torch
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.utils import ActivationType
-
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import create_derived_custom_op
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -123,143 +122,29 @@ def aux_stream_wrapper(
     return output
 
 
-# trtllm bf16
-@torch.library.custom_op("auto_deploy::trtllm_moe_fused_aux", mutates_args=())
-def trtllm_moe_fused_aux(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    w3_w1_stacked_weight: torch.Tensor,
-    w2_stacked_weight: torch.Tensor,
-    is_gated_mlp: bool = True,
-    act_fn: int = int(ActivationType.Silu),
-) -> torch.Tensor:
-    device = torch.cuda.current_device()
-    with torch.cuda.stream(
-        cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
-    ):
-        torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
-        output = torch.ops.auto_deploy.trtllm_moe_fused(
-            x,
-            selected_experts,
-            routing_weights,
-            w3_w1_stacked_weight,
-            w2_stacked_weight,
-            is_gated_mlp,
-            act_fn,
-        )
-        torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
-    torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.AUX_STREAM_NAME)
-    return output
+def _make_aux_stream_impl(base_overload: Callable) -> Callable:
+    """Build an implementation that runs *base_overload* on the auxiliary CUDA stream."""
+
+    def _impl(*args, **kwargs):
+        device = torch.cuda.current_device()
+        with torch.cuda.stream(
+            cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
+        ):
+            torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
+            output = base_overload(*args, **kwargs)
+            torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
+        torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.AUX_STREAM_NAME)
+        return output
+
+    return _impl
 
 
-@trtllm_moe_fused_aux.register_fake
-def trtllm_moe_fused_aux_fake(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    w3_w1_stacked_weight: torch.Tensor,
-    w2_stacked_weight: torch.Tensor,
-    is_gated_mlp: bool = True,
-    act_fn: int = int(ActivationType.Silu),
-) -> torch.Tensor:
-    return torch.empty_like(x)
+def _create_aux_op(base_op: Callable) -> Callable:
+    """Create an ``_aux`` variant of a MoE custom op that runs on the auxiliary CUDA stream."""
+    return create_derived_custom_op(base_op, "_aux", _make_aux_stream_impl)
 
 
-# triton bf16
-@torch.library.custom_op("auto_deploy::triton_moe_fused_aux", mutates_args=())
-def triton_moe_fused_aux(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    w1_stacked_weight: torch.Tensor,
-    w2_stacked_weight: torch.Tensor,
-) -> torch.Tensor:
-    device = torch.cuda.current_device()
-    with torch.cuda.stream(
-        cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
-    ):
-        torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
-        output = torch.ops.auto_deploy.triton_moe_fused(
-            x,
-            selected_experts,
-            routing_weights,
-            w1_stacked_weight,
-            w2_stacked_weight,
-        )
-        torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
-    torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.AUX_STREAM_NAME)
-    return output
-
-
-@triton_moe_fused_aux.register_fake
-def triton_moe_fused_aux_fake(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    w1_stacked_weight: torch.Tensor,
-    w2_stacked_weight: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-@torch.library.custom_op("auto_deploy::trtllm_quant_fp8_moe_fused_aux", mutates_args=())
-def trtllm_quant_fp8_moe_fused_aux(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    fc1_expert_weights: torch.Tensor,
-    fc2_expert_weights: torch.Tensor,
-    fc1_act_scale: torch.Tensor,
-    fc1_dequant_scale: torch.Tensor,
-    fc2_act_scale_reciprocal: torch.Tensor,
-    fc2_dequant_scale: torch.Tensor,
-    is_gated_mlp: bool = True,
-    act_fn: int = int(ActivationType.Silu),
-) -> torch.Tensor:
-    device = torch.cuda.current_device()
-    with torch.cuda.stream(
-        cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
-    ):
-        torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
-        output = torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused(
-            x,
-            selected_experts,
-            routing_weights,
-            fc1_expert_weights,
-            fc2_expert_weights,
-            fc1_act_scale,
-            fc1_dequant_scale,
-            fc2_act_scale_reciprocal,
-            fc2_dequant_scale,
-            is_gated_mlp,
-            act_fn,
-        )
-        torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
-    torch.ops.auto_deploy.wait_event(device, cuda_stream_manager.AUX_STREAM_NAME)
-    return output
-
-
-@trtllm_quant_fp8_moe_fused_aux.register_fake
-def trtllm_quant_fp8_moe_fused_aux_fake(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    fc1_expert_weights: torch.Tensor,
-    fc2_expert_weights: torch.Tensor,
-    fc1_act_scale: torch.Tensor,
-    fc1_dequant_scale: torch.Tensor,
-    fc2_act_scale_reciprocal: torch.Tensor,
-    fc2_dequant_scale: torch.Tensor,
-    is_gated_mlp: bool = True,
-    act_fn: int = int(ActivationType.Silu),
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-def _execute_op_in_aux_stream(
-    gm: GraphModule, op_dict: Dict[Callable, Callable]
-) -> Tuple[GraphModule, int]:
+def _execute_op_in_aux_stream(gm: GraphModule, base_ops: List[Callable]) -> Tuple[GraphModule, int]:
     """Replace MoE ops with aux-stream variants and insert CUDA event synchronisation.
 
     For each MoE op we:
@@ -273,12 +158,21 @@ def _execute_op_in_aux_stream(
          stream) to execute concurrently.
       3. Replace the original MoE op with its ``_aux`` variant that runs on
          the auxiliary CUDA stream.
+
+    Aux-stream variants are created lazily — only for base ops that actually
+    appear in the graph.
     """
     graph = gm.graph
     num_replaced = 0
 
     # Collect targets first to avoid mutating while iterating
-    target_nodes = [n for n in graph.nodes if is_op(n, op_dict.keys())]
+    target_nodes = [n for n in graph.nodes if is_op(n, base_ops)]
+    if not target_nodes:
+        return gm, 0
+
+    # Create aux ops only for ops that are present in the graph.
+    ops_in_graph = {n.target for n in target_nodes}
+    op_dict = {op: _create_aux_op(op) for op in ops_in_graph}
 
     # Topological position map — used to find the latest routing input.
     node_order = {node: i for i, node in enumerate(graph.nodes)}
@@ -332,16 +226,16 @@ class MultiStreamMOE(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        op_dict = {
-            torch.ops.auto_deploy.trtllm_moe_fused: torch.ops.auto_deploy.trtllm_moe_fused_aux,
-            torch.ops.auto_deploy.triton_moe_fused: torch.ops.auto_deploy.triton_moe_fused_aux,
-            torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused: torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused_aux,
-        }
-        with open("before_multi_stream.txt", "w") as f:
-            f.write(str(gm.graph))
+        base_ops = [
+            torch.ops.auto_deploy.trtllm_moe_fused,
+            torch.ops.auto_deploy.triton_moe_fused,
+            torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
+            torch.ops.auto_deploy.trtllm_quant_fp4_moe_fused,
+        ]
+
         # Ensure that aux stream and events for the current device are added to the CudaStreamManager.
         cuda_stream_manager.add_device(torch.cuda.current_device())
-        gm, num_matches = _execute_op_in_aux_stream(gm, op_dict)
+        gm, num_matches = _execute_op_in_aux_stream(gm, base_ops)
 
         info = TransformInfo(
             skipped=False,
@@ -349,6 +243,4 @@ class MultiStreamMOE(BaseTransform):
             is_clean=num_matches == 0,
             has_valid_shapes=num_matches == 0,
         )
-        with open("after_multi_stream.txt", "w") as f:
-            f.write(str(gm.graph))
         return gm, info
