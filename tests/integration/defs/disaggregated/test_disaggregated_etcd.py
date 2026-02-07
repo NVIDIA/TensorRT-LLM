@@ -13,22 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 import signal
 import subprocess
+import tempfile
 import time
 
 import pytest
 import requests
+import yaml
+from defs.common import get_free_port_in_ci as get_free_port
+from disagg_test_utils import (CHECK_STATUS_INTERVAL, HEARTBEAT_INTERVAL,
+                               INACTIVE_TIMEOUT, verify_cluster_info,
+                               wait_for_disagg_server_ready)
 
 from tensorrt_llm.logger import logger
 
 # Configuration file paths
 EXAMPLES_DIR = "examples/disaggregated"
+TEST_CONFIGS_DIR = "tests/integration/defs/disaggregated/test_configs"
 CLIENTS_DIR = f"{EXAMPLES_DIR}/clients"
-CONTEXT_CONFIG_FILE = f"{EXAMPLES_DIR}/context_extra-llm-api-config.yml"
-GENERATION_CONFIG_FILE = f"{EXAMPLES_DIR}/gen_extra-llm-api-config.yml"
-ETCD_CONFIG_FILE = f"{EXAMPLES_DIR}/etcd_config.yaml"
+CONTEXT_CONFIG_FILE = f"{TEST_CONFIGS_DIR}/context_extra-llm-api-config.yml"
+GENERATION_CONFIG_FILE = f"{TEST_CONFIGS_DIR}/gen_extra-llm-api-config.yml"
+ETCD_CONFIG_FILE = f"{TEST_CONFIGS_DIR}/etcd_config.yaml"
 DISAGG_CONFIG_FILE = f"{EXAMPLES_DIR}/disagg_config.yaml"
 CLIENT_SCRIPT_FILE = f"{CLIENTS_DIR}/disagg_client.py"
 PROMPTS_FILE = f"{CLIENTS_DIR}/prompts.json"
@@ -57,24 +65,50 @@ def cleanup_automated_output_files():
 def start_context_server(config,
                          gpu_id: int,
                          port: int,
+                         disagg_cluster_config: dict,
                          env=None) -> subprocess.Popen:
-    """Start a context server on specified GPU and port."""
+    """Start a context server with service discovery on specified GPU and port."""
+    # Create worker config file with cluster settings
+    worker_config = {
+        "disagg_cluster": disagg_cluster_config,
+        "disable_overlap_scheduler": True,
+        "cache_transceiver_config": {
+            "backend": "DEFAULT",
+            "max_tokens_in_buffer": 2048
+        },
+        "kv_cache_config": {
+            "free_gpu_memory_fraction": 0.2,
+        },
+    }
+
+    with tempfile.NamedTemporaryFile(mode='w',
+                                     suffix='.yaml',
+                                     delete=False,
+                                     dir='.') as f:
+        yaml.dump(worker_config, f)
+        config_file = f.name
+
     cmd = [
-        "trtllm-serve", config['model_path'], "--host", "localhost", "--port",
-        str(port), "--config", f"./{CONTEXT_CONFIG_FILE}",
-        "--metadata_server_config_file", ETCD_CONFIG_FILE, "--server_role",
-        "CONTEXT"
+        "trtllm-serve", "serve", config['model_path'], "--host", "localhost",
+        "--port",
+        str(port), "--config", config_file, "--server_role", "context"
     ]
 
-    server_env = env.copy() if env else os.environ.copy()
+    # FIX: Merge env with os.environ to preserve system variables
+    server_env = os.environ.copy()
+    if env:
+        server_env.update(env)
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
 
     logger.info(f"Starting CONTEXT server on GPU {gpu_id} (port {port})...")
+    # Write logs to files so we can debug issues
+    stdout_log = open(f'context_server_{gpu_id}_stdout.log', 'w')
+    stderr_log = open(f'context_server_{gpu_id}_stderr.log', 'w')
     process = subprocess.Popen(cmd,
                                env=server_env,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
+                               stdout=stdout_log,
+                               stderr=stderr_log,
                                text=True,
                                bufsize=1)
     return process
@@ -83,41 +117,66 @@ def start_context_server(config,
 def start_generation_server(config,
                             gpu_id: int,
                             port: int,
+                            disagg_cluster_config: dict,
                             env=None) -> subprocess.Popen:
-    """Start a generation server on specified GPU and port."""
+    """Start a generation server with service discovery on specified GPU and port."""
+    # Create worker config file with cluster settings
+    worker_config = {
+        "disagg_cluster": disagg_cluster_config,
+        "cache_transceiver_config": {
+            "backend": "DEFAULT",
+            "max_tokens_in_buffer": 2048
+        },
+        "kv_cache_config": {
+            "free_gpu_memory_fraction": 0.2,
+        },
+    }
+
+    with tempfile.NamedTemporaryFile(mode='w',
+                                     suffix='.yaml',
+                                     delete=False,
+                                     dir='.') as f:
+        yaml.dump(worker_config, f)
+        config_file = f.name
+
     cmd = [
-        "trtllm-serve", config['model_path'], "--host", "localhost", "--port",
-        str(port), "--config", f"./{GENERATION_CONFIG_FILE}",
-        "--metadata_server_config_file", ETCD_CONFIG_FILE, "--server_role",
-        "GENERATION"
+        "trtllm-serve", "serve", config['model_path'], "--host", "localhost",
+        "--port",
+        str(port), "--config", config_file, "--server_role", "generation"
     ]
 
-    server_env = env.copy() if env else os.environ.copy()
+    # FIX: Merge env with os.environ to preserve system variables
+    server_env = os.environ.copy()
+    if env:
+        server_env.update(env)
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
 
     logger.info(f"Starting GENERATION server on GPU {gpu_id} (port {port})...")
+    # Write logs to files so we can debug issues
+    stdout_log = open(f'generation_server_{gpu_id}_stdout.log', 'w')
+    stderr_log = open(f'generation_server_{gpu_id}_stderr.log', 'w')
     process = subprocess.Popen(cmd,
                                env=server_env,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
+                               stdout=stdout_log,
+                               stderr=stderr_log,
                                text=True,
                                bufsize=1)
     return process
 
 
 def start_disaggregated_service(config, env=None) -> subprocess.Popen:
-    """Launch the disaggregated service."""
-    cmd = [
-        "trtllm-serve", "disaggregated", "-c", DISAGG_CONFIG_FILE, "-m",
-        ETCD_CONFIG_FILE
-    ]
+    """Launch the disaggregated service with service discovery."""
+    cmd = ["trtllm-serve", "disaggregated", "-c", DISAGG_CONFIG_FILE]
 
     logger.info("Launching disaggregated service...")
+    # Write logs to files so we can debug issues
+    stdout_log = open('disagg_service_stdout.log', 'w')
+    stderr_log = open('disagg_service_stderr.log', 'w')
     process = subprocess.Popen(cmd,
                                env=env,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
+                               stdout=stdout_log,
+                               stderr=stderr_log,
                                text=True,
                                bufsize=1)
     return process
@@ -211,10 +270,13 @@ def start_etcd_server(working_dir, env=None) -> subprocess.Popen:
     cmd = ["etcd"]
 
     logger.info("Starting etcd server...")
+    # Write logs to files so we can debug issues
+    stdout_log = open('etcd_stdout.log', 'w')
+    stderr_log = open('etcd_stderr.log', 'w')
     process = subprocess.Popen(cmd,
                                env=env,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
+                               stdout=stdout_log,
+                               stderr=stderr_log,
                                text=True,
                                bufsize=1,
                                cwd=working_dir)
@@ -238,8 +300,8 @@ def cleanup_etcd_data(env=None):
         logger.warning(f"Failed to clean etcd data: {result.stderr}")
 
 
-def create_config_files(config):
-    """Create necessary configuration files"""
+def create_config_files(config, disagg_cluster_config, disagg_port):
+    """Create necessary configuration files with service discovery."""
     # Create context config file
     context_config_content = """pytorch_backend_config:
   disable_overlap_scheduler: True
@@ -267,34 +329,63 @@ health_check_timeout: 5.0"""
     with open(ETCD_CONFIG_FILE, 'w') as file:
         file.write(etcd_config_content)
 
-    disagg_config_content = """hostname: localhost
-port: 8000
-backend: pytorch
-context_servers:
-  num_instances: 1
-  urls:
-      - "localhost:8001"
-generation_servers:
-  num_instances: 1
-  urls:
-      - "localhost:8002"
-"""
-
+    # Create disagg config file with service discovery - no hardcoded URLs or ports
+    disagg_config = {
+        "hostname": "localhost",
+        "port": disagg_port,
+        "backend": "pytorch",
+        "disagg_cluster": disagg_cluster_config,
+        "context_servers": {
+            "router": {
+                "type": "round_robin"
+            }
+        },
+        "generation_servers": {
+            "router": {
+                "type": "round_robin"
+            }
+        }
+    }
     with open(DISAGG_CONFIG_FILE, 'w') as file:
-        file.write(disagg_config_content)
+        yaml.dump(disagg_config, file)
 
     return True
 
 
 def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
-    """Run automated disaggregated test with given configuration."""
+    """Run automated disaggregated test with service discovery."""
     kill_automated_disaggregated_processes()
     cleanup_automated_output_files()
 
-    config = {"model_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"}
+    # Use absolute path for model to avoid path resolution issues
+    # The symlink is created in the cwd directory, so resolve the path from there
+    if cwd:
+        model_path = os.path.join(cwd, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    else:
+        model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
-    # Create configuration files
-    create_config_files(config)
+    config = {"model_path": model_path}
+
+    # DEBUG: Log the model path and verify it exists (using print so it shows in pytest output)
+    print(f"\n=== DEBUG: Model Configuration ===")
+    print(f"Model path configured: {model_path}")
+    print(f"Model path exists: {os.path.exists(model_path)}")
+    print(f"Working directory (cwd): {cwd}")
+    print(f"==================================\n")
+
+    # Get a free port for the disaggregated proxy server
+    disagg_port = get_free_port()
+
+    # Define cluster config for service discovery
+    disagg_cluster_config = {
+        "cluster_uri": "etcd://localhost:2379",
+        "cluster_name": "test_cluster",
+        "heartbeat_interval_sec": HEARTBEAT_INTERVAL,
+        "inactive_timeout_sec": INACTIVE_TIMEOUT,
+    }
+
+    # Create configuration files with service discovery
+    create_config_files(config, disagg_cluster_config, disagg_port)
     processes = {}
 
     try:
@@ -307,100 +398,131 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
         logger.info("Step 2: Cleaning etcd data...")
         cleanup_etcd_data(env=env)
 
-        # Step 3: Start context server on GPU 0 (port 8001)
-        logger.info("Step 3: Starting context server on GPU 0 (port 8001)...")
-        processes["context_8001"] = start_context_server(config,
-                                                         gpu_id=0,
-                                                         port=8001,
-                                                         env=env)
-
-        # Step 4: Start generation server on GPU 1 (port 8002)
+        # Step 3: Start context server on GPU 0 with auto port
         logger.info(
-            "Step 4: Starting generation server on GPU 1 (port 8002)...")
-        processes["generation_8002"] = start_generation_server(config,
-                                                               gpu_id=1,
-                                                               port=8002,
-                                                               env=env)
+            "Step 3: Starting context server on GPU 0 with auto port...")
+        processes["context_1"] = start_context_server(
+            config,
+            gpu_id=0,
+            port=0,
+            disagg_cluster_config=disagg_cluster_config,
+            env=env)
 
-        # Step 5: Wait till gen and context ready
+        # Step 4: Start generation server on GPU 1 with auto port
         logger.info(
-            "Step 5: Waiting for context and generation servers to be ready...")
-        if not wait_for_server_health(port=8001):
-            logger.error("Context server on port 8001 failed to start")
-            return False
-        if not wait_for_server_health(port=8002):
-            logger.error("Generation server on port 8002 failed to start")
-            return False
+            "Step 4: Starting generation server on GPU 1 with auto port...")
+        processes["generation_1"] = start_generation_server(
+            config,
+            gpu_id=1,
+            port=0,
+            disagg_cluster_config=disagg_cluster_config,
+            env=env)
 
-        # Step 6: Start disaggregated service
-        logger.info("Step 6: Starting disaggregated service...")
+        # Step 5: Start disaggregated proxy service
+        logger.info("Step 5: Starting disaggregated proxy service...")
         processes["disagg_service"] = start_disaggregated_service(config,
                                                                   env=env)
 
-        # Step 7: Wait for disaggregated service and run first client test
-        logger.info(
-            "Step 7: Waiting for disaggregated service and running first client test..."
-        )
-        if not wait_for_server_health(port=8000):
-            logger.error("Disaggregated service failed to start")
-            return False
+        # Step 6: Wait for service discovery to complete
+        logger.info("Step 6: Waiting for workers to be discovered...")
+        logger.info(f"Disagg server port: {disagg_port}")
 
+        # Give processes a moment to fail if they're going to fail
+        print("\n=== Waiting 3 seconds for processes to initialize... ===")
+        time.sleep(3)
+
+        # Check if processes are still running and FAIL immediately if any died
+        for name, proc in processes.items():
+            if proc.poll() is not None:
+                print(
+                    f"\n!!! Process {name} exited with code {proc.returncode} !!!"
+                )
+                if proc.stderr:
+                    stderr_output = proc.stderr.read()
+                    print(f"{name} stderr: {stderr_output[:2000]}")
+                if proc.stdout:
+                    stdout_output = proc.stdout.read()
+                    print(f"{name} stdout: {stdout_output[:2000]}")
+                raise RuntimeError(
+                    f"Process {name} died during startup with exit code {proc.returncode}. "
+                    f"Check logs above for stderr/stdout output.")
+
+        # DEBUG: Log process status if they're still running
+        print("\n=== All processes are still running. Process Status: ===")
+        for name, proc in processes.items():
+            print(f"  {name}: PID={proc.pid}, running={proc.poll() is None}")
+        print("========================================================\n")
+
+        asyncio.run(wait_for_disagg_server_ready(disagg_port))
+        verify_cluster_info(ready=True,
+                            ctx_workers=1,
+                            gen_workers=1,
+                            port=disagg_port)
+
+        # Step 7: Run first client test
+        logger.info("Step 7: Running first client test...")
         first_test_success = run_client_test(config, env=env)
         if not first_test_success:
             logger.error("First client test failed")
             return False
 
-        # Step 8: Start second context server on GPU 2 (port 8003)
+        # Step 8: Add second context server dynamically on GPU 2
         logger.info(
-            "Step 8: Starting second context server on GPU 2 (port 8003)...")
-        processes["context_8003"] = start_context_server(config,
-                                                         gpu_id=2,
-                                                         port=8003,
-                                                         env=env)
+            "Step 8: Adding second context server on GPU 2 with auto port...")
+        processes["context_2"] = start_context_server(
+            config,
+            gpu_id=2,
+            port=0,
+            disagg_cluster_config=disagg_cluster_config,
+            env=env)
 
-        # Step 9: Wait till ready and then 10 seconds, run second client test
-        logger.info(
-            "Step 9: Waiting for second context server and running second client test..."
-        )
-        if not wait_for_server_health(port=8003):
-            logger.error("Second context server on port 8003 failed to start")
-            return False
-
-        logger.info("Waiting additional 10 seconds for system stabilization...")
-        time.sleep(10)
+        # Step 9: Wait for new worker discovery and verify
+        logger.info("Step 9: Waiting for new worker discovery...")
+        time.sleep(CHECK_STATUS_INTERVAL + 2)
+        verify_cluster_info(ready=True,
+                            ctx_workers=2,
+                            gen_workers=1,
+                            port=disagg_port)
 
         second_test_success = run_client_test(config, env=env)
         if not second_test_success:
             logger.error("Second client test failed")
             return False
 
-        # Step 10: Kill 8001 process (first context server)
-        logger.info("Step 10: Killing first context server (port 8001)...")
-        if "context_8001" in processes:
-            process = processes["context_8001"]
+        # Step 10: Kill first context server
+        logger.info("Step 10: Killing first context server...")
+        if "context_1" in processes:
+            process = processes["context_1"]
             if process.poll() is None:
                 process.terminate()
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     process.kill()
-        kill_server_by_port(8001)
 
-        # Step 11: Wait a few seconds and run final client test
+        # Step 11: Wait for inactive timeout and verify worker removal
         logger.info(
-            "Step 11: Waiting a few seconds and running final client test...")
-        time.sleep(5)
+            "Step 11: Waiting for inactive timeout and worker removal...")
+        time.sleep(INACTIVE_TIMEOUT + CHECK_STATUS_INTERVAL)
+        verify_cluster_info(ready=True,
+                            ctx_workers=1,
+                            gen_workers=1,
+                            port=disagg_port)
 
+        # Step 12: Run final client test
+        logger.info("Step 12: Running final client test...")
         final_test_success = run_client_test(config, env=env)
         if not final_test_success:
             logger.error("Final client test failed")
             return False
 
-        logger.info("✅ All automated disaggregated tests passed successfully!")
+        logger.info("✅ All service discovery tests passed successfully!")
         return True
 
     except Exception as e:
-        logger.exception(f"Error during automated test: {e}")
+        logger.error(f"Error during automated test: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
     finally:
         cleanup_processes(processes)

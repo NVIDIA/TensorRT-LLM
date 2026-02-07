@@ -1,7 +1,6 @@
 hostname: localhost
-port: 8000
 model: DeepSeek-V3-Lite/bf16
-backend: "pytorch"
+backend: pytorch
 context_servers:
   num_instances: 1
   build_config:
@@ -23,8 +22,8 @@ context_servers:
   cache_transceiver_config:
     max_tokens_in_buffer: 8448
     backend: DEFAULT
-  urls:
-      - "localhost:8001"
+  router:
+    type: round_robin
 generation_servers:
   num_instances: 1
   build_config:
@@ -52,5 +51,9 @@ generation_servers:
     backend: DEFAULT
   stream_interval: 1
   num_postprocess_workers: 1
-  urls:
-      - "localhost:8002"
+  router:
+    type: round_robin
+disagg_cluster:
+  cluster_name: test_cluster
+  heartbeat_interval_sec: 1
+  inactive_timeout_sec: 2

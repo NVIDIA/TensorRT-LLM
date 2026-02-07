@@ -1,28 +1,45 @@
 hostname: localhost
-port: 8000
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 free_gpu_memory_fraction: 0.25
-backend: "pytorch"
+backend: pytorch
 cuda_graph_config: null
-disable_overlap_scheduler: True
+disable_overlap_scheduler: true
 perf_metrics_max_requests: 1000
 context_servers:
   num_instances: 1
+  max_batch_size: 1
+  max_num_tokens: 3000
+  max_seq_len: 4096
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
-  return_perf_metrics: True
+  return_perf_metrics: true
   perf_metrics_max_requests: 1000
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+    enable_block_reuse: false
+    enable_partial_reuse: false
   cache_transceiver_config:
     backend: DEFAULT
-  urls:
-      - "localhost:8001"
+  router:
+    type: round_robin
 generation_servers:
   num_instances: 1
+  max_batch_size: 256
+  max_num_tokens: 4096
+  max_seq_len: 4096
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
-  return_perf_metrics: True
+  return_perf_metrics: true
   perf_metrics_max_requests: 1000
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+    enable_block_reuse: false
+    enable_partial_reuse: false
   cache_transceiver_config:
     backend: DEFAULT
-  urls:
-      - "localhost:8002"
+  router:
+    type: round_robin
+disagg_cluster:
+  cluster_name: test_cluster
+  heartbeat_interval_sec: 1
+  inactive_timeout_sec: 2

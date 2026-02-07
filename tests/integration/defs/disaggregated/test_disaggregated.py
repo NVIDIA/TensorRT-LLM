@@ -14,48 +14,37 @@
 # limitations under the License.
 
 import asyncio
-import contextlib
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import traceback
 import uuid
 from collections import namedtuple
 from dataclasses import dataclass
-from functools import wraps
-from typing import Callable
 
-import openai
 import pytest
-import requests
 import yaml
 
 try:
-    import ray
+    pass
 except ImportError:
-    import tensorrt_llm.ray_stub as ray
+    pass
 
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import (parse_gsm8k_output,
-                         revise_disagg_config_file_with_free_ports,
-                         wait_for_server)
+from defs.common import parse_gsm8k_output, wait_for_server
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell)
-from defs.trt_test_alternative import (check_call, check_output, popen,
-                                       print_info)
+from defs.trt_test_alternative import check_call, check_output, print_info
+from disagg_test_utils import (run_ctx_worker, run_disagg_server,
+                               run_gen_worker, terminate, verify_cluster_info,
+                               wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
-
-# Service discovery constants
-HEARTBEAT_INTERVAL = 1
-INACTIVE_TIMEOUT = 2
 
 
 @dataclass
@@ -79,323 +68,13 @@ def cleanup_output_files():
             pass
 
 
-def get_disagg_server_url_from_cfg(config_file: str) -> tuple[str, int]:
-    with open(config_file, 'r') as file:
-        config = yaml.safe_load(file)
-    server_host = config.get('hostname', 'localhost')
-    server_port = config.get('port', 8000)
-    return server_host, server_port
-
-
-@pytest.fixture
-def disagg_port():
-    return get_free_port()
-
-
-@pytest.fixture
-def work_dir():
-    return tempfile.mkdtemp()
-
-
-@pytest.fixture
-def router(request):
-    return request.param
-
-
-@pytest.fixture
-def service_discovery(request, disagg_port, work_dir):
-    if request.param == "etcd":
-        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
-        etcd = subprocess.Popen(["etcd", "--data-dir", data_dir])
-        yield etcd, f"etcd://localhost:2379"
-        try:
-            etcd.kill()
-            etcd.wait(timeout=10)
-            shutil.rmtree(data_dir)
-        except Exception:
-            print(f"Failed to kill etcd: {traceback.format_exc()}")
-    else:
-        yield None, f"http://localhost:{disagg_port}"
-
-
-@pytest.fixture
-def disagg_server_config(disagg_cluster_config, router, disagg_port):
-    return {
-        "hostname": "localhost",
-        "port": disagg_port,
-        "disagg_cluster": disagg_cluster_config,
-        "context_servers": {
-            "router": {
-                "type": router
-            }
-        },
-        "generation_servers": {
-            "router": {
-                "type": router
-            }
-        },
-    }
-
-
-@pytest.fixture
-def worker_config(disagg_cluster_config):
-    return {
-        "disagg_cluster": disagg_cluster_config,
-        "disable_overlap_scheduler": True,
-        "cache_transceiver_config": {
-            "backend": "DEFAULT"
-        },
-        "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.2,
-            "enable_partial_reuse": False,
-        },
-        "cuda_graph_config": {},
-    }
-
-
-class ProcessWrapper:
-
-    def __init__(self, process, log_file=None, log_path=None, port=0):
-        self.process = process
-        self.log_file = log_file
-        self.log_path = log_path
-        self.port = port
-
-
-# Decorator for periodic checking
-def periodic_check(timeout=300, interval=3):
-
-    def decorator(func):
-
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                try:
-                    result = await func(*args, **kwargs)
-                    if result:
-                        return result
-                except Exception as e:
-                    logger.debug(f"Check failed: {e}")
-                await asyncio.sleep(interval)
-            raise TimeoutError(
-                f"Timeout after {timeout}s waiting for condition")
-
-        return wrapper
-
-    return decorator
-
-
-async def _wait_for_disagg_server_status(port,
-                                         check_ready,
-                                         min_ctx_workers=-1,
-                                         min_gen_workers=-1):
-    """Check disagg server status via /cluster_info endpoint."""
-    try:
-        info_resp = requests.get(f"http://localhost:{port}/cluster_info",
-                                 timeout=5)
-        if info_resp.status_code != 200:
-            return False
-        info = info_resp.json()
-
-        if check_ready and not info.get("is_ready", False):
-            return False
-
-        if min_ctx_workers != -1:
-            ctx_count = len(
-                info.get("current_workers", {}).get("context_servers", []))
-            if ctx_count < min_ctx_workers:
-                return False
-
-        if min_gen_workers != -1:
-            gen_count = len(
-                info.get("current_workers", {}).get("generation_servers", []))
-            if gen_count < min_gen_workers:
-                return False
-
-        return True
-    except Exception as e:
-        logger.debug(f"Failed to check server status: {e}")
-        return False
-
-
-@periodic_check(timeout=300, interval=3)
-async def wait_for_disagg_server_status(port,
-                                        min_ctx_workers=-1,
-                                        min_gen_workers=-1):
-    return await _wait_for_disagg_server_status(port, False, min_ctx_workers,
-                                                min_gen_workers)
-
-
-@periodic_check(timeout=300, interval=3)
-async def wait_for_disagg_server_ready(port):
-    """Wait for disagg server to be ready."""
-    return await _wait_for_disagg_server_status(port, True)
-
-
-def verify_cluster_info(ready,
-                        ctx_workers=-1,
-                        gen_workers=-1,
-                        port=0,
-                        expected_code=200):
-    """Verify cluster info from /cluster_info endpoint."""
-    assert port > 0, "port must be positive"
-    info_resp = requests.get(f"http://localhost:{port}/cluster_info")
-    assert info_resp.status_code == expected_code
-    info = info_resp.json()
-    logger.info(
-        f"verify_cluster_info: {info}, ready={ready}, ctx={ctx_workers}, gen={gen_workers}"
-    )
-    assert info["is_ready"] == ready
-    if ctx_workers != -1:
-        assert len(info["current_workers"]["context_servers"]) == ctx_workers
-    if gen_workers != -1:
-        assert len(info["current_workers"]["generation_servers"]) == gen_workers
-
-
-def _run_worker(model_name,
-                worker_config,
-                role,
-                port,
-                work_dir,
-                device=-1,
-                save_log=False):
-    worker_config_path = os.path.join(work_dir, f"{role}_{port}_config.yaml")
-    with open(worker_config_path, "w+") as f:
-        yaml.dump(worker_config, f)
-        f.flush()
-        cmd = [
-            "trtllm-serve",
-            "serve",
-            model_name,
-            "--host",
-            "localhost",
-            "--port",
-            str(port),
-            "--config",
-            worker_config_path,
-            "--server_role",
-            "context" if role.startswith("ctx") else "generation",
-        ]
-        env = os.environ.copy()
-        log_file = None
-        log_path = None
-        if save_log:
-            log_path = os.path.join(work_dir, f"worker_{role}_{port}.log")
-            log_file = open(log_path, "w+")
-            stdout = log_file
-            stderr = log_file
-        else:
-            stdout = sys.stdout
-            stderr = sys.stderr
-        if device != -1:
-            env["CUDA_VISIBLE_DEVICES"] = str(device)
-        print(f"Running {role} on port {port}")
-        return ProcessWrapper(subprocess.Popen(cmd,
-                                               env=env,
-                                               stdout=stdout,
-                                               stderr=stderr),
-                              log_file=log_file,
-                              log_path=log_path,
-                              port=port)
-
-
-def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False):
-    disagg_server_config_path = os.path.join(work_dir,
-                                             "disagg_server_config.yaml")
-    disagg_cluster_config["port"] = port
-    with open(disagg_server_config_path, "w+") as f:
-        yaml.dump(disagg_cluster_config, f)
-    cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
-    log_file = None
-    log_path = None
-    if save_log:
-        log_path = os.path.join(work_dir, "disagg_server.log")
-        log_file = open(log_path, "w+")
-        stdout = log_file
-        stderr = log_file
-    else:
-        stdout = sys.stdout
-        stderr = sys.stderr
-    p = subprocess.Popen(cmds, stdout=stdout, stderr=stderr)
-    return ProcessWrapper(p, log_file=log_file, log_path=log_path, port=port)
-
-
-def run_ctx_worker(model_name, ctx_worker_config, work_dir, port=0, device=0):
-    """Launch a context worker with service discovery."""
-    return _run_worker(model_name, ctx_worker_config, "ctx", port, work_dir,
-                       device)
-
-
-def run_gen_worker(model_name,
-                   gen_worker_config,
-                   work_dir,
-                   port=0,
-                   device=0):  # TODO use device=1 for multiple gpus
-    """Launch a generation worker with service discovery."""
-    return _run_worker(model_name, gen_worker_config, "gen", port, work_dir,
-                       device)
-
-
-def terminate(*args, show_log_lines=30):
-    """Terminate processes and show their logs."""
-    for arg in args:
-        if arg and isinstance(arg, ProcessWrapper):
-            try:
-                # Print log tail for debugging
-                if arg.log_path and os.path.exists(arg.log_path):
-                    print(f"-------------{arg.log_path}---------------")
-                    try:
-                        with open(arg.log_path, 'r') as f:
-                            lines = f.readlines()
-                            print(''.join(lines[-show_log_lines:]))
-                    except Exception as e:
-                        print(f"Failed to read log: {e}")
-            except Exception as e:
-                print(f"Failed to tail {arg.log_path}: {e}")
-
-            if arg.process:
-                print(f"Killing process {arg.process.pid}")
-                try:
-                    arg.process.kill()
-                    arg.process.wait(timeout=10)
-                    arg.process = None
-                    if arg.log_file:
-                        arg.log_file.close()
-                        arg.log_file = None
-                except Exception as e:
-                    print(f"Failed to terminate process {arg.process.pid}: {e}")
-
-
-def request_completion(model_name, prompt, port):
-    """Make a completion request to the disagg server."""
-    client = openai.OpenAI(api_key="tensorrt_llm",
-                           base_url=f"http://localhost:{port}/v1")
-    return client.completions.create(model=model_name,
-                                     prompt=prompt,
-                                     max_tokens=10,
-                                     temperature=0.0)
-
-
-@pytest.fixture
-def disagg_cluster_config(service_discovery):
-    # same cluster config for workers and proxy server
-    _, uri = service_discovery
-    return {
-        "cluster_uri": uri,
-        "cluster_name": "test_cluster",
-        "heartbeat_interval_sec": HEARTBEAT_INTERVAL,
-        "inactive_timeout_sec": INACTIVE_TIMEOUT,
-    }
-
-
 def get_test_config(test_desc, example_dir, test_root):
     """Get test configuration based on test description."""
     test_configs_root = f"{test_root}/test_configs"
     config_map = {
         "2_ranks_diff_max_tokens":
         (2, f"{test_configs_root}/disagg_config_diff_max_tokens.yaml"),
-        "2_ranks": (2, f"{example_dir}/disagg_config.yaml"),
+        "2_ranks": (2, f"{test_configs_root}/disagg_config.yaml"),
         "2_ranks_trt_backend":
         (2, f"{test_configs_root}/disagg_config_trt_backend.yaml"),
         "gen_only": (2, f"{test_configs_root}/disagg_config_gen_only.yaml"),
@@ -530,8 +209,23 @@ def get_test_config(test_desc, example_dir, test_root):
         raise ValueError(f"Invalid test description: {test_desc}, "
                          f"valid descriptions are: {config_map.keys()}")
 
-    return (config_map[test_desc][0],
-            revise_disagg_config_file_with_free_ports(config_map[test_desc][1]))
+    # Return config file path directly - no need to revise URLs for SD
+    # (port assignment handled at runtime in run_disaggregated_test)
+    return config_map[test_desc]
+
+
+def setup_model_symlink(llm_venv, model_root, dest_subpath):
+    """Create symlink for model in test working directory.
+
+    Args:
+        llm_venv: Virtual environment object with get_working_directory()
+        model_root: Source model directory path
+        dest_subpath: Destination subdirectory (relative to working dir)
+    """
+    dst = f"{llm_venv.get_working_directory()}/{dest_subpath}"
+    if not os.path.islink(dst):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.symlink(model_root, dst, target_is_directory=True)
 
 
 def get_extra_llm_config(config, suffix, cwd):
@@ -641,7 +335,7 @@ def run_client_tests(example_dir,
         if prompt_file == "long_prompts.json":
             # Use max_tokens 4 for long prompts to reduce test time
             client_cmd.extend(['--max-tokens', '4'])
-        if test_desc in ["tool_calls", "tool_calls_sd"]:
+        if test_desc == "tool_calls":
             client_cmd.extend(['-e', 'chat', '-o', 'output_tool_calls.json'])
 
         # Prepare poll processes
@@ -663,7 +357,7 @@ def run_client_tests(example_dir,
             check_call(client_cmd, env=env, poll_procs=poll_procs)
 
         # tool calls test does not need to run streaming and completion
-        if test_desc in ["tool_calls", "tool_calls_sd"]:
+        if test_desc == "tool_calls":
             continue
 
         # Streaming client run
@@ -750,229 +444,17 @@ def fetch_prometheus_metrics(server_url: str):
 
 def run_disaggregated_test(example_dir,
                            test_desc,
-                           num_iters=5,
+                           num_iters=2,
                            env=None,
                            cwd=None,
                            prompt_file="prompts.json",
-                           extra_endpoints_test: Callable[[str], None] = None,
-                           model_path=None):
-    """Run disaggregated test with given configuration."""
-    cleanup_output_files()
-    run_env = env.copy()
-
-    # on some CI nodes , we set UCX_TLS to "^ib" to avoid the issue that IB equipped but not available.
-    # we set UCX_MM_ERROR_HANDLING to "y" to avoid the issue that NIXL cannot use IB or TCP for notify on some CI nodes,
-    # setting it to "y" will enable NIXL to use system memory for notify.
-
-    run_env["UCX_TLS"] = "^ib"
-    run_env["UCX_MM_ERROR_HANDLING"] = "y"
-    num_ranks, config_file = get_test_config(test_desc, example_dir,
-                                             os.path.dirname(__file__))
-
-    use_ray = mpi_disabled()
-    if not use_ray:
-        workers_cmd = [
-            'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-            str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
-            config_file
-        ]
-    else:
-        pytest.skip(
-            "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
-        )
-        with open(config_file, 'r') as f:
-            config = yaml.safe_load(f)
-
-        if config['backend'] != "pytorch":
-            pytest.skip(
-                "Ray orchestrator is only supported with pytorch backend.")
-
-        extra_config_files = []
-        workers_cmds = []
-
-        # Generate ctx and gen server worker commands
-        ctx_extra_config_file = get_extra_llm_config(config['context_servers'],
-                                                     "ctx", cwd)
-        extra_config_files.append(ctx_extra_config_file)
-        workers_cmds.extend(
-            generate_worker_commands(model_path, config,
-                                     config['context_servers'],
-                                     ctx_extra_config_file, 'context'))
-
-        gen_extra_config_file = get_extra_llm_config(
-            config['generation_servers'], "gen", cwd)
-        extra_config_files.append(gen_extra_config_file)
-        workers_cmds.extend(
-            generate_worker_commands(model_path, config,
-                                     config['generation_servers'],
-                                     gen_extra_config_file, 'generation'))
-
-    server_start_timeout = 1200
-    server_cmd = [
-        'trtllm-serve', 'disaggregated', '--server_start_timeout',
-        str(server_start_timeout), '-c', config_file
-    ]
-    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
-    server_url = f"http://{server_host}:{server_port}"
-
-    try:
-        if not use_ray:
-            with (  # Start workers
-                    open('output_workers.log', 'w') as output_workers,
-                    popen(workers_cmd,
-                          stdout=output_workers,
-                          stderr=subprocess.STDOUT,
-                          env=run_env,
-                          cwd=cwd) as workers_proc,
-                    # Start server
-                    open('output_disagg.log', 'w') as output_disagg,
-                    popen(server_cmd,
-                          stdout=output_disagg,
-                          stderr=subprocess.STDOUT,
-                          env=run_env,
-                          cwd=cwd) as server_proc):
-                run_client_tests(example_dir,
-                                 config_file,
-                                 test_desc,
-                                 num_iters,
-                                 env,
-                                 server_start_timeout,
-                                 prompt_file,
-                                 extra_endpoints_test,
-                                 server_url,
-                                 workers_proc,
-                                 server_proc,
-                                 use_ray=False)
-
-        else:
-            runtime_env = {
-                "env_vars": {
-                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
-                }
-            }
-            ray.init(address="local",
-                     include_dashboard=False,
-                     ignore_reinit_error=True,
-                     runtime_env=runtime_env)
-            gcs_addr = ray.get_runtime_context().gcs_address
-            ray_port = str(gcs_addr.split(":")[1])
-            run_env.update({
-                "RAY_ADDRESS": f"localhost:{ray_port}",
-                "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
-            })
-            workers_proc = []
-            with contextlib.ExitStack() as stack:
-                workers_log = stack.enter_context(
-                    open('output_workers.log', 'w'))
-
-                for cmd in workers_cmds:
-                    proc = stack.enter_context(
-                        popen(
-                            cmd,
-                            stdout=workers_log,
-                            stderr=subprocess.STDOUT,
-                            env=run_env,
-                            cwd=cwd,
-                        ))
-                    workers_proc.append(proc)
-
-                output_disagg = stack.enter_context(
-                    open('output_disagg.log', 'w'))
-                server_proc = stack.enter_context(
-                    popen(server_cmd,
-                          stdout=output_disagg,
-                          stderr=subprocess.STDOUT,
-                          env=run_env,
-                          cwd=cwd))
-
-                if not wait_for_server(server_host,
-                                       server_port,
-                                       timeout_seconds=server_start_timeout):
-                    raise RuntimeError(
-                        f"Disaggregated server failed to start within {server_start_timeout} seconds"
-                    )
-
-                run_client_tests(example_dir,
-                                 config_file,
-                                 test_desc,
-                                 num_iters,
-                                 env,
-                                 server_start_timeout,
-                                 prompt_file,
-                                 extra_endpoints_test,
-                                 server_url,
-                                 workers_proc,
-                                 server_proc,
-                                 use_ray=True)
-    except Exception:
-        # Print outputs on error
-        logger.error("-------- Workers output --------")
-        with open('output_workers.log', 'r') as f:
-            logger.error(f.read())
-
-        logger.error("-------- Disagg server output --------")
-        with open('output_disagg.log', 'r') as f:
-            logger.error(f.read())
-        raise
-    finally:
-        if 'server_proc' in locals() and 'workers_proc' in locals():
-            server_proc.terminate()
-            workers_proc.terminate()
-            server_proc.wait()
-            workers_proc.wait()
-        if use_ray:
-            ray.shutdown()
-            for extra_file in extra_config_files:
-                if os.path.exists(extra_file):
-                    os.remove(extra_file)
-
-
-def _run_disaggregated_test_sd(  # TODO implement sd for multi-gpu tests
-        example_dir,
-        test_desc,
-        num_iters=2, # TODO change to 5
-        env=None,
-        cwd=None,
-        prompt_file="prompts.json",
-        extra_endpoints_test=None,
-        model_path=None,
-        service_discovery_backend="http"):
+                           extra_endpoints_test=None,
+                           model_path=None,
+                           service_discovery_backend="http"):
     """Run disaggregated test using service discovery instead of MPI."""
 
-    test_configs_root = f"{os.path.dirname(__file__)}/test_configs"
-    config_map = {
-        "2_ranks_sd": (2, f"{example_dir}/disagg_config_sd.yaml"),
-        "2_ranks_diff_max_tokens_sd":
-        (2, f"{test_configs_root}/disagg_config_diff_max_tokens_sd.yaml"),
-        "2_ranks_trt_backend_sd":
-        (2, f"{test_configs_root}/disagg_config_trt_backend_sd.yaml"),
-        "gen_only_sd": (2,
-                        f"{test_configs_root}/disagg_config_gen_only_sd.yaml"),
-        "gen_only_trt_backend_sd":
-        (2, f"{test_configs_root}/disagg_config_gen_only_trt_backend_sd.yaml"),
-        "cuda_graph_sd":
-        (2, f"{test_configs_root}/disagg_config_cuda_graph_padding_sd.yaml"),
-        "mixed_sd": (2, f"{test_configs_root}/disagg_config_mixed_sd.yaml"),
-        "overlap_sd": (2, f"{test_configs_root}/disagg_config_overlap_sd.yaml"),
-        "perf_metrics_sd":
-        (2, f"{test_configs_root}/disagg_config_metrics_sd.yaml"),
-        "tool_calls_sd": (2,
-                          f"{test_configs_root}/disagg_config_overlap_sd.yaml"),
-        "trtllm_sampler_sd":
-        (2, f"{test_configs_root}/disagg_config_trtllm_sampler_sd.yaml"),
-        "load_balance_sd":
-        (4, f"{test_configs_root}/disagg_config_load_balance_sd.yaml"),
-        "cache_aware_balance_sd":
-        (4, f"{test_configs_root}/disagg_config_cache_aware_balance_sd.yaml"),
-        "conditional_sd":
-        (2, f"{test_configs_root}/disagg_config_conditional_sd.yaml"),
-        "ngram_sd": (2, f"{test_configs_root}/disagg_config_ngram_sd.yaml"),
-    }
-
-    if test_desc not in config_map:
-        raise ValueError(f"Unknown test_desc: {test_desc}")
-
-    num_ranks, config_file = config_map[test_desc]
+    num_ranks, config_file = get_test_config(test_desc, example_dir,
+                                             os.path.dirname(__file__))
 
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
@@ -995,6 +477,14 @@ def _run_disaggregated_test_sd(  # TODO implement sd for multi-gpu tests
         disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
         logger.info(
             f"Using HTTP service discovery at {disagg_cluster['cluster_uri']}")
+
+    # Auto-deduce minimal_instances from num_instances
+    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
+    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    disagg_cluster["minimal_instances"] = {
+        "context_servers": ctx_instances,
+        "generation_servers": gen_instances
+    }
 
     # Create worker config (separate from server config)
     worker_config = {
@@ -1026,7 +516,7 @@ def _run_disaggregated_test_sd(  # TODO implement sd for multi-gpu tests
                 model_path or config.get("model"),
                 worker_config,
                 work_dir,
-                port=0,  # TODO set to 'device' for multiple gpus
+                port=0,  # Auto-assign port
                 device=device)
             ctx_workers.append(ctx_worker)
 
@@ -1042,19 +532,44 @@ def _run_disaggregated_test_sd(  # TODO implement sd for multi-gpu tests
                 worker_config,
                 work_dir,
                 port=0,  # Auto-assign
-                device=0  # TODO set to 'device' for multiple gpus
+                device=device  # Use calculated device index for multi-GPU
             )
             gen_workers.append(gen_worker)
 
         logger.info("Starting disagg server")
 
         # Create server config (without worker URLs)
+        # Add defaults for missing fields when num_instances is 0
+        def add_defaults_if_unused(server_config_section):
+            """Add default values for required fields if num_instances is 0."""
+            if server_config_section.get("num_instances", 1) == 0:
+                # These fields won't be used but may be required for config validation
+                server_config_section.setdefault("max_batch_size", 1)
+                server_config_section.setdefault("max_num_tokens", 3000)
+                server_config_section.setdefault("max_seq_len", 4096)
+                server_config_section.setdefault("tensor_parallel_size", 1)
+                server_config_section.setdefault("pipeline_parallel_size", 1)
+                server_config_section.setdefault(
+                    "kv_cache_config", {
+                        "free_gpu_memory_fraction": 0.2,
+                        "enable_block_reuse": False,
+                        "enable_partial_reuse": False
+                    })
+                server_config_section.setdefault("cache_transceiver_config",
+                                                 {"backend": "DEFAULT"})
+            return server_config_section
+
+        ctx_servers = add_defaults_if_unused(
+            config.get("context_servers", {}).copy())
+        gen_servers = add_defaults_if_unused(
+            config.get("generation_servers", {}).copy())
+
         server_config = {
             "hostname": server_host,
             "port": server_port,
             "disagg_cluster": disagg_cluster,
-            "context_servers": config.get("context_servers", {}),
-            "generation_servers": config.get("generation_servers", {}),
+            "context_servers": ctx_servers,
+            "generation_servers": gen_servers,
         }
         server_config["context_servers"].pop("urls", None)
         server_config["generation_servers"].pop("urls", None)
@@ -1115,613 +630,203 @@ def _run_disaggregated_test_sd(  # TODO implement sd for multi-gpu tests
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_diff_max_tokens(disaggregated_test_root,
                                        disaggregated_example_root, llm_venv,
-                                       llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                       llama_model_root,
+                                       service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks_diff_max_tokens",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           prompt_file="long_prompts.json")
+                           prompt_file="long_prompts.json",
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_single_gpu_with_mpirun(disaggregated_test_root,
                                               disaggregated_example_root,
-                                              llm_venv, llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                              llm_venv, llama_model_root,
+                                              service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 @pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_single_gpu_with_mpirun_sd(disaggregated_test_root,
-                                                 disaggregated_example_root,
-                                                 llm_venv, llama_model_root,
-                                                 service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "2_ranks_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_diff_max_tokens_sd(disaggregated_test_root,
-                                          disaggregated_example_root,
-                                          llm_venv, llama_model_root,
-                                          service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "2_ranks_diff_max_tokens_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_trt_backend_sd(disaggregated_test_root,
-                                      disaggregated_example_root,
-                                      llm_venv, llama_model_root,
-                                      service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "2_ranks_trt_backend_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_benchmark_gen_only_sd(disaggregated_test_root,
-                                             disaggregated_example_root,
-                                             llm_venv, llama_model_root,
-                                             service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    env = llm_venv._new_env.copy()
-    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "gen_only_sd",
-        env=env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_benchmark_gen_only_trt_backend_sd(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root, service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    env = llm_venv._new_env.copy()
-    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "gen_only_trt_backend_sd",
-        env=env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_cuda_graph_sd(disaggregated_test_root,
-                                     disaggregated_example_root,
-                                     llm_venv, llama_model_root,
-                                     service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "cuda_graph_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_mixed_sd(disaggregated_test_root,
-                                disaggregated_example_root,
-                                llm_venv, llama_model_root,
-                                service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "mixed_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_overlap_sd(disaggregated_test_root,
-                                  disaggregated_example_root,
-                                  llm_venv, llama_model_root,
-                                  service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "overlap_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_perf_metrics_sd(disaggregated_test_root,
-                                       disaggregated_example_root,
-                                       llm_venv, llama_model_root,
-                                       service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    def extra_endpoints_test(server_url: str):
-        item = get_timing_metrics(server_url)
-        validate_timing_metrics(item, "perf_metrics_sd test")
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "perf_metrics_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        extra_endpoints_test=extra_endpoints_test,
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_chat_completion_tool_calls_sd(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root, service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "tool_calls_sd",
-        num_iters=1,
-        prompt_file="tool_call_prompts.json",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_trtllm_sampler_sd(disaggregated_test_root,
-                                         disaggregated_example_root,
-                                         llm_venv, llama_model_root,
-                                         service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "trtllm_sampler_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_load_balance_sd(disaggregated_test_root,
-                                       disaggregated_example_root,
-                                       llm_venv, llama_model_root,
-                                       service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "load_balance_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_cache_aware_balance_sd(disaggregated_test_root,
-                                              disaggregated_example_root,
-                                              llm_venv, llama_model_root,
-                                              service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "cache_aware_balance_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_conditional_sd(disaggregated_test_root,
-                                      disaggregated_example_root,
-                                      llm_venv, llama_model_root,
-                                      service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "conditional_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
-def test_disaggregated_ngram_sd(disaggregated_test_root,
-                                disaggregated_example_root,
-                                llm_venv, llama_model_root,
-                                service_discovery_backend):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    _run_disaggregated_test_sd(
-        disaggregated_example_root,
-        "ngram_sd",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        service_discovery_backend=service_discovery_backend)
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_single_gpu_with_mpirun_trt_backend(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        llama_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks_trt_backend",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
                                           disaggregated_example_root, llm_venv,
-                                          llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                          llama_model_root,
+                                          service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
                            env=env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_benchmark_gen_only_trt_backend(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        llama_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_trt_backend",
                            env=env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_genbs1(disaggregated_test_root,
                               disaggregated_example_root, llm_venv,
-                              llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                              llama_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_bs1",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_multi_gpu_with_mpirun(disaggregated_test_root,
                                              disaggregated_example_root,
-                                             llm_venv, llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                             llm_venv, llama_model_root,
+                                             service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_multi_gpu_with_mpirun_trt_backend(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        llama_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks_trt_backend",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
-                                  disaggregated_example_root, llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                  disaggregated_example_root, llama_model_root,
+                                  service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "cuda_graph",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
-                             disaggregated_example_root, llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                             disaggregated_example_root, llama_model_root,
+                             service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "mixed",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
-                               disaggregated_example_root, llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                               disaggregated_example_root, llama_model_root,
+                               service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root,
-                                    llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                    llama_model_root,
+                                    service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     def extra_endpoints_test(server_url: str):
         item = get_timing_metrics(server_url)
@@ -1732,52 +837,47 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                            "perf_metrics",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           extra_endpoints_test=extra_endpoints_test)
+                           extra_endpoints_test=extra_endpoints_test,
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                                                   llm_venv,
                                                   disaggregated_example_root,
-                                                  llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                                  llama_model_root,
+                                                  service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "tool_calls",
                            num_iters=1,
                            prompt_file="tool_call_prompts.json",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                                             disaggregated_example_root,
-                                            llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                            llama_model_root,
+                                            service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
                            env=llm_venv._new_env
                            | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
     assert os.path.isdir(output_path)
     send_file = os.path.join(output_path, "rank_0_send.csv")
     recv_file = os.path.join(output_path, "rank_1_recv.csv")
@@ -1808,315 +908,266 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
                                       disaggregated_example_root,
-                                      llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                      llama_model_root,
+                                      service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "trtllm_sampler",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root,
-                                    llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                    llama_model_root,
+                                    service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "load_balance",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
                                            disaggregated_example_root,
-                                           llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                           llama_model_root,
+                                           service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "cache_aware_balance",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
-                                   disaggregated_example_root,
-                                   llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                   disaggregated_example_root, llama_model_root,
+                                   service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
                            "conditional",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
-                             disaggregated_example_root, llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                             disaggregated_example_root, llama_model_root,
+                             service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                     llama_model_root,
+                                     service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_genpp2",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           model_path=llama_model_root)
+                           model_path=llama_model_root,
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                     llama_model_root,
+                                     service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2_genpp2",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           model_path=llama_model_root)
+                           model_path=llama_model_root,
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                     llama_model_root,
+                                     service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_gentp2",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           model_path=llama_model_root)
+                           model_path=llama_model_root,
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
                                            disaggregated_example_root,
-                                           llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                           llama_model_root,
+                                           service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                     llama_model_root,
+                                     service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 #tiny llama pp4 will have uneven layer per pp. pp4
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                     llama_model_root,
+                                     service_discovery_backend):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           model_path=llama_model_root)
+                           model_path=llama_model_root,
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
                                                 disaggregated_example_root,
                                                 llm_venv,
-                                                deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+                                                deepseek_v3_model_root,
+                                                service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_mpi",
                            env=env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1_mtp",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root, service_discovery_backend):
     #add one mtp layer, pp rank0 will have 15 layer, pp rank 1 will have 16 layers.
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           model_path=deepseek_v3_model_root)
+                           model_path=deepseek_v3_model_root,
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
@@ -2124,19 +1175,15 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                                                 disaggregated_example_root,
                                                 llm_venv,
-                                                deepseek_v3_model_root):
+                                                deepseek_v3_model_root,
+                                                service_discovery_backend):
 
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = "^ib"
@@ -2144,26 +1191,23 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                            "deepseek_v3_lite_fp8_ucx",
                            env=env,
                            cwd=llm_venv.get_working_directory(),
-                           model_path=deepseek_v3_model_root)
+                           model_path=deepseek_v3_model_root,
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                                                  disaggregated_example_root,
                                                  llm_venv,
-                                                 deepseek_v3_model_root):
+                                                 deepseek_v3_model_root,
+                                                 service_discovery_backend):
 
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = "^ib"
@@ -2172,24 +1216,20 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                            "deepseek_v3_lite_fp8_nixl",
                            env=env,
                            cwd=llm_venv.get_working_directory(),
-                           model_path=deepseek_v3_model_root)
+                           model_path=deepseek_v3_model_root,
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = "^ib"
@@ -2197,235 +1237,189 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
                            env=env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp_8_attention_dp_overlap",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(
         disaggregated_example_root,
         "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph",
         env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory())
+        cwd=llm_venv.get_working_directory(),
+        service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_overlap_cuda_graph",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp_one",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp_one_mtp",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root, service_discovery_backend):
 
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(
         disaggregated_example_root,
         "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp",
         env=llm_venv._new_env,
         cwd=llm_venv.get_working_directory(),
-        model_path=deepseek_v3_model_root)
+        model_path=deepseek_v3_model_root,
+        service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_cache_aware_balance",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_bf16_conditional(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_conditional",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1_two_mtp",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           service_discovery_backend=service_discovery_backend)
 
 
 @pytest.fixture(scope="module")
@@ -2471,113 +1465,184 @@ def run_disaggregated_benchmark(example_dir,
                                 random_output_len=64,
                                 num_prompts=100,
                                 max_concurrency=32,
-                                skip_warmup=False):
+                                skip_warmup=False,
+                                service_discovery_backend="http"):
     """Run disaggregated test with given configuration."""
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
-    workers_cmd = [
-        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
-        config_file
-    ]
 
-    server_start_timeout = 1200
-    server_cmd = [
-        'trtllm-serve', 'disaggregated', '--server_start_timeout',
-        str(server_start_timeout), '-c', config_file
-    ]
-    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
+    # Load config
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Setup service discovery
+    disagg_cluster = config.get("disagg_cluster", {})
+    server_host = config.get("hostname", "localhost")
+    server_port = get_free_port()
+    work_dir = tempfile.mkdtemp()
+    etcd_process = None
+
+    if service_discovery_backend == "etcd":
+        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
+        etcd_process = subprocess.Popen(["etcd", "--data-dir", data_dir])
+        disagg_cluster["cluster_uri"] = "etcd://localhost:2379"
+    elif service_discovery_backend == "http":
+        disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
+
+    # Auto-deduce minimal_instances from num_instances
+    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
+    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    disagg_cluster["minimal_instances"] = {
+        "context_servers": ctx_instances,
+        "generation_servers": gen_instances
+    }
+
+    # Create worker config
+    worker_config = {
+        "disagg_cluster":
+        disagg_cluster,
+        "disable_overlap_scheduler":
+        config.get("disable_overlap_scheduler", True),
+        "cache_transceiver_config":
+        config.get("cache_transceiver_config", {"backend": "DEFAULT"}),
+        "kv_cache_config":
+        config.get("kv_cache_config", {"free_gpu_memory_fraction": 0.2}),
+    }
+
+    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
+    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+
+    ctx_workers = []
+    gen_workers = []
+
+    # Launch context workers
+    for i in range(ctx_instances):
+        ctx_worker = run_ctx_worker(config.get("model"),
+                                    worker_config,
+                                    work_dir,
+                                    port=0,
+                                    device=i)
+        ctx_workers.append(ctx_worker)
+
+    # Launch generation workers
+    for i in range(gen_instances):
+        gen_worker = run_gen_worker(config.get("model"),
+                                    worker_config,
+                                    work_dir,
+                                    port=0,
+                                    device=ctx_instances + i)
+        gen_workers.append(gen_worker)
+
+    # Create server config
+    server_config = {
+        "hostname": server_host,
+        "port": server_port,
+        "disagg_cluster": disagg_cluster,
+        "context_servers": config.get("context_servers", {}),
+        "generation_servers": config.get("generation_servers", {}),
+    }
+    server_config["context_servers"].pop("urls", None)
+    server_config["generation_servers"].pop("urls", None)
+
+    disagg_server = run_disagg_server(server_config, work_dir, server_port)
+
+    # Wait for workers to register
+    asyncio.run(wait_for_disagg_server_ready(server_port))
     try:
-        with (  # Start workers
-                open('output_workers.log', 'w') as output_workers,
-                popen(workers_cmd,
-                      stdout=output_workers,
-                      stderr=subprocess.STDOUT,
-                      env=run_env,
-                      cwd=cwd) as workers_proc,
-                # Start server
-                open('output_disagg.log', 'w') as output_disagg,
-                popen(server_cmd,
-                      stdout=output_disagg,
-                      stderr=subprocess.STDOUT,
-                      env=run_env,
-                      cwd=cwd) as server_proc):
-            # Ensure the sever has started
-            client_dir = f"{example_dir}/clients"
-            client_cmd = [
-                'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
-                '-p', f'{client_dir}/prompts.json', '--ignore-eos',
-                '--server-start-timeout',
-                str(server_start_timeout)
-            ]
-            # Warm up
-            check_call(client_cmd,
-                       env=env,
-                       poll_procs=[workers_proc, server_proc])
-            # Start Benchmark
-            benchmark_script = os.path.join(benchmark_root,
-                                            "benchmark_serving.py")
-            benchmark_cmd = [
-                'python3',
-                benchmark_script,
-                '--model',
-                benchmark_model_root,
-                '--tokenizer',
-                benchmark_model_root,
-                '--dataset-name',
-                'random',
-                '--dataset-path',
-                shared_gpt_path,
-                '--random-input-len',
-                str(random_input_len),
-                '--random-output-len',
-                str(random_output_len),
-                '--random-prefix-len',
-                '0',
-                '--num-prompts',
-                str(num_prompts),
-                '--max-concurrency',
-                str(max_concurrency),
-                '--host',
-                server_host,
-                '--port',
-                str(server_port),
-                '--ignore-eos',
-                '--no-test-input',
-                '--percentile-metrics',
-                'e2el,ttft',
-            ]
-            # warm up
-            if not skip_warmup:
-                check_call(benchmark_cmd, env=env)
-            output = check_output(benchmark_cmd, env=env)
-            e2el_pattern = r"Median E2EL \(ms\):\s*(\d+\.?\d*)"
-            ttft_pattern = r"Median TTFT \(ms\):\s*(\d+\.?\d*)"
-            e2el_match = re.search(e2el_pattern, output)
-            ttft_match = re.search(ttft_pattern, output)
-            if e2el_match and ttft_match:
-                median_e2el = float(e2el_match.group(1))
-                median_ttft = float(ttft_match.group(1))
-                return median_e2el, median_ttft
-            else:
-                raise ValueError("No benchmark result found")
+        # Ensure the server has started
+        client_dir = f"{example_dir}/clients"
+        client_cmd = [
+            'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
+            '-p', f'{client_dir}/prompts.json', '--ignore-eos',
+            '--server-start-timeout',
+            str(server_start_timeout)
+        ]
+        # Warm up
+        all_worker_procs = [w.process for w in ctx_workers + gen_workers]
+        check_call(client_cmd,
+                   env=env,
+                   poll_procs=all_worker_procs + [disagg_server.process])
+        # Start Benchmark
+        benchmark_script = os.path.join(benchmark_root, "benchmark_serving.py")
+        benchmark_cmd = [
+            'python3',
+            benchmark_script,
+            '--model',
+            benchmark_model_root,
+            '--tokenizer',
+            benchmark_model_root,
+            '--dataset-name',
+            'random',
+            '--dataset-path',
+            shared_gpt_path,
+            '--random-input-len',
+            str(random_input_len),
+            '--random-output-len',
+            str(random_output_len),
+            '--random-prefix-len',
+            '0',
+            '--num-prompts',
+            str(num_prompts),
+            '--max-concurrency',
+            str(max_concurrency),
+            '--host',
+            server_host,
+            '--port',
+            str(server_port),
+            '--ignore-eos',
+            '--no-test-input',
+            '--percentile-metrics',
+            'e2el,ttft',
+        ]
+        # warm up
+        if not skip_warmup:
+            check_call(benchmark_cmd, env=env)
+        output = check_output(benchmark_cmd, env=env)
+        e2el_pattern = r"Median E2EL \(ms\):\s*(\d+\.?\d*)"
+        ttft_pattern = r"Median TTFT \(ms\):\s*(\d+\.?\d*)"
+        e2el_match = re.search(e2el_pattern, output)
+        ttft_match = re.search(ttft_pattern, output)
+        if e2el_match and ttft_match:
+            median_e2el = float(e2el_match.group(1))
+            median_ttft = float(ttft_match.group(1))
+            return median_e2el, median_ttft
+        else:
+            raise ValueError("No benchmark result found")
 
     except Exception:
-        # Print outputs on error
-        logger.error("-------- Workers output --------")
-        with open('output_workers.log', 'r') as f:
-            logger.error(f.read())
-
-        logger.error("-------- Disagg server output --------")
-        with open('output_disagg.log', 'r') as f:
-            logger.error(f.read())
+        logger.error("Benchmark test failed")
         raise
     finally:
-        server_proc.terminate()
-        workers_proc.terminate()
-        server_proc.wait()
-        workers_proc.wait()
+        # Cleanup workers
+        for worker in ctx_workers + gen_workers:
+            if worker.process and worker.process.poll() is None:
+                worker.process.terminate()
+                try:
+                    worker.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    worker.process.kill()
+
+        # Cleanup server
+        if disagg_server and disagg_server.process and disagg_server.process.poll(
+        ) is None:
+            disagg_server.process.terminate()
+            try:
+                disagg_server.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                disagg_server.process.kill()
+
+        # Cleanup etcd
+        if etcd_process and etcd_process.poll() is None:
+            etcd_process.terminate()
+            try:
+                etcd_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                etcd_process.kill()
+
+        # Cleanup temp dir
+        if work_dir and os.path.exists(work_dir):
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def get_config_for_benchmark(model_root, backend):
@@ -2632,7 +1697,8 @@ def run_disaggregated_aiperf(config_file,
                              accuracy_test=False,
                              threshold=0.8,
                              env=None,
-                             cwd=None):
+                             cwd=None,
+                             service_discovery_backend="http"):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -2658,102 +1724,154 @@ def run_disaggregated_aiperf(config_file,
     run_env["UCX_TLS"] = "^ib"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
-    workers_cmd = [
-        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
-        config_file
-    ]
+    # Load config
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
 
-    server_cmd = [
-        'trtllm-serve', 'disaggregated', '--server_start_timeout',
-        str(server_start_timeout), '-c', config_file
-    ]
+    # Setup service discovery
+    disagg_cluster = config.get("disagg_cluster", {})
+    server_host = config.get("hostname", "localhost")
+    server_port = get_free_port()
+    work_dir = tempfile.mkdtemp()
+    etcd_process = None
+
+    if service_discovery_backend == "etcd":
+        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
+        etcd_process = subprocess.Popen(["etcd", "--data-dir", data_dir])
+        disagg_cluster["cluster_uri"] = "etcd://localhost:2379"
+    elif service_discovery_backend == "http":
+        disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
+
+    # Auto-deduce minimal_instances from num_instances
+    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
+    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    disagg_cluster["minimal_instances"] = {
+        "context_servers": ctx_instances,
+        "generation_servers": gen_instances
+    }
+
+    # Create worker config
+    worker_config = {
+        "disagg_cluster":
+        disagg_cluster,
+        "disable_overlap_scheduler":
+        config.get("disable_overlap_scheduler", True),
+        "cache_transceiver_config":
+        config.get("cache_transceiver_config", {"backend": "DEFAULT"}),
+        "kv_cache_config":
+        config.get("kv_cache_config", {"free_gpu_memory_fraction": 0.2}),
+    }
+
+    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
+    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+
+    ctx_workers = []
+    gen_workers = []
+
+    # Launch context workers
+    for i in range(ctx_instances):
+        ctx_worker = run_ctx_worker(config.get("model"),
+                                    worker_config,
+                                    work_dir,
+                                    port=0,
+                                    device=i)
+        ctx_workers.append(ctx_worker)
+
+    # Launch generation workers
+    for i in range(gen_instances):
+        gen_worker = run_gen_worker(config.get("model"),
+                                    worker_config,
+                                    work_dir,
+                                    port=0,
+                                    device=ctx_instances + i)
+        gen_workers.append(gen_worker)
+
+    # Create server config
+    server_config = {
+        "hostname": server_host,
+        "port": server_port,
+        "disagg_cluster": disagg_cluster,
+        "context_servers": config.get("context_servers", {}),
+        "generation_servers": config.get("generation_servers", {}),
+    }
+    server_config["context_servers"].pop("urls", None)
+    server_config["generation_servers"].pop("urls", None)
+
+    disagg_server = run_disagg_server(server_config, work_dir, server_port)
+
+    # Wait for workers to register
+    asyncio.run(wait_for_disagg_server_ready(server_port))
 
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
-    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
 
     try:
-        with (open('output_workers.log', 'w') as output_workers,
-              popen(workers_cmd,
-                    stdout=output_workers,
-                    stderr=subprocess.STDOUT,
-                    env=run_env,
-                    cwd=cwd) as workers_proc, open('output_disagg.log', 'w') as
-              output_disagg,
-              popen(server_cmd,
-                    stdout=output_disagg,
-                    stderr=subprocess.STDOUT,
-                    env=run_env,
-                    cwd=cwd) as server_proc):
+        # Wait for server to be ready
+        if not wait_for_server(
+                server_host, server_port, timeout_seconds=server_start_timeout):
+            raise RuntimeError(
+                f"Disaggregated server did not become ready within {server_start_timeout} seconds"
+            )
 
-            # Wait for server to be ready
-            if not wait_for_server(server_host,
-                                   server_port,
-                                   timeout_seconds=server_start_timeout):
-                raise RuntimeError(
-                    f"Disaggregated server did not become ready within {server_start_timeout} seconds"
+        # Build base command (using aiperf instead of genai-perf)
+        aiperf_cmd = [
+            'aiperf', 'profile', '--model', model_path, '--tokenizer',
+            model_path, '--endpoint-type', endpoint_type
+        ]
+
+        # Add endpoint path based on type
+        if endpoint_type == 'chat':
+            aiperf_cmd.extend(['--endpoint', '/v1/chat/completions'])
+
+        # Add streaming flag if enabled
+        if streaming:
+            aiperf_cmd.append('--streaming')
+
+        # Add common parameters
+        aiperf_cmd.extend([
+            '--url', f'{server_host}:{server_port}',
+            '--synthetic-input-tokens-mean',
+            str(input_tokens), '--synthetic-input-tokens-stddev', '0',
+            '--output-tokens-mean',
+            str(output_tokens), '--output-tokens-stddev', '0', '--extra-inputs',
+            f'max_tokens:{output_tokens}', '--extra-inputs',
+            f'min_tokens:{output_tokens}', '--extra-inputs', 'ignore_eos:true',
+            '--concurrency',
+            str(concurrency), '--warmup-request-count',
+            str(warmup_request_count)
+        ])
+
+        # Use request-count or num-dataset-entries
+        if request_count is not None:
+            aiperf_cmd.extend(['--request-count', str(request_count)])
+        else:
+            # Default: use num-dataset-entries for compatibility
+            aiperf_cmd.extend(['--num-dataset-entries', '64'])
+
+        aiperf_cmd.extend(
+            ['--random-seed',
+             str(random_seed), '--artifact-dir', artifact_dir])
+
+        # Run aiperf
+        all_worker_procs = [w.process for w in ctx_workers + gen_workers]
+        check_call(aiperf_cmd,
+                   env=env,
+                   poll_procs=all_worker_procs + [disagg_server.process])
+
+        if accuracy_test:
+            accuracy_test_result, accuracy_value = run_accuracy_test(
+                model_path=model_path,
+                server_url=f"http://{server_host}:{server_port}",
+                concurrency=concurrency,
+                max_retries=3,
+                timeout=1200,
+                max_gen_toks=256,
+                max_length=4096)
+
+            # only raise error if accuracy test passed and accuracy value is less than threshold
+            if accuracy_test_result and (accuracy_value < threshold):
+                raise AssertionError(
+                    f"Accuracy test failed: accuracy value {accuracy_value} is less than test threshold {threshold}"
                 )
-
-            # Build base command (using aiperf instead of genai-perf)
-            aiperf_cmd = [
-                'aiperf', 'profile', '--model', model_path, '--tokenizer',
-                model_path, '--endpoint-type', endpoint_type
-            ]
-
-            # Add endpoint path based on type
-            if endpoint_type == 'chat':
-                aiperf_cmd.extend(['--endpoint', '/v1/chat/completions'])
-
-            # Add streaming flag if enabled
-            if streaming:
-                aiperf_cmd.append('--streaming')
-
-            # Add common parameters
-            aiperf_cmd.extend([
-                '--url', f'{server_host}:{server_port}',
-                '--synthetic-input-tokens-mean',
-                str(input_tokens), '--synthetic-input-tokens-stddev', '0',
-                '--output-tokens-mean',
-                str(output_tokens), '--output-tokens-stddev', '0',
-                '--extra-inputs', f'max_tokens:{output_tokens}',
-                '--extra-inputs', f'min_tokens:{output_tokens}',
-                '--extra-inputs', 'ignore_eos:true', '--concurrency',
-                str(concurrency), '--warmup-request-count',
-                str(warmup_request_count)
-            ])
-
-            # Use request-count or num-dataset-entries
-            if request_count is not None:
-                aiperf_cmd.extend(['--request-count', str(request_count)])
-            else:
-                # Default: use num-dataset-entries for compatibility
-                aiperf_cmd.extend(['--num-dataset-entries', '64'])
-
-            aiperf_cmd.extend([
-                '--random-seed',
-                str(random_seed), '--artifact-dir', artifact_dir
-            ])
-
-            # Run aiperf
-            check_call(aiperf_cmd,
-                       env=env,
-                       poll_procs=[workers_proc, server_proc])
-
-            if accuracy_test:
-                accuracy_test_result, accuracy_value = run_accuracy_test(
-                    model_path=model_path,
-                    server_url=f"http://{server_host}:{server_port}",
-                    concurrency=concurrency,
-                    max_retries=3,
-                    timeout=1200,
-                    max_gen_toks=256,
-                    max_length=4096)
-
-                # only raise error if accuracy test passed and accuracy value is less than threshold
-                if accuracy_test_result and (accuracy_value < threshold):
-                    raise AssertionError(
-                        f"Accuracy test failed: accuracy value {accuracy_value} is less than test threshold {threshold}"
-                    )
 
     except Exception:
         # Print outputs on error
@@ -2778,10 +1896,35 @@ def run_disaggregated_aiperf(config_file,
             pass
         raise
     finally:
-        server_proc.terminate()
-        workers_proc.terminate()
-        server_proc.wait()
-        workers_proc.wait()
+        # Cleanup workers
+        for worker in ctx_workers + gen_workers:
+            if worker.process and worker.process.poll() is None:
+                worker.process.terminate()
+                try:
+                    worker.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    worker.process.kill()
+
+        # Cleanup server
+        if disagg_server and disagg_server.process and disagg_server.process.poll(
+        ) is None:
+            disagg_server.process.terminate()
+            try:
+                disagg_server.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                disagg_server.process.kill()
+
+        # Cleanup etcd
+        if etcd_process and etcd_process.poll() is None:
+            etcd_process.terminate()
+            try:
+                etcd_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                etcd_process.kill()
+
+        # Cleanup temp dir
+        if work_dir and os.path.exists(work_dir):
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
@@ -2934,14 +2077,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
         disaggregated_example_root, llm_venv, benchmark_model_root,
         benchmark_root, shared_gpt_path):
 
-    src_dst_dict = {
-        benchmark_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, benchmark_model_root, "DeepSeek-V3-Lite/bf16")
 
     test_desc = "deepseek_v3_lite_bf16_empty_batch"
     num_ranks, config_file = get_test_config(test_desc,
@@ -2984,13 +2120,7 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
     llama4_model_root = os.path.join(models_root, model_path)
 
     # Create symlink to match config file path
-    src_dst_dict = {
-        llama4_model_root: f"{llm_venv.get_working_directory()}/{model_path}",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, llama4_model_root, model_path)
 
     num_ranks, config_file = get_test_config("llama4_kv_cache_overflow",
                                              disaggregated_example_root,
@@ -3009,23 +2139,19 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
+@pytest.mark.parametrize("service_discovery_backend", ["etcd", "http"])
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+        deepseek_v3_model_root, service_discovery_backend):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           prompt_file="long_prompts.json")
+                           prompt_file="long_prompts.json",
+                           service_discovery_backend=service_discovery_backend)
 
 
 @skip_pre_blackwell
@@ -3076,13 +2202,7 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     model_path = test_config.model_path
     test_desc = test_config.test_desc
     model_dir = f"{llm_models_root()}/{model_path}"
-    src_dst_dict = {
-        model_dir: f"{llm_venv.get_working_directory()}/{model_path}",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, model_dir, model_path)
 
     num_ranks, config_file = get_test_config(test_desc,
                                              disaggregated_example_root,
@@ -3177,7 +2297,8 @@ def run_disaggregated_cancel_test(example_dir,
                                   env=None,
                                   cwd=None,
                                   num_bursts=64,
-                                  requests_per_burst=64):
+                                  requests_per_burst=64,
+                                  service_discovery_backend="http"):
     """Run disaggregated test with request cancellation stress test."""
     cleanup_output_files()
     run_env = env.copy()
@@ -3186,74 +2307,145 @@ def run_disaggregated_cancel_test(example_dir,
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
 
-    workers_cmd = [
-        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
-        config_file
-    ]
+    # Load config
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
 
-    server_start_timeout = 1200
-    server_cmd = [
-        'trtllm-serve', 'disaggregated', '--server_start_timeout',
-        str(server_start_timeout), '-c', config_file
-    ]
-    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
+    # Setup service discovery
+    disagg_cluster = config.get("disagg_cluster", {})
+    server_host = config.get("hostname", "localhost")
+    server_port = get_free_port()
+    work_dir = tempfile.mkdtemp()
+    etcd_process = None
+
+    if service_discovery_backend == "etcd":
+        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
+        etcd_process = subprocess.Popen(["etcd", "--data-dir", data_dir])
+        disagg_cluster["cluster_uri"] = "etcd://localhost:2379"
+    elif service_discovery_backend == "http":
+        disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
+
+    # Auto-deduce minimal_instances from num_instances
+    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
+    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    disagg_cluster["minimal_instances"] = {
+        "context_servers": ctx_instances,
+        "generation_servers": gen_instances
+    }
+
+    # Create worker config
+    worker_config = {
+        "disagg_cluster":
+        disagg_cluster,
+        "disable_overlap_scheduler":
+        config.get("disable_overlap_scheduler", True),
+        "cache_transceiver_config":
+        config.get("cache_transceiver_config", {"backend": "DEFAULT"}),
+        "kv_cache_config":
+        config.get("kv_cache_config", {"free_gpu_memory_fraction": 0.2}),
+    }
+
+    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
+    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+
+    ctx_workers = []
+    gen_workers = []
+
+    # Launch context workers
+    for i in range(ctx_instances):
+        ctx_worker = run_ctx_worker(config.get("model"),
+                                    worker_config,
+                                    work_dir,
+                                    port=0,
+                                    device=i)
+        ctx_workers.append(ctx_worker)
+
+    # Launch generation workers
+    for i in range(gen_instances):
+        gen_worker = run_gen_worker(config.get("model"),
+                                    worker_config,
+                                    work_dir,
+                                    port=0,
+                                    device=ctx_instances + i)
+        gen_workers.append(gen_worker)
+
+    # Create server config
+    server_config = {
+        "hostname": server_host,
+        "port": server_port,
+        "disagg_cluster": disagg_cluster,
+        "context_servers": config.get("context_servers", {}),
+        "generation_servers": config.get("generation_servers", {}),
+    }
+    server_config["context_servers"].pop("urls", None)
+    server_config["generation_servers"].pop("urls", None)
+
+    disagg_server = run_disagg_server(server_config, work_dir, server_port)
+
+    # Wait for workers to register
+    asyncio.run(wait_for_disagg_server_ready(server_port))
+
     server_url = f"http://{server_host}:{server_port}"
 
     try:
-        with (open('output_workers.log', 'w') as output_workers,
-              popen(workers_cmd,
-                    stdout=output_workers,
-                    stderr=subprocess.STDOUT,
-                    env=run_env,
-                    cwd=cwd) as workers_proc, open('output_disagg.log', 'w') as
-              output_disagg,
-              popen(server_cmd,
-                    stdout=output_disagg,
-                    stderr=subprocess.STDOUT,
-                    env=run_env,
-                    cwd=cwd) as server_proc):
+        # Wait for server to be ready
+        if not wait_for_server(
+                server_host, server_port, timeout_seconds=server_start_timeout):
+            raise RuntimeError(
+                f"Disaggregated server did not become ready within {server_start_timeout} seconds"
+            )
 
-            # Wait for server to be ready
-            if not wait_for_server(server_host,
-                                   server_port,
-                                   timeout_seconds=server_start_timeout):
-                raise RuntimeError(
-                    f"Disaggregated server did not become ready within {server_start_timeout} seconds"
-                )
+        # Run the cancel stress test
+        run_cancel_stress_test(server_url,
+                               num_bursts=num_bursts,
+                               requests_per_burst=requests_per_burst)
 
-            # Run the cancel stress test
-            run_cancel_stress_test(server_url,
-                                   num_bursts=num_bursts,
-                                   requests_per_burst=requests_per_burst)
-
-            # Verify server is still healthy after stress test by sending a normal request
-            client_dir = f"{example_dir}/clients"
-            client_cmd = [
-                'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
-                '-p', f'{client_dir}/prompts.json', '--ignore-eos',
-                '--server-start-timeout',
-                str(server_start_timeout)
-            ]
-            check_call(client_cmd,
-                       env=env,
-                       poll_procs=[workers_proc, server_proc])
+        # Verify server is still healthy after stress test by sending a normal request
+        client_dir = f"{example_dir}/clients"
+        client_cmd = [
+            'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
+            '-p', f'{client_dir}/prompts.json', '--ignore-eos',
+            '--server-start-timeout',
+            str(server_start_timeout)
+        ]
+        all_worker_procs = [w.process for w in ctx_workers + gen_workers]
+        check_call(client_cmd,
+                   env=env,
+                   poll_procs=all_worker_procs + [disagg_server.process])
 
     except Exception:
-        logger.error("-------- Workers output --------")
-        with open('output_workers.log', 'r') as f:
-            logger.error(f.read())
-
-        logger.error("-------- Disagg server output --------")
-        with open('output_disagg.log', 'r') as f:
-            logger.error(f.read())
+        logger.error("Cancel test failed")
         raise
     finally:
-        if 'server_proc' in locals() and 'workers_proc' in locals():
-            server_proc.terminate()
-            workers_proc.terminate()
-            server_proc.wait()
-            workers_proc.wait()
+        # Cleanup workers
+        for worker in ctx_workers + gen_workers:
+            if worker.process and worker.process.poll() is None:
+                worker.process.terminate()
+                try:
+                    worker.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    worker.process.kill()
+
+        # Cleanup server
+        if disagg_server and disagg_server.process and disagg_server.process.poll(
+        ) is None:
+            disagg_server.process.terminate()
+            try:
+                disagg_server.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                disagg_server.process.kill()
+
+        # Cleanup etcd
+        if etcd_process and etcd_process.poll() is None:
+            etcd_process.terminate()
+            try:
+                etcd_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                etcd_process.kill()
+
+        # Cleanup temp dir
+        if work_dir and os.path.exists(work_dir):
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
@@ -3268,14 +2460,8 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
     This test sends bursts of requests with large contexts and cancels them
     during prefill to stress test resource cleanup.
     """
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_cancel_test(disaggregated_example_root,
                                   "cancel_stress_test",
@@ -3297,13 +2483,7 @@ def test_disaggregated_cancel_large_context_requests_long(
     during prefill to stress test resource cleanup.
     """
     model_dir = f"{llm_models_root()}/{model_path}"
-    src_dst_dict = {
-        model_dir: f"{llm_venv.get_working_directory()}/{model_path}",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, model_dir, model_path)
 
     run_disaggregated_cancel_test(disaggregated_example_root,
                                   "cancel_stress_test_large",

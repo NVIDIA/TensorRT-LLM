@@ -1,0 +1,5 @@
+pytorch_backend_config:
+  disable_overlap_scheduler: True
+cache_transceiver_config:
+  backend: "DEFAULT"
+  max_tokens_in_buffer: 2048
