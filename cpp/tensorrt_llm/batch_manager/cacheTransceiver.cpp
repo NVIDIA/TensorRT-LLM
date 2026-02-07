@@ -143,8 +143,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
     mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
         attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(),
-        cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
-        cacheManager->getIndexerKCacheQuantBlockSize());
+        cacheManager->isEnablePartialReuse(), cacheManager->isEnableIndexerKCache(),
+        cacheManager->getIndexerKCacheIndexHeadDim(), cacheManager->getIndexerKCacheQuantBlockSize());
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {

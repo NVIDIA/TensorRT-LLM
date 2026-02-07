@@ -357,8 +357,8 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto& bufferManager = session.getBufferManager();
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
     bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
-    auto blockRange
-        = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(), recvSideHasCP);
+    auto blockRange = getBlockRangeForReceiving(
+        mCacheManager, llmRequest, destConfig.getEnableBlockReuse(), destConfig.getEnablePartialReuse(), recvSideHasCP);
     auto const numPools = mCacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     auto const& windowSizes = blockRange.getWindowSizes();

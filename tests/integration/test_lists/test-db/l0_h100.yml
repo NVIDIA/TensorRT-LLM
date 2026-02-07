@@ -39,6 +39,10 @@ l0_h100:
   - unittest/disaggregated/test_remoteDictionary.py
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_messenger.py
+  - unittest/disaggregated/test_extractor.py
+  - unittest/disaggregated/test_extractor_v2.py
+  - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/region/test_block.py
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse
