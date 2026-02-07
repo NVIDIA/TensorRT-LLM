@@ -25,8 +25,9 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=True]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=False]
-  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False]
-  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True]
+  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-True]
+  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True-True]
+  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-False]
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend

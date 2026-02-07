@@ -1273,20 +1273,27 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
-    def test_auto_dtype(self, overlap_scheduler):
+    @pytest.mark.parametrize("enable_partial_reuse", [True, False])
+    def test_auto_dtype(self, overlap_scheduler, enable_partial_reuse):
+        kv_cache_config = {
+            "enable_block_reuse": True,
+            "enable_partial_reuse": enable_partial_reuse,
+        }
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
-            }
+            },
+            "kv_cache_config": kv_cache_config,
         }
         gen_server_config = {
             "disable_overlap_scheduler": overlap_scheduler,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
-            }
+            },
+            "kv_cache_config": kv_cache_config,
         }
         disaggregated_server_config = {
             "hostname": "localhost",

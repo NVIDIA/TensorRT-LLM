@@ -471,6 +471,7 @@ class KVCacheManager(BaseResourceManager):
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.host_kv_cache_block_offsets = torch.empty(self.num_pools,
                                                        max_batch_size *
                                                        max_beam_width,
@@ -1711,6 +1712,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len = max_num_tokens
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
 
         # Plus 1 for cuda graph dummy request
         self.index_mapper = IndexMapper(max_batch_size + 1, max_beam_width)
