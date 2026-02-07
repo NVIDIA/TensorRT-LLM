@@ -442,7 +442,7 @@ class Glm4MoeLiteMoE(nn.Module):
         final_hidden_states = final_hidden_states.view(*orig_shape)
         final_hidden_states = final_hidden_states + shared_output
 
-        return final_hidden_states.to(hidden_states.dtype)
+        return final_hidden_states
 
 
 class Glm4MoeLiteAttention(nn.Module):

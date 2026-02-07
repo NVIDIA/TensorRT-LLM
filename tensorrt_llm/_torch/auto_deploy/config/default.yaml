@@ -48,6 +48,8 @@ transforms:
   match_rope_layout:
     stage: pattern_matcher
     expected_layout: bsnd
+  match_swiglu_pattern:
+    stage: pattern_matcher
   match_rmsnorm_pattern:
     stage: pattern_matcher
   match_l2norm_pattern:
@@ -147,6 +149,9 @@ transforms:
   fuse_l2norm:
     stage: post_load_fusion
     backend: fla
+  fuse_swiglu:
+    stage: post_load_fusion
+    enabled: true
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true

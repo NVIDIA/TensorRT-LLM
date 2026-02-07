@@ -88,17 +88,23 @@ def wait_event(device: int, stream_name: str) -> None:
     event.wait()
 
 
-# skip during compilation
 @torch._dynamo.disable
-def record_event_wrapper(
-    fn: Callable,
-    *args: Tuple[Any, ...],
-    **kwargs: Dict[str, Any],
+def record_event_passthrough(
+    x: torch.Tensor,
+    *,
+    device: int = -1,
 ) -> torch.Tensor:
-    device = kwargs.pop("device", torch.cuda.current_device())
-    output = fn(*args, **kwargs)
+    """Record a CUDA event on the main stream and return the input unchanged.
+
+    Inserted after the gating/routing computation to mark a synchronization
+    point.  The aux stream waits for this event before starting the MoE
+    computation, enabling overlap between the shared expert (main stream)
+    and routed experts (aux stream).
+    """
+    if device < 0:
+        device = torch.cuda.current_device()
     torch.ops.auto_deploy.record_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
-    return output
+    return x
 
 
 @torch._dynamo.disable
@@ -254,38 +260,58 @@ def trtllm_quant_fp8_moe_fused_aux_fake(
 def _execute_op_in_aux_stream(
     gm: GraphModule, op_dict: Dict[Callable, Callable]
 ) -> Tuple[GraphModule, int]:
+    """Replace MoE ops with aux-stream variants and insert CUDA event synchronisation.
+
+    For each MoE op we:
+      1. Identify its *routing* inputs (selected_experts, routing_weights) —
+         everything except the hidden-state tensor (``args[0]``) and static
+         weight parameters (``get_attr`` nodes).
+      2. Insert ``record_event_passthrough`` right after the latest routing
+         input in graph order.  This records a CUDA event on the main stream
+         *after* gating is done but *before* the shared expert starts,
+         enabling the shared expert (main stream) and routed experts (aux
+         stream) to execute concurrently.
+      3. Replace the original MoE op with its ``_aux`` variant that runs on
+         the auxiliary CUDA stream.
+    """
     graph = gm.graph
     num_replaced = 0
 
     # Collect targets first to avoid mutating while iterating
     target_nodes = [n for n in graph.nodes if is_op(n, op_dict.keys())]
 
-    for n in target_nodes:
-        target_input_node = None
-        for input_node in n.all_input_nodes:
-            if input_node.target == torch.ops.aten.view.default:
-                target_input_node = input_node
-                break
-            # Look through dtype cast nodes (aten.to) to find the view node
-            if input_node.target == torch.ops.aten.to:
-                for nested_input in input_node.all_input_nodes:
-                    if nested_input.target == torch.ops.aten.view.default:
-                        target_input_node = nested_input
-                        break
-                if target_input_node is not None:
-                    break
+    # Topological position map — used to find the latest routing input.
+    node_order = {node: i for i, node in enumerate(graph.nodes)}
 
-        assert target_input_node is not None, f"Target input node not found for node {n}"
-        with graph.inserting_before(target_input_node):
-            kwargs = target_input_node.kwargs.copy()
-            kwargs["device"] = torch.cuda.current_device()
-            new_node = graph.call_function(
-                record_event_wrapper,
-                args=(target_input_node.target, *target_input_node.args),
-                kwargs=kwargs,
+    for n in target_nodes:
+        # MoE ops follow the convention (x, selected_experts, routing_weights, ...weights...).
+        # args[0] is the hidden-state tensor; the remaining *compute* (non-get_attr)
+        # inputs are routing results produced by the gating computation.
+        hidden_state_node = n.args[0]
+        routing_inputs = [
+            inp
+            for inp in n.all_input_nodes
+            if inp is not hidden_state_node and inp.op != "get_attr"
+        ]
+        assert routing_inputs, f"No routing inputs found for MoE node {n}"
+
+        # Place the event record right after the last routing dependency so
+        # that the aux stream's wait_event sees all routing results as ready
+        # while the shared expert (later in graph order) can still overlap.
+        latest_routing = max(routing_inputs, key=lambda inp: node_order.get(inp, 0))
+
+        with graph.inserting_after(latest_routing):
+            rec_node = graph.call_function(
+                record_event_passthrough,
+                args=(latest_routing,),
+                kwargs={"device": torch.cuda.current_device()},
             )
-        target_input_node.replace_all_uses_with(new_node)
-        graph.erase_node(target_input_node)
+
+        # Wire the event node into the MoE op so there is a true data
+        # dependency that prevents reordering.
+        n.args = tuple(rec_node if arg is latest_routing else arg for arg in n.args)
+
+        # Replace MoE op with its aux-stream variant
         with graph.inserting_after(n):
             new_node = graph.call_function(op_dict[n.target], args=n.args, kwargs=n.kwargs)
         n.replace_all_uses_with(new_node)
