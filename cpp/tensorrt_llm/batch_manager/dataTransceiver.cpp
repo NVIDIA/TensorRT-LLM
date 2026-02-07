@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <chrono>
@@ -360,6 +361,7 @@ public:
         auto const* connection = isAgent
             ? agentConnectionManager->recvConnectionAndRequestInfo(info, mTerminate)
             : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mTerminate}, &id, sizeof(id));
+        TLLM_LOG_INFO("isAgent: %d", isAgent);
         if (connection == nullptr && !mManager->isRunning())
         {
             TLLM_LOG_WARNING(" recvRequestInfo connection is nullptr, maybe the server is terminating");
@@ -384,9 +386,15 @@ public:
         auto allCounterparts = mCacheTransferLayer.computeCounterparts(
             mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
 
-        auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx(); // Index of self in peer's comm state
+        auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx();
         int peerIdx = std::distance(
             allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
+        TLLM_LOG_INFO("[CTX] reqId=%lu allCounterparts.size()=%zu", requestId, allCounterparts.size());
+        for (size_t idx = 0; idx < allCounterparts.size(); idx++)
+        {
+            TLLM_LOG_INFO("[CTX] allCounterparts[%zu]=%d", idx, allCounterparts[idx]);
+        }
+        TLLM_LOG_INFO("[CTX] peerSelfIdx=%d, peerIdx=%d", peerSelfIdx, peerIdx);
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
         {
@@ -458,6 +466,7 @@ public:
                 TLLM_CHECK(agentConnection);
                 agentConnection->sendReadySignal(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, isReady);
+                TLLM_LOG_INFO("sendReadySignal to agent: %d, isReady: %d", i, isReady);
             }
             else
             {
@@ -546,6 +555,7 @@ private:
     {
         auto reqId = mCurrentRequest.value();
         auto count = --mRemainSendCount[reqId];
+        TLLM_LOG_INFO("[CTX] sendResponse reqId=%lu count after decrement=%d", reqId, count);
         TLLM_CHECK(count >= 0);
         if (count == 0)
         {
@@ -637,6 +647,7 @@ private:
                     {
                         mRemainSendCount[reqId] = getCounterpartsCount(reqId);
                     }
+                    TLLM_LOG_INFO("[CTX] reqId=%lu mRemainSendCount=%d", reqId, mRemainSendCount[reqId]);
                 }
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
@@ -855,11 +866,40 @@ public:
             {
                 cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv());
             }
+            TLLM_LOG_INFO("cacheBufferIds: %zu", cacheBufferIds.size());
             TLLM_CHECK(!cacheBufferIds.empty());
         }
 
         auto allCounterparts
             = mCacheTransferLayer.computeCounterparts(mSelfState.getCommState().value().getSelfIdx(), contextState);
+
+        auto kvCounterParts = mCacheTransferLayer.getKvFormatter()->getCounterparts(
+            mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
+
+        bool hasRnn = mCacheTransferLayer.getCacheState().hasRnnConfig() && destCacheState.hasRnnConfig();
+
+        std::vector<SizeType32> rnnCounterParts;
+        if (hasRnn)
+        {
+            rnnCounterParts = executor::kv_cache::targetIRanksForRnn(
+                destCacheState, mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx())
+                                  .mIRanks;
+        }
+
+        std::vector<std::optional<size_t>> kvCacheBufferIds;
+        std::vector<std::optional<size_t>> rnnCacheBufferIds;
+        if (hasRnn && cacheBufferIds.size() > 1)
+        {
+            kvCacheBufferIds.assign(cacheBufferIds.begin(), cacheBufferIds.end() - 1);
+            rnnCacheBufferIds.assign(cacheBufferIds.end() - 1, cacheBufferIds.end());
+        }
+        else
+        {
+            kvCacheBufferIds = cacheBufferIds;
+        }
+
+        TLLM_LOG_INFO("[GEN] kvCounterParts.size()=%zu, rnnCounterParts.size()=%zu, allCounterparts.size()=%zu",
+            kvCounterParts.size(), rnnCounterParts.size(), allCounterparts.size());
 
         auto connections = mManager->getConnections(commState);
         std::vector<executor::kv_cache::Connection const*> allConnections;
@@ -869,24 +909,66 @@ public:
             allConnections.emplace_back(connection);
         }
 
-        for (size_t i = 0; i < allConnections.size(); i++)
+        for (size_t i = 0; i < kvCounterParts.size(); i++)
         {
-            auto const* connection = allConnections[i];
-            // if Manager is agentConnectionManager, then send request info to agent
-            auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+            auto const* connection = connections.at(kvCounterParts[i]);
             if (agentConnectionManager)
             {
-                // TODO: index -> validConnectionIdx conversion
-                // TODO(shreyasm): this will not work for RNN. Will error out in the constructor if used with RNN.
+                // Check if this KV counterpart is also an RNN counterpart
+                bool isAlsoRnn = hasRnn
+                    && std::find(rnnCounterParts.begin(), rnnCounterParts.end(), kvCounterParts[i])
+                        != rnnCounterParts.end();
+
                 auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
                     allCounterparts.size(), mSelfState.getCacheState().value(),
                     mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterparts);
                 auto validConnectionIdx = std::find(localRankIdx.begin(), localRankIdx.end(), i) - localRankIdx.begin();
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
-                TLLM_CHECK(!cacheBufferIds.empty());
+
+                // For overlapping ranks, send combined KV+RNN buffer IDs to preserve positional mapping;
+                // otherwise send only KV buffer IDs.
+                auto const& bufferIdsToSend = isAlsoRnn ? cacheBufferIds : kvCacheBufferIds;
+                TLLM_LOG_INFO("Sending KV%s request info to agent (bufferIds=%zu)", isAlsoRnn ? "+RNN" : "",
+                    bufferIdsToSend.size());
+                TLLM_CHECK(!bufferIdsToSend.empty());
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, cacheBufferIds, validConnectionIdx);
+                    ->sendRequestAndBufferInfo(requestInfo, bufferIdsToSend, validConnectionIdx);
+            }
+            else
+            {
+                sendRequestInfo(connection, requestInfo);
+            }
+        }
+
+        for (size_t j = 0; j < rnnCounterParts.size(); j++)
+        {
+            // Skip ranks already handled in the KV loop (overlapping counterparts)
+            if (std::find(kvCounterParts.begin(), kvCounterParts.end(), rnnCounterParts[j]) != kvCounterParts.end())
+            {
+                continue;
+            }
+            // RNN-only counterparts (not in kvCounterParts) are not supported with NIXL agent connections
+            // because the buffer ID positional mapping assumes combined KV+RNN IDs sent in the KV loop.
+            // Currently, KV and RNN counterparts always overlap, so this path should not be reached.
+            TLLM_CHECK_WITH_INFO(!agentConnectionManager,
+                "RNN-only counterpart rank %d has no KV counterpart; not supported with agent connections",
+                rnnCounterParts[j]);
+            auto const* connection = connections.at(rnnCounterParts[j]);
+            if (agentConnectionManager)
+            {
+                TLLM_LOG_INFO("Sending RNN request info to agent");
+                auto rnnTargetInfo = executor::kv_cache::targetIRanksForRnn(destCacheState,
+                    mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx());
+                auto [pickUpIdx, localRankIdx] = cache_formatter_utils::pickRecvConnections(rnnCounterParts.size(),
+                    mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx(), destCacheState,
+                    rnnCounterParts, rnnTargetInfo);
+                auto validConnectionIdx = std::find(localRankIdx.begin(), localRankIdx.end(), j) - localRankIdx.begin();
+                auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
+                TLLM_CHECK(agentConnection != nullptr);
+                TLLM_CHECK(!rnnCacheBufferIds.empty());
+                const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
+                    ->sendRequestAndBufferInfo(requestInfo, rnnCacheBufferIds, validConnectionIdx);
             }
             else
             {
@@ -964,6 +1046,7 @@ public:
         bool isReadyFinal = true;
         bool isReady = false;
         auto const& connections = session.getConnections();
+        TLLM_LOG_INFO("[GEN] receiveReadySignal: waiting for %zu connections", session.getConnections().size());
 
         for (size_t i = 0; i < connections.size(); i++)
         {
@@ -974,6 +1057,7 @@ public:
                 TLLM_CHECK(agentConnection);
                 isReady = agentConnection->recvReadySignal(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG, mTerminate});
+                TLLM_LOG_INFO("[GEN] received ready signal from connection %zu, isReady=%d", i, isReady);
             }
             else
             {
