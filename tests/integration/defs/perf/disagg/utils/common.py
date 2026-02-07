@@ -246,7 +246,7 @@ class InfoPrinter:
         logger.info(f"SLURM_PARTITION:   {EnvManager.get_slurm_partition()}")
         logger.info(f"SLURM_ACCOUNT:     {EnvManager.get_slurm_account()}")
         logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")
-        logger.info(f"Reproduce: cd <TensorRT-LLM> && python3 examples/disaggregated/slurm/benchmark/submit.py -c {config_path[config_path.find('tests/integration/defs/perf/disagg/test_configs/'):]} --log-dir <YOUR_OUTPUT_DIR>")
+        logger.info(f"Reproduce Steps: cd [TensorRT-LLM] && python3 examples/disaggregated/slurm/benchmark/submit.py -c {config_path[config_path.find('tests/integration/defs/perf/disagg/test_configs/'):]} --log-dir [YOUR_OUTPUT_DIR]")
 
 
 CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")
