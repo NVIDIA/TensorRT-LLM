@@ -264,10 +264,8 @@ class KvCacheCreator:
         num_cache_blocks = 0
         num_extra_tokens_per_seq = 1  # account for generated tokens
         spec_cfg = self._speculative_config
-        if not self._llm_args.disable_overlap_scheduler:
-            num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
-            if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
+        if not self._llm_args.disable_overlap_scheduler and spec_cfg is not None:
+            num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
 
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
