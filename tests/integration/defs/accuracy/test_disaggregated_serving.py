@@ -1328,10 +1328,16 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
-    def test_chunked_prefill(self):
+    def _test_chunked_prefill_helper(self, *, ctx_pp: int):
         # bs=1 will stabilize the result, but the test will be much slower
         max_batch_size = 32
+
+        kv_cache_config = {
+            "enable_block_reuse": True if ctx_pp == 1 else False,
+        }
+
         ctx_server_config = {
+            "pipeline_parallel_size": ctx_pp,
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
@@ -1340,6 +1346,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": True,
             "max_num_tokens": 256,
             "max_batch_size": max_batch_size,
+            "kv_cache_config": kv_cache_config,
         }
         gen_server_config = {
             "cuda_graph_config": None,
@@ -1365,6 +1372,16 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    def test_chunked_prefill(self):
+        self._test_chunked_prefill_helper(ctx_pp=1)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(4)
+    def test_chunked_prefill_ctx_pp2(self):
+        self._test_chunked_prefill_helper(ctx_pp=2)
 
 
 @skip_pre_blackwell
