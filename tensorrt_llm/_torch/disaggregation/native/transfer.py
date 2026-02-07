@@ -383,10 +383,14 @@ class KVSendTask:
                     peer_ri, self_group_id, peer_group_id, pool_role
                 )
                 region_pair = mapper.map(src_region, dst_region)
-                src_frags.extend(region_pair.src.memory.ptrs)
-                dst_frags.extend(region_pair.dst.memory.ptrs)
-                frag_size = region_pair.src.memory.bytes_per_region
-                kv_sizes.extend([frag_size] * len(region_pair.src.memory.ptrs))
+                # ConvStateMismatchMapper returns List[SpecRegionPair];
+                # other mappers return a single SpecRegionPair.
+                region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+                for rp in region_pairs:
+                    src_frags.extend(rp.src.memory.ptrs)
+                    dst_frags.extend(rp.dst.memory.ptrs)
+                    frag_size = rp.src.memory.bytes_per_region
+                    kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
 
         if self._perf_timer is not None:
             transfer_total_size = frag_size * len(src_frags)

@@ -5,11 +5,14 @@ from tensorrt_llm._torch.disaggregation.native.region.block import (
     HeadMatchMapper,
     HeadMismatchMapper,
     IdentityMapper,
+    MambaHeadMatchMapper,
+    MambaHeadMismatchMapper,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVPoolAttrs,
     KVRegionExtractorV1,
     LayerGroupAttrs,
+    MambaLayerGroupAttrs,
     PoolRole,
 )
 
@@ -370,3 +373,416 @@ def test_peer_registrar_get_kv_map_head_mismatch():
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     mapper = reg.get_kv_map(peer_ri, self_layer_group_id=0, peer_layer_group_id=0)
     assert isinstance(mapper, HeadMismatchMapper)
+
+
+# ============== Mamba-related tests ==============
+
+
+def make_mamba_kv_pool_attrs(
+    global_layer_ids=None,
+    kv_head_num_per_rank=8,
+    max_batch_size_per_pool=16,
+    conv_block_bytes=128,
+    ssm_block_bytes=256,
+):
+    """Create KVPoolAttrs with a Mamba layer group (Conv and SSM pools)."""
+    if global_layer_ids is None:
+        global_layer_ids = [0, 1, 2, 3]
+
+    mamba_group = MambaLayerGroupAttrs(
+        group_id=0,
+        pool_base_ptrs=[10000, 20000],  # Conv, SSM base pointers
+        pool_sizes=[1024000, 2048000],  # Pool sizes
+        roles_to_pool_idx={
+            PoolRole.CONV_STATE: 0,
+            PoolRole.SSM_STATE: 1,
+        },
+        block_bytes_per_pool=[conv_block_bytes, ssm_block_bytes],
+        global_layer_ids=global_layer_ids,
+        kv_head_num_per_rank=kv_head_num_per_rank,
+        max_batch_size_per_pool=max_batch_size_per_pool,
+    )
+
+    layer_to_group_id = {lid: 0 for lid in global_layer_ids}
+    return KVPoolAttrs(
+        layer_to_group_id=layer_to_group_id,
+        layer_group_attrs_list=[mamba_group],
+    )
+
+
+def make_hybrid_kv_pool_attrs(
+    kv_global_layer_ids=None,
+    mamba_global_layer_ids=None,
+    kv_head_num_per_rank=8,
+    mamba_head_num_per_rank=8,
+    max_batch_size_per_pool=16,
+):
+    """Create KVPoolAttrs with both KV cache and Mamba layer groups."""
+    if kv_global_layer_ids is None:
+        kv_global_layer_ids = [0, 1]
+    if mamba_global_layer_ids is None:
+        mamba_global_layer_ids = [2, 3]
+
+    # KV cache layer group
+    kv_group = LayerGroupAttrs(
+        group_id=0,
+        pool_base_ptrs=[1000],
+        pool_sizes=[10240],
+        roles_to_pool_idx={PoolRole.KV_CACHE: 0},
+        block_bytes_per_pool=[512],
+        global_layer_ids=kv_global_layer_ids,
+        kv_head_num_per_rank=kv_head_num_per_rank,
+    )
+
+    # Mamba layer group
+    mamba_group = MambaLayerGroupAttrs(
+        group_id=1,
+        pool_base_ptrs=[10000, 20000],
+        pool_sizes=[1024000, 2048000],
+        roles_to_pool_idx={
+            PoolRole.CONV_STATE: 0,
+            PoolRole.SSM_STATE: 1,
+        },
+        block_bytes_per_pool=[128, 256],
+        global_layer_ids=mamba_global_layer_ids,
+        kv_head_num_per_rank=mamba_head_num_per_rank,
+        max_batch_size_per_pool=max_batch_size_per_pool,
+    )
+
+    layer_to_group_id = {lid: 0 for lid in kv_global_layer_ids}
+    layer_to_group_id.update({lid: 1 for lid in mamba_global_layer_ids})
+
+    return KVPoolAttrs(
+        layer_to_group_id=layer_to_group_id,
+        layer_group_attrs_list=[kv_group, mamba_group],
+    )
+
+
+def test_check_mamba_compatible_both_have_mamba():
+    """Test _check_mamba_compatible when both self and peer have Mamba."""
+    self_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[0, 1, 2, 3])
+    peer_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[0, 1, 2, 3])
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+
+    # Should pass - both have Mamba with overlapping layers
+    result = reg._check_mamba_compatible(peer_ri)
+    assert result is True
+
+
+def test_check_mamba_compatible_neither_has_mamba():
+    """Test _check_mamba_compatible when neither has Mamba."""
+    self_kv_attrs = make_kv_pool_attrs(global_layer_ids=[0, 1])
+    peer_kv_attrs = make_kv_pool_attrs(global_layer_ids=[0, 1])
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_kv_attrs,
+        layer_num_per_pp=[2],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_kv_attrs,
+        layer_num_per_pp=[2],
+    )
+
+    extractor = KVRegionExtractorV1(self_kv_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+
+    # Should pass - neither has Mamba
+    result = reg._check_mamba_compatible(peer_ri)
+    assert result is True
+
+
+def test_check_mamba_compatible_one_has_mamba():
+    """Test _check_mamba_compatible when only one has Mamba (incompatible)."""
+    self_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[0, 1, 2, 3])
+    peer_kv_attrs = make_kv_pool_attrs(global_layer_ids=[0, 1, 2, 3])
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_kv_attrs,
+        layer_num_per_pp=[4],
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+
+    # Should fail - one has Mamba, other doesn't
+    result = reg._check_mamba_compatible(peer_ri)
+    assert result is False
+
+
+def test_check_mamba_compatible_partial_overlap():
+    """Test _check_mamba_compatible with partial Mamba layer overlap."""
+    self_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[0, 1, 2, 3])
+    peer_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[2, 3, 4, 5])
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+
+    # Should pass - partial overlap is okay (layers 2, 3 overlap)
+    result = reg._check_mamba_compatible(peer_ri)
+    assert result is True
+
+
+def test_check_mamba_compatible_no_overlap():
+    """Test _check_mamba_compatible with no Mamba layer overlap.
+
+    No overlap is allowed (e.g., different PP stages owning different Mamba layers).
+    The function should still return True (compatible) and only log a warning.
+    """
+    self_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[0, 1])
+    peer_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[2, 3])
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[2],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_mamba_attrs,
+        layer_num_per_pp=[2],
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+
+    # No overlap is still compatible - just warns
+    result = reg._check_mamba_compatible(peer_ri)
+    assert result is True
+
+
+def test_get_kv_map_mamba_identity():
+    """Test get_kv_map returns IdentityMapper for Mamba when all layers match."""
+    global_layers = [0, 1, 2, 3]
+    self_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=global_layers)
+    peer_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=global_layers)
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    # For SSM_STATE with matching layers and heads
+    mapper = reg.get_kv_map(
+        peer_ri, self_layer_group_id=0, peer_layer_group_id=0, pool_role=PoolRole.SSM_STATE
+    )
+    assert isinstance(mapper, IdentityMapper)
+
+    # For CONV_STATE with matching layers and heads
+    mapper = reg.get_kv_map(
+        peer_ri, self_layer_group_id=0, peer_layer_group_id=0, pool_role=PoolRole.CONV_STATE
+    )
+    assert isinstance(mapper, IdentityMapper)
+
+
+def test_get_kv_map_mamba_head_match():
+    """Test get_kv_map returns MambaHeadMatchMapper when layers differ but heads match."""
+    # Self has pp_rank=0 with layers [0, 1], peer has pp_rank=1 with layers [2, 3]
+    # Total layers = 4 for both
+    self_layers = [0, 1]
+    peer_layers = [0, 1, 2, 3]  # Peer has all layers but different layer group
+
+    self_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=self_layers)
+    peer_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=peer_layers)
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        pp_size=2,
+        pp_rank=0,
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[2, 2],  # Total 4 layers
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        pp_size=1,
+        pp_rank=0,
+        kv_pool_attrs=peer_mamba_attrs,
+        layer_num_per_pp=[4],  # Total 4 layers
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    # Same TP size -> head match, but different layer counts in groups -> MambaHeadMatchMapper
+    # self has 2 layers [0,1], peer has 4 layers [0,1,2,3], overlap is [0,1]
+    # transfer_layers=2, self_group_layer_count=2, peer_group_layer_count=4
+    # 2 != 4 -> MambaHeadMatchMapper
+    mapper = reg.get_kv_map(
+        peer_ri, self_layer_group_id=0, peer_layer_group_id=0, pool_role=PoolRole.SSM_STATE
+    )
+    assert isinstance(mapper, MambaHeadMatchMapper)
+
+
+def test_get_kv_map_mamba_head_mismatch():
+    """Test get_kv_map returns MambaHeadMismatchMapper when TP sizes differ."""
+    global_layers = [0, 1, 2, 3]
+    self_mamba_attrs = make_mamba_kv_pool_attrs(
+        global_layer_ids=global_layers,
+        kv_head_num_per_rank=8,
+    )
+    peer_mamba_attrs = make_mamba_kv_pool_attrs(
+        global_layer_ids=global_layers,
+        kv_head_num_per_rank=4,  # Different head count
+    )
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        tp_size=2,  # Different TP
+        tp_rank=0,
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        tp_size=4,  # Different TP
+        tp_rank=0,
+        kv_pool_attrs=peer_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    # Different TP sizes -> head mismatch -> MambaHeadMismatchMapper
+    mapper = reg.get_kv_map(
+        peer_ri, self_layer_group_id=0, peer_layer_group_id=0, pool_role=PoolRole.SSM_STATE
+    )
+    assert isinstance(mapper, MambaHeadMismatchMapper)
+
+
+def test_get_group_id_mapping_with_mamba():
+    """Test get_group_id_mapping correctly maps Mamba layer groups."""
+    # Self has KV layers [0,1] and Mamba layers [2,3]
+    self_attrs = make_hybrid_kv_pool_attrs(
+        kv_global_layer_ids=[0, 1],
+        mamba_global_layer_ids=[2, 3],
+    )
+    # Peer has KV layers [0,1] and Mamba layers [2,3]
+    peer_attrs = make_hybrid_kv_pool_attrs(
+        kv_global_layer_ids=[0, 1],
+        mamba_global_layer_ids=[2, 3],
+    )
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_attrs,
+        layer_num_per_pp=[4],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_attrs,
+        layer_num_per_pp=[4],
+    )
+
+    extractor = KVRegionExtractorV1(self_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    mapping = reg.get_group_id_mapping(peer_ri)
+
+    # Self group 0 (KV) -> Peer group 0 (KV)
+    # Self group 1 (Mamba) -> Peer group 1 (Mamba)
+    assert mapping[0] == 0
+    assert mapping[1] == 1
+
+
+def test_register_peer_with_mamba_compatible():
+    """Test registering a peer with Mamba layer group (compatible)."""
+    self_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[0, 1, 2, 3])
+    peer_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[0, 1, 2, 3])
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_mamba_attrs,
+        layer_num_per_pp=[4],
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+
+    # Should succeed - compatible Mamba configurations
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
+def test_register_peer_with_mamba_incompatible():
+    """Test registering a peer with incompatible Mamba configuration."""
+    self_mamba_attrs = make_mamba_kv_pool_attrs(global_layer_ids=[0, 1])
+    peer_kv_attrs = make_kv_pool_attrs(global_layer_ids=[0, 1])  # No Mamba
+
+    self_ri = make_rankinfo(
+        instance_name="self",
+        kv_pool_attrs=self_mamba_attrs,
+        layer_num_per_pp=[2],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        kv_pool_attrs=peer_kv_attrs,
+        layer_num_per_pp=[2],
+    )
+
+    extractor = KVRegionExtractorV1(self_mamba_attrs)
+    reg = PeerRegistrar(self_ri, extractor)
+
+    # Should raise - one has Mamba, other doesn't
+    with pytest.raises(ValueError):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)

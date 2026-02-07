@@ -9,9 +9,11 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import PoolRole
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
@@ -82,6 +84,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         ctx_server_endpoint = self.transfer_worker._sender.endpoint
         layer_num = len(self.kv_cache_manager.pp_layers)
 
+        if isinstance(self.kv_cache_manager, MambaHybridCacheManager):
+            layer_num += len(self.kv_cache_manager.mamba_layer_offsets)
+
         ctx_server_endpoints = self.dist.allgather(ctx_server_endpoint)
         layer_num_per_pp = self.dist.pp_allgather(layer_num)
         self.transfer_worker.populate_instance_and_rank_info(
@@ -107,7 +112,18 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         tokens_per_block = self.kv_cache_manager.tokens_per_block
 
         for group_attrs in self.kv_pool_attrs.layer_group_attrs_list:
-            if self.is_v2_manager:
+            # Check if this is a Mamba layer group
+            is_mamba_group = (
+                PoolRole.SSM_STATE in group_attrs.roles_to_pool_idx
+                or PoolRole.CONV_STATE in group_attrs.roles_to_pool_idx
+            )
+
+            if is_mamba_group:
+                # Mamba: use mamba_cache_index to get slot_id
+                # block_ids contains only one slot_id
+                slot_id = self.kv_cache_manager.mamba_cache_index[req.py_request_id]
+                block_ids = [slot_id]
+            elif self.is_v2_manager:
                 # V2: Use get_aggregated_page_indices for efficient slot indices
                 block_ids = list(
                     self.kv_cache_manager.kv_cache_map[

@@ -663,6 +663,8 @@ def _create_kv_cache_manager(
         num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
             config.full_attention_interval - 1)
         num_layers = num_hidden_layers - num_mamba_layers
+        from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+            ConvLayoutOrder
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.linear_key_head_dim,
@@ -689,6 +691,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            conv_layout_order=ConvLayoutOrder.QWEN3_QKV,
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager

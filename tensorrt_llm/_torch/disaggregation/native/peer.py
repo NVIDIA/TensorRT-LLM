@@ -4,10 +4,13 @@ from typing import Dict, List
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.region.block import (
+    ConvStateMismatchMapper,
     HeadMatchMapper,
     HeadMismatchMapper,
     IdentityMapper,
     IndexerKCacheHeadMatchMapper,
+    MambaHeadMatchMapper,
+    MambaHeadMismatchMapper,
     RegionMapperBase,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1, PoolRole
@@ -136,6 +139,63 @@ class PeerRegistrar:
                     f" (local={self._ri.kv_heads_per_rank}, peer={peer_ri.kv_heads_per_rank})"
                 )
                 return False
+
+        # Check Mamba compatibility
+        if not self._check_mamba_compatible(peer_ri):
+            return False
+
+        return True
+
+    def _check_mamba_compatible(self, peer_ri: RankInfo) -> bool:
+        """Check Mamba-specific compatibility between self and peer."""
+        self_attrs = self._self_ext_cache.kv_pool_attrs if self._self_ext_cache else None
+        peer_attrs = peer_ri.kv_pool_attrs
+
+        if self_attrs is None or peer_attrs is None:
+            return True  # No attrs to check
+
+        # Find Mamba layer groups
+        def find_mamba_group(attrs):
+            for group in attrs.layer_group_attrs_list:
+                if (
+                    PoolRole.SSM_STATE in group.roles_to_pool_idx
+                    or PoolRole.CONV_STATE in group.roles_to_pool_idx
+                ):
+                    return group
+            return None
+
+        self_mamba_group = find_mamba_group(self_attrs)
+        peer_mamba_group = find_mamba_group(peer_attrs)
+
+        # If one has Mamba and the other doesn't, they're incompatible
+        if (self_mamba_group is None) != (peer_mamba_group is None):
+            logger.warning(
+                "PeerRegistrar: Mamba compatibility check failed: "
+                f"local has_mamba={self_mamba_group is not None}, "
+                f"peer has_mamba={peer_mamba_group is not None}"
+            )
+            return False
+
+        if self_mamba_group is None:
+            return True  # Neither has Mamba, compatible
+
+        # Both have Mamba, check that global layer counts match
+        self_mamba_layers = set(self_mamba_group.global_layer_ids)
+        peer_mamba_layers = set(peer_mamba_group.global_layer_ids)
+        all_mamba_layers = self_mamba_layers | peer_mamba_layers
+
+        if len(all_mamba_layers) != len(self_mamba_layers) or len(all_mamba_layers) != len(
+            peer_mamba_layers
+        ):
+            # Different total mamba layer counts - check if there's any overlap
+            overlapping = self_mamba_layers & peer_mamba_layers
+            if not overlapping:
+                logger.warning(
+                    "PeerRegistrar: Mamba layer compatibility check failed: "
+                    f"no overlapping mamba layers between local and peer. "
+                    f"local={sorted(self_mamba_layers)}, peer={sorted(peer_mamba_layers)}"
+                )
+
         return True
 
     def _tp_per_dp(self, info: RankInfo) -> int:
@@ -184,6 +244,7 @@ class PeerRegistrar:
             peer_ri: Peer's RankInfo
             self_layer_group_id: Local layer group ID
             peer_layer_group_id: Peer's layer group ID
+            pool_role: Pool role (KV_CACHE, INDEXER, SSM_STATE, CONV_STATE)
 
         Returns:
             RegionMapperBase for the specified layer group pair.
@@ -195,12 +256,6 @@ class PeerRegistrar:
 
         self_tp_per_dp = self._tp_per_dp(self._ri)
         peer_tp_per_dp = self._tp_per_dp(peer_ri)
-
-        is_dup_head = (
-            self._ri.kv_heads_per_rank * self_tp_per_dp
-            != peer_ri.kv_heads_per_rank * peer_tp_per_dp
-        )
-        head_match = is_dup_head or self._ri.is_mla or self_tp_per_dp == peer_tp_per_dp
 
         # Get layer group attributes
         self_attrs = self._self_ext_cache.kv_pool_attrs
@@ -225,6 +280,29 @@ class PeerRegistrar:
         else:
             self_layer_offset = 0
             peer_layer_offset = 0
+
+        # Handle Mamba states (SSM_STATE, CONV_STATE)
+        if pool_role in (PoolRole.SSM_STATE, PoolRole.CONV_STATE):
+            mapper = self._get_mamba_mapper(
+                pool_role=pool_role,
+                transfer_layers=transfer_layers,
+                self_layer_offset=self_layer_offset,
+                peer_layer_offset=peer_layer_offset,
+                self_group_attrs=self_group_attrs,
+                peer_group_attrs=peer_group_attrs,
+                self_tp_per_dp=self_tp_per_dp,
+                peer_tp_per_dp=peer_tp_per_dp,
+                peer_tp_rank=peer_ri.tp_rank,
+            )
+            self._kv_map_cache[key] = mapper
+            return mapper
+
+        # KV cache handling
+        is_dup_head = (
+            self._ri.kv_heads_per_rank * self_tp_per_dp
+            != peer_ri.kv_heads_per_rank * peer_tp_per_dp
+        )
+        head_match = is_dup_head or self._ri.is_mla or self_tp_per_dp == peer_tp_per_dp
 
         logger.debug(
             "PeerRegistrar.get_kv_map: "
@@ -287,6 +365,86 @@ class PeerRegistrar:
         )
         self._kv_map_cache[key] = mapper
         return mapper
+
+    def _get_mamba_mapper(
+        self,
+        pool_role: PoolRole,
+        transfer_layers: int,
+        self_layer_offset: int,
+        peer_layer_offset: int,
+        self_group_attrs,
+        peer_group_attrs,
+        self_tp_per_dp: int,
+        peer_tp_per_dp: int,
+        peer_tp_rank: int,
+    ) -> RegionMapperBase:
+        """
+        Get mapper for Mamba states (SSM_STATE or CONV_STATE).
+
+        For Mamba, headNum and tp_size are inversely proportional.
+        For CONV_STATE with sectioned layout info (MambaLayerGroupAttrs),
+        uses ConvStateMismatchMapper to handle each section independently.
+        """
+        pool_idx = self_group_attrs.roles_to_pool_idx[pool_role]
+        block_bytes_per_layer = self_group_attrs.block_bytes_per_pool[pool_idx]
+
+        # Get head counts from layer group attrs
+        self_nheads = self_group_attrs.kv_head_num_per_rank
+        peer_nheads = peer_group_attrs.kv_head_num_per_rank
+
+        # Check if head counts match (considering TP relationship)
+        # headNum * tp_size should be constant, so if tp_per_dp differs, heads differ
+        head_match = self_tp_per_dp == peer_tp_per_dp
+
+        self_group_layer_count = len(self_group_attrs.global_layer_ids)
+        peer_group_layer_count = len(peer_group_attrs.global_layer_ids)
+
+        # Fast identity when all layers match and head counts match
+        if head_match and transfer_layers == self_group_layer_count == peer_group_layer_count:
+            return IdentityMapper()
+
+        if head_match:
+            return MambaHeadMatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=self_layer_offset,
+                dst_layer_off=peer_layer_offset,
+                block_bytes_per_layer=block_bytes_per_layer,
+            )
+
+        # Head mismatch case: for CONV_STATE, prefer ConvStateMismatchMapper
+        # if section information is available (from MambaLayerGroupAttrs)
+        if pool_role == PoolRole.CONV_STATE:
+            self_sec = getattr(self_group_attrs, "conv_section_bytes_per_rank", None)
+            peer_sec = getattr(peer_group_attrs, "conv_section_bytes_per_rank", None)
+            if self_sec and peer_sec:
+                return ConvStateMismatchMapper(
+                    transfer_layers=transfer_layers,
+                    src_layer_off=self_layer_offset,
+                    dst_layer_off=peer_layer_offset,
+                    self_section_bytes=self_sec,
+                    peer_section_bytes=peer_sec,
+                    self_tp_per_dp=self_tp_per_dp,
+                    peer_tp_per_dp=peer_tp_per_dp,
+                    self_tp_rank=self._ri.tp_rank,
+                    peer_tp_rank=peer_tp_rank,
+                )
+
+        # SSM_STATE or CONV_STATE without section info: use head-based mapper
+        # bytes_per_head = block_bytes_per_layer / nheads
+        bytes_per_head = block_bytes_per_layer // self_nheads
+
+        return MambaHeadMismatchMapper(
+            transfer_layers=transfer_layers,
+            src_layer_off=self_layer_offset,
+            dst_layer_off=peer_layer_offset,
+            bytes_per_head=bytes_per_head,
+            self_nheads=self_nheads,
+            peer_nheads=peer_nheads,
+            self_tp_per_dp=self_tp_per_dp,
+            peer_tp_per_dp=peer_tp_per_dp,
+            self_tp_rank=self._ri.tp_rank,
+            peer_tp_rank=peer_tp_rank,
+        )
 
     @staticmethod
     def _find_overlap(self_val, peer_val, self_rank, peer_rank=None):
