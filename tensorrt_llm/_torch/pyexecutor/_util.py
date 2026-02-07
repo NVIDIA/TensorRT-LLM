@@ -403,7 +403,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
         )
     else:
-        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCacheManager
+        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCacheManager
         is_vswa = is_vswa_enabled(kv_cache_config)
         binding_model_config = model_engine.model.model_config.get_bindings_model_config(
             tokens_per_block=tokens_per_block) if is_vswa else None
