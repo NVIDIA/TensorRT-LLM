@@ -453,6 +453,7 @@ def launch_disaggregated_llm(
 
 def run_parallel_test(model_name: str,
                       model_path: str,
+                      *,
                       ctx_pp: int,
                       ctx_tp: int,
                       gen_pp: int,
@@ -771,8 +772,15 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_tp_pp_symmetric(self, tp, pp, testset):
         if tp * pp * 2 > get_device_count():
             pytest.skip(f"Not enough devices for tp={tp}*pp={pp} test")
-        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
-                                 tp, 1, 1, [get_accuracy_task(testset)])
+        return run_parallel_test(self.MODEL_NAME,
+                                 self.MODEL_PATH,
+                                 ctx_pp=pp,
+                                 ctx_tp=tp,
+                                 gen_pp=pp,
+                                 gen_tp=tp,
+                                 ctx_instances=1,
+                                 gen_instances=1,
+                                 test_sets=[get_accuracy_task(testset)])
 
     @parametrize_with_ids("ctx_pp", [2, 4])
     @parametrize_with_ids("gen_tp", [1, 2])
@@ -781,13 +789,27 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if ctx_pp + gen_tp > get_device_count():
             pytest.skip(
                 f"Not enough devices for ctx_pp={ctx_pp}+gen_tp={gen_tp} test")
-        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
-                                 gen_tp, 1, 1, [get_accuracy_task(testset)])
+        return run_parallel_test(self.MODEL_NAME,
+                                 self.MODEL_PATH,
+                                 ctx_pp=ctx_pp,
+                                 ctx_tp=1,
+                                 gen_pp=1,
+                                 gen_tp=gen_tp,
+                                 ctx_instances=1,
+                                 gen_instances=1,
+                                 test_sets=[get_accuracy_task(testset)])
 
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_multi_instance(self, testset):
-        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, 1, 1, 1, 1,
-                                 2, 2, [get_accuracy_task(testset)])
+        return run_parallel_test(self.MODEL_NAME,
+                                 self.MODEL_PATH,
+                                 ctx_pp=1,
+                                 ctx_tp=1,
+                                 gen_pp=1,
+                                 gen_tp=1,
+                                 ctx_instances=2,
+                                 gen_instances=2,
+                                 test_sets=[get_accuracy_task(testset)])
 
 
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
