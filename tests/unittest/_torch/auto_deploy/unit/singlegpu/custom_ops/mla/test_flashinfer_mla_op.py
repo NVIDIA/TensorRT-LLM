@@ -1940,6 +1940,7 @@ def test_flashinfer_mla_plan_generate_only(
     # to re-plan the cached wrappers before graph replay
     _GlobalFlashInferMLAPlanner.plan_generate_only(
         batch_size,
+        flashinfer_meta["cu_seqlen_host"][: batch_size + 1],  # cu_seqlen (serves as qo_indptr)
         flashinfer_meta["cu_num_pages"][: batch_size + 1],
         flashinfer_meta["cache_loc"],
         flashinfer_meta["last_page_len"][:batch_size],

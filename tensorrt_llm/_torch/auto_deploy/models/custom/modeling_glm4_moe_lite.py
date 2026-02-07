@@ -425,7 +425,8 @@ class Glm4MoeLiteMoE(nn.Module):
         orig_shape = hidden_states.shape
 
         selected_experts, routing_weights = self.gate(hidden_states)
-
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(identity)
         # Use torch_moe custom op for routed experts
         final_hidden_states = torch.ops.auto_deploy.torch_moe(
             hidden_states.view(-1, hidden_states.shape[-1]),
@@ -439,10 +440,7 @@ class Glm4MoeLiteMoE(nn.Module):
         )
 
         final_hidden_states = final_hidden_states.view(*orig_shape)
-
-        # Add shared experts output if present
-        if self.shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(identity)
+        final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states.to(hidden_states.dtype)
 

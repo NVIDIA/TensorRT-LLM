@@ -311,6 +311,8 @@ class MultiStreamMOE(BaseTransform):
             torch.ops.auto_deploy.triton_moe_fused: torch.ops.auto_deploy.triton_moe_fused_aux,
             torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused: torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused_aux,
         }
+        with open("before_multi_stream.txt", "w") as f:
+            f.write(str(gm.graph))
         # Ensure that aux stream and events for the current device are added to the CudaStreamManager.
         cuda_stream_manager.add_device(torch.cuda.current_device())
         gm, num_matches = _execute_op_in_aux_stream(gm, op_dict)
@@ -321,5 +323,6 @@ class MultiStreamMOE(BaseTransform):
             is_clean=num_matches == 0,
             has_valid_shapes=num_matches == 0,
         )
-
+        with open("after_multi_stream.txt", "w") as f:
+            f.write(str(gm.graph))
         return gm, info

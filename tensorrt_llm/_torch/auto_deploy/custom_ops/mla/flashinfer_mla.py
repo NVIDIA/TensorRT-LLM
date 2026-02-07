@@ -226,6 +226,7 @@ class _FlashInferMLAPlanner:
 
     def plan_decode(
         self,
+        qo_indptr: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_page_indices: torch.Tensor,
         kv_last_page_len: torch.Tensor,
@@ -237,13 +238,13 @@ class _FlashInferMLAPlanner:
         FlashInfer's optimized MLA kernels. Each sequence generates 1 token.
 
         Args:
+            qo_indptr: Cumulative query/output lengths [batch_size + 1].
+                       For decode, this is [0, 1, 2, ..., batch_size] (1 token per sequence).
             kv_page_indptr: Cumulative page counts [batch_size + 1].
             kv_page_indices: Page indices for the KV cache.
             kv_last_page_len: Length of the last page per sequence.
             plan_params: Parameters for planning.
         """
-        # Decode qo_indptr: [0, 1, 2, ..., batch_size] (1 token per sequence)
-
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
         if (
             cuda_graph_state.in_warm_up()
@@ -251,10 +252,6 @@ class _FlashInferMLAPlanner:
         ):
             # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
             # Pass the buffer tensors to the wrapper for use_cuda_graph=True
-            batch_size = kv_page_indptr.shape[0] - 1
-            qo_indptr = torch.arange(
-                batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32
-            )
 
             # Compute kv_len_arr for CUDA graph wrapper initialization
             num_pages_per_seq = kv_page_indptr[1:] - kv_page_indptr[:-1]
@@ -278,11 +275,6 @@ class _FlashInferMLAPlanner:
 
         # Re-plan if plan_params changed
         if plan_params != self.plan_params_decode:
-            batch_size = kv_page_indptr.shape[0] - 1
-            qo_indptr = torch.arange(
-                batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32
-            )
-
             self._plan_mla_wrapper(
                 self.decode_wrapper,
                 qo_indptr,
@@ -332,6 +324,7 @@ class _FlashInferMLAPlanner:
     def plan_generate_only(
         self,
         num_seq: int,
+        cu_seqlen: torch.Tensor,
         cu_num_pages: torch.Tensor,
         cache_loc: torch.Tensor,
         last_page_len: torch.Tensor,
@@ -344,6 +337,8 @@ class _FlashInferMLAPlanner:
 
         Args:
             num_seq: Number of sequences in the decode batch.
+            cu_seqlen: Cumulative sequence lengths [num_seq + 1]. For decode-only batches,
+                       this is [0, 1, 2, ..., num_seq] (1 token per sequence), serving as qo_indptr.
             cu_num_pages: Cumulative page counts, already sliced to [: num_seq + 1].
             cache_loc: Page indices for the KV cache.
             last_page_len: Length of the last page per sequence, already sliced to [:num_seq].
@@ -352,16 +347,14 @@ class _FlashInferMLAPlanner:
             if plan_params.num_seq == num_seq:
                 wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
 
-                # For a pure decode batch, qo_indptr is just [0, 1, 2, ..., batch_size]
-                qo_indptr = torch.arange(num_seq + 1, device=cu_num_pages.device, dtype=torch.int32)
-
                 # Compute actual KV lengths from paging metadata:
                 # kv_len = (num_pages - 1) * page_size + last_page_len
                 num_pages_per_seq = cu_num_pages[1:] - cu_num_pages[:-1]
                 kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + last_page_len
 
+                # For decode-only batches, cu_seqlen = [0, 1, 2, ..., num_seq] = qo_indptr
                 wrapper.plan(
-                    qo_indptr,
+                    cu_seqlen,  # qo_indptr
                     cu_num_pages,  # kv_page_indptr
                     cache_loc,  # kv_page_indices
                     kv_len_arr,
@@ -424,6 +417,7 @@ def prepare_flashinfer_mla_metadata_fake(
 
 def prepare_flashinfer_mla_metadata_host(
     batch_info_host: torch.Tensor,
+    cu_seqlen_host: torch.Tensor,
     cu_num_pages_host: torch.Tensor,
     cache_loc_host: torch.Tensor,
     last_page_len_host: torch.Tensor,
@@ -432,12 +426,23 @@ def prepare_flashinfer_mla_metadata_host(
 
     For decode-only batches, this function pre-plans the cached CUDA graph
     wrappers to avoid planning during graph capture/replay.
+
+    Args:
+        batch_info_host: Batch info tensor [num_prefill, num_prefill_tokens, num_decode].
+        cu_seqlen_host: Cumulative sequence lengths on host. For decode-only batches,
+                        this is [0, 1, 2, ..., num_decode] (1 token per sequence),
+                        which serves as qo_indptr.
+        cu_num_pages_host: Cumulative page counts on host.
+        cache_loc_host: Page indices for the KV cache on host.
+        last_page_len_host: Length of the last page per sequence on host.
     """
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
 
     if num_prefill == 0:
+        # For decode-only batches, cu_seqlen_host = [0, 1, 2, ..., num_decode] = qo_indptr
         _GlobalFlashInferMLAPlanner.plan_generate_only(
             num_decode,
+            cu_seqlen_host[: num_decode + 1],
             cu_num_pages_host[: num_decode + 1],
             cache_loc_host,
             last_page_len_host[:num_decode],
@@ -729,7 +734,13 @@ def flashinfer_mla_with_cache(
             sm_scale=scale,
         )
 
+        # Decode qo_indptr: [0, 1, 2, ..., num_decode] (1 token per sequence)
+        qo_indptr_decode = torch.arange(
+            num_decode + 1, device=cu_num_pages.device, dtype=torch.int32
+        )
+
         wrapper_decode = _GlobalFlashInferMLAPlanner.plan_decode(
+            qo_indptr=qo_indptr_decode,
             kv_page_indptr=cu_num_pages[num_prefill : num_seq + 1],
             kv_page_indices=cache_loc,
             kv_last_page_len=last_page_len[num_prefill:num_seq],
