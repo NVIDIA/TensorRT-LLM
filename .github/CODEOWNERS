@@ -31,6 +31,8 @@
 /CONTAINER_SOURCE.md @NVIDIA/trt-llm-doc-owners
 /CONTRIBUTING.md @NVIDIA/trt-llm-doc-owners
 /README.md @NVIDIA/trt-llm-doc-owners
+/CLAUDE.md @NVIDIA/trt-llm-doc-owners
+/AGENTS.md @NVIDIA/trt-llm-doc-owners
 
 ## Examples
 /examples @NVIDIA/trt-llm-doc-owners
