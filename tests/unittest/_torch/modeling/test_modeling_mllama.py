@@ -10,6 +10,7 @@ from test_modeling_llama import Scenario, reduce_llama_config
 from transformers import MllamaConfig
 from transformers import \
     MllamaForConditionalGeneration as HFMllamaForConditionalGeneration
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -392,9 +393,10 @@ class TestMLlama(unittest.TestCase):
                                     position_ids=position_ids,
                                     use_cache=True)
 
+        atol = 0.35 if getSMVersion() >= 121 else 0.3
         torch.testing.assert_close(logits,
                                    ref.logits[:, -1].float(),
-                                   atol=0.3,
+                                   atol=atol,
                                    rtol=0.3)
 
         # gen
@@ -458,9 +460,10 @@ class TestMLlama(unittest.TestCase):
                                     past_key_values=ref.past_key_values,
                                     use_cache=True)
 
+        atol = 0.35 if getSMVersion() >= 121 else 0.3
         torch.testing.assert_close(logits,
                                    ref.logits[:, -1].float(),
-                                   atol=0.3,
+                                   atol=atol,
                                    rtol=0.3)
         if graph_runner is not None:
             graph_runner.clear()

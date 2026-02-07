@@ -4503,6 +4503,33 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
+    # on spark 120b accuracy takes 2.2 hours, so we do 20b for now
+    def test_w4_1gpu_20b_spark(self, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              cuda_graph_config=CudaGraphConfig())
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        dtype="auto")
+
+        model_path = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
+        llm = LLM(model_path,
+                  tensor_parallel_size=1,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  **pytorch_config,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        with llm:
+            model_name = "GPT-OSS/20B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
     def test_dummy_load_format(self):
         llm = LLM(
             self.MODEL_PATH,
