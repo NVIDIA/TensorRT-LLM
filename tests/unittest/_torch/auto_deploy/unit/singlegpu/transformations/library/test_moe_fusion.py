@@ -918,7 +918,7 @@ def test_nvfp4_moe_different_input_scales(
     - When scales_identical=False and allow_different_input_scales=False: should fail with assertion
     - When scales_identical=False and allow_different_input_scales=True: should work (uses min)
 
-    Note: NVFP4 uses min() (not max like FP8) because scales are in kernel format (2688/amax):
+    Note: NVFP4 uses min() (not max() like FP8) because scales are in kernel format (2688/amax):
     smaller scale = larger amax = larger dynamic range.
 
     This test uses mock tensors to test the transform logic without running the actual NVFP4 kernel.
