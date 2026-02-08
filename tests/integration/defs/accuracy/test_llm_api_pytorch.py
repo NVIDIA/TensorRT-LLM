@@ -2732,12 +2732,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -4851,7 +4851,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3,
                                         dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
@@ -5667,7 +5667,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                               overlap_scheduler, cuda_graph):
 
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        mamba_ssm_cache_dtype="float32")
+                                        mamba_ssm_cache_dtype="float32",
+                                        free_gpu_memory_fraction=0.5)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
                                   max_batch_size=512, enable_padding=True)

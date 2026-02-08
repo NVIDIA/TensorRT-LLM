@@ -17,7 +17,7 @@ cuda_graph_config:
 kv_cache_config:
   dtype: fp8
   enable_block_reuse: false
-  free_gpu_memory_fraction: 0.6
+  free_gpu_memory_fraction: 0.5
 speculative_config:
   decoding_type: MTP
   num_nextn_predict_layers: 1
