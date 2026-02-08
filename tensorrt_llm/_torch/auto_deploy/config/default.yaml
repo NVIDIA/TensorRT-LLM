@@ -169,7 +169,7 @@ transforms:
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
-    enabled: true
+    enabled: false
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
