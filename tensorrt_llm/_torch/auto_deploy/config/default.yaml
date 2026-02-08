@@ -85,6 +85,7 @@ transforms:
     stage: pattern_matcher
   match_nvfp4_swiglu_pattern:
     stage: pattern_matcher
+    requires_shape_prop: true
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
@@ -168,7 +169,7 @@ transforms:
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
-    enabled: false
+    enabled: true
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
