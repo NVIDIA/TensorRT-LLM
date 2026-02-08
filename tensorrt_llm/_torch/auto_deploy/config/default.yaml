@@ -50,6 +50,7 @@ transforms:
     expected_layout: bsnd
   match_rmsnorm_pattern:
     stage: pattern_matcher
+    run_shape_prop: true
   match_l2norm_pattern:
     stage: pattern_matcher
   ############################################################################################
@@ -75,6 +76,16 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_from_graph:
     stage: pattern_matcher
+  # SwiGLU pattern matching must run AFTER quantization transforms. For pre-quantized
+  # checkpoints (e.g., NVFP4), quantization converts torch_linear_simple ops to quantized
+  # ops first, and then match_nvfp4_swiglu_pattern captures the NVFP4 SwiGLU pattern.
+  # For non-quantized models, quantization transforms are no-ops, so match_swiglu_pattern
+  # proceeds normally.
+  match_swiglu_pattern:
+    stage: pattern_matcher
+  match_nvfp4_swiglu_pattern:
+    stage: pattern_matcher
+    requires_shape_prop: true
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
@@ -126,6 +137,8 @@ transforms:
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_nvfp4_swiglu:
+    stage: post_load_fusion
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -147,6 +160,9 @@ transforms:
   fuse_l2norm:
     stage: post_load_fusion
     backend: fla
+  fuse_swiglu:
+    stage: post_load_fusion
+    enabled: true
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
@@ -196,6 +212,9 @@ transforms:
   fuse_causal_conv_activation:
     stage: compile
   multi_stream_moe:
+    stage: compile
+    enabled: false
+  multi_stream_mla_attn:
     stage: compile
     enabled: false
   compile_model:

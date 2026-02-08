@@ -444,7 +444,7 @@ class Glm4MoeLiteMoE(nn.Module):
         if self.shared_experts is not None:
             final_hidden_states = final_hidden_states + self.shared_experts(identity)
 
-        return final_hidden_states.to(hidden_states.dtype)
+        return final_hidden_states
 
 
 class Glm4MoeLiteAttention(nn.Module):
