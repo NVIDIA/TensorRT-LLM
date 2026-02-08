@@ -2018,6 +2018,8 @@ def test_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
         "--disable_overlap_scheduler",
         "--eagle_choices",
         "[[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [2, 0], [0, 0, 0], [0, 1, 0], [1, 0, 0]]",
+        "--kv_cache_fraction",
+        "0.4",
     ])
 
 
@@ -2045,6 +2047,8 @@ def test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree(
         "--disable_overlap_scheduler",
         "--eagle_choices",
         "[[0], [1], [2]]",
+        "--kv_cache_fraction",
+        "0.4",
     ])
 
 

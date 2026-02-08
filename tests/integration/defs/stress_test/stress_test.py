@@ -507,7 +507,7 @@ def stress_test(config,
             )
 
     # For DeepSeek-V3 specific server parameters
-    if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
+    if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir or "llama-v3-8b" in config.model_dir:
         test_server_config = ServerConfig(
             port=test_server_config.port,
             host=test_server_config.host,
