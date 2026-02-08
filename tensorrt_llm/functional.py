@@ -33,7 +33,7 @@ from ._utils import (QuantModeWrapper, bf16_array, bool_array,
                      fp16_array, fp32_array, get_sm_version, int32_array,
                      int64_array, np_dtype_to_trt, str_dtype_to_trt,
                      trt_dtype_to_np, trt_dtype_to_str)
-from .network import PluginInfo, set_np_weight, set_plugin_info
+from .network import PluginInfo, get_np_weight, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
 
@@ -3553,30 +3553,56 @@ def conv1d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = weight.size()[-2]
+    kernel_shape = trt.Dims([kernel_size, 1])
+
     is_weight_constant = (weight.producer is not None
                           and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    if is_weight_constant:
+        ndarray = get_np_weight(default_trtnet(), weight.producer.name)
+        if ndarray is not None:
+            trt_weight = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                     ndarray.ctypes.data,
+                                     int(np.prod(ndarray.shape)))
+        else:
+            weight.producer.__class__ = trt.IConstantLayer
+            trt_weight = weight.producer.weights
+    else:
+        trt_weight = trt.Weights()
+    weight_tensor = weight
 
     if bias is not None:
+        bias_tensor = bias
         is_bias_constant = (bias.producer is not None
                             and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        if is_bias_constant:
+            ndarray = get_np_weight(default_trtnet(), bias.producer.name)
+            if ndarray is not None:
+                trt_bias = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                       ndarray.ctypes.data,
+                                       int(np.prod(ndarray.shape)))
+            else:
+                bias.producer.__class__ = trt.IConstantLayer
+                trt_bias = bias.producer.weights
+        else:
+            trt_bias = trt.Weights()
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     input_shuffled = stack([input], dim=input.ndim())
-    kernel_size = trt.Dims([kernel_size, 1])
 
     layer = default_trtnet().add_convolution_nd(input_shuffled.trt_tensor,
-                                                noutput, kernel_size, weight,
-                                                bias)
+                                                noutput, kernel_shape,
+                                                trt_weight, trt_bias)
     layer.stride_nd = (stride, 2)
     layer.padding_nd = (padding, 0)
     layer.dilation_nd = (dilation, 2)
     layer.num_groups = groups
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output_2d = _create_tensor(layer.get_output(0), layer)
     output_1d = squeeze(output_2d, dim=-1)
@@ -3602,18 +3628,45 @@ def conv2d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = (weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
     is_weight_constant = (weight.producer is not None
                           and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    if is_weight_constant:
+        ndarray = get_np_weight(default_trtnet(), weight.producer.name)
+        if ndarray is not None:
+            trt_weight = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                     ndarray.ctypes.data,
+                                     int(np.prod(ndarray.shape)))
+        else:
+            weight.producer.__class__ = trt.IConstantLayer
+            trt_weight = weight.producer.weights
+    else:
+        trt_weight = trt.Weights()
+    weight_tensor = weight
 
     if bias is not None:
+        bias_tensor = bias
         is_bias_constant = (bias.producer is not None
                             and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        if is_bias_constant:
+            ndarray = get_np_weight(default_trtnet(), bias.producer.name)
+            if ndarray is not None:
+                trt_bias = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                       ndarray.ctypes.data,
+                                       int(np.prod(ndarray.shape)))
+            else:
+                bias.producer.__class__ = trt.IConstantLayer
+                trt_bias = bias.producer.weights
+        else:
+            trt_bias = trt.Weights()
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
-                                                kernel_size, weight, bias)
+                                                kernel_shape, trt_weight,
+                                                trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.dilation_nd = dilation
@@ -3625,9 +3678,9 @@ def conv2d(input: Tensor,
         layer.post_padding = post_padding
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
 
@@ -3666,18 +3719,45 @@ def conv3d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
     is_weight_constant = (weight.producer is not None
                           and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    if is_weight_constant:
+        ndarray = get_np_weight(default_trtnet(), weight.producer.name)
+        if ndarray is not None:
+            trt_weight = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                     ndarray.ctypes.data,
+                                     int(np.prod(ndarray.shape)))
+        else:
+            weight.producer.__class__ = trt.IConstantLayer
+            trt_weight = weight.producer.weights
+    else:
+        trt_weight = trt.Weights()
+    weight_tensor = weight
 
     if bias is not None:
+        bias_tensor = bias
         is_bias_constant = (bias.producer is not None
                             and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        if is_bias_constant:
+            ndarray = get_np_weight(default_trtnet(), bias.producer.name)
+            if ndarray is not None:
+                trt_bias = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                       ndarray.ctypes.data,
+                                       int(np.prod(ndarray.shape)))
+            else:
+                bias.producer.__class__ = trt.IConstantLayer
+                trt_bias = bias.producer.weights
+        else:
+            trt_bias = trt.Weights()
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
-                                                kernel_size, weight, bias)
+                                                kernel_shape, trt_weight,
+                                                trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.dilation_nd = dilation
@@ -3685,9 +3765,9 @@ def conv3d(input: Tensor,
     layer.dilation_nd = dilation
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
     return output
@@ -3713,26 +3793,53 @@ def conv_transpose2d(input: Tensor,
 
     noutput = weight.size()[1]
     kernel_size = (weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
     is_weight_constant = (weight.producer is not None
                           and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    if is_weight_constant:
+        ndarray = get_np_weight(default_trtnet(), weight.producer.name)
+        if ndarray is not None:
+            trt_weight = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                     ndarray.ctypes.data,
+                                     int(np.prod(ndarray.shape)))
+        else:
+            weight.producer.__class__ = trt.IConstantLayer
+            trt_weight = weight.producer.weights
+    else:
+        trt_weight = trt.Weights()
+    weight_tensor = weight
 
     if bias is not None:
+        bias_tensor = bias
         is_bias_constant = (bias.producer is not None
                             and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        if is_bias_constant:
+            ndarray = get_np_weight(default_trtnet(), bias.producer.name)
+            if ndarray is not None:
+                trt_bias = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                       ndarray.ctypes.data,
+                                       int(np.prod(ndarray.shape)))
+            else:
+                bias.producer.__class__ = trt.IConstantLayer
+                trt_bias = bias.producer.weights
+        else:
+            trt_bias = trt.Weights()
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_deconvolution_nd(input.trt_tensor, noutput,
-                                                  kernel_size, weight, bias)
+                                                  kernel_shape, trt_weight,
+                                                  trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.num_groups = groups
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
 
