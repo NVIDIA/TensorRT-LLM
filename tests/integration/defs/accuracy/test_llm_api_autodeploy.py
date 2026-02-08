@@ -455,7 +455,10 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "transforms": {
                 "multi_stream_moe": {
                     "stage": "compile",
-                    # multi-stream MOE currently does not work for world_size > 1
+                    "enabled": True,
+                },
+                "multi_stream_mla_attn": {
+                    "stage": "compile",
                     "enabled": True,
                 },
             }

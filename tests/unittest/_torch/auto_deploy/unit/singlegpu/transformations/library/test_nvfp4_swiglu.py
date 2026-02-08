@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 from _torch_test_utils import fp4_compatible, trtllm_ops_available
+from torch.export import Dim
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -233,7 +234,7 @@ def test_nvfp4_swiglu_full_fusion():
     model = NVFP4SwiGLUTestModel().to("cuda")
     x = torch.randn(2, 128, device="cuda", dtype=torch.float16)
 
-    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm = torch_export_to_gm(model, args=(x,), clone=True, dynamic_shapes=({0: Dim.DYNAMIC},))
 
     # Apply pattern matching + fusion
     gm_fused = InferenceOptimizer(

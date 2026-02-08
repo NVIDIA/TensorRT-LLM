@@ -25,6 +25,22 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+try:
+    from flashinfer.activation import silu_and_mul as _flashinfer_silu_and_mul
+except ImportError:
+    _flashinfer_silu_and_mul = None
+
+
+def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """SwiGLU activation: split x in half, apply silu to first half, multiply with second half.
+
+    Uses FlashInfer's fused kernel when available, falls back to manual implementation.
+    """
+    if _flashinfer_silu_and_mul is not None:
+        return _flashinfer_silu_and_mul(x)
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
 
 @torch.library.custom_op("auto_deploy::torch_swiglu_mlp", mutates_args=())
 def torch_swiglu_mlp(
@@ -104,11 +120,8 @@ def fused_swiglu_mlp(
     # Single matmul for both gate and up projections
     gate_up_out = F.linear(input, gate_up_weight, gate_up_bias)
 
-    # Split into gate and up outputs
-    gate_out, up_out = gate_up_out.chunk(2, dim=-1)
-
-    # Apply SwiGLU activation: silu(gate) * up
-    hidden = F.silu(gate_out) * up_out
+    # Apply SwiGLU activation: split, silu(gate) * up (uses FlashInfer when available)
+    hidden = _silu_and_mul(gate_up_out)
 
     # Down projection
     return F.linear(hidden, down_weight, down_bias)
@@ -266,11 +279,8 @@ def fused_nvfp4_swiglu_mlp(
         alpha=gate_up_alpha,
     )
 
-    # Split into gate and up outputs
-    gate_out, up_out = gate_up_out.chunk(2, dim=-1)
-
-    # Apply SwiGLU activation: silu(gate) * up
-    hidden = F.silu(gate_out) * up_out
+    # Apply SwiGLU activation: split, silu(gate) * up (uses FlashInfer when available)
+    hidden = _silu_and_mul(gate_up_out)
 
     # Down projection
     return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
