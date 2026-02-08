@@ -13,6 +13,7 @@ from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
+from ...utils.cuda_graph import cuda_graph_state
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
@@ -143,8 +144,13 @@ def _torch_cached_ssm(
     b, s = hidden_states.shape[:2]
     num_seq = seq_len.shape[0]
 
-    # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    # Get batch dimensions from shared state if available (for CUDA graph replay)
+    shared_batch_info = cuda_graph_state.get_batch_info()
+    if shared_batch_info is not None:
+        num_prefill, num_prefill_tokens, num_decode = shared_batch_info
+    else:
+        num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     seq_start = cu_seqlen[:num_seq]

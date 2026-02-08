@@ -34,6 +34,7 @@ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 from .....llmapi.llm_args import KvCacheConfig
+from ...utils.cuda_graph import cuda_graph_state
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
@@ -77,10 +78,23 @@ def _cuda_cached_causal_conv1d(
       describe per-sequence segments. We'll process each segment and scatter final states to caches.
 
     NOTE: This op modifies `input` in-place.
+
+    CUDA graph compatibility:
+    - During graph capture, batch_info_host has capture-time values (MAX batch)
+    - During graph replay, batch_info_host has STALE capture-time values (not updated)
+    - Use cuda_graph_state.get_batch_info() for current batch info during replay
     """
     b, s = input.shape[:2]
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    # Get batch dimensions from shared state if available (for CUDA graph replay)
+    # During graph replay, batch_info_host retains capture-time values.
+    # cuda_graph_state is updated by TRT-LLM attention's host_prepare before each forward.
+    shared_batch_info = cuda_graph_state.get_batch_info()
+    if shared_batch_info is not None:
+        num_prefill, num_prefill_tokens, num_decode = shared_batch_info
+    else:
+        num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
