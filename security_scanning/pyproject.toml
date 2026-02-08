@@ -70,7 +70,7 @@ dependencies = [
     "soundfile (>=0.13.1,<0.14.0)",
     "triton (==3.5.1)",
     "tiktoken (>=0.12.0,<0.13.0)",
-    "blobfile (>=3.1.0,<4.0.0)",
+    "blobfile (>=3.2.0,<4.0.0)",
     "openai-harmony (==0.0.4)",
     "nvidia-cutlass-dsl (==4.3.4)",
     "plotly (>=6.5.2,<7.0.0)",
