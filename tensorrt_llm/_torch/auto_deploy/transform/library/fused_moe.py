@@ -1660,6 +1660,10 @@ class FuseFP8Moe(BaseTransform):
     This runs after weights are loaded, similar to FuseMoe for unquantized MoE.
     """
 
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseFP8MoeConfig
+
     def _apply(
         self,
         gm: GraphModule,
