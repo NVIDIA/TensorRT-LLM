@@ -21,25 +21,20 @@ This benchmarks ONLY the communication kernels, specifically:
 - Communication.dispatch()
 - Communication.combine()
 
-Timing method:
-- CUDA events on the default stream
-- Region wrapped by cudaProfilerStart/Stop (via torch.cuda.profiler.start/stop)
-  so Nsight Compute (ncu) can capture it later.
-
 Launch (examples):
 
 ```bash
-# Run backend AllGather/ReduceScatter
- python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend ALLGATHER --profile gpt_oss
+# Basic usage
+python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend DEEPEP --profile deepseek_v3
 
-# Run backend NVLinkOneSided
- python tests/microbenchmarks/bench_moe_comm.cpy --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3
+# Show per-kernel breakdown and stats across iterations
+python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED --kernel_breakdown --iter_stats
 
 # With batch size sweeping
- /scratch/projects/tekit/tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED -b 1 -e 1024 -f 2
+python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED -b 640 -e 2048 -f 2
 
 # Run all supported strategies for the given profile
- python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --profile deepseek_v3
+python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --profile deepseek_v3
 
 ```
 """
@@ -52,7 +47,6 @@ import os
 import pickle
 import sys
 import traceback
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -60,6 +54,7 @@ import cloudpickle
 import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from torch.autograd import DeviceType
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -112,6 +107,11 @@ PROFILES: Dict[str, Profile] = {
 def _maybe_warn_rank0(msg: str):
     if mpi_rank() == 0:
         print(msg, flush=True)
+
+
+def _sync():
+    torch.cuda.synchronize()
+    mpi_barrier()
 
 
 def _set_device_from_local_rank():
@@ -186,36 +186,6 @@ def _create_model_config(
     )
 
 
-def _profile_start(enabled: bool):
-    # Use cudaProfilerStart/Stop (torch calls cudart under the hood).
-    if not enabled:
-        return
-    torch.cuda.profiler.start()
-
-
-def _profile_stop(enabled: bool):
-    if not enabled:
-        return
-    torch.cuda.profiler.stop()
-
-
-@contextmanager
-def _nvtx_range(msg: str, enabled: bool) -> None:
-    """Best-effort NVTX range helper for Nsight Systems timelines."""
-    if not enabled:
-        yield
-        return
-    try:
-        torch.cuda.nvtx.range_push(msg)
-        yield
-    finally:
-        # Avoid masking the original exception if NVTX isn't available for some reason.
-        try:
-            torch.cuda.nvtx.range_pop()
-        except Exception:
-            pass
-
-
 def _time_dispatch_and_combine(
     backend: Communication,
     *,
@@ -227,30 +197,65 @@ def _time_dispatch_and_combine(
     hidden_size: int,
     warmup: int,
     iters: int,
-    profile_wrap: bool,
-    nvtx: bool,
-    nvtx_prefix: str,
-) -> Tuple[float, float]:
-    # Returns: (dispatch_us_per_iter, combine_us_per_iter)
+    flush_l2: bool = True,
+) -> Tuple[List[float], List[float], Dict[str, Any]]:
+    """Time dispatch and combine using Kineto (torch.profiler with CUPTI).
 
-    # Some backends require prepare_dispatch() before dispatch() (e.g., NVLinkTwoSided).
-    # We intentionally exclude prepare_dispatch() from timing as requested.
+    Returns:
+        dispatch_times_us: Per-iteration dispatch GPU times in microseconds
+        combine_times_us: Per-iteration combine GPU times in microseconds
+        detailed_stats: Dict containing per-kernel timing breakdown
+    """
+    device = hidden_states.device
+
+    # Prepare dispatch once (excluded from timing)
     _ = backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens, None)
 
-    # TODO: warmup
+    # L2 cache flushing buffer
+    l2_buffer = None
+    if flush_l2:
+        l2_size = torch.cuda.get_device_properties(device).L2_cache_size
+        # Use 2x L2 size to ensure complete flush
+        l2_flush_size = (l2_size * 2) // 4  # Size in int32 elements
+        l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
-    start_dispatch = torch.cuda.Event(enable_timing=True)
-    end_dispatch = torch.cuda.Event(enable_timing=True)
-    start_combine = torch.cuda.Event(enable_timing=True)
-    end_combine = torch.cuda.Event(enable_timing=True)
+    # Warmup iterations (not profiled)
+    for _ in range(warmup):
+        if l2_buffer is not None:
+            l2_buffer.zero_()
+        recv_hidden_states, _, _, _ = backend.dispatch(
+            hidden_states,
+            hidden_states_sf,
+            token_selected_slots,
+            token_final_scales,
+            all_rank_num_tokens,
+        )
+        shape = list(recv_hidden_states.shape)
+        shape[-1] = hidden_size
+        recv_hidden_states_moe = torch.empty(
+            tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
+        )
+        _ = backend.combine(
+            recv_hidden_states_moe, all_rank_max_num_tokens=max(all_rank_num_tokens)
+        )
 
-    dispatch_total_ms = 0.0
-    combine_total_ms = 0.0
-
-    with _nvtx_range(f"{nvtx_prefix}:timed", enabled=nvtx):
+    # Profile with Kineto
+    with torch.profiler.profile(
+        # Include CPU so `record_function("dispatch_iter..."/"combine_iter...")` ranges
+        # appear in key_averages() / events(). Without CPU activity those ranges are
+        # missing, causing dispatch/combine attribution to fail.
+        activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
+        record_shapes=False,
+        with_stack=False,
+    ) as prof:
+        _sync()
         for _ in range(iters):
-            start_dispatch.record()
-            with _nvtx_range("dispatch", enabled=nvtx):
+            # L2 cache flushing
+            if l2_buffer is not None:
+                l2_buffer.zero_()
+
+            # Mark dispatch operation for aggregated timing
+            with torch.profiler.record_function("dispatch"):
                 recv_hidden_states, _, _, _ = backend.dispatch(
                     hidden_states,
                     hidden_states_sf,
@@ -258,43 +263,176 @@ def _time_dispatch_and_combine(
                     token_final_scales,
                     all_rank_num_tokens,
                 )
-            end_dispatch.record()
 
-            # Simulate the output of MoE computation
-            # TODO: Support payload in workspace.
+            # Simulate MoE computation output
             shape = list(recv_hidden_states.shape)
             shape[-1] = hidden_size
             recv_hidden_states_moe = torch.empty(
                 tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
             )
 
-            start_combine.record()
-            with _nvtx_range("combine", enabled=nvtx):
+            # Mark combine operation for aggregated timing
+            with torch.profiler.record_function("combine"):
                 _ = backend.combine(
-                    recv_hidden_states_moe,
-                    all_rank_max_num_tokens=max(all_rank_num_tokens),
+                    recv_hidden_states_moe, all_rank_max_num_tokens=max(all_rank_num_tokens)
                 )
-            end_combine.record()
-            end_combine.synchronize()
 
-            dispatch_total_ms += start_dispatch.elapsed_time(end_dispatch)
-            combine_total_ms += start_combine.elapsed_time(end_combine)
+    _sync()
 
-    dispatch_ms = dispatch_total_ms / iters
-    combine_ms = combine_total_ms / iters
-    return dispatch_ms * 1e3, combine_ms * 1e3
+    # if mpi_rank() == 0:
+    #     print("########################################################")
+    #     print(prof.key_averages())
+    #     print("########################################################")
 
+    # ------------------------------------------------------------------
+    # Categorize GPU kernels by enclosing record_function scope
+    # ("dispatch" or "combine").
+    #
+    # Each record_function marker produces both a CPU event and a CUDA
+    # range event.  We collect the GPU-side "dispatch"/"combine" ranges
+    # and check whether each GPU kernel's start timestamp falls inside
+    # one of them (GPU time-range containment).
+    # ------------------------------------------------------------------
+    events_list = list(prof.events())
+    # if mpi_rank() == 0:
+    #     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+    #     for evt in events_list:
+    #         print(evt)
+    #     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
 
-def _gather_stats_us(x_us: float) -> Dict[str, float]:
-    xs = mpi_allgather(float(x_us))
-    xs_sorted = sorted(xs)
-    n = len(xs_sorted)
-    return {
-        "min": xs_sorted[0],
-        "p50": xs_sorted[n // 2],
-        "max": xs_sorted[-1],
-        "avg": sum(xs_sorted) / n,
+    def _is_gpu_event(evt) -> bool:
+        return getattr(evt, "device_type", None) == DeviceType.CUDA
+
+    # Step 1: Collect GPU time ranges of "dispatch"/"combine" CUDA ranges.
+    gpu_dispatch_intervals: List[Tuple[int, int]] = []
+    gpu_combine_intervals: List[Tuple[int, int]] = []
+
+    for evt in events_list:
+        if not _is_gpu_event(evt) or evt.name not in ("dispatch", "combine"):
+            continue
+        tr = getattr(evt, "time_range", None)
+        if tr is None:
+            continue
+        assert tr.end > tr.start
+        (gpu_dispatch_intervals if evt.name == "dispatch" else gpu_combine_intervals).append(
+            (tr.start, tr.end)
+        )
+    gpu_dispatch_intervals.sort()
+    gpu_combine_intervals.sort()
+
+    # Step 2: Scope resolver (GPU events only) ---------------------------------
+    def _find_scope(evt) -> Optional[str]:
+        """Return 'dispatch', 'combine', or None based on GPU time-range containment."""
+        tr = getattr(evt, "time_range", None)
+        if tr is None:
+            return None
+        t = tr.start
+        for s, e in gpu_dispatch_intervals:
+            if s <= t <= e:
+                return "dispatch"
+        for s, e in gpu_combine_intervals:
+            if s <= t <= e:
+                return "combine"
+        return None
+
+    # Step 3: Iterate events and bucket by scope ----------------------------
+    dispatch_kernel_times: Dict[str, List[float]] = {}
+    combine_kernel_times: Dict[str, List[float]] = {}
+    other_kernel_times: Dict[str, List[float]] = {}
+
+    for evt in events_list:
+        if not _is_gpu_event(evt):
+            continue
+        if evt.device_time <= 0:
+            continue
+        if evt.name in ("dispatch", "combine"):
+            continue  # skip record_function range markers
+
+        scope = _find_scope(evt)
+        if scope == "dispatch":
+            dispatch_kernel_times.setdefault(evt.name, []).append(evt.device_time)
+        elif scope == "combine":
+            combine_kernel_times.setdefault(evt.name, []).append(evt.device_time)
+        else:
+            other_kernel_times.setdefault(evt.name, []).append(evt.device_time)
+
+    # Step 4: Build per-kernel stats ----------------------------------------
+    def _build_kernel_list(kernel_times: Dict[str, List[float]]) -> List[Dict[str, Any]]:
+        result = []
+        for name, times in kernel_times.items():
+            result.append(
+                {
+                    "name": name,
+                    "count": len(times),
+                    "_times": times,  # raw per-iteration times, gathered across ranks later
+                }
+            )
+        return result
+
+    dispatch_kernels = _build_kernel_list(dispatch_kernel_times)
+    combine_kernels = _build_kernel_list(combine_kernel_times)
+    other_kernels = _build_kernel_list(other_kernel_times)
+
+    # Step 5: Collect per-iteration dispatch/combine times (us) ---------------
+    # Use the CUDA-side "dispatch"/"combine" range events (device_type=CUDA)
+    # for direct GPU time measurement.
+    dispatch_times_us: List[float] = []
+    combine_times_us: List[float] = []
+    for evt in events_list:
+        if not _is_gpu_event(evt):
+            continue
+        if evt.name == "dispatch":
+            dispatch_times_us.append(evt.device_time)
+        elif evt.name == "combine":
+            combine_times_us.append(evt.device_time)
+
+    # Sort each category by mean time descending
+    dispatch_kernels.sort(
+        key=lambda x: sum(x["_times"]) / len(x["_times"]) if x["_times"] else 0, reverse=True
+    )
+    combine_kernels.sort(
+        key=lambda x: sum(x["_times"]) / len(x["_times"]) if x["_times"] else 0, reverse=True
+    )
+    other_kernels.sort(
+        key=lambda x: sum(x["_times"]) / len(x["_times"]) if x["_times"] else 0, reverse=True
+    )
+
+    detailed_stats = {
+        "dispatch_kernels": dispatch_kernels,
+        "combine_kernels": combine_kernels,
+        "other_kernels": other_kernels,
     }
+
+    return dispatch_times_us, combine_times_us, detailed_stats
+
+
+def _compute_stats(values: List[float]) -> Dict[str, float]:
+    """Compute summary statistics over a list of values."""
+    if not values:
+        return {"mean": 0.0, "median": 0.0, "stdev": 0.0, "min": 0.0, "max": 0.0}
+    s = sorted(values)
+    n = len(s)
+    mean = sum(s) / n
+    variance = sum((x - mean) ** 2 for x in s) / n
+    return {
+        "mean": mean,
+        "median": s[n // 2],
+        "stdev": variance**0.5,
+        "min": s[0],
+        "max": s[-1],
+    }
+
+
+def _gather_per_rank(times_us: List[float], iter_stats: bool = False) -> Dict[str, Any]:
+    """Allgather per-iteration times from each rank, return per-rank results.
+
+    If iter_stats=True, return full stats (mean/median/stdev/min/max).
+    If iter_stats=False, return just the mean.
+    """
+    all_times = mpi_allgather(times_us)
+    if iter_stats:
+        return {f"rank{i}": _compute_stats(t) for i, t in enumerate(all_times)}
+    return {f"rank{i}": (sum(t) / len(t) if t else 0.0) for i, t in enumerate(all_times)}
 
 
 def parse_args() -> argparse.Namespace:
@@ -381,14 +519,20 @@ def parse_args() -> argparse.Namespace:
         help="Max tokens per rank for workspace allocation (defaults to max scanned local_batch_size).",
     )
     parser.add_argument(
-        "--no_profiler_wrap",
+        "--kernel_breakdown",
         action="store_true",
-        help="Disable cudaProfilerStart/Stop wrapping (useful when profiler is unavailable).",
+        help="Show per-kernel timing breakdown.",
     )
     parser.add_argument(
-        "--no_nvtx",
+        "--iter_stats",
         action="store_true",
-        help="Disable NVTX ranges (useful to minimize profiler overhead).",
+        help="Show detailed per-iteration stats (mean/median/stdev/min/max) instead of just mean.",
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default=None,
+        help="Path to write JSON report file (default: None, stdout only).",
     )
     return parser.parse_args()
 
@@ -475,7 +619,6 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
     hidden_size, _, top_k, num_experts_total, profile_quant_algo = _resolve_profile_args(args)
     local_batch_sizes = _iter_local_batch_sizes(args)
     act_dtype = torch.bfloat16
-    nvtx = not bool(args.no_nvtx)
     quant_algo = QuantAlgo[args.quant] if args.quant is not None else profile_quant_algo
     quant_config = (
         QuantConfig(quant_algo=None)
@@ -530,7 +673,8 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
         else [args.backend]
     )
 
-    _profile_start(not args.no_profiler_wrap)
+    all_results: List[Dict[str, Any]] = []
+
     for backend_name in backends:
         try:
             model_config = _create_model_config(
@@ -612,48 +756,53 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                 )
             )
 
-            torch.cuda.synchronize()
-            mpi_barrier()
+            # Time dispatch and combine with Kineto
+            dispatch_times_us, combine_times_us, detailed_stats = _time_dispatch_and_combine(
+                backend,
+                hidden_states=hidden_states,
+                hidden_states_sf=hidden_states_sf,
+                token_selected_slots=token_selected_slots,
+                token_final_scales=token_final_scales,
+                all_rank_num_tokens=all_rank_num_tokens,
+                hidden_size=hidden_size,
+                warmup=int(args.warmup),
+                iters=int(args.iters),
+                flush_l2=True,
+            )
 
-            with _nvtx_range(
-                f"{backend_name}:local_batch_size={int(local_num_tokens)}", enabled=nvtx
-            ):
-                nvtx_prefix = f"{backend_name}:local_batch_size={int(local_num_tokens)}"
-                dispatch_us, combine_us = _time_dispatch_and_combine(
-                    backend,
-                    hidden_states=hidden_states,
-                    hidden_states_sf=hidden_states_sf,
-                    token_selected_slots=token_selected_slots,
-                    token_final_scales=token_final_scales,
-                    all_rank_num_tokens=all_rank_num_tokens,
-                    hidden_size=hidden_size,
-                    warmup=int(args.warmup),
-                    iters=int(args.iters),
-                    profile_wrap=(not args.no_profiler_wrap),
-                    nvtx=nvtx,
-                    nvtx_prefix=nvtx_prefix,
-                )
+            iter_stats = bool(args.iter_stats)
+            dispatch_stats = _gather_per_rank(dispatch_times_us, iter_stats=iter_stats)
+            combine_stats = _gather_per_rank(combine_times_us, iter_stats=iter_stats)
 
-            dispatch_stats = _gather_stats_us(dispatch_us)
-            combine_stats = _gather_stats_us(combine_us)
+            # Prepare output
+            output = {
+                "backend": backend_name,
+                "local_batch_size": int(local_num_tokens),
+                "dispatch_us": dispatch_stats,
+                "combine_us": combine_stats,
+            }
+
+            # Add kernel breakdown if requested and available
+            if args.kernel_breakdown and detailed_stats is not None:
+                for category in ("dispatch_kernels", "combine_kernels", "other_kernels"):
+                    kernels = detailed_stats.get(category, [])
+                    for kernel in kernels:
+                        kernel["per_rank"] = _gather_per_rank(
+                            kernel.pop("_times", []), iter_stats=iter_stats
+                        )
+                    output[category] = kernels
 
             if rank == 0:
-                print(
-                    json.dumps(
-                        {
-                            "backend": backend_name,
-                            "local_batch_size": int(local_num_tokens),
-                            "dispatch_us": dispatch_stats,
-                            "combine_us": combine_stats,
-                        },
-                        indent=2,
-                    ),
-                    flush=True,
-                )
+                print(json.dumps(output, indent=2), flush=True)
+                all_results.append(output)
 
             mpi_barrier()
 
-    _profile_stop(not args.no_profiler_wrap)
+    # Write JSON report if requested
+    if rank == 0 and args.output_file and all_results:
+        with open(args.output_file, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"Report written to {args.output_file}", flush=True)
 
     return
 
