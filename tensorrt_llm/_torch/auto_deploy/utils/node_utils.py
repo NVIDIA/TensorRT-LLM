@@ -153,10 +153,12 @@ def get_all_weights_in_subgraph(
 
 def extract_weight_name(node: Node) -> Union[str, bool]:
     try:
-        weight_node = get_weight_node(node)
-    except ValueError:
+        weight_nodes = extract_weight_nodes(node)
+    except Exception:
         return False
-    return weight_node.target
+    if len(weight_nodes.weights) == 0:
+        return False
+    return weight_nodes.weights[0].node_key
 
 
 def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
