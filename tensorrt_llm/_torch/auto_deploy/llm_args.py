@@ -53,6 +53,14 @@ _TRANSFORMS_SHORTCUT_LOOKUP = {
     "use_pt_cache_backend": ("insert_cached_attention.use_pt_cache_backend",),
 }
 
+# Default stages for transforms when created via shortcuts
+_TRANSFORM_DEFAULT_STAGES = {
+    "insert_cached_attention": "cache_init",
+    "transformers_replace_cached_attn": "cache_init",
+    "resize_kv_cache": "cache_init",
+    "compile_model": "compile",
+}
+
 
 def _shortcut_description(description: str, shortcut: str) -> str:
     long_names_str = ", ".join([f"transforms.{k}" for k in _TRANSFORMS_SHORTCUT_LOOKUP[shortcut]])
@@ -276,8 +284,13 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         for shortcut_key, transforms_keys in _TRANSFORMS_SHORTCUT_LOOKUP.items():
             for transform_key in transforms_keys:
                 t_key, config_key = transform_key.split(".")
+
+                # Create the transform config dict if it doesn't exist
                 if t_key not in self.transforms:
-                    continue
+                    self.transforms[t_key] = {}
+                    # Set the default stage for this transform if available
+                    if t_key in _TRANSFORM_DEFAULT_STAGES:
+                        self.transforms[t_key]["stage"] = _TRANSFORM_DEFAULT_STAGES[t_key]
 
                 # first update the transforms config with the shortcut value
                 if shortcut_key in self.model_fields_set:

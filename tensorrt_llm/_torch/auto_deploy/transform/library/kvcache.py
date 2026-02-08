@@ -199,6 +199,11 @@ class InsertCachedAttention(BaseTransform):
         # Register host-side prepare_metadata function for attention descriptor.
         self._process_metadata_host(cm)
 
+        # Configure backend with sequence info (e.g., max_batch_size, max_seq_len)
+        # This must be called BEFORE get_constants() for backends that need these values.
+        if hasattr(attn_descriptor, "configure_from_sequence_info"):
+            attn_descriptor.configure_from_sequence_info(cm.info)
+
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
         for idx, attn_node in enumerate(source_attn_nodes):
