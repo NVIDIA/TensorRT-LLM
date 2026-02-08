@@ -7,7 +7,7 @@ from torch.fx import GraphModule, Node
 from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe import (
     aux_stream_wrapper,
     cuda_stream_manager,
-    record_event_wrapper,
+    record_event_passthrough,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import canonicalize_graph
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -32,12 +32,14 @@ def multi_stream_linear_fake(input, weight0, weight1):
 def replace_multi_stream_linear_with_aux_stream_wrapper(gm: GraphModule) -> Tuple[GraphModule, int]:
     """Traverse ``gm`` and replace all ``auto_deploy::multi_stream_linear`` ops with ``aux_stream_wrapper``.
 
-    The replacement preserves the original args/kwargs of the node.
-    After rewriting, the graph is cleaned and recompiled.
-
-    Args:
-        gm: The FX graph module to transform.
-        aux_stream_wrapper: A callable to replace the custom op with.
+    For each target op we:
+      1. Find the shared input (a node with >1 users, e.g. relu output used
+         by both a main-stream consumer and the target op).
+      2. Insert ``record_event_passthrough`` right after it to mark a CUDA
+         synchronisation point — the aux stream waits for this event before
+         starting.
+      3. Wire the event node into the target op (other users of the shared
+         input are unaffected) and replace the op with ``aux_stream_wrapper``.
 
     Returns:
         A tuple of (gm, num_replaced)
@@ -46,27 +48,34 @@ def replace_multi_stream_linear_with_aux_stream_wrapper(gm: GraphModule) -> Tupl
     num_replaced = 0
 
     # Collect targets first to avoid mutating while iterating
-    target_nodes: list[Node] = []
-    target_nodes = [n for n in graph.nodes if is_op(n, torch.ops.auto_deploy.multi_stream_linear)]
+    target_nodes: list[Node] = [
+        n for n in graph.nodes if is_op(n, torch.ops.auto_deploy.multi_stream_linear)
+    ]
 
     for n in target_nodes:
-        target_input_node = None
+        # Find the shared input — a node consumed by multiple ops.
+        # Analogous to the routing input in the MoE transform.
+        shared_input = None
         for input_node in n.all_input_nodes:
             if len(input_node.users) > 1:
-                target_input_node = input_node
+                shared_input = input_node
                 break
-        if target_input_node is None:
-            raise ValueError(f"Target input node not found for node {n}")
-        with graph.inserting_before(target_input_node):
-            kwargs = target_input_node.kwargs.copy()
-            kwargs["device"] = torch.cuda.current_device()
-            new_node = graph.call_function(
-                record_event_wrapper,
-                args=(target_input_node.target, *target_input_node.args),
-                kwargs=kwargs,
+        if shared_input is None:
+            raise ValueError(f"Shared input node not found for node {n}")
+
+        # Record CUDA event right after the shared input so the aux stream
+        # can start as soon as this dependency is ready, while the main
+        # stream continues with other consumers (e.g. fc2).
+        with graph.inserting_after(shared_input):
+            rec_node = graph.call_function(
+                record_event_passthrough,
+                args=(shared_input,),
+                kwargs={"device": torch.cuda.current_device()},
             )
-            target_input_node.replace_all_uses_with(new_node)
-            graph.erase_node(target_input_node)
+
+        # Wire the event node into the target op only.
+        n.args = tuple(rec_node if arg is shared_input else arg for arg in n.args)
+
         with graph.inserting_after(n):
             new_node = graph.call_function(
                 aux_stream_wrapper, args=(n.target, *n.args), kwargs=n.kwargs
