@@ -543,9 +543,6 @@ class FusedMoEMethodBase(ABC):
 
     def pre_reload_weights(self, module: torch.nn.Module):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            logger.warning(
-                f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
-            )
             # Extract meta tensor from metadata dict
             meta_tensor = metadata['meta']
             param = torch.nn.Parameter(torch.empty_like(meta_tensor,
@@ -1077,23 +1074,19 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                 recipe=(1, 128, 128),
                 num_groups=module.w3_w1_weight.shape[0],
                 is_sfa=False)
-            replace_parameter_and_save_metadata(
-                module, "w3_w1_weight",
-                nn.Parameter(resmoothed_w3_w1_weight, requires_grad=False),
-                module.rebuild_tensor_metadata)
-            transformed_w3_w1_weight_scaling_factor = nn.Parameter(
-                transfromed_w3_w1_scale, requires_grad=False)
-            replace_parameter_and_save_metadata(
-                module, "w3_w1_weight_scaling_factor",
-                transformed_w3_w1_weight_scaling_factor,
-                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module, "w3_w1_weight",
+                                                resmoothed_w3_w1_weight,
+                                                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module,
+                                                "w3_w1_weight_scaling_factor",
+                                                transfromed_w3_w1_scale,
+                                                module.rebuild_tensor_metadata)
 
             resmoothed_w2_weight, resmoothed_w2_scale = resmooth_to_fp8_e8m0(
                 module.w2_weight, module.w2_weight_scaling_factor)
-            replace_parameter_and_save_metadata(
-                module, "w2_weight",
-                nn.Parameter(resmoothed_w2_weight, requires_grad=False),
-                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module, "w2_weight",
+                                                resmoothed_w2_weight,
+                                                module.rebuild_tensor_metadata)
             transfromed_w2_scale = transform_sf_into_required_layout(
                 resmoothed_w2_scale,
                 mn=module.w2_weight.shape[1],
@@ -1101,12 +1094,10 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                 recipe=(1, 128, 128),
                 num_groups=module.w3_w1_weight.shape[0],
                 is_sfa=False)
-            transformed_w2_weight_scaling_factor = nn.Parameter(
-                transfromed_w2_scale, requires_grad=False)
-            replace_parameter_and_save_metadata(
-                module, "w2_weight_scaling_factor",
-                transformed_w2_weight_scaling_factor,
-                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module,
+                                                "w2_weight_scaling_factor",
+                                                transfromed_w2_scale,
+                                                module.rebuild_tensor_metadata)
             self.setup_quant_scales(module)
 
 

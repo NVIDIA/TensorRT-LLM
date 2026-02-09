@@ -3,7 +3,7 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Dict, List, Union
+from typing import Dict, List
 
 import torch
 from torch.nn import functional as F
@@ -416,16 +416,15 @@ def maybe_compiled_cat(tensors, dim):
     return torch.cat(tensors, dim)
 
 
-def replace_parameter_and_save_metadata(module: torch.nn.Module,
-                                        param_name: str,
-                                        new_param: Union[torch.nn.Parameter,
-                                                         torch.Tensor],
-                                        metadata_dict: Dict):
+def replace_parameter_and_save_metadata(
+        module: torch.nn.Module, param_name: str,
+        new_param: torch.nn.Parameter | torch.Tensor, metadata_dict: Dict):
     """
     Replace a parameter in a module and save the metadata of the original parameter.
     On first call: saves original param's meta tensor and new param's tensor, then replaces.
     On subsequent calls: copies new_param data into the saved tensor, then registers it.
     """
+    saved_param = None
     if param_name not in metadata_dict:
         # First time: save original meta tensor and the new param tensor reference
         original_meta = getattr(module, param_name).to("meta")
@@ -440,12 +439,14 @@ def replace_parameter_and_save_metadata(module: torch.nn.Module,
             'meta': original_meta,
             'param': saved_param
         }
-        module.register_parameter(param_name, saved_param)
     else:
         # Subsequent calls: copy new_param into the saved tensor
         saved_param = metadata_dict[param_name]['param']
         if isinstance(new_param, torch.nn.Parameter):
             saved_param.data.copy_(new_param.data)
-        else:
+        elif isinstance(new_param, torch.Tensor):
             saved_param.data.copy_(new_param)
-        module.register_parameter(param_name, saved_param)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+
+    module.register_parameter(param_name, saved_param)
