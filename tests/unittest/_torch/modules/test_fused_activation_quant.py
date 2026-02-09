@@ -42,9 +42,8 @@ skip_unless_fused_relu2_and_fp4_quantize = pytest.mark.skipif(
 )
 
 
-# FP4 E2M1 lookup tables for reference implementation
+# FP4 E2M1 lookup table for reference implementation
 E2M1_BOUNDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
-E2M1_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
 
 
 def relu2(x: torch.Tensor) -> torch.Tensor:
@@ -67,24 +66,6 @@ def cast_to_fp4(weight: torch.Tensor) -> torch.Tensor:
     round_val = torch.any((weight_abs.unsqueeze(-1) == E2M1_BOUNDS.to(device)) * mask, dim=-1)
     fp4_val = (sign_bit * 0b1000 + ord_val + round_val).to(torch.uint8)
     return fp4_val
-
-
-def dequantize_fp4(
-    packed: torch.Tensor, scale: torch.Tensor, scale2: torch.Tensor, m: int, n: int
-) -> torch.Tensor:
-    """Dequantize FP4 packed tensor back to float for comparison."""
-    device = packed.device
-
-    # Unpack FP4 values
-    high = (packed >> 4) & 0x0F
-    low = packed & 0x0F
-
-    idx = torch.empty(m, n, dtype=torch.long, device=device)
-    idx[..., 0::2] = low.long()
-    idx[..., 1::2] = high.long()
-
-    vals = E2M1_VALUES.to(device)[idx]
-    return vals
 
 
 def quantize_nvfp4_ref(

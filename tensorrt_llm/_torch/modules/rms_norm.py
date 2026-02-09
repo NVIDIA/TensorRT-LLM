@@ -82,7 +82,8 @@ class RMSNorm(nn.Module):
             Optional[torch.Tensor],
             _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
     ) -> Union[torch.Tensor, Fp4QuantizedTensor, Tuple[Union[
-            torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]]]:
+            torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]], Tuple[
+                Fp4QuantizedTensor, torch.Tensor, torch.Tensor]]:
         has_residual = residual is not self._ARGUMENT_NOT_SPECIFIED_SENTINEL
         if not has_residual:
             residual = None

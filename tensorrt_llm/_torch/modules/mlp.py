@@ -129,7 +129,8 @@ class MLP(nn.Module):
 
         if not x_flat.is_contiguous():
             x_flat = x_flat.contiguous()
-        if x_flat.dtype != torch.bfloat16:
+
+        if x_flat.dtype not in (torch.float16, torch.bfloat16):
             x_flat = x_flat.to(torch.bfloat16)
 
         fp4_tensor, sf_tensor = torch.ops.trtllm.fused_relu2_quantize(

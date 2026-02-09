@@ -44,7 +44,6 @@ def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias, apply_silu):
     assert conv_weight.shape[0] == dim
     assert conv_weight.shape[1] == 1
     assert conv_weight.shape[2] == dconv
-    assert conv_weight.shape[0] == dim
 
     padded_x = torch.cat([past_conv_state, x], dim=2)
     present_conv_state = padded_x[:, :, -(dconv - 1) :]
