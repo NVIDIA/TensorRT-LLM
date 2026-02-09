@@ -48,7 +48,7 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+def run_cmd(cmd, **kwargs):
     """Run a command and return the result."""
     log(f"[CMD] {' '.join(cmd)}")
     return subprocess.run(cmd, **kwargs)
@@ -70,7 +70,7 @@ def validate_downstream_job_durations(downstream_durations: dict) -> bool:
 
     log(f"Checking {len(MIN_JOB_DURATIONS)} required job(s)...")
 
-    issues: list[str] = []
+    issues = []
     for required_key, min_duration in MIN_JOB_DURATIONS.items():
         # Find matching job by substring match
         matched = None
@@ -116,9 +116,7 @@ def validate_downstream_job_durations(downstream_durations: dict) -> bool:
 # ---------------------------------------------------------------------------
 # Step 2: Get failed stages via bot's failures.py
 # ---------------------------------------------------------------------------
-def get_failed_stages(
-    jenkins_url: str, job_name: str, build_number: str, bot_root: str
-) -> list[str] | None:
+def get_failed_stages(jenkins_url: str, job_name: str, build_number: str, bot_root: str):
     """Retrieve failed stages using the bot's failures.py script.
 
     Returns a list of failed stage names, or None on error.
@@ -165,7 +163,7 @@ def get_failed_stages(
 # ---------------------------------------------------------------------------
 # Step 3: Check whether all failures are post-merge only
 # ---------------------------------------------------------------------------
-def are_all_failures_post_merge(failed_stage_list: list[str]) -> bool:
+def are_all_failures_post_merge(failed_stage_list):
     """Return True if all relevant failures are from post-merge stages."""
     if not failed_stage_list:
         log("✓ No failed stages")
