@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Union
 
+import psutil
 import zmq
 
 from tensorrt_llm.logger import logger
@@ -180,6 +181,13 @@ def worker_main(
         # unless we update it explicitly here.
         os.environ.update(llm_args.env_overrides)
 
+    is_leader: bool = mpi_rank() == 0
+    # increase fi jit compile jobs
+    if is_leader:
+        logger.info(
+            f"Setting FlashInfer JIT MAX_JOBS to max or 16, the cpu count is {os.cpu_count()}, the total memory is {psutil.virtual_memory().total / 1024**3} GB, the available memory is {psutil.virtual_memory().available / 1024**3} GB"
+        )
+    os.environ["MAX_JOBS"] = str(os.cpu_count() or 16)
     if llm_args is not None and llm_args.trust_remote_code:
         _init_hf_modules()
 
@@ -190,7 +198,6 @@ def worker_main(
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
-    is_leader: bool = mpi_rank() == 0
     if tracer_init_kwargs is not None and is_leader:
         tracer = VizTracer(**tracer_init_kwargs)
         tracer.register_exit()
