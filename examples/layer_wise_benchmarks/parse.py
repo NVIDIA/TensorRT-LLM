@@ -100,137 +100,135 @@ json_file_path = nsys_rep_file_path.parent / (
 )
 lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 
-conn = sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True)
+with sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True) as conn:
 
-query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
-df = pd.read_sql_query(query, conn)
-event_id_NvtxDomainCreate = df[df["name"] == "NvtxDomainCreate"].iloc[0]["id"].tolist()
-event_id_NvtxPushPopRange = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
+    query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
+    df = pd.read_sql_query(query, conn)
+    event_id_NvtxDomainCreate = df[df["name"] == "NvtxDomainCreate"].iloc[0]["id"].tolist()
+    event_id_NvtxPushPopRange = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
 
-query = "SELECT domainId FROM NVTX_EVENTS WHERE eventType = ? AND text = ?"
-df = pd.read_sql_query(query, conn, params=(event_id_NvtxDomainCreate, "NCCL"))
-nccl_domain_id = -1 if df.empty else df.iloc[0]["domainId"].tolist()
+    query = "SELECT domainId FROM NVTX_EVENTS WHERE eventType = ? AND text = ?"
+    df = pd.read_sql_query(query, conn, params=(event_id_NvtxDomainCreate, "NCCL"))
+    nccl_domain_id = -1 if df.empty else df.iloc[0]["domainId"].tolist()
 
-query = """SELECT T1.start, T2.value AS text
-    FROM NVTX_EVENTS AS T1
-    JOIN StringIds AS T2 ON T1.textId = T2.id
-    WHERE eventType = ? AND T2.value LIKE ?"""
-df = pd.read_sql_query(query, conn, params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %"))
-problem_start_times: list[int] = []
-problem_set: list[dict] = []
-for start, text in df.itertuples(index=False):
-    if text.startswith("layer_wise_benchmarks args {"):
-        run_args = json.loads(text[len("layer_wise_benchmarks args") :])
-    elif text.startswith("layer_wise_benchmarks problem_spec {"):
-        problem_start_times.append(start)
-        problem_set.append(
-            {
-                "spec": json.loads(text[len("layer_wise_benchmarks problem_spec ") :]),
-                "text": "",
-                "run_starts": [],
-                "run_ends": [],
-                "ranges": [],
-                "kernel_count_per_range": [],
-            }
-        )
-
-query = """SELECT T1.start, T1.end, T2.value AS text
-    FROM NVTX_EVENTS AS T1
-    JOIN StringIds AS T2 ON T1.textId = T2.id
-    WHERE eventType = ? AND T2.value NOT LIKE ? AND domainId != ?"""
-df = pd.read_sql_query(
-    query,
-    conn,
-    params=(event_id_NvtxPushPopRange, "[DG]%", nccl_domain_id),
-)
-for start, end, text in df.itertuples(index=False):
-    problem_id = bisect.bisect(problem_start_times, start) - 1
-    if text.startswith("layer_wise_benchmarks "):
-        if text != "layer_wise_benchmarks ignore":
-            continue
-    else:
-        assert problem_id != -1
-    if re.match(r"b=\d+ s=\d+ ", text):
-        problem_set[problem_id]["text"] = text
-        problem_set[problem_id]["run_starts"].append(start)
-        problem_set[problem_id]["run_ends"].append(end)
-    else:
-        problem_set[problem_id]["ranges"].append(NvtxRange(start, end, text))
-        problem_set[problem_id]["kernel_count_per_range"].append(0)
-
-query = """SELECT name FROM sqlite_master WHERE type = ?"""
-df = pd.read_sql_query(query, conn, params=("table",))
-tables = df["name"].tolist()
-unified_subquery = """SELECT T1.start, T1.end, T1.demangledName, T1.correlationId, T1.graphNodeId
-    FROM CUPTI_ACTIVITY_KIND_KERNEL AS T1"""
-if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:
-    unified_subquery += """ UNION ALL
-        SELECT T2.start, T2.end, -2 AS demangledName, T2.correlationId, T2.graphNodeId
-        FROM CUPTI_ACTIVITY_KIND_MEMCPY AS T2"""
-if "CUPTI_ACTIVITY_KIND_MEMSET" in tables:
-    unified_subquery += """ UNION ALL
-        SELECT T3.start, T3.end, -3 AS demangledName, T3.correlationId, T3.graphNodeId
-        FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3"""
-query = f"""SELECT unified.start, unified.end, unified.demangledName,
-       R.start AS runtime_start, R.start AS capture_start, R.end AS capture_end
-FROM ({unified_subquery}) AS unified
-JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
-WHERE unified.graphNodeId IS NULL"""
-if "CUDA_GRAPH_NODE_EVENTS" in tables:
-    query += f""" UNION ALL
-    SELECT unified.start, unified.end, unified.demangledName,
-           R.start AS runtime_start, CGE2.start AS capture_start, CGE2.end AS capture_end
-    FROM ({unified_subquery}) AS unified
-    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.graphNodeId IS NOT NULL AND
-                                             unified.correlationId = R.correlationId
-    LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
-                                                CGE1.originalGraphNodeId IS NOT NULL
-    LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE2 ON CGE1.originalGraphNodeId = CGE2.graphNodeId"""
-df = pd.read_sql_query(query, conn)
-kernel_records: list[KernelRecord] = []
-for (
-    kernel_start,
-    kernel_end,
-    demangled_name,
-    runtime_start,
-    capture_start,
-    capture_end,
-) in df.itertuples(index=False):
-    problem_id = bisect.bisect(problem_start_times, kernel_start) - 1
-    problem = problem_set[problem_id]
-    run_id = bisect.bisect(problem["run_starts"], runtime_start) - 1
-    if run_id == -1 or runtime_start >= problem["run_ends"][run_id]:
-        continue
-    matching_range_indices = [
-        i
-        for i, nvtx_range in enumerate(problem["ranges"])
-        if capture_start >= nvtx_range.start and capture_end <= nvtx_range.end
-    ]
-    for range_idx in matching_range_indices:
-        problem["kernel_count_per_range"][range_idx] += 1
-    range_names = tuple(problem["ranges"][i].text for i in matching_range_indices)
-    if (
-        args.module is None or args.module in range_names
-    ) and "layer_wise_benchmarks ignore" not in range_names:
-        kernel_records.append(
-            KernelRecord(
-                problem_id=problem_id,
-                run_id=run_id,
-                range_names=range_names,
-                kernel_start=kernel_start,
-                kernel_end=kernel_end,
-                demangled_name=demangled_name,
-                runtime_start=runtime_start,
-                capture_start=capture_start,
+    query = """SELECT T1.start, T2.value AS text
+        FROM NVTX_EVENTS AS T1
+        JOIN StringIds AS T2 ON T1.textId = T2.id
+        WHERE eventType = ? AND T2.value LIKE ?"""
+    df = pd.read_sql_query(query, conn, params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %"))
+    problem_start_times: list[int] = []
+    problem_set: list[dict] = []
+    for start, text in df.itertuples(index=False):
+        if text.startswith("layer_wise_benchmarks args {"):
+            run_args = json.loads(text[len("layer_wise_benchmarks args") :])
+        elif text.startswith("layer_wise_benchmarks problem_spec {"):
+            problem_start_times.append(start)
+            problem_set.append(
+                {
+                    "spec": json.loads(text[len("layer_wise_benchmarks problem_spec ") :]),
+                    "text": "",
+                    "run_starts": [],
+                    "run_ends": [],
+                    "ranges": [],
+                    "kernel_count_per_range": [],
+                }
             )
-        )
 
-query = "SELECT * FROM StringIds"
-df = pd.read_sql_query(query, conn)
-string_ids = dict(zip(df["id"], df["value"]))
-string_ids.update({-2: "Memcpy", -3: "Memset"})
+    query = """SELECT T1.start, T1.end, T2.value AS text
+        FROM NVTX_EVENTS AS T1
+        JOIN StringIds AS T2 ON T1.textId = T2.id
+        WHERE eventType = ? AND T2.value NOT LIKE ? AND domainId != ?"""
+    df = pd.read_sql_query(
+        query,
+        conn,
+        params=(event_id_NvtxPushPopRange, "[DG]%", nccl_domain_id),
+    )
+    for start, end, text in df.itertuples(index=False):
+        problem_id = bisect.bisect(problem_start_times, start) - 1
+        if text.startswith("layer_wise_benchmarks "):
+            if text != "layer_wise_benchmarks ignore":
+                continue
+        else:
+            assert problem_id != -1
+        if re.match(r"b=\d+ s=\d+ ", text):
+            problem_set[problem_id]["text"] = text
+            problem_set[problem_id]["run_starts"].append(start)
+            problem_set[problem_id]["run_ends"].append(end)
+        else:
+            problem_set[problem_id]["ranges"].append(NvtxRange(start, end, text))
+            problem_set[problem_id]["kernel_count_per_range"].append(0)
 
-conn.close()
+    query = """SELECT name FROM sqlite_master WHERE type = ?"""
+    df = pd.read_sql_query(query, conn, params=("table",))
+    tables = df["name"].tolist()
+    unified_subquery = """SELECT T1.start, T1.end, T1.demangledName, T1.correlationId, T1.graphNodeId
+        FROM CUPTI_ACTIVITY_KIND_KERNEL AS T1"""
+    if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:
+        unified_subquery += """ UNION ALL
+            SELECT T2.start, T2.end, -2 AS demangledName, T2.correlationId, T2.graphNodeId
+            FROM CUPTI_ACTIVITY_KIND_MEMCPY AS T2"""
+    if "CUPTI_ACTIVITY_KIND_MEMSET" in tables:
+        unified_subquery += """ UNION ALL
+            SELECT T3.start, T3.end, -3 AS demangledName, T3.correlationId, T3.graphNodeId
+            FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3"""
+    query = f"""SELECT unified.start, unified.end, unified.demangledName,
+           R.start AS runtime_start, R.start AS capture_start, R.end AS capture_end
+    FROM ({unified_subquery}) AS unified
+    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
+    WHERE unified.graphNodeId IS NULL"""
+    if "CUDA_GRAPH_NODE_EVENTS" in tables:
+        query += f""" UNION ALL
+        SELECT unified.start, unified.end, unified.demangledName,
+               R.start AS runtime_start, CGE2.start AS capture_start, CGE2.end AS capture_end
+        FROM ({unified_subquery}) AS unified
+        JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.graphNodeId IS NOT NULL AND
+                                                 unified.correlationId = R.correlationId
+        LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
+                                                    CGE1.originalGraphNodeId IS NOT NULL
+        LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE2 ON CGE1.originalGraphNodeId = CGE2.graphNodeId"""
+    df = pd.read_sql_query(query, conn)
+    kernel_records: list[KernelRecord] = []
+    for (
+        kernel_start,
+        kernel_end,
+        demangled_name,
+        runtime_start,
+        capture_start,
+        capture_end,
+    ) in df.itertuples(index=False):
+        problem_id = bisect.bisect(problem_start_times, kernel_start) - 1
+        problem = problem_set[problem_id]
+        run_id = bisect.bisect(problem["run_starts"], runtime_start) - 1
+        if run_id == -1 or runtime_start >= problem["run_ends"][run_id]:
+            continue
+        matching_range_indices = [
+            i
+            for i, nvtx_range in enumerate(problem["ranges"])
+            if capture_start >= nvtx_range.start and capture_end <= nvtx_range.end
+        ]
+        for range_idx in matching_range_indices:
+            problem["kernel_count_per_range"][range_idx] += 1
+        range_names = tuple(problem["ranges"][i].text for i in matching_range_indices)
+        if (
+            args.module is None or args.module in range_names
+        ) and "layer_wise_benchmarks ignore" not in range_names:
+            kernel_records.append(
+                KernelRecord(
+                    problem_id=problem_id,
+                    run_id=run_id,
+                    range_names=range_names,
+                    kernel_start=kernel_start,
+                    kernel_end=kernel_end,
+                    demangled_name=demangled_name,
+                    runtime_start=runtime_start,
+                    capture_start=capture_start,
+                )
+            )
+
+    query = "SELECT * FROM StringIds"
+    df = pd.read_sql_query(query, conn)
+    string_ids = dict(zip(df["id"], df["value"]))
+    string_ids.update({-2: "Memcpy", -3: "Memset"})
 
 # Check ambiguous modules
 if args.module:
