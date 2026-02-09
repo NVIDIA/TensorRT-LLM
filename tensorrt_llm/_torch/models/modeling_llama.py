@@ -166,6 +166,7 @@ class Llama4Attention(Attention):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         all_reduce_params: Optional[AllReduceParams] = None,
+        allow_window_output: Optional[bool] = None,
         skip_attn_scaling: bool = False,
     ):
 
@@ -191,7 +192,8 @@ class Llama4Attention(Attention):
             attn_output = Fp4QuantizedTensor(attn_output[0], attn_output[1])
 
         attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
+                                  all_reduce_params=all_reduce_params,
+                                  allow_window_output=allow_window_output)
 
         return attn_output
 
@@ -203,6 +205,7 @@ class Llama4Attention(Attention):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         all_reduce_params: Optional[AllReduceParams] = None,
+        allow_window_output: Optional[bool] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -214,6 +217,7 @@ class Llama4Attention(Attention):
                 attn_metadata=attn_metadata,
                 attention_mask=attention_mask,
                 all_reduce_params=all_reduce_params,
+                allow_window_output=allow_window_output,
                 lora_params=lora_params,
                 **kwargs,
             )
@@ -222,7 +226,8 @@ class Llama4Attention(Attention):
                                       hidden_states=hidden_states,
                                       attn_metadata=attn_metadata,
                                       attention_mask=attention_mask,
-                                      all_reduce_params=all_reduce_params)
+                                      all_reduce_params=all_reduce_params,
+                                      allow_window_output=allow_window_output)
 
 
 class LlamaAttention(Attention):
