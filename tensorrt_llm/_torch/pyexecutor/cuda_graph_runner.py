@@ -79,6 +79,7 @@ class CUDAGraphRunnerConfig:
     dist: Optional[Distributed]
     kv_cache_manager_key: Any
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
+    capture_flashinfer_allreduce_workspace: bool = False
 
 
 class CUDAGraphRunner:
@@ -344,12 +345,10 @@ class CUDAGraphRunner:
             return forward_fn(capture_inputs)
 
         def _maybe_add_flashinfer_allreduce_context():
-            #Use self.config here
-            import os
-            if os.getenv("_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1":
+            if self.config.capture_flashinfer_allreduce_workspace:
                 from ..flashinfer_utils import \
-                    current_flashinfer_allreduce_workspace
-                return current_flashinfer_allreduce_workspace().capture()
+                    get_current_flashinfer_allreduce_workspace
+                return get_current_flashinfer_allreduce_workspace().capture()
             else:
                 return contextlib.nullcontext()
 
