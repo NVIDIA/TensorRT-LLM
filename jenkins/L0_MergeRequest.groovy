@@ -10,18 +10,25 @@ import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 
 // LLM repository configuration
+@Field String LLM_REPO
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
-LLM_ROOT = "llm"
+@Field String LLM_ROOT = "llm"
 
-// LLM repository configuration
+@Field String BOT_REPO = "https://gitlab-master.nvidia.com/ftp/llm-bloom-bot.git"
+@Field String BOT_REVISION = "master"
+@Field String BOT_ROOT = "bot"
+
+// Scan repository configuration
 withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
     SCAN_REPO = "${DEFAULT_SCAN_REPO}"
 }
 SCAN_COMMIT = "main"
 SCAN_ROOT = "scan"
 
+// Note: These variables access 'env' which is only available during pipeline execution
+// so they cannot be @Field with initialization
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
@@ -146,12 +153,28 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TARGET_BRANCH = "target_branch"
+@Field
+def DOWNSTREAM_JOB_DURATION = "downstream_job_duration"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
+    (DOWNSTREAM_JOB_DURATION): [:],
+]
+
+@Field
+def IGNORED_JOBS_FOR_TAG = ["BuildDockerImages"]
+
+@Field
+def MIN_JOB_DURATIONS = [
+    "Build-x86_64": 10,
+    "Build-SBSA": 10,
+    "Test-x86_64-Single-GPU": 50,
+    "Test-x86_64-Multi-GPU": 50,
+    "Test-SBSA-Single-GPU": 40,
+    "Test-SBSA-Multi-GPU": 40,
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -213,7 +236,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     case "agent":
         containerConfig = """
                   - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: urm.nvidia.com/sw-tensorrt-docker-local/alpine-golem:latest
                     command: ['cat']
                     tty: true
                     resources:
@@ -834,7 +857,7 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
-def collectTestResults(pipeline, testFilter)
+def collectTestResults(pipeline, testFilter, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
@@ -868,6 +891,12 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+            stage("Update GitHub Tag") {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
+                updateGithubTagCommit(pipeline, globalVars)
+            }
+        }
         stage("Collect Perf Regression Result") {
             def yamlFiles = sh(
                 returnStdout: true,
@@ -978,7 +1007,7 @@ def getCommonParameters()
     ]
 }
 
-def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
+def triggerJob(jobName, parameters, globalVars, jenkinsUrl = "", credentials = "")
 {
     if (jenkinsUrl == "" && env.localJobCredentials) {
         jenkinsUrl = env.JENKINS_URL
@@ -995,6 +1024,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
             abortTriggeredJob: true,
         )
         status = handle.getBuildResult().toString()
+        globalVars[DOWNSTREAM_JOB_DURATION][jobName] = handle.getBuildDuration() / 1000 / 60 // Convert to minutes
     } else {
         def handle = build(
             job: jobName,
@@ -1003,6 +1033,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
         )
         echo "Triggered job: ${handle.absoluteUrl}"
         status = handle.result
+        globalVars[DOWNSTREAM_JOB_DURATION][jobName] = handle.duration / 1000 / 60 // Convert to minutes
     }
     return status
 }
@@ -1039,7 +1070,7 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
 
     echo "Trigger ${jobName} job, params: ${parameters}"
 
-    def status = triggerJob(jobName, parameters)
+    def status = triggerJob(jobName, parameters, globalVars)
     if (status != "SUCCESS") {
         error "Downstream job did not succeed"
     }
@@ -1306,6 +1337,244 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     pipeline.parallel parallelJobs
 }
 
+/**
+ * Retrieve failed stages from the current build using the bot's failures.py script
+ */
+def getFailedStages() {
+    def status = sh(
+        script: """rm -f failed_stages.json failed_stages_error.txt && \
+            python3 ${BOT_ROOT}/bin/failures.py \
+                --jenkins-url ${JENKINS_URL} \
+                --build-path ${env.JOB_NAME} \
+                --build-number ${env.BUILD_NUMBER} \
+                --json \
+                > failed_stages.json 2>failed_stages_error.txt""",
+        returnStatus: true,
+        label: "Retrieving failed stages"
+    )
+
+    if (status != 0) {
+        echo "ERROR: Failed to retrieve failed stages (exit code: ${status})"
+        sh "cat failed_stages_error.txt 2>/dev/null || true"
+        sh "cat failed_stages.json 2>/dev/null || true"
+        return null
+    }
+
+    def failedStageList = readJSON(file: "failed_stages.json", returnPojo: true)["failed_stage_list"] ?: []
+    echo "Found ${failedStageList.size()} failed stage(s): ${failedStageList.join(', ')}"
+    return failedStageList
+}
+
+/**
+ * Validate that all required pre-merge jobs were executed with sufficient duration
+ *
+ * This ensures:
+ * 1. All jobs in MIN_JOB_DURATIONS were actually executed
+ * 2. Each job ran for at least the minimum required time
+ *
+ * If any required job is missing or ran too quickly (startup failure), tag update is blocked.
+ * This validation is INDEPENDENT of which stages failed - it's a completeness check.
+ *
+ * Note: Duration = actual execution time (queue time excluded)
+ */
+def validateDownstreamJobDurations(globalVars) {
+    echo "=== Validating Required Job Execution (excludes queue time) ==="
+
+    def downstreamDurations = globalVars.get(DOWNSTREAM_JOB_DURATION, [:])
+
+    if (downstreamDurations.isEmpty()) {
+        echo "❌ No downstream job data available"
+        return false
+    }
+
+    echo "Checking ${MIN_JOB_DURATIONS.size()} required job(s)..."
+
+    def issues = []
+    MIN_JOB_DURATIONS.each { requiredJobKey, minDuration ->
+        // Find matching job in downstream durations
+        def matchedEntry = downstreamDurations.find { actualJobName, duration ->
+            actualJobName.contains(requiredJobKey) || requiredJobKey.contains(actualJobName)
+        }
+
+        if (!matchedEntry) {
+            issues.add("${requiredJobKey}: Not executed (missing from downstream jobs)")
+            echo "❌ ${requiredJobKey}: NOT FOUND - job was not executed"
+            return
+        }
+
+        def actualJobName = matchedEntry.key
+        def actualDuration = matchedEntry.value
+
+        if (actualDuration < minDuration) {
+            issues.add("${requiredJobKey}: ${actualDuration}min < ${minDuration}min (likely startup failure)")
+            echo "❌ ${requiredJobKey}: Only ${actualDuration}min (expected ≥${minDuration}min)"
+        } else {
+            echo "✓ ${requiredJobKey}: ${actualDuration}min"
+        }
+    }
+
+    if (!issues.isEmpty()) {
+        echo ""
+        echo "❌ Validation FAILED - ${issues.size()} issue(s) detected:"
+        issues.each { echo "  - ${it}" }
+        echo ""
+        echo "Cannot update tag: Required jobs missing or failed too quickly"
+        return false
+    }
+
+    echo "✓ All ${MIN_JOB_DURATIONS.size()} required jobs executed successfully with sufficient duration"
+    return true
+}
+
+/**
+ * Check if all relevant failures are post-merge stages
+ *
+ * Returns true if:
+ * - No failed stages exist
+ * - All failures are from ignored jobs (e.g., BuildDockerImages)
+ * - All relevant failures are post-merge tests
+ */
+def areAllFailuresPostMerge(failedStageList) {
+    if (!failedStageList) {
+        echo "✓ No failed stages"
+        return true
+    }
+
+    // Filter out ignored jobs from the failed stage list
+    def relevantFailedStages = failedStageList.findAll { stageName ->
+        !IGNORED_JOBS_FOR_TAG.any { ignored -> stageName.contains(ignored) }
+    }
+
+    if (relevantFailedStages.isEmpty()) {
+        echo "✓ All failures are from ignored jobs"
+        return true
+    }
+
+    // Separate pre-merge and post-merge failures
+    def premergeFailures = relevantFailedStages.findAll {
+        !it.contains("Post-Merge") && !it.contains("post-merge")
+    }
+    def postmergeFailures = relevantFailedStages.size() - premergeFailures.size()
+
+    echo "Relevant failures: ${relevantFailedStages.size()} total (${premergeFailures.size()} pre-merge, ${postmergeFailures} post-merge)"
+
+    if (premergeFailures.isEmpty()) {
+        echo "✓ Only post-merge failures: ${relevantFailedStages.join(', ')}"
+        return true
+    }
+
+    echo "❌ Found pre-merge failures: ${premergeFailures.join(', ')}"
+    return false
+}
+
+/**
+ * Create/update GitHub tag 'latest-ci-stable-commit-<branch>' for the current commit
+ */
+def createGithubTag(globalVars) {
+    def commitSha = env.gitlabCommit
+    def prNumber = globalVars[GITHUB_PR_API_URL].split('/').last()
+    def targetBranch = env.gitlabTargetBranch ?: (globalVars[TARGET_BRANCH] ?: "main")
+    def tagName = "latest-ci-stable-commit-${targetBranch}"
+
+    echo "Creating tag '${tagName}' for PR #${prNumber} at ${commitSha}"
+
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'GITHUB_USER',
+            passwordVariable: 'GITHUB_TOKEN'
+        )
+    ]) {
+        // Use single quotes to avoid Groovy string interpolation security warning
+        // Clone repo with minimal depth to save time and space
+        def tagResult = sh(
+            script: '''#!/bin/sh
+                set -e
+
+                # Install git-lfs if needed
+                which git-lfs || apk add --no-cache git-lfs || true
+
+                # Clone repo (shallow clone for speed)
+                rm -rf repo
+                git clone --depth=1 --no-checkout ''' + LLM_REPO + ''' repo
+                cd repo
+
+                git config --global user.email "90828364+tensorrt-cicd@users.noreply.github.com"
+                git config --global user.name "tensorrt-cicd"
+
+                # Fetch the specific commit
+                git fetch origin ''' + commitSha + ''' --depth=1 || git fetch origin --unshallow
+
+                # Delete existing remote tag if present
+                git push https://${GITHUB_TOKEN}@github.com/NVIDIA/TensorRT-LLM.git :refs/tags/''' + tagName + ''' 2>/dev/null || true
+
+                # Create new tag (annotated)
+                git tag -a ''' + tagName + ''' ''' + commitSha + ''' -m "Pre-merge tests passed for PR #''' + prNumber + '''"
+
+                # Push tag to GitHub
+                git push https://${GITHUB_TOKEN}@github.com/NVIDIA/TensorRT-LLM.git ''' + tagName + '''
+            ''',
+            returnStatus: true,
+            label: "Creating GitHub tag ${tagName}"
+        )
+
+        if (tagResult == 0) {
+            echo "Successfully created GitHub tag: ${tagName}"
+            return true
+        }
+
+        echo "WARNING: Failed to create GitHub tag: ${tagName}"
+        return false
+    }
+}
+
+/**
+ * Check if pre-merge tests passed and update GitHub tag accordingly
+ * @param pipeline Pipeline object
+ * @param globalVars Global variables map
+ * @return true if tag is successfully updated, false otherwise
+ */
+def updateGithubTagCommit(pipeline, globalVars) {
+    if (!globalVars[GITHUB_PR_API_URL]) {
+        echo "Not a GitHub PR - skipping tag update"
+        return false
+    }
+
+    def buildResult = currentBuild.result ?: 'SUCCESS'
+    echo "=== GitHub Tag Update Check (${buildResult}) ==="
+
+    // Fast path: SUCCESS -> update tag directly
+    if (buildResult == 'SUCCESS') {
+        echo "✓ Pipeline succeeded - updating tag"
+        return createGithubTag(globalVars)
+    }
+
+    // Slow path: Analyze failures
+    echo "Analyzing failures to determine if only post-merge tests failed..."
+    trtllm_utils.checkoutSource(BOT_REPO, BOT_REVISION, BOT_ROOT)
+
+    // Step 1: Validate that all required jobs were executed with sufficient duration
+    if (!validateDownstreamJobDurations(globalVars)) {
+        return false
+    }
+
+    // Step 2: Check which stages failed
+    def failedStageList = getFailedStages()
+    if (!failedStageList || failedStageList.isEmpty()) {
+        echo "❌ Cannot retrieve failure information - skipping tag update"
+        return false
+    }
+
+    // Step 3: Check if only post-merge tests failed
+    if (!areAllFailuresPostMerge(failedStageList)) {
+        echo "❌ Found pre-merge failures: ${failedStageList.join(', ')}"
+        return false
+    }
+
+    echo "✓ Only post-merge failures detected - updating tag"
+    return createGithubTag(globalVars)
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -1338,7 +1607,7 @@ pipeline {
         always {
             script {
                 if (!isReleaseCheckMode) {
-                    collectTestResults(this, testFilter)
+                    collectTestResults(this, testFilter, globalVars)
                 }
             }
         }
