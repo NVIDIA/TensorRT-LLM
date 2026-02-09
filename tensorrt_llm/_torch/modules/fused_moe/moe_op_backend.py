@@ -458,7 +458,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
     ):
-        hidden_size = hidden_states.shape[-1]
+        hidden_size = gemm1_weights.shape[-1] * 2
         if hidden_states.dtype == torch.uint8 or hidden_states.dtype == torch.float8_e4m3fn:
             if (
                 gemm1_weights_scale is not None
@@ -505,7 +505,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                         final_hidden_states = final_hidden_states[
                             :, :valid_hidden_size
                         ].contiguous()
-                        return final_hidden_states
+                    return final_hidden_states
             elif (
                 gemm1_weights_scale is not None
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
@@ -806,32 +806,56 @@ class FlashinferOpBackend(MoEOpBackend):
         enable_pdl=None,
         tune_max_num_tokens=8192,
     ):
-        assert topk_weights is not None and topk_ids is not None, (
-            "topk_weights and topk_ids must be provided None"
-        )
-        return self._fused_moe.trtllm_fp8_block_scale_moe(
-            router_logits,
-            routing_bias,
-            hidden_states,
-            hidden_states_scale,
-            gemm1_weights,
-            gemm1_weights_scale,
-            gemm2_weights,
-            gemm2_weights_scale,
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            intermediate_size,
-            local_expert_offset,
-            local_num_experts,
-            routed_scaling_factor,
-            routing_method_type,
-            use_shuffled_weight=use_shuffled_weight,
-            weight_layout=weight_layout,
-            enable_pdl=enable_pdl,
-            tune_max_num_tokens=tune_max_num_tokens,
-        )
+        if router_logits is not None:
+            return self._fused_moe.trtllm_fp8_block_scale_moe(
+                router_logits,
+                routing_bias,
+                hidden_states,
+                hidden_states_scale,
+                gemm1_weights,
+                gemm1_weights_scale,
+                gemm2_weights,
+                gemm2_weights_scale,
+                num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                intermediate_size,
+                local_expert_offset,
+                local_num_experts,
+                routed_scaling_factor,
+                self.cvt_routing_method_type(routing_method_type),
+                use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
+                enable_pdl=enable_pdl,
+                tune_max_num_tokens=tune_max_num_tokens,
+            )
+        else:
+            packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
+            # Run with pre-computed routing (packed format)
+            return self._fused_moe.trtllm_fp8_block_scale_routed_moe(
+                topk_ids=packed_topk_ids,
+                routing_bias=routing_bias,
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+                gemm1_weights=gemm1_weights,
+                gemm1_weights_scale=gemm1_weights_scale,
+                gemm2_weights=gemm2_weights,
+                gemm2_weights_scale=gemm2_weights_scale,
+                num_experts=num_experts,
+                top_k=top_k,
+                n_group=n_group,
+                topk_group=topk_group,
+                intermediate_size=intermediate_size,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=num_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=self.cvt_routing_method_type(routing_method_type),
+                use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
+                enable_pdl=enable_pdl,
+                tune_max_num_tokens=tune_max_num_tokens,
+            )
 
     def run_fp4_block_scale_moe(
         self,
