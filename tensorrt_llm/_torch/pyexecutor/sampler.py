@@ -1771,10 +1771,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         Note: To defer the decision whether or not to skip BeamHistory construction until update_requests(), only
               a builder (BeamHistoryBuilder) is returned here. The builder contains host tensors which are
-              being populated asynchronously. Hence, it can only be invoked after async D2H copies have completed.
+              being populated asynchronously. Hence, it can only be invoked after async D2H copies have completed,
+              e.g., after awaiting state.sampler_event in update_requests.
 
         arguments:
             request: The request to create the beam history for
+            finish_reasons: The first finish reason encountered for each beam of the request.
+                            Shape: (max_tokens, max_beam_width)
         """
 
         # Gather data used for skipping beam history processing
