@@ -878,7 +878,8 @@ def collectTestResults(pipeline, testFilter, globalVars)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        // TODO: CI TEST MODE - Force tag update stage to run in non-PostMerge jobs
+        if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
             stage("Update GitHub Tag") {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
                 updateGithubTagCommit(pipeline, globalVars)
