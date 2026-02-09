@@ -16,7 +16,8 @@ def parse_name(classname, name, filename):
         return filename + "::" + name
 
 
-def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList):
+def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
+                              test_type):
     # Generate rerun test lists:
     # 1. Parse the test results xml file
     # 2. For failed tests:
@@ -64,6 +65,37 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList):
     for filename in [rerun_0_filename, rerun_1_filename, rerun_2_filename]:
         if os.path.getsize(filename) == 0:
             os.remove(filename)
+
+    # If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
+    # fail the stage immediately without attempting any reruns
+    if os.path.exists(rerun_0_filename):
+        with open(rerun_0_filename, 'r') as f:
+            print(f.read())
+            print(
+                "There are some failed tests that cannot be rerun, skip the rerun step."
+            )
+            exit(1)
+
+    # If the stage has more than 5 failed tests, skip the rerun step
+    validLineCount = 0
+    for times in [1, 2]:
+        rerun_filename = os.path.join(outdir, f"rerun_{times}.txt")
+        if os.path.exists(rerun_filename):
+            count = 0
+            with open(rerun_filename) as f:
+                count = sum(1 for _ in f)
+            print(f"Found {count} {test_type} tests to rerun {times} time(s)")
+            validLineCount += count
+    if validLineCount > 5:
+        print(
+            f"There are more than 5 failed {test_type} tests, skip the rerun step."
+        )
+        exit(1)
+    elif validLineCount == 0:
+        print(
+            f"No failed {test_type} tests need to be rerun, skip the rerun step."
+        )
+        exit(1)
 
 
 def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
@@ -421,10 +453,13 @@ if __name__ == '__main__':
         parser.add_argument('--fail-signatures',
                             required=True,
                             help='List of failure signatures to match')
+        parser.add_argument('--test-type',
+                            required=True,
+                            help='Test type: regular or isolated')
         args = parser.parse_args(sys.argv[2:])
         failSignaturesList = args.fail_signatures.split(',')
         generate_rerun_tests_list(args.output_dir, args.input_file,
-                                  failSignaturesList)
+                                  failSignaturesList, args.test_type)
 
     elif (sys.argv[1] == "merge_junit_xmls"):
         parser = argparse.ArgumentParser()

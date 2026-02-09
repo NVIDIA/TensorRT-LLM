@@ -18,8 +18,10 @@ set_value_in_command() {
 
     # Check if placeholder exists
     if [[ "$command" != *"$placeholder"* ]]; then
-        echo "Error: placeholder '$placeholder' not found in the command" >&2
-        return 1
+        # If placeholder not found, return the original command without error
+        echo "Placeholder '$placeholder' not found in the command" >&2
+        echo "$command"
+        exit 0
     fi
 
     # Replace all occurrences
