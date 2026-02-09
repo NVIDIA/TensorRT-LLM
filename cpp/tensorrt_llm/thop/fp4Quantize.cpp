@@ -238,9 +238,11 @@ at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<a
 // X: [M, KQ], bf16
 // reorder_index: [KQ], int16
 // KE: int, residual dimension, grouped by 16 and interleaved with last KQ dimensions.
+// is_act: bool, if true, quantize the activation with residual,
+// otherwise quantize the weight with duplication.
 // [KQ - KE, KQ_b0, KE_b0, KQ_b1, KE_b1, ...] KQ_bi and KE_bi have size 16.
 std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
-    at::Tensor const& X, at::Tensor const& reorder_index, int64_t KE)
+    at::Tensor const& X, at::Tensor const& reorder_index, int64_t KE, bool is_act)
 {
     CHECK_TH_CUDA(X);
     CHECK_CONTIGUOUS(X);
@@ -248,6 +250,8 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
 
     int const M = X.size(0);
     int const KQ = X.size(1);
+    TORCH_CHECK(KQ % 16 == 0, "KQ must be divisible by 16");
+    TORCH_CHECK(KQ <= 16384, "KQ must be less than or equal to 16384");
     int const K = KQ + KE;
 
     auto QX = at::detail::empty_cuda({M, K / 2}, FLOAT4_E2M1X2, X.device(), std::nullopt);
@@ -256,12 +260,24 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
     int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(M, K / 16)
                                         : tensorrt_llm::computeLinearLayoutSFSize(M, K / 16);
     auto SFX = at::detail::empty_cuda({SFSize}, SF_DTYPE, X.device(), std::nullopt);
+    SFX.zero_();
 
     auto ptr_X = reinterpret_cast<int16_t*>(X.data_ptr());
     auto ptr_idx = reinterpret_cast<int16_t*>(reorder_index.data_ptr());
     auto ptr_QX = reinterpret_cast<uint8_t*>(QX.data_ptr());
     auto ptr_SFX = reinterpret_cast<uint8_t*>(SFX.data_ptr());
-    tensorrt_llm::kernels::run_reorder_activation_nvfp4<__nv_bfloat16, 16>(ptr_X, ptr_idx, ptr_QX, ptr_SFX, M, KQ, KE);
+
+    if (is_act)
+    {
+        tensorrt_llm::kernels::run_quantize_reorder_nvfp4<__nv_bfloat16, 16, tensorrt_llm::kernels::ArcQuantType::ACT>(
+            ptr_X, ptr_idx, ptr_QX, ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+    }
+    else
+    {
+        tensorrt_llm::kernels::run_quantize_reorder_nvfp4<__nv_bfloat16, 16,
+            tensorrt_llm::kernels::ArcQuantType::WEIGHT>(
+            ptr_X, ptr_idx, ptr_QX, ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+    }
     return std::make_tuple(QX, SFX);
 }
 } // namespace torch_ext
@@ -274,7 +290,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
         "isSfSwizzledLayout=True) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
-    m.def("fp4_quantize_with_reorder_residual(Tensor X, Tensor reorder_index, int KE) -> (Tensor, Tensor)");
+    m.def(
+        "fp4_quantize_with_reorder_residual(Tensor X, Tensor reorder_index, int KE, bool is_act) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
