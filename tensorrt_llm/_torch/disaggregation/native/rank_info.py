@@ -3,7 +3,8 @@ from typing import List, Optional
 
 import msgpack
 
-from tensorrt_llm._torch.disaggregation.native.region.aux import AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.region.auxiliary import AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.region.page import KVCachePageTable
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVPoolAttrs
 
 
@@ -57,6 +58,7 @@ class RankInfo:
     transfer_engine_info: bytes
     aux_meta: Optional[AuxBufferMeta] = None
     kv_pool_attrs: Optional[KVPoolAttrs] = None
+    page_table: Optional[KVCachePageTable] = None
 
     @property
     def kv_factor(self) -> int:
@@ -68,11 +70,13 @@ class RankInfo:
         data["kv_pool_attrs"] = (
             self.kv_pool_attrs.to_dict() if self.kv_pool_attrs is not None else None
         )
+        data["page_table"] = self.page_table.to_bytes()
         return msgpack.packb(data)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
+        unpacked["page_table"] = KVCachePageTable.from_bytes(unpacked["page_table"])
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
         if unpacked.get("kv_pool_attrs") is not None:

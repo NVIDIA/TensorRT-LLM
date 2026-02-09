@@ -1,6 +1,7 @@
 import pytest
 
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor_v2 import build_page_table
+from tensorrt_llm._torch.pyexecutor.resource_manager import Role
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
@@ -18,8 +19,8 @@ def simple_manager():
             sliding_window_size=None,
             num_sink_tokens=0,
             buffers=[
-                BufferConfig(role=0, size=8192),
-                BufferConfig(role=1, size=8192),
+                BufferConfig(role=Role.KEY, size=8192),
+                BufferConfig(role=Role.VALUE, size=8192),
             ],
         ),
         AttentionLayerConfig(
@@ -27,8 +28,8 @@ def simple_manager():
             sliding_window_size=None,
             num_sink_tokens=0,
             buffers=[
-                BufferConfig(role=0, size=8192),
-                BufferConfig(role=1, size=8192),
+                BufferConfig(role=Role.KEY, size=8192),
+                BufferConfig(role=Role.VALUE, size=8192),
             ],
         ),
     ]

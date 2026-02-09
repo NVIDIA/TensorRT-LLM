@@ -32,10 +32,13 @@ from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, de
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import InstanceInfo, RankInfo
-from tensorrt_llm._torch.disaggregation.native.region.aux import AuxBuffer
+from tensorrt_llm._torch.disaggregation.native.region.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    build_page_table,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
@@ -1557,6 +1560,7 @@ class TransferWorker:
             transfer_engine_info=bytes(),
             aux_meta=self._aux_buffer.meta if self._aux_buffer is not None else None,
             kv_pool_attrs=kv_pool_attrs,
+            page_table=build_page_table(self._kv_cache_manager),
         )
 
     def _register_kv_cache(self):

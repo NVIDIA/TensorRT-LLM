@@ -54,6 +54,7 @@ def make_rankinfo(
         transfer_engine_info=b"",
         aux_meta=None,
         kv_pool_attrs=None,
+        page_table=None,
     )
 
 

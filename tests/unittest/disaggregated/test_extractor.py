@@ -1,13 +1,14 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
+from tensorrt_llm._torch.disaggregation.base.region import DataRole, MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVPoolAttrs,
     KVRegionExtractorV1,
     LayerGroupAttrs,
     MambaLayerGroupAttrs,
     PoolRole,
+    build_page_table,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
@@ -527,3 +528,54 @@ def test_kv_pool_attrs_with_mamba_layer_group_serialization():
     assert isinstance(g1, MambaLayerGroupAttrs)
     assert g1.conv_section_bytes_per_rank == [32, 32, 64]
     assert g1.d_conv == 4
+
+
+@pytest.mark.cuda
+def test_build_page_table():
+    num_layers = 8
+    num_kv_heads = 8
+    head_dim = 128
+    tokens_per_block = 64
+    max_tokens = 3200
+
+    kv_cache_config = KvCacheConfig(max_tokens=max_tokens)
+
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=2048,
+        max_batch_size=8,
+        mapping=mapping,
+        dtype=DataType.HALF,
+        max_num_tokens=max_tokens,
+    )
+
+    page_table = build_page_table(manager)
+
+    assert page_table.tokens_per_block == 64
+    assert page_table.num_layers == 8
+    assert page_table.num_pool_groups > 0
+
+    pool = page_table.get_pool(0, 0)
+    assert pool.base_address > 0
+    assert pool.num_slots == 50  # 3200 tokens / 64 tokens_per_block
+    assert len(pool.buffer_entries) > 0
+
+    layer_id = list(pool.unique_layers)[0]
+    ptr_key = page_table.get_device_pointer(0, 0, 0, layer_id, DataRole.KEY)
+    ptr_value = page_table.get_device_pointer(0, 0, 0, layer_id, DataRole.VALUE)
+    assert ptr_key > 0
+    assert ptr_value > ptr_key
+
+    print(
+        f"Page table created: {page_table.num_pool_groups} pools,\
+          tokens_per_block={page_table.tokens_per_block}, num_layers={page_table.num_layers}"
+    )
+
+    manager.shutdown()
