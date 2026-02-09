@@ -72,7 +72,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
-        return self.is_eagle3_one_model() or self.is_mtp_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp_one_model(
+        ) or self.is_ngram()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -93,7 +94,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def without_logits(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_ngram()
 
     def needs_kv_cache_rewind(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
@@ -101,13 +103,14 @@ class SpeculativeDecodingMode(IntEnum):
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.has_draft_model()
+        ) or self.is_ngram() or self.has_draft_model()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_ngram()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -129,12 +132,12 @@ class SpeculativeDecodingMode(IntEnum):
 
     def has_spec_decoder(self):
         return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model()
+        ) or self.is_eagle3_one_model() or self.is_ngram()
 
     def has_spec_drafter(self):
-        return self.is_eagle3(
-        ) or self.is_draft_target() or self.is_ngram() or self.is_user_provided(
-        ) or self.is_mtp_eagle() or self.is_save_hidden_states()
+        return self.is_eagle3() or self.is_draft_target(
+        ) or self.is_user_provided() or self.is_mtp_eagle(
+        ) or self.is_save_hidden_states()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

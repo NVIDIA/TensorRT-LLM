@@ -54,6 +54,7 @@ from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import (Eagle3OneModelSpecMetadata,
                                   Eagle3ResourceManager, Eagle3SpecMetadata)
 from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
@@ -1974,8 +1975,9 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsMTP.
-            if isinstance(new_tensors_device, SampleStateTensorsMTP):
+            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsMTP or SampleStateTensorsSpec.
+            if isinstance(new_tensors_device,
+                          (SampleStateTensorsMTP, SampleStateTensorsSpec)):
                 assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
@@ -3324,16 +3326,16 @@ class PyTorchModelEngine(ModelEngine):
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
         # Initialize SA state for new requests (only if SA speculative decoding is enabled)
-        use_sa_spec = (self.spec_config is not None 
+        use_sa_spec = (self.spec_config is not None
                        and getattr(self.spec_config, 'use_sa_spec', False))
 
-        
         if use_sa_spec and self.mapping.is_last_pp_rank():
-            logger.info(f"use_sa_spec: {use_sa_spec} start to build sa state for new requests")
+            logger.info(
+                f"use_sa_spec: {use_sa_spec} start to build sa state for new requests"
+            )
             for request in itertools.chain(
-                scheduled_requests.context_requests,
-                scheduled_requests.generation_requests
-            ):
+                    scheduled_requests.context_requests,
+                    scheduled_requests.generation_requests):
                 if request.py_request_id not in self.sa_spec_seen_requests:
                     self.sa_spec_seen_requests.add(request.py_request_id)
 
@@ -3341,9 +3343,12 @@ class PyTorchModelEngine(ModelEngine):
                     # could use a thread pool for add_request
                     # Use lazy import to avoid circular dependency
                     from ..speculative import suffix_automaton as sa_spec
-                    sa_spec.add_request(request.py_request_id, request.get_tokens(0))
-            
-            logger.info(f"use_sa_spec: {use_sa_spec} build sa state for new requests done")
+                    sa_spec.add_request(request.py_request_id,
+                                        request.get_tokens(0))
+
+            logger.info(
+                f"use_sa_spec: {use_sa_spec} build sa state for new requests done"
+            )
 
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,

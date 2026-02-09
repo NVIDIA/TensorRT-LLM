@@ -291,6 +291,14 @@ def create_py_executor(
             logger.warning(
                 "Advanced sampling is not supported for MTP yet - this will be added soon."
             )
+        # Check FLASHINFER compatibility with one-engine speculative decoding
+        if llm_args.attn_backend == "FLASHINFER":
+            raise ValueError(
+                f"FLASHINFER attention backend is not supported with one-engine speculative "
+                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
+                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
+                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
+                f"backend instead by setting attn_backend='TRTLLM'.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

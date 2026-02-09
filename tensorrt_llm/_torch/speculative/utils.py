@@ -13,7 +13,8 @@ from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
-from .ngram import NGramDrafter, NGramPoolManager
+from .ngram import NGramPoolManager
+from .ngram_worker import NGramSampler, NGramSpecMetadata, NGramWorker
 from .save_hidden_state import SaveHiddenStatesDrafter
 
 
@@ -97,8 +98,17 @@ def get_spec_metadata(spec_config,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
+    if spec_config.spec_dec_mode.is_ngram():
+        return NGramSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            sa_manager=spec_resource_manager._sa_manager
+            if spec_resource_manager else None,
+            max_matching_ngram_size=spec_config.max_matching_ngram_size,
+        )
     if  spec_config.spec_dec_mode.is_draft_target() or \
-        spec_config.spec_dec_mode.is_ngram() or \
         spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -172,6 +182,9 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args)
+    if spec_config.spec_dec_mode.is_ngram():
+        return NGramSampler(sampler_args,
+                            max_draft_len=spec_config.max_draft_len)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -201,8 +214,9 @@ def get_spec_drafter(model_engine,
                             spec_resource_manager=spec_resource_manager,
                             guided_decoder=guided_decoder)
 
-    if spec_config.spec_dec_mode.is_ngram():
-        return NGramDrafter(spec_config, spec_resource_manager)
+    # Note: NGram no longer uses external drafter - it uses in-forward NGramWorker
+    # if spec_config.spec_dec_mode.is_ngram():
+    #     return NGramDrafter(spec_config, spec_resource_manager)
 
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
@@ -227,6 +241,8 @@ def get_spec_worker(spec_config, model_config, mapping):
         return MTPEagleWorker(spec_config, model_config)
     if spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping)
+    if spec_dec_mode.is_ngram():
+        return NGramWorker(spec_config, model_config)
     return None
 
 

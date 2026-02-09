@@ -216,25 +216,107 @@ class NGramDrafter(Drafter):
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
+        """Batched draft token generation using CUDA kernel.
+
+        This processes all generation requests in a single batched call to
+        extend_ngram(), reducing kernel launch overhead and enabling better
+        GPU utilization compared to per-request processing.
+        """
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.
-        for request in sorted(
-                scheduled_requests.generation_requests,
-                key=lambda r:
+        requests = sorted(
+            scheduled_requests.generation_requests,
+            key=lambda r:
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
-        ):
-            # Add new token to a copy of the generated tokens to find new draft tokens
-            prefix = list(request.get_tokens(0))  # Get a copy
+        )
 
-            # Generate draft tokens
-            draft_tokens = self.spec_resource_manager.get_draft_tokens(
-                prefix,
-                request.request_id,
-                max_sequence_length=request.py_orig_prompt_len +
-                request.py_max_new_tokens,
-            )
-            request.py_draft_tokens = draft_tokens
+        if not requests:
+            return
+
+        batch_size = len(requests)
+        request_ids = []
+        all_new_tokens = []
+        max_new_tokens = 0
+        max_draft_lens = []
+
+        mgr = self.spec_resource_manager
+
+        # Phase 1: Collect data and initialize new requests
+        for request in requests:
+            request_id = request.request_id
+            prefix = list(request.get_tokens(0))  # Get a copy
+            prefix_len = len(prefix)
+
+            max_seq_len = request.py_orig_prompt_len + request.py_max_new_tokens
+            max_draft_len = min(self.max_total_draft_tokens,
+                                max_seq_len - 1 - prefix_len)
+            max_draft_lens.append(max(0, max_draft_len))
+
+            # Initialize or get incremental tokens
+            if request_id not in mgr._token_counts:
+                # New request - initialize SA with context
+                mgr._sa_manager.add_request(request_id, prefix)
+                mgr._token_counts[request_id] = prefix_len
+                new_tokens = []
+            else:
+                # Existing request - compute new tokens since last call
+                prev_count = mgr._token_counts[request_id]
+                if prefix_len > prev_count:
+                    new_tokens = prefix[prev_count:]
+                    mgr._token_counts[request_id] = prefix_len
+                else:
+                    new_tokens = []
+
+            request_ids.append(request_id)
+            all_new_tokens.append(new_tokens)
+            max_new_tokens = max(max_new_tokens, len(new_tokens))
+
+        # Phase 2: Build batched tensors
+        max_draft_len = max(
+            max_draft_lens) if max_draft_lens else self.max_total_draft_tokens
+        if max_draft_len <= 0:
+            for request in requests:
+                request.py_draft_tokens = []
+            return
+
+        # Pad accepted_tokens to max_new_tokens (or at least 1)
+        padded_len = max(max_new_tokens, 1)
+        accepted_tokens = torch.zeros((batch_size, padded_len),
+                                      dtype=torch.int32,
+                                      device='cuda')
+        num_accepted_tokens = torch.zeros((batch_size, ),
+                                          dtype=torch.int32,
+                                          device='cuda')
+
+        for i, new_tokens in enumerate(all_new_tokens):
+            if new_tokens:
+                accepted_tokens[i, :len(new_tokens)] = torch.tensor(
+                    new_tokens, dtype=torch.int32, device='cuda')
+            num_accepted_tokens[i] = len(new_tokens)
+
+        # Phase 3: Batched extend_ngram call
+        mgr._sa_manager.prepare(request_ids, max_draft_len)
+        match_len, draft_tokens = mgr._sa_manager.extend_ngram(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=mgr.max_matching_ngram_size)
+
+        # Phase 4: Extract results back to requests
+        match_len_cpu = match_len.cpu().tolist()
+        draft_tokens_cpu = draft_tokens.cpu().tolist()
+
+        for i, request in enumerate(requests):
+            if match_len_cpu[i] == 0 or max_draft_lens[i] <= 0:
+                request.py_draft_tokens = []
+            else:
+                # Trim to actual draft length and remove trailing zeros
+                drafts = draft_tokens_cpu[i][:max_draft_lens[i]]
+                while drafts and drafts[-1] == 0:
+                    drafts.pop()
+                request.py_draft_tokens = drafts
 
     def update_max_total_draft_tokens(self,
                                       new_max_total_draft_tokens: int) -> None:
