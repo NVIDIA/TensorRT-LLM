@@ -600,6 +600,9 @@ class TRTLLMGenFusedMoE(MoE):
             )
 
         elif self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_mxfp8:
+            if not do_finalize:
+                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
+
             factor = 1 if self.activation_type == ActivationType.Relu2 else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // factor
@@ -614,20 +617,19 @@ class TRTLLMGenFusedMoE(MoE):
             output2_scale_scalar = getattr(
                 self, 'fc2_alpha', None).data if getattr(
                     self, 'fc2_alpha', None) is not None else None
-
             outputs = self.op_backend.run_fp4_block_scale_moe(
                 router_logits,
                 routing_bias,
                 x,
-                x_sf.view(torch.float8_e4m3fn) if x_sf is not None else None,
+                x_sf,
                 self.w3_w1_weight,
-                self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                self.w3_w1_weight_scale,
                 self.w3_w1_bias if self.bias else None,
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
                 self.w2_weight,
-                self.w2_weight_scale.view(torch.float8_e4m3fn),
+                self.w2_weight_scale,
                 self.w2_bias if self.bias else None,
                 output1_scale_scalar,
                 output1_scale_gate_scalar,
@@ -651,18 +653,8 @@ class TRTLLMGenFusedMoE(MoE):
                 gated_act_type=act_type,
                 output=moe_output,
             )
-            if not do_finalize:
-                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
-                return outputs
 
-            final_hidden_states = moe_output if moe_output is not None else outputs[
-                0]
-            if final_hidden_states.shape[1] > self.hidden_size:
-                final_hidden_states = final_hidden_states[:, :self.
-                                                          hidden_size].contiguous(
-                                                          )
-            return final_hidden_states
-
+            final_hidden_states = moe_output if moe_output is not None else outputs
         elif self.has_w4a8_nvfp4_fp8:
 
             outputs = torch.ops.trtllm.fp8_fp4_block_scale_moe_runner(
