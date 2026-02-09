@@ -20,6 +20,100 @@ from torch.utils._pytree import _LEAF_SPEC, TreeSpec
 from .logger import ad_logger
 from .node_utils import get_weight_tensor, is_op
 
+# ---------------------------------------------------------------------------
+# Dynamic custom-op derivation helpers
+# ---------------------------------------------------------------------------
+# These are used to create new custom ops that share the schema of an existing
+# op but wrap it with additional logic (e.g. stream management).  A single
+# module-level dict of ``Library`` objects (keyed by namespace) is used so that
+# the registrations persist and are visible via ``torch.ops.<namespace>.*``.
+# ---------------------------------------------------------------------------
+
+_derived_op_libs: Dict[str, torch.library.Library] = {}
+_derived_op_registry: Dict[str, Callable] = {}
+
+
+def _get_lib(namespace: str) -> torch.library.Library:
+    """Return (and lazily create) a ``FRAGMENT`` Library for *namespace*."""
+    if namespace not in _derived_op_libs:
+        _derived_op_libs[namespace] = torch.library.Library(namespace, "FRAGMENT")
+    return _derived_op_libs[namespace]
+
+
+def create_derived_custom_op(
+    base_op: Callable,
+    suffix: str,
+    make_impl: Callable[[Callable], Callable],
+    make_fake: Optional[Callable[[Callable], Callable]] = None,
+) -> Callable:
+    """Dynamically create a new custom op derived from an existing one.
+
+    The new op has the **same** schema (arguments, default values, and return
+    type) as *base_op* but with a different name (``<base_name><suffix>``) and a
+    custom implementation produced by *make_impl*.
+
+    Args:
+        base_op: The base custom op — either an ``OpOverloadPacket``
+            (e.g. ``torch.ops.auto_deploy.trtllm_moe_fused``) or an
+            ``OpOverload`` (e.g. ``…trtllm_moe_fused.default``).
+        suffix: Suffix appended to the base op name to form the new op name
+            (e.g. ``"_aux"``).
+        make_impl: A factory ``(base_overload) -> impl_fn`` that receives the
+            resolved base ``OpOverload`` and returns the *implementation*
+            function for the new op.  ``impl_fn`` will be called with the
+            same positional/keyword arguments as *base_op*.
+        make_fake: Optional factory ``(base_overload) -> fake_fn`` that returns
+            the *Meta / fake-tensor* implementation.  When ``None`` the
+            default fake implementation ``torch.empty_like(args[0])`` is used.
+
+    Returns:
+        The newly registered op as an ``OpOverloadPacket``
+        (e.g. ``torch.ops.auto_deploy.<name><suffix>``).  Repeated calls with
+        the same *base_op* and *suffix* return the cached op.
+    """
+    base_overload = base_op.default if hasattr(base_op, "default") else base_op
+    schema = base_overload._schema
+
+    # e.g. "auto_deploy::trtllm_moe_fused"
+    qualified_name = schema.name
+    namespace, base_name = qualified_name.split("::")
+    new_name = f"{base_name}{suffix}"
+    new_qualified = f"{namespace}::{new_name}"
+
+    # Return the cached op if it was already created.
+    if new_qualified in _derived_op_registry:
+        return _derived_op_registry[new_qualified]
+
+    # Build the schema string for the derived op.  ``str(schema)`` produces a
+    # fully-qualified string such as
+    #   auto_deploy::trtllm_moe_fused(Tensor x, …) -> Tensor
+    # We replace the qualified name with the bare new name (the Library already
+    # knows its namespace).
+    new_schema_str = str(schema).replace(qualified_name, new_name, 1)
+
+    lib = _get_lib(namespace)
+    lib.define(new_schema_str)
+
+    # Register the real implementation for all devices.
+    # We use "CompositeExplicitAutograd" so that we can provide a separate
+    # Meta / fake kernel for shape inference.
+    lib.impl(new_name, make_impl(base_overload), "CompositeExplicitAutograd")
+
+    # Register the Meta / fake implementation.
+    if make_fake is not None:
+        lib.impl(new_name, make_fake(base_overload), "Meta")
+    else:
+
+        def _default_fake(*args, **kwargs):
+            return torch.empty_like(args[0])
+
+        lib.impl(new_name, _default_fake, "Meta")
+
+    new_op = getattr(getattr(torch.ops, namespace), new_name)
+    _derived_op_registry[new_qualified] = new_op
+    return new_op
+
+
 _NoValType = type("_NoValType", (), {})
 
 

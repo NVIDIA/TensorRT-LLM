@@ -18,9 +18,11 @@
 This module provides linear layer implementations:
 - linear: Linear layer operations
 - torch_router: MoE router operations
+- swiglu: SwiGLU MLP custom operations
 """
 
 __all__ = [
     "linear",
     "torch_router",
+    "swiglu",
 ]
