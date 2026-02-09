@@ -116,9 +116,11 @@ def apply_rotary_emb(
     """
     cos, sin = freqs_cis
 
-    # Cast to input dtype to avoid dtype mismatch
-    cos = cos.to(x.dtype)
-    sin = sin.to(x.dtype)
+    # Upcast to float32 for RoPE multiply-add (matches HF diffusers).
+    # BF16 accumulates significant rounding error over 57 blocks x 50 steps.
+    x_fp32 = x.float()
+    cos = cos.float()
+    sin = sin.float()
 
     # Handle different input shapes
     ndim = x.ndim
@@ -132,9 +134,9 @@ def apply_rotary_emb(
         sin = sin.unsqueeze(0)
 
     # Rotate pairs: [x0, x1, x2, x3, ...] -> [-x1, x0, -x3, x2, ...]
-    x_rotated = torch.stack([-x[..., 1::2], x[..., 0::2]], dim=-1).flatten(-2)
+    x_rotated = torch.stack([-x_fp32[..., 1::2], x_fp32[..., 0::2]], dim=-1).flatten(-2)
 
-    return x * cos + x_rotated * sin
+    return (x_fp32 * cos + x_rotated * sin).to(x.dtype)
 
 
 class FluxPosEmbed(nn.Module):

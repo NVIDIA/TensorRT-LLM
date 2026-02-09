@@ -334,21 +334,17 @@ class FluxPipeline(BasePipeline):
             padding="max_length",
             max_length=max_sequence_length,
             truncation=True,
-            return_attention_mask=True,
+            return_length=False,
+            return_overflowing_tokens=False,
             return_tensors="pt",
         )
         t5_input_ids = t5_inputs.input_ids.to(self.device)
-        t5_attention_mask = t5_inputs.attention_mask.to(self.device)
 
-        t5_outputs = self.text_encoder_2(
-            t5_input_ids, attention_mask=t5_attention_mask, output_hidden_states=False
-        )
+        # NOTE: HF diffusers does NOT pass attention_mask to T5 for FLUX.1.
+        # T5 treats padding tokens as real tokens, and the transformer sees
+        # their non-zero embeddings. Matching HF behavior for PSNR parity.
+        t5_outputs = self.text_encoder_2(t5_input_ids, output_hidden_states=False)
         prompt_embeds = t5_outputs.last_hidden_state.to(self.dtype)
-
-        # Zero-out padded tokens to prevent padding artifacts (WAN pattern)
-        seq_lens = t5_attention_mask.gt(0).sum(dim=1).long()
-        for i, seq_len in enumerate(seq_lens):
-            prompt_embeds[i, seq_len:] = 0
 
         # Prepare text position IDs
         text_ids = self._prepare_text_ids(prompt_embeds)
@@ -488,8 +484,8 @@ class FluxPipeline(BasePipeline):
         # Unpatchify: (batch, 64, h, w) -> (batch, 16, 2h, 2w)
         latents = self._unpatchify_latents(latents)
 
-        # Scale latents
-        latents = latents / self.vae.config.scaling_factor
+        # Scale latents (must include shift_factor, matching HF diffusers)
+        latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
         # VAE decode
         latents = latents.to(self.vae.dtype)
