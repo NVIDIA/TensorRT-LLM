@@ -475,6 +475,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output = torch.ops.trtllm.cublas_mm_out(input, module.weight.t(),
                                                     bias, out)
         else:
+            if input.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # torch.matmul(out=) does not support float8; fall back to non-out path.
+                return self.apply(module, input, bias)
             torch.matmul(input, module.weight.t(), out=out)
             if bias is not None:
                 out += bias
