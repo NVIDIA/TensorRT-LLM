@@ -138,9 +138,7 @@ def test_llm_update_weights(model_dir):
     hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    moe_config = None
-    if "Qwen3/Qwen3-30B-A3B-FP8" in model_dir:
-        moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
+    moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
     llm = LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -191,9 +189,7 @@ def test_llm_partial_update_weights(model_dir):
     hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    moe_config = None
-    if "Qwen3/Qwen3-30B-A3B-FP8" in model_dir:
-        moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
+    moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
     llm = LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -258,9 +254,7 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir):
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    moe_config = None
-    if "Qwen3/Qwen3-30B-A3B-FP8" in fp8_model_dir:
-        moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
+    moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
     llm = LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
