@@ -31,6 +31,8 @@ from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import \
     fused_sigmoid_gating_delta_rule_update
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    use_cpp_mamba_cache_manager
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -755,7 +757,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         has_initial_states = mamba_metadata.has_initial_states
 
         batch_size = num_prefills + num_decodes
-        state_indices = mamba_metadata.state_indices[:batch_size]
+        if use_cpp_mamba_cache_manager():
+            state_indices = mamba_metadata.state_indices[:batch_size]
+        else:
+            state_indices = attn_metadata.kv_cache_manager.get_state_indices(
+            )[:batch_size]
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
@@ -1197,8 +1203,6 @@ class Qwen3NextModel(DecoderModel):
             use_gemma=True,
         )
 
-        self.mamba_metadata: Optional[Mamba2Metadata] = None
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1214,6 +1218,9 @@ class Qwen3NextModel(DecoderModel):
             )
 
         mamba_metadata = attn_metadata.mamba_metadata
+        if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
+            attn_metadata.mamba_metadata = Mamba2Metadata(
+                attn_metadata.max_num_requests, chunk_size=128)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)

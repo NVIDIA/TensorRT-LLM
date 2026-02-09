@@ -388,7 +388,9 @@ class PythonMambaCacheManager(BaseResourceManager):
             block = self.mamba_cache_index.pop(request_id)
             self.mamba_cache_free_blocks.append(block)
 
-    def get_state_indices(self) -> torch.Tensor:
+    def get_state_indices(self,
+                          request_ids: List[int] = None,
+                          is_padding: List[bool] = None) -> torch.Tensor:
         return self.state_indices
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
@@ -533,14 +535,10 @@ class MambaCacheManager(BaseResourceManager):
             )
 
     def get_max_resource_count(self) -> int:
-        if self._use_cpp:
-            return self._impl.get_max_resource_count()
-        return self._impl.state_indices.numel()
+        return self._impl.get_max_resource_count()
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        if self._use_cpp:
-            return self._impl.get_needed_resource_to_completion(request)
-        return 1
+        return self._impl.get_needed_resource_to_completion(request)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         self._impl.prepare_resources(scheduled_batch)
@@ -557,30 +555,23 @@ class MambaCacheManager(BaseResourceManager):
         request_ids: Optional[List[int]] = None,
         is_padding: Optional[List[bool]] = None
     ) -> Union[torch.Tensor, List[int]]:
-        if self._use_cpp:
-            return self._impl.get_state_indices(request_ids, is_padding)
-        return self._impl.get_state_indices()
+        return self._impl.get_state_indices(request_ids, is_padding)
 
     def reorder_state_indices_when_padding_requests(self, request_size: int,
                                                     padding_size: int):
-        """Reorder state indices when padding requests exist (Python impl only)."""
-        if not self._use_cpp:
-            self._impl.reorder_state_indices_when_padding_requests(
-                request_size, padding_size)
+        assert not self._use_cpp, "reorder_state_indices_when_padding_requests is not supported in CppMambaCacheManager"
+        self._impl.reorder_state_indices_when_padding_requests(
+            request_size, padding_size)
 
     @property
     def mamba_cache_free_blocks(self) -> List[int]:
-        """Get mamba cache free blocks (Python impl only)."""
-        if not self._use_cpp and hasattr(self._impl, 'mamba_cache_free_blocks'):
-            return self._impl.mamba_cache_free_blocks
-        return []
+        assert not self._use_cpp, "mamba_cache_free_blocks is not supported in CppMambaCacheManager"
+        return self._impl.mamba_cache_free_blocks
 
     @property
     def mamba_cache_index(self) -> Dict[int, int]:
-        """Get mamba cache index mapping request_id -> state index (Python impl only)."""
-        if not self._use_cpp and hasattr(self._impl, 'mamba_cache_index'):
-            return self._impl.mamba_cache_index
-        return {}
+        assert not self._use_cpp, "mamba_cache_index is not supported in CppMambaCacheManager"
+        return self._impl.mamba_cache_index
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         return self._impl.get_conv_states(layer_idx)
@@ -593,38 +584,32 @@ class MambaCacheManager(BaseResourceManager):
 
     def get_intermediate_ssm_states(self,
                                     layer_idx: int) -> Optional[torch.Tensor]:
-        if hasattr(self._impl, 'get_intermediate_ssm_states'):
-            return self._impl.get_intermediate_ssm_states(layer_idx)
-        return None
+        assert not self._use_cpp, "get_intermediate_ssm_states is not supported in CppMambaCacheManager"
+        return self._impl.get_intermediate_ssm_states(layer_idx)
 
     def get_intermediate_conv_states(self,
                                      layer_idx: int) -> Optional[torch.Tensor]:
-        if hasattr(self._impl, 'get_intermediate_conv_states'):
-            return self._impl.get_intermediate_conv_states(layer_idx)
-        return None
+        assert not self._use_cpp, "get_intermediate_conv_states is not supported in CppMambaCacheManager"
+        return self._impl.get_intermediate_conv_states(layer_idx)
 
     def is_speculative(self) -> bool:
-        if hasattr(self._impl, 'is_speculative'):
-            return self._impl.is_speculative()
-        return False
+        assert not self._use_cpp, "is_speculative is not supported in CppMambaCacheManager"
+        return self._impl.is_speculative()
 
     def mamba_layer_cache(
         self, layer_idx: int
     ) -> Union[PythonMambaCacheManager.State,
                PythonMambaCacheManager.SpeculativeState, None]:
-        """Get mamba layer cache (Python impl only)."""
-        if hasattr(self._impl, 'mamba_layer_cache'):
-            return self._impl.mamba_layer_cache(layer_idx)
-        return None
+        assert not self._use_cpp, "mamba_layer_cache is not supported in CppMambaCacheManager"
+        return self._impl.mamba_layer_cache(layer_idx)
 
     def shutdown(self):
         self._impl.shutdown()
 
     def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor):
-        # Only PythonMambaCacheManager supports update_mamba_states
-        if hasattr(self._impl, 'update_mamba_states'):
-            self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
+        assert self._use_cpp, "update_mamba_states is not supported in PythonMambaCacheManager"
+        self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):

@@ -117,6 +117,15 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
+        self._query_start_loc_long_buf = torch.arange(0,
+                                                      max_batch_size + 1,
+                                                      dtype=torch.long,
+                                                      device="cuda")
+        self._query_start_loc_buf = torch.zeros(max_batch_size + 1,
+                                                dtype=torch.int,
+                                                device="cuda")
+        self.query_start_loc_long = self._query_start_loc_long_buf
+        self.query_start_loc = self._query_start_loc_buf
 
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
@@ -156,8 +165,14 @@ class Mamba2Metadata:
                       out=self.cu_seqlens[num_contexts + 1:batch_size + 1])
             # Need both `query_start_loc` and `query_start_loc_long` because `causal_conv1d_fn`
             # accepts only `int32` while `chunk_gated_delta_rule` accepts only `long`.
-            self.query_start_loc = self.cu_seqlens[:batch_size + 1]
-            self.query_start_loc_long = self.query_start_loc.to(torch.long)
+            self._query_start_loc_buf[:batch_size +
+                                      1] = self.cu_seqlens[:batch_size + 1]
+            self.query_start_loc = self._query_start_loc_buf[:batch_size + 1]
+            self._query_start_loc_long_buf[:batch_size + 1].copy_(
+                self.query_start_loc.to(torch.long), non_blocking=True)
+            self.query_start_loc_long = self._query_start_loc_long_buf[:
+                                                                       batch_size
+                                                                       + 1]
             self.seq_idx = torch.repeat_interleave(
                 torch.arange(num_contexts,
                              dtype=torch.int,
@@ -179,8 +194,11 @@ class Mamba2Metadata:
                 self.chunk_offsets = None
         else:
             self.query_start_loc = None
-            self.query_start_loc_long = torch.arange(
-                0,
-                batch_size + 1,
-                dtype=torch.long,
-                device=self.cu_seqlens.device)
+            torch.arange(0,
+                         batch_size + 1,
+                         dtype=torch.long,
+                         device=self.cu_seqlens.device,
+                         out=self._query_start_loc_long_buf[:batch_size + 1])
+            self.query_start_loc_long = self._query_start_loc_long_buf[:
+                                                                       batch_size
+                                                                       + 1]

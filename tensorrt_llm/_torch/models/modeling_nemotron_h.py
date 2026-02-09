@@ -22,7 +22,6 @@ from transformers import AutoConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.utils import ActivationType, relu2
 
 from ..attention_backend import AttentionMetadata
@@ -423,8 +422,6 @@ class NemotronHModel(DecoderModel):
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
         )
-
-        self.mamba_metadata: Optional[Mamba2Metadata] = None
 
     def forward(
         self,

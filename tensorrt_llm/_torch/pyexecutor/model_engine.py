@@ -2725,6 +2725,8 @@ class PyTorchModelEngine(ModelEngine):
             num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
+        if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
+            attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
         attn_metadata.prepare()
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
