@@ -451,6 +451,11 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "model_kwargs": {
                 "torch_dtype": "bfloat16"
             },
+            "transforms": {
+                "fuse_nvfp4_moe": {
+                    "allow_different_input_scales": True,
+                },
+            },
         }
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
