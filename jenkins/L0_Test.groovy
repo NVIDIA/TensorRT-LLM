@@ -2676,19 +2676,45 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             def verlConfig = readYaml(file: verlConfigPath)
             def verlPath = "${llmPath}/verl"
 
-            // Clone verl repo at specific commit
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-                git clone ${verlConfig.verl_config.repo_url} ${verlPath}
-                cd ${verlPath} && git checkout ${verlConfig.verl_config.commit}
-            """)
-
-            // Run install commands from config
-            verlConfig.verl_config.install_commands.each { cmd ->
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${verlPath} && ${cmd}")
+            // Build environment variable export prefix from config for shell commands
+            def envPrefix = ""
+            if (verlConfig.verl_config.env_vars) {
+                envPrefix = verlConfig.verl_config.env_vars.collect { "export ${it}" }.join(" && ") + " && "
             }
+
+            // Run install commands with env vars exported
+            verlConfig.verl_config.install_commands.each { cmd ->
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "${envPrefix}${cmd}")
+            }
+
+            // Clone verl repo at specific commit/tag
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+                git clone ${verlConfig.verl_config.repo_url} ${verlPath} && cd ${verlPath} && git checkout ${verlConfig.verl_config.repo_tag}
+            """)
 
             // Set VERL_ROOT environment variable for test execution
             env.VERL_ROOT = verlPath
+
+            // Persist env vars in Jenkins environment for test execution
+            if (verlConfig.verl_config.env_vars) {
+                def resolvedVars = [:]
+                verlConfig.verl_config.env_vars.each { envVar ->
+                    def eqIdx = envVar.indexOf('=')
+                    if (eqIdx > 0) {
+                        def key = envVar.substring(0, eqIdx)
+                        def value = envVar.substring(eqIdx + 1).replaceAll('^"|"$', '')
+                        // Resolve references to previously resolved vars
+                        resolvedVars.each { k, v ->
+                            value = value.replace('${' + k + '}', v)
+                        }
+                        // Resolve references to existing env vars
+                        value = value.replace('$LD_LIBRARY_PATH', env.LD_LIBRARY_PATH ?: '')
+                        value = value.replace('$PATH', env.PATH ?: '')
+                        resolvedVars[key] = value
+                        env."${key}" = value
+                    }
+                }
+            }
         }
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
