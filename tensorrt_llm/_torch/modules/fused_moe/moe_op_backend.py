@@ -459,13 +459,13 @@ class TRTLLMOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
     ):
         hidden_size = hidden_states.shape[-1]
-        if hidden_states.dtype == torch.uint8:
+        if hidden_states.dtype == torch.uint8 or hidden_states.dtype == torch.float8_e4m3fn:
             if (
                 gemm1_weights_scale is not None
                 and gemm1_weights_scale.shape[-1] == hidden_size // 16
             ):
                 # nvfp4
-                return torch.ops.trtllm.fp4_block_scale_moe_runner(
+                outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                     router_logits,
                     routing_bias,
                     hidden_states,
@@ -497,6 +497,15 @@ class TRTLLMOpBackend(MoEOpBackend):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                 )
+                if not do_finalize:
+                    return outputs
+                else:
+                    final_hidden_states = outputs[0]
+                    if final_hidden_states.shape[1] > valid_hidden_size:
+                        final_hidden_states = final_hidden_states[
+                            :, :valid_hidden_size
+                        ].contiguous()
+                        return final_hidden_states
             elif (
                 gemm1_weights_scale is not None
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
@@ -576,7 +585,15 @@ class FlashinferOpBackend(MoEOpBackend):
         from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll as _flashinfer_MoeAlltoAll
         from flashinfer.fp4_quantization import fp4_quantize as _flashinfer_fp4_quantize
         from flashinfer.fp8_quantization import mxfp8_quantize as _flashinfer_mxfp8_quantize
+        from flashinfer.fused_moe.core import ActivationType as _flashinfer_activation_type
+        from flashinfer.fused_moe.core import RoutingMethodType as _flashinfer_routing_method_type
 
+        from ..fused_moe.routing import RoutingMethodType as _trtllmgen_routing_method_type
+
+        self._trtllmgen_routing_method_type = _trtllmgen_routing_method_type
+
+        self._activation_type = _flashinfer_activation_type
+        self._routing_method_type = _flashinfer_routing_method_type
         self._fused_moe = _flashinfer_fused_moe
         self._MnnvlMemory = _flashinfer_MnnvlMemory
         self._MnnvlMoe = _flashinfer_MnnvlMoe
@@ -586,6 +603,33 @@ class FlashinferOpBackend(MoEOpBackend):
 
         # need to add this to the flashinfer side
         os.environ["FLASHINFER_EXTRA_LDFLAGS"] = "-Wl,-Bsymbolic-functions"
+
+    def cvt_activation_type(self, activation_type) -> int:
+        """Convert TRT-LLM ActivationType to FlashInfer ActivationType int value."""
+        _flashinfer = self._activation_type
+        _mapping = {
+            0: _flashinfer.Swiglu.value,
+            1: _flashinfer.Relu2.value,
+        }
+        if activation_type not in _mapping:
+            raise ValueError(f"Unsupported activation type: {activation_type}")
+        return int(_mapping[activation_type])
+
+    def cvt_routing_method_type(self, routing_method_type) -> int:
+        """Convert TRT-LLM RoutingMethodType to FlashInfer RoutingMethodType int value."""
+        _trtllm = self._trtllmgen_routing_method_type
+        _flashinfer = self._routing_method_type
+        _mapping = {
+            _trtllm.Default: _flashinfer.Default,
+            _trtllm.Renormalize: _flashinfer.Renormalize,
+            _trtllm.DeepSeekV3: _flashinfer.DeepSeekV3,
+            _trtllm.Llama4: _flashinfer.Llama4,
+            _trtllm.RenormalizeNaive: _flashinfer.RenormalizeNaive,
+            _trtllm.Unspecified: _flashinfer.Unspecified,
+        }
+        if routing_method_type not in _mapping:
+            raise ValueError(f"Unsupported routing method type: {routing_method_type}")
+        return int(_mapping[routing_method_type])
 
     # Quantization
     def fp4_quantize(
@@ -827,7 +871,7 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
     ):
         if router_logits is not None:
-            return self._fused_moe.trtllm_fp4_block_scale_moe(
+            outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
                 router_logits,
                 routing_bias,
                 hidden_states,
@@ -854,10 +898,10 @@ class FlashinferOpBackend(MoEOpBackend):
                 local_expert_offset,
                 local_num_experts,
                 routed_scaling_factor,
-                routing_method_type,
+                self.cvt_routing_method_type(routing_method_type),
                 do_finalize=do_finalize,
                 enable_pdl=enable_pdl,
-                gated_act_type=gated_act_type,
+                activation_type=self.cvt_activation_type(gated_act_type),
                 output=output,
                 tune_max_num_tokens=tune_max_num_tokens,
             )
@@ -865,7 +909,7 @@ class FlashinferOpBackend(MoEOpBackend):
             packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
                 torch.int16
             )
-            return self._fused_moe.trtllm_fp4_block_scale_routed_moe(
+            outputs = self._fused_moe.trtllm_fp4_block_scale_routed_moe(
                 packed_tensor,
                 routing_bias,
                 hidden_states,
@@ -892,10 +936,18 @@ class FlashinferOpBackend(MoEOpBackend):
                 local_expert_offset,
                 local_num_experts,
                 routed_scaling_factor,
-                routing_method_type,
+                self.cvt_routing_method_type(routing_method_type),
                 do_finalize=do_finalize,
                 enable_pdl=enable_pdl,
-                gated_act_type=gated_act_type,
+                activation_type=self.cvt_activation_type(gated_act_type),
                 output=output,
                 tune_max_num_tokens=tune_max_num_tokens,
             )
+        if not do_finalize:
+            return outputs
+        else:
+            final_hidden_states = outputs[0]
+            # Slice output if it was padded
+            if final_hidden_states.shape[1] > valid_hidden_size:
+                final_hidden_states = final_hidden_states[:, :valid_hidden_size].contiguous()
+            return final_hidden_states
