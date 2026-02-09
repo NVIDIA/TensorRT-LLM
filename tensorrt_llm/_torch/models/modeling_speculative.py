@@ -19,7 +19,8 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
-from ..speculative import SpecMetadata, get_spec_worker
+from ..speculative import (SpecMetadata, get_spec_worker,
+                           should_use_separate_draft_kv_cache)
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
@@ -931,6 +932,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                          vocab_size=model_config.pretrained_config.vocab_size)
         self.draft_model = None
         self.draft_config = None
+        self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             if spec_config.spec_dec_mode.is_eagle3_one_model():
@@ -964,11 +966,16 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
 
+            self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
+                spec_config)
+
             self.draft_model = get_draft_model(model_config, self.draft_config,
                                                self.lm_head, self.model)
-            self.spec_worker = get_spec_worker(model_config.spec_config,
-                                               model_config,
-                                               model_config.mapping)
+            self.spec_worker = get_spec_worker(
+                model_config.spec_config,
+                model_config,
+                model_config.mapping,
+                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             self.epilogue.append(self.draft_model)
             self.epilogue.append(self.spec_worker)
 
@@ -987,6 +994,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.model(
@@ -1030,7 +1038,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     logits=logits,
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
-                                    draft_model=self.draft_model)
+                                    draft_model=self.draft_model,
+                                    resource_manager=resource_manager)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,
