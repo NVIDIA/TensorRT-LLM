@@ -2737,7 +2737,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
