@@ -360,3 +360,7 @@ accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_dec
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=2] SKIP (https://nvbugs/5879620)
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-False-False-False] SKIP (https://nvbugs/5879625)
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-True-True-False] SKIP (https://nvbugs/5879625)
+cpp/test_multi_gpu.py::test_cache_transceiver[8proc-nixl_kvcache-90] SKIP (https://nvbugs/5880261)
+cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] SKIP (https://nvbugs/5880261)
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp1pp2] SKIP (https://nvbugs/5880313)
+accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-False-True-False] SKIP (https://nvbugs/5879625)
