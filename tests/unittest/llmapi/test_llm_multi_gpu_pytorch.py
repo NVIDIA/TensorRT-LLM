@@ -12,6 +12,7 @@ from .lora_test_utils import (
     check_phi3_lora_fused_modules_output_tp2_identical_to_tp1,
     test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, llama_model_path,
+                       llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness,
                        tinyllama_logits_processor_test_harness)
@@ -169,3 +170,21 @@ def test_llm_get_stats_pp4(return_context_logits, enable_chunked_prefill,
         enable_chunked_prefill=enable_chunked_prefill,
         enable_iter_req_stats=enable_iter_req_stats,
     )
+
+
+@skip_ray
+@pytest.mark.gpu2
+def test_llm_get_stats_tp2():
+    llm_get_stats_test_harness(tp_size=2, pytorch_backend=True)
+
+
+@skip_ray
+@pytest.mark.gpu2
+def test_llm_get_stats_async_tp2():
+    llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=True)
+
+
+@skip_ray
+@pytest.mark.gpu2
+def test_llm_get_stats_async_pp2():
+    llm_get_stats_async_test_harness(pp_size=2, pytorch_backend=True)
