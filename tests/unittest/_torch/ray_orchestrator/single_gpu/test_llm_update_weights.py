@@ -9,11 +9,11 @@ from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
-from utils.util import skip_no_hopper
+from utils.util import getSMVersion, skip_pre_hopper
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.utils import get_device_uuid
-from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 
 
 class RefHFModelWithIPCHandles(RefHFModel):
@@ -120,7 +120,7 @@ def run_generate(
     return llm_logits, ref_logits
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize(
     "model_dir",
     [
@@ -138,6 +138,9 @@ def test_llm_update_weights(model_dir):
     hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+    moe_config = None
+    if "Qwen3/Qwen3-30B-A3B-FP8" in model_dir:
+        moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
     llm = LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -146,6 +149,7 @@ def test_llm_update_weights(model_dir):
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
         model_kwargs={"num_hidden_layers": num_hidden_layers},
+        moe_config=moe_config,
     )
 
     # Generate texts from the prompts.
@@ -169,7 +173,7 @@ def test_llm_update_weights(model_dir):
     compare_logits(llm_logits, ref_logits)
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize(
     "model_dir",
     [
@@ -187,7 +191,9 @@ def test_llm_partial_update_weights(model_dir):
     hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-
+    moe_config = None
+    if "Qwen3/Qwen3-30B-A3B-FP8" in model_dir:
+        moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
     llm = LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -196,6 +202,7 @@ def test_llm_partial_update_weights(model_dir):
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
         model_kwargs={"num_hidden_layers": num_hidden_layers},
+        moe_config=moe_config,
     )
 
     # Generate texts from the prompts.
@@ -236,7 +243,7 @@ def test_llm_partial_update_weights(model_dir):
     compare_logits(llm_logits, ref_logits)
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize(
     "model_dir, fp8_model_dir",
     [
@@ -251,6 +258,9 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir):
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+    moe_config = None
+    if "Qwen3/Qwen3-30B-A3B-FP8" in fp8_model_dir:
+        moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
     llm = LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -267,6 +277,7 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir):
                 "weight_block_size": [128, 128],
             },
         },
+        moe_config=moe_config,
     )
 
     # Generate texts from the prompts.
