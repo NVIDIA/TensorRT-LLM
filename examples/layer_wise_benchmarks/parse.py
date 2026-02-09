@@ -103,8 +103,14 @@ lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 with sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True) as conn:
     query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
     df = pd.read_sql_query(query, conn)
-    event_id_NvtxDomainCreate = df[df["name"] == "NvtxDomainCreate"].iloc[0]["id"].tolist()
-    event_id_NvtxPushPopRange = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
+    filtered_df = df[df["name"] == "NvtxDomainCreate"]
+    if filtered_df.empty:
+        raise ValueError("NvtxDomainCreate event type not found in database")
+    event_id_NvtxDomainCreate = filtered_df.iloc[0]["id"].tolist()
+    filtered_df = df[df["name"] == "NvtxPushPopRange"]
+    if filtered_df.empty:
+        raise ValueError("NvtxPushPopRange event type not found in database")
+    event_id_NvtxPushPopRange = filtered_df.iloc[0]["id"].tolist()
 
     query = "SELECT domainId FROM NVTX_EVENTS WHERE eventType = ? AND text = ?"
     df = pd.read_sql_query(query, conn, params=(event_id_NvtxDomainCreate, "NCCL"))
