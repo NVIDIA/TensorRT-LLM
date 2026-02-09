@@ -1353,7 +1353,7 @@ class PyExecutor:
 
                         if self.kv_cache_transceiver:
                             self._send_kv_async(
-                                previous_batch.scheduled_ctx_reqs)
+                                previous_batch.finished_ctx_reqs)
                         self._handle_canceled_requests()
 
                         self._handle_logits_communication(
