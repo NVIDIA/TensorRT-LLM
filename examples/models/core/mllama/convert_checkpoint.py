@@ -350,7 +350,7 @@ def from_cli_args(args):
             'moe_tp_size': args.moe_tp_size,
             'moe_ep_size': args.moe_ep_size,
         },
-        'quantization': args_to_quant_config(args).to_dict()
+        'quantization': args_to_quant_config(args).model_dump()
     }
     config.update(args_to_build_options(args))
     return config
