@@ -287,9 +287,10 @@ class TrtllmAttentionGlobalState:
     ) -> bool:
         """Initialize shared tensors used by all layers.
 
-        Supports reallocation if a larger batch size is needed after initial allocation.
+        Supports reallocation if a larger batch size or block count is needed after initial allocation.
         This handles the case where attention ops are created with default max_batch_size
-        but the actual batch size from AD's cache config is larger.
+        but the actual batch size from AD's cache config is larger, or when sequences
+        require more blocks than initially allocated (e.g., during cache resize measurement).
 
         Returns:
             True if (re)allocation was performed, False if already sufficient.
@@ -298,10 +299,14 @@ class TrtllmAttentionGlobalState:
         max_blocks_per_seq = (max_context_length + tokens_per_block - 1) // tokens_per_block
 
         # Check if reallocation is needed (current size < requested size)
+        # Check both batch size AND blocks per sequence
         needs_realloc = (
             self._shared_tensors_initialized
             and self._shared_sequence_length is not None
-            and self._shared_sequence_length.shape[0] < max_num_requests
+            and (
+                self._shared_sequence_length.shape[0] < max_num_requests
+                or self._shared_kv_cache_block_offsets.shape[3] < max_blocks_per_seq
+            )
         )
 
         if self._shared_tensors_initialized and not needs_realloc:
@@ -412,7 +417,7 @@ class TrtllmAttentionGlobalState:
         """Initialize pool pointers from AD's KVCacheManager.
 
         This is called during host_prepare to set up the pool info.
-        Pool pointers are ALWAYS updated from AD to handle cache reallocation.
+        Pool pointers are updated only when they change (e.g., after cache resize).
 
         Args:
             ad_pool_pointers: Pool pointers from SequenceInfo (if available)
@@ -429,23 +434,21 @@ class TrtllmAttentionGlobalState:
         )
 
         if use_ad_pool:
-            # ALWAYS update pool pointers from AD (they may change during cache resize)
+            # Check if pointers changed (avoid unnecessary updates in hot path)
             new_ptr = ad_pool_pointers[0, 0].item()
+            current_ptr = self._shared_host_kv_cache_pool_pointers[0, 0].item()
 
-            # Use AD's pool pointers directly
-            # K and V are interleaved in blocks, so only K ptr is needed
-            # V ptr is set to 0 - kernel uses block offsets to find V
-            self._shared_host_kv_cache_pool_pointers[0, 0] = new_ptr
-            self._shared_host_kv_cache_pool_pointers[0, 1] = 0
+            if current_ptr != new_ptr:
+                # Pool pointers changed (cache was resized) - update everything
+                # Use AD's pool pointers directly
+                # K and V are interleaved in blocks, so only K ptr is needed
+                # V ptr is set to 0 - kernel uses block offsets to find V
+                self._shared_host_kv_cache_pool_pointers[0, 0] = new_ptr
+                self._shared_host_kv_cache_pool_pointers[0, 1] = 0
 
-            # Set pool mapping for all layers
-            for layer_i in range(min(num_layers, ad_pool_mapping.shape[0])):
-                self._shared_host_kv_cache_pool_mapping[layer_i, 0] = ad_pool_mapping[
-                    layer_i, 0
-                ].item()
-                self._shared_host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[
-                    layer_i, 1
-                ].item()
+                # Set pool mapping for all layers (vectorized copy)
+                n_layers = min(num_layers, ad_pool_mapping.shape[0])
+                self._shared_host_kv_cache_pool_mapping[:n_layers].copy_(ad_pool_mapping[:n_layers])
 
             self._pool_pointers_initialized = True
         elif not self._pool_pointers_initialized:
@@ -881,6 +884,24 @@ def _prepare_trtllm_metadata(
     pages_per_seq = (cu_num_pages_host[1 : num_seq + 1] - cu_num_pages_host[:num_seq]).int()
     max_blocks = pages_per_seq.max().item() if num_seq > 0 else 1
     _global_state.set_max_blocks_per_seq(max_blocks)
+
+    # Ensure kv_cache_block_offsets is large enough for the required pages
+    # This can happen when cache is resized during warmup
+    block_offsets_shape = state.kv_cache_block_offsets.shape
+    if max_blocks > block_offsets_shape[3]:
+        ad_logger.info(
+            f"Reallocating block offsets: need {max_blocks} blocks but have {block_offsets_shape[3]}."
+        )
+        # Trigger reallocation with the actual max blocks needed
+        did_realloc = _global_state._init_shared_tensors(
+            num_seq, max_blocks * state.tokens_per_block, state.tokens_per_block
+        )
+        if did_realloc:
+            # Re-link this state to the new shared tensors
+            state.init_from_shared(_global_state)
+            ad_logger.info(
+                f"Block offsets reallocated: new shape {state.kv_cache_block_offsets.shape}"
+            )
 
     # Fill block offsets
     # AD's cache_loc contains LOGICAL block indices from KVCacheManager

@@ -748,11 +748,22 @@ class SequenceInfo:
         )
 
     def set_max_num_tokens_sample(self) -> None:
-        """Set an example sequence with max_num_tokens."""
-        # TODO (lucaslie): understand what this implies for extra arguments
+        """Set an example sequence with max_num_tokens.
+
+        This creates a sample batch for memory measurement. To avoid OOM during
+        logits computation, we only gather logits for the last token of each sequence
+        (similar to prefill behavior with gather_logits_before_lm_head enabled).
+        """
         seq_len = self.max_num_tokens // self.max_batch_size
         input_ids = torch.ones(self.max_batch_size, seq_len, dtype=torch.int).tolist()
-        self.set_example_sequence(input_ids)
+        # Only gather last token of each sequence to avoid huge logits tensor
+        # Indices in flat layout: [seq_len-1, 2*seq_len-1, 3*seq_len-1, ...]
+        logits_gather_indices = [i * seq_len + (seq_len - 1) for i in range(self.max_batch_size)]
+        self.set_example_sequence(
+            input_ids,
+            logits_gather_indices=logits_gather_indices,
+            logits_gather_info=[self.max_batch_size, 1],
+        )
 
     def set_generate_only_batch(self, batch_size: Optional[int] = None) -> None:
         """Set an example sequence for generate-only batch."""
@@ -1126,17 +1137,92 @@ class StateResourceHandler(ManagedResourceHandler):
 
     These resources have shape [max_batch_size, *state_shape] and are
     managed by MambaHybridCacheManager via byte-level pooling.
+
+    Subclasses can override state_shape as a property instead of setting it
+    in __init__ by calling super().__init__() without state_shape args.
     """
+
+    state_shape: Tuple[int, ...]  # Can be set as attribute or property
+    dtype: torch.dtype
 
     def __init__(self, *state_shape: int, dtype: torch.dtype) -> None:
         """Initialize the StateResourceHandler.
 
         Args:
-            state_shape: The shape of a single state resource.
+            state_shape: The shape of a single state resource (optional for subclasses
+                        that define state_shape as a property).
             dtype: The dtype of the state resource.
         """
-        self.state_shape = state_shape
+        if state_shape:  # Only set if provided (subclasses may use property)
+            self.state_shape = state_shape
         self.dtype = dtype
+
+
+class SSMResourceHandler(StateResourceHandler):
+    """Handler for SSM state resources that maps directly to MambaCacheManager's ssm_states buffer.
+
+    These resources have shape [max_batch_size, num_heads, head_dim, d_state] and are
+    managed by MambaHybridCacheManager via the ssm_states buffer when compatible.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        d_state: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """Initialize the SSMResourceHandler.
+
+        Args:
+            num_heads: Number of attention heads.
+            head_dim: Dimension per head.
+            d_state: SSM state size.
+            dtype: Data type for the state.
+        """
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.d_state = d_state
+        # Call parent with dtype only (state_shape comes from property)
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int, int]:
+        """Return the SSM state shape: (num_heads, head_dim, d_state)."""
+        return (self.num_heads, self.head_dim, self.d_state)
+
+
+class CausalConvResourceHandler(StateResourceHandler):
+    """Handler for causal conv state resources that maps to MambaCacheManager's conv_states buffer.
+
+    These resources have shape [max_batch_size, conv_dim, d_conv - 1] and are
+    managed by MambaHybridCacheManager via the conv_states buffer when compatible.
+
+    Note: d_conv is the kernel size, and (d_conv - 1) is the state size stored in the cache.
+    """
+
+    def __init__(
+        self,
+        conv_dim: int,
+        d_conv: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """Initialize the CausalConvResourceHandler.
+
+        Args:
+            conv_dim: Convolution dimension (typically in_channels).
+            d_conv: Kernel size. The cache stores d_conv - 1 elements.
+            dtype: Data type for the state.
+        """
+        self.conv_dim = conv_dim
+        self.d_conv = d_conv  # kernel_size
+        # Call parent with dtype only (state_shape comes from property)
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int]:
+        """Return the conv state shape: (conv_dim, d_conv - 1)."""
+        return (self.conv_dim, self.d_conv - 1)
 
 
 class UnpagedResourceHandler(ResourceHandler):
