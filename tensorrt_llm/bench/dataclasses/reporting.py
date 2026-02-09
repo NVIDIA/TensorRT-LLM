@@ -84,7 +84,7 @@ class StatsKeeper:
     def set_energy(self, energy: float):
         """Set the total energy for the benchmark."""
         self.total_energy = energy
-    
+
     def generate_statistics_summary(self, max_draft_tokens: int) -> None:
         """Generate summary statistics from internally stored statistics.
 
@@ -448,9 +448,13 @@ class ReportUtility:
 
         if self.statistics.total_energy is not None:
             stats_dict["energy"] = {
-                "total_energy_j": self.statistics.total_energy,
-                "output_token_per_j": self.statistics.output_token_per_j,
-                "average_gpu_power": self.statistics.total_gpu_power / self.rt_cfg.mapping["world_size"]
+                "total_energy_j":
+                self.statistics.total_energy,
+                "output_token_per_j":
+                self.statistics.output_token_per_j,
+                "average_gpu_power":
+                self.statistics.total_gpu_power /
+                self.rt_cfg.mapping["world_size"]
             }
 
         if self.streaming:
@@ -684,7 +688,8 @@ class ReportUtility:
                 "\n-- Energy Metrics --------------------------------------\n\n"
                 f"Total Energy (J):                                 {energy['total_energy_j']:.4f}\n"
                 f"Output Tokens per Joule (tokens/J):               {energy['output_token_per_j']:.4f}\n"
-                f"Average GPU Power (W):                            {energy['average_gpu_power']:.4f}\n")
+                f"Average GPU Power (W):                            {energy['average_gpu_power']:.4f}\n"
+            )
 
         perf_stats += (
             "\n-- Request Latency Breakdown (ms) -----------------------\n\n"
