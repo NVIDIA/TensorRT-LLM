@@ -36,6 +36,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         BufferSlice,
         CacheLevel,
         CudaStream,
+        DataRole,
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
@@ -78,6 +79,7 @@ else:
         BufferSlice,
         CacheLevel,
         CudaStream,
+        DataRole,
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
@@ -340,12 +342,12 @@ class TestNoBatching(TestKVCacheManagerV2):
         if use_external_page_index_buf:
             max_num_blocks = div_up(seq_len, self.cfg.tokens_per_block)
             num_layer_groups = len(self.manager.layer_grouping)
-            page_indices = [
+            base_page_indices = [
                 array.array("i", [-1]) * max_num_blocks for _ in range(num_layer_groups)
             ]
             for id in range(num_layer_groups):
-                req0.kv_cache.set_page_index_buf(
-                    DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(page_indices[id])
+                req0.kv_cache.set_base_page_index_buf(
+                    DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(base_page_indices[id])
                 )
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
@@ -367,12 +369,12 @@ class TestNoBatching(TestKVCacheManagerV2):
         if use_external_page_index_buf:
             max_num_blocks = div_up(seq_len, self.cfg.tokens_per_block)
             num_layer_groups = len(self.manager.layer_grouping)
-            page_indices = [
+            base_page_indices = [
                 array.array("i", [-1]) * max_num_blocks for _ in range(num_layer_groups)
             ]
             for id in range(num_layer_groups):
-                req0.kv_cache.set_page_index_buf(
-                    DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(page_indices[id])
+                req0.kv_cache.set_base_page_index_buf(
+                    DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(base_page_indices[id])
                 )
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
@@ -952,6 +954,106 @@ class TestDisaggregatedServing(unittest.TestCase):
         for node in self.decode:
             node.stream.synchronize()
             node.kv_cache.close()
+
+
+class TestComplexModels(unittest.TestCase):
+    def setUp(self) -> None:
+        init_cuda_once()
+        gc.collect()
+        gc.disable()
+
+    def tearDown(self) -> None:
+        gc.enable()
+
+    def test_complex_model_0(self) -> None:
+        role = DataRole("buf0")
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(2),
+                buffers=[BufferConfig(role=role, size=98304)],
+                sliding_window_size=None,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(3),
+                buffers=[BufferConfig(role=role, size=163840)],
+                sliding_window_size=64,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(4),
+                buffers=[BufferConfig(role=role, size=163840)],
+                sliding_window_size=64,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(5),
+                buffers=[BufferConfig(role=role, size=65536)],
+                sliding_window_size=None,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(6),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=64,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(7),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=64,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(8),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(9),
+                buffers=[BufferConfig(role=role, size=32768)],
+                sliding_window_size=None,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(10),
+                buffers=[BufferConfig(role=role, size=262144)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(11),
+                buffers=[BufferConfig(role=role, size=262144)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+        ]
+
+        config = KVCacheManagerConfig(
+            tokens_per_block=128,
+            vocab_size=1024,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=1024 * 1024 * 1024),
+                HostCacheTierConfig(quota=8000 << 20),
+            ],
+            max_util_for_resume=0.95,
+            layers=layers,
+        )
+        manager = KVCacheManager(config)
+        del manager
 
 
 if __name__ == "__main__":

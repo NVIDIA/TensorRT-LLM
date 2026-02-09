@@ -334,8 +334,9 @@ accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_inst
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[MMLU]
 accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[True]
-accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False]
-accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True]
+accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-True]
+accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True-True]
+accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-False]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestKimiK2::test_nvfp4
 

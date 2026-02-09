@@ -444,15 +444,26 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
 
 
 @skip_single_gpu
-@pytest.mark.parametrize("pytorch_backend", [False, True])
-def test_llm_get_stats_tp2(pytorch_backend):
-    llm_get_stats_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
+def test_llm_get_stats_tp2():
+    llm_get_stats_test_harness(tp_size=2, pytorch_backend=False)
 
 
 @skip_single_gpu
-@pytest.mark.parametrize("pytorch_backend", [False, True])
-def test_llm_get_stats_async_tp2(pytorch_backend):
-    llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+def test_llm_get_stats_pp2(enable_chunked_prefill):
+    llm_get_stats_test_harness(pp_size=2,
+                               pytorch_backend=False,
+                               enable_chunked_prefill=enable_chunked_prefill)
+
+
+@skip_single_gpu
+def test_llm_get_stats_async_tp2():
+    llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=False)
+
+
+@skip_single_gpu
+def test_llm_get_stats_async_pp2():
+    llm_get_stats_async_test_harness(pp_size=2, pytorch_backend=False)
 
 
 @skip_ray

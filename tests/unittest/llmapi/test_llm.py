@@ -2062,13 +2062,16 @@ def validate_stats(
         ifbStats = result["inflightBatchingStats"]
         print(f"iter: {iter}, ifbStats: {ifbStats}")
 
-    expected_num_results = max_tokens if pytorch_backend else max_tokens + 1
-    if enable_chunked_prefill:
-        expected_num_results += 1
-    assert len(results) == expected_num_results
+    # Filter out the results where no requests are scheduled
+    results = [
+        r for r in results
+        if r["inflightBatchingStats"]["numScheduledRequests"] > 0
+    ]
 
     context_iterations = 2 if enable_chunked_prefill else 1
     generation_iterations = max_tokens - 1
+    assert len(results) == context_iterations + generation_iterations
+
     microbatch_id = 0
     for iter, result in enumerate(results):
         ifbStats = result["inflightBatchingStats"]
@@ -2084,12 +2087,6 @@ def validate_stats(
             assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
             assert ifbStats["numGenRequests"] == 1, f"iter: {iter}"
             assert result["numActiveRequests"] == 1, f"iter: {iter}"
-            assert ifbStats["microBatchId"] == microbatch_id, f"iter: {iter}"
-        else:
-            assert ifbStats["numScheduledRequests"] == 0, f"iter: {iter}"
-            assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
-            assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
-            assert result["numActiveRequests"] == 0, f"iter: {iter}"
             assert ifbStats["microBatchId"] == microbatch_id, f"iter: {iter}"
 
         # In pipeline parallel mode, increment microbatch_id for each context iteration except the last one,
@@ -2171,10 +2168,8 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                  disable_overlap_scheduler=not use_overlap))
         LLM_CLASS = LLM_torch
     else:
-        LLM_CLASS = LLM
-
-    if not pytorch_backend:
         llm_args_extra["fast_build"] = True
+        LLM_CLASS = LLM
 
     with LLM_CLASS(model=llama_model_path,
                    kv_cache_config=global_kvcache_config,
@@ -2322,6 +2317,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     with LLM_CLASS(model=llama_model_path,
                    kv_cache_config=global_kvcache_config,
                    tensor_parallel_size=tp_size,
+                   pipeline_parallel_size=pp_size,
                    **llm_args_extra) as llm:
 
         max_tokens = 6

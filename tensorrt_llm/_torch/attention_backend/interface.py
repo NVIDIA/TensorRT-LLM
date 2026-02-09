@@ -65,6 +65,8 @@ class AttentionMetadata:
     max_num_sequences: Optional[int] = None
     # The KV cache manager.
     kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2]
+    # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
+    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False

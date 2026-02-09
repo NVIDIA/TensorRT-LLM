@@ -3,12 +3,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
-from tensorrt_llm.logger import logger
-
-try:
-    import etcd3
-except Exception as e:
-    logger.warning(f"etcd3 is not installed correctly: {e}")
+from tensorrt_llm.serve.cluster_storage import etcd3
 
 
 class RemoteDictionary(ABC):

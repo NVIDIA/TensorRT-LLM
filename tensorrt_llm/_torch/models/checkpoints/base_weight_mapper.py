@@ -74,12 +74,18 @@ class BaseWeightMapper(ABC):
                 pattern_mapping = {
                     r'(.*?)out_proj(.*)': r'\1o_proj\2'
                 }
-            weights: A dictionary of weights
+            weights: A dictionary of weights (or ConsumableWeightsDict)
 
         Returns:
-            A dictionary of weights with renamed keys
+            A dictionary of weights with renamed keys (preserves ConsumableWeightsDict if input was one)
         """
         import re
+
+        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+            ConsumableWeightsDict
+
+        # Check if input is a ConsumableWeightsDict to preserve the type
+        is_consumable = isinstance(weights, ConsumableWeightsDict)
 
         # Create a new dictionary to store the renamed weights
         renamed_weights = {}
@@ -103,6 +109,9 @@ class BaseWeightMapper(ABC):
             if key not in matched_keys:
                 renamed_weights[key] = weights[key]
 
+        # Preserve ConsumableWeightsDict type if that's what was passed in
+        if is_consumable:
+            return ConsumableWeightsDict(renamed_weights)
         return renamed_weights
 
     def preprocess_weights(self, weights: dict) -> dict:
