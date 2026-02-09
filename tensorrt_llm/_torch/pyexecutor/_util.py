@@ -895,9 +895,13 @@ def create_py_executor_instance(
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
+    # Treat Ulysses CP as TP for kv cache transceiver
+    mapping_for_kv_cache_transceiver = mapping
+    if mapping.has_cp_ulysses():
+        mapping_for_kv_cache_transceiver = mapping.repurpose_ulysses_cp_to_tp()
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config)
+        mapping_for_kv_cache_transceiver, dist, kv_cache_manager,
+        attention_type, cache_transceiver_config)
     return PyExecutor(
         resource_manager,
         scheduler,

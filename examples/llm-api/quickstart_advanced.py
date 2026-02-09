@@ -8,6 +8,7 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
+from tensorrt_llm.mapping import CpType
 
 example_prompts = [
     "Hello, my name is",
@@ -80,6 +81,7 @@ def add_llm_args(parser):
                         default="auto",
                         choices=["auto", "TorchSampler", "TRTLLMSampler"])
     parser.add_argument('--tp_size', type=int, default=1)
+    parser.add_argument('--cp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--orchestrator_type',
                         type=str,
@@ -276,6 +278,10 @@ def setup_llm(args, **kwargs):
         batching_wait_iters=args.attention_dp_batching_wait_iters,
     )
 
+    cp_config = {}
+    if args.cp_size > 1:
+        cp_config = {"cp_type": CpType.ULYSSES}
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -305,6 +311,8 @@ def setup_llm(args, **kwargs):
         moe_expert_parallel_size=args.moe_ep_size,
         moe_tensor_parallel_size=args.moe_tp_size,
         moe_cluster_parallel_size=args.moe_cluster_size,
+        context_parallel_size=args.cp_size,
+        cp_config=cp_config,
         enable_chunked_prefill=args.enable_chunked_prefill,
         speculative_config=spec_config,
         trust_remote_code=args.trust_remote_code,
