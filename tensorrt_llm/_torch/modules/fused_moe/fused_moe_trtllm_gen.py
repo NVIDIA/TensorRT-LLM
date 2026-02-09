@@ -533,7 +533,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         if token_selected_experts is not None:
             # for cases like deepep low latency where fake top_k=1 might be used
-            top_k = token_selected_experts.shape[1]
+            top_k = token_selected_experts.shape[-1]
 
         # Ensure x_sf is 2D before flattening
         if x_sf is not None:
