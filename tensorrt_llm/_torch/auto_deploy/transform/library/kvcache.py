@@ -51,10 +51,8 @@ class InsertCachedAttentionConfig(TransformConfig):
     backend: Optional[str] = Field(default=None, description="The attention backend to use.")
 
 
-@TransformRegistry.register("insert_cached_attention")
-class InsertCachedAttention(BaseTransform):
-    """
-    A transform to insert cached attention into the graph module."""
+class _InsertCachedOperator(BaseTransform):
+    """A generic base transform to insert cached operators into the graph module."""
 
     config: InsertCachedAttentionConfig
 
@@ -236,15 +234,22 @@ class InsertCachedAttention(BaseTransform):
         return gm, info
 
 
+@TransformRegistry.register("insert_cached_attention")
+class InsertCachedAttention(_InsertCachedOperator):
+    """A transform to insert cached attention into the graph module."""
+
+    def _apply(self, *args, **kwargs):
+        if self.config.backend == "triton":
+            self._log_warning(
+                "'triton' backend only supports GREEDY sampling (top_k=1). "
+                "Please set top_k=1 in the sampling parameters to ensure cohesive output."
+            )
+        return super()._apply(*args, **kwargs)
+
+
 @TransformRegistry.register("insert_cached_mla_attention")
-class InsertCachedMLAAttention(InsertCachedAttention):
-    """
-    A transform to insert cached MLA attention into the graph module.
-
-    This class is identical to InsertCachedAttention and inherits all its behavior.
-    """
-
-    pass
+class InsertCachedMLAAttention(_InsertCachedOperator):
+    """A transform to insert cached MLA attention into the graph module."""
 
 
 @TransformRegistry.register("resize_kv_cache")
@@ -316,7 +321,6 @@ class InitializeCache(BaseTransform):
         # Initialize with estimation mode
         # This allows resize_kv_cache to recreate with correct capacity after measuring memory
         num_caches = cm.initialize_resources()
-        self._log_info(f"Initialized {num_caches} caches for cached attention")
 
         info = TransformInfo(
             skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True

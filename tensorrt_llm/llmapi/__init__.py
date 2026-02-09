@@ -1,5 +1,5 @@
 from .._torch.async_llm import AsyncLLM
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
@@ -32,6 +32,7 @@ __all__ = [
     'GuidedDecodingParams',
     'SamplingParams',
     'DisaggregatedParams',
+    'DisaggScheduleStyle',
     'KvCacheConfig',
     'KvCacheRetentionConfig',
     'CudaGraphConfig',

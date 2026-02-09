@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from .....functional import AllReduceStrategy
-from ...custom_ops.trtllm_dist import is_trtllm_op_available
+from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import del_attr_by_name, eliminate_dead_code
@@ -40,11 +40,10 @@ from ...utils.node_utils import (
     LayerType,
     bfs,
     extract_weight_name,
-    extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
+    get_all_weight_infos,
     get_all_weights_in_subgraph,
-    get_layer_after_linear_node,
     is_any_attention_op,
     is_any_lin_op,
     is_any_moe_op,
@@ -1296,6 +1295,11 @@ def _shard_parameter_node(
     rank, world_size = config.rank, config.world_size
     allreduce_strategy = config.allreduce_strategy.name
 
+    if "sharded" in node.meta and node.meta["sharded"]:
+        # Node was already sharded, skip
+        return
+    node.meta["sharded"] = True
+
     num_users = num_users_of_weight_node(node)
     if num_users > 1 or num_users == 0:
         ad_logger.warning(
@@ -1304,12 +1308,17 @@ def _shard_parameter_node(
         return
 
     # Shard weight using the unified function (also updates the parameter)
-    weight_nodes = extract_weight_nodes(node)
-    for weight_node in weight_nodes.weights:
+    all_weight_infos = get_all_weight_infos(node)
+    # Parametrized nodes must have at least one weight (for debugging)
+    assert len(all_weight_infos.weights) > 0, (
+        f"Node {node.name} has no weights - weight mapping may be incorrect"
+    )
+
+    for weight_info in all_weight_infos.weights:
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
-            weight_tensor=weight_node.tensor,
-            param_key=weight_node.node_key,
+            weight_tensor=weight_info.tensor,
+            param_key=weight_info.node_key,
             dim=dim,
             rank=rank,
             world_size=world_size,
@@ -1319,29 +1328,29 @@ def _shard_parameter_node(
         if quantization_cb is not None:
             quantization_cb(
                 gm=gm,
-                submod=weight_node.submod,
+                submod=weight_info.submod,
                 node=node,
-                weight_key=weight_node.node_key,
+                weight_key=weight_info.node_key,
                 weight_new_shape=weight_new_shape,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
             )
 
-    for bias_node in weight_nodes.biases:
+    for bias_info in all_weight_infos.biases:
         if dim == 0:
             # update bias for dim 0 --> we can handle it like the weight
             shard_weight_tensor(
                 gm=gm,
-                weight_tensor=bias_node.tensor,
-                param_key=bias_node.node_key,
+                weight_tensor=bias_info.tensor,
+                param_key=bias_info.node_key,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_weight_dims,
             )
-        elif bias_node is not None and rank != world_size - 1:
+        elif rank != world_size - 1:
             # update the bias for dim 1 --> in this case only the last rank gets the bias to avoid
             # double counting it. For all other we will delete the bias.
             args = list(node.args)
@@ -1349,10 +1358,10 @@ def _shard_parameter_node(
             args[2] = None
             node.args = tuple(args)
             gm.graph.erase_node(node_bias)
-            bias_param_name = bias_node.node_key.rpartition(".")[-1]
-            setattr(bias_node.submod, bias_param_name, None)
+            bias_param_name = bias_info.node_key.rpartition(".")[-1]
+            setattr(bias_info.submod, bias_param_name, None)
             gm._register_load_state_dict_pre_hook(
-                partial(_load_hook_remove, param_key=bias_node.node_key)
+                partial(_load_hook_remove, param_key=bias_info.node_key)
             )
 
     # # # column shard with no gather: the output is sharded
@@ -2295,47 +2304,37 @@ def detect_sharding_from_config(
         raise ValueError(f"Unsupported sharding source: {source}")
     tp_plan = config["tp_plan"]
 
-    # If the node is inside the attention module, we need to set min_local_shape to the
-    # head_dim - otherwise, we would risk splitting the heads into smaller shards.
-    # TODO: is there a better way to check if we are in attention module?
-    attn_names = [
-        "attention",
-        "Attention",
-        "attn",
-        "Attn",
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-    ]
-
     num_shards = 0
     num_simple_shards = 0
     num_row_col_shards = 0
     num_attention_shards = 0
     num_ssm_shards = 0
-    head_dim = -1
     linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+
+    # use layer_subgraphs to determine the layer_type
+    # and check the validity of the sharding transform
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
         weight_name = extract_weight_name(lin_node)
-
-        if any(attn_name in weight_name for attn_name in attn_names):
-            # find the next attention node and infer the head_dim
-            next_attention_node, _ = bfs(
-                lin_node, is_any_attention_op, attr_next="users", include_root=False
-            )
-            if next_attention_node is None:
-                # this is the last attention node in the graph. Take the previously found head_dim
-                assert head_dim != -1, "Head dim not found for the last attention node"
-            else:
-                head_dim = shape(next_attention_node)[-1]
-            min_local_shape = head_dim
-            layer_type = LayerType.ATTENTION
+        # get the parent layer_subgraph
+        layer_subgraph = [
+            layer
+            for layer in layer_subgraphs
+            if lin_node in layer.opening_nodes or lin_node == layer.terminating_node
+        ]
+        if len(layer_subgraph) == 1:
+            layer_subgraph = layer_subgraph[0]
+            layer_type = layer_subgraph.layer_type
         else:
-            min_local_shape = 1
-            layer_type = LayerType.MLP
+            if lin_node in unprocessed_linear_nodes:
+                layer_type = LayerType.UNKNOWN
+            else:
+                ad_logger.warning(
+                    f"Failed to find the parent layer_subgraph for linear node {lin_node}. "
+                    f"May result in incorrect sharding."
+                )
 
         # use regex to find if module_name matches any of the keys in sharding_config
         for key in tp_plan.keys():
@@ -2349,11 +2348,6 @@ def detect_sharding_from_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
 
-                if config in ["colwise", "mamba"]:
-                    cur_node_index = linear_nodes.index(lin_node)
-                    layer_subgraph = get_layer_after_linear_node(
-                        linear_nodes, [cur_node_index - 1], enforce_strict_linear_history=False
-                    )
                 if config == "colwise":
                     _process_column_sharding(
                         layer_subgraph=layer_subgraph,
@@ -2366,7 +2360,6 @@ def detect_sharding_from_config(
                             split_dim=SplitDimension.ROW,
                             config=transform_container.config,
                             dist_op="all_reduce",
-                            min_local_shape=min_local_shape,
                             layer_type=layer_type,
                         )
                     ):
@@ -2393,7 +2386,6 @@ def detect_sharding_from_config(
                                     split_dim=SplitDimension.COLUMN,
                                     config=transform_container.config,
                                     dist_op=None,
-                                    min_local_shape=min_local_shape,
                                     layer_type=layer_type,
                                 )
                             )
@@ -2404,7 +2396,6 @@ def detect_sharding_from_config(
                                     split_dim=SplitDimension.ROW,
                                     config=transform_container.config,
                                     dist_op="all_reduce",
-                                    min_local_shape=min_local_shape,
                                     layer_type=layer_type,
                                 )
                             ):
@@ -2423,7 +2414,6 @@ def detect_sharding_from_config(
                             split_dim=SplitDimension.COLUMN,
                             config=transform_container.config,
                             dist_op="all_gather",
-                            min_local_shape=1,
                             layer_type=layer_type,
                         )
                     ):
@@ -2536,7 +2526,7 @@ def detect_column_row_shard(
         attention_nodes = list(filtered_nodes(layer_subgraph, is_any_attention_op))
         min_local_shape = 1
 
-        if config.simple_shard_only:
+        if config.simple_shard_only or layer.layer_type == LayerType.UNKNOWN:
             ad_logger.debug(
                 f"Forcing Simple Shard on nodes: {nodes_linear} with layer type: {layer.layer_type}"
             )

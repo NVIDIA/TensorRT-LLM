@@ -263,7 +263,9 @@ class ModelFactory(ABC):
         """
         return model_name_or_path
 
-    def load_or_random_init(self, model: nn.Module, device: DeviceLikeType):
+    def load_or_random_init(
+        self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
+    ):
         """Load the checkpoint into the model or randomly initialize the model.
 
         Args:
@@ -271,6 +273,7 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            disable_preload: If True, disable preloading weights to CPU before moving to device.
             load_factoy_model: If True, will load weights for the factory model in addition to main
                 gm. This is useful for the transformers model.
 
@@ -303,7 +306,7 @@ class ModelFactory(ABC):
 
         if not self.skip_loading_weights:
             self.prefetch_checkpoint(force=True)
-            self._load_checkpoint(model, device)
+            self._load_checkpoint(model, device, disable_preload=disable_preload)
 
     @staticmethod
     def _to_maybe_random(model: nn.Module, device: DeviceLikeType):
@@ -323,7 +326,9 @@ class ModelFactory(ABC):
         )
 
     @abstractmethod
-    def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
+    def _load_checkpoint(
+        self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
+    ):
         """Load the checkpoint into the model.
 
         Args:
@@ -331,6 +336,7 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            disable_preload: If True, disable preloading weights to CPU before moving to device.
         """
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:

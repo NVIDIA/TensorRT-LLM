@@ -152,6 +152,14 @@ class KVCacheManager:
         slot_size = pool_group.slot_size[pool_idx]
         return exact_div(slot_size, attr.size) * num_slots - exact_div(attr.offset, attr.size)
 
+    def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int:
+        """
+        The multiplier to convert from base page indices to page indices expected by operators/kernels.
+        """
+        storage = self._storage
+        attr = storage.get_buffer_attr(layer_id, data_role)
+        return storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
+
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,
@@ -295,7 +303,7 @@ class KVCacheManager:
             )
 
     # @TODO: need updating when dynamic resizing is supported.
-    def clamp_max_seq_len_for_mem(self, batch_size: int, model_max_seq_len: int) -> int:
+    def clamp_max_seq_len_for_mem(self, batch_size: int) -> int:
         "Get the max possible sequence length limited by the GPU memory pools."
         assert batch_size > 0
         tokens_per_block = self.tokens_per_block
@@ -330,13 +338,14 @@ class KVCacheManager:
 
         assert is_enough(1)
         lb = 1
-        ub = div_up(model_max_seq_len, tokens_per_block)
-        if is_enough(ub):
-            return model_max_seq_len
-        while lb < ub:
+        ub = lb
+        while is_enough(ub):
+            lb = ub
+            ub *= 2
+        while lb < ub - 1:
             mid = (lb + ub) // 2
             if is_enough(mid):
                 lb = mid
             else:
-                ub = mid - 1
-        return min(lb * tokens_per_block, model_max_seq_len)
+                ub = mid
+        return lb * tokens_per_block

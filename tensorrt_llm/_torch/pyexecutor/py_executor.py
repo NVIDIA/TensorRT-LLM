@@ -12,6 +12,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
+from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 try:
@@ -352,6 +353,9 @@ class PyExecutor:
             ResourceManagerType.KV_CACHE_MANAGER)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        self.enable_partial_reuse_for_disagg = (
+            self.enable_kv_cache_reuse
+            and self.kv_cache_manager.enable_partial_reuse)
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -360,7 +364,7 @@ class PyExecutor:
         self.expected_num_active_requests = 0
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
-            should_store_blocks=self.enable_kv_cache_reuse
+            should_store_blocks=self.enable_partial_reuse_for_disagg
             and not self.kv_cache_manager.is_vswa)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
@@ -1419,6 +1423,7 @@ class PyExecutor:
             return None, None
 
         if self.kv_cache_transceiver:
+            self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
 
@@ -2396,6 +2401,24 @@ class PyExecutor:
 
         return
 
+    @nvtx_range("_check_disagg_ctx_schedulable_status")
+    def _check_disagg_ctx_schedulable_status(self,
+                                             new_requests: List[LlmRequest]):
+        """
+        In context-first mode, context requests are scheduable immediately,
+        otherwise, we need to check if context requests are ready to be scheduled by querying kv cache transceiver
+        """
+        if not self.kv_cache_transceiver:
+            return
+        ctx_only_requests = [
+            req for req in new_requests
+            if req.is_context_only_request and req.py_disaggregated_params.
+            schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        ]
+        if ctx_only_requests:
+            self.kv_cache_transceiver.prepare_context_requests(
+                ctx_only_requests)
+
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -2984,7 +3007,7 @@ class PyExecutor:
                                 logger.debug(
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
-                if self.enable_kv_cache_reuse and not self.kv_cache_manager.is_vswa:
+                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa:
                     requests_to_terminate.append(request)
                 else:
                     if not request.is_disagg_context_transmission_state:

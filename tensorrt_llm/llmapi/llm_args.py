@@ -1770,6 +1770,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    use_kv_cache_manager_v2: bool = Field(
+        default=False,
+        status="prototype",
+        description="Whether to use the KV cache manager v2 (experimental).")
+
+    max_util_for_resume: float = Field(
+        default=0.95,
+        status="prototype",
+        description=
+        "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
+    )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1828,6 +1840,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive"
                 )
+        return v
+
+    @field_validator('max_util_for_resume')
+    @classmethod
+    def validate_max_util_for_resume(cls, v: float):
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
 
@@ -3039,6 +3059,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading."
         "Only enable it if you intend to use this feature.",
         status="prototype")
+
+    # fp8 cute dsl configs
+    use_cute_dsl_blockscaling_mm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling mm implementation.",
+        status="prototype",
+    )
+    use_cute_dsl_blockscaling_bmm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
+        status="prototype",
+    )
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
