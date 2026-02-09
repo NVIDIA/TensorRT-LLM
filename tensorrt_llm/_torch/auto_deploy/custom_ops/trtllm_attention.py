@@ -88,18 +88,23 @@ class TrtllmWorkspaceResourceHandler(ResourceHandler):
 
     Allocates a global workspace buffer used by all attention layers.
     Returns the same buffer for all layers to avoid redundant allocations.
+
+    The workspace is initially allocated at a modest size. The C++ attention
+    kernel (thop.attention) automatically resizes the workspace via in-place
+    ``resize_()`` if it determines more space is needed (see
+    ``attentionOp.cpp`` – ``getWorkspaceSize`` / ``resize_`` logic). This
+    avoids pre-allocating enormous buffers for large ``max_batch_size *
+    max_seq_len`` configurations.
     """
 
     def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
-        """Allocate workspace buffer (64 MB) - reuses existing if already allocated."""
+        """Allocate workspace buffer - reuses existing if already allocated."""
         # Check if workspace already exists (stored in _global_state)
         if _global_state.workspace is not None:
             return _global_state.workspace
 
         # Debug mode: skip workspace allocation to test if it's the culprit
         if _SKIP_WORKSPACE_ALLOC:
-            # Return a dummy buffer that will cause attention to fail but allows us to test
-            # if the workspace allocation is causing issues
             buffer = torch.empty(1, dtype=torch.uint8, device=sequence_info.device)
             _global_state.init_workspace(buffer)
             return buffer
@@ -108,16 +113,17 @@ class TrtllmWorkspaceResourceHandler(ResourceHandler):
         if not check_cuda_health("before_workspace_alloc"):
             raise RuntimeError("CUDA unhealthy before workspace allocation")
 
-        # Synchronize CUDA before allocation to ensure clean state
         torch.cuda.synchronize()
 
-        # Allocate new workspace (256MB - large enough for attention ops)
-        # The TRT-LLM attention kernel may need up to ~128MB for large batches
-        buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=sequence_info.device)
+        # Allocate a reasonable initial workspace.  The C++ thop.attention
+        # kernel will auto-resize (via ``resize_()``) if more space is needed
+        # during the warmup / resize_kv_cache forward pass.  We therefore do
+        # NOT try to pre-compute ``max_batch_size * max_seq_len * bytes_per_token``
+        # which can easily exceed GPU memory for large serving configs.
+        workspace_bytes = 256 * 1024 * 1024  # 256 MB initial size
+        buffer = torch.empty(workspace_bytes, dtype=torch.uint8, device=sequence_info.device)
 
-        # Synchronize after allocation to ensure buffer is ready
         torch.cuda.synchronize()
-
         _global_state.init_workspace(buffer)
 
         # Check CUDA health after allocation
@@ -265,6 +271,8 @@ class TrtllmAttentionGlobalState:
             cls._instance._shared_host_kv_cache_pool_mapping: Optional[torch.Tensor] = None
             # Track if pool pointers have been initialized
             cls._instance._pool_pointers_initialized: bool = False
+            # Correct num_layers from pool_mapping (may differ from _track_layer_config)
+            cls._instance._pool_num_layers: int = 0
             # Track if host_prepare has been called (tensors are pre-filled)
             cls._instance._host_prepare_called: bool = False
             # Cache the current batch info for tensor slicing (updated by host_prepare)
@@ -407,23 +415,26 @@ class TrtllmAttentionGlobalState:
         self._gpu_base_offset = torch.zeros(max_pages, dtype=torch.int32, device="cuda")
         self._gpu_buffers_initialized = True
 
-    def _init_pool_pointers(
+    def _update_pool_pointers(
         self,
         ad_pool_pointers: Optional[torch.Tensor],
         ad_pool_mapping: Optional[torch.Tensor],
         num_layers: int,
-        fallback_kv_cache_ptr: Optional[int] = None,
     ) -> None:
-        """Initialize pool pointers from AD's KVCacheManager.
+        """Update pool pointers from AD's KVCacheManager.
 
-        This is called during host_prepare to set up the pool info.
-        Pool pointers are updated only when they change (e.g., after cache resize).
+        Called on every host_prepare to ensure pool pointers stay current after
+        KVCacheManager resizes (which change the pool base address).
+
+        The pool pointer is the GLOBAL pool base address from KVCacheManager.
+        The pool mapping contains per-layer offsets that the kernel uses to find
+        each layer's data within the global pool. Block offsets are scaled by
+        num_layers * kv_factor to account for the interleaved layout.
 
         Args:
-            ad_pool_pointers: Pool pointers from SequenceInfo (if available)
-            ad_pool_mapping: Pool mapping from SequenceInfo (if available)
+            ad_pool_pointers: Pool pointers from SequenceInfo
+            ad_pool_mapping: Pool mapping from SequenceInfo
             num_layers: Number of transformer layers
-            fallback_kv_cache_ptr: Fallback KV cache data pointer (DEPRECATED - not used)
         """
         # Check if AD pool pointers are valid
         use_ad_pool = (
@@ -433,29 +444,33 @@ class TrtllmAttentionGlobalState:
             and ad_pool_pointers[0, 0].item() != 0
         )
 
-        if use_ad_pool:
-            # Check if pointers changed (avoid unnecessary updates in hot path)
-            new_ptr = ad_pool_pointers[0, 0].item()
-            current_ptr = self._shared_host_kv_cache_pool_pointers[0, 0].item()
+        if not use_ad_pool:
+            if not self._pool_pointers_initialized:
+                ad_logger.warning("AD pool pointers not available. Pool initialization deferred.")
+            return
 
-            if current_ptr != new_ptr:
-                # Pool pointers changed (cache was resized) - update everything
-                # Use AD's pool pointers directly
-                # K and V are interleaved in blocks, so only K ptr is needed
-                # V ptr is set to 0 - kernel uses block offsets to find V
-                self._shared_host_kv_cache_pool_pointers[0, 0] = new_ptr
-                self._shared_host_kv_cache_pool_pointers[0, 1] = 0
+        new_ptr = ad_pool_pointers[0, 0].item()
+        current_ptr = self._shared_host_kv_cache_pool_pointers[0, 0].item()
 
-                # Set pool mapping for all layers (vectorized copy)
-                n_layers = min(num_layers, ad_pool_mapping.shape[0])
-                self._shared_host_kv_cache_pool_mapping[:n_layers].copy_(ad_pool_mapping[:n_layers])
+        # Only update if pointer changed (e.g., after KVCacheManager resize)
+        if current_ptr == new_ptr and self._pool_pointers_initialized:
+            return
 
-            self._pool_pointers_initialized = True
-        elif not self._pool_pointers_initialized:
-            # AD pool pointers not available yet - don't use fallback, wait for proper pointers
-            # Using kv_cache.data_ptr() as fallback is WRONG because it's a view pointer,
-            # not the pool base pointer. The block offsets are relative to pool base.
-            ad_logger.warning("AD pool pointers not available yet. Pool initialization deferred.")
+        # Use AD's pool pointers directly
+        # K and V are interleaved in blocks, so only K ptr is needed
+        # V ptr is set to 0 - kernel uses block offsets to find V
+        self._shared_host_kv_cache_pool_pointers[0, 0] = new_ptr
+        self._shared_host_kv_cache_pool_pointers[0, 1] = 0
+
+        # Set pool mapping for all layers
+        for layer_i in range(min(num_layers, ad_pool_mapping.shape[0])):
+            self._shared_host_kv_cache_pool_mapping[layer_i, 0] = ad_pool_mapping[layer_i, 0].item()
+            self._shared_host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[layer_i, 1].item()
+
+        # Use the actual pool_mapping size for num_layers, not the passed value
+        # which may be inflated (e.g., 32 fallback for hybrid models with only 6 attn layers)
+        self._pool_num_layers = ad_pool_mapping.shape[0]
+        self._pool_pointers_initialized = True
 
     def get_or_create_layer_state(
         self,
@@ -559,7 +574,14 @@ class TrtllmAttentionGlobalState:
             if first_state.sequence_length is None:
                 return
 
-            num_layers = first_state.num_layers if first_state.num_layers > 0 else 32
+            # Prefer pool_num_layers (from pool_mapping, most accurate for hybrid models)
+            # over first_state.num_layers (which may have wrong fallback value)
+            if global_state._pool_num_layers > 0:
+                num_layers = global_state._pool_num_layers
+            elif first_state.num_layers > 0:
+                num_layers = first_state.num_layers
+            else:
+                num_layers = 32
 
             # Initialize buffers once (lazy initialization)
             if not global_state._cpu_buffers_initialized:
@@ -572,11 +594,12 @@ class TrtllmAttentionGlobalState:
                 )
                 global_state._init_gpu_buffers(max_pages, first_state.max_num_requests)
 
-            # Update pool pointers from AD (they may change during cache resize)
+            # Update pool pointers from AD's KVCacheManager
+            # Must check every call because pool may be resized (changes base address)
             if _trtllm_config._sequence_info is not None:
                 ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
                 ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
-                global_state._init_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
+                global_state._update_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
 
             # Use pre-allocated CPU buffers with out= to avoid tensor allocation
             input_seq_lens = global_state._cpu_input_seq_lens[:num_seq]
@@ -663,17 +686,29 @@ class TrtllmAttentionGlobalState:
                 )
                 page_in_seq = global_state._gpu_page_idx[:total_pages]
 
-                # Block offsets: For SELF cache type (kv_factor=2, native HND),
-                # K and V are in the SAME block. Use raw cache_loc as block index.
-                # The layer offset is handled by pool_mapping, not block offsets.
-                block_indices = cache_loc[:total_pages]
+                # Block offsets: multiplier = num_layers * kv_factor for interleaved K/V
+                # K and V have different offsets: K = base, V = base + 1
+                # Use pool_num_layers (from pool_mapping) for correct multiplier
+                kv_factor = 2
+                pool_layers = (
+                    global_state._pool_num_layers
+                    if global_state._pool_num_layers > 0
+                    else num_layers
+                )
+                multiplier = pool_layers * kv_factor
+                torch.mul(
+                    cache_loc[:total_pages],
+                    multiplier,
+                    out=global_state._gpu_base_offset[:total_pages],
+                )
+                base_offsets = global_state._gpu_base_offset[:total_pages]
 
                 # Fill block offsets using advanced indexing (only for active slots)
                 global_state._shared_kv_cache_block_offsets[0, seq_indices, 0, page_in_seq] = (
-                    block_indices  # K
+                    base_offsets  # K
                 )
                 global_state._shared_kv_cache_block_offsets[0, seq_indices, 1, page_in_seq] = (
-                    block_indices  # V (same block as K for SELF cache type)
+                    base_offsets + 1  # V
                 )
 
             # Mark that host_prepare has run
@@ -695,6 +730,7 @@ class TrtllmAttentionGlobalState:
         self._cpu_buffers_initialized = False
         self._gpu_buffers_initialized = False
         self._pool_pointers_initialized = False
+        self._pool_num_layers = 0
 
 
 # Global state singleton
@@ -772,11 +808,8 @@ def _prepare_trtllm_metadata(
     # This is the key optimization - each layer does almost no work during replay
     # NOTE: This must be checked BEFORE extracting batch info, because during CUDA graph replay,
     # batch_info_host.tolist() returns capture-time values which are stale.
+    # Pool pointers use the global pool base (same for all layers), so no per-layer update needed.
     if _global_state._host_prepare_called and not is_cuda_graph_mode:
-        # Pool pointers are set once during initialization via _init_pool_pointers()
-        # They point to AD's pool base and contain per-layer offsets in pool_mapping
-        # Do NOT overwrite them here - the shared pointers are already correct
-
         num_seq = _global_state._current_num_seq
         max_blocks_per_seq = state.kv_cache_block_offsets.shape[3]
         return (
@@ -818,11 +851,12 @@ def _prepare_trtllm_metadata(
         state.host_total_kv_lens[0] = 0
         state.host_total_kv_lens[1] = max_seq * num_seq
 
-        # Initialize pool pointers from AD's pool info if not already done
-        # This is critical for CUDA graph - the pointers must be stable across warmup/capture/replay
-        num_layers = state.num_layers if state.num_layers > 0 else 32
-        # Always try to initialize/update pool pointers from AD - don't use fallback
-        _global_state._init_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
+        # Pool pointers should already be initialized by host_prepare or initial setup.
+        # If not yet initialized, try from AD's SequenceInfo.
+        # Update pool pointers (may have changed after resize)
+        if ad_pool_pointers is not None and ad_pool_mapping is not None:
+            num_layers = state.num_layers if state.num_layers > 0 else 32
+            _global_state._update_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
 
         # Return tensors for capture - use shared pool pointers (already initialized)
         max_blocks_per_seq = state.kv_cache_block_offsets.shape[3]
@@ -850,6 +884,22 @@ def _prepare_trtllm_metadata(
     # Get num_layers - prefer from pool_mapping (accurate) over state.num_layers (may be stale)
     if ad_pool_mapping is not None and ad_pool_mapping.numel() > 0:
         num_layers = ad_pool_mapping.shape[0]
+        # For hybrid models (e.g., Mamba+Attention), _track_layer_config double-counts
+        # during export+runtime, causing set_model_config to never trigger.
+        # Force-call set_model_config here with correct num_layers from pool_mapping.
+        if _trtllm_config._num_layers == 0:
+            # Extract head_dim and num_kv_heads from kv_cache shape [blocks, kv_factor, heads, tokens, dim]
+            kv_num_heads = kv_cache.shape[2]
+            kv_head_dim = kv_cache.shape[4]
+            kv_heads_list = TrtllmAttention._num_kv_heads_per_layer[:num_layers]
+            if len(kv_heads_list) < num_layers:
+                kv_heads_list = [kv_num_heads] * num_layers
+            _trtllm_config.set_model_config(
+                num_layers=num_layers,
+                num_kv_heads_per_layer=kv_heads_list,
+                head_dim=kv_head_dim,
+                dtype=kv_cache.dtype,
+            )
     elif state.num_layers > 0:
         num_layers = state.num_layers
     else:
@@ -874,12 +924,6 @@ def _prepare_trtllm_metadata(
     state.sequence_length[:num_seq].copy_(seq_len_with_cache.cuda())
     state.context_lengths[:num_seq].copy_(input_seq_lens.cuda())
 
-    # Set up KV cache pool pointers - use AD's pool pointers
-    # Initialize pool pointers from AD's pool info if not already done
-    # This sets up the shared pool pointers that all layers will use
-    # Always try to initialize/update pool pointers from AD - don't use fallback
-    _global_state._init_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
-
     # Block offsets: convert flat cache_loc to per-sequence block indices
     pages_per_seq = (cu_num_pages_host[1 : num_seq + 1] - cu_num_pages_host[:num_seq]).int()
     max_blocks = pages_per_seq.max().item() if num_seq > 0 else 1
@@ -903,21 +947,46 @@ def _prepare_trtllm_metadata(
                 f"Block offsets reallocated: new shape {state.kv_cache_block_offsets.shape}"
             )
 
+    # Set up KV cache pool pointers - use AD's pool pointers
+    use_ad_pool = (
+        ad_pool_pointers is not None
+        and ad_pool_mapping is not None
+        and ad_pool_pointers.numel() > 0
+        and ad_pool_pointers[0, 0].item() != 0
+    )
+
+    if not use_ad_pool:
+        raise RuntimeError(
+            f"AD pool not available. ad_pool_pointers={ad_pool_pointers}, "
+            f"ad_pool_mapping={ad_pool_mapping}"
+        )
+
+    # Use AD's pool pointers directly
+    state.host_kv_cache_pool_pointers[0, 0] = ad_pool_pointers[0, 0].item()
+    state.host_kv_cache_pool_pointers[0, 1] = 0
+
+    # Use AD's pool mapping directly
+    for layer_i in range(min(num_layers, ad_pool_mapping.shape[0])):
+        state.host_kv_cache_pool_mapping[layer_i, 0] = ad_pool_mapping[layer_i, 0].item()
+        state.host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[layer_i, 1].item()
+
+    # Mark pool pointers as initialized in global state
+    _global_state._pool_pointers_initialized = True
+
     # Fill block offsets
     # AD's cache_loc contains LOGICAL block indices from KVCacheManager
-    # For SELF cache type (kv_factor=2, native HND): K and V are in the SAME block
-    # The block offset is the raw cache_loc value - NOT scaled by num_layers
-    # The layer offset is handled by host_kv_cache_pool_mapping, not block offsets
+    # Multiplier = num_layers * kv_factor for interleaved K/V layout
+    # K and V have different offsets: K = base, V = base + 1
+    kv_factor = 2
+    multiplier = num_layers * kv_factor
     state.kv_cache_block_offsets.zero_()
     offset = 0
     for i in range(num_seq):
         n_pages = pages_per_seq[i].item()
         if n_pages > 0:
-            # For SELF cache type, K and V use the SAME block index
-            # They are stored at different positions WITHIN the block (kv_factor dimension)
-            block_indices = cache_loc[offset : offset + n_pages]
-            state.kv_cache_block_offsets[0, i, 0, :n_pages] = block_indices  # K
-            state.kv_cache_block_offsets[0, i, 1, :n_pages] = block_indices  # V (same block)
+            base_offsets = cache_loc[offset : offset + n_pages] * multiplier
+            state.kv_cache_block_offsets[0, i, 0, :n_pages] = base_offsets  # K
+            state.kv_cache_block_offsets[0, i, 1, :n_pages] = base_offsets + 1  # V
             offset += n_pages
 
     # Return tensors
@@ -1065,7 +1134,15 @@ def trtllm_mha_with_cache(
     output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
     # Get num_layers from config for block offset calculation
-    num_layers = _trtllm_config._num_layers if _trtllm_config._num_layers > 0 else 32
+    # For hybrid models (e.g., Mamba+Attention), _num_layers may not be set correctly
+    # because _track_layer_config is called during both export and runtime.
+    # Prefer pool_num_layers from pool_mapping (most accurate) when available.
+    if _global_state._pool_num_layers > 0:
+        num_layers = _global_state._pool_num_layers
+    elif _trtllm_config._num_layers > 0:
+        num_layers = _trtllm_config._num_layers
+    else:
+        num_layers = 32
     state = _global_state.get_or_create_layer_state(
         layer_idx=layer_idx,
         num_heads=num_heads,
@@ -1084,17 +1161,6 @@ def trtllm_mha_with_cache(
     if _trtllm_config._sequence_info is not None:
         ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
         ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
-
-    # For hybrid models (like Nemotron), the kv_cache view from KVCacheManager may be
-    # non-contiguous because layers are interleaved in the pool memory layout.
-    # This is FINE because thop.attention uses pool_pointers + block_offsets to compute
-    # addresses directly - it doesn't use the kv_cache tensor's data_ptr.
-    # AD's pool_pointers and pool_mapping already account for the layer interleaving.
-    #
-    # We keep the kv_cache for:
-    # 1. Shape validation (asserting correct dimensions)
-    # 2. tokens_per_block extraction from kv_cache.shape[3]
-    # 3. Dtype for FP8 mode detection
 
     # Prepare TRT-LLM metadata
     (
