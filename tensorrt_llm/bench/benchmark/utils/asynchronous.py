@@ -180,9 +180,12 @@ class LlmManager:
             raise e
         finally:
             # Ensure the socket sends a termination message and is properly closed
-            logger.debug("Iteration log worker sending None...")
-            socket.send_json({"end": True})
             if socket is not None:
+                logger.debug("Iteration log worker sending None...")
+                try:
+                    socket.send_json({"end": True})
+                except Exception:
+                    pass
                 logger.debug("Closing socket...")
                 socket.close()
             if context is not None:
