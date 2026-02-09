@@ -124,10 +124,9 @@ def run_precommit_with_timing():
     if len(hook_durations) > 0:
         print(f"\nTop 5 slowest hooks:")
         for i, (hook_name, duration,
-            status) in enumerate(hook_durations[:5], 1):
+                status) in enumerate(hook_durations[:5], 1):
             print(
-                f"  {i}. {hook_name}: {duration:.2f}s ({duration/60:.2f} min)"
-            )
+                f"  {i}. {hook_name}: {duration:.2f}s ({duration/60:.2f} min)")
 
     print("=" * 80)
 
