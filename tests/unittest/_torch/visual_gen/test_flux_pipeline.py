@@ -9,6 +9,7 @@ Tests cover:
 - Attention backend comparison (VANILLA vs TRTLLM)
 """
 
+import gc
 import os
 
 import pytest
@@ -16,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionArgs
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionArgs, PipelineConfig
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 # Checkpoint paths for integration tests
@@ -143,6 +144,10 @@ class TestFluxPipelineLoading:
         assert pipeline.transformer is not None
         assert pipeline.model_config.attention.backend == "VANILLA"
 
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_load_flux2_pipeline_basic(self, flux2_checkpoint_exists):
         """Test loading FLUX.2 pipeline."""
@@ -159,6 +164,10 @@ class TestFluxPipelineLoading:
         assert hasattr(pipeline, "transformer")
         assert pipeline.transformer is not None
 
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
     def test_load_flux1_with_attention_backend(self, flux1_checkpoint_exists, backend: str):
@@ -174,6 +183,10 @@ class TestFluxPipelineLoading:
         pipeline = PipelineLoader(args).load()
 
         assert pipeline.model_config.attention.backend == backend
+
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 # =============================================================================
@@ -224,6 +237,10 @@ class TestFluxQuantization:
         assert quant_count > 0, "No layers were quantized"
         assert found_fp8, f"No FP8 Linear modules found in blocks for {quant_algo}"
 
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_load_flux2_with_quantization(self, flux2_checkpoint_exists, quant_algo: str):
@@ -262,6 +279,10 @@ class TestFluxQuantization:
         print(f"[{quant_algo}] Quantized {quant_count} Linear layers")
         assert quant_count > 0, "No layers were quantized"
         assert found_fp8, f"No FP8 Linear modules found in blocks for {quant_algo}"
+
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 # =============================================================================
@@ -555,6 +576,7 @@ class TestFluxAttentionBackend:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="VANILLA"),
+            pipeline=PipelineConfig(enable_torch_compile=False),
         )
         pipeline_baseline = PipelineLoader(args_baseline).load()
         transformer_baseline = pipeline_baseline.transformer
@@ -567,6 +589,7 @@ class TestFluxAttentionBackend:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="TRTLLM"),
+            pipeline=PipelineConfig(enable_torch_compile=False),
         )
         pipeline_trtllm = PipelineLoader(args_trtllm).load()
         transformer_trtllm = pipeline_trtllm.transformer
@@ -624,6 +647,7 @@ class TestFluxAttentionBackend:
         print(f"\n[PASS] TRTLLM backend matches VANILLA: cos_sim={cos_sim:.6f} (>0.99)")
 
         del pipeline_baseline, pipeline_trtllm, transformer_baseline, transformer_trtllm
+        gc.collect()
         torch.cuda.empty_cache()
 
 

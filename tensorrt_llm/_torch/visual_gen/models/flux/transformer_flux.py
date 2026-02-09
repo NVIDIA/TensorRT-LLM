@@ -996,9 +996,6 @@ class FluxTransformer2DModel(nn.Module):
                             module_weights[param_name].to(self.model_config.torch_dtype)
                         )
 
-        # Call post_load_weights on all Linear modules for quantization finalization
-        self.post_load_weights()
-
     def post_load_weights(self) -> None:
         """Call post_load_weights on all Linear modules and convert embedders to target dtype."""
         # Convert time_text_embed components to target dtype

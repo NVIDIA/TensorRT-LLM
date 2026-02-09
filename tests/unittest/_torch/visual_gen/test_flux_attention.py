@@ -150,24 +150,44 @@ class TestFluxAttentionBackend(unittest.TestCase):
         torch.manual_seed(42)
 
         # Create attention modules for both backends
-        attns = {}
-        for backend in ["VANILLA", "TRTLLM"]:
-            config = self._create_config(backend)
-            attns[backend] = (
-                FluxAttention(
-                    query_dim=dim,
-                    heads=heads,
-                    dim_head=dim_head,
-                    added_kv_proj_dim=dim,  # Enable dual-stream for text tokens
-                    config=config,
-                    layer_idx=0,
-                )
-                .to(self.DEVICE, dtype=dtype)
-                .eval()
+        config = self._create_config("VANILLA")
+        vanilla_attn = (
+            FluxAttention(
+                query_dim=dim,
+                heads=heads,
+                dim_head=dim_head,
+                added_kv_proj_dim=dim,  # Enable dual-stream for text tokens
+                config=config,
+                layer_idx=0,
             )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
 
-        # Copy weights from VANILLA to TRTLLM
-        attns["TRTLLM"].load_state_dict(attns["VANILLA"].state_dict())
+        # TRT-LLM Linear uses torch.empty for bias (uninitialized memory).
+        # After prior tests free GPU memory, recycled memory can contain NaN.
+        # Initialize all parameters with small random values for numerical stability.
+        with torch.no_grad():
+            for p in vanilla_attn.parameters():
+                p.normal_(0, 0.02)
+
+        config = self._create_config("TRTLLM")
+        trtllm_attn = (
+            FluxAttention(
+                query_dim=dim,
+                heads=heads,
+                dim_head=dim_head,
+                added_kv_proj_dim=dim,
+                config=config,
+                layer_idx=0,
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+
+        # Copy scaled weights from VANILLA to TRTLLM
+        trtllm_attn.load_state_dict(vanilla_attn.state_dict())
+        attns = {"VANILLA": vanilla_attn, "TRTLLM": trtllm_attn}
 
         # Create inputs (scaled for numerical stability)
         hidden_states = (

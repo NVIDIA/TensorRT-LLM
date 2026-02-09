@@ -894,9 +894,6 @@ class Flux2Transformer2DModel(nn.Module):
                     if param is not None and param_name in module_weights:
                         param.data.copy_(module_weights[param_name].to(target_dtype))
 
-        # Call post_load_weights on all Linear modules for quantization finalization
-        self.post_load_weights()
-
     def post_load_weights(self) -> None:
         """Call post_load_weights on all Linear modules and convert embedders to target dtype."""
         # Convert time_guidance_embed components to target dtype

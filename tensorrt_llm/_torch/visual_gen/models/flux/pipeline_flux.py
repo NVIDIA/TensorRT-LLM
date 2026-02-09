@@ -6,12 +6,13 @@
 import time
 from typing import Optional, Tuple
 
-import PIL.Image
 import torch
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
+from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
@@ -53,9 +54,16 @@ class FluxPipeline(BasePipeline):
         Returns:
             Combined timestep embedding for TeaCache distance calculation
         """
+        # Cast to embedder's dtype (avoid int8 quantized layers)
+        te_dtype = next(iter(module.time_text_embed.parameters())).dtype
+        if timestep.dtype != te_dtype and te_dtype != torch.int8:
+            timestep = timestep.to(te_dtype)
+
         temb = module.time_text_embed(timestep)
 
         if module.guidance_embeds and guidance is not None:
+            if guidance.dtype != te_dtype and te_dtype != torch.int8:
+                guidance = guidance.to(te_dtype)
             temb = temb + module.guidance_embed(guidance)
 
         return temb
@@ -85,47 +93,49 @@ class FluxPipeline(BasePipeline):
         skip_components = skip_components or []
 
         # CLIP tokenizer and text encoder (for pooled embeddings)
-        if "tokenizer" not in skip_components:
+        if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading CLIP tokenizer...")
-            self.tokenizer = CLIPTokenizer.from_pretrained(checkpoint_dir, subfolder="tokenizer")
+            self.tokenizer = CLIPTokenizer.from_pretrained(
+                checkpoint_dir, subfolder=PipelineComponent.TOKENIZER
+            )
 
-        if "text_encoder" not in skip_components:
+        if PipelineComponent.TEXT_ENCODER not in skip_components:
             logger.info("Loading CLIP text encoder...")
             self.text_encoder = CLIPTextModel.from_pretrained(
                 checkpoint_dir,
-                subfolder="text_encoder",
+                subfolder=PipelineComponent.TEXT_ENCODER,
                 torch_dtype=self.model_config.torch_dtype,
             ).to(device)
 
         # T5 tokenizer and text encoder (for sequence embeddings)
-        if "tokenizer_2" not in skip_components:
+        if PipelineComponent.TOKENIZER_2 not in skip_components:
             logger.info("Loading T5 tokenizer...")
             self.tokenizer_2 = T5TokenizerFast.from_pretrained(
-                checkpoint_dir, subfolder="tokenizer_2"
+                checkpoint_dir, subfolder=PipelineComponent.TOKENIZER_2
             )
 
-        if "text_encoder_2" not in skip_components:
+        if PipelineComponent.TEXT_ENCODER_2 not in skip_components:
             logger.info("Loading T5 text encoder...")
             self.text_encoder_2 = T5EncoderModel.from_pretrained(
                 checkpoint_dir,
-                subfolder="text_encoder_2",
+                subfolder=PipelineComponent.TEXT_ENCODER_2,
                 torch_dtype=self.model_config.torch_dtype,
             ).to(device)
 
         # VAE
-        if "vae" not in skip_components:
+        if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
             self.vae = AutoencoderKL.from_pretrained(
-                checkpoint_dir, subfolder="vae", torch_dtype=torch.float32
+                checkpoint_dir, subfolder=PipelineComponent.VAE, torch_dtype=torch.float32
             ).to(device)
 
             self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
         # Scheduler
-        if "scheduler" not in skip_components:
+        if PipelineComponent.SCHEDULER not in skip_components:
             logger.info("Loading scheduler...")
             self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                checkpoint_dir, subfolder="scheduler"
+                checkpoint_dir, subfolder=PipelineComponent.SCHEDULER
             )
 
         # Default config values
@@ -146,48 +156,10 @@ class FluxPipeline(BasePipeline):
             self.transformer.eval()
 
     def post_load_weights(self) -> None:
-        """Post-load setup: FP8 scale processing, move to device, and TeaCache registration."""
-        # Call base class to trigger transformer.post_load_weights() for FP8 scale transformations
+        """Post-load setup: TeaCache registration."""
         super().post_load_weights()
         if self.transformer is not None:
-            # Move transformer to CUDA
-            has_fp8 = (
-                self.model_config.quant_config
-                and self.model_config.quant_config.quant_algo
-                and "FP8" in self.model_config.quant_config.quant_algo.name
-            )
-            if has_fp8:
-                # FP8 mode: Move to CUDA, then convert non-FP8 parameters to target dtype
-                # This keeps FP8 weights as FP8 while converting other params to BF16
-                self.transformer.to(device="cuda")
-                self._convert_non_fp8_to_target_dtype()
-            else:
-                # Non-quantized mode: move to CUDA and convert all to target dtype
-                self.transformer.to(device="cuda", dtype=self._target_dtype)
-
-    def _convert_non_fp8_to_target_dtype(self) -> None:
-        """Convert non-FP8/non-scale parameters to target dtype (BF16).
-
-        When using FP8 quantization:
-        - Linear weights are FP8 (torch.float8_e4m3fn) - keep as-is
-        - Scale parameters (weight_scale, input_scale, etc.) are float32 - keep as-is
-        - Other parameters (LayerNorm, embeddings, biases) should be converted to BF16
-        """
-        import torch
-
-        # Scale parameter names that must remain float32 for FP8 GEMM
-        scale_suffixes = ("_scale", "inv_input_scale", "inv_kv_scales", "kv_scales")
-
-        for name, param in self.transformer.named_parameters():
-            # Keep FP8 weights as FP8
-            if param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                continue
-            # Keep scale parameters as float32 (required by FP8 GEMM kernels)
-            if any(name.endswith(suffix) for suffix in scale_suffixes):
-                continue
-            # Convert everything else to target dtype
-            param.data = param.data.to(self._target_dtype)
-            # Register TeaCache extractor for FLUX
+            # Register TeaCache extractor for FLUX (must be after device placement)
             register_extractor_from_config(
                 ExtractorConfig(
                     model_class_name="FluxTransformer2DModel",
@@ -245,7 +217,7 @@ class FluxPipeline(BasePipeline):
             max_sequence_length: Maximum text sequence length
 
         Returns:
-            Dict with "image" key containing PIL.Image
+            MediaOutput with image tensor
         """
         pipeline_start = time.time()
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -315,13 +287,13 @@ class FluxPipeline(BasePipeline):
         # Decode
         logger.info("Decoding image...")
         decode_start = time.time()
-        image = self._decode_latents(latents, height, width)
+        image = self.decode_latents(latents, lambda lat: self._decode_latents(lat, height, width))
 
         if self.rank == 0:
             logger.info(f"Image decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return {"image": image}
+        return MediaOutput(image=image)
 
     def __call__(self, *args, **kwargs):
         """Backward compatibility wrapper."""
@@ -362,12 +334,21 @@ class FluxPipeline(BasePipeline):
             padding="max_length",
             max_length=max_sequence_length,
             truncation=True,
+            return_attention_mask=True,
             return_tensors="pt",
         )
         t5_input_ids = t5_inputs.input_ids.to(self.device)
+        t5_attention_mask = t5_inputs.attention_mask.to(self.device)
 
-        t5_outputs = self.text_encoder_2(t5_input_ids, output_hidden_states=False)
+        t5_outputs = self.text_encoder_2(
+            t5_input_ids, attention_mask=t5_attention_mask, output_hidden_states=False
+        )
         prompt_embeds = t5_outputs.last_hidden_state.to(self.dtype)
+
+        # Zero-out padded tokens to prevent padding artifacts (WAN pattern)
+        seq_lens = t5_attention_mask.gt(0).sum(dim=1).long()
+        for i, seq_len in enumerate(seq_lens):
+            prompt_embeds[i, seq_len:] = 0
 
         # Prepare text position IDs
         text_ids = self._prepare_text_ids(prompt_embeds)
@@ -492,8 +473,8 @@ class FluxPipeline(BasePipeline):
 
         return latents, latent_ids
 
-    def _decode_latents(self, latents: torch.Tensor, height: int, width: int) -> PIL.Image.Image:
-        """Decode latents to PIL image."""
+    def _decode_latents(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Decode latents to image tensor."""
         # Unpack latents: (batch, seq_len, channels) -> (batch, channels, h, w)
         batch_size = latents.shape[0]
         num_patches = latents.shape[1]
@@ -514,13 +495,12 @@ class FluxPipeline(BasePipeline):
         latents = latents.to(self.vae.dtype)
         image = self.vae.decode(latents, return_dict=False)[0]
 
-        # Post-process to PIL
+        # Post-process to tensor (H, W, C) uint8
         image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-        image = (image * 255).round().astype("uint8")
-        image = PIL.Image.fromarray(image[0])
+        image = image.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+        image = (image * 255).round().to(torch.uint8)
 
-        return image
+        return image[0]  # Remove batch dimension
 
     def _unpatchify_latents(self, latents: torch.Tensor) -> torch.Tensor:
         """Convert packed latents back to spatial format.
