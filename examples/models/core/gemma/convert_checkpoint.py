@@ -172,8 +172,9 @@ def compute_quant_algo(args: argparse.Namespace) -> Optional[QuantAlgo]:
 def create_quant_config(args: argparse.Namespace) -> QuantConfig:
     quant_algo = compute_quant_algo(args)
     GemmaForCausalLM.assert_valid_quant_algo(quant_algo)
-    quant_config = QuantConfig(quant_algo=quant_algo,
-                               smoothquant_val=args.smoothquant)
+    quant_config = QuantConfig(quant_algo=quant_algo)
+    if args.smoothquant is not None:
+        quant_config.smoothquant_val = args.smoothquant
 
     if args.fp8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.FP8
