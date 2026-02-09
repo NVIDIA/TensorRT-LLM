@@ -87,143 +87,147 @@ graph_sqlite_file_path = graph_nsys_rep_file_path.parent / (
 )
 lazy_convert_sqlite(eager_nsys_rep_file_path, eager_sqlite_file_path)
 lazy_convert_sqlite(graph_nsys_rep_file_path, graph_sqlite_file_path)
-eager_conn = sqlite3.connect(f"file:{eager_sqlite_file_path}?mode=ro", uri=True)
-graph_conn = sqlite3.connect(f"file:{graph_sqlite_file_path}?mode=ro", uri=True)
 
-query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
-df = pd.read_sql_query(query, eager_conn)
-eager_event_id_NvtxPushPopRange = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
-df = pd.read_sql_query(query, graph_conn)
-graph_event_id_NvtxPushPopRange = df[df["name"] == "NvtxPushPopRange"].iloc[0]["id"].tolist()
+with sqlite3.connect(f"file:{eager_sqlite_file_path}?mode=ro", uri=True) as eager_conn, \
+     sqlite3.connect(f"file:{graph_sqlite_file_path}?mode=ro", uri=True) as graph_conn:
 
-query = """SELECT T1.start, T1.end, T2.value AS text
-    FROM NVTX_EVENTS AS T1
-    JOIN StringIds AS T2 ON T1.textId = T2.id
-    WHERE eventType = ?"""
-df = pd.read_sql_query(query, eager_conn, params=(eager_event_id_NvtxPushPopRange,))
-target_ctx_reqs = args.target_ctx_reqs
-target_gen_reqs = args.target_gen_reqs
-if target_gen_reqs is None:
-    if target_ctx_reqs == 0:
-        for _, _, text in df.itertuples(index=False):
-            if m := re.match(
-                r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text
-            ):
-                ctx_reqs = int(m.group(2))
-                gen_reqs = int(m.group(3))
-                if ctx_reqs == target_ctx_reqs:
-                    target_gen_reqs = gen_reqs
-                    break
+    query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
+    df = pd.read_sql_query(query, eager_conn)
+    eager_filtered_df = df[df["name"] == "NvtxPushPopRange"]
+    if eager_filtered_df.empty:
+        raise ValueError("NvtxPushPopRange event type not found in eager trace database")
+    eager_event_id_NvtxPushPopRange = eager_filtered_df.iloc[0]["id"].tolist()
+    df = pd.read_sql_query(query, graph_conn)
+    graph_filtered_df = df[df["name"] == "NvtxPushPopRange"]
+    if graph_filtered_df.empty:
+        raise ValueError("NvtxPushPopRange event type not found in graph trace database")
+    graph_event_id_NvtxPushPopRange = graph_filtered_df.iloc[0]["id"].tolist()
+
+    query = """SELECT T1.start, T1.end, T2.value AS text
+        FROM NVTX_EVENTS AS T1
+        JOIN StringIds AS T2 ON T1.textId = T2.id
+        WHERE eventType = ?"""
+    df = pd.read_sql_query(query, eager_conn, params=(eager_event_id_NvtxPushPopRange,))
+    target_ctx_reqs = args.target_ctx_reqs
+    target_gen_reqs = args.target_gen_reqs
+    if target_gen_reqs is None:
+        if target_ctx_reqs == 0:
+            for _, _, text in df.itertuples(index=False):
+                if m := re.match(
+                    r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text
+                ):
+                    ctx_reqs = int(m.group(2))
+                    gen_reqs = int(m.group(3))
+                    if ctx_reqs == target_ctx_reqs:
+                        target_gen_reqs = gen_reqs
+                        break
+            else:
+                raise ValueError("Cannot determine target_gen_reqs")
         else:
-            raise ValueError("Cannot determine target_gen_reqs")
-    else:
-        target_gen_reqs = 0
-print(f"{target_ctx_reqs=} {target_gen_reqs=}")
-eager_iters: list[IterInfo] = []
-for start, end, text in df.itertuples(index=False):
-    if m := re.match(r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text):
-        iter_id = int(m.group(1))
-        ctx_reqs = int(m.group(2))
-        gen_reqs = int(m.group(3))
-        if ctx_reqs == target_ctx_reqs and gen_reqs == target_gen_reqs:
-            eager_iters.append(IterInfo(start, end, iter_id))
-eager_iters = sorted(eager_iters)[args.warmup_times :]
-iter_id_list = [it.iter_id for it in eager_iters]
-print("Iters (eager)", *iter_id_list)
-per_iter_eager_layers: list[list[LayerInfo]] = [[] for _ in iter_id_list]
-for start, end, text in df.itertuples(index=False):
-    if m := re.match(r"^layer_wise_benchmarks layer_idx (\d+)$", text):
-        layer_idx = int(m.group(1))
-        iter_idx = bisect.bisect(eager_iters, (start,)) - 1
-        if iter_idx < 0 or end > eager_iters[iter_idx].end:
-            continue
-        assert end <= eager_iters[iter_idx].end, "Not belong to any iter"
-        per_iter_eager_layers[iter_idx].append(LayerInfo(start, end, layer_idx))
-layer_idx_list = [layer.layer_idx for layer in per_iter_eager_layers[0]]
-print("Layers (eager)", *layer_idx_list)
-for eager_layers in per_iter_eager_layers:
-    assert [layer.layer_idx for layer in eager_layers] == layer_idx_list, "inconsistent layer idx"
-df = pd.read_sql_query(query, graph_conn, params=(graph_event_id_NvtxPushPopRange,))
-graph_iters: list[IterInfo] = []
-for start, end, text in df.itertuples(index=False):
-    if m := re.match(r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text):
-        iter_id = int(m.group(1))
-        ctx_reqs = int(m.group(2))
-        gen_reqs = int(m.group(3))
-        if ctx_reqs == target_ctx_reqs and gen_reqs == target_gen_reqs:
-            graph_iters.append(IterInfo(start, end, iter_id))
-graph_iters = sorted(graph_iters)[args.warmup_times :]
-graph_iter_id_list = [it.iter_id for it in graph_iters]
-print("Iters (graph)", *graph_iter_id_list)
-if iter_id_list != graph_iter_id_list:
-    raise ValueError("The ID of iterations do not match")
+            target_gen_reqs = 0
+    print(f"{target_ctx_reqs=} {target_gen_reqs=}")
+    eager_iters: list[IterInfo] = []
+    for start, end, text in df.itertuples(index=False):
+        if m := re.match(r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text):
+            iter_id = int(m.group(1))
+            ctx_reqs = int(m.group(2))
+            gen_reqs = int(m.group(3))
+            if ctx_reqs == target_ctx_reqs and gen_reqs == target_gen_reqs:
+                eager_iters.append(IterInfo(start, end, iter_id))
+    eager_iters = sorted(eager_iters)[args.warmup_times :]
+    iter_id_list = [it.iter_id for it in eager_iters]
+    print("Iters (eager)", *iter_id_list)
+    per_iter_eager_layers: list[list[LayerInfo]] = [[] for _ in iter_id_list]
+    for start, end, text in df.itertuples(index=False):
+        if m := re.match(r"^layer_wise_benchmarks layer_idx (\d+)$", text):
+            layer_idx = int(m.group(1))
+            iter_idx = bisect.bisect(eager_iters, (start,)) - 1
+            if iter_idx < 0 or end > eager_iters[iter_idx].end:
+                continue
+            assert end <= eager_iters[iter_idx].end, "Not belong to any iter"
+            per_iter_eager_layers[iter_idx].append(LayerInfo(start, end, layer_idx))
+    layer_idx_list = [layer.layer_idx for layer in per_iter_eager_layers[0]]
+    print("Layers (eager)", *layer_idx_list)
+    for eager_layers in per_iter_eager_layers:
+        assert [layer.layer_idx for layer in eager_layers] == layer_idx_list, "inconsistent layer idx"
+    df = pd.read_sql_query(query, graph_conn, params=(graph_event_id_NvtxPushPopRange,))
+    graph_iters: list[IterInfo] = []
+    for start, end, text in df.itertuples(index=False):
+        if m := re.match(r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text):
+            iter_id = int(m.group(1))
+            ctx_reqs = int(m.group(2))
+            gen_reqs = int(m.group(3))
+            if ctx_reqs == target_ctx_reqs and gen_reqs == target_gen_reqs:
+                graph_iters.append(IterInfo(start, end, iter_id))
+    graph_iters = sorted(graph_iters)[args.warmup_times :]
+    graph_iter_id_list = [it.iter_id for it in graph_iters]
+    print("Iters (graph)", *graph_iter_id_list)
+    if iter_id_list != graph_iter_id_list:
+        raise ValueError("The ID of iterations do not match")
 
 
-def query_kernels(conn: sqlite3.Connection, iters: list[IterInfo]) -> list[list[KernelQueryResult]]:
-    query = """SELECT name FROM sqlite_master WHERE type = ?"""
-    df = pd.read_sql_query(query, conn, params=("table",))
-    tables = df["name"].tolist()
-    unified_subquery = """SELECT T1.start, T1.end, T1.demangledName, T1.correlationId, T1.graphNodeId
-        FROM CUPTI_ACTIVITY_KIND_KERNEL AS T1"""
-    if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:
-        unified_subquery += """ UNION ALL
-            SELECT T2.start, T2.end, -2 AS demangledName, T2.correlationId, T2.graphNodeId
-            FROM CUPTI_ACTIVITY_KIND_MEMCPY AS T2"""
-    if "CUPTI_ACTIVITY_KIND_MEMSET" in tables:
-        unified_subquery += """ UNION ALL
-            SELECT T3.start, T3.end, -3 AS demangledName, T3.correlationId, T3.graphNodeId
-            FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3"""
-    query = f"""SELECT unified.start, unified.end, unified.graphNodeId, unified.demangledName,
-        R.start AS runtime_start, R.end AS runtime_end
-    FROM ({unified_subquery}) AS unified
-    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId"""
-    df = pd.read_sql_query(query, conn)
-    per_iter_kernels: list[list[KernelQueryResult]] = [[] for _ in iters]
-    for (
-        kernel_start,
-        kernel_end,
-        graph_node_id,
-        demangled_name,
-        runtime_start,
-        runtime_end,
-    ) in df.itertuples(index=False):
-        iter_idx = bisect.bisect(iters, (runtime_start,)) - 1
-        if iter_idx < 0 or runtime_end > iters[iter_idx].end:
-            continue
-        per_iter_kernels[iter_idx].append(
-            KernelQueryResult(
-                runtime_start, graph_node_id, kernel_start, kernel_end, demangled_name
+    def query_kernels(conn: sqlite3.Connection, iters: list[IterInfo]) -> list[list[KernelQueryResult]]:
+        query = """SELECT name FROM sqlite_master WHERE type = ?"""
+        df = pd.read_sql_query(query, conn, params=("table",))
+        tables = df["name"].tolist()
+        unified_subquery = """SELECT T1.start, T1.end, T1.demangledName, T1.correlationId, T1.graphNodeId
+            FROM CUPTI_ACTIVITY_KIND_KERNEL AS T1"""
+        if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:
+            unified_subquery += """ UNION ALL
+                SELECT T2.start, T2.end, -2 AS demangledName, T2.correlationId, T2.graphNodeId
+                FROM CUPTI_ACTIVITY_KIND_MEMCPY AS T2"""
+        if "CUPTI_ACTIVITY_KIND_MEMSET" in tables:
+            unified_subquery += """ UNION ALL
+                SELECT T3.start, T3.end, -3 AS demangledName, T3.correlationId, T3.graphNodeId
+                FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3"""
+        query = f"""SELECT unified.start, unified.end, unified.graphNodeId, unified.demangledName,
+            R.start AS runtime_start, R.end AS runtime_end
+        FROM ({unified_subquery}) AS unified
+        JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId"""
+        df = pd.read_sql_query(query, conn)
+        per_iter_kernels: list[list[KernelQueryResult]] = [[] for _ in iters]
+        for (
+            kernel_start,
+            kernel_end,
+            graph_node_id,
+            demangled_name,
+            runtime_start,
+            runtime_end,
+        ) in df.itertuples(index=False):
+            iter_idx = bisect.bisect(iters, (runtime_start,)) - 1
+            if iter_idx < 0 or runtime_end > iters[iter_idx].end:
+                continue
+            per_iter_kernels[iter_idx].append(
+                KernelQueryResult(
+                    runtime_start, graph_node_id, kernel_start, kernel_end, demangled_name
+                )
             )
-        )
-    for kernels in per_iter_kernels:
-        kernels.sort(key=lambda k: (k.runtime_start, k.graph_node_id))
-    return per_iter_kernels
+        for kernels in per_iter_kernels:
+            kernels.sort(key=lambda k: (k.runtime_start, k.graph_node_id))
+        return per_iter_kernels
 
 
-eager_per_iter_kernels = query_kernels(eager_conn, eager_iters)
-graph_per_iter_kernels = query_kernels(graph_conn, graph_iters)
-print("#Kernels (eager)", *[len(kernels) for kernels in eager_per_iter_kernels])
-print("#Kernels (graph)", *[len(kernels) for kernels in graph_per_iter_kernels])
-for eager_kernels, graph_kernels in zip(eager_per_iter_kernels, graph_per_iter_kernels):
-    assert all(
-        kernel.demangled_name == eager_per_iter_kernels[0][i].demangled_name
-        for i, kernel in enumerate(eager_kernels)
-    ), "eager kernels change across iterations"
-    assert all(
-        kernel.demangled_name == graph_per_iter_kernels[0][i].demangled_name
-        for i, kernel in enumerate(graph_kernels)
-    ), "graph kernels change across iterations"
+    eager_per_iter_kernels = query_kernels(eager_conn, eager_iters)
+    graph_per_iter_kernels = query_kernels(graph_conn, graph_iters)
+    print("#Kernels (eager)", *[len(kernels) for kernels in eager_per_iter_kernels])
+    print("#Kernels (graph)", *[len(kernels) for kernels in graph_per_iter_kernels])
+    for eager_kernels, graph_kernels in zip(eager_per_iter_kernels, graph_per_iter_kernels):
+        assert all(
+            kernel.demangled_name == eager_per_iter_kernels[0][i].demangled_name
+            for i, kernel in enumerate(eager_kernels)
+        ), "eager kernels change across iterations"
+        assert all(
+            kernel.demangled_name == graph_per_iter_kernels[0][i].demangled_name
+            for i, kernel in enumerate(graph_kernels)
+        ), "graph kernels change across iterations"
 
-query = "SELECT * FROM StringIds"
-df = pd.read_sql_query(query, eager_conn)
-eager_string_ids = dict(zip(df["id"], df["value"]))
-eager_string_ids.update({-2: "Memcpy", -3: "Memset"})
-df = pd.read_sql_query(query, graph_conn)
-graph_string_ids = dict(zip(df["id"], df["value"]))
-graph_string_ids.update({-2: "Memcpy", -3: "Memset"})
-
-eager_conn.close()
-graph_conn.close()
+    query = "SELECT * FROM StringIds"
+    df = pd.read_sql_query(query, eager_conn)
+    eager_string_ids = dict(zip(df["id"], df["value"]))
+    eager_string_ids.update({-2: "Memcpy", -3: "Memset"})
+    df = pd.read_sql_query(query, graph_conn)
+    graph_string_ids = dict(zip(df["id"], df["value"]))
+    graph_string_ids.update({-2: "Memcpy", -3: "Memset"})
 
 eager_kernel_names = [
     eager_string_ids[kernel.demangled_name] for kernel in eager_per_iter_kernels[0]
