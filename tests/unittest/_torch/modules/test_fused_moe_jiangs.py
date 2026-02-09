@@ -10,6 +10,7 @@ import _torch.helpers
 import cloudpickle
 import pytest
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.nn as nn
 import torch.nn.functional as F
 from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
@@ -347,12 +348,21 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
     mapping.rank = mpi_rank()
 
     with torch.device(f'cuda:{mapping.rank}'):
-        SEQ_LEN = 4
+        ######################################################################
+        # SEQ_LEN = 4
+        # HIDDEN_SIZE = hidden_size
+        # INTERMEDIATE_SIZE = 640
+        # SCALING_GROUP_SIZE = 32
+        # NUM_EXPERTS = 4
+        # TOP_K = 2
+        ######################################################################
+        SEQ_LEN = 16
         HIDDEN_SIZE = hidden_size
         INTERMEDIATE_SIZE = 640
         SCALING_GROUP_SIZE = 32
-        NUM_EXPERTS = 4
-        TOP_K = 2
+        NUM_EXPERTS = 8
+        TOP_K = 8
+        ######################################################################
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
@@ -465,8 +475,24 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
         with torch.inference_mode():
             ref_output = ref()
 
+        nvtx.range_push("autotune")
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
+        nvtx.range_pop()
+
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+        # Get the C++ FusedMoeRunner to query tactic descriptions
+        cpp_runner = next(iter(MoERunner.runner_dict.values()))
+
+        cache = AutoTuner.get().profiling_cache.cache
+        for key, value in cache.items():
+            custom_op, runner_cls, runner_id, shape_profile = key
+            runner_id_val, tactic, min_time = value
+            gemm_idx = 1 if "gemm1" in custom_op else 2
+            desc = cpp_runner.get_tactic_desc(gemm_idx, tactic)
+            print(f"Op: {custom_op}, Runner: {runner_cls}, Shape: {shape_profile}")
+            print(f"  -> Best tactic: {tactic}, Time: {min_time:.6f}ms")
+            print(f"  -> {desc}")
 
         # Explicitly capture context for kernel testing
         with AutoTuner.get().capture() as all_tactics, torch.inference_mode():

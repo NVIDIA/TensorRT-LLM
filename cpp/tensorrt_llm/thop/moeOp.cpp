@@ -665,6 +665,16 @@ public:
         return (gemm_idx == 1) ? mGemm1Profiles.size() : mGemm2Profiles.size();
     }
 
+    std::string getTacticDesc(int64_t const gemm_idx, int64_t const tactic_id)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        TORCH_CHECK(gemm_idx == 1 || gemm_idx == 2, "gemm_idx must be 1 or 2");
+        auto const& profiles = (gemm_idx == 1) ? mGemm1Profiles : mGemm2Profiles;
+        TORCH_CHECK(tactic_id >= 0 && tactic_id < static_cast<int64_t>(profiles.size()),
+            "tactic_id out of range: ", tactic_id, " >= ", profiles.size());
+        return profiles[tactic_id].toString();
+    }
+
     // TODO Update this to be able to tell if we are profiling swiglu bias
     void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc1_expert_weights,
         torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
@@ -1209,6 +1219,7 @@ TORCH_LIBRARY(trtllm, m)
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool>())
         .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)
         .def("get_tactic_num", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticNum)
+        .def("get_tactic_desc", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticDesc)
         .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)
         .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency);
 }
