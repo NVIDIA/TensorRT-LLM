@@ -3133,6 +3133,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_post_blackwell
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
         [(8, 1, 8, False, False, True, True, 16)],
