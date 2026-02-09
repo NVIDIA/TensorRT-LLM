@@ -12,8 +12,6 @@ import torch
 from strenum import StrEnum
 
 import tensorrt_llm
-from tensorrt_llm._torch.pyexecutor.model_loader import (
-    ModelLoader, _construct_checkpoint_loader)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
@@ -40,9 +38,9 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     validate_feature_combination)
 from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
-from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
+from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
 
@@ -324,6 +322,20 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+        # WAR for https://nvbugs/5807902
+        # Disable separate draft KV cache in disaggregated mode
+        if cache_transceiver_config is not None or kv_connector_config is not None:
+            spec_config._allow_separate_draft_kv_cache = False
+
+    # chunk_unit_size may be changed to 64 when using flash mla
+    attn_runtime_features = AttentionRuntimeFeatures(
+        chunked_prefill=enable_chunked_context,
+        cache_reuse=kv_cache_config.enable_block_reuse,
+        has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
+        chunk_size=max_num_tokens,
+    )
+    logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
+
     mem_monitor = _ExecutorMemoryMonitor()
 
     @contextmanager
@@ -340,20 +352,6 @@ def create_py_executor(
                     vm_pools[stage] = memory_pool
                     yield
 
-    # WAR for https://nvbugs/5807902
-    # Disable separate draft KV cache in disaggregated mode
-    if spec_config is not None:
-        if cache_transceiver_config is not None or kv_connector_config is not None:
-            spec_config._allow_separate_draft_kv_cache = False
-
-    # chunk_unit_size may be changed to 64 when using flash mla
-    attn_runtime_features = AttentionRuntimeFeatures(
-        chunked_prefill=enable_chunked_context,
-        cache_reuse=kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
-        chunk_size=max_num_tokens,
-    )
-    logger.info("ATTENTION RUNTIME FEATURES: %s", attn_runtime_features)
     with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN,
                           RestoreMode.PINNED):
         model_engine = PyTorchModelEngine(
