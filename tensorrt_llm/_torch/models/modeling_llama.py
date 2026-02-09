@@ -502,6 +502,9 @@ class Llama4DecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            allow_window_output=(self.disable_attn_allreduce
+                                 and (self.fusion_config.PRE_MLP_FUSION
+                                      or self.fusion_config.PRE_MOE_FUSION)),
             **kwargs,
         )
 
@@ -541,6 +544,9 @@ class Llama4DecoderLayer(DecoderLayer):
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_feed_forward_allreduce),
+            allow_window_output=(self.disable_feed_forward_allreduce
+                                 and (self.fusion_config.POST_MLP_FUSION
+                                      or self.fusion_config.POST_MOE_FUSION)),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
         )
 

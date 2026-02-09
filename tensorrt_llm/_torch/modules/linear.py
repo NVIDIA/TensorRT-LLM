@@ -2646,9 +2646,11 @@ class Linear(nn.Module):
         return output
 
     def _should_use_nccl_window_output(
-            self, input: torch.Tensor,
+            self,
+            input: torch.Tensor,
             all_reduce_params: Optional[AllReduceParams],
-            lora_params: Optional[dict]) -> bool:
+            lora_params: Optional[dict],
+            allow_window_output: Optional[bool] = None) -> bool:
         if mpi_disabled():
             return False
         if self.all_reduce is None:
@@ -2656,7 +2658,9 @@ class Linear(nn.Module):
         if self.all_reduce.strategy not in (AllReduceStrategy.AUTO,
                                             AllReduceStrategy.NCCL_SYMMETRIC):
             return False
-        if all_reduce_params is not None and not all_reduce_params.enable_allreduce:
+        if (all_reduce_params is not None
+                and not all_reduce_params.enable_allreduce
+                and not allow_window_output):
             return False
         if self.lora is not None and bool(lora_params):
             return False
@@ -2669,9 +2673,10 @@ class Linear(nn.Module):
         input: torch.Tensor,
         all_reduce_params: Optional[AllReduceParams],
         lora_params: Optional[dict],
+        allow_window_output: Optional[bool] = None,
     ) -> Optional[torch.Tensor]:
-        if not self._should_use_nccl_window_output(input, all_reduce_params,
-                                                   lora_params):
+        if not self._should_use_nccl_window_output(
+                input, all_reduce_params, lora_params, allow_window_output):
             mpi_off = mpi_disabled()
             has_all_reduce = self.all_reduce is not None
             strategy = None if self.all_reduce is None else self.all_reduce.strategy
@@ -2687,7 +2692,7 @@ class Linear(nn.Module):
                 reasons.append("no_all_reduce")
             if has_all_reduce and not strategy_ok:
                 reasons.append("strategy_not_auto_or_nccl_symmetric")
-            if enable_allreduce is False:
+            if enable_allreduce is False and not allow_window_output:
                 reasons.append("enable_allreduce_false")
             if has_lora:
                 reasons.append("lora_active")
@@ -2698,6 +2703,7 @@ class Linear(nn.Module):
                 f"(reasons={reasons}, "
                 f"mpi_disabled={mpi_off}, has_all_reduce={has_all_reduce}, "
                 f"strategy={strategy}, enable_allreduce={enable_allreduce}, "
+                f"allow_window_output={allow_window_output}, "
                 f"has_lora={has_lora}, valid_input={valid_input})")
             return None
         output_shape = list(input.shape)
@@ -2757,6 +2763,7 @@ class Linear(nn.Module):
         input: Union[torch.Tensor, Fp4QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
+        allow_window_output: Optional[bool] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
@@ -2781,7 +2788,8 @@ class Linear(nn.Module):
                         window_attempted = True
                         window_path = "apply_out"
                         window_out = self._maybe_create_nccl_window_output(
-                            input, all_reduce_params, lora_params)
+                            input, all_reduce_params, lora_params,
+                            allow_window_output)
                         if window_out is not None:
                             output = self.quant_method.apply_out(
                                 self, input, bias, window_out)
