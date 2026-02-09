@@ -133,6 +133,8 @@ class IterationWriter:
         """
         context = None
         socket = None
+        context = None
+        message = None
 
         try:
             # Create a ZeroMQ context and socket for inter-process communication
@@ -160,8 +162,9 @@ class IterationWriter:
             # messages until "None" is received. LlmManager will
             # send "None" when it is finished.
             logger.info("Keyboard interrupt, exiting iteration logging...")
-            while message != b"None":
-                message = socket.recv_json()
+            if message is not None and socket is not None:
+                while message != b"None":
+                    message = socket.recv_json()
         finally:
             # Finalize the logging process by closing the socket and terminating
             # the context
