@@ -357,6 +357,9 @@ class GenerationExecutor(ABC):
         self._iter_kv_events_result.set_timeout(timeout)
         return self._iter_kv_events_result
 
+    def get_disaggregated_params(self) -> dict:
+        return {}
+
     @staticmethod
     def _create_ray_executor(
         worker_kwargs: Dict,

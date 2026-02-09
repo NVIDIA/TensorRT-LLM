@@ -1,6 +1,6 @@
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.torch_attention import update_kv_cache
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_attention import update_kv_cache
 
 
 def test_update_kv_cache():
@@ -23,7 +23,7 @@ def test_update_kv_cache():
     print("k_cache: " + str(k_cache))
     print("v_cache: " + str(v_cache))
     print("input_pos: " + str(torch.tensor([0, 0])))
-    print("cache_loc: " + str(torch.tensor([0, 1])))
+    print("slot_idx: " + str(torch.tensor([0, 1])))
     print("seq_start: " + str(torch.tensor([0, 3])))
 
     update_kv_cache(
@@ -33,7 +33,7 @@ def test_update_kv_cache():
         v_cache,
         torch.tensor([3, 1]).long(),
         torch.tensor([0, 0]),
-        cache_loc=torch.tensor([0, 1]),
+        slot_idx=torch.tensor([0, 1]),
         seq_start=torch.tensor([0, 3]).long(),
     )
 

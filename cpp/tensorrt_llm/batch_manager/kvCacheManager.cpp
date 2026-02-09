@@ -34,6 +34,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <optional>
 #include <utility>
@@ -483,7 +484,6 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 
 void KVCacheBlock::freeDescendantsRecursively()
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     bool hasChildren = !mNextBlocks.empty();
     if (hasChildren)
     {
@@ -1398,15 +1398,16 @@ void WindowBlockManager::refreshBlocks()
 
 // There are two versions of BlockManager::addSequence function.
 // This is called when block reuse is enabled.
-void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
+SizeType32 BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
     LlmRequest& llmRequest, SizeType32 windowSize)
 {
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
+    return mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
 }
 
 // There are two versions of WindowBlockManager::addSequence function.
 // This is called when block reuse is enabled.
-void WindowBlockManager::addSequence(
+// Returns the total prepopulatedPromptLen (including connector matched tokens) for this window.
+SizeType32 WindowBlockManager::addSequence(
     GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
 {
     auto const requestId = sequence.getRequestId();
@@ -1458,9 +1459,13 @@ void WindowBlockManager::addSequence(
         numConnectorMatchedTokens = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
     }
 
-    llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen + numConnectorMatchedTokens, getTokensPerBlock());
-    TLLM_LOG_DEBUG("addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d, numConnectorMatchedTokens %d",
-        llmRequest.mRequestId, inputLength, prepopulatedPromptLen, numConnectorMatchedTokens);
+    // Return the total prepopulated length for this window (do not set on llmRequest here -
+    // the caller KVCacheManager::addSequence will use the minimum across all windows)
+    auto const totalPrepopulatedLen = prepopulatedPromptLen + numConnectorMatchedTokens;
+    TLLM_LOG_DEBUG(
+        "%s::addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d, numConnectorMatchedTokens %d",
+        mLogPrefix.c_str(), llmRequest.mRequestId, inputLength, prepopulatedPromptLen, numConnectorMatchedTokens);
+    return totalPrepopulatedLen;
 }
 
 void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
@@ -2450,6 +2455,9 @@ void KVCacheManager::addSequence(
             "[kv cache manager] Encounter existing sequence %d, skip sequence storage validity initialization",
             requestId);
     }
+    // Track the minimum prepopulated length across all windows (for VSWA with mixed isSWA flags)
+    SizeType32 minPrepopulatedPromptLen = std::numeric_limits<SizeType32>::max();
+
     for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
     {
         // NOTE: Caller to KVCacheManager::addSequence should deal with the chunking
@@ -2461,7 +2469,11 @@ void KVCacheManager::addSequence(
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
         if (mEnableBlockReuse)
         {
-            mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
+            auto const prepopulatedLen
+                = mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
+            // Use the minimum prepopulated length across all windows to ensure correctness
+            // when there's a mix of SWA and non-SWA windows (e.g., VSWA case)
+            minPrepopulatedPromptLen = std::min(minPrepopulatedPromptLen, prepopulatedLen);
         }
         else
         {
@@ -2478,6 +2490,13 @@ void KVCacheManager::addSequence(
             mBlockManager.addSequence(sequence, numContextBlocks, windowSize, isShareLastContextBlock);
         }
         mBlockManager.updateSequenceCacheBlockOffsets(sequence, windowSize);
+    }
+
+    // Set the prepopulated prompt length once using the minimum across all windows
+    if (llmRequest && mEnableBlockReuse)
+    {
+        TLLM_LOG_DEBUG("KVCacheManager::addSequence: Setting prepopulatedPromptLen to %d", minPrepopulatedPromptLen);
+        llmRequest->setPrepopulatedPromptLen(minPrepopulatedPromptLen, getTokensPerBlock());
     }
 
     if (llmRequest)
@@ -2584,6 +2603,26 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
 void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     mBlockManager.unpinBlocksById(blockIds);
+}
+
+tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId, SizeType32 windowSize) const
+{
+    try
+    {
+        BlockPtr const& block = mBlockManager.getBlockById(blockId, windowSize);
+        if (block)
+        {
+            return block->getPriority();
+        }
+        TLLM_LOG_WARNING("getPriorityByBlockId: Block ID %d not found in window %d", blockId, windowSize);
+        return tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
+    }
+    catch (std::out_of_range const& ex)
+    {
+        TLLM_LOG_WARNING(
+            "getPriorityByBlockId: Block ID %d or window size %d out of range: %s", blockId, windowSize, ex.what());
+        return tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
+    }
 }
 
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const

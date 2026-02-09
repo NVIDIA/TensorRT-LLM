@@ -58,6 +58,10 @@ PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
 SlotId = NewType("SlotId", int)
 
+# A temporary work-around while migrating to new page index API.
+# To be removed later.
+PoolIndex0 = PoolIndex(0)
+
 
 class SlotPoolBase(abc.ABC):
     _slot_size: int

@@ -21,6 +21,7 @@ import random
 import time
 import unittest
 from contextlib import contextmanager
+from dataclasses import dataclass
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
@@ -28,11 +29,14 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, cast
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
+        DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
-        BeamIndex,
         BufferConfig,
+        BufferId,
+        BufferSlice,
         CacheLevel,
         CudaStream,
+        DataRole,
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
@@ -45,24 +49,37 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         _KVCache,
     )
     from kv_cache_manager_v2._block_radix_tree import traverse_post_order
-    from kv_cache_manager_v2._common import GPU_LEVEL, PageStatus, SlidingWindowSize
+    from kv_cache_manager_v2._common import (
+        GPU_LEVEL,
+        CacheTier,
+        MemAddress,
+        PageStatus,
+        SlidingWindowSize,
+    )
+    from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
     from kv_cache_manager_v2._utils import (
+        CachedCudaStream,
         TemporaryCudaStream,
         div_up,
+        exact_div,
         init_cuda_once,
         remove_if,
         round_up,
+        temporary_sys_path,
         typed_range,
         unwrap_rawref,
     )
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
-        BeamIndex,
         BufferConfig,
+        BufferId,
+        BufferSlice,
         CacheLevel,
         CudaStream,
+        DataRole,
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
@@ -77,24 +94,31 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import traverse_post_order
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
         GPU_LEVEL,
+        CacheTier,
+        MemAddress,
         PageStatus,
         SlidingWindowSize,
     )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+        CachedCudaStream,
         TemporaryCudaStream,
         div_up,
+        exact_div,
         init_cuda_once,
         remove_if,
         round_up,
+        temporary_sys_path,
         typed_range,
         unwrap_rawref,
     )
 
-from dynamic_path_manager import DynamicPathManager
+from copy import deepcopy
+
 from parameterized import parameterized
 
-with DynamicPathManager(os.path.dirname(os.path.abspath(__file__)), clear_cache=False):
+with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
     from fake_engine import FakeEngine, Role, Step
     from kernels import enable_kernel_delay
 
@@ -147,6 +171,53 @@ def assert_no_ref_cycle(func):
     return wrapper
 
 
+def create_config(
+    tokens_per_block: int,
+    gpu_quota: int,
+    host_quota: int,
+    disk_quota: int,
+    num_layers: int,
+    window_size: SlidingWindowSize,
+    sink_tokens: int,
+    kv_buf_size: int = 8192,
+    block_quant_buf_size: int | None = None,
+) -> KVCacheManagerConfig:
+    layer_buffers = [
+        BufferConfig(role=Role.KEY, size=kv_buf_size),
+        BufferConfig(role=Role.VALUE, size=kv_buf_size),
+    ]
+    if block_quant_buf_size is not None:
+        layer_buffers.extend(
+            [
+                BufferConfig(role=Role.KEY_BLOCK_QUANT, size=block_quant_buf_size),
+                BufferConfig(role=Role.VALUE_BLOCK_QUANT, size=block_quant_buf_size),
+            ]
+        )
+    disk_path_candidates = ["/workspace/", "/tmp/nvidia-mps/", "/tmp"]
+    disk_path = next(p for p in disk_path_candidates if os.path.exists(p))
+    assert gpu_quota > 0
+    cache_tiers = [
+        GpuCacheTierConfig(quota=gpu_quota),
+        HostCacheTierConfig(quota=host_quota),
+        DiskCacheTierConfig(quota=disk_quota, path=disk_path),
+    ]
+    cache_tiers = [t for t in cache_tiers if t.quota > 0]
+    return KVCacheManagerConfig(
+        tokens_per_block=tokens_per_block,
+        vocab_size=4096,
+        cache_tiers=[t for t in cache_tiers if t.quota > 0],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=layer_id,
+                buffers=layer_buffers,
+                sliding_window_size=window_size if layer_id % 2 == 0 else None,
+                num_sink_tokens=sink_tokens if layer_id % 2 == 0 else None,
+            )
+            for layer_id in typed_range(LayerId(num_layers))
+        ],
+    )
+
+
 class TestKVCacheManagerV2(unittest.TestCase):
     engine: FakeEngine
     cfg: KVCacheManagerConfig
@@ -181,8 +252,9 @@ class TestKVCacheManagerV2(unittest.TestCase):
         sink_tokens: int,
         tokens_per_block: int = 32,
         kv_buf_size: int = 8192,
+        block_quant_buf_size: int | None = None,
     ):
-        self._init_cfg(
+        self.cfg = create_config(
             tokens_per_block,
             gpu_quota,
             host_quota,
@@ -191,54 +263,10 @@ class TestKVCacheManagerV2(unittest.TestCase):
             window_size,
             sink_tokens,
             kv_buf_size,
+            block_quant_buf_size,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
-
-    def _init_cfg(
-        self,
-        tokens_per_block: int,
-        gpu_quota: int,
-        host_quota: int,
-        disk_quota: int,
-        num_layers: int,
-        window_size: SlidingWindowSize,
-        sink_tokens: int,
-        kv_buf_size: int = 8192,
-        block_quant_buf_size: int | None = None,
-    ):
-        layer_buffers = [
-            BufferConfig(role=Role.KEY, size=kv_buf_size),
-            BufferConfig(role=Role.VALUE, size=kv_buf_size),
-        ]
-        if block_quant_buf_size is not None:
-            layer_buffers.extend(
-                [
-                    BufferConfig(role=Role.KEY_BLOCK_QUANT, size=block_quant_buf_size),
-                    BufferConfig(role=Role.VALUE_BLOCK_QUANT, size=block_quant_buf_size),
-                ]
-            )
-        disk_path_candidates = ["/workspace/", "/tmp/nvidia-mps/", "/tmp"]
-        disk_path = next(p for p in disk_path_candidates if os.path.exists(p))
-        cache_tiers = [
-            GpuCacheTierConfig(quota=gpu_quota),
-            HostCacheTierConfig(quota=host_quota),
-            DiskCacheTierConfig(quota=disk_quota, path=disk_path),
-        ]
-        self.cfg = KVCacheManagerConfig(
-            tokens_per_block=tokens_per_block,
-            vocab_size=4096,
-            cache_tiers=[t for t in cache_tiers if t.quota > 0],
-            layers=[
-                AttentionLayerConfig(
-                    layer_id=layer_id,
-                    buffers=layer_buffers,
-                    sliding_window_size=window_size if layer_id % 2 == 0 else None,
-                    num_sink_tokens=sink_tokens if layer_id % 2 == 0 else None,
-                )
-                for layer_id in typed_range(LayerId(num_layers))
-            ],
-        )
 
 
 class TestNoBatching(TestKVCacheManagerV2):
@@ -314,12 +342,12 @@ class TestNoBatching(TestKVCacheManagerV2):
         if use_external_page_index_buf:
             max_num_blocks = div_up(seq_len, self.cfg.tokens_per_block)
             num_layer_groups = len(self.manager.layer_grouping)
-            page_indices = [
+            base_page_indices = [
                 array.array("i", [-1]) * max_num_blocks for _ in range(num_layer_groups)
             ]
             for id in range(num_layer_groups):
-                req0.kv_cache.set_page_index_buf(
-                    BeamIndex(0), LayerGroupId(id), memoryview(page_indices[id])
+                req0.kv_cache.set_base_page_index_buf(
+                    DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(base_page_indices[id])
                 )
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
@@ -341,12 +369,12 @@ class TestNoBatching(TestKVCacheManagerV2):
         if use_external_page_index_buf:
             max_num_blocks = div_up(seq_len, self.cfg.tokens_per_block)
             num_layer_groups = len(self.manager.layer_grouping)
-            page_indices = [
+            base_page_indices = [
                 array.array("i", [-1]) * max_num_blocks for _ in range(num_layer_groups)
             ]
             for id in range(num_layer_groups):
-                req0.kv_cache.set_page_index_buf(
-                    BeamIndex(0), LayerGroupId(id), memoryview(page_indices[id])
+                req0.kv_cache.set_base_page_index_buf(
+                    DEFAULT_BEAM_INDEX, LayerGroupId(id), memoryview(base_page_indices[id])
                 )
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
@@ -448,10 +476,18 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         self.manager.clear_reusable_blocks()
 
-    @parameterized.expand([(False,), (True,)])
+    @parameterized.expand(list(itertools.product([False, True], repeat=2)))
     # @assert_no_ref_cycle
-    def test_naive(self, use_external_page_index_buf: bool) -> None:
-        self.prepare(256 << 20, 256 << 20, 1 << 30, 36, 128, 48)
+    def test_naive(self, use_external_page_index_buf: bool, use_block_quant: bool) -> None:
+        self.prepare(
+            256 << 20,
+            256 << 20,
+            1 << 30,
+            36,
+            128,
+            48,
+            block_quant_buf_size=(1024 if use_block_quant else None),
+        )
         self.run_naive(512, 1, True, use_external_page_index_buf)
 
     @parameterized.expand([(2**i, False) for i in range(12)])
@@ -705,6 +741,319 @@ class TestDisagg(TestKVCacheManagerV2):
             kv_cache.commit(prompt)
         kv_cache.close()
         stream.take_finish_event().synchronize()
+
+
+class TestDisaggregatedServing(unittest.TestCase):
+    @dataclass(slots=True)
+    class NodeGroup:
+        class Node(NamedTuple):
+            manager: KVCacheManager
+            stream: CachedCudaStream
+            engine: FakeEngine
+            kv_cache: _KVCache
+
+        _nodes: list[Node]
+        tp_size: int
+
+        @property
+        def pp_size(self) -> int:
+            return exact_div(len(self._nodes), self.tp_size)
+
+        def __getitem__(self, key: tuple[int, int]) -> Node:
+            pp_rank, tp_rank = key
+            assert 0 <= pp_rank < self.pp_size and 0 <= tp_rank < self.tp_size
+            return self._nodes[pp_rank * self.tp_size + tp_rank]
+
+        def __iter__(self) -> Iterator[Node]:
+            return iter(self._nodes)
+
+        def __init__(self, full_config: KVCacheManagerConfig, tp_size: int, pp_size: int):
+            self.tp_size = tp_size
+            full_layers = full_config.layers
+            assert len(full_layers) % pp_size == 0
+            np = tp_size * pp_size
+            cache_tiers = deepcopy(full_config.cache_tiers)
+            for tier in cache_tiers:
+                tier.quota = tier.quota // np
+            num_local_layers = len(full_layers) // pp_size
+            self._nodes = []
+            for pp_rank in range(pp_size):
+                layer_start = num_local_layers * pp_rank
+                layers = full_layers[layer_start : layer_start + num_local_layers]
+                for layer in layers:
+                    for b in layer.buffers:
+                        b.size = exact_div(b.size, tp_size)
+                for tp_rank in range(tp_size):
+                    config = deepcopy(full_config)
+                    config.cache_tiers = cache_tiers
+                    config.layers = layers
+                    manager = KVCacheManager(config)
+                    kv_cache = manager.create_kv_cache()
+                    stream = CachedCudaStream()
+                    kv_cache.resume(CudaStream(stream.handle))
+                    kv_cache.stop_committing()
+                    engine = FakeEngine(config)
+                    self._nodes.append(self.Node(manager, stream, engine, kv_cache))
+
+    _token_id_gen: Iterator[int]
+    full_config: KVCacheManagerConfig
+    prefill: NodeGroup
+    decode: NodeGroup
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        self._token_id_gen = itertools.count()
+        gc.collect()
+        gc.disable()
+
+    def tearDown(self) -> None:
+        gc.enable()
+
+    def next_token(self) -> TokenIdExt:
+        token_id = next(self._token_id_gen)
+        if token_id % 100 == 99:
+            return randbytes(32)
+        else:
+            return TokenId(token_id)
+
+    def prepare(
+        self,
+        gpu_quota: int = 128 << 20,
+        host_quota: int = 128 << 20,
+        disk_quota: int = 0,
+        num_layers: int = 4,
+        window_size: SlidingWindowSize = 128,
+        sink_tokens: int = 0,
+        tokens_per_block: int = 32,
+        kv_buf_size: int = 8192,
+        block_quant_buf_size: int | None = None,
+        prefill_pp_size: int = 1,
+        prefill_tp_size: int = 1,
+        decode_pp_size: int = 1,
+        decode_tp_size: int = 1,
+    ) -> None:
+        assert max(prefill_tp_size, decode_tp_size) % min(prefill_tp_size, decode_tp_size) == 0
+        assert max(decode_pp_size, prefill_pp_size) % min(decode_pp_size, prefill_pp_size) == 0
+        self.full_config = create_config(
+            tokens_per_block,
+            gpu_quota,
+            host_quota,
+            disk_quota,
+            num_layers,
+            window_size,
+            sink_tokens,
+            kv_buf_size,
+            block_quant_buf_size,
+        )
+        self.prefill = self.NodeGroup(self.full_config, prefill_tp_size, prefill_pp_size)
+        self.decode = self.NodeGroup(self.full_config, decode_tp_size, decode_pp_size)
+
+    def transfer(self, stream: CudaStream) -> None:
+        prefill = self.prefill
+        decode = self.decode
+        max_pp = max(prefill.pp_size, decode.pp_size)
+        max_tp = max(prefill.tp_size, decode.tp_size)
+
+        class Slice(NamedTuple):
+            num_slices: int
+            slice_rank: int
+
+        def get_rank_and_slice(max_par_size: int, par_size: int, idx: int) -> tuple[int, Slice]:
+            num_slices = exact_div(max_par_size, par_size)
+            rank = idx // num_slices
+            slice = Slice(num_slices, idx % num_slices)
+            return rank, slice
+
+        for pp_idx in range(max_pp):
+            src_pp_rank, _ = get_rank_and_slice(max_pp, prefill.pp_size, pp_idx)
+            dst_pp_rank, _ = get_rank_and_slice(max_pp, decode.pp_size, pp_idx)
+            layers_per_slice = exact_div(len(self.full_config.layers), max_pp)
+            layers = self.full_config.layers[
+                layers_per_slice * pp_idx : layers_per_slice * (pp_idx + 1)
+            ]
+            buffers = sum(
+                ([BufferId(layer.layer_id, b.role) for b in layer.buffers] for layer in layers), []
+            )
+            for tp_idx in range(max_tp):
+                src_tp_rank, src_tp_slice = get_rank_and_slice(max_tp, prefill.tp_size, tp_idx)
+                dst_tp_rank, dst_tp_slice = get_rank_and_slice(max_tp, decode.tp_size, tp_idx)
+                src = prefill[src_pp_rank, src_tp_rank]
+                dst = decode[dst_pp_rank, dst_tp_rank]
+                src_buffer_slices = (
+                    BufferSlice(b, src_tp_slice.num_slices, src_tp_slice.slice_rank)
+                    for b in buffers
+                )
+                dst_buffer_slices = (
+                    BufferSlice(b, dst_tp_slice.num_slices, dst_tp_slice.slice_rank)
+                    for b in buffers
+                )
+                src_pages = src.manager.get_aggregated_pages(src_buffer_slices)
+                dst_pages = dst.manager.get_aggregated_pages(dst_buffer_slices)
+                for src_page, dst_page in zip(src_pages, dst_pages, strict=True):
+                    assert src_page.size == dst_page.size
+                    num_bytes = src_page.size
+                    assert all(
+                        s.buffer_id == d.buffer_id
+                        for s, d in zip(src_page.buffers, dst_page.buffers, strict=True)
+                    )
+                    tasks = [
+                        CopyTask(
+                            MemAddress(dst_page.base + dst_page.stride * i),
+                            MemAddress(src_page.base + src_page.stride * j),
+                        )
+                        for i, j in zip(
+                            dst.kv_cache.get_aggregated_page_indices(
+                                dst_page.layer_group_id, valid_only=True
+                            ),
+                            src.kv_cache.get_aggregated_page_indices(
+                                src_page.layer_group_id, valid_only=True
+                            ),
+                            strict=True,
+                        )
+                    ]
+                    batched_copy(CacheTier.GPU_MEM, CacheTier.GPU_MEM, num_bytes, tasks, stream)
+
+    @parameterized.expand([(1, 1, 1, 1), (1, 2, 1, 1), (1, 1, 1, 2), (2, 1, 1, 1), (1, 1, 2, 1)])
+    def test_disaggregated_serving(
+        self,
+        prefill_tp_size: int,
+        prefill_pp_size: int,
+        decode_tp_size: int,
+        decode_pp_size: int,
+    ) -> None:
+        self.prepare(prefill_tp_size, prefill_pp_size, decode_tp_size, decode_pp_size)
+
+        prompt_len = 185
+        prompt = [self.next_token() for _ in range(prompt_len)]
+        for node in self.prefill:
+            node.kv_cache.capacity = prompt_len
+            node.engine.execute(
+                [Step(node.kv_cache, prompt, [])], cast(CudaStream, node.stream.handle)
+            )
+            node.kv_cache.history_length = prompt_len
+        for node in self.decode:
+            node.kv_cache.resize(prompt_len, prompt_len)
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            # make both prefill and decode pages available in the steam used for data copy
+            for src in self.prefill:
+                src.kv_cache.cuda_stream = stream
+            for dst in self.decode:
+                dst.kv_cache.cuda_stream = stream
+            # Do that data transfer
+            self.transfer(stream)
+        # OK to close the prefill requests now.
+        for node in self.prefill:
+            node.kv_cache.close()
+        _ = s.take_finish_event()  # no need to synchronize.
+        # ref-check from decode nodes.
+        for node in self.decode:
+            stream = cast(CudaStream, node.stream.handle)
+            node.kv_cache.cuda_stream = stream
+            node.engine.execute([Step(node.kv_cache, [], prompt)], stream)
+        for node in self.decode:
+            node.stream.synchronize()
+            node.kv_cache.close()
+
+
+class TestComplexModels(unittest.TestCase):
+    def setUp(self) -> None:
+        init_cuda_once()
+        gc.collect()
+        gc.disable()
+
+    def tearDown(self) -> None:
+        gc.enable()
+
+    def test_complex_model_0(self) -> None:
+        role = DataRole("buf0")
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(2),
+                buffers=[BufferConfig(role=role, size=98304)],
+                sliding_window_size=None,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(3),
+                buffers=[BufferConfig(role=role, size=163840)],
+                sliding_window_size=64,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(4),
+                buffers=[BufferConfig(role=role, size=163840)],
+                sliding_window_size=64,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(5),
+                buffers=[BufferConfig(role=role, size=65536)],
+                sliding_window_size=None,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(6),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=64,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(7),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=64,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(8),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(9),
+                buffers=[BufferConfig(role=role, size=32768)],
+                sliding_window_size=None,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(10),
+                buffers=[BufferConfig(role=role, size=262144)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(11),
+                buffers=[BufferConfig(role=role, size=262144)],
+                sliding_window_size=128,
+                num_sink_tokens=None,
+            ),
+        ]
+
+        config = KVCacheManagerConfig(
+            tokens_per_block=128,
+            vocab_size=1024,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=1024 * 1024 * 1024),
+                HostCacheTierConfig(quota=8000 << 20),
+            ],
+            max_util_for_resume=0.95,
+            layers=layers,
+        )
+        manager = KVCacheManager(config)
+        del manager
 
 
 if __name__ == "__main__":

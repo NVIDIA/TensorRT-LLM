@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Attention Interface to handle various attention operators and cache operations.
 
 This module provides an interface between the high-level runtime and cache management system and
@@ -11,7 +26,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 import math
 from abc import ABC, abstractmethod
-from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union, final
+from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -395,6 +410,9 @@ class SequenceInfo:
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         self.max_num_tokens = max_num_tokens or (max_seq_len + 1) * max_batch_size
 
+        # will store num_blocks later...
+        self._num_blocks = None
+
         # TODO (lucaslie): can we remove this eventually from this i/f?
         self.vocab_size_padded = vocab_size_padded
 
@@ -569,6 +587,11 @@ class SequenceInfo:
         """Return the page assignments for each sequence."""
         return self._get_page_assignments(self.cache_loc, self.pages_per_seq)
 
+    @property
+    def num_blocks(self) -> int:
+        assert self._num_blocks is not None, "num_blocks not set yet"
+        return self._num_blocks
+
     def estimate_cache_tokens_per_forward(self) -> int:
         """Estimate the max number of tokens that will be cached for a forward pass.
 
@@ -581,6 +604,10 @@ class SequenceInfo:
 
     def estimate_cache_loc_capacity(self, num_blocks: int) -> None:
         """Estimate needed capacity of cache_loc based on available blocks and resize."""
+        # set num_blocks
+        self._num_blocks = num_blocks
+
+        # get current capacity
         cache_loc_capacity = self._input_buffer.get_capacity("cache_loc")
 
         # cache_loc requires some special treatment due to block reuse. Note that the constraint for
@@ -1011,42 +1038,135 @@ class ResourceHandler(ABC):
     performs on the resources providing an abstract handle.
     """
 
+    @property
+    def is_paged(self) -> bool:
+        """Whether the resource is paged.
+
+        If the resource is paged, it will participate in the resize computation of the caches and
+        needs to implement the _get_bytes_per_token method.
+        """
+        return False
+
+    @property
+    def bytes_per_token(self) -> int:
+        """The size of the resource per token."""
+        if self.is_paged:
+            return self._get_bytes_per_token()
+        else:
+            raise NotImplementedError(f"Resource {self.__class__.__name__} is not paged.")
+
+    def _get_bytes_per_token(self) -> int:
+        """The size of the resource per token."""
+        raise NotImplementedError(
+            f"Resource {self.__class__.__name__} needs to implement _get_bytes_per_token."
+        )
+
     @abstractmethod
     def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
         """Initialize the resource for the given sequence info."""
 
 
-class ManagedResourceHandler(ResourceHandler):
-    """An abstract interface to handle a resource that is managed by the cache manager."""
+class KVPagedResourceHandler(ResourceHandler):
+    """Handler for paged KV cache resources.
 
-    @final
-    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
-        """Allocate the resource for the given sequence info."""
-        raise NotImplementedError("Managed resources should not be allocated directly!")
+    This handler indicates the resource should be managed by the standard KVCacheManager.
 
-
-class PagedResourceHandler(ManagedResourceHandler):
-    """An abstract interface to handle a paged resource.
-
-    The PagedResourceHandler can be used to handle resources that support paging such as kv-caches.
+    Args:
+        num_kv_heads: Number of key-value heads.
+        head_dim: Dimension of each head.
+        dtype: The dtype of the KV cache.
+        kv_factor: The factor of the KV cache. Default is 2 for combined k/v cache.
+        kv_layout: Memory layout for the KV cache. Either "HND" (head-num-dim) or "NHD" (num-head-dim).
+            Default is "HND" which is the standard layout for flashinfer.
     """
 
-    def __init__(self, *token_shape: int, dtype: torch.dtype) -> None:
-        """Initialize the PagedResourceHandler.
+    @property
+    def is_paged(self) -> bool:
+        """Whether the resource is paged."""
+        return True
+
+    def __init__(
+        self,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        kv_factor: int = 2,
+        kv_layout: Literal["HND", "NHD"] = "HND",
+    ) -> None:
+        """Initialize the KVPagedResourceHandler.
 
         Args:
-            page_shape: The shape of a single page of the resource.
-            dtype: The dtype of the resource.
+            num_kv_heads: Number of key-value heads.
+            head_dim: Dimension of each head.
+            dtype: The dtype of the KV cache.
+            kv_factor: The factor of the KV cache. Default is 2.
+            kv_layout: Memory layout - "HND" or "NHD". Default is "HND".
         """
-        self.token_shape = token_shape
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
         self.dtype = dtype
+        self.kv_factor = kv_factor
+        assert kv_factor in [1, 2], f"Invalid kv_factor: {kv_factor}"
+        self.kv_layout = kv_layout
+
+    def __eq__(self, other: Optional[ResourceHandler]) -> bool:
+        """Check compatibility for KVCacheManager (head_dim and dtype must match)."""
+        if type(other) is not type(self):
+            return False
+        return (
+            self.head_dim == other.head_dim
+            and self.dtype == other.dtype
+            and self.kv_factor == other.kv_factor
+            and self.kv_layout == other.kv_layout
+        )
+
+    def _get_bytes_per_token(self) -> int:
+        """The size of the resource per token in bytes."""
+        return self.num_kv_heads * self.kv_factor * self.head_dim * self.dtype.itemsize
+
+    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        """Allocate paged resource locally when not managed by KVCacheManager.
+
+        Args:
+            sequence_info: Sequence information containing device info.
+
+        Returns:
+            Allocated tensor with shape depending on kv_layout:
+            - NHD: [num_blocks, 2, tokens_per_block, num_kv_heads, head_dim]
+            - HND: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]
+        """
+        if self.kv_layout == "HND":
+            return torch.empty(
+                sequence_info.num_blocks,
+                self.kv_factor,
+                self.num_kv_heads,
+                sequence_info.tokens_per_block,
+                self.head_dim,
+                device=sequence_info.device,
+                dtype=self.dtype,
+            )
+        elif self.kv_layout == "NHD":
+            return torch.empty(
+                sequence_info.num_blocks,
+                sequence_info.tokens_per_block,
+                self.kv_factor,
+                self.num_kv_heads,
+                self.head_dim,
+                device=sequence_info.device,
+                dtype=self.dtype,
+            )
+        else:
+            raise ValueError(f"Invalid kv_layout: {self.kv_layout}")
 
 
-class StateResourceHandler(ManagedResourceHandler):
+class StateResourceHandler(ResourceHandler):
     """Handler for per-sequence state resources (e.g., Mamba SSM/conv states).
 
-    These resources have shape [max_batch_size, *state_shape] and are
-    managed by MambaHybridCacheManager via byte-level pooling.
+    These resources have shape [max_batch_size, *state_shape] and can be either:
+    - Managed by MambaHybridCacheManager (for typed subclasses SSMResourceHandler, CausalConvResourceHandler)
+    - Allocated locally via allocate() (for generic StateResourceHandler or when constraints don't hold)
+
+    Subclasses should define state_shape as a property that returns the appropriate shape.
     """
 
     def __init__(self, *state_shape: int, dtype: torch.dtype) -> None:
@@ -1056,8 +1176,95 @@ class StateResourceHandler(ManagedResourceHandler):
             state_shape: The shape of a single state resource.
             dtype: The dtype of the state resource.
         """
-        self.state_shape = state_shape
+        self._state_shape = state_shape
         self.dtype = dtype
+
+    @property
+    def state_shape(self) -> Tuple[int, ...]:
+        """Return the state shape. Subclasses may override this as a property."""
+        return self._state_shape
+
+    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        """Allocate state resource locally (fallback when not managed by cache manager)."""
+        return torch.empty(
+            sequence_info.max_num_state_slots,
+            *self.state_shape,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+    def __eq__(self, other: Optional[ResourceHandler]) -> bool:
+        """Check compatibility for MambaHybridCacheManager state resources."""
+        if type(other) is not type(self):
+            return False
+        return self.state_shape == other.state_shape and self.dtype == other.dtype
+
+
+class SSMResourceHandler(StateResourceHandler):
+    """Handler for SSM state resources that maps directly to MambaCacheManager's ssm_states buffer.
+
+    These resources have shape [max_batch_size, num_heads, head_dim, d_state] and are
+    managed by MambaHybridCacheManager via the ssm_states buffer when compatible.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        d_state: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """Initialize the SSMResourceHandler.
+
+        Args:
+            num_heads: Number of attention heads.
+            head_dim: Dimension per head.
+            d_state: SSM state size.
+            dtype: Data type for the state.
+        """
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.d_state = d_state
+        # Call parent with dtype only (state_shape comes from property)
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int, int]:
+        """Return the SSM state shape: (num_heads, head_dim, d_state)."""
+        return (self.num_heads, self.head_dim, self.d_state)
+
+
+class CausalConvResourceHandler(StateResourceHandler):
+    """Handler for causal conv state resources that maps to MambaCacheManager's conv_states buffer.
+
+    These resources have shape [max_batch_size, conv_dim, d_conv - 1] and are
+    managed by MambaHybridCacheManager via the conv_states buffer when compatible.
+
+    Note: d_conv is the kernel size, and (d_conv - 1) is the state size stored in the cache.
+    """
+
+    def __init__(
+        self,
+        conv_dim: int,
+        d_conv: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """Initialize the CausalConvResourceHandler.
+
+        Args:
+            conv_dim: Convolution dimension (typically in_channels).
+            d_conv: Kernel size. The cache stores d_conv - 1 elements.
+            dtype: Data type for the state.
+        """
+        self.conv_dim = conv_dim
+        self.d_conv = d_conv  # kernel_size
+        # Call parent with dtype only (state_shape comes from property)
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int]:
+        """Return the conv state shape: (conv_dim, d_conv - 1)."""
+        return (self.conv_dim, self.d_conv - 1)
 
 
 class UnpagedResourceHandler(ResourceHandler):

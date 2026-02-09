@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -101,6 +101,9 @@ struct BatchedGemmData
     {
         // The matrix A. The data type is controlled by options.mDtypeA.
         //
+        // Sparsity is only supported with batchN.
+        // Let S be the sparsity ratio (1 for dense, 2 for sparse).
+        //
         // If (routeAct == true && batchM), the shape is [M, K]
         // Elseif (batchStrideInTokens > 0)
         //   If batchM:
@@ -109,23 +112,23 @@ struct BatchedGemmData
         //
         //   If batchN:
         //      If layoutA is MatrixLayout::MajorK
-        //         Logical shape is [B, divUpMul(M, tileM), K].
-        //         Logical strides are [divUpMul(M, tileM) * K, K, 1].
-        //      If layoutA is MatrixLayout::MajorMn
+        //         Logical shape is [B, divUpMul(M, tileM), K / S].
+        //         Logical strides are [divUpMul(M, tileM) * K / S, K / S, 1].
+        //      If layoutA is MatrixLayout::MajorMn (sparsity not supported)
         //         Logical shape is [B, K, divUpMul(M, tileM)].
         //         Logical strides are [K * divUpMul(M, tileM), divUpMul(M, tileM), 1].
         //      If layoutA is MatrixLayout::BlockMajorK
-        //         Logical shape is [B, K / blockK, divUpMul(M, tileM), blockK].
-        //         Logical strides are [K * divUpMul(M, tileM), divUpMul(M, tileM) * blockK, blockK, 1].
-        //         where blockK is 128B.
+        //         Logical shape is [B, K / S / blockK, divUpMul(M, tileM), blockK].
+        //         Logical strides are [K / S * divUpMul(M, tileM), divUpMul(M, tileM) * blockK, blockK,
+        //         1]. where blockK is 128B.
         // Else // batchStrideInTokens == 0
-        //   If batchM:
+        //   If batchM: (sparsity not supported)
         //      Logical shape is [M, K].
         //      Logical strides are [K, 1].
         //
         //   If batchN:
-        //      Logical shape is [B, divUpMul(M, tileM), K].
-        //      Logical strides are [divUpMul(M, tileM) * K, K, 1].
+        //      Logical shape is [B, divUpMul(M, tileM), K / S].
+        //      Logical strides are [divUpMul(M, tileM) * K / S, K / S, 1].
         void const* mPtrA{nullptr};
 
         // The block scaling factors to dequantize A.
@@ -141,9 +144,9 @@ struct BatchedGemmData
         //      The layout of scaling factors for A is always R128c4
         //      M must be a multiple of 128.
         //      K must be a multiple of 64.
-        //      The "logical" shape is: [paddedM, K / 16].
-        //      The R128c4 layout is: [paddedM / 128, K / 16 / 4, 512].
-        //      The shape we use for TMA is: [paddedM / 128, K / 16 / 4, 2, 256].
+        //      The "logical" shape is: [paddedM, K / P], where P is the scaling block size.
+        //      The R128c4 layout is: [paddedM / 128, K / P / 4, 512].
+        //      The shape we use for TMA is: [paddedM / 128, K / P / 4, 2, 256].
         //  Where paddedM is M if (routeAct == true && batchM), or
         //  sum(divUpMul(M[bi], tileM) for bi in B) if batchM,
         //  otherwise divUpMul(M, tileM) * B.
@@ -214,15 +217,15 @@ struct BatchedGemmData
         //    If the layout is R128c4,
         //       paddedN must be a multiple of 128.
         //       K must be a multiple of 64.
-        //       The R128c4 layout is: [paddedN / 128, K / 16 / 4, 512]
-        //       The shape we use for TMA is: [paddedN / 128, K / 16 / 4, 2, 256]
+        //       The R128c4 layout is: [paddedN / 128, K / P / 4, 512], where P is the scaling block
+        //       size. The shape we use for TMA is: [paddedN / 128, K / P / 4, 2, 256]
         //
         //    If the layout is R8c4,
         //       paddedN must be a multiple of 8.
         //       K must be a multiple of 64.
-        //       The R8c4 layout is: [paddedN / 8, K / 16 / 4, 32]
-        //       The shape we use for TMA is: [paddedN / 8, K / 16 / 4 / repeats, repeats * 32]
-        //       where repeats = min(tileK / 16 / 4, 8)
+        //       The R8c4 layout is: [paddedN / 8, K / P / 4, 32], where P is the scaling block size.
+        //       The shape we use for TMA is: [paddedN / 8, K / P / 4 / repeats, repeats * 32]
+        //       where repeats = min(tileK / P / 4, 8)
         //
         // where paddedN is N if (routeAct == true && batchN),
         // or sum(divUpMul(N[bi], tileN) for bi in B) if batchN,
@@ -247,6 +250,25 @@ struct BatchedGemmData
         // if (batchN (B is activations)):
         //     Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B)]
         void const* mPtrPerTokenSfB{nullptr};
+
+        // The sparsity information of A, if structured sparsity is used.
+        // Only supported for batchN (A is weights).
+        //
+        // When sparsityA is Any_2_4:
+        //     2 elements are non-zero in any chunk of 4 elements.
+        //     A 4-bit index indicates the position of the non-zero elements.
+        //     The shape in Uint8 is: [B, divUpMul(M, tileM), K / 8]
+        //     (two 4-bit indices packed into one UInt8)
+        //
+        // When sparsityA is Pairwise_4_8:
+        //     4 elements are non-zero in any chunk of 8 elements.
+        //     The zero and non-zero elements are grouped in pairs.
+        //     A 4-bit index indicates the position of the non-zero pairs.
+        //     The shape in Uint8 is: [B, divUpMul(M, tileM), K / 16]
+        //     (two 4-bit indices packed into one UInt8)
+        //
+        // If sparsityA is Dense, this should be set to nullptr.
+        void const* mPtrSparsityInfoA{nullptr};
 
         // The bias applied after the GEMM and before the activation function.
         // The bias is applied before applying the global scaling factor. I.e.
@@ -277,6 +299,13 @@ struct BatchedGemmData
         //    otherwise it is 1.
         // Shape is [B].
         float const* mPtrScaleC{nullptr};
+
+        // The pre-activation scaling factor (typically dequantA * dequantB) for non-gated non-linear
+        // activation.
+        // Only used when non-linear activation is applied (e.g., GELU, Relu2).
+        // When used, scaleC should be quantScaleC only, and this scale is applied before the
+        // activation. Shape is [B].
+        float const* mPtrScaleAct{nullptr};
 
         // The output gate scale for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
@@ -379,7 +408,8 @@ struct BatchedGemmData
         // Computed as
         // int32_t totalNumPaddedTokens{0};
         // for (int bi = 0; bi < options.mNumBatches; bi++) {
-        //   totalNumPaddedTokens += batchM ? divUpMul(options.mBatchedM[bi], options.mTileM)
+        //   totalNumPaddedTokens += batchM ? divUpMul(options.mBatchedM[bi], options.mTileM *
+        //   options.mClusterDimX)
         //                                  : divUpMul(options.mBatchedN[bi], options.mTileN);
         // }
         // The size is 1 and the dtype is int32_t.
@@ -411,6 +441,13 @@ struct BatchedGemmData
         // The shape is
         // [divUp(numTokens + numBatches * (tileM/N - 1), tileM/N)]
         int32_t const* mPtrCtaIdxXyToMnLimit;
+
+        // Global counter for SW-emulated dynamic tile scheduling. When dynamic scheduling is enabled,
+        // must be initialized to gridDim.x * gridDim.y (gridDim.z is reserved for K-dim in CGA splitK)
+        // before each kernel launch.
+        // Set to nullptr if not using the PersistentSm90 tile scheduler.
+        // Shape is [1].
+        uint32_t* mPtrDynamicTileCounter{nullptr};
     };
 
     struct OutputBuffers
@@ -429,26 +466,26 @@ struct BatchedGemmData
         // The output block scaling factors for C.
         //
         // If MxFp{4,8} and NvFp4 formats are used,
-        // The "logical" shape is:
-        //    if batchM: [paddedM, N / 16]
-        //    if batchN: [paddedN, M / 16]
+        // The "logical" shape is (P is the scaling block size):
+        //    if batchM: [paddedM, N / P]
+        //    if batchN: [paddedN, M / P]
         // where paddedM is sum(divUpMul(M[bi], tileM) for bi in B),
         // where paddedN is sum(divUpMul(N[bi], tileN) for bi in B).
         //
         // If the layout is R128c4,
         //    paddedOuter must be a multiple of 128.
         //    inner must be a multiple of 64.
-        //    The R128c4 layout is: [paddedOuter / 128, inner / 16 / 4, 512]
-        //    The shape we use for TMA is: [paddedOuter / 128, inner / 16 / 4, 2, 256]
+        //    The R128c4 layout is: [paddedOuter / 128, inner / P / 4, 512]
+        //    The shape we use for TMA is: [paddedOuter / 128, inner / P / 4, 2, 256]
         //    where inner = N if batchM, otherwise M.
         //    where paddedOuter = paddedM if batchM, otherwise paddedN.
         //
         // If the layout is R8c4,
         //    paddedOuter must be a multiple of 8.
         //    inner must be a multiple of 64.
-        //    The R8c4 layout is: [paddedOuter / 8, inner / 16 / 4, 32]
-        //    The shape we use for TMA is: [paddedOuter / 8, inner / 16 / 4 / repeats, repeats * 32]
-        //    where repeats = min(tileInner / 16 / 4, 8),
+        //    The R8c4 layout is: [paddedOuter / 8, inner / P / 4, 32]
+        //    The shape we use for TMA is: [paddedOuter / 8, inner / P / 4 / repeats, repeats * 32]
+        //    where repeats = min(tileInner / P / 4, 8),
         //    where tileInner = tileN if batchM, otherwise tileM,
         //    where paddedOuter = paddedM if batchM, otherwise paddedN.
         //    where inner = N if batchM, otherwise M.
@@ -502,8 +539,10 @@ public:
 
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
+    //
+    // pinnedHostBuffer: if provided, it must be pinned host memory buffer of 4 bytes.
     int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& batchedGemmData,
-        void* cudaStream, int32_t /*multiProcessorCount*/, bool usePdl = true,
+        void* cudaStream, int32_t multiProcessorCount, bool usePdl = true, void* pinnedHostBuffer = nullptr,
         std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt)
     {
         // Get options from config and data.
@@ -512,7 +551,9 @@ public:
         bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
         bool const useDeepSeekFp8
             = options.mUseDeepSeekFp8 && options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3;
-
+        // Get the grid dimensions.
+        auto [numCtaBatch, numCtaTile, numCtaInner]
+            = getGridDim(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
         auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
         float* dPtrRowMax{nullptr};
         uint32_t* dPtrRowMaxBars{nullptr};
@@ -531,24 +572,56 @@ public:
             }
         }
 
-        auto [numCtaBatch, numCtaTile, numCtaInner]
-            = getGridDim(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+        // Initialize the dynamic tile counter if dynamic scheduling is enabled.
+        // The counter must be initialized to the fixed grid dim.
+        // TODO: we may avoid H2D copy by offloading the operation to some kernel.
+        if (batchedGemmData.mInputBuffers.mPtrDynamicTileCounter != nullptr)
+        {
+            auto [numFixedCtaBatch, numFixedCtaTile, numFixedCtaInner] = getFixedGridDim(options, multiProcessorCount);
+            static uint32_t* pinnedCounterValue_ = nullptr;
+            if (pinnedHostBuffer)
+            {
+                // Use the pre-allocated pinned host memory if provided.
+                pinnedCounterValue_ = reinterpret_cast<uint32_t*>(pinnedHostBuffer);
+            }
+            // Use pinned host memory for the source value to support CUDA graph, or it silently breaks
+            // during CUDA graph replay and corrupts the data.
+            if (pinnedHostBuffer == nullptr && pinnedCounterValue_ == nullptr)
+            {
+                // Allocate pinned host memory if not provided.
+                auto err = cudaMallocHost((void**) &pinnedCounterValue_, sizeof(uint32_t));
+                if (err != cudaSuccess)
+                {
+                    return 1;
+                }
+            }
+            *pinnedCounterValue_ = numFixedCtaBatch * numFixedCtaTile;
+            auto err
+                = cudaMemcpyAsync((void*) batchedGemmData.mInputBuffers.mPtrDynamicTileCounter, pinnedCounterValue_,
+                    sizeof(uint32_t), cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(cudaStream));
+            if (err != cudaSuccess)
+            {
+                return 1;
+            }
+        }
+
         auto kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
             batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
             batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,
             batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
-            batchedGemmData.mInputBuffers.mPtrBias, batchedGemmData.mOutputBuffers.mPtrSfC,
-            batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleGate,
+            batchedGemmData.mInputBuffers.mPtrSparsityInfoA, batchedGemmData.mInputBuffers.mPtrBias,
+            batchedGemmData.mOutputBuffers.mPtrSfC, batchedGemmData.mInputBuffers.mPtrScaleC,
+            batchedGemmData.mInputBuffers.mPtrScaleAct, batchedGemmData.mInputBuffers.mPtrScaleGate,
             batchedGemmData.mInputBuffers.mPtrClampLimit, batchedGemmData.mInputBuffers.mPtrGatedActAlpha,
             batchedGemmData.mInputBuffers.mPtrGatedActBeta, batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax,
             dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
             batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
             batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
-            numCtaBatch);
+            numCtaBatch, batchedGemmData.mInputBuffers.mPtrDynamicTileCounter);
 
         // The size of the grid.
-        std::vector<int32_t> grid = batchM ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
-                                           : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
+        auto grid
+            = getLaunchGrid(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim, multiProcessorCount);
 
         BatchedGemmConfig batchedGemmConfig = config;
 #ifndef TLLM_GEN_EXPORT_INTERFACE
@@ -679,6 +752,26 @@ public:
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
+    // Returns the grid dimensions of the current kernel when using fixed grid size.
+    std::tuple<int32_t, int32_t, int32_t> getFixedGridDim(
+        BatchedGemmOptions const& options, int32_t multiProcessorCount, int32_t multiProcessorOccupancy = 1) const
+    {
+
+        // For StaticPersistent scheduler, limit grid size based on SM count.
+        assert(multiProcessorCount > 0 && "multiProcessorCount must be provided when using StaticPersistent scheduler");
+        // The cluster size spanned in the XY dimension.
+        auto clusterSizeXy = options.mClusterDimX * options.mClusterDimY;
+        // The maximum number of CTAs a GPU can run across the XY dimension.
+        auto numCtasXy = multiProcessorCount / options.mNumSlicesForSplitK;
+        // Round down to the nearest multiple of the cluster size.
+        numCtasXy = (numCtasXy / clusterSizeXy) * clusterSizeXy;
+        // Account for available occupancy for the kernel. Defaults to 1 CTA per multiprocessor.
+        numCtasXy *= multiProcessorOccupancy;
+        return std::make_tuple(numCtasXy, 1, options.mNumSlicesForSplitK);
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
     // Returns the grid dimensions of the current kernel.
     std::tuple<int32_t, int32_t, int32_t> getGridDim(
         BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
@@ -691,8 +784,9 @@ public:
         {
             for (int32_t bi = 0; bi < options.mNumBatches; ++bi)
             {
-                numCtasBatch += batchM ? gemm::divUp(options.mBatchedM[bi], options.mTileM)
-                                       : gemm::divUp(options.mBatchedN[bi], options.mTileN);
+                numCtasBatch += batchM
+                    ? gemm::divUp(options.mBatchedM[bi], options.mTileM * options.mClusterDimX) * options.mClusterDimX
+                    : gemm::divUp(options.mBatchedN[bi], options.mTileN);
             }
         }
         // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
@@ -735,11 +829,30 @@ public:
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
     // Returns the number of CTAs of the current kernel.
+    std::vector<int32_t> getLaunchGrid(BatchedGemmOptions const& options,
+        std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt, int32_t multiProcessorCount = 0) const
+    {
+        bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
+        // Determine if the scheduler requires a fixed grid dimension.
+        bool const isFixedGridDim = (options.mTileScheduler == gemm::TileScheduler::StaticPersistent
+            || options.mTileScheduler == gemm::TileScheduler::PersistentSm90);
+        // Get the grid dimensions.
+        auto [numCtaBatch, numCtaTile, numCtaInner] = isFixedGridDim ? getFixedGridDim(options, multiProcessorCount)
+                                                                     : getGridDim(options, maxNumCtasInBatchDim);
+        std::vector<int32_t> grid = isFixedGridDim || batchM
+            ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
+            : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
+        return grid;
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Returns the number of CTAs of the current kernel.
     int32_t getNumCtas(
         BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
     {
-        auto [numCtasBatch, numCtasTile, numCtasInner] = getGridDim(options, maxNumCtasInBatchDim);
-        return numCtasBatch * numCtasTile * numCtasInner;
+        auto [dim0, dim1, dim2] = getGridDim(options, maxNumCtasInBatchDim);
+        return dim0 * dim1 * dim2;
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -808,21 +921,21 @@ private:
             {
                 for (int32_t bi = 0; bi < options.mNumBatches; ++bi)
                 {
-                    totalNumPaddedTokens += batchM ? gemm::divUpMul(options.mBatchedM[bi], options.mTileM)
-                                                   : gemm::divUpMul(options.mBatchedN[bi], options.mTileN);
+                    totalNumPaddedTokens += batchM
+                        ? gemm::divUpMul(options.mBatchedM[bi], options.mTileM * options.mClusterDimX)
+                        : gemm::divUpMul(options.mBatchedN[bi], options.mTileN);
                 }
             }
             else
             {
                 // Get tile in token dim.
-                auto tileTokensDim = batchM ? options.mTileM : options.mTileN;
+                auto tileTokensDim = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
                 totalNumPaddedTokens = data.mProblemDimensions.mMaxNumCtasInTokenDim * tileTokensDim;
             }
-
             // Get options from config.
             auto& options = config.mOptions;
 
-            int const tokenTile = batchM ? options.mTileM : options.mTileN;
+            int const tokenTile = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
 
             auto const numTokens = totalNumPaddedTokens;
             auto const intermediateDim = batchM ? options.mN : options.mM;
@@ -837,6 +950,11 @@ private:
             // TODO: do we need to pad to 1024?
             workspaceSizes.push_back(getSizePaddedToAlignment(numBytesRowMax, 1024));
             workspaceSizes.push_back(getSizePaddedToAlignment(numBytesRowMaxBars, 1024));
+        }
+
+        if (options.mTileScheduler == gemm::TileScheduler::PersistentSm90)
+        {
+            workspaceSizes.push_back(sizeof(uint32_t));
         }
 
         return workspaceSizes;

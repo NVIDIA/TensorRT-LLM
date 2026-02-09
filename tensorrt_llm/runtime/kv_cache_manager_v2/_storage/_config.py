@@ -19,17 +19,9 @@ from typing import NamedTuple, cast
 
 from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
-from .._life_cycle_registry import LifeCycle, LifeCycleId, LifeCycleRegistry
+from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._core import PoolGroupIndex, PoolIndex
-from .._utils import (
-    HomoTuple,
-    TypedIndexList,
-    exact_div,
-    filled_list,
-    get_uniform_attribute,
-    is_sorted,
-    typed_range,
-)
+from .._utils import HomoTuple, TypedIndexList, filled_list, get_uniform_attribute, is_sorted
 
 
 class BufferId(NamedTuple):
@@ -37,73 +29,55 @@ class BufferId(NamedTuple):
     role: DataRole
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class CoalescedBuffer:
-    life_cycle_id: LifeCycleId
+    """Each coalesced buffer has multiple buffers with the same size and life cycle."""
+
     single_buffer_size: int  # identical for all buffers in the same coalesced buffer
-    buffer_ids: list[BufferId]
+    buffer_ids: HomoTuple[BufferId]
 
     @property
     def size(self) -> int:
         return self.single_buffer_size * len(self.buffer_ids)
 
-
-@dataclass(slots=True)
-class PageConfig:
-    """
-    A page is a group of coalesced buffers. Each coalesced buffer has multiple buffers with the same
-    size. Multiple coalesced buffers can be in the same page if they share the same life cycle and
-    coalesced size.
-    """
-
-    coalesced_buffers: list[CoalescedBuffer]
-
     @property
-    def _coalesced_size(self) -> int:
-        return get_uniform_attribute(self.coalesced_buffers, lambda b: b.size)
-
-    @property
-    def slot_size(self) -> int:
-        return self._coalesced_size * len(self.coalesced_buffers)
-
-    @property
-    def life_cycle_id(self) -> LifeCycleId:
-        return get_uniform_attribute(self.coalesced_buffers, lambda b: b.life_cycle_id)
+    def num_buffers(self) -> int:
+        return len(self.buffer_ids)
 
 
 @dataclass(slots=True, frozen=True)
-class SlotConfig:
-    "A group of pages for the same life cycle."
+class SlotDescVariant:
+    """
+    A group of coalesced buffers for the same life cycle. Each coalesced buffer goes to one different memory pool.
+    These pools forms a pool group. Allocation / deallocation of buffers in these pools are mirrored.
+    """
 
-    pages: HomoTuple[PageConfig]
+    life_cycle_id: LifeCycleId
+    coalesced_buffers: HomoTuple[CoalescedBuffer]
 
     def __post_init__(self) -> None:
-        assert is_sorted(self.pages, key=lambda s: s.slot_size, reverse=True)
-        assert all(
-            len(p.coalesced_buffers) == len(self.pages[0].coalesced_buffers) for p in self.pages
-        )
+        assert is_sorted(self.coalesced_buffers, key=lambda s: s.size, reverse=True)
 
     @property
-    def life_cycle_id(self) -> LifeCycleId:
-        return get_uniform_attribute(self.pages, lambda s: s.life_cycle_id)
+    def layer_group_id(self) -> LayerGroupId:
+        return self.life_cycle_id
 
     @property
     def slot_size_list(self) -> HomoTuple[int]:
-        return tuple(s.slot_size for s in self.pages)
+        return tuple(s.size for s in self.coalesced_buffers)
 
 
 @dataclass(slots=True, frozen=True)
-class PoolGroupConfig:
+class SlotDesc:
     """
-    A group of pools may contain slots (page groups) with different life cycles. They have identical
-    slot size list, so we can put them in the same group of memory pools.
+    A slot in a memory pool group can have different composition, if they have the same slot_size_list.
     """
 
-    slots: HomoTuple[SlotConfig]
+    variants: HomoTuple[SlotDescVariant]
 
     @property
     def slot_size_list(self) -> HomoTuple[int]:
-        return get_uniform_attribute(self.slots, lambda s: s.slot_size_list)
+        return get_uniform_attribute(self.variants, lambda s: s.slot_size_list)
 
 
 @dataclass(slots=True, frozen=True)
@@ -117,60 +91,51 @@ class BufferAttr:
 @dataclass(slots=True, frozen=True)
 class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
-    pool_groups: HomoTuple[PoolGroupConfig]
+    slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
 
     @property
     def num_life_cycles(self) -> LifeCycleId:
-        return LifeCycleId(sum(len(pg.slots) for pg in self.pool_groups))
+        return LifeCycleId(sum(len(pg.variants) for pg in self.slot_desc_list))
 
     def life_cycle_grouping(self) -> TypedIndexList[LifeCycleId, PoolGroupIndex]:
         ret = filled_list(PoolGroupIndex(-1), self.num_life_cycles)
-        for pg_idx, pg in enumerate(self.pool_groups):
+        for pg_idx, pg in enumerate(self.slot_desc_list):
             pg_idx = PoolGroupIndex(pg_idx)
-            for s in pg.slots:
+            for s in pg.variants:
                 ret[s.life_cycle_id] = pg_idx
         return ret
 
     def buffer_attributes(self) -> dict[BufferId, BufferAttr]:
         ret = dict[BufferId, BufferAttr]()
-        for pg in self.pool_groups:
-            for slot in pg.slots:
+        for pg in self.slot_desc_list:
+            for slot in pg.variants:
                 life_cycle_id = slot.life_cycle_id
-                for pool, page in enumerate(slot.pages):
+                for pool, cb in enumerate(slot.coalesced_buffers):
                     offset = 0
-                    for cb in page.coalesced_buffers:
-                        for b in cb.buffer_ids:
-                            ret[b] = BufferAttr(
-                                life_cycle_id, PoolIndex(pool), offset, cb.single_buffer_size
-                            )
-                            offset += cb.single_buffer_size
+                    for b in cb.buffer_ids:
+                        ret[b] = BufferAttr(
+                            life_cycle_id, PoolIndex(pool), offset, cb.single_buffer_size
+                        )
+                        offset += cb.single_buffer_size
         return ret
 
-    def slot_to_page_indices(self) -> TypedIndexList[LifeCycleId, int]:
-        ret = filled_list(0, self.num_life_cycles)
-        for pg in self.pool_groups:
-            for slot in pg.slots:
+    def slot_to_page_indices(self) -> TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]]:
+        ret = [[]] * self.num_life_cycles
+        for pg in self.slot_desc_list:
+            for slot in pg.variants:
                 life_cycle = slot.life_cycle_id
-                assert len(slot.pages) == 1
-                page = slot.pages[0]
-                assert len(page.coalesced_buffers) == 1
-                scale = exact_div(page.slot_size, page.coalesced_buffers[0].single_buffer_size)
-                ret[life_cycle] = scale
-        return ret
+                ret[life_cycle] = [cb.num_buffers for cb in slot.coalesced_buffers]
+        return cast(TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]], ret)
 
-    def layer_to_life_cycle_ids(self) -> TypedIndexList[LayerId, LifeCycleId]:
+    def layer_to_life_cycle_ids(self) -> dict[LayerId, LifeCycleId]:
         map = dict[LayerId, LifeCycleId]()
         for (layer_id, _), attr in self.buffer_attributes().items():
             lc_id = map.setdefault(layer_id, attr.life_cycle_id)
             assert lc_id == attr.life_cycle_id
-        assert len(map) == max(map.keys()) + 1
-        return cast(
-            TypedIndexList[LayerId, LifeCycleId],
-            [map[LayerId(layer_id)] for layer_id in typed_range(len(map))],
-        )
+        return map
 
     def __post_init__(self) -> None:
-        groups = [tuple(s.life_cycle_id for s in pg.slots) for pg in self.pool_groups]
+        groups = [tuple(s.life_cycle_id for s in pg.variants) for pg in self.slot_desc_list]
         all_life_cycle_ids = sum((g for g in groups), ())
         assert len(all_life_cycle_ids) == len(set(all_life_cycle_ids))
 
@@ -192,34 +157,21 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     # Create one slot group for each life cycle.
     # It's possible that buffers with different sizes form coalesced buffers with the same coalesced size.
     # @TODO: add test for this case.
-    slot_groups: list[SlotConfig] = []
+    slot_groups: list[SlotDescVariant] = []
     for life_cycle_id, size_to_buffers in buffer_groups.items():
-        assert len(set(len(buffer_ids) for buffer_ids in size_to_buffers.values())) == 1, (
-            "Not yet supported. While we can support this easily, we need to know whether the kernels "
-            "need to share page indices or not. We haven't seen such models, yet. So we leave this as a "
-            "future work."
-        )
-        size_to_coalesced_buffers = defaultdict[int, list[CoalescedBuffer]](list[CoalescedBuffer])
-        for size, buffer_ids in size_to_buffers.items():
-            coalesced_size = size * len(buffer_ids)
-            coalesced_buffers = size_to_coalesced_buffers[coalesced_size]
-            coalesced_buffers.append(
-                CoalescedBuffer(
-                    life_cycle_id=life_cycle_id, single_buffer_size=size, buffer_ids=buffer_ids
-                )
-            )
         slots = [
-            PageConfig(coalesced_buffers)
-            for coalesced_buffers in size_to_coalesced_buffers.values()
+            CoalescedBuffer(size, tuple(buffer_ids)) for size, buffer_ids in size_to_buffers.items()
         ]
-        slots.sort(key=lambda p: p.slot_size, reverse=True)
-        slot_groups.append(SlotConfig(tuple(slots)))
+        slots.sort(key=lambda p: p.size, reverse=True)
+        slot_groups.append(SlotDescVariant(life_cycle_id, tuple(slots)))
     # Merge slot groups with the same slot_size_list
-    pool_groups_by_slot_size_list = defaultdict[HomoTuple[int], list[SlotConfig]](list[SlotConfig])
+    pool_groups_by_slot_size_list = defaultdict[HomoTuple[int], list[SlotDescVariant]](
+        list[SlotDescVariant]
+    )
     for slot_group in slot_groups:
         pool_groups_by_slot_size_list[slot_group.slot_size_list].append(slot_group)
-    pool_groups = [
-        PoolGroupConfig(tuple(slot_groups))
-        for slot_groups in pool_groups_by_slot_size_list.values()
-    ]
-    return StorageConfig(cache_tiers=tuple(config.cache_tiers), pool_groups=tuple(pool_groups))
+    slot_desc_list = cast(
+        TypedIndexList[PoolGroupIndex, SlotDesc],
+        [SlotDesc(tuple(slot_groups)) for slot_groups in pool_groups_by_slot_size_list.values()],
+    )
+    return StorageConfig(cache_tiers=tuple(config.cache_tiers), slot_desc_list=slot_desc_list)

@@ -12,7 +12,8 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import default_multimodal_input_loader
-from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
+                                 KvCacheConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
 test_data_root = Path(
@@ -173,6 +174,41 @@ def _load_inputs(llm: LLM, prompts, media, mm_embeddings=None):
     return inputs
 
 
+def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
+    # Helper function for checking that two SharedTensorContainer dict representations of the same
+    # underlying data are different. Certain metadata should stay the same (basically those describing
+    # the tensor's contents), while others should actually differ (those pertaining to the underlying
+    # storage).
+    matching_keys = [
+        "dtype",
+        "event_sync_required",
+        "method_key",
+        "requires_grad",
+        # NOTE: this assumes the workers are on the same physical device, which is the case in
+        # the tests in this file since `LLM` API does not expose a way to select the device ID.
+        "storage_device",
+        "storage_size_bytes",
+        "tensor_offset",
+        "tensor_size",
+        "tensor_stride",
+    ]
+
+    different_keys = [
+        "event_handle",
+        "ref_counter_handle",
+        "ref_counter_offset",
+        "storage_handle",
+        "storage_offset_bytes",
+    ]
+
+    assert set(matching_keys + different_keys) == x.keys() == y.keys()
+
+    for key in matching_keys:
+        assert x[key] == y[key]
+    for key in different_keys:
+        assert x[key] != y[key]
+
+
 # TODO: Add multi-image in single chat test
 @pytest.mark.threadleak(enabled=False)
 def test_single_image_chat(
@@ -225,6 +261,7 @@ def test_single_image_chat(
 
         assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
         ep_disaggregated_params.request_type = "context_and_generation" if not pd_disagg else "context_only"
+
         outputs = llm.generate(inputs,
                                sampling_params=sampling_params,
                                disaggregated_params=ep_disaggregated_params)
@@ -233,6 +270,12 @@ def test_single_image_chat(
             # Generation using llm_decode
             assert len(outputs) == 1
             pd_disaggregated_params = outputs[0].disaggregated_params
+
+            ep_handle = ep_disaggregated_params.mrope_position_ids_handle
+            pd_handle = pd_disaggregated_params.mrope_position_ids_handle
+            assert type(ep_handle) is type(pd_handle)
+            if ep_handle is not None:
+                _assert_handles_are_different(ep_handle, pd_handle)
             pd_disaggregated_params.request_type = "generation_only"
             sampling_params = SamplingParams(max_tokens=max_tokens)
             # remove multimodal data from input as decoder worker doesn't need it
@@ -281,6 +324,58 @@ def test_single_image_chat(
             if hasattr(ref_gen, 'logprobs') and hasattr(test_gen, 'logprobs'):
                 assert ref_gen.logprobs == test_gen.logprobs, \
                     f"Log probabilities don't match for output {i}, generation {j}"
+
+
+@pytest.mark.parametrize("model_dir", [_QWEN_3_VL_DIR], indirect=True)
+@pytest.mark.parametrize("pd_disagg", [True], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_pd_disagg_with_image_input(
+    model_dir: Path,
+    pd_disagg: bool,
+    llms: tuple[LLM, LLM | None],
+):
+    """Test P/D disagg with image input."""
+    llm, llm_decode = llms
+    assert llm_decode is not None, "Disaggregated decode worker required."
+
+    prompts = ["Describe the image."]
+    media = [example_images[-1]]
+    sampling_params = SamplingParams(max_tokens=32, temperature=0)
+
+    # Reference outputs: use desired `max_tokens`.
+    inputs = _load_inputs(llm, prompts, media)
+    outputs_ref = llm.generate(inputs, sampling_params=sampling_params)
+    assert outputs_ref is not None and len(outputs_ref) == len(prompts)
+
+    # Prefill: `max_tokens=0`.
+    prefill_disagg_params = DisaggregatedParams(request_type="context_only")
+    outputs = llm.generate(inputs,
+                           sampling_params=SamplingParams(max_tokens=0,
+                                                          temperature=0),
+                           disaggregated_params=prefill_disagg_params)
+    assert len(outputs) == 1
+    pd_disaggregated_params = outputs[0].disaggregated_params
+    pd_disaggregated_params.request_type = "generation_only"
+
+    # Decode: use desired `max_tokens`.
+    decode_inputs = [{
+        "prompt": inputs[0]["prompt"],
+        "multi_modal_data": None,
+        "prompt_token_ids": outputs[0].prompt_token_ids,
+    }]
+    outputs_pd = llm_decode.generate(
+        decode_inputs,
+        sampling_params=sampling_params,
+        disaggregated_params=pd_disaggregated_params)
+
+    assert len(outputs_pd) == len(prompts)
+    for i, (ref_output, test_output) in enumerate(zip(outputs_ref, outputs_pd)):
+        assert len(ref_output.outputs) == len(test_output.outputs), \
+            f"Number of generated outputs don't match for output {i}: {len(ref_output.outputs)} vs {len(test_output.outputs)}"
+        for j, (ref_gen, test_gen) in enumerate(
+                zip(ref_output.outputs, test_output.outputs)):
+            assert ref_gen.text == test_gen.text, \
+                f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
 
 
 @pytest.mark.parametrize("use_mm_embeddings,pass_embeddings_through_loader",

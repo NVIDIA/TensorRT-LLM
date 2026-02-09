@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.quant import (
+from ...custom_ops.quantization.quant import (
     FP4_GLOBAL_SCALE_MAX,
     FP8_MAX,
     TRTLLM_NVFP4_COLUMN_SIZE,
@@ -17,8 +17,8 @@ from ...custom_ops.quant import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import (
-    extract_weight_nodes,
     get_quantization_params_from_linear_node,
+    get_weight_info,
     is_bmm_op,
     is_linear_op,
 )
@@ -110,11 +110,13 @@ class Quantization(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
+        if not qcfg or (
+            qcfg.get("quant_algo", "").upper() != self.algo_name
+            and qcfg.get("quant_method", "").upper() != self.algo_name
+        ):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-
         excluded = qcfg.get("exclude_modules", [])
         cnt = 0
         for n in gm.graph.nodes:
@@ -139,9 +141,10 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
-        weight_nodes = extract_weight_nodes(node)
-        assert len(weight_nodes.weights) == 1, "Expected exactly one weight node"
-        lin_weight = weight_nodes.weights[0]
+        lin_weight = get_weight_info(node)
+        if lin_weight is None:
+            raise ValueError(f"Linear node {node.name} has no weight")
+
         new_param = nn.Parameter(self.quantize_weight(lin_weight.tensor), requires_grad=False)
         modname, _, attrname = lin_weight.node_key.rpartition(".")
 
@@ -635,3 +638,104 @@ class NVFP4QuantizationFromGraph(NVFP4LinearQuantizationFromConfig):
         return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )
+
+
+@TransformRegistry.register("quantize_int4_gptq_linear_from_config")
+class INT4GPTQLinearQuantizationFromConfig(Quantization):
+    """Config-based INT4 GPTQ quantization for GPTQ-quantized checkpoints.
+
+    GPTQ uses:
+      - qweight: [K/8, N] int32 (8 packed int4 values per int32)
+      - qzeros: [G, N/8] int32 (packed zero points)
+      - scales: [G, N] float (per-group scales)
+    """
+
+    algo_name = "GPTQ"
+
+    @staticmethod
+    def target_op():
+        return torch.ops.auto_deploy.torch_fake_quant_int4_gptq_linear.default
+
+    @staticmethod
+    def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
+        """Returns placeholder qweight tensor [K/8, N] int32."""
+        N, K = original_weight.shape
+        assert K % 8 == 0, "K must be divisible by 8 for GPTQ int4 packing."
+        return torch.empty((K // 8, N), dtype=torch.int32, device=original_weight.device)
+
+    @staticmethod
+    def scale_names() -> List[str]:
+        return ["scales", "qzeros"]
+
+    @staticmethod
+    def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+        """Returns placeholder tensors for GPTQ scales and qzeros."""
+        N, K = original_weight_shape
+        BLOCK = 128  # GPTQ group size
+        assert K % BLOCK == 0, "K must be divisible by 128 for GPTQ block quant."
+        assert N % 8 == 0, "N must be divisible by 8 for GPTQ qzeros packing."
+        G = K // BLOCK
+        return {
+            "scales": torch.empty((G, N), dtype=torch.float16),
+            "qzeros": torch.empty((G, N // 8), dtype=torch.int32),
+        }
+
+    @staticmethod
+    def build_custom_args_for_linear(scales: Dict[str, Node]) -> Tuple[object, ...]:
+        """Build args for torch_fake_quant_int4_gptq_linear:
+        (input, weight, bias, input_scale, weight_scale, input_zp, weight_zp)
+        -> input_scale=[], weight_scale=[scales], input_zp=[], weight_zp=[qzeros]
+        """
+        return ([], [scales["scales"]], [], [scales["qzeros"]])
+
+    @staticmethod
+    def load_hook(state_dict, prefix, *args, weight_name: str):
+        """
+        Load hook for GPTQ checkpoints:
+          - qweight: keep as [K/8, N] int32
+          - scales: [G, N] float16
+          - qzeros: [G, N/8] int32
+
+        GPTQ checkpoint uses naming convention:
+          - {prefix}qweight
+          - {prefix}scales
+          - {prefix}qzeros
+        """
+
+        mod_prefix, _, _ = weight_name.rpartition(".")
+
+        qweight_ckpt = f"{mod_prefix}.qweight"
+        scales_ckpt = f"{mod_prefix}.scales"
+        qzeros_ckpt = f"{mod_prefix}.qzeros"
+
+        if qweight_ckpt not in state_dict:
+            return
+
+        qweight = state_dict[qweight_ckpt]
+        if qweight.dtype != torch.int32:
+            return
+
+        K_packed, N = qweight.shape  # [K/8, N]
+        K = K_packed * 8
+
+        assert scales_ckpt in state_dict, f"Missing {scales_ckpt}"
+        scales = state_dict[scales_ckpt]  # [G, N]
+        G = scales.shape[0]
+
+        assert qzeros_ckpt in state_dict, f"Missing {qzeros_ckpt}"
+        qzeros = state_dict[qzeros_ckpt]  # [G, N/8]
+
+        # Validate GPTQ weight layout
+        assert K % G == 0, f"K ({K}) must be divisible by G ({G})"
+        assert scales.shape == (G, N), f"scales shape {scales.shape} != {(G, N)}"
+        assert qzeros.shape == (G, N // 8), f"qzeros shape {qzeros.shape} != {(G, N // 8)}"
+
+        # Map to our buffer names
+        state_dict[weight_name] = qweight  # [K/8, N] int32
+        state_dict[f"{mod_prefix}.scales"] = scales.to(torch.float16)  # [G, N]
+        # GPTQ v1 format stores (zero_point - 1); convert to v2 by adding 0x11111111
+        # See: gptqmodel.utils.model.convert_gptq_v1_to_v2_format_module
+        qzeros_v2 = qzeros + 0x11111111
+        state_dict[f"{mod_prefix}.qzeros"] = qzeros_v2  # [G, N/8] int32 (v2 format)
+        # Remove the original qweight key to avoid "unexpected key" warnings
+        del state_dict[qweight_ckpt]

@@ -34,12 +34,14 @@ from .llm_request import ExecutorResponse
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, PeftCacheManager,
-                               ResourceManager, ResourceManagerType)
+from .resource_manager import (KVCacheManager, KVCacheManagerV2,
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        SimpleScheduler, SimpleUnifiedScheduler)
+                        KVCacheV2DummyScheduler, SimpleScheduler,
+                        SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -99,6 +101,8 @@ class KvCacheCreator:
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
         self._execution_stream = execution_stream
+        if self._kv_cache_manager_cls == KVCacheManager and kv_cache_config.use_kv_cache_manager_v2:
+            self._kv_cache_manager_cls = KVCacheManagerV2
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -583,6 +587,7 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
+            vocab_size=config.vocab_size,
             max_beam_width=max_beam_width,
             is_draft=model_engine.is_draft_model,
             kv_connector_manager=kv_connector_manager
@@ -686,7 +691,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
         )
     else:
-        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
+        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
         is_vswa = kv_cache_config.max_attention_window is not None and len(
             set(kv_cache_config.max_attention_window)) > 1
         binding_model_config = model_engine.model.model_config.get_bindings_model_config(
@@ -704,6 +709,7 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
+            vocab_size=config.vocab_size,
             max_num_tokens=max_num_tokens,
             model_config=binding_model_config,
             max_beam_width=max_beam_width,
@@ -855,7 +861,8 @@ def create_py_executor_instance(
         scheduler_capacity += 1
 
     use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
-    if use_python_scheduler:
+    if use_python_scheduler and not isinstance(kv_cache_manager,
+                                               KVCacheManagerV2):
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -868,12 +875,19 @@ def create_py_executor_instance(
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity)
     else:
-        capacity_scheduler = BindCapacityScheduler(
-            scheduler_capacity,
-            kv_cache_manager.impl if kv_cache_manager is not None else None,
-            peft_cache_manager.impl if peft_cache_manager is not None else None,
-            scheduler_config.capacity_scheduler_policy,
-            two_step_lookahead=mapping.has_pp())
+        if isinstance(kv_cache_manager, KVCacheManagerV2):
+            capacity_scheduler = KVCacheV2DummyScheduler(
+                scheduler_capacity,
+                kv_cache_manager if kv_cache_manager is not None else None)
+        else:
+            capacity_scheduler = BindCapacityScheduler(
+                scheduler_capacity,
+                kv_cache_manager.impl if kv_cache_manager is not None else None,
+                peft_cache_manager.impl
+                if peft_cache_manager is not None else None,
+                scheduler_config.capacity_scheduler_policy,
+                two_step_lookahead=mapping.has_pp())
+
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)

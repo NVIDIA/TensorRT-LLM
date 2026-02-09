@@ -1,7 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import inspect
 import os
 from functools import cached_property
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -10,13 +25,14 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 
 # isort: off
@@ -61,6 +77,88 @@ class TRTLLMGenFusedMoE(MoE):
     There should be at lease `num_experts` slots in the model engine. More than that is OK, in that case, some experts may have multiple replicas.
     """
 
+    # Supported quantization algorithms for TRTLLMGenFusedMoE
+    _SUPPORTED_QUANT_ALGOS = {
+        QuantAlgo.NVFP4,
+        QuantAlgo.FP8_BLOCK_SCALES,
+        QuantAlgo.W4A8_NVFP4_FP8,
+        QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    }
+
+    # Quantization algorithms that support gptoss_style
+    _GPTOSS_SUPPORTED_ALGOS = {
+        QuantAlgo.NVFP4,
+        QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    }
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if TRTLLMGenFusedMoE can implement the given quantization algorithm.
+
+        TRTLLMGenFusedMoE only supports SM in {100, 103} and the following quantizations:
+        - NVFP4
+        - FP8_BLOCK_SCALES
+        - W4A8_NVFP4_FP8
+        - W4A16_MXFP4
+        - W4A8_MXFP4_FP8
+        - W4A8_MXFP4_MXFP8
+
+        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation input data type. Only bfloat16 is supported.
+                See: forward_impl() assert x.dtype == torch.bfloat16 (line 722).
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                Only supported for nvfp4 and mxfp4 variants.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        # TRTLLMGenFusedMoE requires SM in {100, 103}
+        if sm_version not in {100, 103}:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
+            )
+
+        # Check dtype_activation: only bfloat16 is supported
+        if dtype_activation != torch.bfloat16:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE only supports bfloat16 activation, got {dtype_activation}"
+            )
+
+        # TRTLLMGenFusedMoE does NOT support unquantized mode
+        if quant_algo is None:
+            return _warn_and_return(
+                "TRTLLMGenFusedMoE does not support unquantized mode")
+
+        # Check if quant_algo is supported
+        if quant_algo not in cls._SUPPORTED_QUANT_ALGOS:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE does not support quant_algo={quant_algo}")
+
+        # Check gptoss_style support: only supported for nvfp4 and mxfp4 variants
+        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE supports gptoss_style (bias/swiglu) only for nvfp4 and mxfp4 variants, "
+                f"got quant_algo={quant_algo}")
+
+        return True, None
+
     def __init__(
         self,
         *,
@@ -82,6 +180,7 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -99,6 +198,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
 
         sm_version = get_sm_version()
@@ -177,6 +277,15 @@ class TRTLLMGenFusedMoE(MoE):
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
+    def _to_trtllm_gen_activation_type(self,
+                                       activation_type: ActivationType) -> int:
+        if activation_type == ActivationType.Swiglu:
+            return 0
+        elif activation_type == ActivationType.Relu2:
+            return 1
+        else:
+            raise ValueError(f"Unsupported activation type: {activation_type}")
+
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         # If no attention DP, no need to use AlltoAll.
         if self.mapping.dp_size == 1:
@@ -231,7 +340,7 @@ class TRTLLMGenFusedMoE(MoE):
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod(
-                ) if self.swiglu_alpha is not None else NVFP4TRTLLMGenFusedMoEBaseMethod(
+                ) if self.swiglu_alpha is not None or self.activation_type == ActivationType.Relu2 else NVFP4TRTLLMGenFusedMoEBaseMethod(
                 )
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
@@ -457,9 +566,10 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_ids=token_selected_experts,
             )
         elif self.has_nvfp4:
+            factor = 1 if self.activation_type == ActivationType.Relu2 else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
-
+                -2] // factor
+            act_type = self._to_trtllm_gen_activation_type(self.activation_type)
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -487,6 +597,7 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
+                act_type=act_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
             )

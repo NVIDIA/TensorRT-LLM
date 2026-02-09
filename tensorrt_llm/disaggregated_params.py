@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -9,6 +10,11 @@ import tensorrt as trt  # noqa
 # isort: on
 
 from tensorrt_llm.bindings import executor as tllme
+
+
+class DisaggScheduleStyle(IntEnum):
+    CONTEXT_FIRST = 0
+    GENERATION_FIRST = 1
 
 
 @dataclass(slots=True, kw_only=True)
@@ -38,6 +44,8 @@ class DisaggregatedParams:
     disagg_request_id: Optional[int] = None
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[List[str]] = None
+    schedule_style: Optional[DisaggScheduleStyle] = None
+
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (
         None  # multimodal embedding handles should be a list of cudaIPC handles for each mm_embedding
