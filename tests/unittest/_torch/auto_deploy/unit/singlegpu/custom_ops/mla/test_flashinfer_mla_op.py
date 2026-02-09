@@ -22,6 +22,12 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.mla.flashinfer_mla import (
 )
 from tensorrt_llm._torch.auto_deploy.utils.cuda_graph import CudaGraphWarmUpPhase
 
+# Skip all tests in this module on GPUs with compute capability < 9.0 (older than Hopper)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (9, 0),
+    reason="FlashInfer MLA tests require GPU with compute capability >= 9.0 (at least Hopper architecture)",
+)
+
 
 def _create_mla_inputs(
     batch_size: int,
