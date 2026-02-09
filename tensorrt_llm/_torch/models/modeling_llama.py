@@ -797,6 +797,8 @@ class LlamaDecoderLayer(DecoderLayer):
             attention_mask=self.attention_mask,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            allow_window_output=(self.disable_attn_allreduce
+                                 and self.PRE_MLP_FUSION),
             **kwargs,
         )
         # Fully Connected
@@ -850,6 +852,8 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_mlp_allreduce),
+            allow_window_output=(self.disable_mlp_allreduce
+                                 and self.POST_MLP_FUSION),
             **kwargs,
         )
 
