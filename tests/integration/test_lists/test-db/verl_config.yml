@@ -1,7 +1,41 @@
+# Verl configuration for CI stage
+
 verl_config:
-  repo_url: "https://github.com/verl-project/verl.git"
-  commit: "COMMIT_HASH_HERE"  # User to provide specific commit hash
-  install_commands:
-    - "pip3 install -e ."
-    # Additional commands to be specified by user
+  repo_url: "https://github.com/volcengine/verl.git"
+  repo_tag: "4ef45d0"
   test_dir: "tests"
+
+  install_commands:
+    # Install gdrcopy
+    - >-
+      git clone -b v2.5.1 https://github.com/NVIDIA/gdrcopy.git &&
+      pushd gdrcopy &&
+      make prefix=/usr/local lib_install &&
+      popd && rm -rf gdrcopy
+    # Install nvshmem
+    - "pip install nvidia-nvshmem-cu13==3.3.20"
+    # Create nvshmem symlink (needed before DeepEP build)
+    - >-
+      pushd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib &&
+      ln -s libnvshmem_host.so.3 libnvshmem_host.so &&
+      popd
+    # Install DeepEP
+    - >-
+      git clone -b v1.2.1 https://github.com/deepseek-ai/DeepEP.git &&
+      pushd DeepEP &&
+      wget https://raw.githubusercontent.com/NVIDIA/Megatron-LM/refs/tags/core_v0.15.0/docker/patches/deepep.patch &&
+      patch -p1 < deepep.patch &&
+      TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" python setup.py install &&
+      popd && rm -rf DeepEP
+    # Install Python dependencies
+    - "pip3 install --no-cache-dir --no-deps trl"
+    - "pip3 install --no-cache-dir nvtx matplotlib liger_kernel cachetools"
+    - "pip install --no-cache-dir -U git+https://github.com/ISEEKYAN/mbridge.git"
+    - "pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.15.0"
+
+
+  # The environment variables to expose in the container before setting up
+  env_vars:
+    - "NVSHMEM_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem"
+    - "LD_LIBRARY_PATH=\"${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH\""
+    - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
