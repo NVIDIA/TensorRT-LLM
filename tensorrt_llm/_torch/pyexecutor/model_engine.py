@@ -254,7 +254,6 @@ class PyTorchModelEngine(ModelEngine):
         torch_compile_max_num_streams = self.torch_compile_config.max_num_streams if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'max_num_streams'].default
 
-        # Eagle3 draft model now does not support torch.compile
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
 
@@ -2119,6 +2118,23 @@ class PyTorchModelEngine(ModelEngine):
                 request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
 
+                # Re-register mrope tensors for context-only requests (EPD disaggregated serving).
+                # This creates new IPC handles owned by the prefill worker, so the decode worker
+                # can access them even after the encode worker's GC deallocates the original memory.
+                # Without this, the decode worker would receive handles pointing to freed memory.
+                if (request.is_context_only_request and self.use_mrope and
+                        "mrope_config" in multimodal_params.multimodal_data):
+                    mrope_config = multimodal_params.multimodal_data[
+                        "mrope_config"]
+                    _mrope_position_ids = mrope_config.get("mrope_position_ids")
+                    _mrope_position_deltas = mrope_config.get(
+                        "mrope_position_deltas")
+                    if _mrope_position_ids is not None and _mrope_position_deltas is not None:
+                        # Clone to allocate new memory owned by this (prefill) worker.
+                        request.py_result.set_mrope_position(
+                            _mrope_position_ids.clone(),
+                            _mrope_position_deltas.clone())
+
             request.py_batch_idx = request.py_seq_slot
 
         if len(multimodal_params_list) > 0:
@@ -2698,7 +2714,8 @@ class PyTorchModelEngine(ModelEngine):
                 #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
                 # Convert to GPU tensor to avoid implicit sync
                 gen_request_seq_slots_tensor = torch.tensor(
-                    gen_request_seq_slots, dtype=torch.long, device='cuda')
+                    gen_request_seq_slots, dtype=torch.long,
+                    pin_memory=True).to(device='cuda', non_blocking=True)
                 self.cache_indirection_attention[:num_generation_requests].copy_(
                     cache_indirection_buffer[gen_request_seq_slots_tensor])
             if cache_indirection_buffer is not None or is_cuda_graph_during_warmup:

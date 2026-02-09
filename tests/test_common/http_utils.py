@@ -4,7 +4,7 @@ import time
 
 import requests
 
-ERROR_KEYWORDS = ["RuntimeError", "out of memory", "ValueError"]
+ERROR_KEYWORDS = ["RuntimeError", "out of memory", "ValueError", "FileNotFoundError"]
 
 
 def wait_for_endpoint_ready(
