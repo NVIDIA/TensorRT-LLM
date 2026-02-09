@@ -2672,17 +2672,33 @@ class Linear(nn.Module):
     ) -> Optional[torch.Tensor]:
         if not self._should_use_nccl_window_output(input, all_reduce_params,
                                                    lora_params):
+            mpi_off = mpi_disabled()
+            has_all_reduce = self.all_reduce is not None
+            strategy = None if self.all_reduce is None else self.all_reduce.strategy
+            enable_allreduce = None if all_reduce_params is None else all_reduce_params.enable_allreduce
+            has_lora = self.lora is not None and bool(lora_params)
+            valid_input = isinstance(input, torch.Tensor) and input.numel() > 0
+            strategy_ok = strategy in (AllReduceStrategy.AUTO,
+                                       AllReduceStrategy.NCCL_SYMMETRIC)
+            reasons = []
+            if mpi_off:
+                reasons.append("mpi_disabled")
+            if not has_all_reduce:
+                reasons.append("no_all_reduce")
+            if has_all_reduce and not strategy_ok:
+                reasons.append("strategy_not_auto_or_nccl_symmetric")
+            if enable_allreduce is False:
+                reasons.append("enable_allreduce_false")
+            if has_lora:
+                reasons.append("lora_active")
+            if not valid_input:
+                reasons.append("invalid_input")
             logger.debug(
-                "create_nccl_window_tensor skipped (mpi_disabled=%s, has_all_reduce=%s, "
-                "strategy=%s, enable_allreduce=%s, has_lora=%s, valid_input=%s)",
-                mpi_disabled(),
-                self.all_reduce is not None,
-                None if self.all_reduce is None else self.all_reduce.strategy,
-                None if all_reduce_params is None else
-                all_reduce_params.enable_allreduce,
-                self.lora is not None and bool(lora_params),
-                isinstance(input, torch.Tensor) and input.numel() > 0,
-            )
+                "create_nccl_window_tensor skipped "
+                f"(reasons={reasons}, "
+                f"mpi_disabled={mpi_off}, has_all_reduce={has_all_reduce}, "
+                f"strategy={strategy}, enable_allreduce={enable_allreduce}, "
+                f"has_lora={has_lora}, valid_input={valid_input})")
             return None
         output_shape = list(input.shape)
         if not output_shape:
@@ -2775,27 +2791,6 @@ class Linear(nn.Module):
                     else:
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)
-                        if self._should_use_nccl_window_output(
-                                input, all_reduce_params, lora_params):
-                            window_attempted = True
-                            window_path = "fallback_copy"
-                            try:
-                                out_shape = list(output.shape)
-                                out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
-                                    output, self.mapping.tp_group, out_shape)
-                                if bool(
-                                        is_valid
-                                ) and out is not None and out.numel() > 0:
-                                    out.copy_(output)
-                                    window_out = out
-                                    output = window_out
-                            except Exception as exc:
-                                logger.debug(
-                                    "create_nccl_window_tensor fallback raised: %s (shape=%s, group=%s)",
-                                    type(exc).__name__,
-                                    tuple(output.shape),
-                                    tuple(self.mapping.tp_group),
-                                )
                     window_success = window_attempted and window_out is not None
                     window_info = ""
                     if window_attempted:
