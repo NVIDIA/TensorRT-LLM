@@ -495,6 +495,16 @@ else:
    - Example: `trtllm-serve --model <model_path> --config config.yaml` (preferred)
    - Avoid: `trtllm-serve --model <model_path> --extra_llm_api_options config.yaml`
 
+## AI Coding Agent Guidance
+
+This repository includes configuration files for AI coding agents (Claude Code, Cursor, Codex, Copilot, etc.):
+
+- **`CLAUDE.md`** — Shared project context, rules, architecture pointers, and commands. Checked into git.
+- **`AGENTS.md`** — Minimal entry point that directs agents to `CLAUDE.md`.
+- **`CLAUDE.local.md`** — Personal developer overrides (gitignored). Create this file alongside `CLAUDE.md` for your own preferences, local paths, or domain-specific context without affecting the shared config.
+
+**Keeping `CLAUDE.md` up to date**: If you change workflows, commands, architecture, or conventions that would benefit all developers and AI agents, ask your agent to update `CLAUDE.md` in the same PR. Treat it like documentation — it should evolve at the pace of the code.
+
 ## NVIDIA Copyright
 
 1. All TensorRT-LLM Open Source Software code should contain an NVIDIA copyright header that includes the year of its latest meaningful modification.  The following block of text should be prepended to the top of all files.  This includes .cpp, .h, .cu, .py, and any other source files which are compiled or interpreted.
