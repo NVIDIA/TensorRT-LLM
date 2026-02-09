@@ -57,6 +57,8 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
         tp_size = self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
 
+        if self.config.mapping.enable_attention_dp:
+            tp_size = 1
         # linear_num_value_heads = config.linear_num_value_heads
         # linear_num_key_heads = config.linear_num_key_heads
         # linear_key_head_dim = config.linear_key_head_dim
