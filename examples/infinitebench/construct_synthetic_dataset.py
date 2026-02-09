@@ -68,9 +68,8 @@ def build_passkey(args):
                 "answer": key_t,
                 "len": 26 * (num_noise_i - j)
             })
-    fw = jsonlines.open("passkey.jsonl", 'w')
-    fw.write_all(ret)
-    fw.close()
+    with jsonlines.open("passkey.jsonl", 'w') as fw:
+        fw.write_all(ret)
 
 
 def build_kv_retrieval():
@@ -112,9 +111,8 @@ def build_kv_retrieval():
                     "answer": line["ordered_kv_records"][ans_id][1]
                 })
 
-        fw = jsonlines.open("kv_retrieval.jsonl", 'w')
-        fw.write_all(ret)
-        fw.close()
+        with jsonlines.open("kv_retrieval.jsonl", 'w') as fw:
+            fw.write_all(ret)
 
 
 if __name__ == "__main__":
