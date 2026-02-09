@@ -41,7 +41,7 @@ def run_precommit_with_timing():
     print("Running pre-commit checks with performance monitoring...")
     print("=" * 80)
 
-    cmd = "pre-commit run -a --show-diff-on-failure"
+    cmd = "pre-commit run -a --show-diff-on-failure --verbose"
 
     # Track hook execution times
     # Since hooks run sequentially, we can estimate each hook's duration
