@@ -34,7 +34,7 @@ class LayerwiseNvtxMarker(object):
         self.iteration = 0
 
     @staticmethod
-    def _print_tensor(tensor_obj, prefix, tensor_list=[]):
+    def _print_tensor(tensor_obj, prefix, tensor_list=None):
         """ Descends iterators that contains Tensors and prints the Tensor
 
         Recursive function that descends iterator type arguments until
@@ -50,6 +50,8 @@ class LayerwiseNvtxMarker(object):
         Raises:
             None:
         """
+        if tensor_list is None:
+            tensor_list = []
         tensor_dims = []
         if isinstance(tensor_obj, list) or isinstance(tensor_obj, tuple):
             for ten in tensor_obj:

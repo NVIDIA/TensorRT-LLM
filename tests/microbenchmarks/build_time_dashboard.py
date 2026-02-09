@@ -66,9 +66,11 @@ def sanity():
     print(out_bytes)
 
 
-def run_model(model, logfile, timeout=3600, extral_options=[]) -> Metrics:
+def run_model(model, logfile, timeout=3600, extral_options=None) -> Metrics:
     '''Spawn a process to run buld_time_benchmark.py and then grep the results
     '''
+    if extral_options is None:
+        extral_options = []
     metrics = Metrics(model)
 
     out_log = ""

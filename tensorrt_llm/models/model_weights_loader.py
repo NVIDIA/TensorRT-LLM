@@ -37,7 +37,7 @@ class ModelWeightsLoader:
         customized_key_dict       : Customized dict for updating the default tllm_to_externel_key_dict.
     """
 
-    def __init__(self, model_dir, customized_key_dict: dict = {}) -> None:
+    def __init__(self, model_dir, customized_key_dict: dict = None) -> None:
 
         # Checkpoint file format information
         self.model_dir = model_dir
@@ -64,7 +64,8 @@ class ModelWeightsLoader:
             "kv_cache_scaling_factor": ["k_proj.k_scale", "v_proj.v_scale"],
             "kv_cache_rcp_scaling_factor": ["k_proj.k_scale", "v_proj.v_scale"],
         }
-        self.tllm_to_externel_key_dict.update(customized_key_dict)
+        if customized_key_dict is not None:
+            self.tllm_to_externel_key_dict.update(customized_key_dict)
 
         self.detect_format()
         self.preload()

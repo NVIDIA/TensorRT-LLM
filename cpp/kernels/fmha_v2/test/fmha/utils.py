@@ -430,7 +430,7 @@ def sanitize_prompt(prompt):
     return [l for l in prompt if l != '']
 
 
-def fmha_harness(exe_path, fmha_arg, rules=[], dryrun=False, **kwargs):
+def fmha_harness(exe_path, fmha_arg, rules=None, dryrun=False, **kwargs):
     """
     exe_path: path to executable
     fmha_arg: arguments to pass the executable
@@ -439,6 +439,8 @@ def fmha_harness(exe_path, fmha_arg, rules=[], dryrun=False, **kwargs):
     dryrun: print command line without actually invoking it
     **kwargs: optional kwargs to pass to rules
     """
+    if rules is None:
+        rules = []
     # print(str(fmha_arg))
     prompt = base_command(exe_path)
     for rule in rules:

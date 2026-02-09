@@ -19,7 +19,9 @@ from fmha.utils import *
 from train_ops.fmha_unit_test import run_test
 
 
-def run_train_ops_harness(seq_len, head_dim, rules=[], **kwargs):
+def run_train_ops_harness(seq_len, head_dim, rules=None, **kwargs):
+    if rules is None:
+        rules = []
     for rule in rules:
         rule(FmhaArgs(), **kwargs)
     run_test(seq_len, head_dim)
