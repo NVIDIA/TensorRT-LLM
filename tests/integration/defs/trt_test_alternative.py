@@ -89,9 +89,23 @@ if is_linux():
 
         persist_pids = []
         if target_pids:
-            # Grace period
-            time.sleep(5)
+            # Force-kill all child processes immediately. Some processes
+            # (e.g. MPI orted workers) do not self-terminate when their
+            # parent dies and will linger indefinitely without SIGKILL.
+            for pid in sorted(target_pids):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            try:
+                p.kill()
+            except OSError:
+                pass
 
+            # Brief wait for the kernel to reap killed processes
+            time.sleep(1)
+
+            # Check for any processes that survived the SIGKILL
             lines = []
             torch_inductors = []
 
@@ -130,6 +144,9 @@ if is_linux():
                     msg = f"{msg}\n{detail}"
                 warnings.warn(msg)
 
+        # Safety net: kill any process that somehow survived the SIGKILL
+        # above (e.g. process stuck in uninterruptible sleep). In normal
+        # conditions persist_pids will be empty and this is a no-op.
         for pid in persist_pids:
             try:
                 os.kill(pid, signal.SIGKILL)
