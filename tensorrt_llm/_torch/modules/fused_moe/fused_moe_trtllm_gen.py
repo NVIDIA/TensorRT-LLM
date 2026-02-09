@@ -43,7 +43,8 @@ from .quantization import (
     W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
-from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
+from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
+                      DefaultMoeRoutingMethod)
 
 
 class TRTLLMGenFusedMoE(MoE):
@@ -290,30 +291,37 @@ class TRTLLMGenFusedMoE(MoE):
             raise ValueError(f"Unsupported activation type: {activation_type}")
 
     def _check_op_backend_support(self) -> bool:
+        # Unsupported activation type or routing method
         if self.activation_type == ActivationType.Relu2:
             return False
+        if isinstance(self.routing_method,
+                      (DeepSeekV3MoeRoutingMethod, DefaultMoeRoutingMethod)):
+            return False
+
         quant_method = self._get_quant_method()
-        if isinstance(quant_method, NVFP4TRTLLMGenFusedMoEBaseMethod):
+
+        # NVFP4 base method is always supported
+        if type(quant_method) is NVFP4TRTLLMGenFusedMoEBaseMethod:
             return True
-        intermediate_size = self.intermediate_size_per_partition
-        hidden_size = self.hidden_size
 
-        input_hidden_alignment = quant_method.input_hidden_alignment
-        weight_alignment = quant_method.weight_alignment
+        if self.quant_config is None:
+            return False
+        mode = self.quant_config.layer_quant_mode
 
-        if self.quant_config is not None:
-            if self.quant_config.layer_quant_mode.has_nvfp4(
-            ) or self.quant_config.layer_quant_mode.has_w4a16_mxfp4(
-            ) or self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
-                if intermediate_size % weight_alignment != 0:
-                    return False
-                if hidden_size % input_hidden_alignment != 0:
-                    return False
-                if self.bias:
-                    return False
-            elif self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
-            ) or self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+        # These quant modes are never supported via op backend
+        if mode.has_w4a8_nvfp4_fp8() or mode.has_w4a8_mxfp4_fp8():
+            return False
+
+        # These quant modes require alignment and no bias
+        if mode.has_nvfp4() or mode.has_w4a16_mxfp4(
+        ) or mode.has_w4a8_mxfp4_mxfp8():
+            if self.bias:
                 return False
+            if self.intermediate_size_per_partition % quant_method.weight_alignment != 0:
+                return False
+            if self.hidden_size % quant_method.input_hidden_alignment != 0:
+                return False
+
         return True
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
@@ -577,7 +585,7 @@ class TRTLLMGenFusedMoE(MoE):
             # fp8_block_scale_moe_runner needs 2D shape for x_sf and only support SM100+
             if x_sf is None:
                 x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-            self.op_backend.run_fp8_block_scale_moe(
+            final_hidden_states = self.op_backend.run_fp8_block_scale_moe(
                 router_logits,
                 routing_bias,
                 x,
