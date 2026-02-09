@@ -24,7 +24,6 @@ class RequestQueueItem:
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
-    arrival_time: Optional[float] = None  # Time when request was enqueued
 
     @property
     def is_shutdown_request(self):
@@ -104,8 +103,7 @@ class ExecutorRequestQueue:
                     RequestQueueItem(req_id,
                                      request,
                                      child_req_ids=child_req_ids,
-                                     query=query,
-                                     arrival_time=start_time))
+                                     query=query))
                 req_ids.append(req_id)
         return req_ids
 
