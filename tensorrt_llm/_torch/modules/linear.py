@@ -2746,9 +2746,14 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
                 input = input * module.pre_quant_scale
 
             # TODO: fuse global scale.
-            input = (input * module.input_scale).to(torch.bfloat16)
+            if input.dtype == torch.float8_e4m3fn:
+                # FP8_Scale = FP4_Scale / 6.0
+                # input = input / FP8_Scale * FP4_Scale
+                input = input.to(torch.bfloat16) * 6.0
+            else:
+                input = (input * module.input_scale).to(torch.bfloat16)
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
-                input, self.reorder_index, self.residual_dim)
+                input, self.reorder_index, self.residual_dim, is_act=True)
         return act_fp4, act_sf
 
     def load_weights(self,

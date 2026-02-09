@@ -28,9 +28,15 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-template <typename T, int group_size>
-void run_reorder_activation_nvfp4(
-    int16_t* hidden_states, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int seq_len, int KQ, int KE);
+enum class ArcQuantType
+{
+    ACT,
+    WEIGHT,
+};
+
+template <typename T, int group_size, ArcQuantType quant_type>
+void run_quantize_reorder_nvfp4(int16_t* hidden_states, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale,
+    int seq_len, int KQ, int KE, cudaStream_t stream);
 
 } // namespace kernels
 
