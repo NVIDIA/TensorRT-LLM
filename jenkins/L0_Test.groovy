@@ -128,7 +128,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
-                sh "ls ${stageName}"
+                sh "ls -al ${stageName}/"
                 def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
                 if (timeoutTestXml != null) {
                     sh """
@@ -165,7 +165,7 @@ EOF_TIMEOUT_XML
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
             if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
-                sh "ls ${stageName}"
+                sh "ls -al ${stageName}/"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
                 ensureStageResultNotUploaded(stageName)
