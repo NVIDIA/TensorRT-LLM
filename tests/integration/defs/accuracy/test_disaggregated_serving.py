@@ -976,10 +976,21 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                  "cudagraph:none", "cudagraph:without_padding",
                                  "cudagraph:with_padding"
                              ])
-    @pytest.mark.parametrize("comms_medium", ["fifo", "nccl"])
+    @pytest.mark.parametrize("comms_medium", ["fifo_v1", "fifo_v2", "nccl"])
     def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
                                    gen_pp, gen_tp, gen_cp, enable_attention_dp):
-        use_nccl_for_alltoall = comms_medium == "nccl"
+        # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
+        if comms_medium == "nccl":
+            use_nccl_for_alltoall = True
+            fifo_version = 2  # Not used when NCCL is enabled.
+        elif comms_medium == "fifo_v1":
+            use_nccl_for_alltoall = False
+            fifo_version = 1
+        elif comms_medium == "fifo_v2":
+            use_nccl_for_alltoall = False
+            fifo_version = 2
+        else:
+            raise ValueError(f"Unknown comms_medium: {comms_medium}")
         gen_ep = gen_tp * gen_cp
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
@@ -1008,7 +1019,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cp_config": {
                 "cp_type": "HELIX",
                 "tokens_per_block": 32,
-                "use_nccl_for_alltoall": use_nccl_for_alltoall
+                "use_nccl_for_alltoall": use_nccl_for_alltoall,
+                "fifo_version": fifo_version,
             },
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,

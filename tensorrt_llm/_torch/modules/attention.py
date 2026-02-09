@@ -1195,29 +1195,63 @@ class MLA(nn.Module):
                 num_tokens = partial_o.shape[0]
                 cp_size = self.mapping.cp_size
 
-                # Reshape for FIFO-based all-to-all.
-                # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
-                # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
+                # Check which FIFO version to use (default: version 2 for better performance).
+                fifo_version = self.mapping.cp_config.get("fifo_version", 2)
 
-                partial_o = partial_o.view(
-                    num_tokens, cp_size, self.num_heads_tp_cp,
-                    kv_lora_rank).transpose(1, 2).contiguous()
-                softmax_stats = softmax_stats.view(num_tokens, cp_size,
-                                                   self.num_heads_tp_cp,
-                                                   2).transpose(1,
-                                                                2).contiguous()
+                if fifo_version == 1:
+                    # Version 1: Uses transpose+contiguous before alltoall, cp_dim=2.
+                    # Reshape for FIFO-based all-to-all. Overlap the two .contiguous() calls on separate streams.
+                    # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
+                    # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
+                    partial_o, softmax_stats = maybe_execute_in_parallel(
+                        lambda: partial_o.view(num_tokens, cp_size, self.
+                                               num_heads_tp_cp, kv_lora_rank).
+                        transpose(1, 2).contiguous(),
+                        lambda: softmax_stats.view(num_tokens, cp_size, self.
+                                                   num_heads_tp_cp, 2).
+                        transpose(1, 2).contiguous(),
+                        self.ln_events[0],
+                        self.ln_events[1],
+                        self.aux_stream,
+                    )
 
-                # Call FIFO-based helixAllToAll.
-                partial_o_out, softmax_stats_out = helix.alltoall_native(
-                    partial_o, softmax_stats)
+                    # Call FIFO-based helixAllToAll.
+                    partial_o_out, softmax_stats_out = helix.alltoall_native(
+                        partial_o, softmax_stats)
 
-                # partial_o_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
-                # softmax_stats_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
-                # cp_dim = 2 (the dimension where cp_size is located)
+                    # partial_o_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
+                    # softmax_stats_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
+                    # cp_dim = 2 (the dimension where cp_size is located)
 
-                # Call helix_post_process_native with cp_dim=2.
-                return torch.ops.trtllm.helix_post_process_native(
-                    partial_o_out, softmax_stats_out, 1.0, 2)
+                    # Call helix_post_process_native V1 (cp_dim=2).
+                    return torch.ops.trtllm.helix_post_process_native(
+                        partial_o_out, softmax_stats_out, 1.0, 2)
+                else:
+                    # Version 2: Uses simple view (no transpose+contiguous) for better performance.
+                    # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp * kv_lora_rank]
+                    # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp * 2]
+                    partial_o = partial_o.view(
+                        num_tokens, cp_size,
+                        self.num_heads_tp_cp * kv_lora_rank)
+                    softmax_stats = softmax_stats.view(num_tokens, cp_size,
+                                                       self.num_heads_tp_cp * 2)
+
+                    # Call FIFO-based helixAllToAll.
+                    partial_o_out, softmax_stats_out = helix.alltoall_native(
+                        partial_o, softmax_stats)
+
+                    # Reshape after alltoall for post-processing.
+                    # partial_o_out: [num_tokens, cp_size, num_heads_tp_cp * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
+                    # softmax_stats_out: [num_tokens, cp_size, num_heads_tp_cp * 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
+                    gathered_o = partial_o_out.view(num_tokens, cp_size,
+                                                    self.num_heads_tp_cp,
+                                                    kv_lora_rank)
+                    gathered_stats = softmax_stats_out.view(
+                        num_tokens, cp_size, self.num_heads_tp_cp, 2)
+
+                    # Call helix_post_process_native V2 (cp_dim=1).
+                    return torch.ops.trtllm.helix_post_process_native(
+                        gathered_o, gathered_stats, 1.0, 1)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output

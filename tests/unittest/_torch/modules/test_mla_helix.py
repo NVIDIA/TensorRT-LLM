@@ -649,7 +649,8 @@ def _full_test_multi_gpu(
     world_size: int,
     scenario: Scenario,
     gen_steps: int,
-    comms_medium: str = False,
+    use_nccl_for_alltoall: bool = False,
+    fifo_version: int = 2,
 ):
     if scenario.rope_scaling:
         rope_scaling = {
@@ -825,7 +826,8 @@ def _full_test_multi_gpu(
         cp_size=world_size,
         cp_config={
             "cp_type": CpType.HELIX,
-            "use_nccl_for_alltoall": comms_medium == "nccl",
+            "use_nccl_for_alltoall": use_nccl_for_alltoall,
+            "fifo_version": fifo_version,
         },
     )
     # we use cp_allgather here because there is no broadcast op across CP group
@@ -861,7 +863,7 @@ def _run_single_rank(func, *args, **kwargs):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
-@pytest.mark.parametrize("comms_medium", ["nccl", "fifo"])
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v1", "fifo_v2"])
 def test_mla_helix_distributed(
     scenario: Scenario,
     comms_medium: str,
@@ -872,11 +874,34 @@ def test_mla_helix_distributed(
     world_size = 2
     print(f"Testing with comms_medium={comms_medium}.")
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
+
+    # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
+    if comms_medium == "nccl":
+        use_nccl_for_alltoall = True
+        fifo_version = 2  # Not used when NCCL is enabled.
+    elif comms_medium == "fifo_v1":
+        use_nccl_for_alltoall = False
+        fifo_version = 1
+    elif comms_medium == "fifo_v2":
+        use_nccl_for_alltoall = False
+        fifo_version = 2
+    else:
+        raise ValueError(f"Unknown comms_medium: {comms_medium}")
+
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
             _run_single_rank,
             *zip(
-                *[(_full_test_multi_gpu, world_size, scenario, gen_steps, comms_medium == "nccl")]
+                *[
+                    (
+                        _full_test_multi_gpu,
+                        world_size,
+                        scenario,
+                        gen_steps,
+                        use_nccl_for_alltoall,
+                        fifo_version,
+                    )
+                ]
                 * world_size
             ),
         )
@@ -888,7 +913,7 @@ def test_mla_helix_distributed(
 
 
 if __name__ == "__main__":
-    for comms_medium in ["fifo", "nccl"]:
+    for comms_medium in ["fifo_v1", "fifo_v2", "nccl"]:
         print(f"\n{'=' * 60}")
         print(f"Testing with comms_medium={comms_medium}")
         print(f"{'=' * 60}\n")
