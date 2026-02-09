@@ -23,6 +23,7 @@ set(SRCS
     assignReqSeqSlots.cpp
     baseTransBuffer.cpp
     cacheFormatter.cpp
+    cacheTransferLayer.cpp
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp
     capacityScheduler.cpp

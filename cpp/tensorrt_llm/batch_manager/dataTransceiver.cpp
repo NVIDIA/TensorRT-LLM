@@ -276,24 +276,16 @@ class CacheSender::Impl
 public:
     using RequestIdType = LlmRequest::RequestIdType;
 
-    Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter,
-        std::optional<executor::rnn_cache::RnnCacheState> rnnCacheState,
-        std::optional<std::unique_ptr<RnnCacheFormatter>> rnnFormatter)
+    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
-        , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
-        , mFormatter{std::move(formatter)}
-        , mSelfRnnState{std::move(rnnCacheState)}
-        , mRnnFormatter{std::move(rnnFormatter)}
+        , mSelfState{cacheLayer.getKvState(), executor::kv_cache::CommState{manager->getCommState()}}
+        , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
-        if (mSelfRnnState.has_value())
-        {
-            mSelfState.setRnnCacheState(mSelfRnnState.value());
-        }
+        mCacheTransferLayer.populateSelfState(mSelfState);
         mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
         int asyncSendThreadNum = common::getEnvKVCacheSendMaxConcurrenceNum();
@@ -388,54 +380,10 @@ public:
         }
 
         auto requestId = info.getRequestId();
-        TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(
-                                 mSelfState.getCacheState().value(), info.getTransState().getCacheState().value()),
-            "Disagg server does not currently support these cacheState, please check the cacheState of the context and "
-            "gen executors");
+        mCacheTransferLayer.validateSupport(info.getTransState());
 
-        if (mRnnFormatter.has_value() && mRnnFormatter.value() && mSelfRnnState.has_value())
-        {
-            if (info.getTransState().hasRnnCacheState())
-            {
-                TLLM_CHECK_WITH_INFO(mRnnFormatter.value()->inquireSupport(
-                                         mSelfRnnState.value(), info.getTransState().getRnnCacheState().value()),
-                    "Disagg server does not currently support these RNN state configurations, please check the RNN "
-                    "state "
-                    "of the context and gen executors");
-            }
-            else
-            {
-                TLLM_LOG_WARNING("Self has RNN state but peer does not. RNN transfer will be skipped.");
-            }
-        }
-        else if (info.getTransState().hasRnnCacheState() && (!mRnnFormatter.has_value() || !mSelfRnnState.has_value()))
-        {
-            TLLM_LOG_WARNING("Peer has RNN state but self does not. RNN transfer will be skipped.");
-        }
-
-        auto kvCounterParts = executor::kv_cache::targetIRanks(info.getTransState().getCacheState().value(),
-            mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx())
-                                  .mIRanks;
-
-        // Compute RNN counterparts
-        std::vector<SizeType32> rnnCounterParts;
-        if (mRnnFormatter.has_value() && mRnnFormatter.value() && mSelfRnnState.has_value()
-            && info.getTransState().hasRnnCacheState())
-        {
-            rnnCounterParts = executor::kv_cache::targetIRanks(info.getTransState().getRnnCacheState().value(),
-                mSelfRnnState.value(), mSelfState.getCommState().value().getSelfIdx())
-                                  .mIRanks;
-        }
-
-        // Compute union of counterparts (KV first, then RNN-only)
-        std::vector<SizeType32> allCounterParts = kvCounterParts;
-        for (auto rank : rnnCounterParts)
-        {
-            if (std::find(allCounterParts.begin(), allCounterParts.end(), rank) == allCounterParts.end())
-            {
-                allCounterParts.push_back(rank);
-            }
-        }
+        auto allCounterParts = mCacheTransferLayer.computeCounterparts(
+            mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
 
         auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx(); // Index of self in peer's comm state
         int peerIdx = std::distance(
@@ -469,11 +417,7 @@ public:
             session = std::addressof(it->second);
         }
         session->setLlmRequest(llmRequest);
-        mFormatter->format(*session);
-        if (mRnnFormatter.has_value() && mRnnFormatter.value())
-        {
-            mRnnFormatter.value()->format(*session);
-        }
+        mCacheTransferLayer.format(*session);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
@@ -788,9 +732,7 @@ private:
     executor::kv_cache::ConnectionManager* mManager;
     std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
     executor::DataTransceiverState mSelfState;
-    std::unique_ptr<BaseCacheFormatter> mFormatter;
-    std::optional<executor::rnn_cache::RnnCacheState> mSelfRnnState;
-    std::optional<std::unique_ptr<RnnCacheFormatter>> mRnnFormatter;
+    CacheTransferLayer mCacheTransferLayer;
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
     std::ofstream mMeasuresFile;
@@ -799,24 +741,16 @@ private:
 class CacheReceiver::Impl
 {
 public:
-    Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter,
-        std::optional<executor::rnn_cache::RnnCacheState> rnnCacheState,
-        std::optional<std::unique_ptr<RnnCacheFormatter>> rnnFormatter)
+    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
-        , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
-        , mFormatter{std::move(formatter)}
-        , mSelfRnnState{std::move(rnnCacheState)}
-        , mRnnFormatter{std::move(rnnFormatter)}
+        , mSelfState{cacheLayer.getKvState(), executor::kv_cache::CommState{manager->getCommState()}}
+        , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
-        if (mSelfRnnState.has_value())
-        {
-            mSelfState.setRnnCacheState(mSelfRnnState.value());
-        }
+        mCacheTransferLayer.populateSelfState(mSelfState);
     }
 
     [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest)
@@ -861,11 +795,7 @@ public:
 
     void receiveSync(TransferSession& session)
     {
-        mFormatter->unformat(session);
-        if (mRnnFormatter.has_value() && mRnnFormatter.value())
-        {
-            mRnnFormatter.value()->unformat(session);
-        }
+        mCacheTransferLayer.unformat(session);
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
@@ -886,32 +816,13 @@ public:
         auto const& contextState = llmRequest.getDataTransceiverState();
         auto const& commState = contextState.getCommState().value();
         auto const& destCacheState = contextState.getCacheState().value();
-        TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(mSelfState.getCacheState().value(), destCacheState),
-            "Disagg server does not currently support these cacheState.");
-
-        if (mRnnFormatter.has_value() && mRnnFormatter.value() && mSelfRnnState.has_value())
-        {
-            if (contextState.hasRnnCacheState())
-            {
-                TLLM_CHECK_WITH_INFO(mRnnFormatter.value()->inquireSupport(
-                                         mSelfRnnState.value(), contextState.getRnnCacheState().value()),
-                    "Disagg server does not currently support these RNN state configurations.");
-            }
-            else
-            {
-                TLLM_LOG_WARNING("No RNN cache state found in context state for request %ld", requestId);
-            }
-        }
-        else if (contextState.hasRnnCacheState() && (!mRnnFormatter.has_value() || !mSelfRnnState.has_value()))
-        {
-            TLLM_LOG_WARNING("Context has RNN state but self does not. RNN transfer will be skipped.");
-        }
+        mCacheTransferLayer.validateSupport(contextState);
 
         RequestInfo requestInfo(requestId, mSelfState);
 
-        if (!mFormatter->getCacheManager()->getBlockManager().isVariableWindow())
+        if (!mCacheTransferLayer.getCacheManager()->getBlockManager().isVariableWindow())
         {
-            auto* cacheManager = mFormatter->getCacheManager();
+            auto* cacheManager = mCacheTransferLayer.getCacheManager();
             auto beam = 0;
             auto requestedBlockRange = getBlockRangeForReceiving(
                 cacheManager, llmRequest, destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse());
@@ -947,26 +858,8 @@ public:
             TLLM_CHECK(!cacheBufferIds.empty());
         }
 
-        auto kvCounterParts = mFormatter->getCounterparts(
-            mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
-
-        std::vector<SizeType32> rnnCounterParts;
-        if (mRnnFormatter.has_value() && mRnnFormatter.value() && mSelfRnnState.has_value()
-            && contextState.hasRnnCacheState())
-        {
-            rnnCounterParts = mRnnFormatter.value()->getCounterparts(mSelfRnnState.value(),
-                mSelfState.getCommState().value().getSelfIdx(), contextState.getRnnCacheState().value());
-        }
-        std::vector<SizeType32> allCounterParts = kvCounterParts;
-        // Compute union of counterparts (preserving order, deduplicating)
-        //  KV first, then RNN
-        for (auto rank : rnnCounterParts)
-        {
-            if (std::find(allCounterParts.begin(), allCounterParts.end(), rank) == allCounterParts.end())
-            {
-                allCounterParts.push_back(rank);
-            }
-        }
+        auto allCounterParts
+            = mCacheTransferLayer.computeCounterparts(mSelfState.getCommState().value().getSelfIdx(), contextState);
 
         auto connections = mManager->getConnections(commState);
         std::vector<executor::kv_cache::Connection const*> allConnections;
@@ -985,10 +878,10 @@ public:
             {
                 // TODO: index -> validConnectionIdx conversion
                 // TODO(shreyasm): this will not work for RNN. Will error out in the constructor if used with RNN.
-                auto [pickUpIdx, localRankIdx]
-                    = mFormatter->pickRecvConnections(kvCounterParts.size(), mSelfState.getCacheState().value(),
-                        mSelfState.getCommState().value().getSelfIdx(), destCacheState, kvCounterParts);
-                auto validConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
+                auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
+                    allCounterParts.size(), mSelfState.getCacheState().value(),
+                    mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterParts);
+                auto validConnectionIdx = std::find(localRankIdx.begin(), localRankIdx.end(), i) - localRankIdx.begin();
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
                 TLLM_CHECK(!cacheBufferIds.empty());
@@ -1245,9 +1138,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<AsyncResource>> mInstanceToAsyncResource;
     executor::kv_cache::ConnectionManager* mManager;
     executor::DataTransceiverState mSelfState;
-    std::unique_ptr<BaseCacheFormatter> mFormatter;
-    std::optional<executor::rnn_cache::RnnCacheState> mSelfRnnState;
-    std::optional<std::unique_ptr<RnnCacheFormatter>> mRnnFormatter;
+    CacheTransferLayer mCacheTransferLayer;
     std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
     std::mutex mProcessIoResouceMutex;
     runtime::BufferManager mBufferManager;
@@ -1266,11 +1157,9 @@ void CacheReceiver::ImplDeleter::operator()(Impl* ptr)
     delete ptr;
 }
 
-CacheSender::CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-    SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter,
-    std::optional<executor::rnn_cache::RnnCacheState> rnnCacheState, std::unique_ptr<RnnCacheFormatter> rnnFormatter)
-    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfCacheState, selfIndex, std::move(formatter),
-        std::move(rnnCacheState), rnnFormatter ? std::make_optional(std::move(rnnFormatter)) : std::nullopt))}
+CacheSender::CacheSender(
+    executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
+    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer)))}
 {
 }
 
@@ -1311,11 +1200,9 @@ void CacheSender::sendReadySignal(LlmRequest::RequestIdType requestId, bool isRe
     mImpl->sendReadySignal(requestId, isReady);
 }
 
-CacheReceiver::CacheReceiver(executor::kv_cache::ConnectionManager* manager,
-    executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter,
-    std::optional<executor::rnn_cache::RnnCacheState> rnnCacheState, std::unique_ptr<RnnCacheFormatter> rnnFormatter)
-    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfCacheState, selfIndex, std::move(formatter),
-        std::move(rnnCacheState), rnnFormatter ? std::make_optional(std::move(rnnFormatter)) : std::nullopt))}
+CacheReceiver::CacheReceiver(
+    executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
+    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer)))}
 {
 }
 

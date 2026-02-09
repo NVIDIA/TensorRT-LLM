@@ -23,8 +23,8 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -42,8 +42,6 @@ namespace kv_cache_manager
 {
 class BaseCacheFormatter;
 }
-
-class RnnCacheFormatter;
 
 using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
 using BlockKey = kv_cache_manager::BlockKey;
@@ -250,10 +248,10 @@ class CacheSender
 {
 public:
     /// @brief Constructor.
-    CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter,
-        std::optional<executor::rnn_cache::RnnCacheState> rnnCacheState = std::nullopt,
-        std::unique_ptr<RnnCacheFormatter> rnnFormatter = nullptr);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheSender() = default;
 
@@ -307,10 +305,10 @@ class CacheReceiver
 {
 public:
     /// @brief Constructor.
-    CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter,
-        std::optional<executor::rnn_cache::RnnCacheState> rnnCacheState = std::nullopt,
-        std::unique_ptr<RnnCacheFormatter> rnnFormatter = nullptr);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheReceiver() = default;
 

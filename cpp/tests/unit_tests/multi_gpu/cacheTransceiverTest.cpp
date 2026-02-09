@@ -304,13 +304,15 @@ protected:
         bufferManagers.push_back(mCacheTransBufferManager.get());
         if (isSender)
         {
-            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mlocalRank,
+                CacheTransferLayer(
+                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
         }
         else
         {
-            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), mlocalRank,
+                CacheTransferLayer(
+                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
         }
     }
 
@@ -786,12 +788,12 @@ protected:
             if (mIsContext)
             {
                 mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
             }
             else
             {
                 mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
             }
             TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 

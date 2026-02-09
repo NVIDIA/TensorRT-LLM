@@ -36,6 +36,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
@@ -278,10 +279,14 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         return nullptr;
     };
 
-    mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter(),
-        mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt, makeRnnFormatter());
-    mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(),
-        makeFormatter(), mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt, makeRnnFormatter());
+    auto makeCacheTransferLayer = [&]()
+    {
+        return CacheTransferLayer(*mCacheState, makeFormatter(),
+            mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt, makeRnnFormatter());
+    };
+
+    mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
+    mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
 
     initializeCommState();
 }
