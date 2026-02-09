@@ -101,7 +101,6 @@ json_file_path = nsys_rep_file_path.parent / (
 lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 
 with sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True) as conn:
-
     query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
     df = pd.read_sql_query(query, conn)
     event_id_NvtxDomainCreate = df[df["name"] == "NvtxDomainCreate"].iloc[0]["id"].tolist()
@@ -115,7 +114,9 @@ with sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True) as conn:
         FROM NVTX_EVENTS AS T1
         JOIN StringIds AS T2 ON T1.textId = T2.id
         WHERE eventType = ? AND T2.value LIKE ?"""
-    df = pd.read_sql_query(query, conn, params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %"))
+    df = pd.read_sql_query(
+        query, conn, params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %")
+    )
     problem_start_times: list[int] = []
     problem_set: list[dict] = []
     for start, text in df.itertuples(index=False):
