@@ -139,19 +139,13 @@ class Mamba2Mixer(nn.Module):
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
         supported_head_dim_in_flashinfer = [64, 128]
         if head_dim in supported_head_dim_in_flashinfer:
-            logger.info_once(
-                "Using flashinfer for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
-            self.selective_state_update_func_no_mtp = selective_state_update_fi
+            logger.info_once("Using flashinfer for selective state update",
+                             key="selective_state_update")
+            self.selective_state_update_func = selective_state_update_fi
         else:
-            logger.info_once(
-                "Using native for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
-            self.selective_state_update_func_no_mtp = selective_state_update_native
-        # TODO: support MTP selective state update in flashinfer.
-        logger.info_once("Using native for selective state update for MTP",
-                         key="selective_state_update_mtp")
-        self.selective_state_update_func_mtp = selective_state_update_native
+            logger.info_once("Using native for selective state update",
+                             key="selective_state_update")
+            self.selective_state_update_func = selective_state_update_native
 
         # D
         self.D = nn.Parameter(
@@ -368,7 +362,7 @@ class Mamba2Mixer(nn.Module):
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
                 intermediate_ssm_states = layer_cache.intermediate_ssm
-                self.selective_state_update_func_mtp(
+                self.selective_state_update_func(
                     ssm_states,
                     x_d.view(
                         num_decodes,
@@ -402,7 +396,7 @@ class Mamba2Mixer(nn.Module):
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
-                self.selective_state_update_func_no_mtp(
+                self.selective_state_update_func(
                     ssm_states,
                     x_d,
                     dt_d,
