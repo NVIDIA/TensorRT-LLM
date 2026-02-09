@@ -24,8 +24,8 @@ The tool generates:
 
 ## Features
 
-### Per-Step Timing (New)
-- **CPU Timeline**: Shows preprocessing, forward, update, sample, and postprocessing for each step
+### Per-Step / Per-Chunk Timing
+- **CPU Timeline**: Shows preprocessing, forward, update, sample, and postprocessing for each generation step and each context chunk
 - **GPU Timeline**: Shows GPU forward and sample times aligned with CPU timeline
 
 ### Interactive Features
@@ -53,13 +53,23 @@ Client Request
 [first_scheduled_time] ── Request scheduled for execution
     |
     |  ┌─────────────────────────────────────────────────────┐
+    |  │  Context Chunks (chunked prefill):                  │
+    |  │  For each chunk iteration:                          │
+    |  │    [forward_start_time] → [forward_end_time]        │
+    |  │    [sample_start_time]  → [sample_end_time]         │
+    |  │    [token_time]         ── End of iteration         │
+    |  │  Non-chunked prefill = single chunk.                │
+    |  │  First output token is produced by the last chunk.  │
+    |  └─────────────────────────────────────────────────────┘
+    |
+    |  ┌─────────────────────────────────────────────────────┐
     |  │  Per-Step Timing (for each generation step):       │
     |  │                                                     │
-    |  │  [forward_start_time] ── Before model forward()    │
-    |  │  [forward_end_time]   ── After model forward()     │
-    |  │  [sample_start_time]  ── Before sampling           │
-    |  │  [sample_end_time]    ── After sampling            │
-    |  │  [token_time]         ── After handle_responses()  │
+    |  │  [forward_start_time] ── Before model forward       │
+    |  │  [forward_end_time]   ── After model forward        │
+    |  │  [sample_start_time]  ── Before sampling            │
+    |  │  [sample_end_time]    ── After sampling             │
+    |  │  [token_time]         ── End of iteration           │
     |  │                                                     │
     |  │  GPU Events (recorded via CUDA events):            │
     |  │  - gpu_forward_start → gpu_forward_end             │
@@ -95,6 +105,12 @@ Client Request
 │      |                                                          │
 │      v                                                          │
 │  [ctx_first_scheduled_time] ── Scheduled for prefill            │
+│      |                                                          │
+│      |  ┌─────────────────────────────────────────────────┐     │
+│      |  │  Context Chunks (if chunked prefill enabled):   │     │
+│      |  │  Each chunk: forward → sample → postprocess     │     │
+│      |  │  GPU times accumulated across all chunks        │     │
+│      |  └─────────────────────────────────────────────────┘     │
 │      |                                                          │
 │      v                                                          │
 │  [ctx_first_token_time] ────── First token generated            │
@@ -168,7 +184,40 @@ Client receives first token
    - **Time Period**: `first_token_time` → `server_first_token_time`
    - **Description**: Detokenize + IPC from executor to OpenAI server
    - **Includes**: Token-to-text conversion, inter-process communication to OpenAI server
-   - **Display**: Shown as semi-transparent overlay on CPU timeline
+   - **Display**: In non-disagg mode, shown as semi-transparent overlay on CPU timeline. In disagg mode with chunk data, extends from `sample_end_time` to include executor-side postprocessing (GPU sync, KV cache send, response creation)
+
+### Per-Chunk Metrics (Context/Prefill Phase)
+
+When chunked prefill is enabled, the context phase is broken down per chunk. Non-chunked prefill is treated as a single chunk. The actual chunk size is determined by the scheduler based on `max_num_tokens` (total token budget per iteration shared by all requests) and the chunking policy.
+
+When multiple chunks exist, labels use `Ctx C1`, `Ctx C2`, etc. A single chunk uses `Ctx`.
+
+1. **Chunk Preprocessing** (inter-chunk gap)
+   - **Time Period**: Previous chunk's `sample_end_time` → current chunk's `forward_start_time`
+   - **Description**: Scheduling and preparation between chunks
+   - **Includes**: Batch scheduling, resource allocation, previous chunk's response handling
+   - For the first chunk: `first_scheduled_time` → `forward_start_time`
+
+2. **Chunk Forward**
+   - **Time Period**: `forward_start_time` → `forward_end_time`
+   - **Description**: Model forward pass for this chunk's tokens
+
+3. **Chunk Update**
+   - **Time Period**: `forward_end_time` → `sample_start_time`
+   - **Description**: GPU synchronization and state updates
+
+4. **Chunk Sample**
+   - **Time Period**: `sample_start_time` → `sample_end_time`
+   - **Description**: Sampling operation for this chunk
+
+5. **Chunk Postprocessing** (inter-chunk only)
+   - **Time Period**: `sample_end_time` → `token_time`
+   - **Description**: Handle responses and update states between chunks
+
+6. **GPU Forward / GPU Sample** (per chunk)
+   - **Measured via**: CUDA events per chunk, accumulated across all chunks
+   - **Description**: Actual GPU execution time for each chunk's forward and sample
+   - Total GPU times (`ctx_gpu_forward_time`, `ctx_gpu_sample_time`) are the sum of all chunks
 
 ### Per-Step Metrics (Generation Phase)
 
@@ -246,7 +295,7 @@ For each generation step, the following CPU and GPU times are recorded:
 
 The tool expects a JSON file containing an array of request performance metrics (unit: seconds).
 
-### Aggregated Format (with step_metrics)
+### Aggregated Format (with step_metrics and ctx_chunk_metrics)
 
 ```json
 [
@@ -262,16 +311,29 @@ The tool expects a JSON file containing an array of request performance metrics 
       }
     },
     "time_breakdown_metrics": {
+      "ctx_chunk_metrics": [
+        {
+          "forward_start_time": 1.006,
+          "forward_end_time": 1.012,
+          "sample_start_time": 1.013,
+          "sample_end_time": 1.014,
+          "token_time": 1.015,
+          "gpu_forward_time": 5.0,
+          "gpu_sample_time": 0.2
+        }
+      ],
+      "ctx_gpu_forward_time": 5.0,
+      "ctx_gpu_sample_time": 0.2,
       "step_metrics": [
         {
           "iter": 1,
-          "forward_start_time": 1.010,
-          "forward_end_time": 1.015,
-          "sample_start_time": 1.018,
-          "sample_end_time": 1.020,
+          "forward_start_time": 1.016,
+          "forward_end_time": 1.020,
+          "sample_start_time": 1.021,
+          "sample_end_time": 1.022,
           "gpu_forward_time": 4.5,
           "gpu_sample_time": 0.1,
-          "prev_batch_token_time": 1.022
+          "prev_batch_token_time": 1.024
         }
       ]
     }

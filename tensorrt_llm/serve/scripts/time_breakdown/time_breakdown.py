@@ -242,6 +242,7 @@ class RequestDataParser:
         step_metrics = None
         ctx_gpu_forward_time = None
         ctx_gpu_sample_time = None
+        ctx_chunk_metrics = None
 
         # Try new unified time_breakdown_metrics structure
         if is_disaggregated:
@@ -252,11 +253,12 @@ class RequestDataParser:
                 ctx_gpu_forward_time = time_breakdown.get(
                     'ctx_gpu_forward_time')
                 ctx_gpu_sample_time = time_breakdown.get('ctx_gpu_sample_time')
+                ctx_chunk_metrics = time_breakdown.get('ctx_chunk_metrics')
             else:
                 # Legacy: step_metrics inside perf_metrics
                 gen_perf_data = (gen_perf or {}).get('perf_metrics') or {}
                 step_metrics = gen_perf_data.get('step_metrics')
-            # ctx GPU timing from ctx_perf
+            # ctx GPU timing / chunk metrics from ctx_perf
             if ctx_gpu_forward_time is None:
                 ctx_time_breakdown = (ctx_perf
                                       or {}).get('time_breakdown_metrics')
@@ -265,6 +267,9 @@ class RequestDataParser:
                         'ctx_gpu_forward_time')
                     ctx_gpu_sample_time = ctx_time_breakdown.get(
                         'ctx_gpu_sample_time')
+                    if not ctx_chunk_metrics:
+                        ctx_chunk_metrics = ctx_time_breakdown.get(
+                            'ctx_chunk_metrics')
                 else:
                     ctx_gpu_forward_time = (ctx_perf
                                             or {}).get('ctx_gpu_forward_time')
@@ -278,6 +283,7 @@ class RequestDataParser:
                 ctx_gpu_forward_time = time_breakdown.get(
                     'ctx_gpu_forward_time')
                 ctx_gpu_sample_time = time_breakdown.get('ctx_gpu_sample_time')
+                ctx_chunk_metrics = time_breakdown.get('ctx_chunk_metrics')
             else:
                 # Fall back to perf_metrics (legacy structure)
                 perf_data = request_data.get('perf_metrics') or {}
@@ -288,6 +294,7 @@ class RequestDataParser:
                         'ctx_gpu_forward_time')
                     ctx_gpu_sample_time = time_breakdown.get(
                         'ctx_gpu_sample_time')
+                    ctx_chunk_metrics = time_breakdown.get('ctx_chunk_metrics')
                 else:
                     step_metrics = perf_data.get('step_metrics')
                     ctx_gpu_forward_time = perf_data.get('ctx_gpu_forward_time')
@@ -310,6 +317,7 @@ class RequestDataParser:
             'disagg_server_arrival_time': disagg_server_arrival_time,
             'disagg_server_first_token_time': disagg_server_first_token_time,
             'step_metrics': step_metrics,
+            'ctx_chunk_metrics': ctx_chunk_metrics,
             'ctx_gpu_forward_time': ctx_gpu_forward_time,
             'ctx_gpu_sample_time': ctx_gpu_sample_time,
         }
@@ -391,8 +399,7 @@ class RequestTimeBreakdown:
             step_metrics = data.get('step_metrics', []) or []
             if step_metrics:
                 last_step = step_metrics[-1]
-                last_token = last_step.get('token_time') or last_step.get(
-                    'prev_batch_token_time', 0)
+                last_token = last_step.get('token_time', 0)
                 if last_token and not math.isnan(arrival):
                     return (last_token - arrival) * 1000  # Convert to ms
             return 0
@@ -635,11 +642,21 @@ class RequestTimeBreakdown:
                 'gen_postprocessing', 'disagg_postprocessing'
             }
             step_metrics = data.get('step_metrics', [])
+            ctx_chunk_metrics_cpu = data.get('ctx_chunk_metrics') or []
             has_step_metrics = bool(step_metrics)
+            has_ctx_chunks = len(
+                ctx_chunk_metrics_cpu
+            ) >= 1  # Has ctx chunk data (single or multiple)
 
             # Check if this is disagg mode (has gen_server_arrival_time)
             is_disagg = not math.isnan(
                 data.get('gen_server_arrival_time', float('nan')))
+
+            # Determine if first step_metric serves as context (non-chunked, non-disagg, no explicit ctx GPU)
+            ctx_gpu_fwd_val = data.get('ctx_gpu_forward_time', 0) or 0
+            used_first_step_as_ctx = (ctx_gpu_fwd_val == 0
+                                      and not has_ctx_chunks and not is_disagg
+                                      and has_step_metrics)
 
             # Short labels for bar text display
             short_labels = {
@@ -661,9 +678,11 @@ class RequestTimeBreakdown:
                 # Skip metrics drawn separately: postprocessing as overlay
                 if metric.name in postprocessing_metrics:
                     continue
-                # Skip ctx_processing only in non-disagg mode when step_metrics available
-                # In disagg mode, ctx_processing shows context server work, separate from generation steps
-                if metric.name == 'ctx_processing' and has_step_metrics and not is_disagg:
+                # Skip ctx_processing when per-chunk or per-step detail is available
+                # In disagg mode, ctx_processing shows context server work (keep unless chunked)
+                if metric.name == 'ctx_processing' and (has_ctx_chunks or
+                                                        (has_step_metrics
+                                                         and not is_disagg)):
                     continue
                 # In disagg mode, ctx_postprocessing is part of sequential timeline (after ctx_processing)
                 # In non-disagg mode, it's drawn as overlay since it overlaps with generation
@@ -673,6 +692,15 @@ class RequestTimeBreakdown:
                 # Use actual timestamps for positioning
                 start_time = data.get(metric.start_field)
                 end_time = data.get(metric.end_field)
+
+                # Disagg ctx_postprocessing: extend start to last chunk's sample_end
+                # to cover executor-side postprocessing (GPU sync, KV send, handle_responses)
+                if metric.name == 'ctx_postprocessing' and has_ctx_chunks and ctx_chunk_metrics_cpu:
+                    last_c = ctx_chunk_metrics_cpu[-1]
+                    chunk_smp_end = last_c.get('sample_end_time')
+                    if chunk_smp_end and chunk_smp_end > 0 and (
+                            not start_time or chunk_smp_end < start_time):
+                        start_time = chunk_smp_end
 
                 # Skip if timestamps are invalid (None, NaN, or not positive)
                 if start_time is None or end_time is None:
@@ -724,15 +752,198 @@ class RequestTimeBreakdown:
                     cpu_step_start = max(cpu_step_start, end_pos)
                     cpu_pos = max(cpu_pos, end_pos)
 
-            # Add per-step CPU metrics
+            # Add per-chunk CPU metrics for chunked prefill context
+            # Initialize prev_chunk_end_time to first_scheduled_time so C1 Pre is drawn
+            ctx_first_scheduled_ts = data.get('ctx_first_scheduled_time')
+            prev_chunk_end_time = ctx_first_scheduled_ts if (
+                ctx_first_scheduled_ts
+                and not math.isnan(ctx_first_scheduled_ts)
+                and ctx_first_scheduled_ts > 0) else None
+            prev_chunk_token_time = None
+            if has_ctx_chunks:
+                for chunk_idx, chunk in enumerate(ctx_chunk_metrics_cpu):
+                    chunk_fwd_start = chunk.get('forward_start_time', 0)
+                    chunk_fwd_end = chunk.get('forward_end_time', 0)
+                    chunk_smp_start = chunk.get('sample_start_time', 0)
+                    chunk_smp_end = chunk.get('sample_end_time', 0)
+                    chunk_num = chunk_idx + 1
+                    num_chunks = len(ctx_chunk_metrics_cpu)
+                    chunk_prefix = f"Ctx C{chunk_num}" if num_chunks > 1 else "Ctx"
+
+                    if not chunk_fwd_start or math.isnan(ref_time):
+                        continue
+
+                    fwd_start_pos = (chunk_fwd_start - ref_time) * 1000
+
+                    # Inter-chunk gap: split into postprocessing + scheduling
+                    prev_chunk_label = f"Ctx C{chunk_idx}" if num_chunks > 1 else "Ctx"
+                    if prev_chunk_end_time is not None:
+                        prev_end_pos = (prev_chunk_end_time - ref_time) * 1000
+                        prev_token_time = prev_chunk_token_time
+                        if prev_token_time and prev_token_time > prev_chunk_end_time:
+                            # Postprocessing: sample_end → token_time
+                            post_end_pos = (prev_token_time - ref_time) * 1000
+                            post_ms = post_end_pos - prev_end_pos
+                            if post_ms > 0.05:
+                                text_label = f"{prev_chunk_label} Post" if post_ms > 2 else ""
+                                batch_data['step_cpu_post']['y'].append(
+                                    cpu_label)
+                                batch_data['step_cpu_post']['x'].append(
+                                    round(post_ms, 2))
+                                batch_data['step_cpu_post']['base'].append(
+                                    round(prev_end_pos, 2))
+                                batch_data['step_cpu_post']['text'].append(
+                                    text_label)
+                                batch_data['step_cpu_post']['step'].append(
+                                    prev_chunk_label)
+                                batch_data['step_cpu_post']['duration'].append(
+                                    round(post_ms, 2))
+                                batch_data['step_cpu_post'][
+                                    'handled_step'].append(prev_chunk_label)
+
+                            # Scheduling: token_time → next forward_start
+                            sched_ms = fwd_start_pos - post_end_pos
+                            if sched_ms > 0.05:
+                                text_label = f"{chunk_prefix} Pre" if sched_ms > 2 else ""
+                                batch_data['step_preproc']['y'].append(
+                                    cpu_label)
+                                batch_data['step_preproc']['x'].append(
+                                    round(sched_ms, 2))
+                                batch_data['step_preproc']['base'].append(
+                                    round(post_end_pos, 2))
+                                batch_data['step_preproc']['text'].append(
+                                    text_label)
+                                batch_data['step_preproc']['step'].append(
+                                    chunk_prefix)
+                                batch_data['step_preproc']['duration'].append(
+                                    round(sched_ms, 2))
+                        else:
+                            # No token_time: show entire gap as preprocessing
+                            gap_ms = fwd_start_pos - prev_end_pos
+                            if gap_ms > 0.05:
+                                text_label = f"{chunk_prefix} Pre" if gap_ms > 2 else ""
+                                batch_data['step_preproc']['y'].append(
+                                    cpu_label)
+                                batch_data['step_preproc']['x'].append(
+                                    round(gap_ms, 2))
+                                batch_data['step_preproc']['base'].append(
+                                    round(prev_end_pos, 2))
+                                batch_data['step_preproc']['text'].append(
+                                    text_label)
+                                batch_data['step_preproc']['step'].append(
+                                    chunk_prefix)
+                                batch_data['step_preproc']['duration'].append(
+                                    round(gap_ms, 2))
+
+                    # Chunk Forward
+                    if chunk_fwd_end:
+                        fwd_end_pos = (chunk_fwd_end - ref_time) * 1000
+                        chunk_fwd_ms = fwd_end_pos - fwd_start_pos
+                        if chunk_fwd_ms > 0:
+                            text_label = f"{chunk_prefix} Fwd" if chunk_fwd_ms > 2 else ""
+                            batch_data['step_cpu_fwd']['y'].append(cpu_label)
+                            batch_data['step_cpu_fwd']['x'].append(
+                                round(chunk_fwd_ms, 2))
+                            batch_data['step_cpu_fwd']['base'].append(
+                                round(fwd_start_pos, 2))
+                            batch_data['step_cpu_fwd']['text'].append(
+                                text_label)
+                            batch_data['step_cpu_fwd']['step'].append(
+                                chunk_prefix)
+                            batch_data['step_cpu_fwd']['duration'].append(
+                                round(chunk_fwd_ms, 2))
+
+                        # Chunk Update (forward_end → sample_start)
+                        if chunk_smp_start:
+                            smp_start_pos = (chunk_smp_start - ref_time) * 1000
+                            upd_ms = smp_start_pos - fwd_end_pos
+                            if upd_ms > 0.05:
+                                text_label = f"{chunk_prefix} Upd" if upd_ms > 2 else ""
+                                batch_data['step_overlap']['y'].append(
+                                    cpu_label)
+                                batch_data['step_overlap']['x'].append(
+                                    round(upd_ms, 2))
+                                batch_data['step_overlap']['base'].append(
+                                    round(fwd_end_pos, 2))
+                                batch_data['step_overlap']['text'].append(
+                                    text_label)
+                                batch_data['step_overlap']['step'].append(
+                                    chunk_prefix)
+                                batch_data['step_overlap']['duration'].append(
+                                    round(upd_ms, 2))
+                                batch_data['step_overlap'][
+                                    'handled_step'].append(chunk_prefix)
+
+                            # Chunk Sample
+                            if chunk_smp_end:
+                                smp_end_pos = (chunk_smp_end - ref_time) * 1000
+                                smp_ms = smp_end_pos - smp_start_pos
+                                if smp_ms > 0:
+                                    text_label = f"{chunk_prefix} Smp" if smp_ms > 2 else ""
+                                    batch_data['step_cpu_smp']['y'].append(
+                                        cpu_label)
+                                    batch_data['step_cpu_smp']['x'].append(
+                                        round(smp_ms, 2))
+                                    batch_data['step_cpu_smp']['base'].append(
+                                        round(smp_start_pos, 2))
+                                    batch_data['step_cpu_smp']['text'].append(
+                                        text_label)
+                                    batch_data['step_cpu_smp']['step'].append(
+                                        chunk_prefix)
+                                    batch_data['step_cpu_smp'][
+                                        'duration'].append(round(smp_ms, 2))
+                                prev_chunk_end_time = chunk_smp_end
+                                prev_chunk_token_time = chunk.get(
+                                    'token_time', 0) or None
+                                cpu_pos = max(cpu_pos, smp_end_pos)
+                            else:
+                                prev_chunk_end_time = chunk_smp_start
+                                prev_chunk_token_time = None
+                                cpu_pos = max(cpu_pos, smp_start_pos)
+                        else:
+                            prev_chunk_end_time = chunk_fwd_end
+                            prev_chunk_token_time = None
+                            cpu_pos = max(cpu_pos, fwd_end_pos)
+                    else:
+                        cpu_pos = max(cpu_pos, fwd_start_pos)
+
+                # Last chunk post: in disagg mode this is absorbed into ctx_postprocessing metric.
+                # In IFB non-overlap mode, draw if token_time is before S1 fwd_start.
+                if not is_disagg and prev_chunk_end_time and prev_chunk_token_time and prev_chunk_token_time > prev_chunk_end_time:
+                    s1_fwd_start = step_metrics[0].get('forward_start_time',
+                                                       0) if step_metrics else 0
+                    if not s1_fwd_start or prev_chunk_token_time <= s1_fwd_start:
+                        num_c = len(ctx_chunk_metrics_cpu)
+                        post_label = f"Ctx C{num_c}" if num_c > 1 else "Ctx"
+                        post_start_pos = (prev_chunk_end_time - ref_time) * 1000
+                        post_end_pos = (prev_chunk_token_time - ref_time) * 1000
+                        post_ms = post_end_pos - post_start_pos
+                        if post_ms > 0.05:
+                            text_label = f"{post_label} Post" if post_ms > 2 else ""
+                            batch_data['step_cpu_post']['y'].append(cpu_label)
+                            batch_data['step_cpu_post']['x'].append(
+                                round(post_ms, 2))
+                            batch_data['step_cpu_post']['base'].append(
+                                round(post_start_pos, 2))
+                            batch_data['step_cpu_post']['text'].append(
+                                text_label)
+                            batch_data['step_cpu_post']['step'].append(
+                                post_label)
+                            batch_data['step_cpu_post']['duration'].append(
+                                round(post_ms, 2))
+                            batch_data['step_cpu_post']['handled_step'].append(
+                                post_label)
+                            cpu_pos = max(cpu_pos, post_end_pos)
+
+            # Add per-step CPU metrics (generation phase)
             # In overlap mode, each step is split into:
             #   1. Preprocessing (prev_token_time → forward_start_time) - schedule + prepare + handle_responses(N-2)
             #   2. Forward call (forward_start_time → forward_end_time)
             #   3. Update(N-1) (forward_end_time → sample_start_time) - sync + update previous batch
             #   4. Sample call (sample_start_time → sample_end_time)
-            #   5. Postprocessing(N-1) (sample_end → prev_batch_token_time) - handle_responses for previous batch
+            #   5. Postprocessing (sample_end → token_time) - handle_responses
             step_metrics = data.get('step_metrics', [])
-            prev_step_token_time = None  # Track previous step's prev_batch_token_time for preprocessing start
+            prev_step_token_time = None
             if step_metrics:
                 for step_idx, step in enumerate(step_metrics):
                     forward_start_time = step.get('forward_start_time', 0)
@@ -751,6 +962,13 @@ class RequestTimeBreakdown:
                     if has_valid_timing:
                         step_num = step_idx + 1
                         prev_step_num = step_idx  # N-1
+                        # Determine label: "Ctx" only when first step IS context (non-chunked, non-disagg)
+                        is_ctx_step = (step_num == 1 and used_first_step_as_ctx)
+                        step_label = "Ctx" if is_ctx_step else f"S{step_num}"
+                        prev_step_label = "Ctx" if (
+                            prev_step_num == 1 and used_first_step_as_ctx
+                        ) else (
+                            f"S{prev_step_num}" if prev_step_num > 0 else "Ctx")
 
                         # Determine step start position
                         # Use forward_start_time if available, otherwise fall back to scheduled_time
@@ -762,23 +980,37 @@ class RequestTimeBreakdown:
 
                         if has_overlap_timing:
                             # 1. Preprocessing (N) - from previous step's token_time to forward_start
-                            # This includes: postproc(N-2) + schedule(N) + prepare(N)
-                            # For step 1: from gen_first_scheduled_time (disagg) or ctx_first_token_time (non-disagg)
                             if forward_start_time:
                                 if step_idx == 0:
-                                    # First step: use actual timestamp for preprocessing start
+                                    # First gen step: determine preprocessing start
                                     gen_first_scheduled = data.get(
                                         'gen_first_scheduled_time')
                                     ctx_first_scheduled = data.get(
                                         'ctx_first_scheduled_time')
-                                    if gen_first_scheduled and not math.isnan(
+                                    if is_disagg and gen_first_scheduled and not math.isnan(
                                             gen_first_scheduled):
-                                        # Disagg mode: from gen_first_scheduled_time
+                                        # Disagg mode: from gen_first_scheduled_time (gen server timeline)
                                         preproc_start = (gen_first_scheduled -
                                                          ref_time) * 1000
+                                    elif has_ctx_chunks and ctx_chunk_metrics_cpu:
+                                        # IFB: from last chunk's sample_end (not token_time,
+                                        # which may be recorded after S1 fwd_start in overlap mode)
+                                        last_c = ctx_chunk_metrics_cpu[-1]
+                                        last_chunk_end = last_c.get(
+                                            'sample_end_time') or last_c.get(
+                                                'token_time')
+                                        if last_chunk_end and last_chunk_end > 0:
+                                            preproc_start = (last_chunk_end -
+                                                             ref_time) * 1000
+                                        elif ctx_first_scheduled and not math.isnan(
+                                                ctx_first_scheduled):
+                                            preproc_start = (ctx_first_scheduled
+                                                             - ref_time) * 1000
+                                        else:
+                                            preproc_start = cpu_step_start
                                     elif ctx_first_scheduled and not math.isnan(
                                             ctx_first_scheduled):
-                                        # Non-disagg mode: from ctx_first_scheduled_time (when scheduled)
+                                        # IFB non-chunked: from ctx_first_scheduled_time
                                         preproc_start = (ctx_first_scheduled -
                                                          ref_time) * 1000
                                     else:
@@ -792,9 +1024,7 @@ class RequestTimeBreakdown:
                                 if preproc_start is not None:
                                     preproc_ms = fwd_start_pos - preproc_start
                                     if preproc_ms > 0.05:
-                                        # Step 1 is context phase, use "Ctx" prefix
-                                        step_prefix = "Ctx" if step_num == 1 else f"S{step_num}"
-                                        text_label = f"{step_prefix} Pre" if preproc_ms > 2 else ""
+                                        text_label = f"{step_label} Pre" if preproc_ms > 2 else ""
                                         batch_data['step_preproc']['y'].append(
                                             cpu_label)
                                         batch_data['step_preproc']['x'].append(
@@ -805,7 +1035,7 @@ class RequestTimeBreakdown:
                                         batch_data['step_preproc'][
                                             'text'].append(text_label)
                                         batch_data['step_preproc'][
-                                            'step'].append(step_num)
+                                            'step'].append(step_label)
                                         batch_data['step_preproc'][
                                             'duration'].append(
                                                 round(preproc_ms, 2))
@@ -813,10 +1043,8 @@ class RequestTimeBreakdown:
                             # 2. Forward(N) call - from forward_start to forward_end
                             fwd_end = (forward_end_time - ref_time) * 1000
                             cpu_fwd_ms = fwd_end - fwd_start_pos
-                            # Step 1 is context phase, use "Ctx" prefix
-                            step_prefix = "Ctx" if step_num == 1 else f"S{step_num}"
                             if cpu_fwd_ms > 0:
-                                text_label = f"{step_prefix} Fwd" if cpu_fwd_ms > 2 else ""
+                                text_label = f"{step_label} Fwd" if cpu_fwd_ms > 2 else ""
                                 batch_data['step_cpu_fwd']['y'].append(
                                     cpu_label)
                                 batch_data['step_cpu_fwd']['x'].append(
@@ -826,16 +1054,15 @@ class RequestTimeBreakdown:
                                 batch_data['step_cpu_fwd']['text'].append(
                                     text_label)
                                 batch_data['step_cpu_fwd']['step'].append(
-                                    step_num)
+                                    step_label)
                                 batch_data['step_cpu_fwd']['duration'].append(
                                     round(cpu_fwd_ms, 2))
 
-                            # 2. Update(N-1) + SendKV(N-1) - overlap with GPU forward(N)
-                            # Display as "SN Upd" but it's handling step N-1
+                            # 2. Update - overlap with GPU forward
                             smp_start = (sample_start_time - ref_time) * 1000
                             overlap_ms = smp_start - fwd_end
-                            if overlap_ms > 0.05:  # Only show if > 0.05ms
-                                text_label = f"{step_prefix} Upd" if overlap_ms > 2 else ""
+                            if overlap_ms > 0.05:
+                                text_label = f"{step_label} Upd" if overlap_ms > 2 else ""
                                 batch_data['step_overlap']['y'].append(
                                     cpu_label)
                                 batch_data['step_overlap']['x'].append(
@@ -844,29 +1071,23 @@ class RequestTimeBreakdown:
                                     round(fwd_end, 2))
                                 batch_data['step_overlap']['text'].append(
                                     text_label)
-                                # Store [step_num, prev_step_num] for hover to show which step is being handled
                                 batch_data['step_overlap']['step'].append(
-                                    step_num)
+                                    step_label)
                                 batch_data['step_overlap']['duration'].append(
                                     round(overlap_ms, 2))
                                 batch_data['step_overlap'][
-                                    'handled_step'].append(prev_step_num)
+                                    'handled_step'].append(prev_step_label)
 
                             # 3. Sample(N) call - from sample_start to sample_end
                             sample_end_time = step.get('sample_end_time', 0)
-                            # Overlap mode uses prev_batch_token_time, non-overlap uses token_time
-                            prev_batch_token_time = step.get(
-                                'prev_batch_token_time', 0)
                             step_token_time = step.get('token_time', 0)
-                            # Use whichever is available
-                            effective_token_time = prev_batch_token_time or step_token_time
-                            is_overlap_mode = prev_batch_token_time > 0
+                            effective_token_time = step_token_time
 
                             if sample_end_time:
                                 smp_end = (sample_end_time - ref_time) * 1000
                                 cpu_smp_ms = smp_end - smp_start
                                 if cpu_smp_ms > 0:
-                                    text_label = f"{step_prefix} Smp" if cpu_smp_ms > 2 else ""
+                                    text_label = f"{step_label} Smp" if cpu_smp_ms > 2 else ""
                                     batch_data['step_cpu_smp']['y'].append(
                                         cpu_label)
                                     batch_data['step_cpu_smp']['x'].append(
@@ -876,25 +1097,17 @@ class RequestTimeBreakdown:
                                     batch_data['step_cpu_smp']['text'].append(
                                         text_label)
                                     batch_data['step_cpu_smp']['step'].append(
-                                        step_num)
+                                        step_label)
                                     batch_data['step_cpu_smp'][
                                         'duration'].append(round(cpu_smp_ms, 2))
 
                                 # 4. Postprocessing - from sample_end to token_time
-                                # Overlap mode: this is _handle_responses for previous batch (N-1)
-                                # Non-overlap mode: this is _handle_responses for current step (N)
-                                # Display as "SN Post" but it's handling step N-1 in overlap mode
                                 if effective_token_time:
                                     token_end = (effective_token_time -
                                                  ref_time) * 1000
                                     cpu_post_ms = token_end - smp_end
-                                    if cpu_post_ms > 0:  # Show any positive postprocessing time
-                                        handled_step = prev_step_num if is_overlap_mode else step_num
-                                        # For overlap mode step 1, handled_step=0 means handling context batch
-                                        if handled_step == 0 and is_overlap_mode:
-                                            text_label = "Ctx Post" if cpu_post_ms > 2 else ""
-                                        else:
-                                            text_label = f"{step_prefix} Post" if cpu_post_ms > 2 else ""
+                                    if cpu_post_ms > 0:
+                                        text_label = f"{step_label} Post" if cpu_post_ms > 2 else ""
                                         batch_data['step_cpu_post']['y'].append(
                                             cpu_label)
                                         batch_data['step_cpu_post']['x'].append(
@@ -904,17 +1117,14 @@ class RequestTimeBreakdown:
                                         batch_data['step_cpu_post'][
                                             'text'].append(text_label)
                                         batch_data['step_cpu_post'][
-                                            'step'].append(step_num)
+                                            'step'].append(step_label)
                                         batch_data['step_cpu_post'][
                                             'duration'].append(
                                                 round(cpu_post_ms, 2))
                                         batch_data['step_cpu_post'][
-                                            'handled_step'].append(handled_step)
+                                            'handled_step'].append(step_label)
                                     cpu_pos = max(cpu_pos, token_end)
-                                    # Update prev_step_token_time for next step's preprocessing
-                                    # Only meaningful in overlap mode
-                                    if is_overlap_mode:
-                                        prev_step_token_time = prev_batch_token_time
+                                    prev_step_token_time = effective_token_time
                                 else:
                                     cpu_pos = max(cpu_pos, smp_end)
                             else:
@@ -923,7 +1133,7 @@ class RequestTimeBreakdown:
                                     token_end = (token_time - ref_time) * 1000
                                     cpu_smp_ms = token_end - smp_start
                                     if cpu_smp_ms > 0:
-                                        text_label = f"S{step_num} Smp" if cpu_smp_ms > 2 else ""
+                                        text_label = f"{step_label} Smp" if cpu_smp_ms > 2 else ""
                                         batch_data['step_cpu_smp']['y'].append(
                                             cpu_label)
                                         batch_data['step_cpu_smp']['x'].append(
@@ -933,7 +1143,7 @@ class RequestTimeBreakdown:
                                         batch_data['step_cpu_smp'][
                                             'text'].append(text_label)
                                         batch_data['step_cpu_smp'][
-                                            'step'].append(step_num)
+                                            'step'].append(step_label)
                                         batch_data['step_cpu_smp'][
                                             'duration'].append(
                                                 round(cpu_smp_ms, 2))
@@ -956,7 +1166,7 @@ class RequestTimeBreakdown:
                                     batch_data['step_cpu_proc']['text'].append(
                                         "")
                                     batch_data['step_cpu_proc']['step'].append(
-                                        step_num)
+                                        step_label)
                                     batch_data['step_cpu_proc'][
                                         'duration'].append(round(
                                             cpu_proc_ms, 2))
@@ -965,29 +1175,35 @@ class RequestTimeBreakdown:
             max_timeline = max(max_timeline, cpu_pos)
 
             # ============ GPU Timeline (aligned to CPU timeline) ============
-            # Context GPU timing
-            # For non-disagg mode, use first step's GPU time as context GPU time
+            ctx_chunk_metrics = data.get('ctx_chunk_metrics') or []
             ctx_gpu_fwd = data.get('ctx_gpu_forward_time', 0) or 0
             ctx_gpu_smp = data.get('ctx_gpu_sample_time', 0) or 0
-            used_first_step_as_ctx = False
+            has_chunk_detail = len(ctx_chunk_metrics) > 0
 
-            # Non-disagg: use first step's GPU times as context GPU
-            if ctx_gpu_fwd == 0 and step_metrics:
+            # Non-disagg fallback: use first step's GPU times as context GPU
+            if used_first_step_as_ctx and step_metrics:
                 first_step = step_metrics[0]
                 ctx_gpu_fwd = first_step.get('gpu_forward_time', 0) or 0
                 ctx_gpu_smp = first_step.get('gpu_sample_time', 0) or 0
-                used_first_step_as_ctx = True
 
-            # Align GPU timeline with actual CPU processing start
-            if used_first_step_as_ctx and step_metrics:
-                # Non-disagg: align with first step's forward_start_time
+            # Align GPU timeline start with actual CPU processing start
+            if has_chunk_detail:
+                # Chunked prefill: align with first chunk's forward_start_time
+                first_chunk_fwd_start = ctx_chunk_metrics[0].get(
+                    'forward_start_time')
+                if first_chunk_fwd_start and not math.isnan(ref_time):
+                    gpu_pos = (first_chunk_fwd_start - ref_time) * 1000
+                else:
+                    gpu_pos = cpu_ctx_processing_start
+            elif used_first_step_as_ctx and step_metrics:
+                # Non-disagg non-chunked: align with first step's forward_start_time
                 first_fwd_start = step_metrics[0].get('forward_start_time')
                 if first_fwd_start and not math.isnan(ref_time):
                     gpu_pos = (first_fwd_start - ref_time) * 1000
                 else:
                     gpu_pos = cpu_ctx_processing_start
             else:
-                # Disagg: align with ctx_first_scheduled_time (when context GPU actually starts)
+                # Disagg non-chunked: align with ctx_first_scheduled_time
                 ctx_first_scheduled = data.get('ctx_first_scheduled_time')
                 if ctx_first_scheduled and not math.isnan(
                         ref_time) and not math.isnan(ctx_first_scheduled):
@@ -995,29 +1211,70 @@ class RequestTimeBreakdown:
                 else:
                     gpu_pos = cpu_ctx_processing_start
 
-            if ctx_gpu_fwd > 0:
-                text_label = "Ctx Fwd" if ctx_gpu_fwd > 2 else ""
-                batch_data['ctx_gpu_fwd']['y'].append(gpu_label)
-                batch_data['ctx_gpu_fwd']['x'].append(round(ctx_gpu_fwd, 2))
-                batch_data['ctx_gpu_fwd']['base'].append(round(gpu_pos, 2))
-                batch_data['ctx_gpu_fwd']['text'].append(text_label)
-                batch_data['ctx_gpu_fwd']['step'].append(0)  # Context = step 0
-                batch_data['ctx_gpu_fwd']['duration'].append(
-                    round(ctx_gpu_fwd, 2))
-                gpu_pos += ctx_gpu_fwd
+            # Draw context GPU chunks (per-chunk or total)
+            if has_chunk_detail:
+                # Chunked prefill: draw each chunk separately
+                for chunk_idx, chunk in enumerate(ctx_chunk_metrics):
+                    chunk_fwd = chunk.get('gpu_forward_time', 0) or 0
+                    chunk_smp = chunk.get('gpu_sample_time', 0) or 0
+                    chunk_num = chunk_idx + 1
+                    num_chunks = len(ctx_chunk_metrics)
+                    if num_chunks > 1:
+                        label_prefix = f"Ctx C{chunk_num}"
+                    else:
+                        label_prefix = "Ctx"
 
-            if ctx_gpu_smp > 0:
-                text_label = "Ctx Smp" if ctx_gpu_smp > 2 else ""
-                batch_data['ctx_gpu_smp']['y'].append(gpu_label)
-                batch_data['ctx_gpu_smp']['x'].append(round(ctx_gpu_smp, 2))
-                batch_data['ctx_gpu_smp']['base'].append(round(gpu_pos, 2))
-                batch_data['ctx_gpu_smp']['text'].append(text_label)
-                batch_data['ctx_gpu_smp']['step'].append(0)  # Context = step 0
-                batch_data['ctx_gpu_smp']['duration'].append(
-                    round(ctx_gpu_smp, 2))
-                gpu_pos += ctx_gpu_smp
+                    if chunk_fwd > 0:
+                        text_label = f"{label_prefix} Fwd" if chunk_fwd > 2 else ""
+                        batch_data['ctx_gpu_fwd']['y'].append(gpu_label)
+                        batch_data['ctx_gpu_fwd']['x'].append(
+                            round(chunk_fwd, 2))
+                        batch_data['ctx_gpu_fwd']['base'].append(
+                            round(gpu_pos, 2))
+                        batch_data['ctx_gpu_fwd']['text'].append(text_label)
+                        batch_data['ctx_gpu_fwd']['step'].append(label_prefix)
+                        batch_data['ctx_gpu_fwd']['duration'].append(
+                            round(chunk_fwd, 2))
+                        gpu_pos += chunk_fwd
 
-            # For disagg mode, reset gpu_pos to align with first step's forward
+                    if chunk_smp > 0:
+                        text_label = f"{label_prefix} Smp" if chunk_smp > 2 else ""
+                        batch_data['ctx_gpu_smp']['y'].append(gpu_label)
+                        batch_data['ctx_gpu_smp']['x'].append(
+                            round(chunk_smp, 2))
+                        batch_data['ctx_gpu_smp']['base'].append(
+                            round(gpu_pos, 2))
+                        batch_data['ctx_gpu_smp']['text'].append(text_label)
+                        batch_data['ctx_gpu_smp']['step'].append(label_prefix)
+                        batch_data['ctx_gpu_smp']['duration'].append(
+                            round(chunk_smp, 2))
+                        gpu_pos += chunk_smp
+            else:
+                # Non-chunked: draw single context GPU block
+                if ctx_gpu_fwd > 0:
+                    text_label = "Ctx Fwd" if ctx_gpu_fwd > 2 else ""
+                    batch_data['ctx_gpu_fwd']['y'].append(gpu_label)
+                    batch_data['ctx_gpu_fwd']['x'].append(round(ctx_gpu_fwd, 2))
+                    batch_data['ctx_gpu_fwd']['base'].append(round(gpu_pos, 2))
+                    batch_data['ctx_gpu_fwd']['text'].append(text_label)
+                    batch_data['ctx_gpu_fwd']['step'].append("Ctx")
+                    batch_data['ctx_gpu_fwd']['duration'].append(
+                        round(ctx_gpu_fwd, 2))
+                    gpu_pos += ctx_gpu_fwd
+
+                if ctx_gpu_smp > 0:
+                    text_label = "Ctx Smp" if ctx_gpu_smp > 2 else ""
+                    batch_data['ctx_gpu_smp']['y'].append(gpu_label)
+                    batch_data['ctx_gpu_smp']['x'].append(round(ctx_gpu_smp, 2))
+                    batch_data['ctx_gpu_smp']['base'].append(round(gpu_pos, 2))
+                    batch_data['ctx_gpu_smp']['text'].append(text_label)
+                    batch_data['ctx_gpu_smp']['step'].append("Ctx")
+                    batch_data['ctx_gpu_smp']['duration'].append(
+                        round(ctx_gpu_smp, 2))
+                    gpu_pos += ctx_gpu_smp
+
+            # Reset gpu_pos to align generation GPU with CPU step1 forward
+            # For disagg or chunked prefill, context GPU may end at a different time than gen GPU starts
             if not used_first_step_as_ctx:
                 first_step = step_metrics[0] if step_metrics else {}
                 first_fwd_start = first_step.get(
@@ -1036,31 +1293,33 @@ class RequestTimeBreakdown:
                     gpu_fwd = step.get('gpu_forward_time', 0) or 0
                     gpu_smp = step.get('gpu_sample_time', 0) or 0
                     step_num = step_idx + 1
-                    step_prefix = "Ctx" if step_num == 1 else f"S{step_num}"
+                    gpu_step_label = f"S{step_num}"
                     step_gpu_start = gpu_pos
 
                     if gpu_fwd > 0:
-                        text_label = f"{step_prefix} Fwd" if gpu_fwd > 2 else ""
+                        text_label = f"{gpu_step_label} Fwd" if gpu_fwd > 2 else ""
                         batch_data['step_gpu_fwd']['y'].append(gpu_label)
                         batch_data['step_gpu_fwd']['x'].append(round(
                             gpu_fwd, 2))
                         batch_data['step_gpu_fwd']['base'].append(
                             round(step_gpu_start, 2))
                         batch_data['step_gpu_fwd']['text'].append(text_label)
-                        batch_data['step_gpu_fwd']['step'].append(step_num)
+                        batch_data['step_gpu_fwd']['step'].append(
+                            gpu_step_label)
                         batch_data['step_gpu_fwd']['duration'].append(
                             round(gpu_fwd, 2))
                         gpu_pos += gpu_fwd
 
                     if gpu_smp > 0:
-                        text_label = f"{step_prefix} Smp" if gpu_smp > 2 else ""
+                        text_label = f"{gpu_step_label} Smp" if gpu_smp > 2 else ""
                         batch_data['step_gpu_smp']['y'].append(gpu_label)
                         batch_data['step_gpu_smp']['x'].append(round(
                             gpu_smp, 2))
                         batch_data['step_gpu_smp']['base'].append(
                             round(gpu_pos, 2))
                         batch_data['step_gpu_smp']['text'].append(text_label)
-                        batch_data['step_gpu_smp']['step'].append(step_num)
+                        batch_data['step_gpu_smp']['step'].append(
+                            gpu_step_label)
                         batch_data['step_gpu_smp']['duration'].append(
                             round(gpu_smp, 2))
                         gpu_pos += gpu_smp
@@ -1090,7 +1349,7 @@ class RequestTimeBreakdown:
                     batch_data['ctx_postproc']['base'].append(
                         round(post_start, 2))
                     batch_data['ctx_postproc']['text'].append("")
-                    batch_data['ctx_postproc']['step'].append(0)
+                    batch_data['ctx_postproc']['step'].append("Ctx Post")
                     batch_data['ctx_postproc']['duration'].append(
                         round(post_duration, 2))
 
@@ -1106,7 +1365,7 @@ class RequestTimeBreakdown:
                     batch_data['gen_postproc']['base'].append(
                         round(post_start, 2))
                     batch_data['gen_postproc']['text'].append("")
-                    batch_data['gen_postproc']['step'].append(0)
+                    batch_data['gen_postproc']['step'].append("Gen Post")
                     batch_data['gen_postproc']['duration'].append(
                         round(post_duration, 2))
             if gen_server_first_token and disagg_server_first_token and not math.isnan(
@@ -1122,7 +1381,7 @@ class RequestTimeBreakdown:
                     batch_data['disagg_postproc']['base'].append(
                         round(post_start, 2))
                     batch_data['disagg_postproc']['text'].append("")
-                    batch_data['disagg_postproc']['step'].append(0)
+                    batch_data['disagg_postproc']['step'].append("Disagg Post")
                     batch_data['disagg_postproc']['duration'].append(
                         round(post_duration, 2))
 
@@ -1162,35 +1421,35 @@ class RequestTimeBreakdown:
         trace_configs = [
             ('step_preproc', 'Preproc(N)', STEP_CPU_PREPROC_COLOR, 'black',
              None,
-             "<b>Step %{customdata[0]}: Preprocessing</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: Preprocessing</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('step_cpu_fwd', 'Forward(N)', STEP_CPU_FWD_COLOR, 'black', None,
-             "<b>Step %{customdata[0]}: Forward</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: Forward</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('step_overlap', 'Update(N)', STEP_CPU_OVERLAP_COLOR, 'white', None,
-             "<b>Step %{customdata[0]}: Update</b><br>(handling Step %{customdata[2]})<br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: Update</b><br>(handling %{customdata[2]})<br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('step_cpu_smp', 'Sample(N)', STEP_CPU_SMP_COLOR, 'black', None,
-             "<b>Step %{customdata[0]}: Sample</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: Sample</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('step_cpu_post', 'Postproc(N)', STEP_CPU_POST_COLOR, 'black', None,
-             "<b>Step %{customdata[0]}: Postprocessing</b><br>(handling Step %{customdata[2]})<br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: Postprocessing</b><br>(handling %{customdata[2]})<br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('step_cpu_proc', 'Step CPU Proc', STEP_CPU_FWD_COLOR, 'black',
              None,
-             "<b>Step %{customdata[0]}: CPU Processing</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: CPU Processing</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('ctx_gpu_fwd', 'Ctx GPU Forward', CTX_GPU_FWD_COLOR, 'white', None,
-             "<b>Context GPU Forward</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: GPU Forward</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('ctx_gpu_smp', 'Ctx GPU Sample', CTX_GPU_SMP_COLOR, 'white', None,
-             "<b>Context GPU Sample</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: GPU Sample</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('step_gpu_fwd', 'Step GPU Fwd', STEP_GPU_FWD_COLOR, 'white', None,
-             "<b>Step %{customdata[0]}: GPU Forward</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: GPU Forward</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('step_gpu_smp', 'Step GPU Smp', STEP_GPU_SMP_COLOR, 'black', None,
-             "<b>Step %{customdata[0]}: GPU Sample</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
+             "<b>%{customdata[0]}: GPU Sample</b><br>Duration: %{customdata[1]:.2f} ms<br>Start: %{base:.2f} ms<extra></extra>"
              ),
             ('ctx_postproc', 'Ctx Postproc (Detokenize+IPC)', '#DDA0DD',
              'black', 0.3,

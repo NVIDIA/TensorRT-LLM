@@ -1012,5 +1012,148 @@ class TestContextGPUFallback(unittest.TestCase):
         self.assertEqual(parsed['step_metrics'][0]['gpu_forward_time'], 15.0)
 
 
+class TestChunkedPrefillMetrics(unittest.TestCase):
+    """Test chunked prefill ctx_chunk_metrics parsing and visualization."""
+
+    def test_parse_ctx_chunk_metrics(self):
+        """Test that ctx_chunk_metrics is correctly parsed from time_breakdown_metrics."""
+        parser = RequestDataParser()
+
+        request_data = {
+            'request_id': 'req_chunked',
+            'perf_metrics': {
+                'timing_metrics': {
+                    'server_arrival_time': 1.0,
+                    'arrival_time': 1.1,
+                    'first_scheduled_time': 1.2,
+                    'first_token_time': 1.8,
+                    'server_first_token_time': 1.9
+                }
+            },
+            'time_breakdown_metrics': {
+                'ctx_chunk_metrics': [{
+                    'forward_start_time': 1.20,
+                    'forward_end_time': 1.35,
+                    'sample_start_time': 1.36,
+                    'sample_end_time': 1.37,
+                    'gpu_forward_time': 10.0,
+                    'gpu_sample_time': 0.5
+                }, {
+                    'forward_start_time': 1.40,
+                    'forward_end_time': 1.55,
+                    'sample_start_time': 1.56,
+                    'sample_end_time': 1.57,
+                    'gpu_forward_time': 12.0,
+                    'gpu_sample_time': 0.6
+                }, {
+                    'forward_start_time': 1.60,
+                    'forward_end_time': 1.72,
+                    'sample_start_time': 1.73,
+                    'sample_end_time': 1.74,
+                    'gpu_forward_time': 8.0,
+                    'gpu_sample_time': 0.4
+                }],
+                'ctx_gpu_forward_time':
+                30.0,  # Sum of chunk gpu_forward_times
+                'ctx_gpu_sample_time':
+                1.5,  # Sum of chunk gpu_sample_times
+                'step_metrics': [{
+                    'iter': 1,
+                    'forward_start_time': 1.80,
+                    'forward_end_time': 1.85,
+                    'sample_start_time': 1.86,
+                    'sample_end_time': 1.87,
+                    'gpu_forward_time': 5.0,
+                    'gpu_sample_time': 0.3,
+                    'token_time': 1.90
+                }]
+            }
+        }
+
+        parsed = parser.parse_request(request_data, 0)
+
+        # Verify ctx_chunk_metrics parsed correctly
+        self.assertIsNotNone(parsed['ctx_chunk_metrics'])
+        self.assertEqual(len(parsed['ctx_chunk_metrics']), 3)
+        self.assertEqual(parsed['ctx_chunk_metrics'][0]['gpu_forward_time'],
+                         10.0)
+        self.assertEqual(parsed['ctx_chunk_metrics'][1]['gpu_forward_time'],
+                         12.0)
+        self.assertEqual(parsed['ctx_chunk_metrics'][2]['gpu_forward_time'],
+                         8.0)
+
+        # Total GPU times
+        self.assertEqual(parsed['ctx_gpu_forward_time'], 30.0)
+        self.assertEqual(parsed['ctx_gpu_sample_time'], 1.5)
+
+        # Step metrics should still be present
+        self.assertIsNotNone(parsed['step_metrics'])
+        self.assertEqual(len(parsed['step_metrics']), 1)
+
+    def test_single_chunk_is_non_chunked(self):
+        """Test that single ctx_chunk_metrics entry works like non-chunked prefill."""
+        parser = RequestDataParser()
+
+        request_data = {
+            'request_id': 'req_single_chunk',
+            'perf_metrics': {
+                'timing_metrics': {
+                    'server_arrival_time': 1.0,
+                    'arrival_time': 1.1,
+                    'first_scheduled_time': 1.2,
+                    'first_token_time': 1.5,
+                    'server_first_token_time': 1.6
+                }
+            },
+            'time_breakdown_metrics': {
+                'ctx_chunk_metrics': [{
+                    'forward_start_time': 1.20,
+                    'forward_end_time': 1.40,
+                    'sample_start_time': 1.41,
+                    'sample_end_time': 1.42,
+                    'gpu_forward_time': 15.0,
+                    'gpu_sample_time': 0.5
+                }],
+                'ctx_gpu_forward_time':
+                15.0,
+                'ctx_gpu_sample_time':
+                0.5,
+            }
+        }
+
+        parsed = parser.parse_request(request_data, 0)
+
+        self.assertIsNotNone(parsed['ctx_chunk_metrics'])
+        self.assertEqual(len(parsed['ctx_chunk_metrics']), 1)
+        self.assertEqual(parsed['ctx_gpu_forward_time'], 15.0)
+
+    def test_no_ctx_chunk_metrics_backward_compatible(self):
+        """Test backward compatibility when ctx_chunk_metrics is absent."""
+        parser = RequestDataParser()
+
+        request_data = {
+            'request_id': 'req_no_chunks',
+            'perf_metrics': {
+                'timing_metrics': {
+                    'server_arrival_time': 1.0,
+                    'arrival_time': 1.1,
+                    'first_scheduled_time': 1.2,
+                    'first_token_time': 1.5,
+                    'server_first_token_time': 1.6
+                }
+            },
+            'time_breakdown_metrics': {
+                'ctx_gpu_forward_time': 15.0,
+                'ctx_gpu_sample_time': 0.5,
+            }
+        }
+
+        parsed = parser.parse_request(request_data, 0)
+
+        # No chunk metrics, but total GPU times should be present
+        self.assertIsNone(parsed['ctx_chunk_metrics'])
+        self.assertEqual(parsed['ctx_gpu_forward_time'], 15.0)
+
+
 if __name__ == '__main__':
     unittest.main()

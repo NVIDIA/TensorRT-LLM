@@ -43,20 +43,25 @@ REQUEST_TYPE_MAPPING = {
 @dataclass
 class PerfTimingInfo:
     """Stores performance timing information for a request."""
-    # Per-step metrics list
+    # Per-step metrics list (generation phase)
     step_metrics: List[Dict] = field(default_factory=list)
-    # Temporary step timing (saved in overlap mode, used in _handle_responses)
+    # Per-chunk metrics list (context/prefill phase, similar to step_metrics)
+    # Non-chunked prefill = single-element list. Each entry stores CPU times and GPU events.
+    ctx_chunk_metrics: List[Dict] = field(default_factory=list)
+    # Temporary step timing (current iteration)
     forward_start_time: Optional[float] = None
     forward_end_time: Optional[float] = None
     sample_start_time: Optional[float] = None
     sample_end_time: Optional[float] = None
-    # GPU events for timing
+    # GPU events for current step/chunk timing
     gpu_forward_start_event: Optional[torch.cuda.Event] = None
     gpu_forward_end_event: Optional[torch.cuda.Event] = None
     gpu_sample_end_event: Optional[torch.cuda.Event] = None
-    # Context phase GPU timing results (ms)
+    # Context phase GPU timing totals (ms) - sum of all chunks
     ctx_gpu_forward_time: Optional[float] = None
     ctx_gpu_sample_time: Optional[float] = None
+    # Flag: set after the last ctx chunk is saved (py_decoding_iter == 1)
+    ctx_chunks_complete: bool = False
 
 
 class LogitsStorage:
@@ -775,6 +780,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if self.py_perf_timing.step_metrics:
                 time_breakdown_metrics[
                     'step_metrics'] = self.py_perf_timing.step_metrics.copy()
+            if self.py_perf_timing.ctx_chunk_metrics:
+                time_breakdown_metrics[
+                    'ctx_chunk_metrics'] = self.py_perf_timing.ctx_chunk_metrics.copy(
+                    )
             if self.py_perf_timing.ctx_gpu_forward_time is not None:
                 time_breakdown_metrics[
                     'ctx_gpu_forward_time'] = self.py_perf_timing.ctx_gpu_forward_time
