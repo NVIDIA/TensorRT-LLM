@@ -1158,6 +1158,18 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             raise RuntimeError(
                 "Could not determine the vocabulary size. Required for guided decoding."
             )
+
+        # The tokenizer may be None if stripped from MPI kwargs to avoid pickle
+        # failures with trust_remote_code models. Reload it from the model path
+        # when guided decoding needs it.
+        if tokenizer is None and ad_config.model is not None:
+            ad_logger.info("Tokenizer not provided; loading from model path for guided decoding")
+            from tensorrt_llm.tokenizer import TransformersTokenizer
+
+            tokenizer = TransformersTokenizer.from_pretrained(
+                ad_config.model, trust_remote_code=ad_config.trust_remote_code
+            )
+
         guided_decoding_config = get_guided_decoding_config(
             guided_decoding_backend=guided_decoding_backend, tokenizer=tokenizer
         )
