@@ -756,7 +756,10 @@ class ConfigurableMoE(MoE):
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
             # Use unified combine interface (reads dispatch state from strategy)
-            final_hidden_states = self.comm.combine(final_hidden_states)
+            all_rank_max_num_tokens = max(all_rank_num_tokens)
+            final_hidden_states = self.comm.combine(
+                final_hidden_states, all_rank_max_num_tokens=all_rank_max_num_tokens
+            )
         else:
             # For non-comm case, It should be attention TP or single rank.
             # only check if allreduce is needed
