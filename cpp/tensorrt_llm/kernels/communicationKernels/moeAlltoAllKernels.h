@@ -20,6 +20,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// Forward declarations for NCCL device API types
+struct ncclComm;
+typedef struct ncclComm* ncclComm_t;
+struct ncclDevComm;
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels::moe_comm
@@ -47,10 +52,8 @@ struct DispatchKernelPointers
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers
     int payload_bytes_per_token[kMaxPayloads];   // Bytes per token for each payload
 
-    // Completion flags for synchronization
-    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
-                                           // rank has signaled the target rank
-    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
+    // NCCL device communicator for LSA barrier synchronization
+    ncclDevComm const* dev_comm;
 
     // Local aux data pointers
     int* send_counters;            // [ep_size] How many tokens have been sent to each target rank
@@ -74,10 +77,12 @@ struct CombineKernelPointers
     void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
     void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
 
-    // Completion flags for synchronization
-    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
-                                           // rank has signaled the target rank
-    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
+    // NCCL device communicator for LSA barrier synchronization
+    ncclDevComm const* dev_comm;
+
+    // Atomic counter reused for intra-rank barrier notification.
+    // Block 0 sets it to 1 after NCCL barrier; other blocks spin on it.
+    int* local_token_counter;
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
     int const* topk_target_ranks; // target rank per k, -1 for duplicates
@@ -107,8 +112,10 @@ struct MoeA2ADispatchParams
     int num_payloads;                         // Number of different payload types
     PayloadDescriptor payloads[kMaxPayloads]; // Array of payload descriptors
 
+    // NCCL device communicator for LSA barrier synchronization
+    ncclDevComm const* dev_comm;
+
     // Local aux data
-    uint32_t* flag_val;       // The value of the flag for this round (stored on the local rank)
     int* local_token_counter; // Atomic counter for completed tokens on this rank
     int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
@@ -118,8 +125,6 @@ struct MoeA2ADispatchParams
 
     // Distributed aux data and recv buffers
     int* recv_counters[kMaxRanks]; // tracks tokens received from each source rank. Each rank has [ep_size] counters
-    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
-                                           // rank has signaled the target rank
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // Per-rank receive buffers for each payload
 
     // Optional: Statistics for EPLB
@@ -134,7 +139,7 @@ struct MoeA2ADispatchParams
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
-// Prepare for dispatch: zero send_counters, local_token_counter and increment flag_val
+// Prepare for dispatch: zero send_counters and local_token_counter
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 
 // Combine phase parameters
@@ -160,8 +165,11 @@ struct MoeA2ACombineParams
     int elements_per_token;   // Number of elements per token
     nvinfer1::DataType dtype; // Data type for proper summation
 
+    // NCCL device communicator for LSA barrier synchronization
+    ncclDevComm const* dev_comm;
+
     // Local aux data
-    uint32_t* flag_val;     // The value of the flag for this round (stored on the local rank)
+    int* local_token_counter; // Reused as a flag for intra-rank synchronization for combine
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
                             // per k, -1 for duplicates
     int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
@@ -169,9 +177,7 @@ struct MoeA2ACombineParams
     int const* recv_counters; // [ep_size] number of valid tokens per source rank for this target
 
     // Distributed aux data and recv buffers
-    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
-                                           // rank has signaled the target rank
-    void const* recv_buffers[kMaxRanks];   // Per-rank receive buffers (only for single payload)
+    void const* recv_buffers[kMaxRanks]; // Per-rank receive buffers (only for single payload)
 
     // CUDA stream
     cudaStream_t stream;
@@ -181,6 +187,14 @@ struct MoeA2ACombineParams
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
+
+// NCCL DevComm lifecycle helpers (defined in .cu, callable from host code).
+// create_moe_nccl_dev_comm creates an NCCL communicator + device communicator with the
+// specified number of LSA barriers. The returned pointer is a DEVICE pointer to ncclDevComm
+// that can be passed directly to kernel parameters.
+// This is a collective call -- all ranks in the group must call it.
+ncclDevComm* create_moe_nccl_dev_comm(int ep_size, int ep_rank, int num_lsa_barriers);
+void destroy_moe_nccl_dev_comm(ncclDevComm* dev_comm);
 
 // Sanitize expert IDs for invalid tokens
 // expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)

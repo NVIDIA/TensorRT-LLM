@@ -20,8 +20,12 @@
 #include "tensorrt_llm/common/vec_dtypes.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 #include <cooperative_groups.h>
 #include <cstdint>
+#include <nccl.h>
+#include <nccl_device.h>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -33,10 +37,6 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
-
-#ifndef DISABLE_TIMEOUT
-#define DISABLE_TIMEOUT 0
-#endif
 
 // Macros for concise launch-time specialization
 #define SWITCH_BOOL(flag, NAME, ...)                                                                                   \
@@ -146,13 +146,6 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
         using POLICY = WarpPolicy;                                                                                     \
         __VA_ARGS__                                                                                                    \
     }
-
-#if DISABLE_TIMEOUT
-#define check_timeout(s) false
-#else
-// 300 * 2000 MHz - should be high enough on any GPU but will prevent a hang
-#define check_timeout(s) ((clock64() - (s)) > (300ll * 2000ll * 1000ll * 1000ll))
-#endif
 
 // ============================================================================
 // Helper Functions for Expert-to-Rank Mapping
@@ -344,8 +337,7 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
     }
 }
 
-__global__ void moeA2APrepareDispatchKernel(
-    int* send_counters, int* local_token_counter, int ep_size, uint32_t* flag_val_ptr)
+__global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token_counter, int ep_size)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -357,12 +349,10 @@ __global__ void moeA2APrepareDispatchKernel(
     {
         send_counters[idx] = 0;
     }
-    // Zero local_token_counter and increment flag_val
+    // Zero local_token_counter
     if (idx == 0)
     {
         *local_token_counter = 0;
-        // Increment flag_val for this dispatch round
-        *flag_val_ptr = *flag_val_ptr + 1;
     }
 }
 
@@ -394,6 +384,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     else
     {
         // Threads that do not have a token to process should return.
+        // TODO: Not needed for one-block-per-token policy. If one-warp-per-token is deprecated, remove this check.
         if (local_token_idx >= local_num_tokens)
             return;
 
@@ -504,6 +495,12 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         if (is_last_token)
         {
+            // Reset local_token_counter to 0 for using in the combine kernel.
+            if (lane_id == 0)
+            {
+                *ptrs.local_token_counter = 0;
+            }
+
 // Store send_counters to recv_counters
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
@@ -528,54 +525,20 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             }
 
 #if !DISABLE_SYNC_FOR_PROFILING
-            uint32_t expected_value = *ptrs.flag_val;
-
+// Issue an release barrier to ensure that the data is visible to other ranks after the synchronization.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
             asm volatile("fence.release.sys;");
 #else
             asm volatile("fence.acq_rel.sys;");
 #endif
-#pragma unroll 1 // No unroll as one iter is typically enough
-            for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
-            {
-                uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
-                asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 
-#if ENABLE_DEBUG_PRINT
-                printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value,
-                    target_rank);
-#endif
-            }
-
-#pragma unroll 1 // No unroll
-            for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
-            {
-                bool flag_set = false;
-                auto s = clock64();
-                do
-                {
-                    uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-                    uint32_t flag_value;
-                    // Acquire load to ensure visibility of peer's release-store
-                    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-#if ENABLE_DEBUG_PRINT
-                    printf(
-                        "combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: "
-                        "%d, address: %p\n",
-                        rank_id, peer_rank, flag_value, expected_value, flag_ptr);
-#endif
-                    flag_set = flag_value == expected_value;
-                } while (!flag_set && !check_timeout(s));
-
-                if (__builtin_expect(!flag_set, 0))
-                {
-                    printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
-                        peer_rank);
-                    asm volatile("trap;");
-                    return;
-                }
-            }
+            // Use NCCL LSA barrier for inter-rank synchronization.
+            // Barrier index 0 is reserved for dispatch.
+            // Only the last-token warp (one warp across all CTAs) participates as a coop.
+            ncclCoopWarp coop = ncclCoopWarp();
+            ncclLsaBarrierSession barrier(coop, *ptrs.dev_comm, ncclTeamTagLsa{}, /*index=*/0, /*multimem=*/true);
+            barrier.sync(coop, cuda::memory_order_relaxed);
 #endif
         }
     }
@@ -584,7 +547,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 {
     launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
-        params.stream, params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
+        params.stream, params.send_counters, params.local_token_counter, params.ep_size);
 }
 
 // ============================================================================
@@ -621,12 +584,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         }
     }
 
-    // Copy completion flag pointers
-    for (int i = 0; i < params.ep_size; i++)
-    {
-        kernel_ptrs.completion_flags[i] = params.completion_flags[i];
-    }
-    kernel_ptrs.flag_val = params.flag_val;
+    // NCCL device communicator for LSA barrier
+    kernel_ptrs.dev_comm = params.dev_comm;
 
     // Copy communication tracking pointers
     kernel_ptrs.send_counters = params.send_counters;
@@ -1003,18 +962,12 @@ __device__ void vectorized_combine(
 // Copy payload to recv buffer using vectorized copy; supports warp/block token mapping
 template <typename ThreadingPolicy>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t const* payload_bytes,
-    int bytes_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters)
+    int bytes_per_token, int ep_size, int max_tokens_per_rank, int const* recv_counters)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-
-    if (blockIdx.x == 0 && threadIdx.x == 0)
-    {
-        // Increment flag_val for this combine round
-        *flag_val_ptr = *flag_val_ptr + 1;
-    }
 
     if (payload_bytes == nullptr)
     {
@@ -1053,92 +1006,73 @@ __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
+#if !DISABLE_SYNC_FOR_PROFILING
+
+    // The first warp in each CTA performs the synchronization.
+    {
+        bool is_first_warp = threadIdx.x / warpSize == 0;
+
+        // local_token_counter is reused as a 3-state flag:
+        //   0 → no CTA elected yet
+        //  -1 → one CTA elected, barrier in progress
+        //   1 → barrier done, peer data is visible
+        // The first CTA to arrive wins the election (CAS 0→-1) and performs the
+        // NCCL inter-rank barrier (index 1 for combine). All other CTAs spin until the flag becomes 1.
+        if (is_first_warp)
+        {
+            int lane_id = threadIdx.x % warpSize;
+            bool elected = false;
+            if (lane_id == 0)
+            {
+                int old = atomicCAS(ptrs.local_token_counter, 0, -1);
+                elected = (old == 0);
+            }
+            elected = __shfl_sync(0xffffffff, elected, 0);
+
+            if (elected)
+            {
+                ncclCoopWarp coop;
+                ncclLsaBarrierSession barrier(coop, *ptrs.dev_comm, ncclTeamTagLsa{}, /*index=*/1);
+                barrier.sync(coop, cuda::memory_order_relaxed);
+                // Signal all other blocks that the inter-rank barrier is done.
+                if (lane_id == 0)
+                {
+                    asm volatile("st.relaxed.gpu.s32 [%0], %1;" ::"l"(ptrs.local_token_counter), "r"(1));
+                }
+            }
+            else
+            {
+                // Wait for the elected CTA to complete the inter-rank barrier.
+                if (lane_id == 0)
+                {
+                    int local_token_counter_val;
+                    do
+                    {
+                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];"
+                                     : "=r"(local_token_counter_val)
+                                     : "l"(ptrs.local_token_counter));
+                    } while (local_token_counter_val != 1);
+                }
+            }
+
+// Acquire system-scope visibility so this block sees peer data.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+            asm volatile("fence.acquire.sys;");
+#else
+            asm volatile("fence.acq_rel.sys;");
+#endif
+        }
+        // Synchronize the rest warps in the CTA with the first warp.
+        __syncthreads();
+    }
+#endif
+
     int local_token_idx = ThreadingPolicy::token_idx();
     int const size_per_token = elements_per_token * sizeof(T);
 
-    if (local_num_tokens == 0)
-    {
-        // Special case: If local_num_tokens == 0,
-        // we need to keep the threads where local_token_idx == 0 alive to participate in the synchronization.
-        // Other threads should return.
-        if (local_token_idx > 0)
-            return;
-    }
-    else
-    {
-        // Threads that do not have a token to process should return.
-        if (local_token_idx >= local_num_tokens)
-            return;
-    }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-
-#if !DISABLE_SYNC_FOR_PROFILING
-    // In-kernel readiness synchronization at start of combine:
-    // - One warp signals readiness to all peers with current flag_val.
-    // - The first warp of each block waits for all peers' readiness (equality), then __syncthreads.
-    bool is_first_warp = threadIdx.x / warpSize == 0;
-    if (is_first_warp)
-    {
-        int lane_id = threadIdx.x % warpSize;
-        uint32_t expected_value = *ptrs.flag_val;
-
-        if (blockIdx.x == 0)
-        {
-#pragma unroll 1 // No unroll
-            for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
-            {
-                uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
-                asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
-#if ENABLE_DEBUG_PRINT
-                printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value,
-                    peer_rank);
-#endif
-            }
-        }
-
-#pragma unroll 1 // No unroll
-        for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
-        {
-            bool flag_set = false;
-            auto s = clock64();
-            do
-            {
-                uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-                uint32_t flag_value;
-                // Acquire load to ensure visibility of peer's release-store
-                asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-#if ENABLE_DEBUG_PRINT
-                printf(
-                    "combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: "
-                    "%d, "
-                    "address: %p\n",
-                    rank_id, peer_rank, flag_value, expected_value, flag_ptr);
-#endif
-                flag_set = flag_value == expected_value;
-            } while (!flag_set && !check_timeout(s));
-
-            if (__builtin_expect(!flag_set, 0))
-            {
-                printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id, peer_rank);
-                asm volatile("trap;");
-                return;
-            }
-        }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-        // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
-        asm volatile("fence.acquire.sys;");
-#else
-        asm volatile("fence.acq_rel.sys;");
-#endif
-    }
-    __syncthreads();
-#endif
-
-    if (local_num_tokens == 0)
+    // Threads that do not have a token to process should return.
+    // TODO: Not needed for one-block-per-token policy. If one-warp-per-token is deprecated, remove this check.
+    if (local_token_idx >= local_num_tokens)
         return;
 
     // Get output location for this token (using src_data_ptrs[0] as output)
@@ -1178,7 +1112,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     auto kernel_fn
         = params.one_block_per_token ? moeA2APrepareCombineKernel<BlockPolicy> : moeA2APrepareCombineKernel<WarpPolicy>;
     launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
-        recv_buffer_bytes, payload_bytes, bytes_per_token, params.ep_size, params.max_tokens_per_rank, params.flag_val,
+        recv_buffer_bytes, payload_bytes, bytes_per_token, params.ep_size, params.max_tokens_per_rank,
         params.recv_counters);
 }
 
@@ -1197,16 +1131,20 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Configure kernel launch
     int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
     int const kWarpsPerBlock = kBlockSize / 32; // warpSize
-    int grid_size_warp = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
-    int grid_size_block = params.local_num_tokens;
-    // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the synchronization.
-    if (grid_size_warp == 0)
+
+    int grid_size;
+    if (params.one_block_per_token)
     {
-        grid_size_warp = 1;
+        grid_size = params.local_num_tokens;
     }
-    if (grid_size_block == 0)
+    else
     {
-        grid_size_block = 1;
+        grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
+    }
+    // Even if local_num_tokens is 0, we need at least 1 block for the barrier.
+    if (grid_size == 0)
+    {
+        grid_size = 1;
     }
 
     // Prepare kernel pointers struct for combine
@@ -1221,25 +1159,20 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         kernel_ptrs.recv_buffers[rank][0] = params.recv_buffers[rank];
     }
 
-    // Copy completion flag pointers
-    for (int i = 0; i < params.ep_size; i++)
-    {
-        kernel_ptrs.completion_flags[i] = params.completion_flags[i];
-    }
-    kernel_ptrs.flag_val = params.flag_val;
+    // NCCL device communicator and intra-rank barrier flag
+    kernel_ptrs.dev_comm = params.dev_comm;
+    kernel_ptrs.local_token_counter = params.local_token_counter;
 
     // Copy communication tracking pointers
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
     kernel_ptrs.topk_send_indices = params.topk_send_indices;
-
-    int grid = params.one_block_per_token ? grid_size_block : grid_size_warp;
 
     // Launch appropriate kernel with compact macros
     SWITCH_DTYPE(params.dtype, TKernelType, {
         SWITCH_POLICY(params.one_block_per_token, Policy, {
             SWITCH_TOP_K(params.top_k, TOP_K, {
                 auto kernel_fn = moeA2ACombineKernel<TKernelType, Policy, TOP_K>;
-                launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
+                launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid_size, kBlockSize, 0, params.stream,
                     kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
                     params.ep_rank, params.ep_size);
             });
@@ -1281,6 +1214,65 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
     int grid = ceilDiv(total_tokens, kBlockSize);
     launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0,
         stream, expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
+}
+
+// ============================================================================
+// NCCL DevComm Lifecycle Helpers
+// ============================================================================
+
+// Static storage for the NCCL communicator used by the DevComm.
+// The NCCL comm is kept alive because ncclDevCommDestroy needs it.
+static ncclComm_t g_moeNcclComm = nullptr;
+
+ncclDevComm* create_moe_nccl_dev_comm(int ep_size, int ep_rank, int num_lsa_barriers)
+{
+    // 1. Create NCCL communicator via MPI bootstrap (collective call)
+    ncclUniqueId ncclId;
+    if (ep_rank == 0)
+    {
+        TLLM_NCCL_CHECK(ncclGetUniqueId(&ncclId));
+    }
+    tensorrt_llm::mpi::MpiComm::world().bcastValue(ncclId, 0);
+
+    ncclComm_t ncclComm;
+    TLLM_NCCL_CHECK(ncclCommInitRank(&ncclComm, ep_size, ncclId, ep_rank));
+
+    // 2. Create device communicator with LSA barrier support (collective call)
+    ncclDevCommRequirements reqs = {};
+    reqs.lsaBarrierCount = num_lsa_barriers;
+    reqs.lsaMultimem = true;
+
+    ncclDevComm hostDevComm;
+    TLLM_NCCL_CHECK(ncclDevCommCreate(ncclComm, &reqs, &hostDevComm));
+
+    // 3. Copy to device memory so kernels can access it via pointer
+    ncclDevComm* deviceDevComm = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&deviceDevComm, sizeof(ncclDevComm)));
+    TLLM_CUDA_CHECK(cudaMemcpy(deviceDevComm, &hostDevComm, sizeof(ncclDevComm), cudaMemcpyHostToDevice));
+
+    // Store the NCCL comm so we can clean up later
+    g_moeNcclComm = ncclComm;
+
+    return deviceDevComm;
+}
+
+void destroy_moe_nccl_dev_comm(ncclDevComm* dev_comm)
+{
+    if (dev_comm != nullptr)
+    {
+        // Copy back to host for ncclDevCommDestroy
+        ncclDevComm hostDevComm;
+        cudaMemcpy(&hostDevComm, dev_comm, sizeof(ncclDevComm), cudaMemcpyDeviceToHost);
+
+        if (g_moeNcclComm != nullptr)
+        {
+            ncclDevCommDestroy(g_moeNcclComm, &hostDevComm);
+            ncclCommDestroy(g_moeNcclComm);
+            g_moeNcclComm = nullptr;
+        }
+
+        cudaFree(dev_comm);
+    }
 }
 
 } // namespace kernels::moe_comm

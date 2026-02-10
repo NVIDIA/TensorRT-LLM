@@ -59,12 +59,9 @@ class NVLinkOneSided(Communication):
     _WORKSPACE: dict | None = None
 
     # MetaInfo indices - initialized from C++ constants
-    FLAG_VAL_OFFSET_INDEX = None
     LOCAL_TOKEN_COUNTER_OFFSET_INDEX = None
     SEND_COUNTERS_OFFSET_INDEX = None
     RECV_COUNTERS_OFFSET_INDEX = None
-    DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = None
-    COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = None
     EPLB_GATHERED_STATS_OFFSET_INDEX = None
     PAYLOAD_DATA_OFFSET_INDEX = None
 
@@ -119,20 +116,13 @@ class NVLinkOneSided(Communication):
     @classmethod
     def _init_constants(cls):
         """Initialize constants from C++ if not already done."""
-        if cls.FLAG_VAL_OFFSET_INDEX is None:
+        if cls.LOCAL_TOKEN_COUNTER_OFFSET_INDEX is None:
             thop = _tllm_internal.thop
-            cls.FLAG_VAL_OFFSET_INDEX = int(thop.MOE_A2A_FLAG_VAL_OFFSET_INDEX)
             cls.LOCAL_TOKEN_COUNTER_OFFSET_INDEX = int(
                 thop.MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX
             )
             cls.SEND_COUNTERS_OFFSET_INDEX = int(thop.MOE_A2A_SEND_COUNTERS_OFFSET_INDEX)
             cls.RECV_COUNTERS_OFFSET_INDEX = int(thop.MOE_A2A_RECV_COUNTERS_OFFSET_INDEX)
-            cls.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = int(
-                thop.MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX
-            )
-            cls.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = int(
-                thop.MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX
-            )
             cls.EPLB_GATHERED_STATS_OFFSET_INDEX = int(
                 thop.MOE_A2A_EPLB_GATHERED_STATS_OFFSET_INDEX
             )
