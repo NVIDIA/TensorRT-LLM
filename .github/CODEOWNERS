@@ -154,6 +154,8 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ## TensorRT-LLM LLM API
 /tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
+/tensorrt_llm/serve @NVIDIA/trt-llm-llmapi-devs
+/tensorrt_llm/commands @NVIDIA/trt-llm-llmapi-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
