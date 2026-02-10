@@ -465,7 +465,6 @@ void initConfigBindings(nb::module_& m)
                     return tle::CacheTransceiverConfig::BackendType::MOONCAKE;
                 throw std::runtime_error("Invalid backend type: " + str);
             });
-
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
         .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
                  std::optional<int>, std::optional<int>>(),

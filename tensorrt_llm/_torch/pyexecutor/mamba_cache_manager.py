@@ -14,9 +14,24 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
+
+
+class ConvLayoutOrder(Enum):
+    """Conv state section layout order for different Mamba variants.
+
+    Different models arrange the conv_state channels in different orders:
+    - MAMBA2_XBC: [x(d_inner) | B(n_groups*d_state) | C(n_groups*d_state)]
+      Used by standard Mamba2 models (e.g., NemotronH).
+    - QWEN3_QKV: [Q(n_groups*d_state) | K(n_groups*d_state) | V(d_inner)]
+      Used by Qwen3Next GatedDeltaNet.
+    """
+    MAMBA2_XBC = "mamba2_xbc"
+    QWEN3_QKV = "qwen3_qkv"
+
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -77,6 +92,7 @@ class MambaCacheManager(BaseResourceManager):
         ssm_cache_dtype: torch.dtype,
         layer_mask: Optional[List[bool]] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        conv_layout_order: ConvLayoutOrder = ConvLayoutOrder.MAMBA2_XBC,
     ) -> None:
 
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
@@ -88,12 +104,39 @@ class MambaCacheManager(BaseResourceManager):
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
-        conv_dim = d_inner + 2 * n_groups * d_state
+        ng_ds = n_groups * d_state
+        conv_dim = d_inner + 2 * ng_ds
         nheads = num_heads
 
         # check that can be partitioned
         assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
         assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
+
+        # Derive conv_state section layout based on model variant.
+        # Each section is independently sharded by TP.
+        if conv_layout_order == ConvLayoutOrder.MAMBA2_XBC:
+            conv_section_dims_global = [d_inner, ng_ds, ng_ds]
+        elif conv_layout_order == ConvLayoutOrder.QWEN3_QKV:
+            conv_section_dims_global = [ng_ds, ng_ds, d_inner]
+        else:
+            raise ValueError(f"Unknown conv_layout_order: {conv_layout_order}")
+
+        for i, s in enumerate(conv_section_dims_global):
+            assert s % tp_size == 0, (
+                f"conv section {i} (size={s}) must be divisible by tp_size={tp_size}"
+            )
+        assert sum(conv_section_dims_global) == conv_dim, (
+            f"conv section dims {conv_section_dims_global} must sum to conv_dim={conv_dim}"
+        )
+
+        # Store section dims after TP partition (for disaggregation)
+        self.conv_section_dims: List[int] = [
+            s // tp_size for s in conv_section_dims_global
+        ]
+        self.d_conv = d_conv
+        self.conv_dtype = dtype
+        self.d_inner_local = d_inner // tp_size
+        self.ng_ds_local = ng_ds // tp_size
 
         # partition conv_dim and nheads
         conv_dim = conv_dim // tp_size
@@ -379,6 +422,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        conv_layout_order: ConvLayoutOrder = ConvLayoutOrder.MAMBA2_XBC,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -401,6 +445,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_layer_mask,
             speculative_num_draft_tokens=spec_config.max_draft_len
             if spec_config is not None else None,
+            conv_layout_order=conv_layout_order,
         )
 
         # initialize kv cache manager

@@ -3,7 +3,9 @@ from typing import List, Optional
 
 import msgpack
 
-from tensorrt_llm._torch.disaggregation.native.region.aux import AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.region.auxiliary import AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.region.page import KVCachePageTable
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVPoolAttrs
 
 
 @dataclass
@@ -27,7 +29,7 @@ class InstanceInfo:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "InstanceInfo":
-        return cls(**msgpack.unpackb(data))
+        return cls(**msgpack.unpackb(data, strict_map_key=False))
 
 
 @dataclass
@@ -51,12 +53,12 @@ class RankInfo:
     enable_attention_dp: bool
     is_mla: bool
     layer_num_per_pp: List[int]
-    kv_ptrs: List[int]
-    aux_ptrs: List[int]
     server_endpoint: str
     self_endpoint: str
     transfer_engine_info: bytes
-    aux_meta: Optional[AuxBufferMeta]
+    aux_meta: Optional[AuxBufferMeta] = None
+    kv_pool_attrs: Optional[KVPoolAttrs] = None
+    page_table: Optional[KVCachePageTable] = None
 
     @property
     def kv_factor(self) -> int:
@@ -65,11 +67,18 @@ class RankInfo:
     def to_bytes(self) -> bytes:
         data = asdict(self)
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
+        data["kv_pool_attrs"] = (
+            self.kv_pool_attrs.to_dict() if self.kv_pool_attrs is not None else None
+        )
+        data["page_table"] = self.page_table.to_bytes()
         return msgpack.packb(data)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
-        unpacked = msgpack.unpackb(data)
+        unpacked = msgpack.unpackb(data, strict_map_key=False)
+        unpacked["page_table"] = KVCachePageTable.from_bytes(unpacked["page_table"])
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
+        if unpacked.get("kv_pool_attrs") is not None:
+            unpacked["kv_pool_attrs"] = KVPoolAttrs.from_dict(unpacked["kv_pool_attrs"])
         return cls(**unpacked)

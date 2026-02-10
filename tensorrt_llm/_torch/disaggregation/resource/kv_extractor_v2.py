@@ -2,12 +2,28 @@ from collections import defaultdict
 
 import numpy as np
 
+from tensorrt_llm._torch.disaggregation.base.region import DataRole
 from tensorrt_llm._torch.disaggregation.native.region.page import (
     BUFFER_ENTRY_DTYPE,
     KVCachePageTable,
     PoolDescriptor,
 )
+from tensorrt_llm._torch.pyexecutor.resource_manager import Role
 from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, KVCacheManager
+
+_ROLE_STR_TO_ENUM: dict[str, DataRole] = {
+    Role.KEY: DataRole.KEY,
+    Role.VALUE: DataRole.VALUE,
+    Role.KEY_BLOCK_QUANT: DataRole.KEY | DataRole.BLOCK_QUANT,
+    Role.VALUE_BLOCK_QUANT: DataRole.VALUE | DataRole.BLOCK_QUANT,
+}
+
+
+def role_str_to_enum(role: str) -> DataRole:
+    if role not in _ROLE_STR_TO_ENUM:
+        valid_roles = list(_ROLE_STR_TO_ENUM.keys())
+        raise ValueError(f"Invalid role: '{role}'. Valid roles: {valid_roles}")
+    return _ROLE_STR_TO_ENUM[role]
 
 
 def build_page_table(manager: KVCacheManager) -> KVCachePageTable:
@@ -15,10 +31,15 @@ def build_page_table(manager: KVCacheManager) -> KVCachePageTable:
     config = manager._init_config
 
     gpu_level = 0
+    found_gpu = False
     for level_idx, cache_tier_config in enumerate(config.cache_tiers):
         if cache_tier_config.tier == CacheTier.GPU_MEM:
             gpu_level = level_idx
+            found_gpu = True
             break
+
+    if not found_gpu:
+        raise ValueError("No GPU_MEM tier found in cache configuration")
 
     buffer_by_pool = defaultdict(list)
 
@@ -35,7 +56,7 @@ def build_page_table(manager: KVCacheManager) -> KVCachePageTable:
         pool_idx = attr.pool_index
         pool_key = (pg_idx, pool_idx)
 
-        buffer_by_pool[pool_key].append((layer_id, role, attr.offset, attr.size))
+        buffer_by_pool[pool_key].append((layer_id, role_str_to_enum(role), attr.offset, attr.size))
 
     pools = []
     num_pool_groups = storage.num_pool_groups

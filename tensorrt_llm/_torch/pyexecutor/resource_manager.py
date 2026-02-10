@@ -483,6 +483,7 @@ class KVCacheManager(BaseResourceManager):
                                                        dtype=torch.int32,
                                                        pin_memory=True,
                                                        device='cpu')
+        self.enable_indexer_k_cache = enable_indexer_k_cache
 
     def shutdown(self):
         self.impl.release_pools()
@@ -972,14 +973,14 @@ class KVCacheManager(BaseResourceManager):
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
-        layer_idx: Optional[int] = None,
+        layer_id: Optional[int] = None,
     ) -> List[List[int]]:
-        if layer_idx is None:
+        if layer_id is None:
             if len(self.max_attention_window_vec) > 1:
                 raise ValueError("layer_idx must be provided for VSWA")
             window_size = self.max_attention_window_vec[0]
         else:
-            layer_offset = self.layer_offsets[layer_idx]
+            layer_offset = self.layer_offsets[layer_id]
             window_size = self.max_attention_window_vec[layer_offset % len(
                 self.max_attention_window_vec)]
 

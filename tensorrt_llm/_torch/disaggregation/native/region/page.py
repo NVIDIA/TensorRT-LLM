@@ -1,3 +1,4 @@
+import pickle
 from dataclasses import dataclass
 from typing import List, Set
 
@@ -16,7 +17,7 @@ BUFFER_ENTRY_DTYPE = np.dtype(
 @dataclass
 class PoolDescriptor:
     """
-    Pool descriptor containing memory layout and buffer information
+    Pool descriptor containing memory layout and buffer information.
 
     One pool contains multiple buffer entries, each representing a (layer_id, role) combination.
     """
@@ -24,8 +25,6 @@ class PoolDescriptor:
     base_address: int  # (uint64)
     slot_bytes: int
     num_slots: int
-
-    # Buffer entries: flattened array of all (layer_id, role, offset, size) in this pool
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
 
     @property
@@ -39,6 +38,10 @@ class PoolDescriptor:
     @property
     def unique_roles(self) -> Set[int]:
         return set(int(entry["role"]) for entry in self.buffer_entries)
+
+    @property
+    def num_buffer_entries(self) -> int:
+        return len(self.buffer_entries)
 
     def get_slot_address(self, slot_id: int) -> int:
         if slot_id >= self.num_slots:
@@ -60,14 +63,14 @@ class PoolDescriptor:
         return (
             f"PoolDescriptor(base=0x{self.base_address:x}, "
             f"slot_bytes={self.slot_bytes}, num_slots={self.num_slots}, "
-            f"layers={len(self.unique_layers)}, roles={len(self.unique_roles)}"
+            f"layers={len(self.unique_layers)}, roles={len(self.unique_roles)})"
         )
 
 
 @dataclass
 class KVCachePageTable:
     """
-    Multi-dimensional KV cache page table
+    Multi-dimensional KV cache page table.
 
     Structure:
         KVCachePageTable
@@ -87,7 +90,7 @@ class KVCachePageTable:
 
     tokens_per_block: int
     num_layers: int
-    pools: List[List[PoolDescriptor]]  # pools[pg_idx][pool_idx] → PoolDescriptor
+    pools: List[List[PoolDescriptor]]  # pools[pg_idx][pool_idx] -> PoolDescriptor
 
     @property
     def num_pool_groups(self) -> int:
@@ -113,14 +116,21 @@ class KVCachePageTable:
         return self.pools[pg_idx][pool_idx]
 
     def get_device_pointer(
-        self, pg_idx: int, pool_idx: int, slot_id: int, layer_id: int, role: str
+        self, pg_idx: int, pool_idx: int, slot_id: int, layer_id: int, role: int
     ) -> int:
         pool = self.pools[pg_idx][pool_idx]
-        role_enum = self.role_to_enum(role)
-        return pool.get_device_pointer(slot_id, layer_id, role_enum)
+        return pool.get_device_pointer(slot_id, layer_id, role)
 
     def __repr__(self) -> str:
         return (
             f"KVCachePageTable(poolgroups={self.num_pool_groups}, "
             f"pools={self.total_pools}, layers={self.num_layers})"
         )
+
+    def to_bytes(self):
+        # Custom serialization using pickle for simplicity
+        return pickle.dumps(self)
+
+    @staticmethod
+    def from_bytes(data: bytes):
+        return pickle.loads(data)
