@@ -60,7 +60,6 @@ struct PackFp4
 namespace kernels
 {
 
-// From https://github.com/actypedef/ARCQuant/blob/main/kernels/src/reorder.cu
 template <typename T, int GROUP_SIZE, ArcQuantType arcquant_type>
 __global__ void quantize_reorder_nvfp4_kernel(
     T* hidden_states, float* input_scale, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int KQ, int KE)

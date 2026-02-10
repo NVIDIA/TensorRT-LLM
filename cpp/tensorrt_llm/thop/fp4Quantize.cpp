@@ -234,7 +234,6 @@ at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<a
     return globalScale;
 }
 
-// https://github.com/actypedef/ARCQuant/blob/main/kernels/src/bindings.cpp
 // X: [M, KQ], bf16
 // input_scale: [1], float32
 // reorder_index: [KQ], int16
