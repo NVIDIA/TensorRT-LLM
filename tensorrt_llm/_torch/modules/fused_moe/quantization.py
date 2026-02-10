@@ -264,8 +264,6 @@ class FusedMoEMethodBase(ABC):
             w3_w1_kargs["allow_partial_loading"] = allow_partial_loading
         if "allow_partial_loading" in w2_args:
             w2_kargs["allow_partial_loading"] = allow_partial_loading
-        # Multithread weight load is superseded by prefetch_files() in model_engine.py
-        # Also, threading adds overhead in order to protect shuffle index cache with critical section.
 
         def maybe_pageout_mmapped_cpu_weights(
                 weight_tensors: List[object]) -> None:
@@ -280,6 +278,8 @@ class FusedMoEMethodBase(ABC):
                         and weight.is_contiguous()):
                     advise_tensor_pageout(weight)
 
+        # Multithread weight load is superseded by prefetch_files() in model_engine.py
+        # Also, threading adds overhead in order to protect shuffle index cache with critical section.
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             # expert_idx is the local slot index of current rank
             expert_idx = local_slot_id
