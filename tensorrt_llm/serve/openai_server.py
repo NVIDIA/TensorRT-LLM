@@ -569,17 +569,6 @@ class OpenAIServer:
                     "total_accepted_draft_tokens": speculative_decoding.total_accepted_draft_tokens,
                     "total_draft_tokens": speculative_decoding.total_draft_tokens,
                 }
-            # Extract context GPU timing
-            ctx_gpu_forward_time = metrics_dict.pop("ctx_gpu_forward_time", None)
-            ctx_gpu_sample_time = metrics_dict.pop("ctx_gpu_sample_time", None)
-            if ctx_gpu_forward_time is not None:
-                metrics_json["timing_metrics"]["ctx_gpu_forward_time"] = ctx_gpu_forward_time
-            if ctx_gpu_sample_time is not None:
-                metrics_json["timing_metrics"]["ctx_gpu_sample_time"] = ctx_gpu_sample_time
-            # Extract step_metrics for per-step generation timing
-            step_metrics = metrics_dict.pop("step_metrics", None)
-            if step_metrics is not None:
-                metrics_json["step_metrics"] = step_metrics
             metrics_dict["perf_metrics"] = metrics_json
         return JSONResponse(content=list(perf_metrics))
 
@@ -633,6 +622,8 @@ class OpenAIServer:
             raise ValueError(f"disaggregated_params is not set in the response for request"
                              f" {disaggregated_params.disagg_request_id}")
 
+        raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+        await self._extract_metrics(promise, raw_request)
         return chat_response
 
     async def _iteration_stats_collector_loop(self):
@@ -793,7 +784,7 @@ class OpenAIServer:
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
-                response = await self._create_chat_response(promise, postproc_params, disaggregated_params)
+                response = await self._create_chat_response(promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
