@@ -18,6 +18,7 @@
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemmNVFP4.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
+#include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
 #include <torch/extension.h>
@@ -111,22 +112,15 @@ Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tenso
 // out_dtype: fp16/bf16/fp32
 Tensor cuda_core_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
     Tensor const& alpha, std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype,
-    bool to_userbuffers = false)
+    int output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
 
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[0]};
 
-    Tensor out;
-    if (to_userbuffers)
-    {
-        out = torch_ext::create_userbuffers_tensor(output_size, out_dtype_).first;
-    }
-    else
-    {
-        out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
-    }
+    Tensor out = torch_ext::allocate_output(
+        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::OutputBufferKind>(output_buffer_kind), group);
 
     return cuda_core_nvfp4_gemm_out(mat_a, mat_b, scale_a, scale_b, alpha, bias, out);
 }
@@ -139,7 +133,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cuda_core_nvfp4_gemm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor alpha, Tensor? bias,"
-        " ScalarType? out_dtype, bool to_userbuffers=False) -> (Tensor out)");
+        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
+        " -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
 #include <ATen/cuda/CUDAContext.h>
@@ -177,7 +178,8 @@ public:
 
     // Run GEMM with specified tactic (-1 for default/best)
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
-        at::Tensor const& mat2_scale, at::Tensor const& alpha, bool to_userbuffers, int64_t tactic) const
+        at::Tensor const& mat2_scale, at::Tensor const& alpha, int output_buffer_kind, int64_t tactic,
+        c10::optional<torch::List<int64_t>> group = c10::nullopt) const
     {
         int m = mat1.size(0);
         int k_compressed = mat1.size(1);
@@ -185,17 +187,9 @@ public:
         int n = mat2.size(0);
 
         // Prepare output tensor
-        at::Tensor out;
         std::vector<int64_t> output_size = {m, n};
-
-        if (to_userbuffers)
-        {
-            out = torch_ext::create_userbuffers_tensor(output_size, mOutputDtype).first;
-        }
-        else
-        {
-            out = at::empty(output_size, mat1.options().dtype(mOutputDtype));
-        }
+        at::Tensor out = torch_ext::allocate_output(output_size, mOutputDtype, mat1.device(),
+            static_cast<torch_ext::OutputBufferKind>(output_buffer_kind), group);
 
         // Get algorithm cache
         auto& cache = getOrCreateAlgoCache(m, k, n, mat1.device(), mat1_scale, mat2_scale);
