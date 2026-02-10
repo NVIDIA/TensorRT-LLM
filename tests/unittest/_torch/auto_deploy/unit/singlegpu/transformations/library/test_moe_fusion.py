@@ -1074,3 +1074,81 @@ def test_nvfp4_moe_different_input_scales(
             assert torch.allclose(actual_alpha, expected_alpha, rtol=1e-5, atol=1e-5), (
                 f"Alpha recomputation mismatch. Got {actual_alpha}, expected {expected_alpha}"
             )
+
+
+class PreStackedMoEModel(nn.Module):
+    """Model using torch_moe_fused directly with pre-stacked 3D weight tensors.
+
+    This mirrors the pattern used by Qwen3_5MoeSparseMoeBlock where weights are
+    already stacked at the module level (not per-expert lists).
+    """
+
+    def __init__(self, hidden_size=64, intermediate_size=32, num_experts=3, top_k=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.top_k = top_k
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.gate_up_proj = nn.Parameter(
+            torch.randn(num_experts, 2 * intermediate_size, hidden_size)
+        )
+        self.down_proj = nn.Parameter(torch.randn(num_experts, hidden_size, intermediate_size))
+
+    def forward(self, x):
+        batch_size, sequence_length, hidden_dim = x.shape
+        hidden_states = x.view(-1, hidden_dim)
+        router_logits = self.gate(hidden_states)
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = (routing_weights / routing_weights.sum(dim=-1, keepdim=True)).to(x.dtype)
+        output = torch.ops.auto_deploy.torch_moe_fused(
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            self.gate_up_proj,
+            self.down_proj,
+        )
+        return output.view(batch_size, sequence_length, hidden_dim)
+
+    def get_input(self, device, dtype=torch.bfloat16):
+        torch.manual_seed(2345)
+        return torch.randn(2, 2, self.hidden_size, device=device, dtype=dtype)
+
+
+def test_pre_stacked_moe_fusion():
+    """Test that torch_moe_fused (pre-stacked weights) is replaced by trtllm_moe_fused."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(2345)
+
+    model = PreStackedMoEModel().to(device=device, dtype=dtype)
+    x = model.get_input(device=device, dtype=dtype)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Verify torch_moe_fused is present before transform
+    has_torch_moe_fused = any(
+        is_op(n, torch.ops.auto_deploy.torch_moe_fused) for n in gm.graph.nodes
+    )
+    assert has_torch_moe_fused, "Expected torch_moe_fused op before transform"
+
+    # Apply fuse_moe transform
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_moe": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
+
+    # Verify trtllm_moe_fused is present after transform
+    has_trtllm_moe_fused = any(
+        is_op(n, torch.ops.auto_deploy.trtllm_moe_fused) for n in gm_transformed.graph.nodes
+    )
+    assert has_trtllm_moe_fused, "Expected trtllm_moe_fused op after transform"
+
+    # Verify torch_moe_fused is gone
+    has_torch_moe_fused_after = any(
+        is_op(n, torch.ops.auto_deploy.torch_moe_fused) for n in gm_transformed.graph.nodes
+    )
+    assert not has_torch_moe_fused_after, "torch_moe_fused should be replaced after transform"

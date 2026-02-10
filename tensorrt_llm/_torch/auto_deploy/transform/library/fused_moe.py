@@ -126,6 +126,38 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
     return fused_key_counter
 
 
+def _replace_torch_moe_fused_ops(
+    gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]
+) -> int:
+    """Replace torch_moe_fused (pre-stacked ref impl) with backend-specific fused MoE.
+
+    Unlike _insert_fused_moe_ops which handles per-expert weight lists,
+    this handles models that already use pre-stacked 3D weight tensors directly
+    (e.g. Qwen 3.5 MoE). No weight restructuring is needed -- it is a 1:1 op swap.
+    """
+    count = 0
+    graph = gm.graph
+    replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_moe_fused,
+        "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
+        "triton": torch.ops.auto_deploy.triton_moe_fused,
+    }[backend.lower()]
+
+    for node in graph.nodes:
+        if is_op(node, torch.ops.auto_deploy.torch_moe_fused):
+            with graph.inserting_before(node):
+                new_node = graph.call_function(
+                    replacement_op,
+                    args=node.args,
+                    kwargs={"is_gated_mlp": True, "act_fn": int(ActivationType.Silu)},
+                )
+            node.replace_all_uses_with(new_node)
+            graph.erase_node(node)
+            count += 1
+
+    return count
+
+
 def _process_moe_node(
     gm: GraphModule,
     graph: torch.fx.Graph,
@@ -1623,8 +1655,8 @@ class FuseMoeConfig(TransformConfig):
 @TransformRegistry.register("fuse_moe")
 class FuseMoe(BaseTransform):
     """
-    Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
-    torch.ops.auto_deploy.trtllm_moe_fused.
+    Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe and
+    torch.ops.auto_deploy.torch_moe_fused with torch.ops.auto_deploy.trtllm_moe_fused.
     """
 
     @classmethod
@@ -1640,6 +1672,7 @@ class FuseMoe(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
             fused_key_counter = _insert_fused_moe_ops(gm, backend=self.config.backend)
+            fused_key_counter += _replace_torch_moe_fused_ops(gm, backend=self.config.backend)
 
         info = TransformInfo(
             skipped=False,
