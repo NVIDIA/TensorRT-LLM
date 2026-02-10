@@ -1,5 +1,6 @@
 runtime: trtllm
 compile_backend: torch-simple
+attn_backend: torch
 max_seq_len: 4096
 max_num_tokens: 4096
 max_batch_size: 64
@@ -13,3 +14,4 @@ kv_cache_config:
   tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
+  # num_hidden_layers: 6
