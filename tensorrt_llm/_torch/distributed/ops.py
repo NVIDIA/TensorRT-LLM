@@ -8,6 +8,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
@@ -748,6 +750,58 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+
+    def get_effective_strategy_for_shape(
+        self,
+        output_shape: Tuple[int, ...],
+        all_reduce_params: Optional[AllReduceParams] = None,
+    ) -> Optional[AllReduceStrategy]:
+        """When strategy is AUTO, return the cached tactic resolved to a strategy
+        (e.g. NCCL_SYMMETRIC) so callers can gate NCCL window usage on the actual
+        choice. When strategy is not AUTO, return that strategy. On cache miss
+        with AUTO, return None (caller should not assume NCCL_SYMMETRIC)."""
+        if self.strategy != AllReduceStrategy.AUTO:
+            return self.strategy
+        params = all_reduce_params or AllReduceParams()
+        # Same runner and input_shapes as tunable_allreduce so cache matches.
+        runner = AllReduceRunner(
+            len(self.mapping.tp_group),
+            self.mapping.tp_group,
+            int(params.fusion_op),
+            params.eps,
+            params.trigger_completion_at_end,
+        )
+
+        # Match AutoTuner._get_input_sizes: Tensor -> .size(), None -> (0,).
+        def _size(x):
+            if x is None:
+                return torch.Size((0, ))
+            if isinstance(x, torch.Tensor):
+                return x.size()
+            return torch.Size(x)
+
+        input_shapes = (
+            _size(output_shape),
+            _size(params.residual),
+            _size(params.norm_weight),
+            _size(params.scale),
+            _size(params.bias),
+            _size(self.workspace if isinstance(self.workspace, torch.Tensor
+                                               ) else None),
+        )
+        result = AutoTuner.get().get_cached_tactic(
+            "trtllm::tunable_allreduce::allreduce",
+            [runner],
+            AllReduceRunner.tuning_config,
+            input_shapes,
+        )
+        if result is None:
+            return None
+        _, tactic = result
+        try:
+            return AllReduceStrategy(tactic)
+        except ValueError:
+            return None
 
     def forward(
         self,
