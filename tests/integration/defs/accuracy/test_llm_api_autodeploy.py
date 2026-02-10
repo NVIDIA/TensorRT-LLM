@@ -510,3 +510,62 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Qwen3-Next Instruct via AutoDeploy.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    Configuration derived from examples/auto_deploy/model_registry/configs/qwen3Next.yaml.
+    """
+
+    MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "skip_loading_weights": False,
+            "attn_backend": "torch",
+            "enable_chunked_prefill": True,
+            "max_batch_size": 64,
+            "max_seq_len": 4096,
+            "max_num_tokens": 4096,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.7,
+            },
+            "transforms": {
+                "compile_model": {
+                    "backend": "torch-simple",
+                },
+                "detect_sharding": {
+                    "sharding_source": ['factory', 'heuristic'],
+                    "sharding_dims": ['ep', 'bmm'],
+                },
+            },
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("world_size", [1, 4])
+    def test_auto_dtype(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           world_size=world_size,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
