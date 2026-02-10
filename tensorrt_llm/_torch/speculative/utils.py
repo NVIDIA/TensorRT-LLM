@@ -220,14 +220,19 @@ def get_num_spec_layers(spec_config):
     return 0
 
 
-def get_spec_worker(spec_config, model_config, mapping):
+def get_spec_worker(spec_config,
+                    model_config,
+                    mapping,
+                    use_separate_draft_kv_cache: bool = False):
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
-        return MTPWorker(spec_config, model_config)
+        return MTPWorker(spec_config, model_config, use_separate_draft_kv_cache)
     if spec_dec_mode.is_mtp_eagle_one_model():
-        return MTPEagleWorker(spec_config, model_config)
+        return MTPEagleWorker(spec_config, model_config,
+                              use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelWorker(spec_config, mapping)
+        return Eagle3OneModelWorker(spec_config, mapping,
+                                    use_separate_draft_kv_cache)
     return None
 
 
@@ -241,6 +246,21 @@ def get_num_extra_kv_tokens(spec_config):
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
     return 0
+
+
+def get_draft_kv_cache_manager(spec_config, resource_manager):
+    """
+    Returns the draft KV cache manager only in one-model speculative decoding
+    mode where the target model manages a separate draft KV cache.
+    """
+    from ..pyexecutor.resource_manager import ResourceManagerType
+
+    if spec_config is None:
+        return None
+    if not spec_config.spec_dec_mode.use_one_engine():
+        return None
+    return resource_manager.get_resource_manager(
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
 
 
 def update_spec_config_from_model_config(spec_config, model_config):

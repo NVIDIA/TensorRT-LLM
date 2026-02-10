@@ -720,6 +720,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
+    # If set, drafting will use separate KV cache in one-model speculative decoding.
+    _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -3049,6 +3051,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading."
         "Only enable it if you intend to use this feature.",
         status="prototype")
+
+    # fp8 cute dsl configs
+    use_cute_dsl_blockscaling_mm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling mm implementation.",
+        status="prototype",
+    )
+    use_cute_dsl_blockscaling_bmm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
+        status="prototype",
+    )
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)

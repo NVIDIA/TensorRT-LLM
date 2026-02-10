@@ -39,6 +39,8 @@ from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -147,7 +149,9 @@ class DeepseekV3WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+    def load_weights(self,
+                     weights: ConsumableWeightsDict,
+                     skip_modules: List[str] = []):
 
         def requantize_weight_with_new_scale(weight, weight_scale, old_scale_2,
                                              new_scale_2, device):
@@ -324,6 +328,9 @@ class DeepseekV3WeightLoader:
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.model.named_modules())
 
+        # Check if weights supports mark_consumed (ConsumableWeightsDict)
+        can_mark_consumed = hasattr(weights, 'mark_consumed')
+
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
@@ -399,6 +406,9 @@ class DeepseekV3WeightLoader:
                                         -1, v_b_proj_scale.shape[-1]).cuda(),
                                 ).view(*attn_module.v_b_proj_dequant.shape).to(
                                     attn_module.v_b_proj_dequant.dtype))
+                    # Mark consumed kv_b_proj weights
+                    if can_mark_consumed:
+                        weights.mark_consumed(name)
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = self.model_config.get_quant_config(
                     ).layer_quant_mode.has_nvfp4() and weights[
@@ -522,6 +532,13 @@ class DeepseekV3WeightLoader:
                         # For DeepseekV32: kv_a_proj_with_mqa is oversized
                         # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
+                    # Mark consumed kv_a_proj_with_mqa and q_a_proj weights
+                    if can_mark_consumed:
+                        parent_prefix = '.'.join(names[:-1])
+                        weights.mark_consumed(
+                            f"{parent_prefix}.kv_a_proj_with_mqa")
+                        if not is_lite:
+                            weights.mark_consumed(f"{parent_prefix}.q_a_proj")
                 elif names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
@@ -529,6 +546,11 @@ class DeepseekV3WeightLoader:
                             filter_weights('.'.join(names[:-1] + [new_name]),
                                            weights))
                     module.load_weights(weights=module_weights)
+                    # Mark consumed source weights (e.g., gate_proj, up_proj)
+                    if can_mark_consumed:
+                        for src_name in params_map[names[-1]]:
+                            weights.mark_consumed('.'.join(names[:-1] +
+                                                           [src_name]))
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
                     module_weights = rename_moe_weight(module_weights, {
@@ -537,6 +559,9 @@ class DeepseekV3WeightLoader:
                         "gate_proj": "w1",
                     })
                     module.load_weights(weights=[module_weights])
+                    # Mark consumed experts weights
+                    if can_mark_consumed:
+                        weights.mark_consumed(name)
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
@@ -552,6 +577,9 @@ class DeepseekV3WeightLoader:
                         "gate_proj": "w1",
                     })
                     module.load_weights(weights=[module_weights])
+                    # Mark consumed MoE weights using parent name
+                    if can_mark_consumed:
+                        weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     continue
                 elif names[-1] == "next_layer_layernorm":
@@ -563,6 +591,9 @@ class DeepseekV3WeightLoader:
                     else:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
+                    # Mark consumed weights
+                    if can_mark_consumed:
+                        weights.mark_consumed(name)
 
 
 class DeepseekV3MTPHead(nn.Module):
@@ -641,6 +672,7 @@ class DeepseekV3Linear(Linear):
         reduce_output: bool = True,  # ROW parallel only
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
+        use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
         super().__init__(
@@ -657,6 +689,7 @@ class DeepseekV3Linear(Linear):
             skip_create_weights_in_init,
             use_custom_cublas_mm,
             lora,
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
         )
 
     def apply_linear(self,
@@ -717,7 +750,10 @@ class DeepseekV3Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            use_cute_dsl_blockscaling_mm=model_config.
+            use_cute_dsl_blockscaling_mm,
+        )
 
 
 class DeepseekV32Attention(MLA):
@@ -894,6 +930,7 @@ class Deepseekv3MoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
+        self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
         gate_cls = DeepseekV3Gate
         if hasattr(model_config.pretrained_config, "gate_cls"):
             gate_cls = model_config.pretrained_config.gate_cls
@@ -946,7 +983,9 @@ class Deepseekv3MoE(nn.Module):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=shared_tp_size,
-            reduce_output=False)
+            reduce_output=False,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+        )
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
@@ -1231,13 +1270,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
             self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
-            self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                                intermediate_size=config.intermediate_size,
-                                bias=False,
-                                dtype=config.torch_dtype,
-                                config=model_config,
-                                overridden_tp_size=self.mlp_tp_size,
-                                reduce_output=has_mlp_tp)
+            self.mlp = GatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                config=model_config,
+                overridden_tp_size=self.mlp_tp_size,
+                reduce_output=has_mlp_tp,
+                use_cute_dsl_blockscaling_mm=model_config.
+                use_cute_dsl_blockscaling_mm,
+            )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -1533,6 +1576,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 dtype=config.torch_dtype,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.
+                use_cute_dsl_blockscaling_mm,
             )
         else:
             self.eh_proj = Linear(
@@ -1545,6 +1590,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 reduce_output=True,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.
+                use_cute_dsl_blockscaling_mm,
             )
 
         self.shared_head = DeepseekV3MTPHead(model_config)
@@ -1793,19 +1840,21 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         input_ids: torch.IntTensor = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
         return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,
                                inputs_embeds=inputs_embeds,
-                               spec_metadata=spec_metadata,
                                return_context_logits=return_context_logits,
+                               spec_metadata=spec_metadata,
+                               resource_manager=resource_manager,
                                **kwargs)
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: ConsumableWeightsDict):
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
 

@@ -518,10 +518,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def pre_reload_weights(self, module: Linear):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            logger.warning(
-                f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
-            )
-            param = Parameter(torch.empty_like(metadata, device="cuda"),
+            # Extract meta tensor from metadata dict
+            meta_tensor = metadata['meta']
+            param = Parameter(torch.empty_like(meta_tensor, device="cuda"),
                               requires_grad=False)
             module.register_parameter(param_name, param)
 
@@ -982,10 +981,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
         if is_sm_100f():
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                # TODO (@lmin): replace with cute_dsl gemm
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
             else:
@@ -2354,6 +2352,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        enable_gemm_allreduce_fusion: bool = True,
     ):
         """
         Args:
@@ -2431,13 +2430,14 @@ class Linear(nn.Module):
         )
 
         device_supported = get_sm_version() >= 100
-        enable_gemm_allreduce_fusion = (os.environ.get(
+        enable_gemm_allreduce_fusion_env = (os.environ.get(
             "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
 
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,
             in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, enable_gemm_allreduce_fusion
+            device_supported, enable_gemm_allreduce_fusion,
+            enable_gemm_allreduce_fusion_env
         ])
         if self.use_fused_gemm_allreduce:
             self.use_fused_gemm_allreduce = ipc_nvls_supported()
