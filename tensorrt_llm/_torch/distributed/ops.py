@@ -9,6 +9,7 @@ from torch import nn
 
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
@@ -761,9 +762,6 @@ class AllReduce(nn.Module):
         with AUTO, return None (caller should not assume NCCL_SYMMETRIC)."""
         if self.strategy != AllReduceStrategy.AUTO:
             return self.strategy
-        # Deferred import to avoid circular import: custom_ops -> modules.attention -> attention_backend
-        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
-            AllReduceRunner
         params = all_reduce_params or AllReduceParams()
         # Same runner and input_shapes as tunable_allreduce so cache matches.
         runner = AllReduceRunner(
