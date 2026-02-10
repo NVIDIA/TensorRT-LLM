@@ -469,7 +469,6 @@ class PyTorchModelEngine(ModelEngine):
             self.cache_indirection_attention = None
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
-        self.sa_spec_seen_requests: set[int] = set()
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
@@ -3325,30 +3324,21 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        # Initialize SA state for new requests (only if SA speculative decoding is enabled)
+        # Initialize SA state for new requests (MTP+SA path)
         use_sa_spec = (self.spec_config is not None
                        and getattr(self.spec_config, 'use_sa_spec', False))
-
-        if use_sa_spec and self.mapping.is_last_pp_rank():
-            logger.info(
-                f"use_sa_spec: {use_sa_spec} start to build sa state for new requests"
-            )
+        if (use_sa_spec and spec_metadata is not None
+                and hasattr(spec_metadata, 'sa_manager')
+                and spec_metadata.sa_manager is not None
+                and self.mapping.is_last_pp_rank()):
+            sa_manager = spec_metadata.sa_manager
             for request in itertools.chain(
                     scheduled_requests.context_requests,
                     scheduled_requests.generation_requests):
-                if request.py_request_id not in self.sa_spec_seen_requests:
-                    self.sa_spec_seen_requests.add(request.py_request_id)
-
-                    # builds the initial suffix automaton state from the context tokens.
-                    # could use a thread pool for add_request
-                    # Use lazy import to avoid circular dependency
-                    from ..speculative import suffix_automaton as sa_spec
-                    sa_spec.add_request(request.py_request_id,
-                                        request.get_tokens(0))
-
-            logger.info(
-                f"use_sa_spec: {use_sa_spec} build sa state for new requests done"
-            )
+                if request.py_request_id not in sa_manager._initialized_requests:
+                    sa_manager.add_request(request.py_request_id,
+                                           request.get_tokens(0))
+                    sa_manager._initialized_requests.add(request.py_request_id)
 
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,

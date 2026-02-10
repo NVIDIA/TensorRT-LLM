@@ -17,9 +17,8 @@ from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, SampleState,
                                   SampleStateTensors, TorchSampler, add_token,
                                   int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
-# Use native suffix automaton implementation instead of external sa_spec
-from . import suffix_automaton as sa_spec
 from .interface import SpecMetadata, SpecWorkerBase
+from .suffix_automaton import SuffixAutomatonManager
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -121,6 +120,8 @@ class MTPSpecMetadata(SpecMetadata):
     # CUDA graph, we use this tensor to store the number of input tokens for the
     # subsequence draft forward.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
+    # Optional suffix automaton manager for MTP+SA speculative decoding
+    sa_manager: Optional[SuffixAutomatonManager] = None
 
     def __post_init__(self) -> None:
         if self.mtp_hidden_states_manager is not None:
@@ -210,6 +211,13 @@ class MTPSpecMetadata(SpecMetadata):
                                         dtype=torch.int,
                                         pin_memory=True)
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
+
+        # Prepare SA manager for MTP+SA path (copies pending states to GPU)
+        if self.sa_manager is not None:
+            num_contexts = num_seqs - self.num_generations
+            gen_request_ids = self.request_ids[num_contexts:]
+            if gen_request_ids:
+                self.sa_manager.prepare(gen_request_ids, self.max_draft_len)
 
 
 class MTPSampler(TorchSampler):
@@ -875,7 +883,7 @@ class MTPWorker(SpecWorkerBase):
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 
-        if self.spec_config.use_sa_spec:
+        if self.spec_config.use_sa_spec and spec_metadata.sa_manager is not None:
 
             # Initialize the output buffers
             self.sa_match_len = torch.zeros((num_gens, ),
@@ -890,9 +898,15 @@ class MTPWorker(SpecWorkerBase):
             # Invoke a batch update of the suffix automaton states
             # and get the next suffix draft tokens
             if num_gens > 0:
-                sa_spec.extend(self.sa_match_len, self.sa_draft_tokens,
-                               accepted_tokens[num_contexts:],
-                               num_accepted_tokens[num_contexts:])
+                gen_request_ids = spec_metadata.request_ids[num_contexts:]
+                match_len, draft_tokens_sa = spec_metadata.sa_manager.extend(
+                    gen_request_ids,
+                    accepted_tokens[num_contexts:],
+                    num_accepted_tokens[num_contexts:],
+                    mtp_num_modules,
+                )
+                self.sa_match_len.copy_(match_len)
+                self.sa_draft_tokens.copy_(draft_tokens_sa)
 
         return accepted_tokens, num_accepted_tokens
 

@@ -7,6 +7,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.speculative import suffix_automaton as sa
+from tensorrt_llm._torch.speculative.suffix_automaton import (
+    SAConfig,
+    SuffixAutomatonManager,
+)  # noqa: I001
 
 # Skip all tests if native kernel is not available
 pytestmark = pytest.mark.skipif(
@@ -14,70 +18,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-class TestSuffixAutomatonBasic:
-    """Basic functionality tests."""
-
-    def test_init(self):
-        """Test initialization."""
-        sa.init(max_num_requests=16, max_seq_len=1024)
-        assert sa._global_sa_manager is not None
-        sa.shutdown()
-
-    def test_add_request(self):
-        """Test adding a request with context tokens."""
-        sa.init(max_num_requests=16, max_seq_len=1024)
-        context_tokens = [1, 2, 3, 4, 5, 1, 2, 3]  # Has repeating pattern
-        sa.add_request(0, context_tokens)
-        sa.shutdown()
-
-    def test_prepare_and_extend(self):
-        """Test prepare and extend operations."""
-        sa.init(max_num_requests=16, max_seq_len=1024)
-
-        # Add request with context that has a repeating pattern
-        # [1, 2, 3, 4, 5, 1, 2, 3] - the suffix [1, 2, 3] appears earlier
-        context_tokens = [1, 2, 3, 4, 5, 1, 2, 3]
-        sa.add_request(0, context_tokens)
-
-        # Prepare for batch processing
-        request_ids = [0]
-        max_draft_len = 4
-        sa.prepare(request_ids, max_draft_len)
-
-        # Create input tensors
-        batch_size = 1
-        accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
-        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
-
-        # Create output tensors
-        match_len_out = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
-        draft_tokens_out = torch.zeros(
-            (batch_size, max_draft_len), dtype=torch.int32, device="cuda"
-        )
-
-        # Extend
-        sa.extend(match_len_out, draft_tokens_out, accepted_tokens, num_accepted_tokens)
-
-        print(f"match_len: {match_len_out}")
-        print(f"draft_tokens: {draft_tokens_out}")
-
-        sa.shutdown()
-
-
 class TestSuffixAutomatonManager:
     """Tests for SuffixAutomatonManager class."""
 
     def test_manager_creation(self):
         """Test manager creation."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
         assert manager is not None
         manager.shutdown()
 
     def test_manager_add_remove(self):
         """Test adding and removing requests."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
 
         # Add requests
         manager.add_request(0, [1, 2, 3, 4, 5])
@@ -95,8 +49,8 @@ class TestSuffixAutomatonManager:
 
     def test_manager_extend(self):
         """Test extend operation."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
 
         # Add request with repeating pattern
         context_tokens = [1, 2, 3, 4, 5, 1, 2, 3]
@@ -126,8 +80,8 @@ class TestCUDAGraphCompatibility:
 
     def test_cuda_graph_capture(self):
         """Test that native extend works during CUDA graph capture."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
 
         # Add request
         context_tokens = [1, 2, 3, 4, 5, 1, 2, 3]
@@ -168,8 +122,8 @@ class TestExtendNgram:
 
     def test_extend_ngram_longest_match(self):
         """Test extend_ngram with longest match mode (max_ngram_size=-1)."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
 
         # Add request with repeating pattern
         # [0, 2, 3, 4, 10, 1, 2, 3, 4, 5, 1, 2, 3] - pattern [1, 2, 3] appears twice
@@ -214,8 +168,8 @@ class TestExtendNgram:
 
     def test_extend_ngram_fixed_size(self):
         """Test extend_ngram with fixed-size ngram matching."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
 
         # Add request with repeating pattern
         # [0, 2, 3, 4, 10, 1, 2, 3, 4, 5, 1, 2, 3]
@@ -260,8 +214,8 @@ class TestExtendNgram:
 
     def test_extend_ngram_no_match(self):
         """Test extend_ngram when no match exists."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
 
         # Add request with repeating pattern
         context_tokens = [1, 2, 3, 4, 5, 1, 2, 3]
@@ -291,8 +245,8 @@ class TestExtendNgram:
 
     def test_extend_ngram_batch(self):
         """Test extend_ngram with multiple requests in batch."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
 
         # Add multiple requests with different patterns
         # Request 0: [1, 2, 3, 4, 5, 1, 2, 3] + [4] -> match [1,2,3,4] at pos 0
@@ -348,8 +302,8 @@ class TestExtendNgram:
 
     def test_extend_ngram_cuda_graph(self):
         """Test that extend_ngram works with CUDA graph capture."""
-        config = sa.SAConfig(max_seq_len=1024, max_slots=16)
-        manager = sa.SuffixAutomatonManager(config, max_num_requests=16)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
 
         # Add request with repeating pattern
         context_tokens = [1, 2, 3, 4, 5, 1, 2, 3]
@@ -437,12 +391,6 @@ if __name__ == "__main__":
     print("\n--- Native kernel availability ---")
     test = TestNativeKernelAvailability()
     test.test_is_native_available()
-
-    print("\n--- Basic tests ---")
-    test = TestSuffixAutomatonBasic()
-    test.test_init()
-    test.test_add_request()
-    test.test_prepare_and_extend()
 
     print("\n--- Manager tests ---")
     test = TestSuffixAutomatonManager()

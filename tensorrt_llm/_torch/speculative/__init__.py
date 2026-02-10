@@ -7,7 +7,7 @@ from .save_hidden_state import SaveHiddenStatesDrafter
 from .spec_sampler_base import (SampleStateSpec, SampleStateTensorsSpec,
                                 SpecSamplerBase)
 from .spec_tree_manager import SpecTreeManager
-from .suffix_automaton import SAResourceManager
+from .suffix_automaton import SuffixAutomatonManager
 from .utils import (get_num_extra_kv_tokens, get_num_spec_layers,
                     get_spec_decoder, get_spec_drafter, get_spec_metadata,
                     get_spec_resource_manager, get_spec_worker,
@@ -22,7 +22,7 @@ __all__ = [
     "NGramSampler",
     "NGramSpecMetadata",
     "NGramWorker",
-    "SAResourceManager",
+    "SuffixAutomatonManager",
     "SampleStateSpec",
     "SampleStateTensorsSpec",
     "SaveHiddenStatesDrafter",

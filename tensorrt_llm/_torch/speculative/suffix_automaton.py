@@ -9,9 +9,9 @@ of a string. It's used to find longest patterns in previously generated tokens
 to predict future tokens, which can boost acceptance rates in speculative decoding
 by up to 40% when combined with MTP (Multi-Token Prediction).
 
-Key components:
-- SuffixAutomatonManager: Manages per-request suffix automaton states
-- SAResourceManager: Integrates with TRT-LLM's resource management
+Key component:
+- SuffixAutomatonManager: Manages per-request suffix automaton states and
+  integrates with TRT-LLM's resource management via BaseResourceManager.
 
 This module requires the native C++/CUDA kernel for GPU-native, CUDA graph
 compatible operations.
@@ -19,16 +19,13 @@ compatible operations.
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import torch
 
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
+from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +56,7 @@ class SAConfig:
     threshold: int = 4
 
 
-class SuffixAutomatonManager:
+class SuffixAutomatonManager(BaseResourceManager):
     """
     Manages suffix automaton states for multiple requests.
 
@@ -67,22 +64,41 @@ class SuffixAutomatonManager:
     - Creating and destroying SA states per request
     - Copying SA states from host (pinned) to device memory
     - Batch operations for efficient GPU utilization
+    - Integration with TRT-LLM's resource management (BaseResourceManager)
 
     SA states are built on CPU using native code, then copied to GPU during
     prepare(). The extend() and extend_ngram() methods run entirely on GPU
     and are CUDA graph compatible.
+
+    Used as the resource manager for both NGram and MTP+SA speculative decoding.
     """
 
-    def __init__(self, config: SAConfig, max_num_requests: int):
+    def __init__(
+        self,
+        config,
+        max_num_requests: int,
+        max_seq_len: int = 262144,
+    ):
         if _sa_native is None:
             raise RuntimeError(
                 "Native suffix automaton kernel is required but not available. "
                 "Please ensure the native bindings are properly built."
             )
 
-        self.config = config
+        # SA configuration
+        sa_config = (
+            config
+            if isinstance(config, SAConfig)
+            else SAConfig(
+                max_seq_len=max_seq_len,
+                max_slots=max_num_requests,
+                threshold=getattr(config, "sa_spec_threshold", 4),
+            )
+        )
+
+        self.config = sa_config
         self.max_num_requests = max_num_requests
-        self.max_seq_len = config.max_seq_len
+        self.max_seq_len = sa_config.max_seq_len
 
         # Calculate per-state size based on max_seq_len
         self.state_size = _sa_native.get_state_size(self.max_seq_len)
@@ -115,6 +131,9 @@ class SuffixAutomatonManager:
         self._gpu_draft_tokens: Optional[torch.Tensor] = None
         self._gpu_batch_indices: Optional[torch.Tensor] = None
 
+        # Track which requests have been initialized (for prepare_resources)
+        self._initialized_requests: Set[int] = set()
+
     def _ensure_workspace(self, max_draft_len: int):
         """Ensure GPU workspace is allocated."""
         if not self._workspace_allocated:
@@ -132,6 +151,8 @@ class SuffixAutomatonManager:
             self._gpu_slots = _sa_native.allocate_workspace(self.max_num_requests, self.max_seq_len)
 
             self._workspace_allocated = True
+
+    # --- Core SA operations ---
 
     def add_request(self, request_id: int, context_tokens: List[int]):
         """
@@ -172,6 +193,7 @@ class SuffixAutomatonManager:
 
         self._host_states_native.pop(request_id, None)
         self._pending_copies.discard(request_id)
+        self._initialized_requests.discard(request_id)
 
         # Clear the GPU slot
         if self._gpu_slots is not None:
@@ -324,69 +346,15 @@ class SuffixAutomatonManager:
 
         return match_len, draft_tokens
 
-    def shutdown(self):
-        """Clean up all resources."""
-        self._request_to_slot.clear()
-        self._free_slots = list(range(self.max_num_requests))
-
-        self._host_states_native.clear()
-        self._pending_copies.clear()
-        self._gpu_slots = None
-
-        # Free GPU memory
-        self._gpu_match_len = None
-        self._gpu_draft_tokens = None
-        self._gpu_batch_indices = None
-        self._workspace_allocated = False
-
-
-class SAResourceManager(BaseResourceManager):
-    """
-    Resource manager for suffix automaton speculative decoding.
-
-    Integrates with TRT-LLM's resource management system to:
-    - Allocate SA states for new requests
-    - Free SA states when requests complete
-    - Prepare SA states for batch processing
-
-    This is the main resource manager for NGram speculative decoding.
-    """
-
-    def __init__(
-        self,
-        config,
-        max_num_requests: int,
-        max_seq_len: int = 262144,
-    ):
-        self.max_num_requests = max_num_requests
-        self.max_seq_len = max_seq_len
-        self.slot_manager = SlotManager(max_num_requests)
-
-        # SA configuration
-        sa_config = SAConfig(
-            max_seq_len=max_seq_len,
-            max_slots=max_num_requests,
-            threshold=getattr(config, "sa_spec_threshold", 4),
-        )
-
-        # Initialize the SA manager
-        self.sa_manager = SuffixAutomatonManager(sa_config, max_num_requests)
-
-        # Track which requests have been initialized
-        self._initialized_requests: Set[int] = set()
+    # --- BaseResourceManager interface ---
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         """Prepare SA states for new context requests."""
-        context_batch = scheduled_batch.context_requests
-
-        for req in context_batch:
+        for req in scheduled_batch.context_requests:
             if req.is_first_context_chunk:
-                self.slot_manager.add_slot(req.request_id)
-
-                # Build initial SA from context tokens
                 if req.request_id not in self._initialized_requests:
                     context_tokens = req.get_tokens(0)
-                    self.sa_manager.add_request(req.request_id, context_tokens)
+                    self.add_request(req.request_id, context_tokens)
                     self._initialized_requests.add(req.request_id)
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
@@ -395,21 +363,28 @@ class SAResourceManager(BaseResourceManager):
 
     def free_resources(self, request: LlmRequest):
         """Free SA state for completed request."""
-        self.slot_manager.remove_slot(request.request_id)
-        self.sa_manager.remove_request(request.request_id)
-        self._initialized_requests.discard(request.request_id)
+        self.remove_request(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
         """Add dummy requests for CUDA graph warmup."""
         for rid in request_ids:
-            self.slot_manager.add_slot(rid)
-            self.sa_manager.add_request(rid, [1])  # Dummy token
+            self.add_request(rid, [1])  # Dummy token
 
     def shutdown(self):
         """Clean up all resources."""
-        self.slot_manager.shutdown()
-        self.sa_manager.shutdown()
+        self._request_to_slot.clear()
+        self._free_slots = list(range(self.max_num_requests))
+
+        self._host_states_native.clear()
+        self._pending_copies.clear()
         self._initialized_requests.clear()
+        self._gpu_slots = None
+
+        # Free GPU memory
+        self._gpu_match_len = None
+        self._gpu_draft_tokens = None
+        self._gpu_batch_indices = None
+        self._workspace_allocated = False
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
@@ -417,126 +392,7 @@ class SAResourceManager(BaseResourceManager):
     def get_needed_resource_to_completion(self, request: LlmRequest):
         return 0
 
-    def prepare_batch(self, request_ids: List[int], max_draft_len: int):
-        """Prepare batch indices for extend operation."""
-        self.sa_manager.prepare(request_ids, max_draft_len)
-
-    def extend_and_get_drafts(
-        self,
-        request_ids: List[int],
-        accepted_tokens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        max_draft_len: int,
-    ) -> tuple:
-        """
-        Extend SA states and get draft tokens.
-
-        Returns:
-            Tuple of (match_len, draft_tokens) tensors
-        """
-        return self.sa_manager.extend(
-            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len
-        )
-
-
-# Module-level interface for compatibility with existing sa_spec usage
-_global_sa_manager: Optional[SuffixAutomatonManager] = None
-_seen_requests: Set[int] = set()
-
 
 def is_native_available() -> bool:
     """Check if native suffix automaton kernel is available."""
     return _sa_native is not None
-
-
-def init(max_num_requests: int = 256, max_seq_len: int = 262144):
-    """
-    Initialize the global SA manager.
-
-    Requires native kernel to be available.
-    """
-    global _global_sa_manager, _seen_requests
-
-    if _sa_native is None:
-        raise RuntimeError(
-            "Native suffix automaton kernel is required but not available. "
-            "Please ensure the native bindings are properly built."
-        )
-
-    config = SAConfig(max_seq_len=max_seq_len, max_slots=max_num_requests)
-    _global_sa_manager = SuffixAutomatonManager(config, max_num_requests)
-    _seen_requests = set()
-
-    logger.info(
-        f"SA manager initialized with native kernel "
-        f"(max_slots={max_num_requests}, max_seq_len={max_seq_len})"
-    )
-
-
-def add_request(request_id: int, context_tokens: List[int]):
-    """Add a request with its context tokens."""
-    global _global_sa_manager
-    if _global_sa_manager is None:
-        init()
-    _global_sa_manager.add_request(request_id, context_tokens)
-
-
-def prepare(request_ids: List[int], max_draft_len: int = 8):
-    """
-    Prepare batch for processing.
-
-    This copies pending host states to GPU.
-    """
-    global _global_sa_manager
-    if _global_sa_manager is None:
-        return
-    _global_sa_manager.prepare(request_ids, max_draft_len)
-
-
-def extend(
-    match_len_out: torch.Tensor,
-    draft_tokens_out: torch.Tensor,
-    accepted_tokens: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-):
-    """
-    Extend SA states and populate output tensors.
-
-    This matches the interface of the external sa_spec.extend() function.
-    Runs entirely on GPU using CUDA kernel. CUDA graph compatible.
-    """
-    global _global_sa_manager
-    if _global_sa_manager is None:
-        match_len_out.zero_()
-        return
-
-    # Get batch size from input tensors
-    batch_size = accepted_tokens.shape[0]
-    max_draft_len = draft_tokens_out.shape[1]
-
-    # For now, use placeholder request IDs
-    # In the actual integration, these will come from SpecMetadata
-    request_ids = list(range(batch_size))
-
-    match_len, draft_tokens = _global_sa_manager.extend(
-        request_ids, accepted_tokens, num_accepted_tokens, max_draft_len
-    )
-
-    match_len_out.copy_(match_len)
-    draft_tokens_out.copy_(draft_tokens)
-
-
-def remove_request(request_id: int):
-    """Remove a completed request."""
-    global _global_sa_manager
-    if _global_sa_manager is not None:
-        _global_sa_manager.remove_request(request_id)
-
-
-def shutdown():
-    """Shutdown the global SA manager."""
-    global _global_sa_manager, _seen_requests
-    if _global_sa_manager is not None:
-        _global_sa_manager.shutdown()
-        _global_sa_manager = None
-    _seen_requests = set()
