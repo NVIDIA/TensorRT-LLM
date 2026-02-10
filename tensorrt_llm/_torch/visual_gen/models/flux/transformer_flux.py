@@ -278,6 +278,31 @@ class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
         return time_guidance_emb + pooled_projections
 
 
+@torch.compiler.disable
+def _gelu_tanh_eager(x: torch.Tensor) -> torch.Tensor:
+    """GELU(tanh) that always runs in eager mode.
+
+    Inductor's fused GELU kernel introduces per-element numerical drift in BF16
+    that compounds through residual transformer blocks, causing ~6.6 dB PSNR loss
+    over 50 denoising steps. Running GELU in eager avoids this.
+    See: pytorch/pytorch#145213
+    """
+    return F.gelu(x, approximate="tanh")
+
+
+class EagerGELU(nn.Module):
+    """nn.GELU replacement that bypasses torch.compile."""
+
+    def __init__(self, approximate: str = "tanh"):
+        super().__init__()
+        self.approximate = approximate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.approximate == "tanh":
+            return _gelu_tanh_eager(x)
+        return F.gelu(x, approximate=self.approximate)
+
+
 class GELU(nn.Module):
     """GELU activation with input projection.
 
@@ -313,6 +338,8 @@ class GELU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
+        if self.approximate == "tanh":
+            return _gelu_tanh_eager(x)
         return F.gelu(x, approximate=self.approximate)
 
 
@@ -595,7 +622,7 @@ class FluxSingleTransformerBlock(nn.Module):
             force_dynamic_quantization=force_dynamic_quant,
             disable_deep_gemm=True,
         )
-        self.act_mlp = nn.GELU(approximate="tanh")
+        self.act_mlp = EagerGELU(approximate="tanh")
 
         # Output projection (concat of attn + mlp) - TRT-LLM Linear
         self.proj_out = Linear(
