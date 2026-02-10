@@ -130,7 +130,7 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
 // Only W4A4_NVFP4 and W4A8_MXFP4_FP8 are currently supported
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, FP4GemmType fp4GemmType,
-    std::optional<c10::ScalarType> out_dtype, int output_buffer_kind, tkc::CutlassGemmConfig const* maybe_config,
+    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind, tkc::CutlassGemmConfig const* maybe_config,
     c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
@@ -275,7 +275,7 @@ public:
     }
 
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-        at::Tensor const& mat2Scale, at::Tensor const& globalScale, int output_buffer_kind, int64_t configIdx,
+        at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t output_buffer_kind, int64_t configIdx,
         c10::optional<torch::List<int64_t>> group = c10::nullopt) const
     {
         tkc::CutlassGemmConfig const* config = nullptr;

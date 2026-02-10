@@ -178,7 +178,7 @@ public:
 
     // Run GEMM with specified tactic (-1 for default/best)
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
-        at::Tensor const& mat2_scale, at::Tensor const& alpha, int output_buffer_kind, int64_t tactic,
+        at::Tensor const& mat2_scale, at::Tensor const& alpha, int64_t output_buffer_kind, int64_t tactic,
         c10::optional<torch::List<int64_t>> group = c10::nullopt) const
     {
         int m = mat1.size(0);
