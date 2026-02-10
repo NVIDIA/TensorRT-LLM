@@ -112,7 +112,7 @@ Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tenso
 // out_dtype: fp16/bf16/fp32
 Tensor cuda_core_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
     Tensor const& alpha, std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype,
-    int output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
