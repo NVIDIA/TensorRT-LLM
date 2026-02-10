@@ -78,11 +78,11 @@ __global__ void quantize_reorder_nvfp4_kernel(
     T* input_smem = reinterpret_cast<T*>(smem);
     // Local memory stores the reordered hidden states.
     cutlass::bfloat16_t input_frag[elements_per_thread];
-    cutlass::bfloat16_t output_frag[elements_per_thread / 2];
+    int8_t output_frag[elements_per_thread];
     // Row are independent
     int row_id = blockIdx.x;
     input = input + row_id * hidden_dim;
-    q_out = q_out + row_id * (GROUP_SIZE * GROUP_NUM(KQ + KE)) / 2;
+    q_out = q_out + row_id * K / 2;
     // Load input scale for FP8 dequantization
     float global_scale = 1.0f;
     // FP8_Scale = FP4_Scale / 6.0
@@ -101,7 +101,9 @@ __global__ void quantize_reorder_nvfp4_kernel(
     int const iters = hidden_dim * sizeof(T) / bytes_per_iter;
     cutlass::NumericConverter<cutlass::float_e2m1_t, float, cutlass::FloatRoundStyle::round_to_nearest> Float2E2m1;
     cutlass::NumericConverter<float, cutlass::float_e2m1_t, cutlass::FloatRoundStyle::round_to_nearest> E2m12Float;
-    cutlass::NumericConverter<cutlass::float_ue4m3_t, float, cutlass::FloatRoundStyle::round_toward_infinity>
+    cutlass::NumericConverter<cutlass::float_ue4m3_t, float,
+        arcquant_type == ArcQuantType::ACT ? cutlass::FloatRoundStyle::round_to_nearest
+                                           : cutlass::FloatRoundStyle::round_toward_infinity>
         Float2Ue4m3;
     cutlass::NumericConverter<float, cutlass::float_ue4m3_t, cutlass::FloatRoundStyle::round_to_nearest> Ue4m32Float;
     cutlass::NumericConverter<cutlass::bfloat16_t, float, cutlass::FloatRoundStyle::round_to_nearest> Float2Bfloat16;
@@ -114,11 +116,11 @@ __global__ void quantize_reorder_nvfp4_kernel(
             = *(float4*) (reinterpret_cast<uint8_t*>(input) + offset);
     }
     cta.sync();
-// Reorder and convert to BF16
+    // Reorder and convert to BF16
 #pragma unroll 4
     for (int i = 0; i < elements_per_thread; ++i)
     {
-        int offset = tid * GROUP_SIZE + i;
+        int offset = tid * elements_per_thread + i;
         // Convert to BF16 and apply FP8 scale if needed
         input_frag[i] = Float2Bfloat16((float) input_smem[reorder_index[offset]] * global_scale);
     }
@@ -132,18 +134,16 @@ __global__ void quantize_reorder_nvfp4_kernel(
     {
         maxv = local_abs_max<cutlass::bfloat16_t, float4>(input_frag_float4 + i, maxv);
     }
-    // Calculate scales
-    // Specific layout
-    float lower_bound, upper_bound;
     // Q quantize
-    lower_bound = -FP4_MAX;
-    upper_bound = FP4_MAX;
+    float lower_bound = -FP4_MAX;
+    float upper_bound = FP4_MAX;
     scale = clamp(maxv / FP4_MAX, SCALE_EPS, FP8_MAX);
     int pos = tid + max(0, tid - GROUP_NUM(KQ - KE));
     int64_t sf_offset = get_sf_offset(row_id, pos, K);
     q_scale_tensor[sf_offset] = Float2Ue4m3(scale);
     // Use reverse scale to replace division by multiplication
-    r_scale = 1.0 / Ue4m32Float(Float2Ue4m3(scale));
+    float qdq_scale = Ue4m32Float(Float2Ue4m3(scale));
+    r_scale = 1.0 / qdq_scale;
     // Quantize each thread's value
     // Each iteration quantize two things, convenient for packing int4
     PackFp4* output_frag_fp4 = reinterpret_cast<PackFp4*>(output_frag);
@@ -154,14 +154,10 @@ __global__ void quantize_reorder_nvfp4_kernel(
         result_1 = clamp(((float) input_frag[i + 1] * r_scale), lower_bound, upper_bound);
         result_2 = clamp(((float) input_frag[i + 2] * r_scale), lower_bound, upper_bound);
         result_3 = clamp(((float) input_frag[i + 3] * r_scale), lower_bound, upper_bound);
-        input_frag[i + 0] = Float2Bfloat16(
-            (float) input_frag[i + 0] - E2m12Float(Float2E2m1(result_0)) * Ue4m32Float(Float2Ue4m3(scale)));
-        input_frag[i + 1] = Float2Bfloat16(
-            (float) input_frag[i + 1] - E2m12Float(Float2E2m1(result_1)) * Ue4m32Float(Float2Ue4m3(scale)));
-        input_frag[i + 2] = Float2Bfloat16(
-            (float) input_frag[i + 2] - E2m12Float(Float2E2m1(result_2)) * Ue4m32Float(Float2Ue4m3(scale)));
-        input_frag[i + 3] = Float2Bfloat16(
-            (float) input_frag[i + 3] - E2m12Float(Float2E2m1(result_3)) * Ue4m32Float(Float2Ue4m3(scale)));
+        input_frag[i + 0] = Float2Bfloat16((float) input_frag[i + 0] - E2m12Float(Float2E2m1(result_0)) * qdq_scale);
+        input_frag[i + 1] = Float2Bfloat16((float) input_frag[i + 1] - E2m12Float(Float2E2m1(result_1)) * qdq_scale);
+        input_frag[i + 2] = Float2Bfloat16((float) input_frag[i + 2] - E2m12Float(Float2E2m1(result_2)) * qdq_scale);
+        input_frag[i + 3] = Float2Bfloat16((float) input_frag[i + 3] - E2m12Float(Float2E2m1(result_3)) * qdq_scale);
         output_frag_fp4[i / 2 + 0].low = Float2E2m1(result_0).storage;
         output_frag_fp4[i / 2 + 0].high = Float2E2m1(result_1).storage;
         output_frag_fp4[i / 2 + 1].low = Float2E2m1(result_2).storage;
@@ -169,7 +165,7 @@ __global__ void quantize_reorder_nvfp4_kernel(
     }
     int const ke_thread_count = GROUP_NUM(KE);
     int const kq_thread_count = bdx - ke_thread_count;
-    if (tid >= bdx - GROUP_NUM(KE))
+    if (tid >= kq_thread_count)
     {
         if constexpr (arcquant_type == ArcQuantType::ACT)
         {
