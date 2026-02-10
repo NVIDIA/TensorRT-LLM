@@ -36,7 +36,6 @@ This implementation bridges the gap by:
 3. Managing per-layer state through global state dictionary
 """
 
-import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -46,6 +45,7 @@ from torch._subclasses import FakeTensor
 from torch.fx import Node
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 
 from ..utils.cuda_graph import cuda_graph_state
@@ -66,22 +66,6 @@ from .attention_interface import (
     SequenceInfo,
 )
 
-# Environment variable to skip workspace allocation for debugging
-_SKIP_WORKSPACE_ALLOC = os.environ.get("TRTLLM_ATTN_SKIP_WORKSPACE", "0") == "1"
-
-# Defer thop import to avoid early CUDA initialization
-_thop = None
-
-
-def _get_thop():
-    """Lazy import of thop to avoid early CUDA initialization."""
-    global _thop
-    if _thop is None:
-        from tensorrt_llm.bindings.internal import thop as _thop_module
-
-        _thop = _thop_module
-    return _thop
-
 
 class TrtllmWorkspaceResourceHandler(ResourceHandler):
     """Resource handler for TRT-LLM workspace buffer.
@@ -99,37 +83,13 @@ class TrtllmWorkspaceResourceHandler(ResourceHandler):
 
     def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
         """Allocate workspace buffer - reuses existing if already allocated."""
-        # Check if workspace already exists (stored in _global_state)
         if _global_state.workspace is not None:
             return _global_state.workspace
 
-        # Debug mode: skip workspace allocation to test if it's the culprit
-        if _SKIP_WORKSPACE_ALLOC:
-            buffer = torch.empty(1, dtype=torch.uint8, device=sequence_info.device)
-            _global_state.init_workspace(buffer)
-            return buffer
-
-        # Check CUDA health before allocation
-        if not check_cuda_health("before_workspace_alloc"):
-            raise RuntimeError("CUDA unhealthy before workspace allocation")
-
-        torch.cuda.synchronize()
-
-        # Allocate a reasonable initial workspace.  The C++ thop.attention
-        # kernel will auto-resize (via ``resize_()``) if more space is needed
-        # during the warmup / resize_kv_cache forward pass.  We therefore do
-        # NOT try to pre-compute ``max_batch_size * max_seq_len * bytes_per_token``
-        # which can easily exceed GPU memory for large serving configs.
-        workspace_bytes = 256 * 1024 * 1024  # 256 MB initial size
-        buffer = torch.empty(workspace_bytes, dtype=torch.uint8, device=sequence_info.device)
-
-        torch.cuda.synchronize()
+        # Allocate a modest initial workspace; C++ thop.attention auto-resizes
+        # via resize_() if more space is needed during warmup.
+        buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=sequence_info.device)
         _global_state.init_workspace(buffer)
-
-        # Check CUDA health after allocation
-        if not check_cuda_health("after_workspace_alloc"):
-            raise RuntimeError("CUDA unhealthy after workspace allocation")
-
         return buffer
 
 
@@ -212,10 +172,9 @@ class TrtllmLayerState:
 
     def __post_init__(self):
         """Initialize tensors - use shared tensors from global state where possible."""
-        # Pool pointers and mapping are NOW SHARED across layers
+        # Pool pointers and mapping are SHARED across layers.
         # For native HND mode with SELF cache type, all layers share the same pool
-        # with different offsets. We use the shared tensors from global state.
-        # These will be linked in init_from_shared().
+        # with different offsets. These will be linked in init_from_shared().
         pass
 
     def init_from_shared(self, global_state: "TrtllmAttentionGlobalState") -> None:
@@ -226,7 +185,6 @@ class TrtllmLayerState:
         and pool_mapping contains per-layer offsets. Block indices from cache_loc
         are global indices relative to the pool base.
         """
-        # All layers share sequence/batch metadata tensors
         self.sequence_length = global_state._shared_sequence_length
         self.context_lengths = global_state._shared_context_lengths
         self.kv_cache_block_offsets = global_state._shared_kv_cache_block_offsets
@@ -234,8 +192,6 @@ class TrtllmLayerState:
         self.host_context_lengths = global_state._shared_host_context_lengths
         self.host_request_types = global_state._shared_host_request_types
         self.host_total_kv_lens = global_state._shared_host_total_kv_lens
-        # Pool pointers and mapping ARE shared - they point to the pool base
-        # and contain per-layer offsets. This is required for native HND mode.
         self.host_kv_cache_pool_pointers = global_state._shared_host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = global_state._shared_host_kv_cache_pool_mapping
 
@@ -275,12 +231,8 @@ class TrtllmAttentionGlobalState:
             cls._instance._pool_num_layers: int = 0
             # Track if host_prepare has been called (tensors are pre-filled)
             cls._instance._host_prepare_called: bool = False
-            # Cache the current batch info for tensor slicing (updated by host_prepare)
-            # These are used during CUDA graph replay instead of batch_info_host.tolist()
+            # Cache the current num_seq for tensor slicing
             cls._instance._current_num_seq: int = 0
-            cls._instance._current_num_prefill: int = 0
-            cls._instance._current_num_prefill_tokens: int = 0
-            cls._instance._current_num_decode: int = 0
             # Pre-allocated CPU buffers for host_prepare (avoid tensor allocation)
             cls._instance._cpu_buffers_initialized: bool = False
             cls._instance._cpu_input_seq_lens: Optional[torch.Tensor] = None
@@ -296,9 +248,6 @@ class TrtllmAttentionGlobalState:
         """Initialize shared tensors used by all layers.
 
         Supports reallocation if a larger batch size or block count is needed after initial allocation.
-        This handles the case where attention ops are created with default max_batch_size
-        but the actual batch size from AD's cache config is larger, or when sequences
-        require more blocks than initially allocated (e.g., during cache resize measurement).
 
         Returns:
             True if (re)allocation was performed, False if already sufficient.
@@ -307,7 +256,6 @@ class TrtllmAttentionGlobalState:
         max_blocks_per_seq = (max_context_length + tokens_per_block - 1) // tokens_per_block
 
         # Check if reallocation is needed (current size < requested size)
-        # Check both batch size AND blocks per sequence
         needs_realloc = (
             self._shared_tensors_initialized
             and self._shared_sequence_length is not None
@@ -348,7 +296,6 @@ class TrtllmAttentionGlobalState:
             1, 2, dtype=torch.int64, device="cpu", pin_memory=True
         )
         # Pool mapping: [num_layers, 2] - layer to pool mapping
-        # Using 64 as max layers (typical transformer max)
         self._shared_host_kv_cache_pool_mapping = torch.zeros(
             64, 2, dtype=torch.int32, device="cpu", pin_memory=True
         )
@@ -357,11 +304,7 @@ class TrtllmAttentionGlobalState:
         return True
 
     def _init_cpu_buffers(self, max_seqs: int) -> None:
-        """Initialize pre-allocated CPU buffers to avoid tensor allocation in hot path.
-
-        Supports reallocation if a larger size is needed.
-        """
-        # Check if reallocation is needed
+        """Initialize pre-allocated CPU buffers to avoid tensor allocation in hot path."""
         needs_realloc = (
             self._cpu_buffers_initialized
             and self._cpu_input_seq_lens is not None
@@ -371,7 +314,6 @@ class TrtllmAttentionGlobalState:
         if self._cpu_buffers_initialized and not needs_realloc:
             return
 
-        # Pre-allocate pinned CPU buffers for intermediate computations
         self._cpu_input_seq_lens = torch.zeros(
             max_seqs, dtype=torch.int32, device="cpu", pin_memory=True
         )
@@ -390,11 +332,7 @@ class TrtllmAttentionGlobalState:
         self._cpu_buffers_initialized = True
 
     def _init_gpu_buffers(self, max_pages: int, max_seqs: int) -> None:
-        """Initialize pre-allocated GPU buffers for vectorized operations.
-
-        Supports reallocation if a larger size is needed.
-        """
-        # Check if reallocation is needed
+        """Initialize pre-allocated GPU buffers for vectorized operations."""
         needs_realloc = (
             self._gpu_buffers_initialized
             and self._gpu_cu_pages is not None
@@ -407,7 +345,6 @@ class TrtllmAttentionGlobalState:
         if self._gpu_buffers_initialized and not needs_realloc:
             return
 
-        # Pre-allocate buffers with max sizes to avoid per-call allocations
         self._gpu_cu_pages = torch.zeros(max_seqs + 1, dtype=torch.long, device="cuda")
         self._gpu_page_positions = torch.arange(max_pages, dtype=torch.long, device="cuda")
         self._gpu_seq_idx = torch.zeros(max_pages, dtype=torch.long, device="cuda")
@@ -423,18 +360,9 @@ class TrtllmAttentionGlobalState:
     ) -> None:
         """Update pool pointers from AD's KVCacheManager.
 
-        Called on every host_prepare to ensure pool pointers stay current after
-        KVCacheManager resizes (which change the pool base address).
-
-        The pool pointer is the GLOBAL pool base address from KVCacheManager.
-        The pool mapping contains per-layer offsets that the kernel uses to find
-        each layer's data within the global pool. Block offsets are scaled by
-        num_layers * kv_factor to account for the interleaved layout.
-
-        Args:
-            ad_pool_pointers: Pool pointers from SequenceInfo
-            ad_pool_mapping: Pool mapping from SequenceInfo
-            num_layers: Number of transformer layers
+        Called once to initialize pool pointers, or when the pool base address changes
+        (after KVCacheManager resize). During steady-state serving, this is a no-op
+        after initial setup.
         """
         # Check if AD pool pointers are valid
         use_ad_pool = (
@@ -456,19 +384,14 @@ class TrtllmAttentionGlobalState:
         if current_ptr == new_ptr and self._pool_pointers_initialized:
             return
 
-        # Use AD's pool pointers directly
-        # K and V are interleaved in blocks, so only K ptr is needed
-        # V ptr is set to 0 - kernel uses block offsets to find V
         self._shared_host_kv_cache_pool_pointers[0, 0] = new_ptr
         self._shared_host_kv_cache_pool_pointers[0, 1] = 0
 
-        # Set pool mapping for all layers
         for layer_i in range(min(num_layers, ad_pool_mapping.shape[0])):
             self._shared_host_kv_cache_pool_mapping[layer_i, 0] = ad_pool_mapping[layer_i, 0].item()
             self._shared_host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[layer_i, 1].item()
 
-        # Use the actual pool_mapping size for num_layers, not the passed value
-        # which may be inflated (e.g., 32 fallback for hybrid models with only 6 attn layers)
+        # Use the actual pool_mapping size for num_layers (accurate for hybrid models)
         self._pool_num_layers = ad_pool_mapping.shape[0]
         self._pool_pointers_initialized = True
 
@@ -484,13 +407,10 @@ class TrtllmAttentionGlobalState:
         num_layers: int = 0,
     ) -> TrtllmLayerState:
         """Get or create per-layer state."""
-        # Initialize or reallocate shared tensors if needed
-        # Returns True if (re)allocation happened
         did_realloc = self._init_shared_tensors(
             max_num_requests, max_context_length, tokens_per_block
         )
 
-        # Re-link existing layer states only if reallocation happened
         if did_realloc:
             for state in self._layer_states.values():
                 state.init_from_shared(self)
@@ -506,7 +426,6 @@ class TrtllmAttentionGlobalState:
                 max_context_length=max_context_length,
                 num_layers=num_layers,
             )
-            # Link layer to shared tensors
             state.init_from_shared(self)
             self._layer_states[layer_idx] = state
         return self._layer_states[layer_idx]
@@ -551,20 +470,13 @@ class TrtllmAttentionGlobalState:
             if not layer_states:
                 return
 
-            # Fast integer extraction (avoid .item() overhead by using int() directly)
+            # Fast integer extraction
             num_prefill = int(batch_info_host[0])
             num_prefill_tokens = int(batch_info_host[1])
             num_decode = int(batch_info_host[2])
             num_seq = num_prefill + num_decode
 
-            # Store batch info in global state for CUDA graph replay
-            # During replay, ops should use these values instead of batch_info_host.tolist()
-            global_state._current_num_prefill = num_prefill
-            global_state._current_num_prefill_tokens = num_prefill_tokens
-            global_state._current_num_decode = num_decode
-
-            # Also set shared batch info in cuda_graph_state for other ops (like Mamba)
-            # This allows all ops to access current batch info during CUDA graph replay
+            # Set shared batch info in cuda_graph_state for other ops (e.g. Mamba)
             cuda_graph_state.set_batch_info(num_prefill, num_prefill_tokens, num_decode)
 
             if num_seq == 0:
@@ -574,8 +486,7 @@ class TrtllmAttentionGlobalState:
             if first_state.sequence_length is None:
                 return
 
-            # Prefer pool_num_layers (from pool_mapping, most accurate for hybrid models)
-            # over first_state.num_layers (which may have wrong fallback value)
+            # Prefer pool_num_layers (most accurate for hybrid models)
             if global_state._pool_num_layers > 0:
                 num_layers = global_state._pool_num_layers
             elif first_state.num_layers > 0:
@@ -594,12 +505,16 @@ class TrtllmAttentionGlobalState:
                 )
                 global_state._init_gpu_buffers(max_pages, first_state.max_num_requests)
 
-            # Update pool pointers from AD's KVCacheManager
-            # Must check every call because pool may be resized (changes base address)
-            if _trtllm_config._sequence_info is not None:
-                ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
-                ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
-                global_state._update_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
+            # Initialize pool pointers once (static for cache lifetime).
+            # Pool pointers only change after KVCacheManager resize, which is handled
+            # in _prepare_trtllm_metadata (initial setup path).
+            if not global_state._pool_pointers_initialized:
+                if _trtllm_config._sequence_info is not None:
+                    ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
+                    ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
+                    global_state._update_pool_pointers(
+                        ad_pool_pointers, ad_pool_mapping, num_layers
+                    )
 
             # Use pre-allocated CPU buffers with out= to avoid tensor allocation
             input_seq_lens = global_state._cpu_input_seq_lens[:num_seq]
@@ -615,58 +530,45 @@ class TrtllmAttentionGlobalState:
             past_kv_lens = global_state._cpu_past_kv_lens[:num_seq]
             torch.sub(seq_len_with_cache, input_seq_lens, out=past_kv_lens)
 
-            # Compute totals (avoid .item() by keeping as tensor)
+            # Compute totals
             context_total_kv = seq_len_with_cache[:num_prefill].sum() if num_prefill > 0 else 0
             gen_total_kv = seq_len_with_cache[num_prefill:num_seq].sum() if num_decode > 0 else 0
 
-            # Block offsets info - use pre-allocated buffers
+            # Block offsets info
             cu_num_pages = global_state._cpu_cu_num_pages[: num_seq + 1]
             cu_num_pages.copy_(cu_num_pages_host[: num_seq + 1])
 
             pages_per_seq = global_state._cpu_pages_per_seq[:num_seq]
             torch.sub(cu_num_pages[1 : num_seq + 1], cu_num_pages[:num_seq], out=pages_per_seq)
 
-            # Get max and total (unavoidable .item() for control flow)
             max_blocks = int(pages_per_seq.max())
             global_state.set_max_blocks_per_seq(max_blocks)
             total_pages = int(cu_num_pages[num_seq])
 
-            # CUDA graph compatibility: Fill FULL tensors (not just [:num_seq])
-            # During graph capture, kernel is recorded with max_num_requests elements.
-            # During replay, we must fill ALL elements with valid data to avoid illegal memory access.
-            # Unused slots get padding values (0 for lengths, 1 for request_type = decode).
-
-            # H2D copies using pinned memory (non-blocking)
-            # Fill active slots with actual data, inactive slots with 0
-            global_state._shared_sequence_length.fill_(0)  # Clear full tensor
+            # H2D copies using pinned memory (non-blocking) - only fill active slots
             global_state._shared_sequence_length[:num_seq].copy_(
                 seq_len_with_cache, non_blocking=True
             )
-            global_state._shared_context_lengths.fill_(0)  # Clear full tensor
             global_state._shared_context_lengths[:num_seq].copy_(input_seq_lens, non_blocking=True)
 
-            # Fill shared host tensors (CPU to CPU, fast)
-            global_state._shared_host_past_key_value_lengths.fill_(0)  # Clear full tensor
+            # Fill shared host tensors (CPU to CPU, fast) - only active slots
             global_state._shared_host_past_key_value_lengths[:num_seq].copy_(past_kv_lens)
-            global_state._shared_host_context_lengths.fill_(0)  # Clear full tensor
             global_state._shared_host_context_lengths[:num_seq].copy_(input_seq_lens)
-            # Request type: all decode (1) by default, then set prefill (0) for active prefill slots
-            global_state._shared_host_request_types.fill_(1)  # Default to decode
             if num_prefill > 0:
                 global_state._shared_host_request_types[:num_prefill].fill_(0)
+            if num_decode > 0:
+                global_state._shared_host_request_types[num_prefill:num_seq].fill_(1)
             global_state._shared_host_total_kv_lens[0] = context_total_kv
             global_state._shared_host_total_kv_lens[1] = gen_total_kv
 
-            # Compute block offsets on GPU (vectorized)
-            # CUDA graph compatibility: Zero the FULL tensor first, then fill active slots
-            global_state._shared_kv_cache_block_offsets.zero_()  # Clear full tensor
-
+            # Compute block offsets on GPU (vectorized) - only zero active slice
             if total_pages > 0:
+                global_state._shared_kv_cache_block_offsets[:, :num_seq, :, :].zero_()
+
                 # Copy cu_pages to GPU (small tensor)
                 global_state._gpu_cu_pages[: num_seq + 1].copy_(cu_num_pages)
                 cu_num_pages_gpu = global_state._gpu_cu_pages[: num_seq + 1]
 
-                # Use pre-allocated page_positions slice
                 page_positions = global_state._gpu_page_positions[:total_pages]
 
                 # searchsorted on GPU
@@ -687,8 +589,6 @@ class TrtllmAttentionGlobalState:
                 page_in_seq = global_state._gpu_page_idx[:total_pages]
 
                 # Block offsets: multiplier = num_layers * kv_factor for interleaved K/V
-                # K and V have different offsets: K = base, V = base + 1
-                # Use pool_num_layers (from pool_mapping) for correct multiplier
                 kv_factor = 2
                 pool_layers = (
                     global_state._pool_num_layers
@@ -703,7 +603,7 @@ class TrtllmAttentionGlobalState:
                 )
                 base_offsets = global_state._gpu_base_offset[:total_pages]
 
-                # Fill block offsets using advanced indexing (only for active slots)
+                # Fill block offsets using advanced indexing
                 global_state._shared_kv_cache_block_offsets[0, seq_indices, 0, page_in_seq] = (
                     base_offsets  # K
                 )
@@ -724,9 +624,6 @@ class TrtllmAttentionGlobalState:
         self._max_blocks_per_seq = 0
         self._host_prepare_called = False
         self._current_num_seq = 0
-        self._current_num_prefill = 0
-        self._current_num_prefill_tokens = 0
-        self._current_num_decode = 0
         self._cpu_buffers_initialized = False
         self._gpu_buffers_initialized = False
         self._pool_pointers_initialized = False
@@ -735,25 +632,6 @@ class TrtllmAttentionGlobalState:
 
 # Global state singleton
 _global_state = TrtllmAttentionGlobalState()
-
-
-def check_cuda_health(tag: str = "") -> bool:
-    """Check CUDA health by running a simple operation.
-
-    Returns True if CUDA is healthy, False otherwise.
-    """
-    try:
-        # Simple CUDA operation to verify GPU is responsive
-        test_tensor = torch.zeros(16, dtype=torch.float32, device="cuda")
-        result = test_tensor.sum().item()
-        torch.cuda.synchronize()
-        if result != 0.0:
-            print(f"[CUDA HEALTH CHECK FAILED {tag}] Unexpected result: {result}")
-            return False
-        return True
-    except Exception as e:
-        print(f"[CUDA HEALTH CHECK FAILED {tag}] Exception: {e}")
-        return False
 
 
 def _prepare_trtllm_metadata(
@@ -779,37 +657,25 @@ def _prepare_trtllm_metadata(
     - First call (before host_prepare): Do full computation to initialize
     - CUDA graph capture: Set host tensors to MAX
     - Normal replay: Just return pre-computed tensors (FAST PATH)
-
-    Args:
-        batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-        cu_seqlen_host: Cumulative sequence lengths [num_seq + 1]
-        cu_num_pages: Cumulative page counts [num_seq + 1]
-        cu_num_pages_host: Same as cu_num_pages but on host
-        cache_loc: Flat page indices for all sequences
-        last_page_len: Tokens in last page per sequence
-        last_page_len_host: Same on host
-        seq_len_with_cache_host: Total seq length including cached tokens
-        state: Per-layer TRT-LLM state
-        kv_cache: Unified KV cache tensor
-        ad_pool_pointers: Optional AD pool pointers
-        ad_pool_mapping: Optional AD pool mapping
-
-    Returns:
-        Tuple of tensors needed by thop.attention
     """
-    # Check if in CUDA graph capture mode OR warmup phase
-    # During warmup, we must use the same code path as capture to ensure the C++ op_cache
-    # is populated with the correct parameters (which will be used during actual capture)
+    # Check if in CUDA graph capture mode
     is_capturing = torch.cuda.is_current_stream_capturing()
-    is_warmup = cuda_graph_state.in_warm_up()
-    is_cuda_graph_mode = is_capturing or is_warmup
 
-    # FAST PATH: If host_prepare has run and not in CUDA graph mode, just return pre-computed tensors
+    # Extract batch info early - needed for capacity check
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+
+    # Check if shared tensors need reallocation (batch size > allocated size)
+    if state.sequence_length is not None and state.sequence_length.shape[0] < num_seq:
+        did_realloc = _global_state._init_shared_tensors(
+            num_seq, state.max_context_length, state.tokens_per_block
+        )
+        if did_realloc:
+            state.init_from_shared(_global_state)
+
+    # FAST PATH: If host_prepare has run and not capturing, just return pre-computed tensors
     # This is the key optimization - each layer does almost no work during replay
-    # NOTE: This must be checked BEFORE extracting batch info, because during CUDA graph replay,
-    # batch_info_host.tolist() returns capture-time values which are stale.
-    # Pool pointers use the global pool base (same for all layers), so no per-layer update needed.
-    if _global_state._host_prepare_called and not is_cuda_graph_mode:
+    if _global_state._host_prepare_called and not is_capturing:
         num_seq = _global_state._current_num_seq
         max_blocks_per_seq = state.kv_cache_block_offsets.shape[3]
         return (
@@ -824,26 +690,8 @@ def _prepare_trtllm_metadata(
             state.host_kv_cache_pool_mapping,
         )
 
-    # Extract batch info - only reached during initial setup or CUDA graph warmup/capture
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-    num_seq = num_prefill + num_decode
-
-    # Check if shared tensors need reallocation (batch size > allocated size)
-    # This handles the case where attention ops were created with a smaller max_batch_size
-    # than the actual batch size from AD's cache config
-    if state.sequence_length is not None and state.sequence_length.shape[0] < num_seq:
-        # Trigger reallocation with the actual batch size
-        did_realloc = _global_state._init_shared_tensors(
-            num_seq, state.max_context_length, state.tokens_per_block
-        )
-        if did_realloc:
-            # Re-link this state to the new shared tensors
-            state.init_from_shared(_global_state)
-
-    # CUDA GRAPH MODE (warmup OR capture): Set host tensors to MAX (kernel requirement)
-    # This ensures the C++ op_cache is populated during warmup with the same parameters
-    # that will be used during capture, preventing cudaMalloc during graph capture.
-    if is_cuda_graph_mode:
+    # CUDA GRAPH CAPTURE: Set host tensors to MAX (kernel requirement)
+    if is_capturing:
         max_seq = state.max_context_length
         state.host_past_key_value_lengths[:num_seq].fill_(max_seq)
         state.host_context_lengths[:num_seq].fill_(max_seq)
@@ -851,14 +699,11 @@ def _prepare_trtllm_metadata(
         state.host_total_kv_lens[0] = 0
         state.host_total_kv_lens[1] = max_seq * num_seq
 
-        # Pool pointers should already be initialized by host_prepare or initial setup.
-        # If not yet initialized, try from AD's SequenceInfo.
-        # Update pool pointers (may have changed after resize)
+        # Update pool pointers if not yet initialized
         if ad_pool_pointers is not None and ad_pool_mapping is not None:
             num_layers = state.num_layers if state.num_layers > 0 else 32
             _global_state._update_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
 
-        # Return tensors for capture - use shared pool pointers (already initialized)
         max_blocks_per_seq = state.kv_cache_block_offsets.shape[3]
         return (
             state.sequence_length[:num_seq],
@@ -873,7 +718,6 @@ def _prepare_trtllm_metadata(
         )
 
     # INITIAL SETUP: First call before host_prepare_fn is registered
-    # This handles model tracing/evaluation phase - do full computation once
 
     # Validate kv_cache shape
     if len(kv_cache.shape) != 5 or kv_cache.shape[1] != 2:
@@ -884,11 +728,9 @@ def _prepare_trtllm_metadata(
     # Get num_layers - prefer from pool_mapping (accurate) over state.num_layers (may be stale)
     if ad_pool_mapping is not None and ad_pool_mapping.numel() > 0:
         num_layers = ad_pool_mapping.shape[0]
-        # For hybrid models (e.g., Mamba+Attention), _track_layer_config double-counts
-        # during export+runtime, causing set_model_config to never trigger.
-        # Force-call set_model_config here with correct num_layers from pool_mapping.
+        # For hybrid models (e.g., Mamba+Attention), force-call set_model_config
+        # with correct num_layers from pool_mapping.
         if _trtllm_config._num_layers == 0:
-            # Extract head_dim and num_kv_heads from kv_cache shape [blocks, kv_factor, heads, tokens, dim]
             kv_num_heads = kv_cache.shape[2]
             kv_head_dim = kv_cache.shape[4]
             kv_heads_list = TrtllmAttention._num_kv_heads_per_layer[:num_layers]
@@ -930,18 +772,15 @@ def _prepare_trtllm_metadata(
     _global_state.set_max_blocks_per_seq(max_blocks)
 
     # Ensure kv_cache_block_offsets is large enough for the required pages
-    # This can happen when cache is resized during warmup
     block_offsets_shape = state.kv_cache_block_offsets.shape
     if max_blocks > block_offsets_shape[3]:
         ad_logger.info(
             f"Reallocating block offsets: need {max_blocks} blocks but have {block_offsets_shape[3]}."
         )
-        # Trigger reallocation with the actual max blocks needed
         did_realloc = _global_state._init_shared_tensors(
             num_seq, max_blocks * state.tokens_per_block, state.tokens_per_block
         )
         if did_realloc:
-            # Re-link this state to the new shared tensors
             state.init_from_shared(_global_state)
             ad_logger.info(
                 f"Block offsets reallocated: new shape {state.kv_cache_block_offsets.shape}"
@@ -970,13 +809,10 @@ def _prepare_trtllm_metadata(
         state.host_kv_cache_pool_mapping[layer_i, 0] = ad_pool_mapping[layer_i, 0].item()
         state.host_kv_cache_pool_mapping[layer_i, 1] = ad_pool_mapping[layer_i, 1].item()
 
-    # Mark pool pointers as initialized in global state
     _global_state._pool_pointers_initialized = True
+    _global_state._pool_num_layers = ad_pool_mapping.shape[0]
 
     # Fill block offsets
-    # AD's cache_loc contains LOGICAL block indices from KVCacheManager
-    # Multiplier = num_layers * kv_factor for interleaved K/V layout
-    # K and V have different offsets: K = base, V = base + 1
     kv_factor = 2
     multiplier = num_layers * kv_factor
     state.kv_cache_block_offsets.zero_()
@@ -989,7 +825,6 @@ def _prepare_trtllm_metadata(
             state.kv_cache_block_offsets[0, i, 1, :n_pages] = base_offsets + 1  # V
             offset += n_pages
 
-    # Return tensors
     max_blocks_per_seq = state.kv_cache_block_offsets.shape[3]
 
     return (
@@ -1034,31 +869,13 @@ def trtllm_mha_with_cache(
     max_num_requests: int,
     max_context_length: int,
 ) -> torch.Tensor:
-    """TRT-LLM attention with unified KV cache for Auto-Deploy.
-
-    This wraps thop.attention() with AD's metadata and cache interface.
-
-    Args:
-        kv_cache: Unified KV cache tensor with shape:
-            - From KVCacheManager: [num_blocks, kv_factor=2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
-            - The kv_factor dimension contains K at index 0 and V at index 1
-
-    Note: This implementation assumes:
-    - RoPE is applied OUTSIDE this kernel (AD's pattern)
-    - No speculative decoding
-    - No MLA
-    - Causal attention mask
-    """
+    """TRT-LLM attention with unified KV cache for Auto-Deploy."""
     # Validate inputs
     if not q.is_cuda:
         raise RuntimeError(f"Q must be on CUDA, got {q.device}")
     if not kv_cache.is_cuda:
         raise RuntimeError(f"kv_cache must be on CUDA, got {kv_cache.device}")
 
-    # Validate KV cache format
-    # TrtllmKVResourceHandler configures AD to allocate cache in HND format:
-    # [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]
-    # This matches what thop.attention expects.
     assert kv_cache.dim() == 5, f"kv_cache must be 5D, got {kv_cache.dim()}D"
     assert kv_cache.shape[1] == 2, (
         f"kv_cache must be in HND format [B, 2, H, T, D] with shape[1]=2, "
@@ -1067,11 +884,7 @@ def trtllm_mha_with_cache(
 
     # Lazy initialization of model config (done once on first attention call)
     if _trtllm_config._num_layers == 0:
-        # Track layer config
         TrtllmAttention._track_layer_config(num_kv_heads, head_dim, kv_cache.dtype)
-
-        # Once all layers have been seen, set model config
-        # We infer num_layers from layer_idx (assumes layers are processed in order)
         expected_num_layers = len(TrtllmAttention._num_kv_heads_per_layer)
         if layer_idx == expected_num_layers - 1 or expected_num_layers >= 32:
             _trtllm_config.set_model_config(
@@ -1081,62 +894,27 @@ def trtllm_mha_with_cache(
                 dtype=kv_cache.dtype,
             )
 
-    # Get batch dimensions from batch_info_host
-    # For CUDA graph replay (not warmup/capture), use cuda_graph_state if available.
-    # This is needed because batch_info_host.tolist() returns capture-time values during replay.
-    is_capturing = torch.cuda.is_current_stream_capturing()
-    is_warmup = cuda_graph_state.in_warm_up()
-    is_cuda_graph_mode = is_capturing or is_warmup
-
-    # Only use shared batch info during graph REPLAY if host_prepare actually ran
-    # (check _global_state._host_prepare_called flag)
-    use_shared_batch_info = (
-        _global_state._host_prepare_called
-        and not is_cuda_graph_mode
-        and cuda_graph_state.get_batch_info() is not None
-    )
-
-    if use_shared_batch_info:
-        # CUDA graph replay: use values set by host_prepare
-        num_prefill, num_prefill_tokens, num_decode = cuda_graph_state.get_batch_info()
-    else:
-        # Normal execution, warmup, or capture: read from batch_info_host
-        batch_info_list = batch_info_host.tolist()
-        num_prefill = batch_info_list[0]
-        num_prefill_tokens = batch_info_list[1]
-        num_decode = batch_info_list[2]
+    # Get batch dimensions
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    num_tokens = num_prefill_tokens + num_decode
 
     # Reshape inputs to TRT-LLM expected format: [num_tokens, hidden_dim]
     q_shape_og = q.shape
     b, s = q_shape_og[:2]
-    max_tokens = b * s  # Maximum tokens in input tensor
-
-    # Compute batch dimensions
-    num_seq = num_prefill + num_decode
-    num_tokens = num_prefill_tokens + num_decode
-
-    # Sanity check for initial setup (before host_prepare is registered)
-    if num_tokens <= 0 or num_tokens > max_tokens:
-        num_tokens = max_tokens
-    if num_seq <= 0 or num_seq > max_num_requests:
-        num_seq = min(b, max_num_requests)
 
     # Reshape Q, K, V to [num_tokens, num_heads * head_dim]
-    q_flat = q.reshape(max_tokens, num_heads * head_dim)[:num_tokens]
-    k_flat = k.reshape(max_tokens, num_kv_heads * head_dim)[:num_tokens]
-    v_flat = v.reshape(max_tokens, num_kv_heads * head_dim)[:num_tokens]
+    q_flat = q.reshape(b * s, num_heads * head_dim)[:num_tokens]
+    k_flat = k.reshape(b * s, num_kv_heads * head_dim)[:num_tokens]
+    v_flat = v.reshape(b * s, num_kv_heads * head_dim)[:num_tokens]
 
     # TRT-LLM requires FUSED QKV: concatenate Q, K, V along hidden dimension
-    # Shape: [num_tokens, (num_heads + 2 * num_kv_heads) * head_dim]
     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
     # Prepare output tensor
     output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
     # Get num_layers from config for block offset calculation
-    # For hybrid models (e.g., Mamba+Attention), _num_layers may not be set correctly
-    # because _track_layer_config is called during both export and runtime.
-    # Prefer pool_num_layers from pool_mapping (most accurate) when available.
     if _global_state._pool_num_layers > 0:
         num_layers = _global_state._pool_num_layers
     elif _trtllm_config._num_layers > 0:
@@ -1154,10 +932,9 @@ def trtllm_mha_with_cache(
         num_layers=num_layers,
     )
 
-    # Get AD's pool pointers if available (for proper integration)
+    # Get AD's pool pointers if available
     ad_pool_pointers = None
     ad_pool_mapping = None
-
     if _trtllm_config._sequence_info is not None:
         ad_pool_pointers = _trtllm_config._sequence_info.kv_cache_pool_pointers
         ad_pool_mapping = _trtllm_config._sequence_info.kv_cache_pool_mapping
@@ -1183,15 +960,11 @@ def trtllm_mha_with_cache(
         last_page_len_host,
         seq_len_with_cache_host,
         state,
-        kv_cache,  # Unified KV cache
+        kv_cache,
         ad_pool_pointers=ad_pool_pointers,
         ad_pool_mapping=ad_pool_mapping,
     )
 
-    # Compute softmax scale
-    # sm_scale = scale if scale is not None else (1.0 / (head_dim**0.5))
-
-    # Attention window (full attention)
     attention_window_size = max_context_length
 
     # Pack parameters for thop.attention
@@ -1200,7 +973,6 @@ def trtllm_mha_with_cache(
     spec_decoding_bool_params = [False, False, False]
     spec_decoding_tensor_params = [None, None, None]
 
-    # Add extra params for newer TRT-LLM versions
     sm_version = get_sm_version()
     if sm_version >= 89:  # Ada/Hopper
         spec_decoding_tensor_params.extend([None, None, None])
@@ -1208,7 +980,6 @@ def trtllm_mha_with_cache(
     mla_tensor_params = [None, None]
 
     try:
-        thop = _get_thop()
         thop.attention(
             qkv_fused,  # q (actually fused QKV)
             None,  # k (None when using fused QKV)
@@ -1226,8 +997,8 @@ def trtllm_mha_with_cache(
             host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
             host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
             None,  # cache_indirection (beam search)
-            _trtllm_config._kv_scale_orig_quant,  # kv_scale_orig_quant (FP8 KV cache)
-            _trtllm_config._kv_scale_quant_orig,  # kv_scale_quant_orig (FP8 KV cache)
+            _trtllm_config._kv_scale_orig_quant,  # kv_scale_orig_quant
+            _trtllm_config._kv_scale_quant_orig,  # kv_scale_quant_orig
             None,  # out_scale
             None,  # rotary_inv_freq
             None,  # rotary_cos_sin
@@ -1235,32 +1006,32 @@ def trtllm_mha_with_cache(
             None,  # q_pe (MLA)
             None,  # block_ids_per_seq
             None,  # attention_sinks
-            True,  # is_fused_qkv (Q contains [Q,K,V] concatenated)
+            True,  # is_fused_qkv
             True,  # update_kv_cache
             1,  # predicted_tokens_per_seq
             layer_idx,  # layer_idx
             num_heads,  # num_heads
             num_kv_heads,  # num_kv_heads
             head_dim,  # head_size
-            kv_cache.shape[3],  # tokens_per_block - use actual value from kv_cache shape!
+            kv_cache.shape[3],  # tokens_per_block
             max_num_requests,  # max_num_requests
             max_context_length,  # max_context_length
             attention_window_size,  # attention_window_size
             0,  # sink_token_length
             1,  # beam_width
             int(AttentionMaskType.causal),  # mask_type
-            _trtllm_config._quant_mode,  # quant_mode (128 for FP8 KV cache, 0 otherwise)
-            1.0,  # q_scaling (scaling factor applied to Q, typically 1.0)
-            0,  # position_embedding_type (none - RoPE applied outside)
+            _trtllm_config._quant_mode,  # quant_mode
+            1.0,  # q_scaling
+            0,  # position_embedding_type
             0,  # rotary_embedding_dim
             10000.0,  # rotary_embedding_base
             0,  # rotary_embedding_scale_type
             rotary_embedding_scales,  # rotary_embedding_scales
             rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
-            True,  # use_paged_context_fmha - True for paged KV cache
-            0,  # attention_input_type - 0=mixed (context + generation)
+            True,  # use_paged_context_fmha
+            0,  # attention_input_type
             False,  # is_mla_enable
-            max_num_requests,  # chunked_prefill_buffer_batch_size - MUST be constant for CUDA graph cache key
+            max_num_requests,  # chunked_prefill_buffer_batch_size (constant for CUDA graph)
             None,  # q_lora_rank (MLA)
             None,  # kv_lora_rank (MLA)
             None,  # qk_nope_head_dim (MLA)
@@ -1289,8 +1060,6 @@ def trtllm_mha_with_cache(
             None,  # mla_bmm2_scale
             None,  # quant_q_buffer
         )
-        # No need to copy back - thop.attention writes directly to pool memory
-        # via pool_pointers + block_offsets, not through the kv_cache tensor
     except Exception as e:
         raise RuntimeError(
             f"TRT-LLM attention failed at layer {layer_idx}: {e}\n"
@@ -1299,7 +1068,6 @@ def trtllm_mha_with_cache(
             f"  kv_cache.shape={kv_cache.shape}"
         ) from e
 
-    # Reshape output back to AD format [b, s, num_heads * head_dim]
     # Reshape output back to AD format [b, s, num_heads * head_dim]
     # Pad back to original batch*seq size if needed
     if output.shape[0] < b * s:
@@ -1339,11 +1107,7 @@ def trtllm_mha_with_cache_fake(
 
 
 class TrtllmAttentionConfig:
-    """Configuration holder for TRT-LLM attention backend.
-
-    This class stores runtime configuration that's set during cache initialization
-    and used when constructing the attention op constants.
-    """
+    """Configuration holder for TRT-LLM attention backend."""
 
     _instance = None
 
@@ -1382,8 +1146,6 @@ class TrtllmAttentionConfig:
         self.max_seq_len = si.max_seq_len
         self.max_num_tokens = si.max_num_tokens
         self.is_configured = True
-
-        # Store SequenceInfo reference for AD pool pointer access
         self._sequence_info = si
 
     def set_model_config(
@@ -1393,14 +1155,7 @@ class TrtllmAttentionConfig:
         head_dim: int,
         dtype: torch.dtype,
     ):
-        """Set model configuration.
-
-        Args:
-            num_layers: Total number of attention layers
-            num_kv_heads_per_layer: Number of KV heads for each layer
-            head_dim: Head dimension
-            dtype: Cache data type
-        """
+        """Set model configuration."""
         self._num_layers = num_layers
         self._num_kv_heads_per_layer = num_kv_heads_per_layer
         self._head_dim = head_dim
@@ -1408,9 +1163,7 @@ class TrtllmAttentionConfig:
 
         # Initialize FP8 KV cache support if dtype is FP8
         if dtype == torch.float8_e4m3fn:
-            # FP8_KV_CACHE quant mode = 128 (from tensorrt_llm.quantization.mode.QuantMode)
             self._quant_mode = 128
-            # Default KV scales (1.0) - for FP8 models, scale is typically 1.0
             self._kv_scale_orig_quant = torch.ones(1, dtype=torch.float32, device="cuda")
             self._kv_scale_quant_orig = torch.ones(1, dtype=torch.float32, device="cuda")
         else:
@@ -1425,17 +1178,7 @@ _trtllm_config = TrtllmAttentionConfig()
 
 @AttentionRegistry.register("trtllm")
 class TrtllmAttention(AttentionDescriptor):
-    """TRT-LLM attention backend for Auto-Deploy.
-
-    This backend uses the optimized thop.attention kernel from TRT-LLM,
-    providing better performance than FlashInfer on certain workloads.
-
-    Note: This backend assumes RoPE is applied outside the attention kernel,
-    which matches AD's current pattern.
-
-    Usage:
-        Set `backend: trtllm` in your AD config under `insert_cached_attention`.
-    """
+    """TRT-LLM attention backend for Auto-Deploy."""
 
     # Class-level counter for layer indices
     _layer_counter: int = 0
@@ -1464,11 +1207,7 @@ class TrtllmAttention(AttentionDescriptor):
 
     @classmethod
     def _track_layer_config(cls, num_kv_heads: int, head_dim: int, dtype: torch.dtype) -> None:
-        """Track layer configuration.
-
-        This is called for each layer during graph analysis to collect
-        the per-layer KV head counts needed for model configuration.
-        """
+        """Track layer configuration."""
         cls._num_kv_heads_per_layer.append(num_kv_heads)
         cls._head_dim = head_dim
         cls._dtype = dtype
@@ -1517,43 +1256,25 @@ class TrtllmAttention(AttentionDescriptor):
         cls, any_source_attn_node: Node
     ) -> Tuple[Optional[PrepareMetadataCallable], int, List[Constant]]:
         """Get the prepare_metadata op info."""
-        # TRT-LLM doesn't need extra metadata preparation like FlashInfer
         return (None, 0, [])
 
     @classmethod
     def configure_from_sequence_info(cls, si: SequenceInfo) -> None:
-        """Configure TRT-LLM backend from SequenceInfo.
-
-        This must be called BEFORE get_constants() to ensure the correct
-        config values (max_batch_size, max_seq_len, etc.) are used for
-        constants embedded in the graph.
-
-        Args:
-            si: SequenceInfo containing batch and sequence configuration.
-        """
+        """Configure TRT-LLM backend from SequenceInfo."""
         _trtllm_config.configure(si)
 
     @classmethod
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: CacheConfig
     ) -> ResourceHandlerDict:
-        """Provide resource handlers for cache initialization.
-
-        Returns a single unified KV cache handler (kv_factor=2) that can be managed
-        by AD's KVCacheManager for direct pool integration.
-        """
-        # Extract tensor shapes from source node
+        """Provide resource handlers for cache initialization."""
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         num_kv_heads = k_fake.shape[2]
         head_dim = k_fake.shape[3]
-        # Resolve dtype from config string to torch.dtype
         dtype = cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype)
-
-        # Get current layer index
-        layer_idx = cls._layer_counter  # Current layer being processed
+        layer_idx = cls._layer_counter
 
         return {
-            # Single unified KV cache with kv_factor=2 (K and V combined)
             "kv_cache": TrtllmKVResourceHandler(
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
@@ -1567,10 +1288,7 @@ class TrtllmAttention(AttentionDescriptor):
 
     @classmethod
     def get_host_prepare_metadata_function(cls) -> Optional[PrepareMetadataHostCallable]:
-        """Get function that performs host-side prep for attention.
-
-        Returns host_prepare function that runs OUTSIDE CUDA graphs to update tensors.
-        """
+        """Get function that performs host-side prep for attention."""
         return _global_state.create_host_prepare_function()
 
     @classmethod
@@ -1587,7 +1305,6 @@ class TrtllmAttention(AttentionDescriptor):
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Provide constant arguments to be passed to the attention op."""
-        # Sanity check layout
         layout = source_attn_node.kwargs.get("layout", None)
         if (
             layout is None
@@ -1601,11 +1318,9 @@ class TrtllmAttention(AttentionDescriptor):
                 f"for node: {source_attn_node.format_node()}"
             )
 
-        # Extract attention parameters
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
-        # Get scale
         if len(source_attn_node.args) > 6:
             scale = source_attn_node.args[6]
         else:
@@ -1615,7 +1330,6 @@ class TrtllmAttention(AttentionDescriptor):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
-        # Extract tensor shapes for constants
         q_fake: FakeTensor = source_attn_node.args[0].meta["val"]
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
 
@@ -1624,27 +1338,22 @@ class TrtllmAttention(AttentionDescriptor):
         head_dim = k_fake.shape[3]
         dtype = k_fake.dtype
 
-        # Track layer configuration for model config
         cls._track_layer_config(num_kv_heads, head_dim, dtype)
-
-        # Get layer index
         layer_idx = cls._get_next_layer_idx()
 
-        # Use configured values if available, otherwise defaults
         tokens_per_block = _trtllm_config.page_size
         max_num_requests = _trtllm_config.max_batch_size
         max_context_length = _trtllm_config.max_seq_len
 
-        # Return constants in order expected by trtllm_mha_with_cache
         return [
-            layer_idx,  # layer_idx
-            scale,  # scale
-            num_heads,  # num_heads
-            num_kv_heads,  # num_kv_heads
-            head_dim,  # head_dim
-            tokens_per_block,  # tokens_per_block (from AD's page_size)
-            max_num_requests,  # max_num_requests (from AD's max_batch_size)
-            max_context_length,  # max_context_length (from AD's max_seq_len)
+            layer_idx,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            tokens_per_block,
+            max_num_requests,
+            max_context_length,
         ]
 
 
@@ -1654,12 +1363,5 @@ class TrtllmAttention(AttentionDescriptor):
 
 
 def reset_trtllm_attention_state() -> None:
-    """Reset all TRT-LLM attention state.
-
-    Call this before building a new model to ensure clean state.
-    This resets:
-    - Layer counter
-    - Global state (per-layer states, workspace)
-    - Configuration (page size, batch size, etc.)
-    """
+    """Reset all TRT-LLM attention state."""
     TrtllmAttention._reset_layer_counter()
