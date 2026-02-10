@@ -1,8 +1,7 @@
-import warnings
 from itertools import chain
-from typing import List, Optional, Tuple
+from typing import Optional
 
-import torch
+from ordered_set import OrderedSet
 
 from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
@@ -11,59 +10,57 @@ from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
-from .suffix_automaton import SAConfig, SuffixAutomatonManager
 
 
 class NGramPoolManager(BaseResourceManager):
     """
     DEPRECATED: This class is kept for backward compatibility with user-provided drafter mode.
-    For new code, use NGramDecodingConfig directly for NGram speculative decoding.
+    For new code, use NGramResourceManager directly for NGram speculative decoding.
 
-    Manager for NGram speculative decoding using suffix automaton.
 
-    Uses a suffix automaton (SA) to efficiently find matching patterns in
-    previously generated tokens. This provides CUDA-compatible pattern matching
-    with O(L) lookup complexity where L is the match length.
+    For example, one of the existed pairs could be: ["I","love"] -> [["apple", "because", "it", "is"], ["banana", "and"]].
 
-    The SA maintains per-request state and supports two matching modes:
-    - Fixed-size ngram: Tries ngram sizes N, N-1, ..., 1 until a match is found
-    - Longest match: Returns the longest matching suffix (max_matching_ngram_size=-1)
+    Here we call ["I","love"] as `pattern`, and [["apple", "because", "it", "is"], ["banana", "and"]] as `matches`.
+
+    `pattern` is a list of token ids. The pool emits corresponding draft tokens from the matches if the pattern appears at the tail of the generated sentence.
+
+    `matches` is a list of candidate draft token ids attaching to a pattern.
 
     Arguments:
         max_total_draft_tokens: int
-            The maximum number of draft tokens to generate.
+            The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
 
         max_matching_ngram_size: int
-            The ngram size for pattern matching:
-            - Positive value (e.g., 3): Fixed-size ngram matching
-            - -1: Use suffix automaton for longest possible match
+            The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
+
+        is_keep_all: bool = True
+            Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
+
+        is_use_oldest: bool = True
+            Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
+
+        is_public_pool: bool = True
+            Whether to use a common pool for all requests, or the pool is private for each request if False.
+
+    Members:
+        pool: dict[tuple[int], OrderedSet[int]] or dict[int, dict[tuple[int], OrderedSet[int]]]
+            If is_public_pool == True, it maps from patterns to matches
+            If is_public_pool == False, it maps from request ID to the request-specific pool
+
+        start_index: dict[int, int]
+            It maps from request ID to the index of the prompt to update the pool in the next step.
     """
 
-    def __init__(self,
-                 spec_config: "NGramDecodingConfig",
-                 max_num_requests: int,
-                 max_seq_len: int = 262144):
-        warnings.warn(
-            "NGramPoolManager is deprecated. Use NGramDecodingConfig directly "
-            "for NGram speculative decoding. This class is kept only for "
-            "backward compatibility with UserProvidedDecodingConfig.",
-            DeprecationWarning,
-            stacklevel=2)
+    def __init__(self, spec_config: "NGramDecodingConfig",
+                 max_num_requests: int):
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
+        self.is_keep_all = spec_config.is_keep_all
+        self.is_use_oldest = spec_config.is_use_oldest  # TODO: remove this if updating strategy is supported
+        self.is_public_pool = spec_config.is_public_pool
         self.max_num_requests = max_num_requests
-        self.max_seq_len = max_seq_len
-
-        # Initialize suffix automaton manager
-        sa_config = SAConfig(
-            max_seq_len=max_seq_len,
-            max_slots=max_num_requests,
-            threshold=1  # Minimum match length
-        )
-        self._sa_manager = SuffixAutomatonManager(sa_config, max_num_requests)
-
-        # Track token counts for incremental updates
-        self._token_counts: dict[int, int] = {}
+        self.pool = {}
+        self.start_index = {}
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
@@ -75,13 +72,18 @@ class NGramPoolManager(BaseResourceManager):
         pass
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
-        # Remove completed requests
+        if self.is_public_pool:
+            # TODO: Here should be an strategy to update the pool in public pool mode.
+            return
+
+        # Remove the pairs if the request is completed in private pool mode.
         for request in chain(scheduled_batch.context_requests,
                              scheduled_batch.generation_requests):
             if request.state == LlmRequestState.GENERATION_COMPLETE:
                 request_id = request.request_id
-                self._sa_manager.remove_request(request_id)
-                self._token_counts.pop(request_id, None)
+                if request_id in self.pool:
+                    self.pool.pop(request_id)
+                    self.start_index.pop(request_id)
 
     def get_draft_tokens(
         self,
@@ -89,139 +91,84 @@ class NGramPoolManager(BaseResourceManager):
         request_id: int,
         max_sequence_length: int,
     ):
-        """
-        Get draft tokens using suffix automaton pattern matching.
-
-        Uses the native CUDA kernel via extend_ngram() with batch size 1.
-        This ensures we use the native implementation rather than Python fallback.
-
-        Args:
-            prefix: List of token IDs generated so far
-            request_id: Unique identifier for this request
-            max_sequence_length: Maximum allowed sequence length
-
-        Returns:
-            List of draft token IDs
-        """
         prefix_len = len(prefix)
-        max_draft_len = min(self.max_total_draft_tokens,
-                            max_sequence_length - 1 - prefix_len)
-
-        if max_draft_len <= 0:
+        max_draft_token_length_this_step = max_sequence_length - 1 - prefix_len
+        if max_draft_token_length_this_step <= 0:  # No draft token is need if the prefix is long enough
             return []
 
-        # Initialize or update the SA state for this request
-        if request_id not in self._token_counts:
-            # New request - build SA from scratch
-            self._sa_manager.add_request(request_id, prefix)
-            self._token_counts[request_id] = prefix_len
-            # No new tokens to extend, just do lookup
-            new_tokens = []
-        else:
-            # Existing request - get new tokens to extend
-            prev_count = self._token_counts[request_id]
-            if prefix_len > prev_count:
-                new_tokens = prefix[prev_count:]
-                self._token_counts[request_id] = prefix_len
-            else:
-                new_tokens = []
+        if request_id not in self.start_index:  # Extend start_index and pool for a new request
+            self.start_index[request_id] = 0
+            if not self.is_public_pool:
+                self.pool[request_id] = {}
 
-        # Prepare batch for single request
-        self._sa_manager.prepare([request_id], max_draft_len)
+        pool = (self.pool if self.is_public_pool else self.pool[request_id])
 
-        # Create tensors for single-request batch
-        # accepted_tokens contains the new tokens to extend the SA with
-        num_new = len(new_tokens)
-        accepted_tokens = torch.zeros((1, max(num_new, 1)),
-                                      dtype=torch.int32,
-                                      device='cuda')
-        if num_new > 0:
-            accepted_tokens[0, :num_new] = torch.tensor(new_tokens,
-                                                        dtype=torch.int32)
-        num_accepted_tokens = torch.tensor([num_new],
-                                           dtype=torch.int32,
-                                           device='cuda')
+        # Update pool
+        sequence = prefix[self.start_index[request_id]:]
+        for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
+                          -1):
+            # Find each possible pattern-match combination, and use tuple for hash
+            for l in range(len(sequence) - size):
+                r = min(l + size + self.max_total_draft_tokens, len(sequence))
+                pattern = tuple(sequence[l:l + size])
+                new_match = tuple(sequence[l + size:r])
+                if pattern not in pool or \
+                    (not self.is_keep_all and len(new_match) > len(pool[pattern][0])):
+                    # Replace the match if
+                    # 1. the pattern does not exist in the pool
+                    # 2. only one match is kept, and the new match is longer (MRU)
+                    pool[pattern] = OrderedSet((new_match, ))
+                elif new_match not in pool[pattern]:
+                    # Update the matches if the pattern is already existed:
+                    # TODO: need a strategy to maintain the short candidates, now we just remove them
+                    # Drop all existed matches with small length
+                    for match in pool[pattern]:
+                        if len(match) < len(new_match):
+                            pool[pattern].remove(match)
+                    pool[pattern].add(new_match)
 
-        # Use native kernel via extend_ngram with batch size 1
-        match_len, draft_tokens = self._sa_manager.extend_ngram(
-            [request_id],
-            accepted_tokens,
-            num_accepted_tokens,
-            max_draft_len,
-            max_ngram_size=self.max_matching_ngram_size)
+        draft_tokens = []
+        for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
+                          -1):
+            pattern = tuple(prefix[-size:])
+            if pattern not in pool:
+                continue
+            draft_tokens = pool[pattern][0 if self.is_use_oldest else -1]
+            draft_tokens = list(draft_tokens)[:max_draft_token_length_this_step]
+            break
 
-        # Extract results from tensors
-        match_length = match_len[0].item()
-        if match_length == 0:
-            return []
+        # Update start_index
+        self.start_index[request_id] = max(
+            0, prefix_len -
+            (self.max_total_draft_tokens + self.max_matching_ngram_size - 1))
 
-        # Convert draft tokens tensor to list
-        draft_list = draft_tokens[0, :max_draft_len].tolist()
-
-        # Trim trailing zeros (padding)
-        while draft_list and draft_list[-1] == 0:
-            draft_list.pop()
-
-        return draft_list
+        return draft_tokens
 
     def print_pool(self):  # For debug
-        """Print debug information about the SA states."""
-        logger.debug(f"NGramPoolManager using SuffixAutomaton")
-        logger.debug(f"Active requests: {len(self._token_counts)}")
-        for request_id, token_count in self._token_counts.items():
-            logger.debug(f"  Request {request_id}: {token_count} tokens")
+        if self.is_public_pool:
+            logger.debug(f"Using public pool, size = {len(self.pool)}")
+            self._print_line(self.pool)
+        else:
+            logger.debug(f"Using private pool")
+            for request_id, request_map in self.pool.items():
+                logger.debug(f"Request {request_id}, size={len(request_map)}")
+                self._print_line(request_map, 4)
 
-    def prepare_batch_draft_tokens(
-            self, request_ids: List[int], accepted_tokens: torch.Tensor,
-            num_accepted_tokens: torch.Tensor,
-            max_draft_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Batched draft token generation using the CUDA kernel.
-
-        This method is CUDA graph compatible when the native kernel is available.
-        It extends the SA states with accepted tokens and performs ngram matching
-        in a single batched GPU operation.
-
-        Args:
-            request_ids: List of request IDs in the batch
-            accepted_tokens: [batch_size, max_draft_len + 1] tensor of accepted tokens
-            num_accepted_tokens: [batch_size] tensor of number of accepted tokens per request
-            max_draft_len: Maximum number of draft tokens to generate
-
-        Returns:
-            Tuple of (match_len, draft_tokens) tensors:
-            - match_len: [batch_size] tensor of match lengths
-            - draft_tokens: [batch_size, max_draft_len] tensor of draft token IDs
-        """
-        # Prepare batch indices for the SA manager
-        self._sa_manager.prepare(request_ids, max_draft_len)
-
-        # Use the batched extend_ngram method
-        return self._sa_manager.extend_ngram(
-            request_ids,
-            accepted_tokens,
-            num_accepted_tokens,
-            max_draft_len,
-            max_ngram_size=self.max_matching_ngram_size)
+    def _print_line(self, local_map, indentation=0):  # For debug
+        for pattern, matches in local_map.items():
+            output = " " * indentation + str(pattern) + "->"
+            for match in matches:
+                output += str(match) + ", "
+            logger.debug(output)
 
 
 class NGramDrafter(Drafter):
-    """
-    DEPRECATED: This class is kept for backward compatibility with user-provided drafter mode.
-    For new code, use NGramDecodingConfig directly for NGram speculative decoding.
-    """
 
     def __init__(
         self,
         spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
     ):
-        warnings.warn(
-            "NGramDrafter is deprecated. Use NGramDecodingConfig directly "
-            "for NGram speculative decoding. This class is kept only for "
-            "backward compatibility with UserProvidedDecodingConfig.",
-            DeprecationWarning,
-            stacklevel=2)
         super().__init__(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,
@@ -239,107 +186,25 @@ class NGramDrafter(Drafter):
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
-        """Batched draft token generation using CUDA kernel.
-
-        This processes all generation requests in a single batched call to
-        extend_ngram(), reducing kernel launch overhead and enabling better
-        GPU utilization compared to per-request processing.
-        """
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.
-        requests = sorted(
-            scheduled_requests.generation_requests,
-            key=lambda r:
+        for request in sorted(
+                scheduled_requests.generation_requests,
+                key=lambda r:
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
-        )
-
-        if not requests:
-            return
-
-        batch_size = len(requests)
-        request_ids = []
-        all_new_tokens = []
-        max_new_tokens = 0
-        max_draft_lens = []
-
-        mgr = self.spec_resource_manager
-
-        # Phase 1: Collect data and initialize new requests
-        for request in requests:
-            request_id = request.request_id
+        ):
+            # Add new token to a copy of the generated tokens to find new draft tokens
             prefix = list(request.get_tokens(0))  # Get a copy
-            prefix_len = len(prefix)
 
-            max_seq_len = request.py_orig_prompt_len + request.py_max_new_tokens
-            max_draft_len = min(self.max_total_draft_tokens,
-                                max_seq_len - 1 - prefix_len)
-            max_draft_lens.append(max(0, max_draft_len))
-
-            # Initialize or get incremental tokens
-            if request_id not in mgr._token_counts:
-                # New request - initialize SA with context
-                mgr._sa_manager.add_request(request_id, prefix)
-                mgr._token_counts[request_id] = prefix_len
-                new_tokens = []
-            else:
-                # Existing request - compute new tokens since last call
-                prev_count = mgr._token_counts[request_id]
-                if prefix_len > prev_count:
-                    new_tokens = prefix[prev_count:]
-                    mgr._token_counts[request_id] = prefix_len
-                else:
-                    new_tokens = []
-
-            request_ids.append(request_id)
-            all_new_tokens.append(new_tokens)
-            max_new_tokens = max(max_new_tokens, len(new_tokens))
-
-        # Phase 2: Build batched tensors
-        max_draft_len = max(
-            max_draft_lens) if max_draft_lens else self.max_total_draft_tokens
-        if max_draft_len <= 0:
-            for request in requests:
-                request.py_draft_tokens = []
-            return
-
-        # Pad accepted_tokens to max_new_tokens (or at least 1)
-        padded_len = max(max_new_tokens, 1)
-        accepted_tokens = torch.zeros((batch_size, padded_len),
-                                      dtype=torch.int32,
-                                      device='cuda')
-        num_accepted_tokens = torch.zeros((batch_size, ),
-                                          dtype=torch.int32,
-                                          device='cuda')
-
-        for i, new_tokens in enumerate(all_new_tokens):
-            if new_tokens:
-                accepted_tokens[i, :len(new_tokens)] = torch.tensor(
-                    new_tokens, dtype=torch.int32, device='cuda')
-            num_accepted_tokens[i] = len(new_tokens)
-
-        # Phase 3: Batched extend_ngram call
-        mgr._sa_manager.prepare(request_ids, max_draft_len)
-        match_len, draft_tokens = mgr._sa_manager.extend_ngram(
-            request_ids,
-            accepted_tokens,
-            num_accepted_tokens,
-            max_draft_len,
-            max_ngram_size=mgr.max_matching_ngram_size)
-
-        # Phase 4: Extract results back to requests
-        match_len_cpu = match_len.cpu().tolist()
-        draft_tokens_cpu = draft_tokens.cpu().tolist()
-
-        for i, request in enumerate(requests):
-            if match_len_cpu[i] == 0 or max_draft_lens[i] <= 0:
-                request.py_draft_tokens = []
-            else:
-                # Trim to actual draft length and remove trailing zeros
-                drafts = draft_tokens_cpu[i][:max_draft_lens[i]]
-                while drafts and drafts[-1] == 0:
-                    drafts.pop()
-                request.py_draft_tokens = drafts
+            # Generate draft tokens
+            draft_tokens = self.spec_resource_manager.get_draft_tokens(
+                prefix,
+                request.request_id,
+                max_sequence_length=request.py_orig_prompt_len +
+                request.py_max_new_tokens,
+            )
+            request.py_draft_tokens = draft_tokens
 
     def update_max_total_draft_tokens(self,
                                       new_max_total_draft_tokens: int) -> None:

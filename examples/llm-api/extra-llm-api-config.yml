@@ -1,5 +1,5 @@
-speculative_config:
-  decoding_type: "MTP"
-  num_nextn_predict_layers: 8
-  use_sa_spec: true
-  sa_spec_threshold: 4
+cuda_graph_config:
+    enable_padding: True
+    max_batch_size: 16
+moe_config:
+    backend: trtllm

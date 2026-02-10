@@ -1,6 +1,0 @@
-kv_cache_config:
-  kv_cache_dtype: "bfloat16"
-speculative_config:
-  decoding_type: "MTP"
-  num_nextn_predict_layers: 8
-  use_sa_spec: false
