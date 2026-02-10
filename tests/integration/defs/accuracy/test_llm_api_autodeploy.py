@@ -69,8 +69,10 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    def test_auto_dtype(self, world_size, enable_chunked_prefill):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        kwargs["attn_backend"] = attn_backend
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
@@ -84,9 +86,11 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("world_size", [2, 4])
-    def test_attention_dp(self, world_size):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_attention_dp(self, world_size, attn_backend):
         """Test attention data parallelism mode where TP sharding is disabled."""
         kwargs = self.get_default_kwargs(enable_chunked_prefill=True)
+        kwargs["attn_backend"] = attn_backend
         # Enable attention DP - this disables TP sharding
         kwargs["transforms"]["detect_sharding"] = {"enable_attention_dp": True}
         sampling_params = self.get_default_sampling_params()
@@ -144,8 +148,11 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
     @pytest.mark.parametrize("ssm_backend", ["triton_ssm", "flashinfer_ssm"])
-    def test_auto_dtype(self, enable_chunked_prefill, ssm_backend):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_auto_dtype(self, enable_chunked_prefill, ssm_backend,
+                        attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        kwargs["attn_backend"] = attn_backend
         kwargs.setdefault("transforms", {})
         insert_ssm_cfg = {"backend": ssm_backend}
         if ssm_backend == "flashinfer_ssm":
@@ -211,8 +218,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 4])
-    def test_bf16(self, world_size):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_bf16(self, world_size, attn_backend):
         kwargs = self.get_default_kwargs(world_size=world_size)
+        kwargs["attn_backend"] = attn_backend
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
         kwargs["kv_cache_config"] = {"free_gpu_memory_fraction": 0.4}
@@ -229,8 +238,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 4])
-    def test_fp8(self, world_size):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_fp8(self, world_size, attn_backend):
         kwargs = self.get_default_kwargs(world_size=world_size)
+        kwargs["attn_backend"] = attn_backend
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
                            world_size=world_size,
@@ -246,8 +257,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize("world_size", [1, 2, 4])
-    def test_nvfp4(self, world_size):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_nvfp4(self, world_size, attn_backend):
         kwargs = self.get_default_kwargs()
+        kwargs["attn_backend"] = attn_backend
         with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
                            tokenizer=self.MODEL_PATH_NVFP4,
                            world_size=world_size,
@@ -307,8 +320,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     # 180GB works, might be able to go lower
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.skip_less_device(4)
-    def test_bf16(self):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_bf16(self, attn_backend):
         kwargs = self.get_default_kwargs()
+        kwargs["attn_backend"] = attn_backend
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
@@ -322,10 +337,12 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip("Skipping FP8 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [1, 4, 8])
-    def test_fp8(self, world_size):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_fp8(self, world_size, attn_backend):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
+        kwargs["attn_backend"] = attn_backend
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
@@ -343,10 +360,12 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip("Skipping FP4 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [1, 4, 8])
-    def test_fp4(self, world_size):
+    @pytest.mark.parametrize("attn_backend", ["trtllm", "flash_infer"])
+    def test_fp4(self, world_size, attn_backend):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
+        kwargs["attn_backend"] = attn_backend
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_FP4,
                            tokenizer=self.MODEL_PATH_FP4,
