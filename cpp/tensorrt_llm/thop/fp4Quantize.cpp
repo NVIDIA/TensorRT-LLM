@@ -249,13 +249,15 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
     TORCH_CHECK(X.dtype() == at::ScalarType::BFloat16 || X.dtype() == at::ScalarType::Float8_e4m3fn,
         "X must be a bf16 or fp8 tensor");
     TORCH_CHECK(input_scale.dtype() == at::ScalarType::Float, "input_scale must be a float32 tensor");
-
     int const M = X.size(0);
     int const KQ = X.size(1);
+    TORCH_CHECK(KE % 16 == 0, "KE must be divisible by 16");
+    TORCH_CHECK(KE <= KQ, "KE must be less than or equal to KQ");
     TORCH_CHECK(KQ % 16 == 0, "KQ must be divisible by 16");
     TORCH_CHECK(KQ <= 16384, "KQ must be less than or equal to 16384");
-    int const K = KQ + KE;
+    TORCH_CHECK(reorder_index.size(0) == KQ, "reorder_index must have size KQ");
 
+    int const K = KQ + KE;
     auto QX = at::detail::empty_cuda({M, K / 2}, FLOAT4_E2M1X2, X.device(), std::nullopt);
 
     bool isSfSwizzledLayout = true;

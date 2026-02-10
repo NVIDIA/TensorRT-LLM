@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "cutlass/numeric_conversion.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/arcquantFP4.h"
@@ -60,6 +76,7 @@ struct PackFp4
 namespace kernels
 {
 
+// Modified from ARCQuant.
 template <typename T, int GROUP_SIZE, ArcQuantType arcquant_type>
 __global__ void quantize_reorder_nvfp4_kernel(
     T* hidden_states, float* input_scale, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int KQ, int KE)

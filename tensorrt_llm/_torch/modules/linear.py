@@ -2732,7 +2732,9 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
                        out_features: int, bias: bool, dtype: torch.dtype):
         self.residual_dim = in_features
         self.in_features_with_residual = in_features + self.residual_dim
-        self.reorder_index = torch.arange(in_features, dtype=torch.int16)
+        self.reorder_index = torch.arange(in_features,
+                                          dtype=torch.int16,
+                                          requires_grad=False)
         super().create_weights(module, self.in_features_with_residual,
                                out_features, bias, dtype)
 
