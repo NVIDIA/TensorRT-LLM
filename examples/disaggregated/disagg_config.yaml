@@ -1,14 +1,24 @@
 hostname: localhost
-port: 42661
-backend: pytorch
-disagg_cluster:
-  cluster_uri: etcd://localhost:2379
-  cluster_name: test_cluster
-  heartbeat_interval_sec: 1
-  inactive_timeout_sec: 2
+port: 8000
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+free_gpu_memory_fraction: 0.25
+backend: "pytorch"
+disable_overlap_scheduler: True
 context_servers:
-  router:
-    type: round_robin
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+  cache_transceiver_config:
+    backend: "DEFAULT"
+  urls:
+      - "localhost:8001"
 generation_servers:
-  router:
-    type: round_robin
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: "DEFAULT"
+  urls:
+      - "localhost:8002"

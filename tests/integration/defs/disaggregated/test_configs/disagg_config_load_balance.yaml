@@ -35,7 +35,3 @@ generation_servers:
   disable_overlap_scheduler: false
   cache_transceiver_config:
     backend: DEFAULT
-disagg_cluster:
-  cluster_name: test_cluster
-  heartbeat_interval_sec: 1
-  inactive_timeout_sec: 2

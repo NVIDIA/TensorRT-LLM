@@ -37,7 +37,3 @@ generation_servers:
     enable_partial_reuse: false
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.1
-disagg_cluster:
-  cluster_name: test_cluster
-  heartbeat_interval_sec: 1
-  inactive_timeout_sec: 2

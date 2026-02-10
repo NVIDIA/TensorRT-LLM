@@ -65,7 +65,3 @@ generation_servers:
     max_tokens_in_buffer: 16384
   router:
     type: round_robin
-disagg_cluster:
-  cluster_name: test_cluster
-  heartbeat_interval_sec: 1
-  inactive_timeout_sec: 2

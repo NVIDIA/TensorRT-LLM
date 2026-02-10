@@ -68,6 +68,51 @@ def cleanup_output_files():
             pass
 
 
+def get_default_disagg_cluster_config():
+    """Get default disaggregated cluster configuration."""
+    return {
+        "cluster_name": "test_cluster",
+        "heartbeat_interval_sec": 1,
+        "inactive_timeout_sec": 2
+    }
+
+
+def build_worker_config(base_config, server_type_config, disagg_cluster):
+    """
+    Build worker configuration by merging base config with server-type specific config.
+
+    Args:
+        base_config: Full YAML config (top-level)
+        server_type_config: context_servers or generation_servers section
+        disagg_cluster: Service discovery config (injected by test)
+
+    Returns:
+        dict: Worker configuration for trtllm-serve
+    """
+    # Fields that should NOT go to workers (server-only)
+    SERVER_ONLY_FIELDS = {
+        'hostname', 'port', 'num_instances', 'urls', 'router',
+        'context_servers', 'generation_servers'
+    }
+
+    # Start with top-level fields (exclude server-only)
+    worker_config = {
+        k: v
+        for k, v in base_config.items() if k not in SERVER_ONLY_FIELDS
+    }
+
+    # Merge server-type specific config (overrides top-level)
+    worker_config.update({
+        k: v
+        for k, v in server_type_config.items() if k not in SERVER_ONLY_FIELDS
+    })
+
+    # Add service discovery config
+    worker_config['disagg_cluster'] = disagg_cluster
+
+    return worker_config
+
+
 def get_test_config(test_desc, example_dir, test_root):
     """Get test configuration based on test description."""
     test_configs_root = f"{test_root}/test_configs"
@@ -226,39 +271,6 @@ def setup_model_symlink(llm_venv, model_root, dest_subpath):
     if not os.path.islink(dst):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         os.symlink(model_root, dst, target_is_directory=True)
-
-
-def get_extra_llm_config(config, suffix, cwd):
-    extra_llm_config = {
-        'orchestrator_type': 'ray',
-    }
-    for key, value in config.items():
-        if key not in ['num_instances', 'urls']:
-            extra_llm_config[key] = value
-
-    temp_fd, extra_config_file = tempfile.mkstemp(suffix='_%s.yaml' % suffix,
-                                                  dir=cwd)
-    with os.fdopen(temp_fd, 'w') as f:
-        yaml.dump(extra_llm_config, f)
-
-    return extra_config_file
-
-
-def generate_worker_commands(model_path, config, server_config,
-                             extra_config_file, server_role):
-    worker_commands = []
-
-    assert model_path, "model path is required."
-
-    for url in server_config['urls']:
-        host, port = url.split(':')
-        cmd = [
-            'trtllm-serve', model_path, '--host', host, '--port', port,
-            '--backend', config['backend'], '--config', extra_config_file,
-            '--server_role', server_role
-        ]
-        worker_commands.append(cmd)
-    return worker_commands
 
 
 ClientTestSet = namedtuple('ClientTestSet', [
@@ -460,7 +472,7 @@ def run_disaggregated_test(example_dir,
         config = yaml.safe_load(f)
 
     # Extract server config
-    disagg_cluster = config.get("disagg_cluster", {})
+    disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
 
@@ -479,27 +491,26 @@ def run_disaggregated_test(example_dir,
             f"Using HTTP service discovery at {disagg_cluster['cluster_uri']}")
 
     # Auto-deduce minimal_instances from num_instances
-    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
-    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    num_ctx_instances = config.get("context_servers",
+                                   {}).get("num_instances", 1)
+    num_gen_instances = config.get("generation_servers",
+                                   {}).get("num_instances", 1)
     disagg_cluster["minimal_instances"] = {
-        "context_servers": ctx_instances,
-        "generation_servers": gen_instances
+        "context_servers": num_ctx_instances,
+        "generation_servers": num_gen_instances
     }
 
-    # Create worker config (separate from server config)
-    worker_config = {
-        "disagg_cluster":
-        disagg_cluster,
-        "disable_overlap_scheduler":
-        config.get("disable_overlap_scheduler", True),
-        "cache_transceiver_config":
-        config.get("cache_transceiver_config", {"backend": "DEFAULT"}),
-        "kv_cache_config":
-        config.get("kv_cache_config", {"free_gpu_memory_fraction": 0.2}),
-    }
+    # Create separate worker configs for context and generation
+    ctx_worker_config = build_worker_config(config,
+                                            config.get("context_servers", {}),
+                                            disagg_cluster)
+    gen_worker_config = build_worker_config(
+        config, config.get("generation_servers", {}), disagg_cluster)
 
-    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
-    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    num_ctx_instances = config.get("context_servers",
+                                   {}).get("num_instances", 1)
+    num_gen_instances = config.get("generation_servers",
+                                   {}).get("num_instances", 1)
 
     ctx_workers = []
     gen_workers = []
@@ -507,29 +518,30 @@ def run_disaggregated_test(example_dir,
 
     try:
         logger.info(
-            f"Starting {ctx_instances} context workers with service discovery")
+            f"Starting {num_ctx_instances} context workers with service discovery"
+        )
 
         # Launch context workers
-        for i in range(ctx_instances):
+        for i in range(num_ctx_instances):
             device = i  # Simple device assignment
             ctx_worker = run_ctx_worker(
                 model_path or config.get("model"),
-                worker_config,
+                ctx_worker_config,
                 work_dir,
                 port=0,  # Auto-assign port
                 device=device)
             ctx_workers.append(ctx_worker)
 
         logger.info(
-            f"Starting {gen_instances} generation workers with service discovery"
+            f"Starting {num_gen_instances} generation workers with service discovery"
         )
 
         # Launch generation workers
-        for i in range(gen_instances):
-            device = ctx_instances + i  # Offset by ctx workers
+        for i in range(num_gen_instances):
+            device = num_ctx_instances + i  # Offset by ctx workers
             gen_worker = run_gen_worker(
                 model_path or config.get("model"),
-                worker_config,
+                gen_worker_config,
                 work_dir,
                 port=0,  # Auto-assign
                 device=device  # Use calculated device index for multi-GPU
@@ -580,8 +592,8 @@ def run_disaggregated_test(example_dir,
         asyncio.run(wait_for_disagg_server_ready(server_port))
 
         verify_cluster_info(ready=True,
-                            ctx_workers=ctx_instances,
-                            gen_workers=gen_instances,
+                            ctx_workers=num_ctx_instances,
+                            gen_workers=num_gen_instances,
                             port=server_port)
 
         server_url = f"http://{server_host}:{server_port}"
@@ -1477,7 +1489,7 @@ def run_disaggregated_benchmark(example_dir,
         config = yaml.safe_load(f)
 
     # Setup service discovery
-    disagg_cluster = config.get("disagg_cluster", {})
+    disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
     work_dir = tempfile.mkdtemp()
@@ -1491,47 +1503,46 @@ def run_disaggregated_benchmark(example_dir,
         disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
 
     # Auto-deduce minimal_instances from num_instances
-    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
-    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    num_ctx_instances = config.get("context_servers",
+                                   {}).get("num_instances", 1)
+    num_gen_instances = config.get("generation_servers",
+                                   {}).get("num_instances", 1)
     disagg_cluster["minimal_instances"] = {
-        "context_servers": ctx_instances,
-        "generation_servers": gen_instances
+        "context_servers": num_ctx_instances,
+        "generation_servers": num_gen_instances
     }
 
-    # Create worker config
-    worker_config = {
-        "disagg_cluster":
-        disagg_cluster,
-        "disable_overlap_scheduler":
-        config.get("disable_overlap_scheduler", True),
-        "cache_transceiver_config":
-        config.get("cache_transceiver_config", {"backend": "DEFAULT"}),
-        "kv_cache_config":
-        config.get("kv_cache_config", {"free_gpu_memory_fraction": 0.2}),
-    }
+    # Create separate worker configs for context and generation
+    ctx_worker_config = build_worker_config(config,
+                                            config.get("context_servers", {}),
+                                            disagg_cluster)
+    gen_worker_config = build_worker_config(
+        config, config.get("generation_servers", {}), disagg_cluster)
 
-    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
-    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    num_ctx_instances = config.get("context_servers",
+                                   {}).get("num_instances", 1)
+    num_gen_instances = config.get("generation_servers",
+                                   {}).get("num_instances", 1)
 
     ctx_workers = []
     gen_workers = []
 
     # Launch context workers
-    for i in range(ctx_instances):
+    for i in range(num_ctx_instances):
         ctx_worker = run_ctx_worker(config.get("model"),
-                                    worker_config,
+                                    ctx_worker_config,
                                     work_dir,
                                     port=0,
                                     device=i)
         ctx_workers.append(ctx_worker)
 
     # Launch generation workers
-    for i in range(gen_instances):
+    for i in range(num_gen_instances):
         gen_worker = run_gen_worker(config.get("model"),
-                                    worker_config,
+                                    gen_worker_config,
                                     work_dir,
                                     port=0,
-                                    device=ctx_instances + i)
+                                    device=num_ctx_instances + i)
         gen_workers.append(gen_worker)
 
     # Create server config
@@ -1729,7 +1740,7 @@ def run_disaggregated_aiperf(config_file,
         config = yaml.safe_load(f)
 
     # Setup service discovery
-    disagg_cluster = config.get("disagg_cluster", {})
+    disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
     work_dir = tempfile.mkdtemp()
@@ -1743,47 +1754,46 @@ def run_disaggregated_aiperf(config_file,
         disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
 
     # Auto-deduce minimal_instances from num_instances
-    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
-    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    num_ctx_instances = config.get("context_servers",
+                                   {}).get("num_instances", 1)
+    num_gen_instances = config.get("generation_servers",
+                                   {}).get("num_instances", 1)
     disagg_cluster["minimal_instances"] = {
-        "context_servers": ctx_instances,
-        "generation_servers": gen_instances
+        "context_servers": num_ctx_instances,
+        "generation_servers": num_gen_instances
     }
 
-    # Create worker config
-    worker_config = {
-        "disagg_cluster":
-        disagg_cluster,
-        "disable_overlap_scheduler":
-        config.get("disable_overlap_scheduler", True),
-        "cache_transceiver_config":
-        config.get("cache_transceiver_config", {"backend": "DEFAULT"}),
-        "kv_cache_config":
-        config.get("kv_cache_config", {"free_gpu_memory_fraction": 0.2}),
-    }
+    # Create separate worker configs for context and generation
+    ctx_worker_config = build_worker_config(config,
+                                            config.get("context_servers", {}),
+                                            disagg_cluster)
+    gen_worker_config = build_worker_config(
+        config, config.get("generation_servers", {}), disagg_cluster)
 
-    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
-    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    num_ctx_instances = config.get("context_servers",
+                                   {}).get("num_instances", 1)
+    num_gen_instances = config.get("generation_servers",
+                                   {}).get("num_instances", 1)
 
     ctx_workers = []
     gen_workers = []
 
     # Launch context workers
-    for i in range(ctx_instances):
+    for i in range(num_ctx_instances):
         ctx_worker = run_ctx_worker(config.get("model"),
-                                    worker_config,
+                                    ctx_worker_config,
                                     work_dir,
                                     port=0,
                                     device=i)
         ctx_workers.append(ctx_worker)
 
     # Launch generation workers
-    for i in range(gen_instances):
+    for i in range(num_gen_instances):
         gen_worker = run_gen_worker(config.get("model"),
-                                    worker_config,
+                                    gen_worker_config,
                                     work_dir,
                                     port=0,
-                                    device=ctx_instances + i)
+                                    device=num_ctx_instances + i)
         gen_workers.append(gen_worker)
 
     # Create server config
@@ -2312,7 +2322,7 @@ def run_disaggregated_cancel_test(example_dir,
         config = yaml.safe_load(f)
 
     # Setup service discovery
-    disagg_cluster = config.get("disagg_cluster", {})
+    disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
     work_dir = tempfile.mkdtemp()
@@ -2326,47 +2336,46 @@ def run_disaggregated_cancel_test(example_dir,
         disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
 
     # Auto-deduce minimal_instances from num_instances
-    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
-    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    num_ctx_instances = config.get("context_servers",
+                                   {}).get("num_instances", 1)
+    num_gen_instances = config.get("generation_servers",
+                                   {}).get("num_instances", 1)
     disagg_cluster["minimal_instances"] = {
-        "context_servers": ctx_instances,
-        "generation_servers": gen_instances
+        "context_servers": num_ctx_instances,
+        "generation_servers": num_gen_instances
     }
 
-    # Create worker config
-    worker_config = {
-        "disagg_cluster":
-        disagg_cluster,
-        "disable_overlap_scheduler":
-        config.get("disable_overlap_scheduler", True),
-        "cache_transceiver_config":
-        config.get("cache_transceiver_config", {"backend": "DEFAULT"}),
-        "kv_cache_config":
-        config.get("kv_cache_config", {"free_gpu_memory_fraction": 0.2}),
-    }
+    # Create separate worker configs for context and generation
+    ctx_worker_config = build_worker_config(config,
+                                            config.get("context_servers", {}),
+                                            disagg_cluster)
+    gen_worker_config = build_worker_config(
+        config, config.get("generation_servers", {}), disagg_cluster)
 
-    ctx_instances = config.get("context_servers", {}).get("num_instances", 1)
-    gen_instances = config.get("generation_servers", {}).get("num_instances", 1)
+    num_ctx_instances = config.get("context_servers",
+                                   {}).get("num_instances", 1)
+    num_gen_instances = config.get("generation_servers",
+                                   {}).get("num_instances", 1)
 
     ctx_workers = []
     gen_workers = []
 
     # Launch context workers
-    for i in range(ctx_instances):
+    for i in range(num_ctx_instances):
         ctx_worker = run_ctx_worker(config.get("model"),
-                                    worker_config,
+                                    ctx_worker_config,
                                     work_dir,
                                     port=0,
                                     device=i)
         ctx_workers.append(ctx_worker)
 
     # Launch generation workers
-    for i in range(gen_instances):
+    for i in range(num_gen_instances):
         gen_worker = run_gen_worker(config.get("model"),
-                                    worker_config,
+                                    gen_worker_config,
                                     work_dir,
                                     port=0,
-                                    device=ctx_instances + i)
+                                    device=num_ctx_instances + i)
         gen_workers.append(gen_worker)
 
     # Create server config
