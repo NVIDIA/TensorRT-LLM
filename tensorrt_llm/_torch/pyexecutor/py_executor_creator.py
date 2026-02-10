@@ -313,6 +313,11 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+        # WAR for https://nvbugs/5807902
+        # Disable separate draft KV cache in disaggregated mode
+        if cache_transceiver_config is not None or kv_connector_config is not None:
+            spec_config._allow_separate_draft_kv_cache = False
+
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
@@ -449,6 +454,10 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
+    # Set default value for cache_transceiver_config.max_tokens_in_buffer
+    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
+        cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
+
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
@@ -560,6 +569,14 @@ def create_py_executor(
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
+
+        max_attention_window = kv_cache_config.max_attention_window
+        if max_attention_window is not None and len(
+                set(max_attention_window)) > 1:
+            raise NotImplementedError(
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+            )
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -611,6 +628,10 @@ def create_py_executor(
 
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
+
+        # Get draft config for one-engine speculative decoding if available
+        draft_config = getattr(model_engine.model, 'draft_config', None)
+
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
@@ -628,6 +649,7 @@ def create_py_executor(
             profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
+            draft_config=draft_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with allocation_scope(

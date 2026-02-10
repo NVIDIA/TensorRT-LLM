@@ -1,7 +1,7 @@
 import inspect
 import math
 from abc import ABC, abstractmethod
-from typing import Dict, List, NamedTuple, Optional, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -543,10 +543,9 @@ class FusedMoEMethodBase(ABC):
 
     def pre_reload_weights(self, module: torch.nn.Module):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            logger.warning(
-                f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
-            )
-            param = torch.nn.Parameter(torch.empty_like(metadata,
+            # Extract meta tensor from metadata dict
+            meta_tensor = metadata['meta']
+            param = torch.nn.Parameter(torch.empty_like(meta_tensor,
                                                         device="cuda"),
                                        requires_grad=False)
             module.register_parameter(param_name, param)
@@ -999,6 +998,23 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         super().post_load_weights(module)
 
 
+def resmooth_and_transform_fp8_scale(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Resmooth weight/scale to FP8 E8M0 and transform scale to required layout for MoE."""
+    resmoothed_weight, resmoothed_scale = resmooth_to_fp8_e8m0(
+        weight, weight_scale)
+    transformed_scale = transform_sf_into_required_layout(
+        resmoothed_scale,
+        mn=weight.shape[1],
+        k=weight.shape[2],
+        recipe=(1, 128, 128),
+        num_groups=weight.shape[0],
+        is_sfa=False)
+    return resmoothed_weight, transformed_scale
+
+
 class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
@@ -1007,53 +1023,70 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
-        if is_sm_100f():
-            expert_ids = set(module.initial_local_expert_ids)
-            if self.need_load_shared_weights(module):
-                expert_ids.update(
-                    module.layer_load_balancer.get_load_expert_ids())
-            for name in list(weights.keys()):
-                if name.endswith("weight_scale_inv"):
-                    if int(name.split(".")[0]) not in expert_ids:
-                        continue
-                    weight_name = name.replace("weight_scale_inv", "weight")
-                    logger.debug(f"Resmoothing {weight_name}")
-                    weight = weights[weight_name][:]
-                    scale = weights[name][:]
-                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
-                        weight, scale)
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
 
     def post_load_weights(self, module: torch.nn.Module):
-        super().post_load_weights(module)
         if is_sm_100f():
-            transfromed_w3_w1_scale = transform_sf_into_required_layout(
-                module.quant_scales[0],
-                mn=module.w3_w1_weight.shape[1],
-                k=module.w3_w1_weight.shape[2],
-                recipe=(1, 128, 128),
-                num_groups=module.w3_w1_weight.shape[0],
-                is_sfa=False)
-            transformed_w3_w1_weight_scaling_factor = nn.Parameter(
-                transfromed_w3_w1_scale, requires_grad=False)
-            replace_parameter_and_save_metadata(
-                module, "w3_w1_weight_scaling_factor",
-                transformed_w3_w1_weight_scaling_factor,
-                module.rebuild_tensor_metadata)
-            transfromed_w2_scale = transform_sf_into_required_layout(
-                module.quant_scales[1],
-                mn=module.w2_weight.shape[1],
-                k=module.w2_weight.shape[2],
-                recipe=(1, 128, 128),
-                num_groups=module.w3_w1_weight.shape[0],
-                is_sfa=False)
-            transformed_w2_weight_scaling_factor = nn.Parameter(
-                transfromed_w2_scale, requires_grad=False)
-            replace_parameter_and_save_metadata(
-                module, "w2_weight_scaling_factor",
-                transformed_w2_weight_scaling_factor,
-                module.rebuild_tensor_metadata)
+            # Resmooth shared experts before registering shared weights
+            if self.need_load_shared_weights(module):
+                local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+                )
+                if getattr(module, 'local_shared_w3_w1_tensors',
+                           None) is not None:
+                    num_shared_experts = len(local_shared_load_expert_ids)
+                    logger.debug(
+                        f"Batch resmoothing {num_shared_experts} shared experts"
+                    )
+
+                    local_shared_w3_w1_tensors = getattr(
+                        module, 'local_shared_w3_w1_tensors')
+                    local_shared_w3_w1_scale_tensors = getattr(
+                        module, 'local_shared_w3_w1_scale_tensors')
+                    local_shared_w2_tensors = getattr(
+                        module, 'local_shared_w2_tensors')
+                    local_shared_w2_scale_tensors = getattr(
+                        module, 'local_shared_w2_scale_tensors')
+
+                    resmoothed_shared_w3_w1_weight, transformed_shared_w3_w1_scale = resmooth_and_transform_fp8_scale(
+                        local_shared_w3_w1_tensors,
+                        local_shared_w3_w1_scale_tensors)
+                    setattr(module, 'local_shared_w3_w1_tensors',
+                            resmoothed_shared_w3_w1_weight.cpu())
+                    setattr(module, 'local_shared_w3_w1_scale_tensors',
+                            transformed_shared_w3_w1_scale.cpu())
+
+                    resmoothed_shared_w2_weight, transformed_shared_w2_scale = resmooth_and_transform_fp8_scale(
+                        local_shared_w2_tensors, local_shared_w2_scale_tensors)
+                    setattr(module, 'local_shared_w2_tensors',
+                            resmoothed_shared_w2_weight.cpu())
+                    setattr(module, 'local_shared_w2_scale_tensors',
+                            transformed_shared_w2_scale.cpu())
+
+        # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
+        super().post_load_weights(module)
+
+        if is_sm_100f():
+            logger.debug("Resmoothing FP8 weights in post_load_weights")
+            resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
+                module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
+            replace_parameter_and_save_metadata(module, "w3_w1_weight",
+                                                resmoothed_w3_w1_weight,
+                                                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module,
+                                                "w3_w1_weight_scaling_factor",
+                                                transformed_w3_w1_scale,
+                                                module.rebuild_tensor_metadata)
+
+            resmoothed_w2_weight, transformed_w2_scale = resmooth_and_transform_fp8_scale(
+                module.w2_weight, module.w2_weight_scaling_factor)
+            replace_parameter_and_save_metadata(module, "w2_weight",
+                                                resmoothed_w2_weight,
+                                                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module,
+                                                "w2_weight_scaling_factor",
+                                                transformed_w2_scale,
+                                                module.rebuild_tensor_metadata)
             self.setup_quant_scales(module)
 
 

@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 # Ensure custom ops are registered
-from tensorrt_llm._torch.auto_deploy.custom_ops import rms_norm  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization import rms_norm  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op

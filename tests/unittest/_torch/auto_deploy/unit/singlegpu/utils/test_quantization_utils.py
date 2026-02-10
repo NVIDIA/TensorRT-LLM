@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.quant import FP8_MAX
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import FP8_MAX
 from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
     FP8LinearQuantizationFromConfig,

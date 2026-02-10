@@ -14,9 +14,9 @@ GPU_RESOURCE_CONFIG = {
     },
     # Lyris GB200
     "GB200_LYRIS": {
-        "slurm_extra_args": "",  # GB200 does not require extra args
+        "slurm_extra_args": "",  # GB300 does not require extra args
         "set_segment": True,
-        "lock_freq_graphics_mhz": None,  # TODO: Set GB200 lock frequency
+        "lock_freq_graphics_mhz": None,  # TODO: Set GB300 lock frequency
         "lock_freq_memory_mhz": None,
     },
     # Lyris GB300

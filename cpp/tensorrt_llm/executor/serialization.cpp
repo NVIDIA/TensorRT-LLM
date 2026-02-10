@@ -544,12 +544,13 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto attentionType = su::deserialize<decltype(CacheState::AttentionConfig::mAttentionType)>(is);
     auto kvFactor = su::deserialize<decltype(CacheState::AttentionConfig::mKvFactor)>(is);
     auto enableBlockReuse = su::deserialize<bool>(is);
+    auto enablePartialReuse = su::deserialize<bool>(is);
     auto hasIndexerKCache = su::deserialize<bool>(is);
     auto indexerDimPerHead = su::deserialize<decltype(CacheState::ModelConfig::mSizePerHead)>(is);
     auto indexerKCacheQuantBlockSize = su::deserialize<decltype(CacheState::ModelConfig::mTokensPerBlock)>(is);
     return CacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
         contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
-        DPsize, enableBlockReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
+        DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
 }
 
 void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& os)
@@ -568,6 +569,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.mAttentionConfig.mAttentionType, os);
     su::serialize(state.mAttentionConfig.mKvFactor, os);
     su::serialize(state.mEnableBlockReuse, os);
+    su::serialize(state.mEnablePartialReuse, os);
     su::serialize(state.getHasIndexerKCache(), os);
     su::serialize(state.getIndexerDimPerHead(), os);
     su::serialize(state.getIndexerKCacheQuantBlockSize(), os);
@@ -590,6 +592,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.mAttentionConfig.mAttentionType);
     totalSize += su::serializedSize(state.mAttentionConfig.mKvFactor);
     totalSize += su::serializedSize(state.mEnableBlockReuse);
+    totalSize += su::serializedSize(state.mEnablePartialReuse);
     totalSize += su::serializedSize(state.getHasIndexerKCache());
     totalSize += su::serializedSize(state.getIndexerDimPerHead());
     totalSize += su::serializedSize(state.getIndexerKCacheQuantBlockSize());

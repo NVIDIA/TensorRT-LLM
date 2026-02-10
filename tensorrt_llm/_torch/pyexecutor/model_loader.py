@@ -364,7 +364,12 @@ class ModelLoader:
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
-            allowed_backends)
+            allowed_backends,
+            use_cute_dsl_blockscaling_mm=self.llm_args.
+            use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_blockscaling_bmm=self.llm_args.
+            use_cute_dsl_blockscaling_bmm,
+        )
 
         # Only pass model_kwargs if it's explicitly set (not None)
         if self.llm_args.model_kwargs is not None:
