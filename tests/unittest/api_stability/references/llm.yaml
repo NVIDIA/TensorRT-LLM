@@ -211,6 +211,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.RayPlacementConfig]
         default: null
         status: prototype
+      ray_worker_nsight_options:
+        annotation: Optional[dict]
+        default: null
+        status: prototype
       enable_sleep:
         annotation: bool
         default: False
