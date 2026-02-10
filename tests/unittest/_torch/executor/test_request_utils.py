@@ -19,7 +19,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     merge_requests,
     schedule_attention_dp_requests,
 )
-from tensorrt_llm._torch.pyexecutor.waiting_queue import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.mapping import CpType
 
