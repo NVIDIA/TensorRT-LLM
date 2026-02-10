@@ -2720,8 +2720,21 @@ class Linear(nn.Module):
             return False
         if self.all_reduce is None:
             return False
-        if self.all_reduce.strategy not in (AllReduceStrategy.AUTO,
-                                            AllReduceStrategy.NCCL_SYMMETRIC):
+        # Only use NCCL window when the effective strategy is NCCL_SYMMETRIC:
+        # either set explicitly or resolved from AUTO by the autotuner cache.
+        if self.all_reduce.strategy == AllReduceStrategy.NCCL_SYMMETRIC:
+            effective = AllReduceStrategy.NCCL_SYMMETRIC
+        elif self.all_reduce.strategy == AllReduceStrategy.AUTO:
+            output_shape = (input.shape[0], self.out_features)
+            effective = self.all_reduce.get_effective_strategy_for_shape(
+                output_shape, all_reduce_params)
+            if effective != AllReduceStrategy.NCCL_SYMMETRIC:
+                logger.debug(
+                    "[NCCL window] AUTO strategy: effective=%s (use window only if NCCL_SYMMETRIC)",
+                    effective,
+                )
+                return False
+        else:
             return False
         if (all_reduce_params is not None
                 and not all_reduce_params.enable_allreduce
