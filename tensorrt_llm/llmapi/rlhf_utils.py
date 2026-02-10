@@ -143,3 +143,11 @@ class WorkerExtension:
         for name, p in self.engine.model_engine.model.named_parameters():
             weights_updated = weights_updated and torch.allclose(p, torch.zeros_like(p))
         return weights_updated
+
+    def start_profile(self):
+        print("david Starting profile at worker extension")
+        torch.cuda.profiler.start()
+
+    def stop_profile(self):
+        print("david Stopping profile at worker extension")
+        torch.cuda.profiler.stop()

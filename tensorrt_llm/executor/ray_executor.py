@@ -111,6 +111,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         llm_args = worker_kwargs.get("llm_args")
         placement_config = getattr(llm_args, 'ray_placement_config',
                                    None) if llm_args else None
+        ray_worker_nsight_options = getattr(llm_args, 'ray_worker_nsight_options', None) if llm_args else None
 
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
@@ -126,6 +127,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             "TLLM_DISABLE_MPI": "1",
             "MASTER_ADDR": self.master_address,  # head-IP for NCCL/Gloo
         })
+        runtime_env["nsight"] = ray_worker_nsight_options
 
         placement_groups, self.bundle_indices = self._get_placement_group(
             tp_size=self.tp_size, worker_kwargs=worker_kwargs)
