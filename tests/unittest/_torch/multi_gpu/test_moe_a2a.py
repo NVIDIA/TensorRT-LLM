@@ -278,22 +278,6 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             expert_id_payload_index=expert_id_payload_index,
             eplb_local_stats=eplb_local_stats)
 
-        # Verify completion flags after dispatch
-        completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
-            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
-        completion_flags = moe_a2a.workspace[
-            rank, completion_flags_offset:completion_flags_offset +
-            ep_size * 4].view(torch.int32).cpu()
-        flag_val_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
-        expected_flag_val = moe_a2a.workspace[rank,
-                                              flag_val_offset:flag_val_offset +
-                                              4].view(torch.int32).cpu()
-
-        assert torch.all(completion_flags == expected_flag_val), (
-            f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
-        )
-
         # Read counters and compact routing tensors from workspace
         send_counters_offset = moe_a2a.metainfo[
             MoeAlltoAll._METAINFO_INDEX["SEND_COUNTERS_OFFSET_INDEX"]].item()
@@ -735,21 +719,6 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
         with torch.cuda.profiler.profile():
             combined_output = moe_a2a.combine(hidden_states_recv,
                                               max_num_tokens)
-
-        # Verify completion flags after combine
-        completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
-            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
-        completion_flags_ptr = moe_a2a.workspace[
-            rank, completion_flags_offset:completion_flags_offset + ep_size * 4]
-        completion_flags = completion_flags_ptr.view(torch.int32).cpu()
-        flag_val_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
-        expected_flag_val = moe_a2a.workspace[rank,
-                                              flag_val_offset:flag_val_offset +
-                                              4].view(torch.int32).cpu()
-        assert torch.all(completion_flags == expected_flag_val), (
-            f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
-        )
 
         # Return results for verification
         return (

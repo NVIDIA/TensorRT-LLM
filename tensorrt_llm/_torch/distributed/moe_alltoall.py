@@ -94,18 +94,12 @@ class MoeAlltoAll:
         if cls._METAINFO_INDEX is None:
             thop = _tllm_internal.thop
             cls._METAINFO_INDEX = {
-                "FLAG_VAL_OFFSET_INDEX":
-                int(thop.MOE_A2A_FLAG_VAL_OFFSET_INDEX),
                 "LOCAL_TOKEN_COUNTER_OFFSET_INDEX":
                 int(thop.MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX),
                 "SEND_COUNTERS_OFFSET_INDEX":
                 int(thop.MOE_A2A_SEND_COUNTERS_OFFSET_INDEX),
                 "RECV_COUNTERS_OFFSET_INDEX":
                 int(thop.MOE_A2A_RECV_COUNTERS_OFFSET_INDEX),
-                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX":
-                int(thop.MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX),
-                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX":
-                int(thop.MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX),
                 "TOPK_TARGET_RANKS_OFFSET_INDEX":
                 int(thop.MOE_A2A_TOPK_TARGET_RANKS_OFFSET_INDEX),
                 "TOPK_SEND_INDICES_OFFSET_INDEX":
