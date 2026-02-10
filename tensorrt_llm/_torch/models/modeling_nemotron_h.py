@@ -344,9 +344,6 @@ class NemotronHLayer(DecoderLayer):
             # It might be overridden in `_try_attach_nvfp4_scale` function.
             return_hp_output=layer_type == "E" and self.is_nvfp4,
         )
-        # Alias for compatibility with layer-wise benchmark runner.
-        self.input_layernorm = self.norm
-        self.next_layer_layernorm = None
 
         if layer_type == "M":
             self.mixer = Mamba2Mixer(d_model=config.hidden_size,
