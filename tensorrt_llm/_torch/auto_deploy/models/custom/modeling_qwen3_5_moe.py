@@ -1274,7 +1274,7 @@ class Qwen3_5MoeModel(nn.Module):
         super().__init__()
         self.config = config
         self.visual = Qwen3_5MoeVisionModel(config.vision_config)
-        self.language_model = Qwen3_5MoeForCausalLM(config.text_config)
+        self.language_model = Qwen3_5MoeTextModel(config.text_config)
 
         # mRoPE embedding -- computed in this wrapper, passed to language model
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config.text_config)
@@ -1473,15 +1473,15 @@ class Qwen3_5MoeModel(nn.Module):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Qwen3_5MoeCausalLMOutput:
-        """Multimodal forward: vision encoding + embedding merge + mRoPE + LM.
+    ) -> Qwen3_5MoeOutput:
+        """Multimodal forward: vision encoding + embedding merge + mRoPE + text model.
 
         Steps:
             1. Embed input_ids -> inputs_embeds
             2. Run vision tower on pixel_values -> masked_scatter into embeds
             3. Compute mRoPE position_ids via get_rope_index
             4. Compute (cos, sin) from rotary_emb
-            5. Call language_model with (inputs_embeds, position_embeddings)
+            5. Call language_model (TextModel) with (inputs_embeds, position_embeddings)
         """
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1523,16 +1523,25 @@ class Qwen3_5MoeModel(nn.Module):
         )
 
 
-class Qwen3_5MoeForConditionalGeneration(nn.Module):
-    """Top-level multimodal model: vision + language + lm_head.
+class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
+    """Top-level multimodal model: vision + language model + lm_head.
 
-    This wraps ``Qwen3_5MoeModel`` and is registered for the composite config.
+    This wraps ``Qwen3_5MoeModel`` (which contains the vision tower and the
+    text ``Qwen3_5MoeTextModel`` as ``language_model``) and adds an ``lm_head``
+    at the top level -- matching the HF checkpoint weight layout.
     """
 
+    config_class = Qwen3_5MoeConfig
+
     def __init__(self, config: Qwen3_5MoeConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.model = Qwen3_5MoeModel(config)
+        self.lm_head = nn.Linear(
+            config.text_config.hidden_size, config.text_config.vocab_size, bias=False
+        )
+
+        # Initialize weights and apply final processing
+        self.post_init()
 
     def forward(
         self,
@@ -1544,17 +1553,18 @@ class Qwen3_5MoeForConditionalGeneration(nn.Module):
         video_grid_thw: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Qwen3_5MoeConditionalOutput:
-        return Qwen3_5MoeConditionalOutput(
-            logits=self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                **kwargs,
-            ).logits
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            **kwargs,
         )
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        return Qwen3_5MoeConditionalOutput(logits=logits)
 
 
 # =============================================================================
