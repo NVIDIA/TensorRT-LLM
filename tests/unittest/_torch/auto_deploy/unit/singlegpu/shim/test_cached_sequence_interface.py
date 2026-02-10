@@ -10,8 +10,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
-    PagedResourceHandler,
+    CausalConvResourceHandler,
+    KVPagedResourceHandler,
     SequenceInfo,
+    SSMResourceHandler,
     StateResourceHandler,
     UnpagedResourceHandler,
 )
@@ -137,7 +139,7 @@ def test_init_default_device_is_cuda():
 
 
 def test_add_resource_paged_handler(paged_kv_cache_config):
-    """Test adding a PagedResourceHandler resource."""
+    """Test adding a KVPagedResourceHandler resource."""
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
@@ -145,15 +147,15 @@ def test_add_resource_paged_handler(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    handler = PagedResourceHandler(8, 64, dtype=torch.float16)
-    interface.add_resource("k_cache_0", handler)
+    handler = KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout="HND")
+    interface.add_resource("kv_cache_0", handler)
 
-    assert "k_cache_0" in interface._resource_lookup
-    assert interface._resource_lookup["k_cache_0"] is handler
+    assert "kv_cache_0" in interface._resource_lookup
+    assert interface._resource_lookup["kv_cache_0"] is handler
 
 
 def test_add_resource_state_handler(paged_kv_cache_config):
-    """Test adding a StateResourceHandler resource."""
+    """Test adding a SSMResourceHandler resource."""
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
@@ -161,7 +163,7 @@ def test_add_resource_state_handler(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    handler = StateResourceHandler(4, 64, 16, dtype=torch.bfloat16)
+    handler = SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16)
     interface.add_resource("ssm_state_0", handler)
 
     assert interface._resource_lookup["ssm_state_0"] is handler
@@ -192,12 +194,12 @@ def test_add_multiple_resources(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    k_handler = PagedResourceHandler(8, 64, dtype=torch.float16)
-    v_handler = PagedResourceHandler(8, 64, dtype=torch.float16)
-    ssm_handler = StateResourceHandler(4, 64, 16, dtype=torch.bfloat16)
+    kv_handler_0 = KVPagedResourceHandler(8, 64, dtype=torch.float16)
+    kv_handler_1 = KVPagedResourceHandler(8, 64, dtype=torch.float16)
+    ssm_handler = SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16)
 
-    interface.add_resource("k_cache_0", k_handler)
-    interface.add_resource("v_cache_0", v_handler)
+    interface.add_resource("kv_cache_0", kv_handler_0)
+    interface.add_resource("kv_cache_1", kv_handler_1)
     interface.add_resource("ssm_state_0", ssm_handler)
 
     assert len(interface._resource_lookup) == 3
@@ -217,9 +219,9 @@ def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache
         kv_cache_config=paged_kv_cache_config,
     )
 
-    # Add only paged resources
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("v_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    # Add only paged resources (combined KV cache)
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
 
     num_caches = interface.initialize_resources()
 
@@ -238,9 +240,12 @@ def test_initialize_resources_mixed_creates_mamba_hybrid_cache_manager(paged_kv_
     )
 
     # Add paged and state resources
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("v_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("ssm_state_0", StateResourceHandler(4, 64, 16, dtype=torch.bfloat16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "ssm_state_0",
+        SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+    )
 
     num_caches = interface.initialize_resources()
 
@@ -259,26 +264,25 @@ def test_initialize_resources_creates_cache_views_with_correct_shape(paged_kv_ca
 
     num_kv_heads = 8
     head_dim = 64
+    # Using HND layout (default)
     interface.add_resource(
-        "k_cache_0", PagedResourceHandler(num_kv_heads, head_dim, dtype=torch.float16)
-    )
-    interface.add_resource(
-        "v_cache_0", PagedResourceHandler(num_kv_heads, head_dim, dtype=torch.float16)
+        "kv_cache_0",
+        KVPagedResourceHandler(num_kv_heads, head_dim, dtype=torch.float16, kv_layout="HND"),
     )
 
     interface.initialize_resources()
 
-    # Check cache views exist
-    assert "k_cache_0" in interface._caches
-    assert "v_cache_0" in interface._caches
+    # Check cache view exists
+    assert "kv_cache_0" in interface._caches
 
-    # Check shapes: [num_blocks, tokens_per_block, num_kv_heads, head_dim]
-    k_cache = interface._caches["k_cache_0"]
-    assert k_cache is not None
-    assert k_cache.shape[1] == paged_kv_cache_config.tokens_per_block
-    assert k_cache.shape[2] == num_kv_heads
-    assert k_cache.shape[3] == head_dim
-    assert k_cache.dtype == torch.float16
+    # Check shape for HND layout: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]
+    kv_cache = interface._caches["kv_cache_0"]
+    assert kv_cache is not None
+    assert kv_cache.shape[1] == 2  # K and V
+    assert kv_cache.shape[2] == num_kv_heads
+    assert kv_cache.shape[3] == paged_kv_cache_config.tokens_per_block
+    assert kv_cache.shape[4] == head_dim
+    assert kv_cache.dtype == torch.float16
 
 
 def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_cache_config):
@@ -293,10 +297,12 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     num_heads = 4
     head_dim = 64
     ssm_state_size = 16
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.add_resource(
         "ssm_state_0",
-        StateResourceHandler(num_heads, head_dim, ssm_state_size, dtype=torch.bfloat16),
+        SSMResourceHandler(
+            num_heads=num_heads, head_dim=head_dim, d_state=ssm_state_size, dtype=torch.bfloat16
+        ),
     )
 
     interface.initialize_resources()
@@ -345,11 +351,11 @@ def test_is_paged_returns_true_for_paged_only(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("v_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.initialize_resources()
 
-    assert interface.is_paged() is True
+    assert interface.kv_cache_config_tuned.enable_block_reuse is True
 
 
 def test_is_paged_returns_false_for_hybrid(paged_kv_cache_config):
@@ -361,11 +367,14 @@ def test_is_paged_returns_false_for_hybrid(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("ssm_state_0", StateResourceHandler(4, 64, 16, dtype=torch.bfloat16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "ssm_state_0",
+        SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+    )
     interface.initialize_resources()
 
-    assert interface.is_paged() is False
+    assert interface.kv_cache_config_tuned.enable_block_reuse is False
 
 
 # =============================================================================
@@ -382,7 +391,7 @@ def test_needs_resize_returns_false_when_fraction_is_zero(paged_kv_cache_config)
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.initialize_resources()
 
     assert interface.needs_resize() is False
@@ -397,7 +406,7 @@ def test_needs_resize_returns_true_when_fraction_is_positive(resizable_kv_cache_
         kv_cache_config=resizable_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.initialize_resources()
 
     assert interface.needs_resize() is True
@@ -412,7 +421,7 @@ def test_resize_kv_cache_manager_skipped_when_not_needed(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.initialize_resources()
 
     # Get initial state
@@ -439,19 +448,19 @@ def test_shutdown_clears_caches(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("v_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.initialize_resources()
 
     assert len(interface._caches) == 2
 
     interface.shutdown()
 
-    assert len(interface._caches) == 0
+    assert all(cache is None for cache in interface._caches.values())
 
 
-def test_clear_cache_views_sets_views_to_none(paged_kv_cache_config):
-    """Test _clear_cache_views() sets paged and state cache views to None."""
+def test_clear_caches_clears_all(paged_kv_cache_config):
+    """Test _clear_caches() clears all cache entries."""
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
@@ -459,16 +468,20 @@ def test_clear_cache_views_sets_views_to_none(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("ssm_state_0", StateResourceHandler(4, 64, 16, dtype=torch.bfloat16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "ssm_state_0",
+        SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+    )
     interface.initialize_resources()
 
-    # Manually call _clear_cache_views
-    interface._clear_cache_views()
+    assert len(interface._caches) == 2
 
-    # Paged and state caches should be None
-    assert interface._caches["k_cache_0"] is None
-    assert interface._caches["ssm_state_0"] is None
+    # Manually call _clear_caches
+    interface._clear_caches()
+
+    # All caches should be cleared
+    assert all(cache is None for cache in interface._caches.values())
 
 
 # =============================================================================
@@ -534,7 +547,7 @@ def test_named_args_includes_sequence_info_and_caches(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.initialize_resources()
 
     named_args = interface.named_args
@@ -544,7 +557,7 @@ def test_named_args_includes_sequence_info_and_caches(paged_kv_cache_config):
     assert "position_ids" in named_args
 
     # Should contain cache
-    assert "k_cache_0" in named_args
+    assert "kv_cache_0" in named_args
 
 
 def test_args_returns_tuple_of_tensors(paged_kv_cache_config):
@@ -556,7 +569,7 @@ def test_args_returns_tuple_of_tensors(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.initialize_resources()
 
     args = interface.args
@@ -722,3 +735,154 @@ def test_sequence_info_page_assignments():
 
     page_assignments = seq_info.page_assignments
     assert page_assignments == [[0], [1, 2]]
+
+
+# =============================================================================
+# Typed State Resource Handler Tests
+# =============================================================================
+
+
+def test_ssm_resource_handler_state_shape():
+    """Test SSMResourceHandler returns correct state_shape property."""
+    handler = SSMResourceHandler(num_heads=8, head_dim=64, d_state=16, dtype=torch.bfloat16)
+    assert handler.state_shape == (8, 64, 16)
+    assert handler.num_heads == 8
+    assert handler.head_dim == 64
+    assert handler.d_state == 16
+    assert handler.dtype == torch.bfloat16
+
+
+def test_causal_conv_resource_handler_state_shape():
+    """Test CausalConvResourceHandler returns correct state_shape property."""
+    # d_conv=4 means state stores d_conv-1=3 elements
+    handler = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
+    assert handler.state_shape == (256, 3)  # (conv_dim, d_conv - 1)
+    assert handler.conv_dim == 256
+    assert handler.d_conv == 4
+    assert handler.dtype == torch.float32
+
+
+def test_typed_handlers_inherit_from_state_resource_handler():
+    """Test that SSMResourceHandler and CausalConvResourceHandler inherit from StateResourceHandler."""
+    ssm_handler = SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16)
+    conv_handler = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
+
+    assert isinstance(ssm_handler, StateResourceHandler)
+    assert isinstance(conv_handler, StateResourceHandler)
+
+
+def test_multiple_ssm_resources_contiguous_views(paged_kv_cache_config):
+    """Test that multiple SSM resources get contiguous views from MambaHybridCacheManager."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+    )
+
+    # Add 3 SSM resources with same parameters (compatible)
+    for i in range(3):
+        interface.add_resource(
+            f"ssm_state_{i}",
+            SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+        )
+
+    interface.initialize_resources()
+
+    # Verify all SSM views are contiguous
+    for i in range(3):
+        ssm_cache = interface._caches[f"ssm_state_{i}"]
+        assert ssm_cache is not None
+        assert ssm_cache.is_contiguous(), f"SSM view {i} is not contiguous"
+
+
+def test_multiple_conv_resources_contiguous_views(paged_kv_cache_config):
+    """Test that multiple Conv resources get contiguous views from MambaHybridCacheManager."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+    )
+
+    # Add 3 Conv resources with same parameters (compatible)
+    for i in range(3):
+        interface.add_resource(
+            f"conv_state_{i}",
+            CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32),
+        )
+
+    interface.initialize_resources()
+
+    # Verify all Conv views are contiguous
+    for i in range(3):
+        conv_cache = interface._caches[f"conv_state_{i}"]
+        assert conv_cache is not None
+        assert conv_cache.is_contiguous(), f"Conv view {i} is not contiguous"
+
+
+def test_mixed_ssm_conv_resources_uses_min_layers(paged_kv_cache_config):
+    """Test that when both SSM and Conv resources exist, uses min(ssm_count, conv_count) layers."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+    )
+
+    # Conv params must satisfy n_groups constraint with SSM params:
+    # conv_dim = head_dim * num_heads + 2 * n_groups * d_state
+    # With num_heads=4, head_dim=64, d_state=16, n_groups=2:
+    # conv_dim = 64 * 4 + 2 * 2 * 16 = 256 + 64 = 320
+    num_heads = 4
+    head_dim = 64
+    d_state = 16
+    n_groups = 2
+    conv_dim = head_dim * num_heads + 2 * n_groups * d_state
+
+    # Add 3 SSM and 2 Conv resources
+    for i in range(3):
+        interface.add_resource(
+            f"ssm_state_{i}",
+            SSMResourceHandler(
+                num_heads=num_heads, head_dim=head_dim, d_state=d_state, dtype=torch.bfloat16
+            ),
+        )
+
+    for i in range(2):
+        interface.add_resource(
+            f"conv_state_{i}",
+            CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
+        )
+
+    interface.initialize_resources()
+
+    # Verify MambaHybridCacheManager was created
+    assert isinstance(interface.kv_cache_manager, MambaHybridCacheManager)
+
+    # All caches should exist
+    for i in range(3):
+        assert interface._caches[f"ssm_state_{i}"] is not None
+    for i in range(2):
+        assert interface._caches[f"conv_state_{i}"] is not None
+
+
+def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
+    """Test that generic StateResourceHandler (not SSM/Conv) is allocated locally."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+    )
+
+    # Add a generic StateResourceHandler (not SSM or Conv)
+    generic_handler = StateResourceHandler(10, 20, dtype=torch.float32)
+    interface.add_resource("generic_state", generic_handler)
+
+    interface.initialize_resources()
+
+    # Generic handler should be allocated but via local allocation (not MambaHybridCacheManager)
+    assert interface._caches["generic_state"] is not None
+    # Without typed handlers, should use plain KVCacheManager
+    assert isinstance(interface.kv_cache_manager, KVCacheManager)

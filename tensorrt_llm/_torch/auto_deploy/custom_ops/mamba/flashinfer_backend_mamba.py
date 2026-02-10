@@ -1,16 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List
 
 import torch
 from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
-from ..attention_interface import (
-    AttentionRegistry,
-    MHACallable,
-    ResourceHandler,
-    ResourceHandlerDict,
-    SequenceInfo,
-)
+from ..attention_interface import AttentionRegistry, MHACallable, ResourceHandlerDict
 from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
@@ -177,29 +186,6 @@ def _flashinfer_cached_ssm_fake(
 FLASHINFER_SUPPORTED_HEAD_DIMS = [64, 128]
 
 
-class FlashInferStateResourceHandler(ResourceHandler):
-    """Handler for flashinfer SSM state resources.
-
-    Unlike the default StateResourceHandler which uses byte-level pooling (resulting
-    in non-contiguous strided views), this handler allocates a separate contiguous
-    buffer. This is required because flashinfer's selective_state_update kernel
-    requires the entire state tensor to be contiguous.
-    """
-
-    def __init__(self, *state_shape: int, dtype: torch.dtype) -> None:
-        self.state_shape = state_shape
-        self.dtype = dtype
-
-    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
-        """Allocate a contiguous state buffer for flashinfer."""
-        return torch.empty(
-            sequence_info.max_num_state_slots,
-            *self.state_shape,
-            device=sequence_info.device,
-            dtype=self.dtype,
-        )
-
-
 @AttentionRegistry.register("flashinfer_ssm")
 class FlashinferBackendSSM(BaseBackendSSM):
     @classmethod
@@ -210,37 +196,14 @@ class FlashinferBackendSSM(BaseBackendSSM):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
-        """Get cache initializers using FlashInferStateResourceHandler.
+        ret = super().get_cache_initializers(source_attn_node, cache_config)
 
-        We use a custom handler that allocates contiguous buffers directly,
-        instead of the default StateResourceHandler which creates non-contiguous
-        views from a shared byte buffer. This is required because flashinfer's
-        selective_state_update kernel requires contiguous state tensors.
-        """
-        # Shapes from fake tensors
-        hs_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
-        B_fake: torch.Tensor = source_attn_node.args[2].meta["val"]
-
-        num_heads = hs_fake.shape[-2]
-        head_dim = hs_fake.shape[-1]
-
-        # Validate head_dim is supported by flashinfer
-        if head_dim not in FLASHINFER_SUPPORTED_HEAD_DIMS:
+        # check head_dim is supported by flashinfer
+        if ret["ssm_state_cache"].head_dim not in FLASHINFER_SUPPORTED_HEAD_DIMS:
             raise ValueError(
-                f"Flashinfer SSM backend only supports head_dim in {FLASHINFER_SUPPORTED_HEAD_DIMS}, "
-                f"but got head_dim={head_dim}. Consider using 'triton_ssm' backend instead."
+                f"flashinfer_ssm only supports head_dim in {FLASHINFER_SUPPORTED_HEAD_DIMS}. "
+                f"Got head_dim={ret['ssm_state_cache'].head_dim}. "
+                "Consider using 'triton_ssm' backend instead."
             )
 
-        if B_fake.ndim >= 4:
-            ssm_state_size = B_fake.shape[-1]
-        else:
-            ssm_state_size = max(1, B_fake.shape[-1])
-
-        # Extract ssm_state_dtype from cache_config or hs_fake
-        ssm_state_dtype = cls.resolve_cache_dtype(cache_config.mamba_ssm_cache_dtype, hs_fake.dtype)
-
-        return {
-            "ssm_state_cache": FlashInferStateResourceHandler(
-                num_heads, head_dim, ssm_state_size, dtype=ssm_state_dtype
-            )
-        }
+        return ret

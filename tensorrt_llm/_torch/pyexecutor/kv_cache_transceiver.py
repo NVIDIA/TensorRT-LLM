@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import List
+from typing import Any, Dict, List
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -97,7 +97,7 @@ class KvCacheTransceiver(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_context_request(self, requests: List[LlmRequest]):
+    def prepare_context_requests(self, requests: List[LlmRequest]):
         """
         Prepare the context request for the cache transceiver in generation-first mode.
         This method should set the context request state to DISAGG_CONTEXT_WAIT_SCHEDULER
@@ -107,10 +107,10 @@ class KvCacheTransceiver(ABC):
         ...
 
     @abstractmethod
-    def get_context_state(self):
+    def get_disaggregated_params(self) -> Dict[str, Any]:
         """
-        Return the opaque context request state, which will be attached to the generation request.
-        The generation server will use this state to get kvcache in generation-first mode.
+        Return a dictionary form of DisaggregatedParams to be set in the generation request.
+        The generation server will use it to get kvcache in generation-first mode.
         """
         ...
 
@@ -160,11 +160,13 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
 
-    def prepare_context_request(self, requests: List[LlmRequest]):
+    def prepare_context_requests(self, requests: List[LlmRequest]):
         raise NotImplementedError
 
-    def get_context_state(self):
-        raise NotImplementedError
+    def get_disaggregated_params(self):
+        # Cpp kv cache transceiver will set the disaggregated params to context response
+        # Only new py cache transceiver will support gen-first disagg
+        return {}
 
 
 class CacheTransBufferManager:

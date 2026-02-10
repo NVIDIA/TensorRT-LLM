@@ -239,6 +239,14 @@ methods:
         annotation: Optional[Dict[str, Any]]
         default: null
         status: prototype
+      use_cute_dsl_blockscaling_mm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_blockscaling_bmm:
+        annotation: bool
+        default: False
+        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -311,3 +319,6 @@ properties:
   llm_id:
     annotation: str
     default: inspect._empty
+  disaggregated_params:
+    annotation: dict
+    default: None

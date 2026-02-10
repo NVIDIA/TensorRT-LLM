@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import time
@@ -11,9 +12,10 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs import default_multimodal_input_loader
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
-                                 KvCacheConfig)
+                                 KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
 test_data_root = Path(
@@ -27,6 +29,67 @@ example_images = [
 _LLAVA_DIR = llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf"
 _QWEN_2_5_VL_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 _QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
+_QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
+) / "Qwen3" / "Qwen3-VL-30B-A3B-Instruct-FP8"
+
+_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL = "qwen3_vl_30b_a3b_fp8_fake"
+_FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
+
+
+# Unlike the other models, we cannot fit a multimodal encoder + 2 copies of the LLM on a single
+# H100 GPU in CI. We therefore resort to creating a slimmed down version of the model with less
+# layers.
+def _get_fake_qwen3_vl_30b_a3b_config() -> dict:
+    config_path = _QWEN_3_VL_30B_A3B_FP8_DIR / "config.json"
+    if not config_path.exists():
+        pytest.skip(f"Qwen3-VL-30B-A3B config not found: {config_path}")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    config = copy.deepcopy(config)
+    config["text_config"]["num_hidden_layers"] = 2
+    return config
+
+
+def _create_fake_qwen3_vl_30b_a3b_fp8_dir(
+    tmp_path_factory: pytest.TempPathFactory,
+    assets_dir: Path,
+) -> Path:
+    if not assets_dir.exists():
+        pytest.skip(f"Base model dir not found: {assets_dir}")
+
+    fake_dir = tmp_path_factory.mktemp("qwen3_vl_30b_a3b_fp8_fake")
+
+    for item in assets_dir.iterdir():
+        if item.name == "config.json":
+            continue
+        target = fake_dir / item.name
+        if target.exists():
+            continue
+        os.symlink(item, target, target_is_directory=item.is_dir())
+
+    config_path = fake_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(_get_fake_qwen3_vl_30b_a3b_config(), f, indent=2)
+
+    (fake_dir /
+     _FAKE_CHECKPOINT_MARKER).write_text("Synthetic checkpoint for CI tests.\n")
+    return fake_dir
+
+
+def _get_fake_checkpoint_kwargs(model_dir: Path) -> dict:
+    if (model_dir / _FAKE_CHECKPOINT_MARKER).exists():
+        return {"load_format": "dummy"}
+    return {}
+
+
+def _is_fake_checkpoint(model_dir: Path) -> bool:
+    return (model_dir / _FAKE_CHECKPOINT_MARKER).exists()
+
+
+def _get_moe_config_for_blackwell() -> MoeConfig:
+    if get_sm_version() >= 100:
+        return MoeConfig(backend="DEEPGEMM")
+    return MoeConfig()
 
 
 @pytest.mark.parametrize(
@@ -67,10 +130,12 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,  # Enable KV cache events
     )
+    moe_config = _get_moe_config_for_blackwell()
 
     llm = LLM(model=encoder_model_dir,
               backend='pytorch',
               kv_cache_config=kv_cache_config,
+              moe_config=moe_config,
               max_batch_size=1)
 
     inputs = _load_inputs(llm, prompts, media)
@@ -100,10 +165,20 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         f"got {num_duplicates}. Offsets: {mm_keys_offsets}")
 
 
-@pytest.fixture(scope="module",
-                params=[_LLAVA_DIR, _QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR],
-                ids=["llava_7b", "qwen2.5_3b", "qwen3_2b"])
-def model_dir(request) -> Path:
+@pytest.fixture(
+    scope="module",
+    params=[
+        pytest.param(_LLAVA_DIR, id="llava_7b"),
+        pytest.param(_QWEN_2_5_VL_DIR, id="qwen2.5_3b"),
+        pytest.param(_QWEN_3_VL_DIR, id="qwen3_2b"),
+        pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
+                     id="qwen3_30b_a3b_fp8"),
+    ],
+)
+def model_dir(request, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    if request.param == _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL:
+        return _create_fake_qwen3_vl_30b_a3b_fp8_dir(tmp_path_factory,
+                                                     _QWEN_3_VL_DIR)
     return request.param
 
 
@@ -125,14 +200,18 @@ def llms(model_dir: Path,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
     )
 
+    load_kwargs = _get_fake_checkpoint_kwargs(model_dir)
+    moe_config = _get_moe_config_for_blackwell()
     llm = LLM(
         model=model_dir,
         backend='pytorch',
         kv_cache_config=kv_cache_config,
+        moe_config=moe_config,
         trust_remote_code=True,
         cache_transceiver_config=cache_transceiver_cfg,
         disable_overlap_scheduler=disable_overlap_scheduler,
         max_batch_size=1,  # fix batch size to reduce non-determinism in tests
+        **load_kwargs,
     )
     with llm:
         if pd_disagg:
@@ -140,8 +219,10 @@ def llms(model_dir: Path,
                 model=model_dir,
                 backend='pytorch',
                 kv_cache_config=kv_cache_config,
+                moe_config=moe_config,
                 trust_remote_code=True,
                 cache_transceiver_config=cache_transceiver_cfg,
+                **load_kwargs,
             )
             with llm_decode:
                 yield (llm, llm_decode)
@@ -172,6 +253,41 @@ def _load_inputs(llm: LLM, prompts, media, mm_embeddings=None):
     assert len(inputs) == len(
         prompts), f"Expected {len(prompts)} inputs, got {len(inputs)}"
     return inputs
+
+
+def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
+    # Helper function for checking that two SharedTensorContainer dict representations of the same
+    # underlying data are different. Certain metadata should stay the same (basically those describing
+    # the tensor's contents), while others should actually differ (those pertaining to the underlying
+    # storage).
+    matching_keys = [
+        "dtype",
+        "event_sync_required",
+        "method_key",
+        "requires_grad",
+        # NOTE: this assumes the workers are on the same physical device, which is the case in
+        # the tests in this file since `LLM` API does not expose a way to select the device ID.
+        "storage_device",
+        "storage_size_bytes",
+        "tensor_offset",
+        "tensor_size",
+        "tensor_stride",
+    ]
+
+    different_keys = [
+        "event_handle",
+        "ref_counter_handle",
+        "ref_counter_offset",
+        "storage_handle",
+        "storage_offset_bytes",
+    ]
+
+    assert set(matching_keys + different_keys) == x.keys() == y.keys()
+
+    for key in matching_keys:
+        assert x[key] == y[key]
+    for key in different_keys:
+        assert x[key] != y[key]
 
 
 # TODO: Add multi-image in single chat test
@@ -217,7 +333,9 @@ def test_single_image_chat(
 
     # Prepare inputs for llm (pass mm_embeddings)
     # Process multimodal data using encoder (pass mm_embeddings)
-    encoder = MultimodalEncoder(model=model_dir, max_batch_size=max_batch_size)
+    encoder = MultimodalEncoder(model=model_dir,
+                                max_batch_size=max_batch_size,
+                                **_get_fake_checkpoint_kwargs(model_dir))
     with encoder:
         encoder_outputs = encoder.generate(inputs)
 
@@ -226,6 +344,7 @@ def test_single_image_chat(
 
         assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
         ep_disaggregated_params.request_type = "context_and_generation" if not pd_disagg else "context_only"
+
         outputs = llm.generate(inputs,
                                sampling_params=sampling_params,
                                disaggregated_params=ep_disaggregated_params)
@@ -234,6 +353,12 @@ def test_single_image_chat(
             # Generation using llm_decode
             assert len(outputs) == 1
             pd_disaggregated_params = outputs[0].disaggregated_params
+
+            ep_handle = ep_disaggregated_params.mrope_position_ids_handle
+            pd_handle = pd_disaggregated_params.mrope_position_ids_handle
+            assert type(ep_handle) is type(pd_handle)
+            if ep_handle is not None:
+                _assert_handles_are_different(ep_handle, pd_handle)
             pd_disaggregated_params.request_type = "generation_only"
             sampling_params = SamplingParams(max_tokens=max_tokens)
             # remove multimodal data from input as decoder worker doesn't need it
@@ -351,13 +476,15 @@ def test_multi_request_batch_chat(
     embeddings alongside the prompt ("multi_modal_embeddings"), as well as the embedding
     handling within default_multimodal_input_loader.
     """
-    if use_mm_embeddings and model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR]:
+    if use_mm_embeddings and (model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR]
+                              or _is_fake_checkpoint(model_dir)):
         pytest.skip("Qwen does not implement attach_multimodal_embeddings")
 
     # Qwen2.5/3 VL's vision encoder seems to output different embeddings based on this value.
     # The test only passes with this set to 1.
-    encoder_max_batch_size = (1 if model_dir
-                              in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR] else 3)
+    encoder_max_batch_size = (1 if
+                              model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR]
+                              or _is_fake_checkpoint(model_dir) else 3)
 
     llm, llm_decode = llms
     if llm_decode is not None:
@@ -388,7 +515,8 @@ def test_multi_request_batch_chat(
         ) > 0, f"Reference generation has no output text for input {i}"
 
     encoder = MultimodalEncoder(model=model_dir,
-                                max_batch_size=encoder_max_batch_size)
+                                max_batch_size=encoder_max_batch_size,
+                                **_get_fake_checkpoint_kwargs(model_dir))
     with encoder:
         # Encoder path
         encoder_outputs = encoder.generate(inputs)

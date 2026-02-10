@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
-from ..custom_ops.quant import FP4_GLOBAL_SCALE_MAX, FP8_MAX
+from ..custom_ops.quantization.quant import FP4_GLOBAL_SCALE_MAX, FP8_MAX
 from .logger import ad_logger
 from .node_utils import (
     extract_weight_name,

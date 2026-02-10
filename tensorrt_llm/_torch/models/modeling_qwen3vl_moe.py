@@ -9,6 +9,7 @@ from ...inputs import (
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     register_input_processor,
+    support_multimodal_disaggregated,
 )
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_moe_weight_mapper import Qwen3VLMoeHfWeightMapper
@@ -21,6 +22,14 @@ from .modeling_qwen3vl import (
 from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
 
 
+# NOTE: this is technically not strictly necessary, since the underlying mechanism for registering
+# support is tacked onto the input processor class (`Qwen3VLInputProcessorBase`). Given that
+# the `Qwen3VLModel` (defined via the import of `modeling_qwen3vl.py` in this file) has that
+# decorator applied to it, and uses the same input processor class, we get it "for free" here.
+# However, we keep it here to explicitly signify intent that this is supported. This also shields
+# it from e.g. the input processor classes becoming specialized between `Qwen3VLModel` and the
+# below MoE class.
+@support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
 @register_auto_model("Qwen3VLMoeForConditionalGeneration")
 @register_input_processor(

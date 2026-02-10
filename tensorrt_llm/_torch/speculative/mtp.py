@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -13,7 +14,7 @@ from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, SampleState,
+from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, Sampler, SampleState,
                                   SampleStateTensors, TorchSampler, add_token,
                                   int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -21,6 +22,11 @@ from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+if sys.version_info[:2] >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
 
 
 @dataclass(kw_only=True)
@@ -30,9 +36,8 @@ class SampleStateTensorsMTP(SampleStateTensors):
 
 
 @dataclass(kw_only=True)
-class SampleStateMTP(SampleState):
-    device: SampleStateTensorsMTP
-    host: SampleStateTensorsMTP
+class SampleStateMTP(SampleState[SampleStateTensorsMTP, SampleStateTensorsMTP]):
+    pass
 
 
 class MTPHiddenStatesManager(BaseResourceManager):
@@ -210,12 +215,16 @@ class MTPSpecMetadata(SpecMetadata):
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPSampler(TorchSampler):
+class MTPSampler(Sampler[SampleStateMTP]):
     """
     MTP sampler.
     """
 
     SampleState = SampleStateMTP
+
+    @override
+    def is_generation_model(self) -> bool:
+        return True
 
     @dataclass(kw_only=True)
     class Store(TorchSampler.Store):
@@ -358,8 +367,11 @@ class MTPSampler(TorchSampler):
 
 class MTPWorker(SpecWorkerBase):
 
-    def __init__(self, spec_config: "MTPDecodingConfig", model_config=None):
-        super().__init__()
+    def __init__(self,
+                 spec_config: "MTPDecodingConfig",
+                 model_config=None,
+                 use_separate_draft_kv_cache: bool = False):
+        super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
@@ -377,6 +389,7 @@ class MTPWorker(SpecWorkerBase):
         attn_metadata,
         spec_metadata,
         draft_model,
+        resource_manager=None,
     ):
         '''
         Example:
@@ -509,43 +522,50 @@ class MTPWorker(SpecWorkerBase):
         # update attn metadata
         if attn_metadata is not None:
             self.change_attn_metadata(num_accepted_tokens, attn_metadata)
-            draft_inputs.update(attn_metadata=attn_metadata)
 
         # Run MTP layers to predict draft tokens
         next_draft_tokens = []
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-        for i, mtp_layer in enumerate(draft_model.mtp_layers):
-            if self.guided_decoder is not None:
-                new_tokens = draft_inputs['input_ids'][last_tokens_idx]
-                self.guided_decoder.add_draft_batch(new_tokens,
-                                                    num_accepted_tokens,
-                                                    draft_step=i)
 
-            hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
-                                      **draft_inputs)
-            logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
-                                           attn_metadata).float()
-            if self.guided_decoder is not None:
-                self.guided_decoder.execute_draft_batch(logits, draft_step=i)
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+            resource_manager)
 
-            new_draft_token = self.draft_sampler(logits)
-            next_draft_tokens.append(new_draft_token)
-            # shift input_ids and hidden_states
-            input_ids = draft_inputs["input_ids"]
-            input_ids[:-1] = input_ids[1:].clone()
-            input_ids[last_tokens_idx] = new_draft_token
-            draft_hidden_states = draft_inputs["hidden_states"]
-            draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
-            draft_hidden_states[last_tokens_idx] = hidden_states[
-                last_tokens_idx, :]
-            draft_inputs = {
-                "input_ids": input_ids,
-                "position_ids": draft_inputs["position_ids"],
-                "hidden_states": draft_hidden_states,
-                "attn_metadata": draft_inputs["attn_metadata"],
-            }
-        next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+            for i, mtp_layer in enumerate(draft_model.mtp_layers):
+                if self.guided_decoder is not None:
+                    new_tokens = draft_inputs['input_ids'][last_tokens_idx]
+                    self.guided_decoder.add_draft_batch(new_tokens,
+                                                        num_accepted_tokens,
+                                                        draft_step=i)
+
+                hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
+                                          **draft_inputs)
+
+                logits = mtp_layer.shared_head(hidden_states,
+                                               draft_model.lm_head,
+                                               attn_metadata).float()
+                if self.guided_decoder is not None:
+                    self.guided_decoder.execute_draft_batch(logits,
+                                                            draft_step=i)
+
+                new_draft_token = self.draft_sampler(logits)
+                next_draft_tokens.append(new_draft_token)
+                # shift input_ids and hidden_states
+                input_ids = draft_inputs["input_ids"]
+                input_ids[:-1] = input_ids[1:].clone()
+                input_ids[last_tokens_idx] = new_draft_token
+                draft_hidden_states = draft_inputs["hidden_states"]
+                draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
+                draft_hidden_states[last_tokens_idx] = hidden_states[
+                    last_tokens_idx, :]
+                draft_inputs = {
+                    "input_ids": input_ids,
+                    "position_ids": draft_inputs["position_ids"],
+                    "hidden_states": draft_hidden_states,
+                    "attn_metadata": draft_inputs["attn_metadata"],
+                }
+            next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn metadata
         if attn_metadata is not None:
@@ -558,6 +578,39 @@ class MTPWorker(SpecWorkerBase):
 
         return {
             'logits': raw_logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
+
+    def skip_forward(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        resource_manager=None,
+    ):
+        batch_size = attn_metadata.num_seqs
+        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+        next_draft_tokens = torch.empty((batch_size, mtp_num_modules),
+                                        dtype=torch.int,
+                                        device=logits.device)
+        next_new_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        return {
+            'logits': logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
@@ -1137,8 +1190,9 @@ class MTPEagleWorker(MTPWorker):
 
     def __init__(self,
                  spec_config: "MTPDecodingConfig",
-                 model_config: Optional[ModelConfig] = None):
-        super().__init__(spec_config, model_config)
+                 model_config: Optional[ModelConfig] = None,
+                 use_separate_draft_kv_cache: bool = False):
+        super().__init__(spec_config, model_config, use_separate_draft_kv_cache)
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
         self._is_mamba_hybrid_cache = None
@@ -1161,6 +1215,7 @@ class MTPEagleWorker(MTPWorker):
         attn_metadata,
         spec_metadata,
         draft_model,
+        resource_manager=None,
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -1203,123 +1258,134 @@ class MTPEagleWorker(MTPWorker):
                                              attn_metadata=attn_metadata,
                                              spec_metadata=spec_metadata)
 
+        # Get the draft KV cache manager if using separate layouts
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+            resource_manager)
+
         # Predict draft tokens
         next_draft_tokens = []
-        for i in range(self.mtp_num_modules):
-            if i == 0:
-                hidden_states = draft_model.mtp_layers[0](
-                    embed_tokens=draft_model.embed_tokens,
-                    all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
-                    **inputs)
-                start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
-                                 (self.mtp_num_modules + 1)).long()
-                gather_ids_gen = (start_ids_gen +
-                                  num_accepted_tokens[num_contexts:] - 1 +
-                                  attn_metadata.num_ctx_tokens)
-                gather_ids = torch.concat(
-                    [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
-            else:
-                hidden_states = draft_model.mtp_layers[0](
-                    embed_tokens=draft_model.embed_tokens,
-                    all_rank_num_tokens=spec_metadata.
-                    subseq_all_rank_num_tokens,
-                    **inputs)
-                # All of the seq_len are 1, use batch_indices_cuda as gather_ids
-                gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+            for i in range(self.mtp_num_modules):
+                if i == 0:
+                    hidden_states = draft_model.mtp_layers[0](
+                        embed_tokens=draft_model.embed_tokens,
+                        all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+                        **inputs)
 
-            if self.guided_decoder is not None:
-                new_tokens = inputs["input_ids"][gather_ids]
-                self.guided_decoder.add_draft_batch(new_tokens,
-                                                    num_accepted_tokens,
-                                                    draft_step=i)
-            if self.model_config.mapping.enable_attention_dp and \
-                getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
-                hidden_states_gathered = hidden_states[gather_ids]
-                token_count = hidden_states_gathered.view(
-                    -1, hidden_states_gathered.shape[-1]).shape[0]
-                max_num_requests = spec_metadata.max_num_requests
-                pad_len = max_num_requests - token_count
-                if pad_len > 0:
-                    padded_hidden_states = F.pad(hidden_states_gathered.view(
-                        -1, hidden_states_gathered.shape[-1]),
-                                                 (0, 0, 0, pad_len),
-                                                 mode="constant",
-                                                 value=0)
-                elif pad_len == 0:
-                    padded_hidden_states = hidden_states_gathered.view(
-                        -1, hidden_states_gathered.shape[-1])
+                    start_ids_gen = (
+                        spec_metadata.batch_indices_cuda[:num_gens] *
+                        (self.mtp_num_modules + 1)).long()
+                    gather_ids_gen = (start_ids_gen +
+                                      num_accepted_tokens[num_contexts:] - 1 +
+                                      attn_metadata.num_ctx_tokens)
+                    gather_ids = torch.concat(
+                        [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
                 else:
-                    raise ValueError(
-                        f"In MTPEagleWorker.forward(), token_count < max_num_requests, which is not supported"
-                    )
-                logits = draft_model.mtp_layers[0].shared_head(
-                    padded_hidden_states, draft_model.lm_head, attn_metadata,
-                    True)
-            else:
-                logits = draft_model.mtp_layers[0].shared_head(
-                    hidden_states[gather_ids], draft_model.lm_head,
-                    attn_metadata, True)
-            if self.guided_decoder is not None:
-                self.guided_decoder.execute_draft_batch(logits, draft_step=i)
+                    hidden_states = draft_model.mtp_layers[0](
+                        embed_tokens=draft_model.embed_tokens,
+                        all_rank_num_tokens=spec_metadata.
+                        subseq_all_rank_num_tokens,
+                        **inputs)
 
-            if self.model_config.mapping.enable_attention_dp and \
-                getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
-                mapping_lm_head_tp = draft_model.mtp_layers[
-                    0].shared_head.mapping_lm_head_tp
-                new_draft_token = self.draft_sampler(logits, mapping_lm_head_tp)
-                new_draft_token = new_draft_token[:token_count]
-            else:
-                new_draft_token = self.draft_sampler(logits)
+                    # All of the seq_len are 1, use batch_indices_cuda as gather_ids
+                    gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
-            hidden_states, position_ids = self.update_draft_tokens(
-                next_draft_tokens, new_draft_token, hidden_states, gather_ids,
-                inputs)
-            # update attn_metadata
-            if i == 0:
-                attn_metadata._seq_lens[:batch_size].fill_(1)
-                attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-                attn_metadata.on_update()
-                # cannot run generation if their is no kv cache
-                has_kv_cache = inputs[
-                    "attn_metadata"].kv_cache_manager is not None
-                if has_kv_cache:
-                    attn_metadata.host_request_types[:attn_metadata.
-                                                     num_contexts].fill_(1)
-                    attn_metadata.num_contexts = 0
-                # update kv_lens_cuda
-                if hasattr(attn_metadata, 'kv_lens_cuda'):
-                    attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                        self.mtp_num_modules -
-                        num_accepted_tokens[num_contexts:])
-                    attn_metadata.kv_lens_cuda[:num_contexts] += 1
-                # update metadata for flash mla
-                if has_kv_cache and num_contexts > 0 and attn_metadata.enable_flash_mla:
-                    reorder_block_ids_per_seq = torch.cat([
-                        attn_metadata.
-                        kv_block_ids_per_seq[num_contexts:batch_size],
-                        attn_metadata.kv_block_ids_per_seq[:num_contexts]
-                    ])
-                    attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
-                        reorder_block_ids_per_seq, non_blocking=True)
-                # update metadata
-                # some attention metadata needs to be updated when changing seq_lens/kv_lens
-                attn_metadata.update_for_spec_dec()
-            elif hasattr(attn_metadata, 'kv_lens_cuda'):
+                if self.guided_decoder is not None:
+                    new_tokens = inputs["input_ids"][gather_ids]
+                    self.guided_decoder.add_draft_batch(new_tokens,
+                                                        num_accepted_tokens,
+                                                        draft_step=i)
+                if self.model_config.mapping.enable_attention_dp and \
+                    getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
+                    hidden_states_gathered = hidden_states[gather_ids]
+                    token_count = hidden_states_gathered.view(
+                        -1, hidden_states_gathered.shape[-1]).shape[0]
+                    max_num_requests = spec_metadata.max_num_requests
+                    pad_len = max_num_requests - token_count
+                    if pad_len > 0:
+                        padded_hidden_states = F.pad(
+                            hidden_states_gathered.view(
+                                -1, hidden_states_gathered.shape[-1]),
+                            (0, 0, 0, pad_len),
+                            mode="constant",
+                            value=0)
+                    elif pad_len == 0:
+                        padded_hidden_states = hidden_states_gathered.view(
+                            -1, hidden_states_gathered.shape[-1])
+                    else:
+                        raise ValueError(
+                            f"In MTPEagleWorker.forward(), token_count < max_num_requests, which is not supported"
+                        )
+                    logits = draft_model.mtp_layers[0].shared_head(
+                        padded_hidden_states, draft_model.lm_head,
+                        attn_metadata, True)
+                else:
+                    logits = draft_model.mtp_layers[0].shared_head(
+                        hidden_states[gather_ids], draft_model.lm_head,
+                        attn_metadata, True)
+                if self.guided_decoder is not None:
+                    self.guided_decoder.execute_draft_batch(logits,
+                                                            draft_step=i)
 
-                @torch.compile(options={"max-autotune": True})
-                def update_kv_lens(kv_lens_cuda, batch_size):
-                    kv_lens_cuda[:batch_size] += 1
+                if self.model_config.mapping.enable_attention_dp and \
+                    getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
+                    mapping_lm_head_tp = draft_model.mtp_layers[
+                        0].shared_head.mapping_lm_head_tp
+                    new_draft_token = self.draft_sampler(
+                        logits, mapping_lm_head_tp)
+                    new_draft_token = new_draft_token[:token_count]
+                else:
+                    new_draft_token = self.draft_sampler(logits)
 
-                update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
-                # update metadata
-                # some attention metadata needs to be updated when changing kv_lens
-                attn_metadata.update_for_spec_dec()
-            inputs = {
-                "input_ids": new_draft_token,
-                "position_ids": position_ids,
-                "hidden_states": hidden_states,
-                "attn_metadata": attn_metadata,
-            }
+                hidden_states, position_ids = self.update_draft_tokens(
+                    next_draft_tokens, new_draft_token, hidden_states,
+                    gather_ids, inputs)
+                # update attn_metadata
+                if i == 0:
+                    attn_metadata._seq_lens[:batch_size].fill_(1)
+                    attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+                    attn_metadata.on_update()
+                    # cannot run generation if their is no kv cache
+                    has_kv_cache = inputs[
+                        "attn_metadata"].kv_cache_manager is not None
+                    if has_kv_cache:
+                        attn_metadata.host_request_types[:attn_metadata.
+                                                         num_contexts].fill_(1)
+                        attn_metadata.num_contexts = 0
+                    # update kv_lens_cuda
+                    if hasattr(attn_metadata, 'kv_lens_cuda'):
+                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
+                            self.mtp_num_modules -
+                            num_accepted_tokens[num_contexts:])
+                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
+                    # update metadata for flash mla
+                    if has_kv_cache and num_contexts > 0 and attn_metadata.enable_flash_mla:
+                        reorder_block_ids_per_seq = torch.cat([
+                            attn_metadata.
+                            kv_block_ids_per_seq[num_contexts:batch_size],
+                            attn_metadata.kv_block_ids_per_seq[:num_contexts]
+                        ])
+                        attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
+                            reorder_block_ids_per_seq, non_blocking=True)
+                    # update metadata
+                    # some attention metadata needs to be updated when changing seq_lens/kv_lens
+                    attn_metadata.update_for_spec_dec()
+                elif hasattr(attn_metadata, 'kv_lens_cuda'):
+
+                    @torch.compile(options={"max-autotune": True})
+                    def update_kv_lens(kv_lens_cuda, batch_size):
+                        kv_lens_cuda[:batch_size] += 1
+
+                    update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
+                    # update metadata
+                    # some attention metadata needs to be updated when changing kv_lens
+                    attn_metadata.update_for_spec_dec()
+                inputs = {
+                    "input_ids": new_draft_token,
+                    "position_ids": position_ids,
+                    "hidden_states": hidden_states,
+                    "attn_metadata": attn_metadata,
+                }
 
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)

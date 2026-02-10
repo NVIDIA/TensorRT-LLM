@@ -265,7 +265,8 @@ def create_sampling_params_from_proto(
 
     # Beam search / sampling
     if proto_config.beam_width > 1:
-        kwargs["beam_width"] = proto_config.beam_width
+        kwargs["use_beam_search"] = True
+        kwargs["best_of"] = proto_config.beam_width
     if proto_config.num_return_sequences > 0:
         kwargs["n"] = proto_config.num_return_sequences
 
@@ -289,7 +290,7 @@ def create_sampling_params_from_proto(
 
     # Seed for reproducibility
     if proto_config.HasField("seed"):
-        kwargs["random_seed"] = proto_config.seed
+        kwargs["seed"] = proto_config.seed
 
     # Min/max tokens
     if proto_config.HasField("min_tokens"):
@@ -336,11 +337,10 @@ def create_sampling_params_from_proto(
     if output_config.exclude_input_from_output:
         kwargs["exclude_input_from_output"] = True
 
-    # Stop sequences (as token ID lists)
-    if stop_words:
-        kwargs["stop_words"] = [list(seq.token_ids) for seq in stop_words]
-    if bad_words:
-        kwargs["bad_words"] = [list(seq.token_ids) for seq in bad_words]
+    # Pre-tokenized stop/bad word sequences (set after construction since
+    # SamplingParams._stop_word_ids/_bad_word_ids are init=False fields)
+    stop_word_ids = [list(seq.token_ids) for seq in stop_words] if stop_words else None
+    bad_word_ids = [list(seq.token_ids) for seq in bad_words] if bad_words else None
 
     # Embedding bias
     if embedding_bias:
@@ -353,15 +353,24 @@ def create_sampling_params_from_proto(
 
         if guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_JSON:
             # json_object=True for JSON validation without schema constraint
-            kwargs["guided_decoding_params"] = GuidedDecodingParams(json_object=True)
+            kwargs["guided_decoding"] = GuidedDecodingParams(json_object=True)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_JSON_SCHEMA:
-            kwargs["guided_decoding_params"] = GuidedDecodingParams(json_schema=guide_content)
+            kwargs["guided_decoding"] = GuidedDecodingParams(json=guide_content)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_REGEX:
-            kwargs["guided_decoding_params"] = GuidedDecodingParams(regex=guide_content)
+            kwargs["guided_decoding"] = GuidedDecodingParams(regex=guide_content)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_EBNF_GRAMMAR:
-            kwargs["guided_decoding_params"] = GuidedDecodingParams(grammar=guide_content)
+            kwargs["guided_decoding"] = GuidedDecodingParams(grammar=guide_content)
 
-    return SamplingParams(**kwargs)
+    params = SamplingParams(**kwargs)
+
+    # Set pre-tokenized stop/bad word IDs directly (these come pre-tokenized
+    # from the router, so we bypass the tokenizer-based setup path)
+    if stop_word_ids:
+        params._stop_word_ids = stop_word_ids
+    if bad_word_ids:
+        params._bad_word_ids = bad_word_ids
+
+    return params
 
 
 def create_lora_request_from_proto(

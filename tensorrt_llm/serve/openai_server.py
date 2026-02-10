@@ -198,7 +198,7 @@ class OpenAIServer:
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
-            return self.create_error_response(message=str(exc))
+            return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is not ServerRole.MM_ENCODER:
             self.register_routes()
@@ -290,6 +290,9 @@ class OpenAIServer:
         self.app.add_api_route("/update_weights",
                                 self.update_weights,
                                 methods=["POST"])
+        self.app.add_api_route("/server_info",
+                                self.get_server_info,
+                                methods=["GET"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -345,6 +348,13 @@ class OpenAIServer:
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
+        extra_args = {}
+        if self.llm.args.max_beam_width > 1:
+            extra_args = dict(
+                use_beam_search=True,
+                best_of=self.llm.args.max_beam_width,
+                n=1,
+            )
         try:
             # Create a minimal chat request
             health_request = ChatCompletionRequest(
@@ -352,7 +362,8 @@ class OpenAIServer:
                 model=self.model,
                 max_completion_tokens=1, # Request only 1 token out
                 stream=False,
-                temperature=0.0 # Deterministic output
+                temperature=0.0, # Deterministic output
+                **extra_args,
             )
 
             # Call the chat completion logic
@@ -482,6 +493,21 @@ class OpenAIServer:
                 async with self.perf_metrics_lock:
                     self.perf_metrics.append(item)
 
+    async def _create_chat_response(self,
+            promise: RequestOutput, postproc_params: PostprocParams, raw_request: Request, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
+        await promise.aresult()
+        if self.postproc_worker_enabled:
+            chat_response = promise.outputs[0]._postprocess_result
+        else:
+            post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            chat_response = post_processor(promise, args)
+
+        if disaggregated_params is not None and chat_response.choices[0].disaggregated_params is None:
+            raise ValueError(f"disaggregated_params is not set in the response for request"
+                             f" {disaggregated_params.disagg_request_id}")
+
+        return chat_response
+
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
         def get_role() -> str:
@@ -513,22 +539,6 @@ class OpenAIServer:
             except:
                 logger.error(traceback.format_exc())
                 raise
-
-        async def create_chat_response(
-                promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
-            await promise.aresult()
-            if self.postproc_worker_enabled:
-                chat_response =promise.outputs[0]._postprocess_result
-            else:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                chat_response = post_processor(promise, args)
-
-            # Add prompt_tokens_ids to the response
-            if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
-                chat_response.prompt_token_ids = promise.prompt_token_ids
-            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
-            await self._extract_metrics(promise, raw_request)
-            return chat_response
 
         try:
             conversation: List[ConversationMessage] = []
@@ -606,7 +616,7 @@ class OpenAIServer:
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
-                response = await create_chat_response(promise, postproc_params, disaggregated_params)
+                response = await self._create_chat_response(promise, postproc_params, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
@@ -861,17 +871,6 @@ class OpenAIServer:
         Supports both streaming and non-streaming modes.
         """
 
-        async def create_harmony_response(
-                promise: RequestOutput, postproc_params: PostprocParams) -> ChatCompletionResponse:
-            await promise.aresult()
-            if self.postproc_worker_enabled:
-                chat_response =promise.outputs[0]._postprocess_result
-            else:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                chat_response = post_processor(promise, args)
-
-            return chat_response
-
         async def create_streaming_generator(promise: RequestOutput, postproc_params: PostprocParams):
             async for res in promise:
                 if not self.postproc_worker_enabled:
@@ -923,6 +922,8 @@ class OpenAIServer:
                 vocab_size=self.tokenizer.tokenizer.vocab_size,
                 reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
+            trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
             postproc_args = ChatCompletionPostprocArgs.from_request(request)
             postproc_params = PostprocParams(
@@ -938,6 +939,8 @@ class OpenAIServer:
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=bool(request.stream),
                 lora_request=request.lora_request,
+                disaggregated_params=disaggregated_params,
+                trace_headers=trace_headers,
             )
             postproc_args.request_id = promise.request_id
 
@@ -954,7 +957,7 @@ class OpenAIServer:
                     media_type="text/event-stream"
                 )
             else:
-                response = await create_harmony_response(promise, postproc_params)
+                response = await self._create_chat_response(promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
         except Exception as e:
@@ -1130,6 +1133,9 @@ class OpenAIServer:
         assert isinstance(self.llm, AsyncLLM), "/update_weights endpoint is only supported with AsyncLLM()"
         await self.llm.collective_rpc('update_weights', args=(request.weights,))
         return JSONResponse(content={"status": "success"})
+
+    async def get_server_info(self) -> JSONResponse:
+        return JSONResponse(content={"disaggregated_params": self.llm.disaggregated_params})
 
     async def __call__(self, host, port, sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration

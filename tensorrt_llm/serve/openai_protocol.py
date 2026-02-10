@@ -36,7 +36,8 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
+                                 SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
 
@@ -76,7 +77,7 @@ class OpenAIBaseModel(BaseModel):
 
 class StreamOptions(OpenAIBaseModel):
     include_usage: Optional[bool] = True
-    continuous_usage_stats: Optional[bool] = True
+    continuous_usage_stats: Optional[bool] = False
 
 
 class PromptTokensDetails(OpenAIBaseModel):
@@ -121,6 +122,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     disagg_request_id: Optional[int] = None
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
+    schedule_style: Optional[DisaggScheduleStyle] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -1095,7 +1097,9 @@ def to_disaggregated_params(
         draft_tokens=tllm_disagg_params.draft_tokens,
         disagg_request_id=tllm_disagg_params.disagg_request_id,
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
-        ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint)
+        ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
+        schedule_style=tllm_disagg_params.schedule_style,
+    )
 
 
 def to_llm_disaggregated_params(
@@ -1111,7 +1115,9 @@ def to_llm_disaggregated_params(
         draft_tokens=disaggregated_params.draft_tokens,
         disagg_request_id=disaggregated_params.disagg_request_id,
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
-        ctx_info_endpoint=disaggregated_params.ctx_info_endpoint)
+        ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
+        schedule_style=disaggregated_params.schedule_style,
+    )
 
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]

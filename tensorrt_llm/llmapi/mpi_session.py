@@ -170,8 +170,14 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith("TRTLLM") or key.startswith("TLLM")
+        }
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
-                                        path=sys.path)
+                                        path=sys.path,
+                                        env=env)
 
     def __del__(self):
         self.shutdown_abort()

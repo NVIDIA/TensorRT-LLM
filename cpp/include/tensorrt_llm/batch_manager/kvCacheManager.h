@@ -642,7 +642,8 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(
+    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
+    [[nodiscard]] SizeType32 addSequence(
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
@@ -890,6 +891,11 @@ public:
         return mIsSWA;
     }
 
+    [[nodiscard]] bool isEnablePartialReuse() const
+    {
+        return mEnablePartialReuse;
+    }
+
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
     //! \brief Unpin blocks by block ids directly
@@ -1077,6 +1083,11 @@ public:
         return mIndexerKCacheIndexHeadDim;
     }
 
+    [[nodiscard]] bool isEnablePartialReuse() const
+    {
+        return mWindowBlockManagers.begin()->second.isEnablePartialReuse();
+    }
+
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
 
@@ -1091,8 +1102,9 @@ public:
 
     void allocatePools(bool useUvm);
 
-    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-        LlmRequest& llmRequest, SizeType32 windowSize);
+    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
+    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
+        SizeType32 numContextBlocks, LlmRequest& llmRequest, SizeType32 windowSize);
 
     //! \brief Assign blocks for a new sequence.
     //! \param sequence  The GenerationRequest to process.
@@ -1563,6 +1575,8 @@ public:
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
+    [[nodiscard]] virtual bool isEnablePartialReuse() const = 0;
+
     [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheQuantBlockSize() const = 0;
@@ -1685,6 +1699,14 @@ public:
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+
+    //! @brief Get the retention priority of a block by its ID.
+    //! @param blockId The ID of the block.
+    //! @param windowSize The attention window size this block belongs to.
+    //! @return The retention priority of the block, or default priority if block not found.
+    [[nodiscard]] virtual executor::RetentionPriority getPriorityByBlockId(
+        KVCacheBlock::IdType blockId, SizeType32 windowSize) const
+        = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -1902,6 +1924,11 @@ public:
         return mEnableBlockReuse;
     }
 
+    [[nodiscard]] bool isEnablePartialReuse() const override
+    {
+        return mBlockManager.isEnablePartialReuse();
+    }
+
     [[nodiscard]] bool isEnableIndexerKCache() const override
     {
         return mBlockManager.isEnableIndexerKCache();
@@ -1967,6 +1994,9 @@ public:
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
+
+    [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
+        KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
 
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 

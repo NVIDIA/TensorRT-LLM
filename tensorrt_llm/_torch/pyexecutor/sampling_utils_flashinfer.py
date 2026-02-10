@@ -20,7 +20,7 @@ referring to types like LlmRequest.
 
 import abc
 import sys
-from typing import Optional, Type, TypeAlias, cast
+from typing import Literal, Optional, Type, TypeAlias, cast
 
 import flashinfer.sampling
 import torch
@@ -60,6 +60,9 @@ class _StrategyImpls:
         @abc.abstractmethod
         def computes_probs(cls) -> bool:
             pass
+
+        def get_temperature(self) -> torch.Tensor | None:
+            return getattr(self, "_temperature", None)
 
         @abc.abstractmethod
         def sample(
@@ -177,8 +180,8 @@ class _StrategyImpls:
     class BeamSearchMixin(StrategyImpl):
         def __init__(
             self,
-            beam_width_in: torch.Tensor,
-            beam_width_out: torch.Tensor,
+            beam_width_in: int,
+            beam_width_out: int,
             temperature: torch.Tensor,
         ):
             self._beam_width_in = beam_width_in
@@ -192,12 +195,8 @@ class _StrategyImpls:
         ) -> "_StrategyImpls.BeamSearchMixin":
             assert all(strat[0] == "beam_search" for strat in strategies)
             narrowed_strats = cast(list[BeamSearch], strategies)
-            beam_width_in = cls._make_tensor(
-                [strat[1] for strat in narrowed_strats], torch.int32, cuda_device
-            )
-            beam_width_out = cls._make_tensor(
-                [strat[2] for strat in narrowed_strats], torch.int32, cuda_device
-            )
+            (beam_width_in,) = set(strat[1] for strat in narrowed_strats)
+            (beam_width_out,) = set(strat[2] for strat in narrowed_strats)
             temperature = cls._make_tensor(
                 [strat[3] or 1.0 for strat in narrowed_strats], torch.float32, cuda_device
             )
@@ -215,22 +214,15 @@ class _StrategyImpls:
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
                 "BeamSearchMetadata is required for beam_search_sampling_batch"
             )
-            assert torch.unique(self._beam_width_in).numel() == 1, (
-                "beam_width_in must be the same for all strategies"
-            )
-            assert torch.unique(self._beam_width_out).numel() == 1, (
-                "beam_width_out must be the same for all strategies"
-            )
-            logits = self._prepare_logits_with_temperature(
-                logits, group_logit_indices, self._temperature
-            )
+            # Convert from 1 temperature per request to 1 temperature per (request, beam)
+            temperature = self._temperature.repeat_interleave(self._beam_width_in)
+            logits = self._prepare_logits_with_temperature(logits, group_logit_indices, temperature)
             return beam_search_sampling_batch(
                 logits,
-                beam_width_in=self._beam_width_in[0],
-                beam_width_out=self._beam_width_out[0],
+                beam_width_in=self._beam_width_in,
+                beam_width_out=self._beam_width_out,
                 beam_search_args=group_metadata,
                 temperature=None,
-                generator=generator,
                 return_probs=self.computes_probs(),
             )
 
@@ -648,84 +640,52 @@ class _StrategyImpls:
         pass
 
 
-def _create_beam_search_specialized_cls(
-    beam_width_in: torch.Tensor,
-    beam_width_out: torch.Tensor,
-    return_probs: bool,
-) -> Type[_StrategyImpls.BeamSearchMixin]:
-    """Create a class that implements BeamSearchMixin with static parameters for grouping."""
-
-    class BeamSearchSpecialized(
-        _StrategyImpls.BeamSearchWithProbs if return_probs else _StrategyImpls.BeamSearchSampleOnly
-    ):
-        static_beam_width_in = beam_width_in
-        static_beam_width_out = beam_width_out
-
-        @override
-        def __hash__(self) -> int:
-            return hash((super(), self.static_beam_width_in, self.static_beam_width_out))
-
-        @override
-        def __eq__(self, other: object) -> bool:
-            return (
-                super().__eq__(other)
-                and self.static_beam_width_in == other.static_beam_width_in
-                and self.static_beam_width_out == other.static_beam_width_out
-            )
-
-    return BeamSearchSpecialized
+_STRATEGY_KEY_TYPE: TypeAlias = (
+    Literal["temperature"]
+    | Literal["top_k"]
+    | Literal["top_p"]
+    | Literal["top_k_top_p"]
+    | Literal["greedy"]
+    | tuple[Literal["beam_search"], int, int]
+)
 
 
-class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpls.StrategyImpl]]):
+class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE]):
     """Implements batched sampling with FlashInfer.sampling kernels.
 
     Note: Currently, FlashInfer.sampling appears to have limited CUDA graph
           support, see https://github.com/flashinfer-ai/flashinfer/issues/978.
     """
 
-    STRATEGY_KEY_TYPE: TypeAlias = Type[_StrategyImpls.StrategyImpl]
+    STRATEGY_KEY_TYPE: TypeAlias = _STRATEGY_KEY_TYPE
 
     @override
     @staticmethod
-    def strategy_grouping_key(strategy: Strategy, return_probs: bool) -> STRATEGY_KEY_TYPE:
-        if return_probs:
-            match strategy:
-                case ("top_k", _, _):
-                    return _StrategyImpls.TopKWithProbs
-                case ("top_p", _, _):
-                    return _StrategyImpls.TopPWithProbs
-                case ("top_k_top_p", _, _, _):
-                    return _StrategyImpls.TopKTopPWithProbs
-                case ("temperature", _):
-                    return _StrategyImpls.TemperatureOnlyWithProbs
-                case ("greedy", None):
-                    return _StrategyImpls.GreedyWithProbs
-                case ("beam_search", beam_width_in, beam_width_out, _):
-                    return _create_beam_search_specialized_cls(beam_width_in, beam_width_out, True)
-        else:
-            match strategy:
-                case ("top_p", _, _):
-                    return _StrategyImpls.TopPSampleOnly
-                case ("top_k", _, _):
-                    return _StrategyImpls.TopKSampleOnly
-                case ("top_k_top_p", _, _, _):
-                    return _StrategyImpls.TopKTopPSampleOnly
-                case ("temperature", _):
-                    return _StrategyImpls.TemperatureOnlySampleOnly
-                case ("greedy", None):
-                    return _StrategyImpls.GreedySampleOnly
-                case ("beam_search", beam_width_in, beam_width_out, _):
-                    return _create_beam_search_specialized_cls(beam_width_in, beam_width_out, False)
+    def strategy_grouping_key(strategy: Strategy) -> STRATEGY_KEY_TYPE:
+        match strategy:
+            case (
+                ("top_k", _, _)
+                | ("top_p", _, _)
+                | ("top_k_top_p", _, _, _)
+                | ("temperature", _)
+                | ("greedy", None)
+            ):
+                return strategy[0]
+            case ("beam_search", beam_width_in, beam_width_out, _):
+                return (strategy[0], beam_width_in, beam_width_out)
+            case _:
+                raise NotImplementedError("Unsupported strategy encountered")
 
     @override
     @staticmethod
     def get_metadata_type_for_group(
         strategy_key: STRATEGY_KEY_TYPE,
     ) -> Type[StrategyMetadata] | None:
-        if issubclass(strategy_key, _StrategyImpls.BeamSearchMixin):
-            return BeamSearchMetadata
-        else:
-            return None
+        match strategy_key:
+            case ("beam_search", _, _):
+                return BeamSearchMetadata
+            case _:
+                return None
 
     @override
     @staticmethod
@@ -739,28 +699,52 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if hasattr(group_key, "static_beam_width_in"):
-            beam_width_in = group_key.static_beam_width_in
+        beam_width_in = 1
+        if return_probs:
+            match group_key:
+                case "top_k":
+                    strategy_impl_cls = _StrategyImpls.TopKWithProbs
+                case "top_p":
+                    strategy_impl_cls = _StrategyImpls.TopPWithProbs
+                case "top_k_top_p":
+                    strategy_impl_cls = _StrategyImpls.TopKTopPWithProbs
+                case "temperature":
+                    strategy_impl_cls = _StrategyImpls.TemperatureOnlyWithProbs
+                case "greedy":
+                    strategy_impl_cls = _StrategyImpls.GreedyWithProbs
+                case ("beam_search", beam_width_in_key, _):
+                    beam_width_in = beam_width_in_key
+                    strategy_impl_cls = _StrategyImpls.BeamSearchWithProbs
+                case _:
+                    raise NotImplementedError("Unsupported strategy key encountered")
         else:
-            beam_width_in = 1
+            match group_key:
+                case "top_p":
+                    strategy_impl_cls = _StrategyImpls.TopPSampleOnly
+                case "top_k":
+                    strategy_impl_cls = _StrategyImpls.TopKSampleOnly
+                case "top_k_top_p":
+                    strategy_impl_cls = _StrategyImpls.TopKTopPSampleOnly
+                case "temperature":
+                    strategy_impl_cls = _StrategyImpls.TemperatureOnlySampleOnly
+                case "greedy":
+                    strategy_impl_cls = _StrategyImpls.GreedySampleOnly
+                case ("beam_search", beam_width_in_key, _):
+                    beam_width_in = beam_width_in_key
+                    strategy_impl_cls = _StrategyImpls.BeamSearchSampleOnly
+                case _:
+                    raise NotImplementedError("Unsupported strategy key encountered")
+
         if group_logit_indices is None:
             assert logits.size(0) == beam_width_in * len(strategies)
         else:
             assert group_logit_indices.size(0) == beam_width_in * len(strategies)
 
-        assert return_probs == group_key.computes_probs()
-
-        strategy_impl_cls = group_key
-        sampling_object = strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device)
-        next_tokens, softmax = sampling_object.sample(
+        strategy_impl = strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device)
+        next_tokens, softmax = strategy_impl.sample(
             logits,
             group_logit_indices=group_logit_indices,
             generator=generator,
             group_metadata=group_metadata,
         )
-        temperature = (
-            sampling_object._temperature.unsqueeze(-1)
-            if sampling_object._temperature is not None
-            else None
-        )
-        return next_tokens, softmax, temperature
+        return next_tokens, softmax, strategy_impl.get_temperature()

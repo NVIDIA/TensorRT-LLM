@@ -16,7 +16,7 @@ from ...export.library.unified_attn import HF_ATTN_KWARGS_MAPPING
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
-from .kvcache import InsertCachedAttention
+from .kvcache import _InsertCachedOperator
 
 
 def fake_profiler_mha(
@@ -202,7 +202,7 @@ def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
 # TODO: how running different kv cache transforms look like? This one below wouldn't work if we
 # had multiple types attention to replace...
 @TransformRegistry.register("transformers_replace_cached_attn")
-class HFReplaceCachedAttn(InsertCachedAttention):
+class HFReplaceCachedAttn(_InsertCachedOperator):
     """Replace cached attention for the factory model, update inputs and outputs, and patch the gm forward."""
 
     def _add_or_retrieve_input(

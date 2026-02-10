@@ -25,7 +25,7 @@ from ..utils import (ActivationType, fp4_scale_infer_shape,
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellLinear
+        CuteDSLNVFP4BlackwellRunner
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -819,7 +819,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                             "Please add other backends to allowed_backends.")
                 else:
                     # SM version OK, check if CuteDSL supports the current shape
-                    cutedsl_runner = CuteDSLNVFP4BlackwellLinear(
+                    cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
                         self.output_dtype)
                     cutedsl_tactics = cutedsl_runner.get_valid_tactics(
                         inputs, profile)
@@ -878,7 +878,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                          self.output_dtype)(inputs,
                                                             tactic=sub_tactic)
         elif backend == "cutedsl":
-            return CuteDSLNVFP4BlackwellLinear(
+            return CuteDSLNVFP4BlackwellRunner(
                 self.output_dtype, self.to_userbuffers)(inputs,
                                                         tactic=sub_tactic)
         else:
@@ -1450,17 +1450,17 @@ def _(
 
 def deep_gemm_gen_tuning_buckets(x: int):
     buckets = tuple(range(8, 128, 8))
+    # Clamp x to be between 4096 and 8192.
     if x >= 128:
+        x = min(x, 8192)
+        x = max(x, 4096)
         buckets += tuple(range(128, x, 128))
     return buckets
 
 
 class fp8SwapABGemmRunner(TunableRunner):
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
-        tune_max_num_tokens=4096,
-    )
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, deep_gemm_gen_tuning_buckets), ), )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool):
         self.output_dtype = output_dtype
@@ -1477,9 +1477,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        # Encode swap_ab as False (0) and True (1). Currently enabled when GEMM m <= 128.
-        input, _, _ = inputs
-        return [0, 1] if input.shape[0] <= 128 else [0]
+        return [0]
 
     def forward(
         self,
@@ -1494,8 +1492,7 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
-        forward_func = deep_gemm.fp8_gemm_ntt if tactic == 1 else deep_gemm.fp8_gemm_nt
-        forward_func(
+        deep_gemm.fp8_gemm_nt(
             (a, a_sf),
             (weight, weight_scale),
             output,
@@ -1511,14 +1508,13 @@ def fp8_swap_ab_gemm(
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
-    tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
     tuner = AutoTuner.get()
     fp8_swap_ab_gemm_runner = fp8SwapABGemmRunner(
         output_dtype,
         disable_ue8m0_cast,
     )
-    fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
         [fp8_swap_ab_gemm_runner],
@@ -1538,7 +1534,6 @@ def _(
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
-    tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 

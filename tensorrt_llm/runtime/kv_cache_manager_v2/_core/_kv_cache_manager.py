@@ -152,6 +152,14 @@ class KVCacheManager:
         slot_size = pool_group.slot_size[pool_idx]
         return exact_div(slot_size, attr.size) * num_slots - exact_div(attr.offset, attr.size)
 
+    def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int:
+        """
+        The multiplier to convert from base page indices to page indices expected by operators/kernels.
+        """
+        storage = self._storage
+        attr = storage.get_buffer_attr(layer_id, data_role)
+        return storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
+
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,

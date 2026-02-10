@@ -1296,13 +1296,14 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     int dpRank = 0;
     int dpSize = 1;
     bool enableBlockReuse = true;
+    bool enablePartialReuse = true;
     bool hasIndexerKCache = true;
     texec::SizeType32 indexerDimPerHead = 96;
     texec::SizeType32 indexerKCacheQuantBlockSize = 128;
 
     CacheState state{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tp, pp, cp, attentionLayerNumPerPP, dataType,
-        attentionType, kvFactor, enableAttentionDP, dpRank, dpSize, enableBlockReuse, hasIndexerKCache,
-        indexerDimPerHead, indexerKCacheQuantBlockSize};
+        attentionType, kvFactor, enableAttentionDP, dpRank, dpSize, enableBlockReuse, enablePartialReuse,
+        hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
 
     std::ostringstream oss;
     texec::Serialization::serialize(state, oss);
@@ -1320,6 +1321,7 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     EXPECT_EQ(state.getAttentionConfig().mAttentionType, state2.getAttentionConfig().mAttentionType);
     EXPECT_EQ(state.getAttentionConfig().mKvFactor, state2.getAttentionConfig().mKvFactor);
     EXPECT_EQ(state.getEnableBlockReuse(), state2.getEnableBlockReuse());
+    EXPECT_EQ(state.getEnablePartialReuse(), state2.getEnablePartialReuse());
     EXPECT_EQ(state.getHasIndexerKCache(), state2.getHasIndexerKCache());
     EXPECT_EQ(state.getIndexerDimPerHead(), state2.getIndexerDimPerHead());
     EXPECT_EQ(state.getIndexerKCacheQuantBlockSize(), state2.getIndexerKCacheQuantBlockSize());

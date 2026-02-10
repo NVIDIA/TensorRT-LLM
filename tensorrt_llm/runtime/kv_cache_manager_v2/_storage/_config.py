@@ -119,14 +119,13 @@ class StorageConfig:
                         offset += cb.single_buffer_size
         return ret
 
-    def slot_to_page_indices(self) -> TypedIndexList[LifeCycleId, int]:
-        ret = filled_list(0, self.num_life_cycles)
+    def slot_to_page_indices(self) -> TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]]:
+        ret = [[]] * self.num_life_cycles
         for pg in self.slot_desc_list:
             for slot in pg.variants:
                 life_cycle = slot.life_cycle_id
-                page = slot.coalesced_buffers[0]
-                ret[life_cycle] = page.num_buffers
-        return ret
+                ret[life_cycle] = [cb.num_buffers for cb in slot.coalesced_buffers]
+        return cast(TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]], ret)
 
     def layer_to_life_cycle_ids(self) -> dict[LayerId, LifeCycleId]:
         map = dict[LayerId, LifeCycleId]()
@@ -160,11 +159,6 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     # @TODO: add test for this case.
     slot_groups: list[SlotDescVariant] = []
     for life_cycle_id, size_to_buffers in buffer_groups.items():
-        assert len(set(len(buffer_ids) for buffer_ids in size_to_buffers.values())) == 1, (
-            "Not yet supported. While we can support this easily, we need to know whether the kernels "
-            "need to share page indices or not. We haven't seen such models, yet. So we leave this as a "
-            "future work."
-        )
         slots = [
             CoalescedBuffer(size, tuple(buffer_ids)) for size, buffer_ids in size_to_buffers.items()
         ]

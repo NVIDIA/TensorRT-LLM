@@ -168,7 +168,8 @@ class _KVCache:
         "_history_length",
         "_commit_state",
         "_blocks",
-        "_page_indices",
+        "_base_page_indices",
+        "_page_indices",  # Deprecated. To be removed in the future.
         "_committed_tokens",
         "_num_committed_blocks",
         "_finish_event",
@@ -193,6 +194,7 @@ class _KVCache:
     _blocks: TypedIndexList[BlockOrdinal, SeqBlock]
     # we maintain _page_indices to accelerate the get_page_indices() API. In principle it can be
     # computed on the fly, but that would be slow due to python.
+    _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
     # Sometimes we can't commit a block because all its tokens are already covered by another block in
@@ -226,6 +228,10 @@ class _KVCache:
         self._history_length = 0
         self._commit_state = self.CommitState.ALLOWED
         self._blocks = cast(TypedIndexList, [])
+        self._base_page_indices = make_typed(
+            lambda: make_typed(lambda: array.array("i"), self.manager._storage.num_life_cycles),
+            self.beam_width,
+        )
         self._page_indices = make_typed(
             lambda: make_typed(lambda: array.array("i"), self.manager._storage.num_life_cycles),
             self.beam_width,
@@ -242,7 +248,10 @@ class _KVCache:
     def set_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
     ) -> None:
-        """Set the buffer for page indices, so we directly update indices in user buffer to
+        """
+        Deprecated. Use set_base_page_index_buf() instead.
+
+        Set the buffer for page indices, so we directly update indices in user buffer to
         avoid user-side copy. This is the zero-copy alternative of get_page_indices()"""
         length = self.num_blocks
         old_indices = self._page_indices[beam_idx][layer_group_id]
@@ -255,6 +264,28 @@ class _KVCache:
             buf[length:] = array.array("i", [BAD_PAGE_INDEX]) * (len(buf) - length)
             new_indices = buf
         self._page_indices[beam_idx][layer_group_id] = new_indices
+
+    def set_base_page_index_buf(
+        self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
+    ) -> None:
+        """
+        Set the buffer for base page indices, so we directly update indices in user buffer to
+        avoid user-side copy. This is the zero-copy alternative of get_base_page_indices().
+
+        Note that base page indices are not meant for direct use in the kernels. They need to
+        be scaled by kv_cache_manager.page_index_scale().
+        """
+        length = self.num_blocks
+        old_indices = self._base_page_indices[beam_idx][layer_group_id]
+        new_indices: IndexSeq
+        if buf is None:
+            new_indices = array.array("i", old_indices[:length])
+        else:
+            assert buf.ndim == 1 and buf.format == "i" and len(buf) >= length
+            buf[:length] = old_indices[:length]
+            buf[length:] = array.array("i", [BAD_PAGE_INDEX]) * (len(buf) - length)
+            new_indices = buf
+        self._base_page_indices[beam_idx][layer_group_id] = new_indices
 
     @property
     def manager(self) -> "KVCacheManager":
@@ -314,10 +345,23 @@ class _KVCache:
     def get_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq:
+        """
+        Deprecated. Use get_base_page_indices() instead.
+        """
         indices = self._page_indices[beam_id][layer_group_id]
         assert NDEBUG or all(
             v == value_or(r, BAD_PAGE_INDEX)
             for v, r in zip(indices, self._get_page_indices_ref(layer_group_id, beam_id))
+        )
+        return indices
+
+    def get_base_page_indices(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    ) -> IndexSeq:
+        indices = self._base_page_indices[beam_id][layer_group_id]
+        assert NDEBUG or all(
+            v == value_or(r, BAD_PAGE_INDEX)
+            for v, r in zip(indices, self._get_base_page_indices_ref(layer_group_id, beam_id))
         )
         return indices
 
@@ -380,15 +424,16 @@ class _KVCache:
         if new_num_blocks < old_num_blocks:
             with self._record_event():
                 del self._blocks[new_num_blocks:]
-            for beam_indices in self._page_indices:
-                for indices in beam_indices:
-                    assert all(i == BAD_PAGE_INDEX for i in indices[new_num_blocks:])
-                    if type(indices) is array.array:
-                        del indices[new_num_blocks:]
-                    else:
-                        indices[new_num_blocks:] = array.array("i", [BAD_PAGE_INDEX]) * (
-                            len(indices) - new_num_blocks
-                        )
+            for page_indices in (self._base_page_indices, self._page_indices):
+                for beam_indices in page_indices:
+                    for indices in beam_indices:
+                        assert all(i == BAD_PAGE_INDEX for i in indices[new_num_blocks:])
+                        if type(indices) is array.array:
+                            del indices[new_num_blocks:]
+                        else:
+                            indices[new_num_blocks:] = array.array("i", [BAD_PAGE_INDEX]) * (
+                                len(indices) - new_num_blocks
+                            )
         elif new_num_blocks > old_num_blocks:
             num_new_slots = filled_list(0, num_life_cycles)
             stale_ranges = [
@@ -408,13 +453,14 @@ class _KVCache:
             except OutOfPagesError:
                 self._lock_held_blocks(backup_holders)
                 return False
-            for beam_indices in self._page_indices:
-                for indices in beam_indices:
-                    if type(indices) is array.array:
-                        assert len(indices) == old_num_blocks
-                        indices.extend([BAD_PAGE_INDEX] * (new_num_blocks - old_num_blocks))
-                    else:
-                        assert len(indices) >= new_num_blocks
+            for page_indices in (self._base_page_indices, self._page_indices):
+                for beam_indices in page_indices:
+                    for indices in beam_indices:
+                        if type(indices) is array.array:
+                            assert len(indices) == old_num_blocks
+                            indices.extend([BAD_PAGE_INDEX] * (new_num_blocks - old_num_blocks))
+                        else:
+                            assert len(indices) >= new_num_blocks
             stream_wait_events(
                 self.cuda_stream, (s.ready_event for s in chain.from_iterable(slots))
             )
@@ -543,6 +589,10 @@ class _KVCache:
         assert self.status == self.Status.ACTIVE
         assert self._check_sanity()
         assert self._finish_event is None
+        for beam_idx, beam_indices in typed_enumerate(self._base_page_indices):
+            for lc, indices in typed_enumerate(beam_indices):
+                if type(indices) is memoryview:
+                    self.set_base_page_index_buf(beam_idx, lc, None)
         for beam_idx, beam_indices in typed_enumerate(self._page_indices):
             for lc, indices in typed_enumerate(beam_indices):
                 if type(indices) is memoryview:
@@ -999,12 +1049,13 @@ class _KVCache:
                         "failure by disallowing partial matching."
                     )
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
-        for beam_indices in self._page_indices:
-            for indices in beam_indices:
-                if type(indices) is array.array:
-                    indices.extend([BAD_PAGE_INDEX] * (self.num_blocks - len(indices)))
-                else:
-                    assert len(indices) >= self.num_blocks
+        for page_indices in (self._base_page_indices, self._page_indices):
+            for beam_indices in page_indices:
+                for indices in beam_indices:
+                    if type(indices) is array.array:
+                        indices.extend([BAD_PAGE_INDEX] * (self.num_blocks - len(indices)))
+                    else:
+                        assert len(indices) >= self.num_blocks
 
     def _clear_blocks(self) -> None:
         # drop the last block first
@@ -1019,6 +1070,14 @@ class _KVCache:
             yield
         finally:
             self._finish_event = None
+
+    def _update_base_page_index(
+        self, beam_idx: BeamIndex, ordinal: BlockOrdinal, lc: LifeCycleId, page_index: PageIndex
+    ) -> PageIndex:
+        indices = self._base_page_indices[beam_idx][lc]
+        old = PageIndex(indices[ordinal])
+        indices[ordinal] = page_index
+        return old
 
     def _update_page_index(
         self, beam_idx: BeamIndex, ordinal: BlockOrdinal, lc: LifeCycleId, page_index: PageIndex
@@ -1041,6 +1100,13 @@ class _KVCache:
             for b in self._blocks
         )
         return self._storage.get_page_indices_ref(lc, pages)
+
+    def _get_base_page_indices_ref(
+        self, lc: LifeCycleId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    ) -> Iterator[int | None]:
+        assert beam_id < self.beam_width
+        assert self.is_active
+        return self.get_aggregated_page_indices(lc, beam_id)
 
     def _shortcut_set_capacity(self, capacity: int) -> bool:
         "Shortcut for cases without side effects. Just for better performance."

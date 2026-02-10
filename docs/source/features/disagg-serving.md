@@ -10,6 +10,7 @@
 - [Usage](#Usage)
   - [Dynamo](#Dynamo)
   - [trtllm-serve](#trtllm-serve)
+  - [Multiple Instances](#multiple-instances)
 - [Environment Variables](#Environment-Variables)
 - [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
 
@@ -214,6 +215,23 @@ curl http://localhost:8000/v1/completions \
 #### Launching disaggregated servers on SLURM clusters
 
 Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
+
+### Multiple Instances
+
+To increase maximum concurrency without more GPU nodes, you can deploy multiple disaggregated server instances across different nodes, while each instance manages the same context/generation servers. This is helpful when one disaggregated server becomes a performance bottleneck or runs out of ephemeral ports.
+
+Example (two-node deployment):
+
+- **Node A**
+  - Context servers: `node-a:8001`
+  - Generation servers: `node-b:8002`
+  - Disaggregated orchestrator endpoint: `node-a:8000`
+- **Node B**
+  - Context servers: `node-a:8001`
+  - Generation servers: `node-b:8002`
+  - Disaggregated orchestrator endpoint: `node-b:8000`
+- **Client entrypoint**
+  - Send requests or use a load balancer forwarding to `node-a:8000` and `node-b:8000`
 
 ## Environment Variables
 

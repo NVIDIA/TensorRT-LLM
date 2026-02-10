@@ -50,7 +50,7 @@ from .softplus import softplus
     "HAS_INTERMEDIATE_STATE_INDICES":
     lambda args: args["intermediate_state_indices_ptr"] is not None
 })
-@triton.jit(do_not_specialize=["T"])
+@triton.jit()
 def _selective_scan_update_kernel(
     # Pointers to matrices
     state_ptr,

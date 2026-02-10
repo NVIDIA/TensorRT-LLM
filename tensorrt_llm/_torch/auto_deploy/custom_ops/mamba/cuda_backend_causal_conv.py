@@ -24,26 +24,15 @@ The flattened cached op integrates with the auto_deploy attention interface
 and updates a slot-indexed convolution state cache internally.
 """
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
-from torch._ops import OpOverloadPacket
-from torch.fx import Node
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
-from .....llmapi.llm_args import KvCacheConfig
-from ...utils.node_utils import extract_op_args
-from ..attention_interface import (
-    AttentionDescriptor,
-    AttentionLayout,
-    AttentionRegistry,
-    Constant,
-    MHACallable,
-    ResourceHandlerDict,
-    StateResourceHandler,
-)
+from ..attention_interface import AttentionRegistry, MHACallable
+from .causal_conv_common import BaseCausalConvDescriptor
 
 
 @torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={"input"})
@@ -163,52 +152,13 @@ def cuda_cached_causal_conv1d_wrapper(input: torch.Tensor, *args, **kwargs) -> t
 
 
 @AttentionRegistry.register("cuda_causal_conv")
-class CudaBackendCausalConv(AttentionDescriptor):
-    @classmethod
-    def get_attention_layout(cls) -> AttentionLayout:
-        # Hidden states follow [b, s, c]
-        return "bsnd"
+class CudaBackendCausalConv(BaseCausalConvDescriptor):
+    """CUDA-backed causal conv1d attention descriptor.
 
-    @classmethod
-    def get_num_qkv_args(cls) -> int:
-        # torch_causal_conv1d signature has 3 relevant tensor arguments
-        # TODO: bias can be optional!! How to handle None bias here?
-        return 3
-
-    @classmethod
-    def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_causal_conv1d.default
+    Inherits shared methods from BaseCausalConvDescriptor.
+    Only overrides get_cached_attention_op to return the CUDA wrapper.
+    """
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return cuda_cached_causal_conv1d_wrapper
-
-    @classmethod
-    def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info_host", "cu_seqlen", "slot_idx", "use_initial_states"]
-
-    @classmethod
-    def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
-    ) -> ResourceHandlerDict:
-        inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
-        w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]
-
-        in_channels = inp_fake.shape[-1]
-        kernel_size = w_fake.shape[-1]
-
-        conv_state_handler = StateResourceHandler(
-            in_channels,
-            max(1, kernel_size - 1),
-            # NOTE: not configurable at the moment, using auto to match the input dtype
-            dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
-        )
-        return {"conv_state_cache": conv_state_handler}
-
-    @classmethod
-    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        stride, padding, dilation, groups, padding_mode = extract_op_args(
-            source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
-        )
-        # None is for activation parameter, which may not exist in the source node (added by fusion later)
-        return [stride, padding, dilation, groups, padding_mode, None]

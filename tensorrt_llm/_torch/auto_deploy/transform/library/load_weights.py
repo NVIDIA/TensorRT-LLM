@@ -25,6 +25,10 @@ class MoveDeviceConfig(TransformConfig):
         default=None,
         description="Optional device to init checkpoint before move to shared_config.local_device.",
     )
+    disable_preload: bool = Field(
+        default=False,
+        description="If True, disable preloading weights.",
+    )
 
 
 @TransformRegistry.register("load_weights")
@@ -48,7 +52,11 @@ class LoadWeightsToDevice(BaseTransform):
         total_size_GB = bytes_to(params_size, unit="GB")
         self._log_info(f"Estimated parameters memory: {total_size_GB:.2f} GB")
 
-        factory.load_or_random_init(mod, device=self.config.checkpoint_device or cm.device)
+        factory.load_or_random_init(
+            mod,
+            device=self.config.checkpoint_device or cm.device,
+            disable_preload=self.config.disable_preload,
+        )
         move_to_device(mod, cm.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)

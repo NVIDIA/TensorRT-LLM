@@ -1401,6 +1401,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_params = kwargs.get("multimodal_params", [])
@@ -1422,7 +1423,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                position_ids,
                                inputs_embeds,
                                spec_metadata=spec_metadata,
-                               return_context_logits=return_context_logits)
+                               return_context_logits=return_context_logits,
+                               resource_manager=resource_manager)
 
     def infer_max_seq_len(self):
         if self.model_config.attn_backend.upper() != 'TRTLLM':

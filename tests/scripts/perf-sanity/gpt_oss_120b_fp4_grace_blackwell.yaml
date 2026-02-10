@@ -32,7 +32,7 @@ server_configs:
         iterations: 5
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.8
+        random_range_ratio: 0.0
         backend: "openai"
 
   - name: "gpt_oss_fp4_dep2_1k1k"
@@ -63,7 +63,7 @@ server_configs:
         iterations: 5
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.0
         backend: "openai"
 
   - name: "gpt_oss_fp4_tep2_1k8k"
@@ -92,7 +92,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.8
+        random_range_ratio: 0.0
         backend: "openai"
 
   - name: "gpt_oss_fp4_tp2_1k8k"
@@ -121,7 +121,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.8
+        random_range_ratio: 0.0
         backend: "openai"
 
   - name: "gpt_oss_fp4_tp4_eagle3_1k1k"
@@ -155,5 +155,5 @@ server_configs:
         iterations: 32
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.0
         backend: "openai"

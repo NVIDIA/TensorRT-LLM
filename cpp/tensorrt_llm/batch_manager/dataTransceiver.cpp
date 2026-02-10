@@ -825,8 +825,8 @@ public:
         {
             auto* cacheManager = mFormatter->getCacheManager();
             auto beam = 0;
-            auto requestedBlockRange
-                = getBlockRangeForReceiving(cacheManager, llmRequest, destCacheState.getEnableBlockReuse());
+            auto requestedBlockRange = getBlockRangeForReceiving(
+                cacheManager, llmRequest, destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse());
 
             auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
             auto lastBlockKey
