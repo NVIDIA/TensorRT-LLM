@@ -396,6 +396,12 @@ def main():
     parser.add_argument(
         "--build-wheel", action="store_true", help="Build wheel before running tests"
     )
+    parser.add_argument(
+        "--install-mode",
+        default="source",
+        choices=["source", "wheel"],
+        help="Installation mode: source (pip install -e ., default) or wheel (pip install *.whl)"
+    )
 
     args = parser.parse_args()
 
@@ -513,6 +519,7 @@ def main():
             f"export installScript='{install_sh}'",
             f"export configYamlPath='{config_yaml}'",
             f"export BUILD_WHEEL={'true' if args.build_wheel else 'false'}",
+            f"export INSTALL_MODE='{args.install_mode}'",
         ]
     )
 

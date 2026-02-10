@@ -44,8 +44,26 @@ slurm_install_setup() {
             rm -f "$lock_file"
         fi
 
-        echo "(Installing TensorRT-LLM and requirements) Current directory: $(pwd)"
-        retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . && pip install --retries 10 -r requirements-dev.txt"
+        echo "(Installing TensorRT-LLM and requirements) Install mode: ${INSTALL_MODE:-source}"
+        
+        # Support two installation modes: source (default) and wheel
+        if [ "${INSTALL_MODE:-source}" = "wheel" ]; then
+            # Wheel installation mode
+            echo "Installing from wheel..."
+            WHEEL_FILE=$(find "$llmSrcNode/build" -name "tensorrt_llm-*.whl" -type f 2>/dev/null | head -1)
+            
+            if [ -n "$WHEEL_FILE" ]; then
+                echo "Found wheel: $WHEEL_FILE"
+                retry_command pip install --retries 10 "$WHEEL_FILE"
+                retry_command pip install --retries 10 -r "$llmSrcNode/requirements-dev.txt"
+            else
+                echo "ERROR: No wheel file found in $llmSrcNode/build, falling back to source install"
+                retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . && pip install --retries 10 -r requirements-dev.txt"
+            fi
+        else
+            # Source installation mode (default)
+            retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . && pip install --retries 10 -r requirements-dev.txt"
+        fi
 
         cd /tmp
         echo "(Writing install lock) Current directory: $(pwd)"
