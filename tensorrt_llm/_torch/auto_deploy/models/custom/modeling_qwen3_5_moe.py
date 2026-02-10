@@ -674,14 +674,11 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModel):
     _is_stateful = True
 
     def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-        elif isinstance(module, Qwen3_5MoeRMSNorm):
+        # Delegate nn.Linear / nn.Embedding / nn.Conv* to the base class, which
+        # safely resolves initializer_range via hasattr + get_text_config() fallback.
+        super()._init_weights(module)
+        std = getattr(self.config, "initializer_range", 0.02)
+        if isinstance(module, Qwen3_5MoeRMSNorm):
             module.weight.data.zero_()
         elif isinstance(module, Qwen3_5MoeRMSNormGated):
             module.weight.data.fill_(1.0)
@@ -1543,7 +1540,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
 
     config_class = Qwen3_5MoeConfig
 
-    def __init__(self, config: Qwen3_5MoeConfig):
+    def __init__(self, config: Qwen3_5MoeConfig, **kwargs):
         super().__init__(config)
         self.model = Qwen3_5MoeModel(config)
         self.lm_head = nn.Linear(
