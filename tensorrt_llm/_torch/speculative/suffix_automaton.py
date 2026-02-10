@@ -28,7 +28,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ except ImportError:
 class SAConfig:
     """Configuration for suffix automaton speculative decoding."""
 
-    # Maximum sequence length supported
+    # Maximum sequence length supported (runtime configurable)
     max_seq_len: int = 262144
 
     # Maximum number of concurrent requests
@@ -82,6 +82,17 @@ class SuffixAutomatonManager:
 
         self.config = config
         self.max_num_requests = max_num_requests
+        self.max_seq_len = config.max_seq_len
+
+        # Calculate per-state size based on max_seq_len
+        self.state_size = _sa_native.get_state_size(self.max_seq_len)
+
+        # Log memory usage
+        total_memory_mb = max_num_requests * self.state_size / 1024 / 1024
+        logger.info(
+            f"Allocating {max_num_requests} SA slots with max_seq_len={self.max_seq_len} "
+            f"({self.state_size / 1024 / 1024:.1f} MB/slot, {total_memory_mb:.1f} MB total)"
+        )
 
         # Request ID -> slot index mapping
         self._request_to_slot: Dict[int, int] = {}
@@ -117,8 +128,8 @@ class SuffixAutomatonManager:
                 (self.max_num_requests,), dtype=torch.int32, device="cuda"
             )
 
-            # Allocate GPU workspace for SA states
-            self._gpu_slots = _sa_native.allocate_workspace(self.max_num_requests)
+            # Allocate GPU workspace for SA states with dynamic size
+            self._gpu_slots = _sa_native.allocate_workspace(self.max_num_requests, self.max_seq_len)
 
             self._workspace_allocated = True
 
@@ -133,7 +144,7 @@ class SuffixAutomatonManager:
         if request_id in self._request_to_slot:
             # Request already exists, rebuild its state
             self._host_states_native[request_id] = _sa_native.build_automaton_host(
-                context_tokens
+                context_tokens, self.max_seq_len
             )
             self._pending_copies.add(request_id)
             return
@@ -147,7 +158,7 @@ class SuffixAutomatonManager:
 
         # Build SA state on host using native code
         self._host_states_native[request_id] = _sa_native.build_automaton_host(
-            context_tokens
+            context_tokens, self.max_seq_len
         )
         self._pending_copies.add(request_id)
 
@@ -164,7 +175,7 @@ class SuffixAutomatonManager:
 
         # Clear the GPU slot
         if self._gpu_slots is not None:
-            _sa_native.clear_slot(self._gpu_slots, slot)
+            _sa_native.clear_slot(self._gpu_slots, slot, self.max_seq_len)
 
     def prepare(self, request_ids: List[int], max_draft_len: int):
         """
@@ -184,7 +195,10 @@ class SuffixAutomatonManager:
                 if rid in self._host_states_native and rid in self._request_to_slot:
                     slot = self._request_to_slot[rid]
                     _sa_native.copy_state_to_slot(
-                        self._host_states_native[rid], self._gpu_slots, slot
+                        self._host_states_native[rid],
+                        self._gpu_slots,
+                        slot,
+                        self.max_seq_len,
                     )
             self._pending_copies.clear()
 
@@ -241,6 +255,8 @@ class SuffixAutomatonManager:
         _sa_native.invoke_extend(
             batch_size,
             max_draft_len,
+            self.max_num_requests,
+            self.max_seq_len,
             self._gpu_slots,
             self._gpu_batch_indices[:batch_size],
             match_len,
@@ -296,6 +312,8 @@ class SuffixAutomatonManager:
             batch_size,
             max_draft_len,
             max_ngram_size,
+            self.max_num_requests,
+            self.max_seq_len,
             self._gpu_slots,
             self._gpu_batch_indices[:batch_size],
             match_len,
@@ -330,15 +348,23 @@ class SAResourceManager(BaseResourceManager):
     - Allocate SA states for new requests
     - Free SA states when requests complete
     - Prepare SA states for batch processing
+
+    This is the main resource manager for NGram speculative decoding.
     """
 
-    def __init__(self, config: "MTPDecodingConfig", max_num_requests: int):
+    def __init__(
+        self,
+        config,
+        max_num_requests: int,
+        max_seq_len: int = 262144,
+    ):
         self.max_num_requests = max_num_requests
+        self.max_seq_len = max_seq_len
         self.slot_manager = SlotManager(max_num_requests)
 
         # SA configuration
         sa_config = SAConfig(
-            max_seq_len=262144,
+            max_seq_len=max_seq_len,
             max_slots=max_num_requests,
             threshold=getattr(config, "sa_spec_threshold", 4),
         )

@@ -1,3 +1,4 @@
+import warnings
 from itertools import chain
 from typing import List, Optional, Tuple
 
@@ -15,6 +16,9 @@ from .suffix_automaton import SAConfig, SuffixAutomatonManager
 
 class NGramPoolManager(BaseResourceManager):
     """
+    DEPRECATED: This class is kept for backward compatibility with user-provided drafter mode.
+    For new code, use NGramDecodingConfig directly for NGram speculative decoding.
+
     Manager for NGram speculative decoding using suffix automaton.
 
     Uses a suffix automaton (SA) to efficiently find matching patterns in
@@ -35,15 +39,24 @@ class NGramPoolManager(BaseResourceManager):
             - -1: Use suffix automaton for longest possible match
     """
 
-    def __init__(self, spec_config: "NGramDecodingConfig",
-                 max_num_requests: int):
+    def __init__(self,
+                 spec_config: "NGramDecodingConfig",
+                 max_num_requests: int,
+                 max_seq_len: int = 262144):
+        warnings.warn(
+            "NGramPoolManager is deprecated. Use NGramDecodingConfig directly "
+            "for NGram speculative decoding. This class is kept only for "
+            "backward compatibility with UserProvidedDecodingConfig.",
+            DeprecationWarning,
+            stacklevel=2)
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.max_num_requests = max_num_requests
+        self.max_seq_len = max_seq_len
 
         # Initialize suffix automaton manager
         sa_config = SAConfig(
-            max_seq_len=262144,  # Reasonable default for LLM sequences
+            max_seq_len=max_seq_len,
             max_slots=max_num_requests,
             threshold=1  # Minimum match length
         )
@@ -193,12 +206,22 @@ class NGramPoolManager(BaseResourceManager):
 
 
 class NGramDrafter(Drafter):
+    """
+    DEPRECATED: This class is kept for backward compatibility with user-provided drafter mode.
+    For new code, use NGramDecodingConfig directly for NGram speculative decoding.
+    """
 
     def __init__(
         self,
         spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
     ):
+        warnings.warn(
+            "NGramDrafter is deprecated. Use NGramDecodingConfig directly "
+            "for NGram speculative decoding. This class is kept only for "
+            "backward compatibility with UserProvidedDecodingConfig.",
+            DeprecationWarning,
+            stacklevel=2)
         super().__init__(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,

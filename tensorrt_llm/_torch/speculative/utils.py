@@ -13,9 +13,9 @@ from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
-from .ngram import NGramPoolManager
 from .ngram_worker import NGramSampler, NGramSpecMetadata, NGramWorker
 from .save_hidden_state import SaveHiddenStatesDrafter
+from .suffix_automaton import SAResourceManager
 
 
 def get_spec_metadata(spec_config,
@@ -104,7 +104,7 @@ def get_spec_metadata(spec_config,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
-            sa_manager=spec_resource_manager._sa_manager
+            sa_manager=spec_resource_manager.sa_manager
             if spec_resource_manager else None,
             max_matching_ngram_size=spec_config.max_matching_ngram_size,
         )
@@ -165,7 +165,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_tokens,
         )
     if spec_dec_mode.is_ngram():
-        return NGramPoolManager(spec_config, max_num_requests)
+        return SAResourceManager(spec_config, max_num_requests, max_seq_len)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None

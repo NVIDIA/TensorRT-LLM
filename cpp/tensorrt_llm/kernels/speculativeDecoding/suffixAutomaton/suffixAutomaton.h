@@ -24,11 +24,9 @@
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
-#include <unordered_map>
 
 #include <cassert>
 
-#include "saConfig.h"
 #include "saCudaCallable.h"
 #include "saFlatGraph.h"
 #include "saNamedType.h"
@@ -41,6 +39,27 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::speculative_decoding::suffix_automaton
 {
 
+/**
+ * @brief Helper function to align a size up to a given alignment.
+ */
+inline constexpr size_t alignUp(size_t size, size_t alignment)
+{
+    return (size + alignment - 1) & ~(alignment - 1);
+}
+
+/**
+ * @brief Suffix Automaton with runtime-configurable maximum sequence length.
+ *
+ * This is a compact state machine that recognizes all suffixes of a string.
+ * It's used for speculative decoding to find longest patterns in previously
+ * generated tokens to predict future tokens.
+ *
+ * Memory Layout (for a single slot):
+ * [SuffixAutomaton header][nodes data][tokens data][allocator data]
+ *
+ * The header contains pointers that point INTO the same memory block.
+ * Total size is computed by getRequiredMemorySize(maxSeqLen).
+ */
 struct SuffixAutomaton
 {
 
@@ -51,25 +70,93 @@ struct SuffixAutomaton
         SAOptional<TextIndex> pos;
     };
 
-    using Graph = SAFlatGraph<Token, NodeData, 2 * SAConfig::MAX_SEQUENCE_LENGTH>;
-    using TokenVec = SADynamicBuffer<Token, SAConfig::MAX_SEQUENCE_LENGTH, TextIndex>;
+    using Graph = SAFlatGraph<Token, NodeData>;
+    using TokenVec = SADynamicBuffer<Token, TextIndex>;
 
     Graph mStates;
     TokenVec mTokens;
     NodeIndex mLast;
-
-    template <typename Func>
-    void visitChunks(Func&& func) const
-    {
-        mStates.visitChunks(func);
-        mTokens.visitChunks(func);
-        func(static_cast<void const*>(&mLast), sizeof(mLast));
-    }
+    size_t mMaxSeqLen;
 
     SuffixAutomaton() = default;
 
     // prevent accidental move construction
     SuffixAutomaton(SuffixAutomaton&& other) = delete;
+
+    /**
+     * @brief Calculate the required memory size for a given max sequence length.
+     *
+     * Memory layout: [header][nodes][tokens][allocator]
+     * Each section is aligned to 64 bytes for GPU cache efficiency.
+     *
+     * @param maxSeqLen Maximum sequence length to support
+     * @return Total size in bytes needed for one SuffixAutomaton slot
+     */
+    static size_t getRequiredMemorySize(size_t maxSeqLen)
+    {
+        size_t maxNodes = 2 * maxSeqLen;
+
+        size_t headerSize = sizeof(SuffixAutomaton);
+        size_t nodeSize = maxNodes * sizeof(Graph::Node);
+        size_t tokenSize = maxSeqLen * sizeof(Token);
+        // Allocator needs space for hash maps: ~10x nodes * (key + value size)
+        size_t allocatorSize = 10 * maxNodes * (sizeof(Token) + sizeof(NodeIndex));
+
+        return alignUp(headerSize, 64) + alignUp(nodeSize, 64) + alignUp(tokenSize, 64) + alignUp(allocatorSize, 64);
+    }
+
+    /**
+     * @brief Initialize the suffix automaton with external memory.
+     *
+     * Must be called before any operations on the automaton.
+     * The memory block must be at least getRequiredMemorySize(maxSeqLen) bytes.
+     *
+     * @param base Pointer to the start of the memory block (where this struct lives)
+     * @param maxSeqLen Maximum sequence length to support
+     */
+    void init(void* base, size_t maxSeqLen)
+    {
+        mMaxSeqLen = maxSeqLen;
+        size_t maxNodes = 2 * maxSeqLen;
+
+        // Data starts after the header (aligned)
+        uint8_t* ptr = static_cast<uint8_t*>(base) + alignUp(sizeof(SuffixAutomaton), 64);
+
+        // Initialize nodes buffer
+        Graph::Node* nodeData = reinterpret_cast<Graph::Node*>(ptr);
+        ptr += alignUp(maxNodes * sizeof(Graph::Node), 64);
+
+        // Initialize tokens buffer
+        Token* tokenData = reinterpret_cast<Token*>(ptr);
+        ptr += alignUp(maxSeqLen * sizeof(Token), 64);
+
+        // Initialize allocator
+        char* allocatorMemory = reinterpret_cast<char*>(ptr);
+        size_t allocatorCapacity = 10 * maxNodes * (sizeof(Token) + sizeof(NodeIndex));
+
+        // Set up the graph and tokens
+        mStates.init(nodeData, maxNodes, allocatorMemory, allocatorCapacity);
+        mTokens.init(tokenData, maxSeqLen);
+
+        // Reset state
+        mLast = NodeIndex(0);
+    }
+
+    /**
+     * @brief Relocate all internal pointers by a given delta.
+     *
+     * Used when copying between host and GPU memory to adjust pointers.
+     * Call this on the host-side copy BEFORE memcpy to GPU.
+     *
+     * @param oldBase The current base address (host address)
+     * @param newBase The target base address (GPU address)
+     */
+    void relocate(void* oldBase, void* newBase)
+    {
+        ptrdiff_t delta = static_cast<uint8_t*>(newBase) - static_cast<uint8_t*>(oldBase);
+        mStates.relocate(delta);
+        mTokens.relocate(delta);
+    }
 
     void clear()
     {

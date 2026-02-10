@@ -200,29 +200,58 @@ struct SAFlatHashMap
     }
 };
 
-template <typename Key, typename Value, size_t MaxSizeBytes>
+/**
+ * @brief A memory allocator for hash maps with runtime-configurable capacity.
+ *
+ * Uses external memory (pointer-based) instead of embedded arrays.
+ * The allocator manages a pool of memory for dynamically creating hash maps.
+ *
+ * @tparam Key Key type for the hash maps
+ * @tparam Value Value type for the hash maps
+ */
+template <typename Key, typename Value>
 struct SAHashMapAllocator
 {
 
     using HashMap = SAFlatHashMap<Key, Value>;
     using Ptr = NamedType<size_t, struct HashMapPtrTag>;
 
+    // Memory pool (pointer to external memory)
+    char* mMemory{nullptr};
+    size_t mCapacity{0};
+    Ptr mUsed{0};
+
+    SAHashMapAllocator() = default;
+
+    SA_CUDA_CALLABLE void init(char* memory, size_t capacity)
+    {
+        mMemory = memory;
+        mCapacity = capacity;
+        mUsed = Ptr(0);
+    }
+
     SA_CUDA_CALLABLE HashMap& at(Ptr ptr)
     {
-        return reinterpret_cast<HashMap&>(mMem.at(ptr));
+        assert(mMemory != nullptr);
+        return reinterpret_cast<HashMap&>(mMemory[+ptr]);
     }
 
     SA_CUDA_CALLABLE HashMap const& at(Ptr ptr) const
     {
-        return reinterpret_cast<HashMap const&>(mMem.at(ptr));
+        assert(mMemory != nullptr);
+        return reinterpret_cast<HashMap const&>(mMemory[+ptr]);
     }
 
     SA_CUDA_CALLABLE Ptr alloc(size_t capacity)
     {
-        // no available pointers, allocate a new one
-        auto index = mMem.size();
+        assert(mMemory != nullptr);
 
-        mMem.extend(HashMap::sizeBytes(capacity));
+        // Allocate from current position
+        auto index = mUsed;
+        size_t required = HashMap::sizeBytes(capacity);
+
+        assert(+mUsed + required <= mCapacity);
+        mUsed = Ptr(+mUsed + required);
 
         new (&at(index)) HashMap(capacity);
         at(index).clear();
@@ -232,22 +261,31 @@ struct SAHashMapAllocator
 
     SA_CUDA_CALLABLE void free(Ptr)
     {
-        // todo
-    }
-
-    template <typename Func>
-    void visitChunks(Func&& func) const
-    {
-        mMem.visitChunks(func);
+        // No-op - memory is managed externally
     }
 
     SA_CUDA_CALLABLE void clear()
     {
-        mMem.clear();
+        mUsed = Ptr(0);
     }
 
-    SADynamicBuffer<char, MaxSizeBytes, Ptr> mMem;
+    /**
+     * @brief Relocate the memory pointer by a given delta.
+     *
+     * Used when copying between host and GPU memory to adjust pointers.
+     */
+    void relocate(ptrdiff_t delta)
+    {
+        if (mMemory)
+        {
+            mMemory = reinterpret_cast<char*>(reinterpret_cast<uint8_t*>(mMemory) + delta);
+        }
+    }
 };
+
+// Verify that SAHashMapAllocator is trivially copyable
+static_assert(
+    std::is_trivially_copyable<SAHashMapAllocator<int, int>>::value, "SAHashMapAllocator must be trivially copyable");
 
 } // namespace kernels::speculative_decoding::suffix_automaton
 

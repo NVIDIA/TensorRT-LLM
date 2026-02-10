@@ -41,8 +41,14 @@ struct SuffixAutomatonExtendParams
     //! Number of draft tokens to generate per sequence
     int draftLength{0};
 
-    //! Pointer to the suffix automaton states on GPU [maxSlots]
-    SuffixAutomaton* slots{nullptr};
+    //! Maximum number of slots in the workspace
+    int maxSlots{0};
+
+    //! Maximum sequence length (runtime configurable)
+    int maxSeqLen{0};
+
+    //! Pointer to the suffix automaton workspace on GPU (raw bytes)
+    void* slots{nullptr};
 
     //! Batch indices mapping external batch idx to workspace slot [batchSize]
     int const* batchIndices{nullptr};
@@ -63,6 +69,8 @@ struct SuffixAutomatonExtendParams
     {
         TLLM_CHECK(batchSize > 0);
         TLLM_CHECK(draftLength > 0);
+        TLLM_CHECK(maxSlots > 0);
+        TLLM_CHECK(maxSeqLen > 0);
         TLLM_CHECK(slots != nullptr);
         TLLM_CHECK(batchIndices != nullptr);
         TLLM_CHECK(matchLenOut != nullptr);
@@ -94,8 +102,14 @@ struct SuffixAutomatonExtendNgramParams
     //! Maximum ngram size for matching, or -1 for longest match mode
     int maxNgramSize{-1};
 
-    //! Pointer to the suffix automaton states on GPU [maxSlots]
-    SuffixAutomaton* slots{nullptr};
+    //! Maximum number of slots in the workspace
+    int maxSlots{0};
+
+    //! Maximum sequence length (runtime configurable)
+    int maxSeqLen{0};
+
+    //! Pointer to the suffix automaton workspace on GPU (raw bytes)
+    void* slots{nullptr};
 
     //! Batch indices mapping external batch idx to workspace slot [batchSize]
     int const* batchIndices{nullptr};
@@ -116,6 +130,8 @@ struct SuffixAutomatonExtendNgramParams
     {
         TLLM_CHECK(batchSize > 0);
         TLLM_CHECK(draftLength > 0);
+        TLLM_CHECK(maxSlots > 0);
+        TLLM_CHECK(maxSeqLen > 0);
         TLLM_CHECK(slots != nullptr);
         TLLM_CHECK(batchIndices != nullptr);
         TLLM_CHECK(matchLenOut != nullptr);
@@ -138,27 +154,27 @@ struct SuffixAutomatonExtendNgramParams
 //! \param stream The CUDA stream to run the kernel on
 void invokeSuffixAutomatonExtendNgram(SuffixAutomatonExtendNgramParams const& params, cudaStream_t stream);
 
-//! \brief Get the size in bytes of a single SuffixAutomaton state
+//! \brief Get the size in bytes of a single SuffixAutomaton state for a given max sequence length
+//! \param maxSeqLen Maximum sequence length
 //! \return Size in bytes
-size_t getSuffixAutomatonStateSize();
+size_t getSuffixAutomatonStateSize(size_t maxSeqLen);
 
-//! \brief Get the maximum number of slots supported
-//! \return Maximum number of slots
-size_t getSuffixAutomatonMaxSlots();
-
-//! \brief Get the maximum sequence length supported
-//! \return Maximum sequence length
-size_t getSuffixAutomatonMaxSeqLen();
-
-//! \brief Initialize a SuffixAutomaton using placement new
-//! \param sa Pointer to allocated memory for the SuffixAutomaton
-void initAutomaton(SuffixAutomaton* sa);
+//! \brief Initialize a SuffixAutomaton at the given memory location
+//! \param memory Pointer to allocated memory for the SuffixAutomaton
+//! \param maxSeqLen Maximum sequence length
+void initAutomaton(void* memory, size_t maxSeqLen);
 
 //! \brief Build a suffix automaton by extending with the given tokens
 //! \param sa Pointer to an initialized SuffixAutomaton
 //! \param tokens Array of token IDs
 //! \param numTokens Number of tokens in the array
 void buildAutomatonFromTokens(SuffixAutomaton* sa, int const* tokens, int numTokens);
+
+//! \brief Relocate a SuffixAutomaton's internal pointers for GPU copy
+//! \param sa Pointer to the SuffixAutomaton
+//! \param oldBase The current base address (host address)
+//! \param newBase The target base address (GPU address)
+void relocateAutomaton(SuffixAutomaton* sa, void* oldBase, void* newBase);
 
 } // namespace kernels::speculative_decoding::suffix_automaton
 

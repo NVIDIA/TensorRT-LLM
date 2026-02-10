@@ -28,8 +28,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::speculative_decoding::suffix_automaton
 {
 
-__global__ void suffixAutomatonExtendKernel(int batchSize, int draftLength, SuffixAutomaton* slots,
-    int const* batchIndices, int* matchLenOut, int* draftTokensOut, int const* acceptedTokensIn,
+__global__ void suffixAutomatonExtendKernel(int batchSize, int draftLength, int maxSlots, size_t stateSize,
+    void* slotsMemory, int const* batchIndices, int* matchLenOut, int* draftTokensOut, int const* acceptedTokensIn,
     int const* acceptedLensIn)
 {
     // Only one thread per block does the work
@@ -45,24 +45,26 @@ __global__ void suffixAutomatonExtendKernel(int batchSize, int draftLength, Suff
     }
 
     int batchIndex = batchIndices[i];
-    assert(batchIndex >= 0 && batchIndex < static_cast<int>(SAConfig::MAX_SLOTS));
+    assert(batchIndex >= 0 && batchIndex < maxSlots);
 
-    SuffixAutomaton& slot = slots[batchIndex];
+    // Calculate slot pointer based on dynamic state size
+    uint8_t* slotMemory = static_cast<uint8_t*>(slotsMemory) + static_cast<size_t>(batchIndex) * stateSize;
+    SuffixAutomaton* slot = reinterpret_cast<SuffixAutomaton*>(slotMemory);
 
     int numNewTokens = acceptedLensIn[i];
 
     // Extend the automaton with accepted tokens
     for (int j = 0; j < numNewTokens; j++)
     {
-        slot.extend(Token(acceptedTokensIn[i * (draftLength + 1) + j]));
+        slot->extend(Token(acceptedTokensIn[i * (draftLength + 1) + j]));
     }
 
     // Lookup the longest suffix match
-    auto result = slot.lookup();
+    auto result = slot->lookup();
     if (result.hasValue())
     {
         matchLenOut[i] = result->len;
-        slot.getDraftTokens(&draftTokensOut[i * draftLength], draftLength, result->pos);
+        slot->getDraftTokens(&draftTokensOut[i * draftLength], draftLength, result->pos);
     }
     else
     {
@@ -75,19 +77,23 @@ void invokeSuffixAutomatonExtend(SuffixAutomatonExtendParams const& params, cuda
     params.checkParams();
 
     int batchSize = params.batchSize;
-    if (batchSize > static_cast<int>(SAConfig::MAX_SLOTS))
+    int maxSlots = params.maxSlots;
+    if (batchSize > maxSlots)
     {
-        batchSize = static_cast<int>(SAConfig::MAX_SLOTS);
+        batchSize = maxSlots;
     }
 
+    size_t stateSize = getSuffixAutomatonStateSize(params.maxSeqLen);
+
     // Launch one block per sequence, one thread per block
-    suffixAutomatonExtendKernel<<<batchSize, 1, 0, stream>>>(batchSize, params.draftLength, params.slots,
-        params.batchIndices, params.matchLenOut, params.draftTokensOut, params.acceptedTokensIn, params.acceptedLensIn);
+    suffixAutomatonExtendKernel<<<batchSize, 1, 0, stream>>>(batchSize, params.draftLength, maxSlots, stateSize,
+        params.slots, params.batchIndices, params.matchLenOut, params.draftTokensOut, params.acceptedTokensIn,
+        params.acceptedLensIn);
 }
 
-__global__ void suffixAutomatonExtendNgramKernel(int batchSize, int draftLength, int maxNgramSize,
-    SuffixAutomaton* slots, int const* batchIndices, int* matchLenOut, int* draftTokensOut, int const* acceptedTokensIn,
-    int const* acceptedLensIn)
+__global__ void suffixAutomatonExtendNgramKernel(int batchSize, int draftLength, int maxNgramSize, int maxSlots,
+    size_t stateSize, void* slotsMemory, int const* batchIndices, int* matchLenOut, int* draftTokensOut,
+    int const* acceptedTokensIn, int const* acceptedLensIn)
 {
     // Only one thread per block does the work
     if (threadIdx.x > 0)
@@ -102,16 +108,18 @@ __global__ void suffixAutomatonExtendNgramKernel(int batchSize, int draftLength,
     }
 
     int batchIndex = batchIndices[i];
-    assert(batchIndex >= 0 && batchIndex < static_cast<int>(SAConfig::MAX_SLOTS));
+    assert(batchIndex >= 0 && batchIndex < maxSlots);
 
-    SuffixAutomaton& slot = slots[batchIndex];
+    // Calculate slot pointer based on dynamic state size
+    uint8_t* slotMemory = static_cast<uint8_t*>(slotsMemory) + static_cast<size_t>(batchIndex) * stateSize;
+    SuffixAutomaton* slot = reinterpret_cast<SuffixAutomaton*>(slotMemory);
 
     int numNewTokens = acceptedLensIn[i];
 
     // Extend the automaton with accepted tokens
     for (int j = 0; j < numNewTokens; j++)
     {
-        slot.extend(Token(acceptedTokensIn[i * (draftLength + 1) + j]));
+        slot->extend(Token(acceptedTokensIn[i * (draftLength + 1) + j]));
     }
 
     // Perform lookup based on maxNgramSize
@@ -120,14 +128,14 @@ __global__ void suffixAutomatonExtendNgramKernel(int batchSize, int draftLength,
     if (maxNgramSize == -1)
     {
         // Longest match mode
-        result = slot.lookup();
+        result = slot->lookup();
     }
     else
     {
         // Fixed-size ngram mode - try sizes from maxNgramSize down to 1
         for (int size = maxNgramSize; size >= 1; size--)
         {
-            result = slot.lookupFixed(size);
+            result = slot->lookupFixed(size);
             if (result.hasValue())
             {
                 break;
@@ -138,7 +146,7 @@ __global__ void suffixAutomatonExtendNgramKernel(int batchSize, int draftLength,
     if (result.hasValue())
     {
         matchLenOut[i] = result->len;
-        slot.getDraftTokens(&draftTokensOut[i * draftLength], draftLength, result->pos);
+        slot->getDraftTokens(&draftTokensOut[i * draftLength], draftLength, result->pos);
     }
     else
     {
@@ -151,36 +159,31 @@ void invokeSuffixAutomatonExtendNgram(SuffixAutomatonExtendNgramParams const& pa
     params.checkParams();
 
     int batchSize = params.batchSize;
-    if (batchSize > static_cast<int>(SAConfig::MAX_SLOTS))
+    int maxSlots = params.maxSlots;
+    if (batchSize > maxSlots)
     {
-        batchSize = static_cast<int>(SAConfig::MAX_SLOTS);
+        batchSize = maxSlots;
     }
+
+    size_t stateSize = getSuffixAutomatonStateSize(params.maxSeqLen);
 
     // Launch one block per sequence, one thread per block
     suffixAutomatonExtendNgramKernel<<<batchSize, 1, 0, stream>>>(batchSize, params.draftLength, params.maxNgramSize,
-        params.slots, params.batchIndices, params.matchLenOut, params.draftTokensOut, params.acceptedTokensIn,
-        params.acceptedLensIn);
+        maxSlots, stateSize, params.slots, params.batchIndices, params.matchLenOut, params.draftTokensOut,
+        params.acceptedTokensIn, params.acceptedLensIn);
 }
 
-size_t getSuffixAutomatonStateSize()
+size_t getSuffixAutomatonStateSize(size_t maxSeqLen)
 {
-    return sizeof(SuffixAutomaton);
+    return SuffixAutomaton::getRequiredMemorySize(maxSeqLen);
 }
 
-size_t getSuffixAutomatonMaxSlots()
+void initAutomaton(void* memory, size_t maxSeqLen)
 {
-    return SAConfig::MAX_SLOTS;
-}
-
-size_t getSuffixAutomatonMaxSeqLen()
-{
-    return SAConfig::MAX_SEQUENCE_LENGTH;
-}
-
-void initAutomaton(SuffixAutomaton* sa)
-{
-    // Use placement new to initialize the SuffixAutomaton struct
+    SuffixAutomaton* sa = reinterpret_cast<SuffixAutomaton*>(memory);
+    // Use placement new to construct the struct, then initialize
     new (sa) SuffixAutomaton();
+    sa->init(memory, maxSeqLen);
 }
 
 void buildAutomatonFromTokens(SuffixAutomaton* sa, int const* tokens, int numTokens)
@@ -190,6 +193,11 @@ void buildAutomatonFromTokens(SuffixAutomaton* sa, int const* tokens, int numTok
     {
         sa->extend(Token(tokens[i]));
     }
+}
+
+void relocateAutomaton(SuffixAutomaton* sa, void* oldBase, void* newBase)
+{
+    sa->relocate(oldBase, newBase);
 }
 
 } // namespace kernels::speculative_decoding::suffix_automaton

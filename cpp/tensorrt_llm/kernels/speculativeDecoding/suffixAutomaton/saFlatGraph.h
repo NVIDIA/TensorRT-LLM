@@ -32,11 +32,20 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::speculative_decoding::suffix_automaton
 {
 
-template <typename Key, typename NodeData, size_t MaxSize>
+/**
+ * @brief A flat graph structure with runtime-configurable capacity.
+ *
+ * Uses external memory (pointer-based) instead of embedded arrays.
+ * Supports dynamic sizing based on max sequence length.
+ *
+ * @tparam Key Edge key type (typically Token)
+ * @tparam NodeData Data stored per node
+ */
+template <typename Key, typename NodeData>
 struct SAFlatGraph
 {
 
-    using Allocator = SAHashMapAllocator<Key, NodeIndex, 10 * MaxSize * (sizeof(Key) + sizeof(NodeIndex))>;
+    using Allocator = SAHashMapAllocator<Key, NodeIndex>;
 
     using HashMap = typename Allocator::HashMap;
 
@@ -85,17 +94,34 @@ struct SAFlatGraph
 
     static_assert(std::is_trivially_copyable<Node>::value, "Node must be trivially copyable");
 
-    SADynamicBuffer<Node, MaxSize, NodeIndex> mNodes;
+    SADynamicBuffer<Node, NodeIndex> mNodes;
     Allocator mAllocator;
 
-    static_assert(std::is_trivially_copyable<decltype(mNodes)>::value, "mNodes must be trivially copyable");
-    static_assert(std::is_trivially_copyable<decltype(mAllocator)>::value, "mAllocator must be trivially copyable");
+    SAFlatGraph() = default;
 
-    template <typename Func>
-    void visitChunks(Func&& func) const
+    /**
+     * @brief Initialize the graph with external memory.
+     *
+     * @param nodeData Pointer to memory for nodes
+     * @param maxNodes Maximum number of nodes (2 * maxSeqLen typically)
+     * @param allocatorMemory Pointer to memory for the hash map allocator
+     * @param allocatorCapacity Size of allocator memory in bytes
+     */
+    SA_CUDA_CALLABLE void init(Node* nodeData, size_t maxNodes, char* allocatorMemory, size_t allocatorCapacity)
     {
-        mNodes.visitChunks(func);
-        mAllocator.visitChunks(func);
+        mNodes.init(nodeData, maxNodes);
+        mAllocator.init(allocatorMemory, allocatorCapacity);
+    }
+
+    /**
+     * @brief Relocate all internal pointers by a given delta.
+     *
+     * Used when copying between host and GPU memory to adjust pointers.
+     */
+    void relocate(ptrdiff_t delta)
+    {
+        mNodes.relocate(delta);
+        mAllocator.relocate(delta);
     }
 
     SA_CUDA_CALLABLE NodeIndex size() const

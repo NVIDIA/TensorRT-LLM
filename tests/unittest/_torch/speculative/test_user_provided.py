@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
+# NOTE: NGramDrafter and NGramPoolManager are deprecated internal classes.
+# They are kept for backward compatibility with user-provided drafter mode.
+# For new code, use NGramDecodingConfig directly for NGram speculative decoding.
 from tensorrt_llm._torch.speculative.ngram import NGramDrafter, NGramPoolManager
 from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
                                  NGramDecodingConfig,
@@ -17,8 +20,8 @@ from utils.llm_data import llm_models_root
 
 @pytest.mark.parametrize(
     "disable_overlap_scheduler,use_cuda_graph,attn_backend",
-    [[True, False, "TRTLLM"], [True, True, "TRTLLM"],
-     [False, True, "TRTLLM"], [True, False, "FLASHINFER"]])
+    [[True, False, "TRTLLM"], [True, True, "TRTLLM"], [False, True, "TRTLLM"],
+     [True, False, "FLASHINFER"]])
 def test_llama_user_provided(disable_overlap_scheduler: bool,
                              use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9

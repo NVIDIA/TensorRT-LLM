@@ -8,11 +8,9 @@ import torch
 
 from tensorrt_llm._torch.speculative import suffix_automaton as sa
 
-
 # Skip all tests if native kernel is not available
 pytestmark = pytest.mark.skipif(
-    not sa.is_native_available(),
-    reason="Native suffix automaton kernel not available"
+    not sa.is_native_available(), reason="Native suffix automaton kernel not available"
 )
 
 
@@ -414,9 +412,16 @@ class TestNativeKernelAvailability:
         # Verify we can access the native module
         from tensorrt_llm.bindings.internal import suffix_automaton as native
 
-        print(f"MAX_SEQUENCE_LENGTH: {native.MAX_SEQUENCE_LENGTH}")
-        print(f"MAX_SLOTS: {native.MAX_SLOTS}")
-        print(f"STATE_SIZE_BYTES: {native.STATE_SIZE_BYTES}")
+        # Test dynamic state size API (replaces static constants)
+        max_seq_len = 1024
+        state_size = native.get_state_size(max_seq_len)
+        print(f"get_state_size({max_seq_len}): {state_size} bytes")
+        assert state_size > 0, "State size should be positive"
+
+        # Verify state size scales with max_seq_len
+        state_size_large = native.get_state_size(max_seq_len * 2)
+        print(f"get_state_size({max_seq_len * 2}): {state_size_large} bytes")
+        assert state_size_large > state_size, "Larger max_seq_len should have larger state size"
 
 
 if __name__ == "__main__":
