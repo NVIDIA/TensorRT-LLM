@@ -32,7 +32,7 @@ from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, de
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import InstanceInfo, RankInfo
-from tensorrt_llm._torch.disaggregation.native.region.aux import AuxBuffer
+from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
