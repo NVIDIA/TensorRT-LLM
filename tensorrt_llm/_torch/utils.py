@@ -8,7 +8,8 @@ from typing import Dict, List
 import torch
 from torch.nn import functional as F
 
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
+                                 torch_dtype_to_str)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
@@ -414,6 +415,29 @@ def split(x: torch.Tensor,
 
 def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
+
+
+def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
+    # Pass num_elements=-1 will print the whole tensor
+    if num_elements < 0:
+        num_elements = torch.numel(x)
+    if x.dtype in (torch.int32, torch.int64):
+        float_x = x.to(dtype=float)
+    else:
+        float_x = x
+    return ("Tensor("
+            f"shape={tuple(x.shape)}, "
+            f"dtype={torch_dtype_to_str(x.dtype)}, "
+            f"device={x.device}, "
+            f"stats=("
+            f"abs_mean={float_x.abs().mean().item():.3f}, "
+            f"mean={float_x.mean().item():.3f}, "
+            f"std={float_x.std().item():.3f}, "
+            f"max={x.max().item():.3f}, "
+            f"min={x.min().item():.3f}"
+            "), "
+            f"values={x.flatten()[:num_elements].tolist()}"
+            ")")
 
 
 @maybe_compile
