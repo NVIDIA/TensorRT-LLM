@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Integration test for Suffix Automaton Speculative Decoding with DeepSeek V3.
+"""Integration test for Suffix Automaton Speculative Decoding with DeepSeek V3.
 
 This script demonstrates how to use the native SA implementation with TensorRT-LLM's
 MTP (Multi-Token Prediction) speculative decoding to boost acceptance rates.
@@ -16,7 +15,7 @@ The script will:
 
 import argparse
 import time
-from typing import List, Optional
+from typing import List
 
 import torch
 
@@ -30,9 +29,7 @@ except ImportError as e:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run SA speculative decoding with DeepSeek V3"
-    )
+    parser = argparse.ArgumentParser(description="Run SA speculative decoding with DeepSeek V3")
     parser.add_argument(
         "--model",
         type=str,
@@ -96,15 +93,14 @@ def parse_args():
 
 def create_llm(args) -> "LLM":
     """Create LLM instance with MTP and optional SA configuration."""
-    
     # Configure MTP decoding
     mtp_config = MTPDecodingConfig(
         num_nextn_predict_layers=args.num_nextn_predict_layers,
         use_sa_spec=args.use_sa_spec,
         sa_spec_threshold=args.sa_spec_threshold,
     )
-    
-    print(f"Creating LLM with configuration:")
+
+    print("Creating LLM with configuration:")
     print(f"  - Model: {args.model}")
     print(f"  - MTP layers: {args.num_nextn_predict_layers}")
     print(f"  - SA enabled: {args.use_sa_spec}")
@@ -113,7 +109,7 @@ def create_llm(args) -> "LLM":
     if args.max_seq_len is not None:
         print(f"  - Max seq len: {args.max_seq_len}")
     print()
-    
+
     llm_kwargs = dict(
         model=args.model,
         tensor_parallel_size=args.tp_size,
@@ -121,9 +117,9 @@ def create_llm(args) -> "LLM":
     )
     if args.max_seq_len is not None:
         llm_kwargs["max_seq_len"] = args.max_seq_len
-    
+
     llm = LLM(**llm_kwargs)
-    
+
     return llm
 
 
@@ -133,19 +129,18 @@ def run_generation(
     max_new_tokens: int,
 ) -> tuple:
     """Run generation and return outputs with timing."""
-    
     sampling_params = SamplingParams(
         max_tokens=max_new_tokens,
         temperature=0.0,  # Greedy decoding for reproducibility
     )
-    
+
     start_time = time.perf_counter()
     outputs = llm.generate(prompts, sampling_params=sampling_params)
     end_time = time.perf_counter()
-    
+
     total_time = end_time - start_time
     total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
-    
+
     return outputs, total_time, total_tokens
 
 
@@ -156,22 +151,21 @@ def print_results(
     use_sa_spec: bool,
 ):
     """Print generation results and metrics."""
-    
     mode = "SA+MTP" if use_sa_spec else "MTP only"
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Results ({mode})")
-    print(f"{'='*60}")
-    
+    print(f"{'=' * 60}")
+
     for i, output in enumerate(outputs):
-        print(f"\nPrompt {i+1}:")
+        print(f"\nPrompt {i + 1}:")
         print(f"  Input: {output.prompt[:50]}...")
         print(f"  Output tokens: {len(output.outputs[0].token_ids)}")
         generated = output.outputs[0].text[:200]
         print(f"  Generated: {generated}...")
-    
-    print(f"\n{'='*60}")
+
+    print(f"\n{'=' * 60}")
     print(f"Performance Metrics ({mode})")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Total time: {total_time:.2f}s")
     print(f"Total tokens: {total_tokens}")
     print(f"Throughput: {total_tokens / total_time:.2f} tokens/sec")
@@ -180,32 +174,32 @@ def print_results(
 
 def main():
     args = parse_args()
-    
-    print("="*60)
+
+    print("=" * 60)
     print("Suffix Automaton Speculative Decoding Test")
-    print("="*60)
-    
+    print("=" * 60)
+
     # Create LLM with configuration
     llm = create_llm(args)
-    
+
     # Get prompts to use
-    prompts = args.prompts[:args.batch_size]
+    prompts = args.prompts[: args.batch_size]
     print(f"Testing with {len(prompts)} prompt(s)")
-    
+
     # Run generation
     outputs, total_time, total_tokens = run_generation(
         llm=llm,
         prompts=prompts,
         max_new_tokens=args.max_new_tokens,
     )
-    
+
     # Print results
     print_results(outputs, total_time, total_tokens, args.use_sa_spec)
-    
+
     # Clean up
     del llm
     torch.cuda.empty_cache()
-    
+
     print("Test completed successfully!")
 
 

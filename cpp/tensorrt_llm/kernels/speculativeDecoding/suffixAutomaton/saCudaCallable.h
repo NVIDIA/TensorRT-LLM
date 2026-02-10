@@ -27,4 +27,3 @@
 #define SA_CUDA_CALLABLE
 #define cudaStream_t int
 #endif // __CUDACC__
-

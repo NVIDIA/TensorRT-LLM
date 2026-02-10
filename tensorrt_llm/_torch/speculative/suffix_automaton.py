@@ -381,7 +381,7 @@ class SAResourceManager(BaseResourceManager):
 
         for req in context_batch:
             if req.is_first_context_chunk:
-                slot_id = self.slot_manager.add_slot(req.request_id)
+                self.slot_manager.add_slot(req.request_id)
 
                 # Build initial SA from context tokens
                 if req.request_id not in self._initialized_requests:
