@@ -1,6 +1,5 @@
 runtime: trtllm
 compile_backend: torch-simple
-attn_backend: torch
 max_seq_len: 4096
 max_num_tokens: 4096
 max_batch_size: 64

@@ -202,7 +202,7 @@ transforms:
     backend: fla_delta
   insert_cached_gated_delta_rule:
     stage: cache_init
-    backend: torch_gated_delta
+    backend: fla_gated_delta
     enabled: true
   insert_cached_residual_add:
     stage: cache_init
