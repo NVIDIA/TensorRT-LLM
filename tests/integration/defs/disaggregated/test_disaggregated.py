@@ -96,6 +96,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
+        "overlap_transceiver_runtime_python":
+        (2,
+         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml"
+         ),
         "tool_calls": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
         "perf_metrics": (2, f"{test_configs_root}/disagg_config_metrics.yaml"),
         "trtllm_sampler":
@@ -130,6 +134,10 @@ def get_test_config(test_desc, example_dir, test_root):
         "deepseek_v3_lite_fp8_nixl":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml"
+         ),
+        "deepseek_v3_lite_fp8_transceiver_runtime_python":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_transceiver_runtime_python.yaml"
          ),
         "deepseek_v3_lite_fp8_tp1":
         (2,
@@ -832,6 +840,26 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root,
                                     llama_model_root):
@@ -1291,6 +1319,31 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
+                           env=env,
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
+
+
+@skip_no_hopper
+@skip_arm
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = "^ib"
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_transceiver_runtime_python",
                            env=env,
                            cwd=llm_venv.get_working_directory(),
                            model_path=deepseek_v3_model_root)

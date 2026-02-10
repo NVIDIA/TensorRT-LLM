@@ -74,5 +74,4 @@ def test_build_page_table(simple_manager):
 
     print(f"\n Page table: {page_table}")
     print(f"  Total pools: {page_table.total_pools}")
-    print(f"  Pools: {page_table.pools}")
     print(f"  Total size: {page_table.total_pool_bytes / (1024**2):.2f} MB")

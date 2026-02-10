@@ -197,7 +197,7 @@ class KVCacheV2DummyScheduler(CapacityScheduler):
             if len(scheduled_requests
                    ) >= self.max_num_requests or reserved_blocks >= max_blocks:
                 break
-            elif req_state == LlmRequestState.GENERATION_IN_PROGRESS or req_state == LlmRequestState.GENERATION_TO_COMPLETE:
+            elif request.is_generation_in_progress_state:
                 scheduled_requests.append(request)
                 reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(
                     request)
@@ -223,8 +223,9 @@ class KVCacheV2DummyScheduler(CapacityScheduler):
                     # If one requests fails to be scheduled, break
                     break
 
-        assert len(scheduled_requests) + len(
-            scheduled_disagg_gen_init_requests) > 0, (
+        if (len(scheduled_requests) + len(scheduled_disagg_gen_init_requests)
+                > 0):
+            logger.warning(
                 "no pending request can get enough resource to complete, "
                 "please increase KV cache pool size.")
         return scheduled_requests, scheduled_disagg_gen_init_requests, []

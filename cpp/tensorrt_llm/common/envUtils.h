@@ -143,6 +143,8 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 uint16_t getEnvNixlPort();
 
+bool getEnvNixlDisableCoalesce();
+
 bool getEnvDisaggBenchmarkGenOnly();
 
 // Whether to disable the chunked-attention in the generation phase.

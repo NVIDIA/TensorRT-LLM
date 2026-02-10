@@ -44,7 +44,9 @@ class KVSlice:
 
     token_range: Optional[TokenRange] = None
     layer_range: Optional[LayerRange] = None
-    block_ids: List[int] = field(default_factory=list)  # Physical block IDs
+    block_ids_per_layer_groups: List[List[int]] = field(
+        default_factory=list
+    )  # Physical block IDs per layer group
     is_last_slice: bool = False
 
 

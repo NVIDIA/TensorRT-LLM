@@ -424,12 +424,29 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             },
             nb::call_guard<nb::gil_scoped_release>())
+
+        .def(
+            "get_primary_pool_by_first_layer_idx",
+            [](tbk::BaseKVCacheManager& self, SizeType32 layer_idx) -> at::Tensor
+            {
+                auto pool = tr::Torch::tensor(self.getPrimaryPool(layer_idx));
+                return pool;
+            },
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_indexer_k_cache_pool_data",
             [](tbk::BaseKVCacheManager& self, SizeType32 layer_idx) -> at::Tensor
             {
                 auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
                 return pool.index({torch::indexing::Slice(), layer_idx});
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_indexer_k_cache_pool",
+            [](tbk::BaseKVCacheManager& self) -> at::Tensor
+            {
+                auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
+                return pool;
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
