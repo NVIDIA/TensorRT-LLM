@@ -55,7 +55,7 @@ from .hang_detector import HangDetector
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, get_draft_token_length)
+                          LlmResponse, PerfTimingInfo, get_draft_token_length)
 from .model_engine import ModelEngine
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests,
@@ -596,6 +596,9 @@ class PyExecutor:
                                  sample_start_time, sample_end_time):
         """Save current iteration's timing info to all requests in the batch."""
         for req in requests:
+            # Lazily create PerfTimingInfo only when perf metrics are enabled
+            if req.py_perf_timing is None:
+                req.py_perf_timing = PerfTimingInfo()
             req.py_perf_timing.gpu_forward_start_event = gpu_forward_start
             req.py_perf_timing.gpu_forward_end_event = gpu_forward_end
             req.py_perf_timing.gpu_sample_end_event = gpu_sample_end
@@ -618,7 +621,7 @@ class PyExecutor:
         batch_gpu_sample_time = None
         for req in requests:
             perf = req.py_perf_timing
-            if perf.gpu_forward_start_event is None:
+            if perf is None or perf.gpu_forward_start_event is None:
                 continue
 
             # Find the last metric entry with gpu_forward_time == 0
@@ -661,7 +664,7 @@ class PyExecutor:
         For generation phase (py_decoding_iter >= 1): saves to step_metrics.
         """
         perf = request.py_perf_timing
-        if not self.return_perf_metrics or perf.forward_start_time is None:
+        if not self.return_perf_metrics or perf is None or perf.forward_start_time is None:
             return
 
         # Determine ctx vs gen:

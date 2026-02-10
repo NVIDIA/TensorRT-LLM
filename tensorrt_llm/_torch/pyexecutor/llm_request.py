@@ -40,7 +40,7 @@ REQUEST_TYPE_MAPPING = {
 }
 
 
-@dataclass
+@dataclass(slots=True)
 class PerfTimingInfo:
     """Stores performance timing information for a request."""
     # Per-step metrics list (generation phase)
@@ -654,7 +654,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_kv_transfer_timed_out = False
 
         # Performance timing info (step metrics, GPU events, context GPU timing)
-        self.py_perf_timing = PerfTimingInfo()
+        # Lazily created only when return_perf_metrics is enabled to avoid
+        # overhead for every request.
+        self.py_perf_timing: Optional[PerfTimingInfo] = None
 
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
@@ -775,7 +777,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Only include time_breakdown_metrics in the final response to avoid O(N²) overhead
         # during streaming (copying all step_metrics for every token is very expensive)
         time_breakdown_metrics = None
-        if is_final:
+        if is_final and self.py_perf_timing is not None:
             time_breakdown_metrics = {}
             if self.py_perf_timing.step_metrics:
                 time_breakdown_metrics[

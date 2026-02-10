@@ -47,9 +47,11 @@ class TimingMetric:
 
     def calculate_duration(self, timing_data: Dict[str, float]) -> float:
         """Calculate the duration for this metric from timing data."""
-        start_time = timing_data.get(self.start_field, float('nan'))
-        end_time = timing_data.get(self.end_field, float('nan'))
+        start_time = timing_data.get(self.start_field)
+        end_time = timing_data.get(self.end_field)
 
+        if start_time is None or end_time is None:
+            return 0
         if math.isnan(start_time) or math.isnan(end_time):
             return 0
         if start_time > end_time:
