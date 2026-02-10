@@ -567,21 +567,28 @@ class PyExecutor:
     # ========== Performance Metrics Helper Methods ==========
 
     def _create_perf_timing_events(self):
-        """Create GPU timing events for performance measurement.
+        """Get GPU timing events for performance measurement.
+
+        Uses ping-pong pattern (two sets of events, alternating per iteration)
+        to avoid creating new events every step. Each set persists until the
+        next same-parity iteration, which is safe because _compute_batch_gpu_times
+        reads the previous iteration's events before they're reused.
 
         Returns:
             Tuple of (gpu_forward_start, gpu_forward_end, gpu_sample_end)
             or (None, None, None) if metrics are disabled.
-
-        Note: gpu_forward_end also serves as sample start time,
-              so no separate gpu_sample_start is needed.
         """
         if not self.return_perf_metrics:
             return None, None, None
-        gpu_forward_start = torch.cuda.Event(enable_timing=True)
-        gpu_forward_end = torch.cuda.Event(enable_timing=True)
-        gpu_sample_end = torch.cuda.Event(enable_timing=True)
-        return gpu_forward_start, gpu_forward_end, gpu_sample_end
+        if not hasattr(self, '_perf_events'):
+            self._perf_events = [
+                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3)),
+                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3)),
+            ]
+            self._perf_event_idx = 0
+        events = self._perf_events[self._perf_event_idx % 2]
+        self._perf_event_idx += 1
+        return events
 
     def _save_timing_to_requests(self, requests, gpu_forward_start,
                                  gpu_forward_end, gpu_sample_end,
@@ -647,19 +654,14 @@ class PyExecutor:
                 perf.ctx_gpu_forward_time += batch_gpu_forward_time
                 perf.ctx_gpu_sample_time += batch_gpu_sample_time
 
-    def _append_step_metrics(self,
-                             request,
-                             is_overlap_mode,
-                             batch_token_time=None):
+    def _append_step_metrics(self, request, batch_token_time=None):
         """Append per-iteration metrics for a request (ctx chunk or gen step).
 
         For context phase (py_decoding_iter < 1): saves to ctx_chunk_metrics.
         For generation phase (py_decoding_iter >= 1): saves to step_metrics.
         """
-        if not self.return_perf_metrics:
-            return
         perf = request.py_perf_timing
-        if perf.forward_start_time is None:
+        if not self.return_perf_metrics or perf.forward_start_time is None:
             return
 
         # Determine ctx vs gen:
@@ -671,12 +673,11 @@ class PyExecutor:
                   and request.py_decoding_iter <= 1)
 
         # Skip if timing hasn't changed (request not scheduled this iteration)
-        if perf.ctx_chunk_metrics and perf.ctx_chunk_metrics[-1][
-                'forward_start_time'] == perf.forward_start_time:
-            return
-        if perf.step_metrics and perf.step_metrics[-1][
-                'forward_start_time'] == perf.forward_start_time:
-            return
+        # Skip if timing hasn't changed (request not scheduled this iteration)
+        for metrics_list in (perf.step_metrics, perf.ctx_chunk_metrics):
+            if metrics_list and metrics_list[-1][
+                    'forward_start_time'] == perf.forward_start_time:
+                return
 
         # Common fields for both ctx chunk and gen step
         metric = {
@@ -3394,7 +3395,6 @@ class PyExecutor:
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
                     self._append_step_metrics(request,
-                                              is_overlap_mode=True,
                                               batch_token_time=batch_token_time)
                     new_active_requests.append(request)
                     continue
@@ -3403,10 +3403,8 @@ class PyExecutor:
                 request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
-            self._append_step_metrics(
-                request,
-                is_overlap_mode=not self.disable_overlap_scheduler,
-                batch_token_time=batch_token_time)
+            self._append_step_metrics(request,
+                                      batch_token_time=batch_token_time)
 
             request_done = False
             if request.py_decoding_iter == 1 or request.is_finished or \
