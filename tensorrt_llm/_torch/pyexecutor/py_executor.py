@@ -1469,29 +1469,13 @@ class PyExecutor:
                                 self.guided_decoder.add_batch(scheduled_batch)
                                 self.guided_decoder.init_disagg_gen_requests()
 
-                            # GPU and CPU timing for perf metrics
-                            gpu_forward_start, gpu_forward_end, gpu_sample_end = self._create_perf_timing_events(
-                            )
-                            if gpu_forward_start is not None:
-                                gpu_forward_start.record()
-                            forward_start_time = get_steady_clock_now_in_seconds(
-                            ) if self.return_perf_metrics else None
-
                             batch_outputs = self._forward_step(scheduled_batch)
-
-                            if gpu_forward_end is not None:
-                                gpu_forward_end.record()
-                            forward_end_time = get_steady_clock_now_in_seconds(
-                            ) if self.return_perf_metrics else None
 
                             guided_decoder_failed_requests = None
                             if self.guided_decoder is not None:
                                 self.guided_decoder.add_batch(scheduled_batch)
                                 guided_decoder_failed_requests = self.guided_decoder.execute(
                                     batch_outputs['logits'])
-
-                            sample_start_time = get_steady_clock_now_in_seconds(
-                            ) if self.return_perf_metrics else None
 
                             if self.pp_multi_stream_sample:
                                 # Wait for the previous sample to finish.
@@ -1511,18 +1495,6 @@ class PyExecutor:
                             else:
                                 sample_state = self._sample_async(
                                     scheduled_batch, batch_outputs)
-
-                            if gpu_sample_end is not None:
-                                gpu_sample_end.record()
-                            sample_end_time = get_steady_clock_now_in_seconds(
-                            ) if self.return_perf_metrics else None
-                            if gpu_forward_start is not None:
-                                self._save_timing_to_requests(
-                                    scheduled_batch.all_requests(),
-                                    gpu_forward_start, gpu_forward_end,
-                                    gpu_sample_end, forward_start_time,
-                                    forward_end_time, sample_start_time,
-                                    sample_end_time)
 
                             assert sample_state is not None, "Sampling failed"
 
