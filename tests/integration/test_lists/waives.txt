@@ -346,6 +346,7 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-kimi-k2-thinking-fp4_1k1k
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-kimi-k2-thinking-fp4_8k1k_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] SKIP (https://nvbugs/5846166)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=vanilla-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (https://nvbugs/5879577)
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM2::test_4gpus[attention_dp=False-cuda_graph=True-overlap_scheduler=True-tp_size=4-ep_size=4] SKIP (https://nvbugs/5879588)
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=True] SKIP (https://nvbugs/5883836)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=True] SKIP (https://nvbugs/5879614)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=2] SKIP (https://nvbugs/5879620)
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-False-False-False] SKIP (https://nvbugs/5879625)
