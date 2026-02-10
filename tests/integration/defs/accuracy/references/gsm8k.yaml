@@ -358,3 +358,11 @@ MiniMaxAI/MiniMax-M2:
   - accuracy: 85
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 85
+nvidia/NVIDIA-Nemotron-Nano-9B-v2:
+  - accuracy: 85.027
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 84.155
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 82.525

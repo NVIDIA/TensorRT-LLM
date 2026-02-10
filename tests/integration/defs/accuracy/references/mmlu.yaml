@@ -392,3 +392,11 @@ nvidia/Nemotron-3-Nano:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 74.35
+nvidia/NVIDIA-Nemotron-Nano-9B-v2:
+  - accuracy: 74.927
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 74.659
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 73.977
