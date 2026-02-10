@@ -120,8 +120,9 @@ class KvCacheCreator:
                 tokens_per_block=self._tokens_per_block)
         elif self._should_create_separate_draft_kv_cache():
             # One-model draft with separate KV cache layout
+            effective_draft_config = self._get_effective_draft_config()
             kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
-                self._draft_config,
+                effective_draft_config,
                 mapping,
                 tokens_per_block=self._tokens_per_block)
         return kv_size_per_token
@@ -529,11 +530,29 @@ class KvCacheCreator:
         """
         Check if we need a separate draft KV cache manager for one-model mode.
         Returns True if the speculative config has use_separate_draft_kv_cache=True.
-        """
-        if self._draft_config is None:
-            return False
 
+        Note: For MTP, _draft_config may be None since MTP layers are embedded
+        in the target model and don't produce a separate ModelConfig. We fall
+        back to the target model's config via _get_effective_draft_config().
+        """
         return should_use_separate_draft_kv_cache(self._speculative_config)
+
+    def _get_effective_draft_config(self) -> ModelConfig:
+        """
+        Return the ModelConfig to use for draft KV cache creation.
+
+        For Eagle3 and draft-target one-model modes, a dedicated draft config
+        is provided at construction time.  For MTP one-model mode, no separate
+        draft config exists because the MTP layers share the same architecture
+        as the target model.  In that case we fall back to the target model's
+        config so that the draft KV cache is created with the correct layout.
+        """
+        if self._draft_config is not None:
+            return self._draft_config
+        # MTP: MTP layers reuse the target model architecture, so the target
+        # model's config describes the correct KV cache layout for the draft
+        # layers as well.
+        return self._model_engine.model.model_config
 
     def _create_one_model_draft_kv_cache_manager(
             self,
@@ -556,9 +575,13 @@ class KvCacheCreator:
         spec_dec_layer_mask = [False
                                ] * target_num_layers + [True] * num_draft_layers
 
+        # Get the effective draft config (explicit draft_config if available,
+        # otherwise fall back to target model config for MTP).
+        effective_draft_config = self._get_effective_draft_config()
+
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            self._draft_config)
+            effective_draft_config)
 
         return _create_kv_cache_manager(
             model_engine=None,
@@ -576,8 +599,8 @@ class KvCacheCreator:
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             # One-model draft specific overrides
-            model_config=self._draft_config,
-            dtype=self._draft_config.pretrained_config.torch_dtype,
+            model_config=effective_draft_config,
+            dtype=effective_draft_config.pretrained_config.torch_dtype,
             is_draft=True,
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
@@ -713,14 +736,42 @@ def _create_kv_cache_manager(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
 
-        num_layers = config.hybrid_override_pattern.count("*")
-        hybrid_layer_mask = [
-            char == "*" for char in config.hybrid_override_pattern
-        ]
-        mamba_num_layers = config.hybrid_override_pattern.count("M")
-        mamba_layer_mask = [
-            char == "M" for char in config.hybrid_override_pattern
-        ]
+        # When layer_mask is provided (e.g., for one-model speculative decoding),
+        # use it to determine which layers to include. The layer_mask may include
+        # draft layers beyond the hybrid_override_pattern.
+        if layer_mask is not None:
+            # layer_mask specifies which layers to include in this KV cache manager.
+            # For draft layers in one-model spec decoding, they are attention-only
+            # (no Mamba states), so we use the passed layer_mask directly.
+            #
+            # Compute the hybrid_layer_mask based on layer_mask:
+            # - If layer_mask[i] is True, include layer i
+            # - For layers beyond hybrid_override_pattern, treat them as attention layers
+            pattern_len = len(config.hybrid_override_pattern)
+            hybrid_layer_mask = []
+            mamba_layer_mask = []
+            for i, include in enumerate(layer_mask):
+                if i < pattern_len:
+                    # Within the pattern range, use the pattern to determine layer type
+                    is_attention = config.hybrid_override_pattern[i] == "*"
+                    is_mamba = config.hybrid_override_pattern[i] == "M"
+                else:
+                    # Beyond the pattern (e.g., MTP/draft layers), treat as attention-only
+                    is_attention = True
+                    is_mamba = False
+                hybrid_layer_mask.append(is_attention and include)
+                mamba_layer_mask.append(is_mamba and include)
+            num_layers = sum(hybrid_layer_mask)
+            mamba_num_layers = sum(mamba_layer_mask)
+        else:
+            num_layers = config.hybrid_override_pattern.count("*")
+            hybrid_layer_mask = [
+                char == "*" for char in config.hybrid_override_pattern
+            ]
+            mamba_num_layers = config.hybrid_override_pattern.count("M")
+            mamba_layer_mask = [
+                char == "M" for char in config.hybrid_override_pattern
+            ]
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
