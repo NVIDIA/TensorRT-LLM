@@ -38,11 +38,12 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
     LayerType,
+    WeightBiasInfoCache,
     bfs,
     extract_weight_name,
+    extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
-    get_all_weight_infos,
     get_all_weights_in_subgraph,
     is_any_attention_op,
     is_any_lin_op,
@@ -821,35 +822,44 @@ class Sharding(BaseTransform):
             )
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-        for source in config.sharding_source:
-            if source == ShardingSource.FACTORY:
-                if len(config.factory_config) == 0:
-                    ad_logger.debug(
-                        "No factory config found. Skipping sharding from factory config"
+        with WeightBiasInfoCache():
+            for source in config.sharding_source:
+                if source == ShardingSource.FACTORY:
+                    if len(config.factory_config) == 0:
+                        ad_logger.debug(
+                            "No factory config found. Skipping sharding from factory config"
+                        )
+                        continue
+                    ad_logger.info("Applying sharding from factory config")
+                    info += detect_sharding_from_config(
+                        gm, transform_container, ShardingSource.FACTORY
                     )
-                    continue
-                ad_logger.info("Applying sharding from factory config")
-                info += detect_sharding_from_config(gm, transform_container, ShardingSource.FACTORY)
-            elif source == ShardingSource.MANUAL:
-                if len(config.manual_config) == 0:
-                    ad_logger.debug("No manual config found. Skipping sharding from manual config")
-                    continue
-                ad_logger.info("Applying sharding from manual config")
-                info += detect_sharding_from_config(gm, transform_container, ShardingSource.MANUAL)
+                elif source == ShardingSource.MANUAL:
+                    if len(config.manual_config) == 0:
+                        ad_logger.debug(
+                            "No manual config found. Skipping sharding from manual config"
+                        )
+                        continue
+                    ad_logger.info("Applying sharding from manual config")
+                    info += detect_sharding_from_config(
+                        gm, transform_container, ShardingSource.MANUAL
+                    )
 
-            elif source == ShardingSource.HEURISTIC:
-                ad_logger.info(f"Running autodeploy sharding heuristics: {config.sharding_dims}")
-                # run TP sharding across ranks
-                if ShardingDim.TP in config.sharding_dims:
-                    info += detect_column_row_shard(gm, transform_container)
+                elif source == ShardingSource.HEURISTIC:
+                    ad_logger.info(
+                        f"Running autodeploy sharding heuristics: {config.sharding_dims}"
+                    )
+                    # run TP sharding across ranks
+                    if ShardingDim.TP in config.sharding_dims:
+                        info += detect_column_row_shard(gm, transform_container)
 
-                # run EP sharding across ranks
-                if ShardingDim.EP in config.sharding_dims:
-                    info += detect_ep_shard(gm, transform_container)
+                    # run EP sharding across ranks
+                    if ShardingDim.EP in config.sharding_dims:
+                        info += detect_ep_shard(gm, transform_container)
 
-                # run BMM sharding across ranks
-                if ShardingDim.BMM in config.sharding_dims:
-                    info += detect_dp_bmm_shard(gm, transform_container)
+                    # run BMM sharding across ranks
+                    if ShardingDim.BMM in config.sharding_dims:
+                        info += detect_dp_bmm_shard(gm, transform_container)
 
         return gm, info
 
@@ -889,18 +899,19 @@ class ShardingTransformExecutor(BaseTransform):
 
         num_matches = 0
         transforms = shared_config.sharding_transform_container
-        for tp_transform in transforms.weight_sharding_transforms:
-            if check_and_apply(tp_transform):
-                num_matches += 1
-        for bmm_transform in transforms.bmm_transforms:
-            if check_and_apply(bmm_transform):
-                num_matches += 1
-        for ep_transform in transforms.ep_transforms:
-            if check_and_apply(ep_transform):
-                num_matches += 1
-        for rmsnorm_transform in transforms.rmsnorm_transforms:
-            if check_and_apply(rmsnorm_transform):
-                num_matches += 1
+        with WeightBiasInfoCache():
+            for tp_transform in transforms.weight_sharding_transforms:
+                if check_and_apply(tp_transform):
+                    num_matches += 1
+            for bmm_transform in transforms.bmm_transforms:
+                if check_and_apply(bmm_transform):
+                    num_matches += 1
+            for ep_transform in transforms.ep_transforms:
+                if check_and_apply(ep_transform):
+                    num_matches += 1
+            for rmsnorm_transform in transforms.rmsnorm_transforms:
+                if check_and_apply(rmsnorm_transform):
+                    num_matches += 1
 
         # post-sharding cleanup transformations
         for update_transform in transforms.parameter_update_transforms:
@@ -1308,17 +1319,17 @@ def _shard_parameter_node(
         return
 
     # Shard weight using the unified function (also updates the parameter)
-    all_weight_infos = get_all_weight_infos(node)
+    weight_nodes = extract_weight_nodes(node)
     # Parametrized nodes must have at least one weight (for debugging)
-    assert len(all_weight_infos.weights) > 0, (
+    assert len(weight_nodes.weights) > 0, (
         f"Node {node.name} has no weights - weight mapping may be incorrect"
     )
 
-    for weight_info in all_weight_infos.weights:
+    for weight_node in weight_nodes.weights:
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
-            weight_tensor=weight_info.tensor,
-            param_key=weight_info.node_key,
+            weight_tensor=weight_node.tensor,
+            param_key=weight_node.node_key,
             dim=dim,
             rank=rank,
             world_size=world_size,
@@ -1328,22 +1339,22 @@ def _shard_parameter_node(
         if quantization_cb is not None:
             quantization_cb(
                 gm=gm,
-                submod=weight_info.submod,
+                submod=weight_node.submod,
                 node=node,
-                weight_key=weight_info.node_key,
+                weight_key=weight_node.node_key,
                 weight_new_shape=weight_new_shape,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
             )
 
-    for bias_info in all_weight_infos.biases:
+    for bias_node in weight_nodes.biases:
         if dim == 0:
             # update bias for dim 0 --> we can handle it like the weight
             shard_weight_tensor(
                 gm=gm,
-                weight_tensor=bias_info.tensor,
-                param_key=bias_info.node_key,
+                weight_tensor=bias_node.tensor,
+                param_key=bias_node.node_key,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
@@ -1358,10 +1369,10 @@ def _shard_parameter_node(
             args[2] = None
             node.args = tuple(args)
             gm.graph.erase_node(node_bias)
-            bias_param_name = bias_info.node_key.rpartition(".")[-1]
-            setattr(bias_info.submod, bias_param_name, None)
+            bias_param_name = bias_node.node_key.rpartition(".")[-1]
+            setattr(bias_node.submod, bias_param_name, None)
             gm._register_load_state_dict_pre_hook(
-                partial(_load_hook_remove, param_key=bias_info.node_key)
+                partial(_load_hook_remove, param_key=bias_node.node_key)
             )
 
     # # # column shard with no gather: the output is sharded
