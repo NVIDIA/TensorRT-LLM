@@ -2573,6 +2573,7 @@ class ResourceManager:
         for resource_manager in resource_manager_list:
             self.resource_managers.move_to_end(resource_manager)
 
+
 class PeftCacheManager(BaseResourceManager):
 
     def __init__(self,

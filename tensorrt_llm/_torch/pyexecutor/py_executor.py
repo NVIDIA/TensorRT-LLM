@@ -3370,7 +3370,6 @@ class PyExecutor:
                 else:
                     if not request.is_disagg_context_transmission_state:
                         requests_to_terminate.append(request)
-
             else:
                 new_active_requests.append(request)
 
