@@ -101,7 +101,7 @@ Tensor& cuda_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor cons
 }
 
 Tensor cuda_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int output_buffer_kind = 0,
+    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind = 0,
     c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
