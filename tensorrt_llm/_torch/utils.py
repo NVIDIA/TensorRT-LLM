@@ -426,13 +426,37 @@ def maybe_compiled_cat(tensors, dim):
     return torch.cat(tensors, dim)
 
 
-def replace_parameter_and_save_metadata(module: torch.nn.Module,
-                                        param_name: str,
-                                        new_param: torch.nn.Parameter,
-                                        metadata_dict: Dict):
+def replace_parameter_and_save_metadata(
+        module: torch.nn.Module, param_name: str,
+        new_param: torch.nn.Parameter | torch.Tensor, metadata_dict: Dict):
     """
     Replace a parameter in a module and save the metadata of the original parameter.
+    On first call: saves original param's meta tensor and new param's tensor, then replaces.
+    On subsequent calls: copies new_param data into the saved tensor, then registers it.
     """
+    saved_param = None
     if param_name not in metadata_dict:
-        metadata_dict[param_name] = getattr(module, param_name).to("meta")
-    module.register_parameter(param_name, new_param)
+        # First time: save original meta tensor and the new param tensor reference
+        original_meta = getattr(module, param_name).to("meta")
+        # Convert new_param to Parameter if it's a Tensor, otherwise use directly
+        if isinstance(new_param, torch.nn.Parameter):
+            saved_param = new_param
+        elif isinstance(new_param, torch.Tensor):
+            saved_param = torch.nn.Parameter(new_param, requires_grad=False)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+        metadata_dict[param_name] = {
+            'meta': original_meta,
+            'param': saved_param
+        }
+    else:
+        # Subsequent calls: copy new_param into the saved tensor
+        saved_param = metadata_dict[param_name]['param']
+        if isinstance(new_param, torch.nn.Parameter):
+            saved_param.data.copy_(new_param.data)
+        elif isinstance(new_param, torch.Tensor):
+            saved_param.data.copy_(new_param)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+
+    module.register_parameter(param_name, saved_param)
