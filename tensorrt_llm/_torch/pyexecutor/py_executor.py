@@ -3371,9 +3371,6 @@ class PyExecutor:
                     if not request.is_disagg_context_transmission_state:
                         requests_to_terminate.append(request)
 
-                if self.kv_connector_manager is not None:
-                    self.async_transfer_manager.start_transfer(request)
-
             else:
                 new_active_requests.append(request)
 
