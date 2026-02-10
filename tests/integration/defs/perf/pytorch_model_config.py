@@ -297,10 +297,10 @@ def get_model_yaml_config(model_label: str,
                 'num_postprocess_workers': 4
             }
         },
-        # GPT-OSS 120B speculative decoding (Eagle3 draft)
+        # GPT-OSS 120B speculative decoding with Eagle3
         {
             'patterns': [
-                'gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:4096-input_output_len:2048,128-reqs:1-con:1',
+                'gpt_oss_120b_eagle3',
             ],
             'config': {
                 'enable_attention_dp': False,
@@ -314,9 +314,34 @@ def get_model_yaml_config(model_label: str,
                     'decoding_type':
                     'Eagle',
                     'max_draft_len':
-                    5,
+                    3,
                     'speculative_model_dir':
-                    f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
+                    f'{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
+        # GPT-OSS 120B speculative decoding with Eagle3-throughput (https://nvbugspro.nvidia.com/bug/5832481)
+        {
+            'patterns': [
+                'gpt_oss_120b_eagle3_throughput',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': False,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f'{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3-throughput',
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
