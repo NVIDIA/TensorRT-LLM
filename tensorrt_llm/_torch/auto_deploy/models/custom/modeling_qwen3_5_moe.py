@@ -28,6 +28,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import AutoConfig
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
@@ -1579,6 +1580,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
 # =============================================================================
 # Registration
 # =============================================================================
+
+AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig)
+AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig)
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
 AutoModelForCausalLMFactory.register_custom_model_cls(
