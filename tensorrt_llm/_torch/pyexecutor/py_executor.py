@@ -3372,7 +3372,8 @@ class PyExecutor:
                         requests_to_terminate.append(request)
 
                 if self.kv_connector_manager is not None:
-                    self.resource_manager.free_slot_only(request)
+                    self.async_transfer_manager.start_transfer(request)
+
             else:
                 new_active_requests.append(request)
 
