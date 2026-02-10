@@ -665,11 +665,10 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         )
 
         if self.has_end_norm:
-            if residual is not None:
-                hidden_states = hidden_states + residual
-                residual = None
-
-            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states, residual = self.final_layernorm(
+                hidden_states, residual)
+            # The last step, so don't forward the residual.
+            residual = None
 
         return hidden_states, residual
 
@@ -697,9 +696,7 @@ class NemotronHMTP(nn.Module):
         # Build pattern-based layers
         self.layers = nn.ModuleDict()
 
-        for i in range(self.pattern_len):
-            step_rel_idx = i % self.pattern_len
-
+        for step_rel_idx in range(self.pattern_len):
             char = self.pattern_str[step_rel_idx]
 
             is_start_of_step = step_rel_idx == 0
@@ -717,7 +714,7 @@ class NemotronHMTP(nn.Module):
                 skip_create_weights_in_init,
             )
 
-            self.layers[str(i)] = NemotronHMTPDecoderLayer(
+            self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
                 model_config=sublayer_model_config,
                 layer_idx=self.layer_idx,
                 aux_stream_dict=aux_stream_dict,
