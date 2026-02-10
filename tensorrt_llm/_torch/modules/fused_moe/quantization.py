@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_device_integrated, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -22,6 +22,7 @@ from ...utils import (replace_parameter_and_save_metadata, swizzle_sf,
                       unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
+from .moe_load_balancer import advise_tensor_pageout
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -265,6 +266,20 @@ class FusedMoEMethodBase(ABC):
             w2_kargs["allow_partial_loading"] = allow_partial_loading
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
+
+        def maybe_pageout_mmapped_cpu_weights(
+                weight_tensors: List[object]) -> None:
+            # Integrated GPU systems share physical memory with CPU. After we
+            # finish copying from mmapped CPU weights, proactively advising the
+            # kernel to drop those pages reduces shared-memory pressure.
+            if not is_device_integrated():
+                return
+            for weight in weight_tensors:
+                if (isinstance(weight, torch.Tensor)
+                        and weight.device.type == "cpu"
+                        and weight.is_contiguous()):
+                    advise_tensor_pageout(weight)
+
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             # expert_idx is the local slot index of current rank
             expert_idx = local_slot_id
@@ -318,6 +333,7 @@ class FusedMoEMethodBase(ABC):
                 if weight is not None
             ]
             module._add_raw_shared_weights_for_unmap(unmap_weights)
+            maybe_pageout_mmapped_cpu_weights(unmap_weights)
 
             if module.bias:
                 self.load_expert_w3_w1_weight(
@@ -332,6 +348,7 @@ class FusedMoEMethodBase(ABC):
                     if weight is not None
                 ]
                 module._add_raw_shared_weights_for_unmap(unmap_weights)
+                maybe_pageout_mmapped_cpu_weights(unmap_weights)
 
     def load_weights(self,
                      module: torch.nn.Module,
