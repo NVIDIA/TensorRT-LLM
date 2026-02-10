@@ -2730,7 +2730,7 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
-        self.residual_dim = 0
+        self.residual_dim = in_features
         self.in_features_with_residual = in_features + self.residual_dim
         self.reorder_index = torch.arange(in_features, dtype=torch.int16)
         super().create_weights(module, self.in_features_with_residual,
@@ -2738,13 +2738,10 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     def _input_prepare(self, module: Linear, input: torch.Tensor):
         if isinstance(input, Fp4QuantizedTensor) or isinstance(input, tuple):
-            raise RuntimeError("No quantization fusion for TwoFP4 now.")
+            raise RuntimeError(
+                "No quantization fusion for TwoFP4 now. Please run with TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0"
+            )
         else:
-            # Input is a regular tensor () - apply pre_quant_scale if it exists (for NVFP4_AWQ)
-            if module.pre_quant_scale is not None:
-                assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
-                input = input * module.pre_quant_scale
-
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
                 input,
                 module.input_scale,
