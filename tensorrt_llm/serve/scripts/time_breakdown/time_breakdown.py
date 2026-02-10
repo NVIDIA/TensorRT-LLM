@@ -1700,7 +1700,8 @@ class RequestTimeBreakdown:
         }});
 '''
 
-        full_html = f"""<!DOCTYPE html>
+        full_html = f"""<!DOCTYPE html>"""  # nosec B608 - HTML template, not SQL
+        full_html += f"""
 <html>
 <head>
     <meta charset="utf-8">
