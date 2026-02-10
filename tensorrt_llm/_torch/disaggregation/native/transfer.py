@@ -236,33 +236,15 @@ class AuxSendTask:
         return should_send_in_tp and should_send_in_pp
 
     def print_perf_info(self, peer_rank: int):
-        if not perf_log_manager.enabled:
-            return
-
-        transfer_size = self._perf_timer.get_transfer_size(peer_rank)
-        avg_segment_size = self._perf_timer.get_average_segment_size(peer_rank)
-        entry_count = self._perf_timer.get_transfer_entry_count(peer_rank)
-        prepare_args_latency_ms = self._perf_timer.get_prepare_args_latency(peer_rank) * 1000
-        queue_latency_ms = self._perf_timer.get_queue_latency(peer_rank) * 1000
-        transfer_latency_ms = self._perf_timer.get_transfer_latency(peer_rank) * 1000
-        task_latency_ms = self._perf_timer.get_task_latency(peer_rank) * 1000
-        throughput_mbs = self._perf_timer.get_transfer_throughput(peer_rank)
-
         ri = self._registrar.self_rank_info
-        csv_line = (
-            f"AuxSendTask,{self._unique_rid},{peer_rank},"
-            f"{transfer_size},{avg_segment_size},{entry_count},"
-            f"{prepare_args_latency_ms:.3f},{queue_latency_ms:.3f},"
-            f"{transfer_latency_ms:.3f},{task_latency_ms:.3f},{throughput_mbs:.2f}"
+        perf_log_manager.log_task_perf(
+            "AuxSendTask",
+            self._unique_rid,
+            peer_rank,
+            ri.instance_name,
+            ri.instance_rank,
+            self._perf_timer,
         )
-        info_msg = (
-            f"AuxSendTask.print_perf_info: unique_rid={self._unique_rid}, peer_rank={peer_rank}, "
-            f"transfer_size={transfer_size} byte, avg_segment_size={avg_segment_size} byte, "
-            f"entry_count={entry_count}, prepare_args_latency={prepare_args_latency_ms:.3f} ms, "
-            f"queue_latency={queue_latency_ms:.3f} ms, transfer_latency={transfer_latency_ms:.3f} ms, "
-            f"task_latency={task_latency_ms:.3f} ms, throughput={throughput_mbs:.2f} MB/s"
-        )
-        perf_log_manager.log(ri.instance_name, ri.instance_rank, csv_line, info_msg)
 
 
 class KVSendTask:
@@ -414,33 +396,15 @@ class KVSendTask:
         return src_block_ids, dst_block_ids
 
     def print_perf_info(self, peer_rank: int):
-        if not perf_log_manager.enabled:
-            return
-
-        transfer_size = self._perf_timer.get_transfer_size(peer_rank)
-        avg_segment_size = self._perf_timer.get_average_segment_size(peer_rank)
-        entry_count = self._perf_timer.get_transfer_entry_count(peer_rank)
-        prepare_args_latency_ms = self._perf_timer.get_prepare_args_latency(peer_rank) * 1000
-        queue_latency_ms = self._perf_timer.get_queue_latency(peer_rank) * 1000
-        transfer_latency_ms = self._perf_timer.get_transfer_latency(peer_rank) * 1000
-        task_latency_ms = self._perf_timer.get_task_latency(peer_rank) * 1000
-        throughput_mbs = self._perf_timer.get_transfer_throughput(peer_rank)
-
         ri = self._registrar.self_rank_info
-        csv_line = (
-            f"KVSendTask,{self._unique_rid},{peer_rank},"
-            f"{transfer_size},{avg_segment_size},{entry_count},"
-            f"{prepare_args_latency_ms:.3f},{queue_latency_ms:.3f},"
-            f"{transfer_latency_ms:.3f},{task_latency_ms:.3f},{throughput_mbs:.2f}"
+        perf_log_manager.log_task_perf(
+            "KVSendTask",
+            self._unique_rid,
+            peer_rank,
+            ri.instance_name,
+            ri.instance_rank,
+            self._perf_timer,
         )
-        info_msg = (
-            f"KVSendTask.print_perf_info: unique_rid={self._unique_rid}, peer_rank={peer_rank}, "
-            f"transfer_size={transfer_size} byte, avg_segment_size={avg_segment_size} byte, "
-            f"entry_count={entry_count}, prepare_args_latency={prepare_args_latency_ms:.3f} ms, "
-            f"queue_latency={queue_latency_ms:.3f} ms, transfer_latency={transfer_latency_ms:.3f} ms, "
-            f"task_latency={task_latency_ms:.3f} ms, throughput={throughput_mbs:.2f} MB/s"
-        )
-        perf_log_manager.log(ri.instance_name, ri.instance_rank, csv_line, info_msg)
 
 
 @dataclass
@@ -1017,19 +981,14 @@ class KVRecvTask:
         )
 
     def print_perf_info(self, peer_rank: int):
-        if not perf_log_manager.enabled:
-            return
-
-        task_latency_ms = self._perf_timer.get_task_latency(peer_rank) * 1000
-
         ri = self._registrar.self_rank_info
-        # CSV: task_type,unique_rid,peer_rank,size,avg_seg,count,prepare_args,queue,transfer,task,throughput
-        csv_line = f"KVRecvTask,{self._unique_rid},{peer_rank},,,,,,,{task_latency_ms:.3f},"
-        info_msg = (
-            f"KVRecvTask.print_perf_info: unique_rid={self._unique_rid}, "
-            f"peer_rank={peer_rank}, task_latency={task_latency_ms:.3f} ms"
+        perf_log_manager.log_recv_task_perf(
+            self._unique_rid,
+            peer_rank,
+            ri.instance_name,
+            ri.instance_rank,
+            self._perf_timer,
         )
-        perf_log_manager.log(ri.instance_name, ri.instance_rank, csv_line, info_msg)
 
 
 class Receiver:

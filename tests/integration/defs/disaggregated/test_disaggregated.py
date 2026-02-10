@@ -1341,7 +1341,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_transceiver_runtime_python",
                            env=env,
