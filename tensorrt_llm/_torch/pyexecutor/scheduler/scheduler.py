@@ -273,8 +273,9 @@ class KVCacheV2MaxUtilizationScheduler(CapacityScheduler):
 
         return scheduled_requests, scheduled_disagg_gen_init_requests, []
 
-    def prepare_resources(self, context_requests: RequestList,
-                          generation_requests: RequestList):
+    def prepare_resources(
+        self, context_requests: RequestList, generation_requests: RequestList
+    ) -> tuple[RequestList, RequestList, RequestList]:
         """
         Prepare resources for max utilization scheduling.
         Delegates to KVCacheManagerV2.prepare_resources_for_max_utilization().
@@ -284,7 +285,8 @@ class KVCacheV2MaxUtilizationScheduler(CapacityScheduler):
             generation_requests: List of generation requests to schedule
 
         Returns:
-            Tuple of (new_context_batch, new_generation_batch) after resource allocation
+            Tuple of (new_context_batch, new_generation_batch, evicted_requests).
+            evicted_requests should be exposed as paused_requests by the caller.
         """
         return self.kv_cache_manager.prepare_resources_for_max_utilization(
             context_requests, generation_requests)
@@ -1064,9 +1066,9 @@ class KVCacheV2MaxUtilizationPolicy(SchedulerPolicyBase):
         return all_scheduled, paused_requests
 
     def prepare_resources(
-            self, context_requests: RequestList,
-            generation_requests: RequestList
-    ) -> tuple[RequestList, RequestList]:
+        self, context_requests: RequestList, generation_requests: RequestList,
+        paused_requests: RequestList
+    ) -> tuple[RequestList, RequestList, RequestList]:
         """
         Prepare resources for MAX_UTILIZATION policy.
         Delegates to KVCacheV2MaxUtilizationScheduler.prepare_resources().
@@ -1075,7 +1077,7 @@ class KVCacheV2MaxUtilizationPolicy(SchedulerPolicyBase):
                 self.delegate_scheduler, 'prepare_resources'):
             return self.delegate_scheduler.prepare_resources(
                 context_requests, generation_requests)
-        return context_requests, generation_requests
+        return context_requests, generation_requests, paused_requests
 
 
 class NoEvictScheduledBlocksManager:
@@ -1454,21 +1456,24 @@ class PyCapacityScheduler:
         return fitting_requests, fitting_disagg_gen_init_requests
 
     def prepare_resources(
-            self, context_requests: RequestList,
-            generation_requests: RequestList
-    ) -> tuple[RequestList, RequestList]:
+        self, context_requests: RequestList, generation_requests: RequestList,
+        paused_requests: RequestList
+    ) -> tuple[RequestList, RequestList, RequestList]:
         """
         Prepare resources for scheduled requests.
         Delegates to the internal policy's prepare_resources method if it exists.
 
         :param context_requests: List of scheduled context requests
         :param generation_requests: List of scheduled generation requests
-        :return: Tuple of (updated context_requests, updated generation_requests)
+        :param paused_requests: Current list of paused requests
+        :return: Tuple of (updated context_requests, updated generation_requests, paused_requests).
         """
         if hasattr(self._policy, 'prepare_resources'):
-            return self._policy.prepare_resources(context_requests,
-                                                  generation_requests)
-        return context_requests, generation_requests
+            result = self._policy.prepare_resources(context_requests,
+                                                    generation_requests,
+                                                    paused_requests)
+            return result
+        return context_requests, generation_requests, paused_requests
 
 
 class SimpleUnifiedScheduler(RequestScheduler):
@@ -1534,11 +1539,12 @@ class SimpleUnifiedScheduler(RequestScheduler):
         )
 
         # Step 3: Resource Preparation (for schedulers that need it, e.g., KVCacheV2MaxUtilization)
-        # This delegates to PyCapacityScheduler.prepare_resources() which delegates to the policy
-        # For KVCacheV2MaxUtilizationPolicy, this allocates KV cache resources
+        # This delegates to PyCapacityScheduler.prepare_resources() which always returns
+        # (context_requests, generation_requests, paused_requests).
         if hasattr(self.capacity_scheduler, 'prepare_resources'):
-            context_requests, generation_requests = \
-                self.capacity_scheduler.prepare_resources(context_requests, generation_requests)
+            context_requests, generation_requests, paused_requests = \
+                self.capacity_scheduler.prepare_resources(
+                    context_requests, generation_requests, paused_requests)
 
         return SchedulerOutput(
             context_requests=context_requests,

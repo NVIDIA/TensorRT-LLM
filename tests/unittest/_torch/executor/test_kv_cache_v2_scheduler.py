@@ -77,11 +77,13 @@ def test_kv_cache_v2_policy_consistency(model_path, test_case):
     )
 
     # KVCacheConfig for V2
+    # host_kv_cache_size is needed for max utilization scheduling due to request eviction
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=0.7,
         dtype="auto",
         use_kv_cache_manager_v2=True,
         enable_block_reuse=False,
+        host_kv_cache_size=10737418240,
     )
 
     # Test with GUARANTEED_NO_EVICT

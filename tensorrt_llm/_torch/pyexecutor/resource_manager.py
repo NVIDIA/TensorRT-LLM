@@ -37,7 +37,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
                                                              typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -2056,7 +2055,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def prepare_resources_for_max_utilization(
         self, context_requests: List[LlmRequest],
         generation_requests: List[LlmRequest]
-    ) -> tuple[List[LlmRequest], List[LlmRequest]]:
+    ) -> tuple[List[LlmRequest], List[LlmRequest], List[LlmRequest]]:
         """
         Allocate KV cache resources for max utilization scheduling.
         Handles eviction when out of pages.
@@ -2066,7 +2065,9 @@ class KVCacheManagerV2(BaseResourceManager):
             generation_requests: List of generation requests to schedule
 
         Returns:
-            Tuple of (scheduled_context, scheduled_generation) after resource allocation
+            Tuple of (scheduled_context, scheduled_generation, evicted_requests).
+            evicted_requests are requests evicted to free capacity and should be
+            exposed as paused_requests by the caller.
         """
         evicted_requests: List[LlmRequest] = []
 
@@ -2104,12 +2105,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 capacity_increased = False
 
                 for _ in range(max_eviction_attempts):
-                    try:
-                        kv_cache.capacity += 1
+                    if kv_cache.resize(kv_cache.capacity + 1):
                         new_generation_batch.append(req)
                         capacity_increased = True
                         break
-                    except OutOfPagesError:
+                    else:
                         evicted = self._try_evict_request_for_capacity(
                             req, new_generation_batch, None, context_requests,
                             generation_requests, evicted_requests)
@@ -2167,10 +2167,10 @@ class KVCacheManagerV2(BaseResourceManager):
                             torch.cuda.current_stream().cuda_stream)
                         if not success:
                             continue
-                        try:
-                            kv_cache.capacity = req.prompt_len
+
+                        if kv_cache.resize(req.prompt_len):
                             new_context_batch.append(req)
-                        except OutOfPagesError:
+                        else:
                             kv_cache.suspend()
                             continue
 
@@ -2194,8 +2194,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # Set flag to indicate scheduler handled resource preparation
         self._scheduler_prepared_resources = True
-
-        return new_context_batch, new_generation_batch
+        # TODO: return evicted_requests as paused requests, not empty list
+        return new_context_batch, new_generation_batch, []
 
     def get_kv_cache_stats(self):
 
@@ -2552,6 +2552,10 @@ class KVCacheManagerV2(BaseResourceManager):
             _update_kv_cache_draft_token_location(self, scheduled_batch,
                                                   attn_metadata,
                                                   kv_cache_dtype_byte_size)
+        # Skip :
+        # - If a request is paused and its kv_cache is suspended, no need to update
+        # - With overlap scheduler, the scheduler pauses a request and frees KV cache at iteration N,
+        #   while the previous batch (N-1) is still trying to update the KV cache after forward pass.
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
@@ -2564,6 +2568,8 @@ class KVCacheManagerV2(BaseResourceManager):
                          context_current_position])
                 kv_cache.stop_committing()
             else:
+                if not kv_cache.is_active:
+                    continue
                 success = kv_cache.resize(None, req.context_current_position)
                 if not success:
                     raise ValueError(
@@ -2574,6 +2580,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
+            if not kv_cache.is_active:
+                continue
             new_capacity = None if req.state in (
                 LlmRequestState.GENERATION_COMPLETE,
                 LlmRequestState.CONTEXT_INIT
