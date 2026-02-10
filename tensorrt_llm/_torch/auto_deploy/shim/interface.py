@@ -27,6 +27,12 @@ from ..distributed.common import is_initialized as is_distributed_initialized
 from ..utils.cuda_mem_tracker import bytes_to, get_mem_info
 from ..utils.logger import ad_logger
 
+# Import trtllm_attention config to configure it when pool info is available
+try:
+    from ..custom_ops.trtllm_attention import _trtllm_config as trtllm_attn_config
+except ImportError:
+    trtllm_attn_config = None
+
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 DataType = tensorrt_llm.bindings.DataType
 
@@ -527,6 +533,16 @@ class CachedSequenceInterface:
         # 5. Assign KV views
         self._assign_kv_cache_views(kv_managed)
 
+        # 5b. Configure trtllm_attention global state with pool info
+        if trtllm_attn_config is not None:
+            trtllm_attn_config.configure(self.info)
+            # Pass KV cache pool pointers if available
+            if hasattr(self._kv_cache_manager, "kv_cache_pool_pointers"):
+                trtllm_attn_config.set_kv_cache_pool_info(
+                    pool_pointers=self._kv_cache_manager.kv_cache_pool_pointers,
+                    pool_mapping=self._kv_cache_manager.kv_cache_pool_mapping,
+                )
+
         # 6. Allocate remaining unmanaged resources
         self._allocate_unmanaged_resources()
 
@@ -675,6 +691,15 @@ class CachedSequenceInterface:
         # Create new cache manager with optimal capacity
         cache_stats = self._create_kv_cache_manager(max_tokens=max_tokens_optimal)
         max_tokens_final = cache_stats["max_tokens"]
+
+        # Update trtllm pool pointers after resize (pool address may change)
+        if trtllm_attn_config is not None and hasattr(
+            self._kv_cache_manager, "kv_cache_pool_pointers"
+        ):
+            trtllm_attn_config.set_kv_cache_pool_info(
+                pool_pointers=self._kv_cache_manager.kv_cache_pool_pointers,
+                pool_mapping=self._kv_cache_manager.kv_cache_pool_mapping,
+            )
 
         # Log resulting memory information
         total_cache_bytes = mem_for_paged_optimal + non_paged_bytes_total

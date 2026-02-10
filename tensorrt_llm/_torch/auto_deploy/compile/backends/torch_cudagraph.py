@@ -54,8 +54,12 @@ class CapturedGraph(nn.Module):
     def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
         """Capture and return one cuda graph."""
         # warm-up and invoke autotuner
+        # NOTE: We use 6 iterations instead of 3 to ensure the C++ attention op_cache
+        # is properly populated before CUDA graph capture. The autotuner's profiling
+        # can cause cache instability in earlier iterations, but stabilizes by iteration 6.
+        # This fixes "cudaMalloc not permitted during capture" errors with trtllm attention.
         with CudaGraphWarmUpPhase(), autotune():
-            for _ in range(3):
+            for _ in range(6):
                 self.model(*args, **kwargs)
 
         # capture graph now

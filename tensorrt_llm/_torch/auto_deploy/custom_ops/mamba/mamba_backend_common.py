@@ -23,6 +23,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import cu_seqlens_to_chun
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
 from .....llmapi.llm_args import KvCacheConfig
+from ...utils.cuda_graph import cuda_graph_state
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
@@ -47,9 +48,17 @@ def _mamba_ssm_prepare_metadata(
     """Prepare metadata for cached SSM transform.
 
     Returns a tuple of (chunk_indices, chunk_offsets, seq_idx_prefill).
+
+    CUDA graph compatibility: Use shared batch info if available.
     """
     device = cu_seqlen.device
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+
+    # Get batch dimensions from shared state if available (for CUDA graph replay)
+    shared_batch_info = cuda_graph_state.get_batch_info()
+    if shared_batch_info is not None:
+        num_prefill, num_prefill_tokens, num_decode = shared_batch_info
+    else:
+        num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
 
     if num_prefill > 0:
         chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
@@ -130,7 +139,13 @@ def _run_ssm_prefill(
     chunk_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], int, int, int, int]:
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    # Get batch dimensions from shared state if available (for CUDA graph replay)
+    shared_batch_info = cuda_graph_state.get_batch_info()
+    if shared_batch_info is not None:
+        num_prefill, num_prefill_tokens, num_decode = shared_batch_info
+    else:
+        num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 

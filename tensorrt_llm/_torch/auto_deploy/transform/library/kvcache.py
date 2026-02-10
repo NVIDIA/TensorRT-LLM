@@ -184,6 +184,11 @@ class _InsertCachedOperator(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
+        # Configure backend with sequence info (e.g., max_batch_size, max_seq_len)
+        # This must be called BEFORE get_constants() for backends that need these values.
+        if hasattr(attn_descriptor, "configure_from_sequence_info"):
+            attn_descriptor.configure_from_sequence_info(cm.info)
+
         # get standard metadata nodes for all source attention nodes
         meta_nodes_std = self._process_metadata_std(gm, cm)
 
