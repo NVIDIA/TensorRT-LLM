@@ -233,6 +233,88 @@ class PerfLogManager:
             # Output to stdout via logger.info
             logger.info(info_msg)
 
+    def log_task_perf(
+        self,
+        task_type: str,
+        unique_rid: int,
+        peer_rank: int,
+        instance_name: str,
+        instance_rank: int,
+        perf_timer: "PerfTimer",
+    ):
+        """Extract metrics from PerfTimer, format, and log.
+
+        This centralises all measuring and formatting so that callers only need
+        to pass the timer object.
+
+        Args:
+            task_type: E.g. "KVSendTask", "AuxSendTask", "KVRecvTask".
+            unique_rid: Unique request id.
+            peer_rank: The peer rank associated with this measurement.
+            instance_name: Self instance name (used for file naming).
+            instance_rank: Self instance rank (used for file naming).
+            perf_timer: A ``PerfTimer`` instance that has recorded the events.
+        """
+        if not self._perf_enabled:
+            return
+
+        transfer_size = perf_timer.get_transfer_size(peer_rank)
+        avg_segment_size = perf_timer.get_average_segment_size(peer_rank)
+        entry_count = perf_timer.get_transfer_entry_count(peer_rank)
+        prepare_args_latency_ms = perf_timer.get_prepare_args_latency(peer_rank) * 1000
+        queue_latency_ms = perf_timer.get_queue_latency(peer_rank) * 1000
+        transfer_latency_ms = perf_timer.get_transfer_latency(peer_rank) * 1000
+        task_latency_ms = perf_timer.get_task_latency(peer_rank) * 1000
+        throughput_mbs = perf_timer.get_transfer_throughput(peer_rank)
+
+        csv_line = (
+            f"{task_type},{unique_rid},{peer_rank},"
+            f"{transfer_size},{avg_segment_size},{entry_count},"
+            f"{prepare_args_latency_ms:.3f},{queue_latency_ms:.3f},"
+            f"{transfer_latency_ms:.3f},{task_latency_ms:.3f},{throughput_mbs:.2f}"
+        )
+        info_msg = (
+            f"{task_type}.print_perf_info: unique_rid={unique_rid}, peer_rank={peer_rank}, "
+            f"transfer_size={transfer_size} byte, avg_segment_size={avg_segment_size} byte, "
+            f"entry_count={entry_count}, prepare_args_latency={prepare_args_latency_ms:.3f} ms, "
+            f"queue_latency={queue_latency_ms:.3f} ms, transfer_latency={transfer_latency_ms:.3f} ms, "
+            f"task_latency={task_latency_ms:.3f} ms, throughput={throughput_mbs:.2f} MB/s"
+        )
+        self.log(instance_name, instance_rank, csv_line, info_msg)
+
+    def log_recv_task_perf(
+        self,
+        unique_rid: int,
+        peer_rank: int,
+        instance_name: str,
+        instance_rank: int,
+        perf_timer: "PerfTimer",
+    ):
+        """Log performance data for a receive task (task_latency only).
+
+        Receive tasks only measure task latency; other fields are left empty
+        in the CSV to distinguish them from send tasks.
+
+        Args:
+            unique_rid: Unique request id.
+            peer_rank: The peer rank associated with this measurement.
+            instance_name: Self instance name (used for file naming).
+            instance_rank: Self instance rank (used for file naming).
+            perf_timer: A ``PerfTimer`` instance that has recorded the events.
+        """
+        if not self._perf_enabled:
+            return
+
+        task_latency_ms = perf_timer.get_task_latency(peer_rank) * 1000
+
+        # CSV: task_type,unique_rid,peer_rank,size,avg_seg,count,prepare_args,queue,transfer,task,throughput
+        csv_line = f"KVRecvTask,{unique_rid},{peer_rank},,,,,,,{task_latency_ms:.3f},"
+        info_msg = (
+            f"KVRecvTask.print_perf_info: unique_rid={unique_rid}, "
+            f"peer_rank={peer_rank}, task_latency={task_latency_ms:.3f} ms"
+        )
+        self.log(instance_name, instance_rank, csv_line, info_msg)
+
 
 # Singleton instance
 perf_log_manager = PerfLogManager()
