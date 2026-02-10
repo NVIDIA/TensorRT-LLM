@@ -34,7 +34,7 @@ if platform.system() != "Windows":
             "flashinfer is not installed properly, please try pip install or building from source codes"
         )
 
-_MiB = 1024 * 1024
+MiB = 1024 * 1024
 
 
 class FlashInferAllReduceWorkspace:
@@ -101,32 +101,32 @@ class FlashInferAllReduceWorkspace:
         # Based on empirical testing.
         custom_ar_max_sizes = {
             (8, 0): {
-                2: 8 * _MiB,
-                4: 8 * _MiB,
-                6: 8 * _MiB,
-                8: 8 * _MiB
+                2: 8 * MiB,
+                4: 8 * MiB,
+                6: 8 * MiB,
+                8: 8 * MiB
             },
             (8, 9): {
-                2: 8 * _MiB,
-                4: 8 * _MiB,
-                6: 8 * _MiB,
-                8: 8 * _MiB
+                2: 8 * MiB,
+                4: 8 * MiB,
+                6: 8 * MiB,
+                8: 8 * MiB
             },
             (9, 0): {
-                2: 8 * _MiB,
-                4: 8 * _MiB,
-                6: 4 * _MiB,
-                8: 4 * _MiB
+                2: 8 * MiB,
+                4: 8 * MiB,
+                6: 4 * MiB,
+                8: 4 * MiB
             },
             (10, 0): {
-                2: 4 * _MiB,
-                4: 4 * _MiB,
-                6: 4 * _MiB,
-                8: 4 * _MiB
+                2: 4 * MiB,
+                4: 4 * MiB,
+                6: 4 * MiB,
+                8: 4 * MiB
             },
         }
 
-        default_max_size = 8 * _MiB  # 8 MB — safe default for unknown architectures
+        default_max_size = 8 * MiB  # 8 MB — safe default for unknown architectures
 
         if not torch.cuda.is_available():
             return default_max_size
@@ -178,12 +178,17 @@ class FlashInferAllReduceWorkspace:
 
 
 flashinfer_allreduce_workspace = None
+_flashinfer_allreduce_refcount = 0
 
 
 def init_flashinfer_allreduce_workspace(mapping: Mapping):
-    global flashinfer_allreduce_workspace
+    """Initialize (or increment refcount of) the shared workspace."""
+    global flashinfer_allreduce_workspace, _flashinfer_allreduce_refcount
     if flashinfer_allreduce_workspace is None and IS_FLASHINFER_AVAILABLE:
         flashinfer_allreduce_workspace = FlashInferAllReduceWorkspace(mapping)
+        logger.info("FlashInferAllReduceWorkspace initialized.")
+    if flashinfer_allreduce_workspace is not None:
+        _flashinfer_allreduce_refcount += 1
 
 
 def get_current_flashinfer_allreduce_workspace(
@@ -193,11 +198,17 @@ def get_current_flashinfer_allreduce_workspace(
     return flashinfer_allreduce_workspace
 
 
-def cleanup_flashinfer_allreduce_workspace():
-    global flashinfer_allreduce_workspace
-    if flashinfer_allreduce_workspace is not None and IS_FLASHINFER_AVAILABLE:
+def release_flashinfer_allreduce_workspace():
+    """Decrement refcount; dispose only when it reaches zero."""
+    global flashinfer_allreduce_workspace, _flashinfer_allreduce_refcount
+    if flashinfer_allreduce_workspace is None:
+        return
+    _flashinfer_allreduce_refcount -= 1
+    if _flashinfer_allreduce_refcount <= 0:
+        _flashinfer_allreduce_refcount = 0
         try:
             flashinfer_comm.vllm_dispose(flashinfer_allreduce_workspace.fa)
-        except Exception as e:
-            logger.warning(f"Error disposing FlashInfer AR workspace: {e}")
+        except Exception:
+            traceback.print_exc()
+            logger.warning("Error disposing FlashInfer AR workspace")
         flashinfer_allreduce_workspace = None

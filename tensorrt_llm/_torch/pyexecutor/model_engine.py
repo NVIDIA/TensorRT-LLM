@@ -40,8 +40,8 @@ from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..flashinfer_utils import (IS_FLASHINFER_AVAILABLE,
-                                cleanup_flashinfer_allreduce_workspace,
-                                init_flashinfer_allreduce_workspace)
+                                init_flashinfer_allreduce_workspace,
+                                release_flashinfer_allreduce_workspace)
 from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
@@ -195,9 +195,9 @@ class PyTorchModelEngine(ModelEngine):
                     "FlashInfer is not installed. Falling back to AUTO AllReduce strategy."
                 )
                 self.llm_args.allreduce_strategy = 'AUTO'
-                return
-            init_flashinfer_allreduce_workspace(mapping)
-            self._enable_flashinfer_allreduce = True
+            else:
+                init_flashinfer_allreduce_workspace(mapping)
+                self._enable_flashinfer_allreduce = True
 
         self.input_processor = create_input_processor(
             model_path,
@@ -1286,7 +1286,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # Clean up FlashInfer AllReduce workspace (IPC memory + CUDA buffers)
         if self._enable_flashinfer_allreduce:
-            cleanup_flashinfer_allreduce_workspace()
+            release_flashinfer_allreduce_workspace()
 
         # Release model weights.
         release_gc()
