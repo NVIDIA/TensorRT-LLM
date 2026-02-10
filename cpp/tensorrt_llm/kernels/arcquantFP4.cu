@@ -63,7 +63,7 @@ namespace kernels
 // From https://github.com/actypedef/ARCQuant/blob/main/kernels/src/reorder.cu
 template <typename T, int GROUP_SIZE, ArcQuantType arcquant_type>
 __global__ void quantize_reorder_nvfp4_kernel(
-    T* hidden_states, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int KQ, int KE)
+    T* hidden_states, float* input_scale, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int KQ, int KE)
 {
     int const hidden_dim = KQ;
     int const K = KQ + KE;
@@ -71,11 +71,11 @@ __global__ void quantize_reorder_nvfp4_kernel(
     constexpr int elements_per_thread = GROUP_SIZE;
     cg::thread_block cta = cg::this_thread_block();
 
-    cutlass::bfloat16_t* input = reinterpret_cast<cutlass::bfloat16_t*>(hidden_states);
+    T* input = reinterpret_cast<T*>(hidden_states);
     cutlass::float_ue4m3_t* q_scale_tensor = reinterpret_cast<cutlass::float_ue4m3_t*>(q_scale);
     // One block solves one row of hidden states.
-    __shared__ uint8_t smem[MAX_HIDDEN_DIM * sizeof(cutlass::bfloat16_t)];
-    cutlass::bfloat16_t* input_smem = reinterpret_cast<cutlass::bfloat16_t*>(smem);
+    __shared__ uint8_t smem[MAX_HIDDEN_DIM * sizeof(T)];
+    T* input_smem = reinterpret_cast<T*>(smem);
     // Local memory stores the reordered hidden states.
     cutlass::bfloat16_t input_frag[elements_per_thread];
     cutlass::bfloat16_t output_frag[elements_per_thread / 2];
@@ -83,10 +83,22 @@ __global__ void quantize_reorder_nvfp4_kernel(
     int row_id = blockIdx.x;
     input = input + row_id * hidden_dim;
     q_out = q_out + row_id * (GROUP_SIZE * GROUP_NUM(KQ + KE)) / 2;
+    // Load input scale for FP8 dequantization
+    float global_scale = 1.0f;
+    // FP8_Scale = FP4_Scale / 6.0
+    // input = input / FP8_Scale * FP4_Scale
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+        global_scale = 6.0f;
+    }
+    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
+    {
+        global_scale = *input_scale;
+    }
     // Coalesced access global memory
     int tid = threadIdx.x;
     int const bytes_per_iter = bdx * 16;
-    int const iters = hidden_dim * sizeof(cutlass::bfloat16_t) / bytes_per_iter;
+    int const iters = hidden_dim * sizeof(T) / bytes_per_iter;
     cutlass::NumericConverter<cutlass::float_e2m1_t, float, cutlass::FloatRoundStyle::round_to_nearest> Float2E2m1;
     cutlass::NumericConverter<float, cutlass::float_e2m1_t, cutlass::FloatRoundStyle::round_to_nearest> E2m12Float;
     cutlass::NumericConverter<cutlass::float_ue4m3_t, float, cutlass::FloatRoundStyle::round_toward_infinity>
@@ -102,12 +114,13 @@ __global__ void quantize_reorder_nvfp4_kernel(
             = *(float4*) (reinterpret_cast<uint8_t*>(input) + offset);
     }
     cta.sync();
-// Reorder
+// Reorder and convert to BF16
 #pragma unroll 4
     for (int i = 0; i < elements_per_thread; ++i)
     {
         int offset = tid * GROUP_SIZE + i;
-        input_frag[i] = input_smem[reorder_index[offset]];
+        // Convert to BF16 and apply FP8 scale if needed
+        input_frag[i] = Float2Bfloat16((float) input_smem[reorder_index[offset]] * global_scale);
     }
     // Reduce to get max
     // Each ty should get its max value
@@ -127,14 +140,6 @@ __global__ void quantize_reorder_nvfp4_kernel(
     upper_bound = FP4_MAX;
     scale = clamp(maxv / FP4_MAX, SCALE_EPS, FP8_MAX);
     int pos = tid + max(0, tid - GROUP_NUM(KQ - KE));
-    // SF (((_32,_4),M/128),((_1,_4),K/4),(_1,1)):(((_16,_4),32*16*bdx/4),((_0,_1),_512),(_0,total_padded))
-    // auto logical_coord0 = make_coord(make_coord(row_id % 32, (row_id / 32) % 4), row_id / 128);
-    // auto logical_coord1 = make_coord(make_coord(0, pos % 4), pos / 4);
-    // auto logical_coord2 = make_coord(0, 0);
-    // auto SF_layout =
-    // cute::filter_zeros(cutlass::detail::Sm1xxBlockScaledConfig<16>::tile_atom_to_shape_SFA(cute::make_shape(128, 16,
-    // hidden_dim, 1))); Tensor q_scale_tensor = cute::make_tensor(q_scale_tensor, filter_zeros());
-    // q_scale_tensor(make_coord(logical_coord0, logical_coord1, logical_coord2)) = Float2Ue4m3(scale);
     int64_t sf_offset = get_sf_offset(row_id, pos, K);
     q_scale_tensor[sf_offset] = Float2Ue4m3(scale);
     // Use reverse scale to replace division by multiplication
@@ -224,26 +229,29 @@ __global__ void quantize_reorder_nvfp4_kernel(
     }
 }
 
-template <typename T, int group_size, ArcQuantType arcquant_type>
-void run_quantize_reorder_nvfp4(int16_t* hidden_states, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale,
-    int seq_len, int KQ, int KE, cudaStream_t stream)
+template <typename T, int GROUP_SIZE, ArcQuantType arcquant_type>
+void run_quantize_reorder_nvfp4(int16_t* hidden_states, float* input_scale, int16_t* reorder_index, uint8_t* q_out,
+    uint8_t* q_scale, int seq_len, int KQ, int KE, cudaStream_t stream)
 {
-    dim3 grids(seq_len);
     int hidden_dim = KQ;
-    dim3 blocks(hidden_dim / group_size);
-    if (std::is_same_v<T, __nv_bfloat16>)
-    {
-        quantize_reorder_nvfp4_kernel<__nv_bfloat16, group_size, arcquant_type>
-            <<<grids, blocks, 0, stream>>>((__nv_bfloat16*) hidden_states, reorder_index, q_out, q_scale, KQ, KE);
-    }
+    dim3 grids(seq_len);
+    dim3 blocks(hidden_dim / GROUP_SIZE);
+    quantize_reorder_nvfp4_kernel<T, GROUP_SIZE, arcquant_type>
+        <<<grids, blocks, 0, stream>>>((T*) hidden_states, input_scale, reorder_index, q_out, q_scale, KQ, KE);
 }
 
 // Explicit template instantiation for the specific types used
 template void run_quantize_reorder_nvfp4<__nv_bfloat16, 16, ArcQuantType::ACT>(int16_t* hidden_states,
-    int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int seq_len, int KQ, int KE, cudaStream_t stream);
+    float* input_scale, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int seq_len, int KQ, int KE,
+    cudaStream_t stream);
+
+template void run_quantize_reorder_nvfp4<__nv_fp8_e4m3, 16, ArcQuantType::ACT>(int16_t* hidden_states,
+    float* input_scale, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int seq_len, int KQ, int KE,
+    cudaStream_t stream);
 
 template void run_quantize_reorder_nvfp4<__nv_bfloat16, 16, ArcQuantType::WEIGHT>(int16_t* hidden_states,
-    int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int seq_len, int KQ, int KE, cudaStream_t stream);
+    float* input_scale, int16_t* reorder_index, uint8_t* q_out, uint8_t* q_scale, int seq_len, int KQ, int KE,
+    cudaStream_t stream);
 
 } // namespace kernels
 

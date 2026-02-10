@@ -236,17 +236,20 @@ at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<a
 
 // https://github.com/actypedef/ARCQuant/blob/main/kernels/src/bindings.cpp
 // X: [M, KQ], bf16
+// input_scale: [1], float32
 // reorder_index: [KQ], int16
 // KE: int, residual dimension, grouped by 16 and interleaved with last KQ dimensions.
 // is_act: bool, if true, quantize the activation with residual,
 // otherwise quantize the weight with duplication.
 // [KQ - KE, KQ_b0, KE_b0, KQ_b1, KE_b1, ...] KQ_bi and KE_bi have size 16.
 std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
-    at::Tensor const& X, at::Tensor const& reorder_index, int64_t KE, bool is_act)
+    at::Tensor const& X, at::Tensor const& input_scale, at::Tensor const& reorder_index, int64_t KE, bool is_act)
 {
     CHECK_TH_CUDA(X);
     CHECK_CONTIGUOUS(X);
-    TORCH_CHECK(X.dtype() == at::ScalarType::BFloat16, "X must be a bf16 tensor");
+    TORCH_CHECK(X.dtype() == at::ScalarType::BFloat16 || X.dtype() == at::ScalarType::Float8_e4m3fn,
+        "X must be a bf16 or fp8 tensor");
+    TORCH_CHECK(input_scale.dtype() == at::ScalarType::Float, "input_scale must be a float32 tensor");
 
     int const M = X.size(0);
     int const KQ = X.size(1);
@@ -262,21 +265,39 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
     auto SFX = at::detail::empty_cuda({SFSize}, SF_DTYPE, X.device(), std::nullopt);
     SFX.zero_();
 
-    auto ptr_X = reinterpret_cast<int16_t*>(X.data_ptr());
+    auto ptr_X = X.data_ptr(); // Keep as void*, cast in kernel based on dtype
+    auto ptr_Xscale = reinterpret_cast<float*>(input_scale.data_ptr());
     auto ptr_idx = reinterpret_cast<int16_t*>(reorder_index.data_ptr());
     auto ptr_QX = reinterpret_cast<uint8_t*>(QX.data_ptr());
     auto ptr_SFX = reinterpret_cast<uint8_t*>(SFX.data_ptr());
 
-    if (is_act)
+    if (X.dtype() == at::ScalarType::BFloat16)
     {
-        tensorrt_llm::kernels::run_quantize_reorder_nvfp4<__nv_bfloat16, 16, tensorrt_llm::kernels::ArcQuantType::ACT>(
-            ptr_X, ptr_idx, ptr_QX, ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+        if (is_act)
+        {
+            tensorrt_llm::kernels::run_quantize_reorder_nvfp4<__nv_bfloat16, 16,
+                tensorrt_llm::kernels::ArcQuantType::ACT>(reinterpret_cast<int16_t*>(ptr_X), ptr_Xscale, ptr_idx,
+                ptr_QX, ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+        }
+        else
+        {
+            tensorrt_llm::kernels::run_quantize_reorder_nvfp4<__nv_bfloat16, 16,
+                tensorrt_llm::kernels::ArcQuantType::WEIGHT>(reinterpret_cast<int16_t*>(ptr_X), ptr_Xscale, ptr_idx,
+                ptr_QX, ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+        }
     }
-    else
+    else if (X.dtype() == at::ScalarType::Float8_e4m3fn)
     {
-        tensorrt_llm::kernels::run_quantize_reorder_nvfp4<__nv_bfloat16, 16,
-            tensorrt_llm::kernels::ArcQuantType::WEIGHT>(
-            ptr_X, ptr_idx, ptr_QX, ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+        if (is_act)
+        {
+            tensorrt_llm::kernels::run_quantize_reorder_nvfp4<__nv_fp8_e4m3, 16,
+                tensorrt_llm::kernels::ArcQuantType::ACT>(reinterpret_cast<int16_t*>(ptr_X), ptr_Xscale, ptr_idx,
+                ptr_QX, ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+        }
+        else
+        {
+            C10_THROW_ERROR(NotImplementedError, "FP8 quantization for weights is not supported yet.");
+        }
     }
     return std::make_tuple(QX, SFX);
 }
@@ -291,7 +312,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "isSfSwizzledLayout=True) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
     m.def(
-        "fp4_quantize_with_reorder_residual(Tensor X, Tensor reorder_index, int KE, bool is_act) -> (Tensor, Tensor)");
+        "fp4_quantize_with_reorder_residual(Tensor X, Tensor input_scale, Tensor reorder_index, int KE, bool is_act) "
+        "-> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
