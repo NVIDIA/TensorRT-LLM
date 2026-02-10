@@ -8,8 +8,15 @@ from enum import Enum
 from typing import List, Optional
 
 import msgpack
+import torch
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 import tensorrt_llm.bindings
+from tensorrt_llm.runtime.generation import CUASSERT
+
 from tensorrt_llm import Mapping, logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
@@ -523,6 +530,10 @@ class Sender:
         Args:
             thread_idx: Index of the worker thread (0 to num_threads-1)
         """
+        device_id = self._device_id
+        torch.cuda.set_device(device_id)
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
+
         task_queue = self._send_task_queues[thread_idx]
         while True:
             agent_args = task_queue.get()
