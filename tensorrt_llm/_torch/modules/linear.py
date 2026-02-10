@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import OutputBufferKind
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -458,8 +459,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         if module.use_custom_cublas_mm:
             output = torch.ops.trtllm.cublas_mm(input,
                                                 module.weight.t(),
@@ -593,6 +598,10 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         else:
             qinput = input
 
+        if output_buffer_kind == int(
+                OutputBufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
+
         # This op does not support bias now.
         if module.enable_cuda_core and qinput.shape[0] <= 8:
             # use cuda core for small m dimension
@@ -603,6 +612,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 scale_b=module.weight_scale,
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
+                output_buffer_kind=output_buffer_kind,
+                group=group,
             )
         else:
             output = torch.ops.trtllm.cublas_scaled_mm(
@@ -612,6 +623,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 scale_b=module.weight_scale,
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
+                output_buffer_kind=output_buffer_kind,
+                group=group,
             )
 
         # Reshape output back to original shape (with out_features as last dim)
@@ -621,6 +634,15 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          group=group)
 
     def load_kv_scales(self, weights: List[Dict]):
         k_scale, v_scale = [], []
@@ -880,8 +902,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # FP8 tensor inputs are from attention. Directly use ones as scale.
         if input.dtype == torch.float8_e4m3fn:
             qinput = input
@@ -894,16 +920,35 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                 input)
 
         # This op does not support bias now.
+        if output_buffer_kind == int(
+                OutputBufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
+
         output = torch.ops.trtllm.fp8_rowwise_gemm(
             qinput,
             module.weight,
             cur_input_scale.float(),
             module.weight_scale,
             module.dtype or input.dtype,
+            output_buffer_kind=output_buffer_kind,
+            group=group,
         )
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], out: torch.Tensor):
+        return self.apply(module, input, bias)
+
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          group=group)
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
@@ -1280,8 +1325,12 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input, input_scale, module.scaling_vector_size, False)
             return act_fp4, act_sf, alpha
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # GEMM requires 2D. Only plain tensors support for now, skip for
         # tuple and Fp4QuantizedTensor.
@@ -1296,6 +1345,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
         allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
+        if output_buffer_kind == int(
+                OutputBufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
         output = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,
             module.weight,
@@ -1303,8 +1355,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.weight_scale,
             alpha,
             module.dtype,
-            to_userbuffers=False,
-            allowed_backends=allowed_backends_str)
+            output_buffer_kind=output_buffer_kind,
+            allowed_backends=allowed_backends_str,
+            group=group)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -1315,6 +1368,15 @@ class NVFP4LinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          group=group)
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
@@ -2677,6 +2739,7 @@ class Linear(nn.Module):
         all_reduce_params: Optional[AllReduceParams],
         lora_params: Optional[dict],
         allow_window_output: Optional[bool] = None,
+        output_dtype: Optional[torch.dtype] = None,
     ) -> Optional[torch.Tensor]:
         if not self._should_use_nccl_window_output(
                 input, all_reduce_params, lora_params, allow_window_output):
@@ -2713,9 +2776,15 @@ class Linear(nn.Module):
         if not output_shape:
             return None
         output_shape[-1] = self.out_features
+        output_dtype = output_dtype or input.dtype
+        like_tensor = input
+        if output_dtype != input.dtype:
+            like_tensor = torch.empty((),
+                                      device=input.device,
+                                      dtype=output_dtype)
         try:
             out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
-                input, self.mapping.tp_group, output_shape)
+                like_tensor, self.mapping.tp_group, output_shape)
         except Exception as exc:
             logger.debug(
                 "create_nccl_window_tensor raised: %s (shape=%s, group=%s)",
@@ -2787,12 +2856,24 @@ class Linear(nn.Module):
                     window_out = None
                     window_attempted = False
                     window_path = "none"
-                    if hasattr(self.quant_method, "apply_out"):
+                    if hasattr(self.quant_method, "apply_window_output"
+                               ) and self._should_use_nccl_window_output(
+                                   input, all_reduce_params, lora_params,
+                                   allow_window_output):
+                        window_attempted = True
+                        window_path = "apply_window_output"
+                        output = self.quant_method.apply_window_output(
+                            self, input, bias)
+                        window_out = output
+                    elif hasattr(self.quant_method, "apply_out"):
                         window_attempted = True
                         window_path = "apply_out"
                         window_out = self._maybe_create_nccl_window_output(
-                            input, all_reduce_params, lora_params,
-                            allow_window_output)
+                            input,
+                            all_reduce_params,
+                            lora_params,
+                            allow_window_output,
+                            output_dtype=self.dtype or input.dtype)
                         if window_out is not None:
                             output = self.quant_method.apply_out(
                                 self, input, bias, window_out)
@@ -2831,6 +2912,19 @@ class Linear(nn.Module):
                         f"Linear GEMM NCCL window output buffer: "
                         f"{'success' if window_success else 'failure'}{window_info}"
                     )
+                    if window_out is not None:
+                        try:
+                            logger.debug(
+                                "Linear GEMM allreduce input (use_window=%s, out_ptr=%s, window_ptr=%s, "
+                                "out_dtype=%s, out_size_bytes=%d)",
+                                output.data_ptr() == window_out.data_ptr(),
+                                hex(output.data_ptr()),
+                                hex(window_out.data_ptr()),
+                                output.dtype,
+                                output.numel() * output.element_size(),
+                            )
+                        except Exception:
+                            pass
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
             else:

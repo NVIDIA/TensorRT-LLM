@@ -16,6 +16,7 @@
 #include "weightOnlyQuantGemm.h"
 #include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/thop/outputTensor.h"
 
 #include <ATen/cuda/EmptyTensor.h>
 #include <optional>
@@ -113,15 +114,9 @@ at::Tensor WeightOnlyQuantGemmRunner::runGemm(at::Tensor const& mat_a, at::Tenso
     }
 
     auto const dtype = out_dtype.value_or(mActivationDtype);
-    at::Tensor out;
-    if (to_userbuffers)
-    {
-        out = torch_ext::create_userbuffers_tensor({m, real_n}, dtype).first;
-    }
-    else
-    {
-        out = at::detail::empty_cuda({m, real_n}, dtype, mat_a.device(), std::nullopt);
-    }
+    auto output_buffer_kind
+        = to_userbuffers ? torch_ext::OutputBufferKind::Userbuffers : torch_ext::OutputBufferKind::Default;
+    at::Tensor out = torch_ext::allocate_output({m, real_n}, dtype, mat_a.device(), output_buffer_kind);
 
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
 

@@ -3,7 +3,7 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..modules.attention import attn_custom_op_inplace, mla_custom_op_inplace
 from .cpp_custom_ops import _register_fake
-from .torch_custom_ops import bmm_out
+from .torch_custom_ops import OutputBufferKind, bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
 
@@ -11,6 +11,7 @@ __all__ = [
     'IS_FLASHINFER_AVAILABLE',
     '_register_fake',
     'bmm_out',
+    'OutputBufferKind',
     'fp8_block_scale_moe_runner',
     'add_to_ub',
     'copy_to_userbuffers',

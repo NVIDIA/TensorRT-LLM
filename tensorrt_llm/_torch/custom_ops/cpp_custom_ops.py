@@ -117,7 +117,8 @@ def _register_fake():
         scale_b: torch.Tensor,
         bias,
         out_dtype,
-        userbuffers_id=False,
+        output_buffer_kind: int = 0,
+        group: Optional[List[int]] = None,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
@@ -132,7 +133,8 @@ def _register_fake():
         scale_b: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
         out_dtype: Optional[torch.dtype] = None,
-        userbuffers_id: bool = False,
+        output_buffer_kind: int = 0,
+        group: Optional[List[int]] = None,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
@@ -943,7 +945,8 @@ def _register_fake():
           alpha: torch.Tensor,
           bias: Optional[torch.Tensor],
           out_dtype: Optional[torch.dtype],
-          to_userbuffers: bool = False):
+          output_buffer_kind: int = 0,
+          group: Optional[List[int]] = None):
         # mat_a: [M, K/2], mat_b: [N, K/2]
         # Output should be [M, N] with dtype=out_dtype
         m = mat_a.shape[0]
