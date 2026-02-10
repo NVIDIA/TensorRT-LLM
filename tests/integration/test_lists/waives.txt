@@ -356,6 +356,8 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_gptoss_style_nvfp4[limitinf-beta0-alpha0.1-RoutingGPTOSS-512-512-1] SKIP (https://nvbugs/5819042)
 disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf] SKIP (https://nvbugs/5839137)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=4] SKIP (https://nvbugs/5845943)
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True] SKIP (https://nvbugs/5849648)
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/5849648)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5884712)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp1pp2] SKIP (https://nvbugs/5880313)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-deepseek-r1-fp4_1k1k_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-UCX] SKIP (https://nvbugs/5846166)
