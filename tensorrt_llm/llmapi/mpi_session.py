@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
@@ -475,13 +475,28 @@ class RemoteMpiCommSessionServer():
                 logger_debug(
                     f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
                     "grey")
-                for future in pending_futures:
+                n_failed = 0
+                first_exc = None
+                # Use as_completed so that failures are logged as soon as
+                # they occur rather than blocking behind a stuck future.
+                for future in as_completed(pending_futures):
                     try:
-                        future.result()  # Wait for completion
+                        future.result()
                     except Exception as e:
-                        print_colored(
-                            f"RemoteMpiCommSessionServer future failed with exception: {e}\n",
-                            "red")
+                        n_failed += 1
+                        if first_exc is None:
+                            first_exc = e
+                        logger.error(
+                            f"RemoteMpiCommSessionServer: MPI worker future "
+                            f"failed: {type(e).__name__}: {e}")
+                        if n_failed == len(pending_futures):
+                            # All workers failed — no point waiting further.
+                            break
+                if n_failed:
+                    logger.error(
+                        f"RemoteMpiCommSessionServer: {n_failed}/"
+                        f"{len(pending_futures)} MPI worker(s) failed. "
+                        f"First error: {first_exc}")
                 pending_futures.clear()
                 logger_debug(
                     "RemoteMpiCommSessionServer all pending futures completed\n",
