@@ -380,16 +380,9 @@ option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
 if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   message(STATUS "BOLT compatible flags enabled")
   # Compiler flags for C/C++
-  set(CMAKE_C_FLAGS
-      "${CMAKE_C_FLAGS} -fno-reorder-blocks-and-partition -fno-plt")
-  set(CMAKE_CXX_FLAGS
-      "${CMAKE_CXX_FLAGS} -fno-reorder-blocks-and-partition -fno-plt")
-  # Linker flags - include MODULE for pybind11/nanobind Python bindings
-  set(CMAKE_SHARED_LINKER_FLAGS
-      "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--emit-relocs")
-  set(CMAKE_MODULE_LINKER_FLAGS
-      "${CMAKE_MODULE_LINKER_FLAGS} -Wl,--emit-relocs")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--emit-relocs")
+  add_compile_options(-fno-reorder-blocks-and-partition -fno-plt)
+  # Linker flags - applies to shared, module, and executable targets
+  add_link_options(-Wl,--emit-relocs)
   # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
   set(CMAKE_STRIP
       ""
