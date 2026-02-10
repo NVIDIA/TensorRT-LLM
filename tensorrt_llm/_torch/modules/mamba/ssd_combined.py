@@ -31,24 +31,25 @@ def is_int_pow_2(n):
 
 
 def _mamba_chunk_scan_combined_fwd(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        chunk_size,
-        D=None,
-        z=None,
-        dt_bias=None,
-        initial_states=None,
-        seq_idx=None,
-        chunk_indices=None,
-        chunk_offsets=None,
-        cu_seqlens=None,
-        dt_softplus=False,
-        dt_limit=(0.0, float("inf")),
-        state_dtype=None,
-        out=None,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    seq_idx=None,
+    chunk_indices=None,
+    chunk_offsets=None,
+    cu_seqlens=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    state_dtype=None,
+    out=None,
+    aux_stream=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     batch, seqlen, nheads, headdim = x.shape
@@ -96,6 +97,28 @@ def _mamba_chunk_scan_combined_fwd(
     # - see the blog and paper for a visualization of the submatrices
     #   which we refer to in the comments below
 
+    # CB output uses input dtype (e.g. bf16) instead of fp32 to halve memory
+    # footprint and bandwidth. The chunk_scan kernel converts to fp32 internally.
+    cb_dtype = x.dtype
+
+    # 4. Compute batched matrix multiply for C_j^T B_i terms
+    # Launched first because it is independent of steps 1-3 and can run
+    # in parallel on an auxiliary CUDA stream.
+    if aux_stream is not None:
+        event_default = torch.cuda.Event()
+        event_default.record()
+        with torch.cuda.stream(aux_stream):
+            event_default.wait()
+            CB = _bmm_chunk_fwd(C,
+                                B,
+                                chunk_size,
+                                seq_idx=seq_idx,
+                                output_dtype=cb_dtype)
+            event_bmm = torch.cuda.Event()
+            event_bmm.record()
+    else:
+        CB = None
+
     # 1. Compute chunked cumsum of A * dt
     # - here dt may go through a softplus activation
     dA_cumsum, dt = _chunk_cumsum_fwd(dt,
@@ -107,12 +130,14 @@ def _mamba_chunk_scan_combined_fwd(
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
+    # Use input dtype (bf16) for states storage to halve memory footprint
+    # and bandwidth. All downstream kernels upcast to fp32 for computation.
     states = _chunk_state_fwd(B,
                               x,
                               dt,
                               dA_cumsum,
                               seq_idx=seq_idx,
-                              states_in_fp32=True)
+                              states_in_fp32=False)
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
@@ -139,12 +164,16 @@ def _mamba_chunk_scan_combined_fwd(
     states, final_states = (rearrange(t, "... (p n) -> ... p n", n=dstate)
                             for t in [states, final_states])
 
-    # 4. Compute batched matrix multiply for C_j^T B_i terms
-    CB = _bmm_chunk_fwd(C,
-                        B,
-                        chunk_size,
-                        seq_idx=seq_idx,
-                        output_dtype=torch.float32)
+    # Wait for step 4 (BMM) to complete on aux stream before step 5
+    if aux_stream is not None:
+        event_bmm.wait()
+    else:
+        # 4. Fallback: run BMM on default stream
+        CB = _bmm_chunk_fwd(C,
+                            B,
+                            chunk_size,
+                            seq_idx=seq_idx,
+                            output_dtype=cb_dtype)
 
     # 5. Scan and compute the diagonal blocks, taking into
     #    account past causal states.
@@ -210,6 +239,7 @@ def mamba_chunk_scan_combined(
     return_final_states=False,
     return_varlen_states=False,
     state_dtype=None,
+    aux_stream=None,
 ):
     """
     Argument:
@@ -255,6 +285,7 @@ def mamba_chunk_scan_combined(
             dt_limit=dt_limit,
             out=out,
             state_dtype=state_dtype,
+            aux_stream=aux_stream,
         ))
     if not return_varlen_states:
         if not return_final_states:

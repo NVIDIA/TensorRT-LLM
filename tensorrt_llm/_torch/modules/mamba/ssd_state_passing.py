@@ -174,7 +174,9 @@ def _state_passing_fwd_kernel(
                 scale_mask = seq_idx_chunk_end == prev_seq_idx_chunk_end
             prev_seq_idx_chunk_end = seq_idx_chunk_end
 
-        scale = tl.where(scale_mask, tl.exp(dA_cs), 0.0)
+        # Use exp2 for faster computation: exp(x) = exp2(x * log2(e))
+        scale = tl.where(scale_mask, tl.math.exp2(dA_cs * 1.4426950408889634),
+                         0.0)
         states = scale * states + new_states
         if c < nchunks - 1:
             tl.store(out_ptrs, states, mask=offs_m < dim)

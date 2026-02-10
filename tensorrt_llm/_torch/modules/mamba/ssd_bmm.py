@@ -54,6 +54,34 @@ import triton.language as tl
             num_stages=2,
             num_warps=4,
         ),
+        # SM100 high-warp configs
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=8,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
         # Original configs for larger chunks
         triton.Config(
             {
@@ -157,13 +185,10 @@ def _bmm_chunk_fwd_kernel(
     if IS_CAUSAL:
         if pid_n * BLOCK_SIZE_N >= (pid_m + 1) * BLOCK_SIZE_M:
             return
-    a_ptr += (pid_b * stride_a_batch + pid_c * chunk_size * stride_a_seqlen +
-              pid_h * stride_a_head)
-    b_ptr += (pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen +
-              pid_h * stride_b_head)
+    a_ptr += pid_b * stride_a_batch + pid_c * chunk_size * stride_a_seqlen + pid_h * stride_a_head
+    b_ptr += pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + pid_h * stride_b_head
     if HAS_SEQ_IDX:
-        seq_idx_ptr += (pid_b * stride_seq_idx_batch +
-                        pid_c * chunk_size * stride_seq_idx_seqlen)
+        seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -178,14 +203,14 @@ def _bmm_chunk_fwd_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(
             a_ptrs,
-            mask=(offs_m[:, None] < chunk_size_limit)
-            & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            mask=(offs_m[:, None] < chunk_size_limit) &
+            (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         ).to(dot_dtype)
         b = tl.load(
             b_ptrs,
-            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K)
-            & (offs_n[None, :] < chunk_size_limit),
+            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) &
+            (offs_n[None, :] < chunk_size_limit),
             other=0.0,
         ).to(dot_dtype)
         acc += tl.dot(a, b)
@@ -209,8 +234,7 @@ def _bmm_chunk_fwd_kernel(
         acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0)
     out = acc.to(out_ptr.dtype.element_ty)
 
-    out_ptr += (pid_b * stride_out_batch + pid_c * stride_out_chunk +
-                pid_h * stride_out_head)
+    out_ptr += pid_b * stride_out_batch + pid_c * stride_out_chunk + pid_h * stride_out_head
     out_ptrs = out_ptr + (stride_outm * offs_m[:, None] +
                           offs_n[None, :] * stride_outn)
     tl.store(
@@ -225,7 +249,8 @@ def _bmm_chunk_fwd(a,
                    chunk_size,
                    seq_idx=None,
                    causal=False,
-                   output_dtype=None):
+                   output_dtype=None,
+                   out=None):
     """
     Argument:
         a: (batch, seqlen, k) or (batch, seqlen, ngroups, k)
@@ -233,6 +258,7 @@ def _bmm_chunk_fwd(a,
         seq_idx: (batch, seqlen) or None. out[i, j] for seq_idx[i] != seq_idx[j] will be zeroed out.
         causal: if True, then out[i, j] for i > j will be arbitrary, only out[i, j] for i <= j are
             guaranteed to be correct.
+        out: optional preallocated output tensor to avoid allocation
     Return:
         out: (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, ngroups, chunk_size, chunk_size)
     """
@@ -252,12 +278,13 @@ def _bmm_chunk_fwd(a,
     nchunks = math.ceil(seqlen / chunk_size)
     # Allocates output.
     out_dtype = a.dtype if output_dtype is None else output_dtype
-    out = torch.empty(
-        ((batch, nchunks, chunk_size, chunk_size) if not has_groups else
-         (batch, nchunks, ngroups, chunk_size, chunk_size)),
-        device=a.device,
-        dtype=out_dtype,
-    )
+    if out is None:
+        out = torch.empty(
+            ((batch, nchunks, chunk_size, chunk_size) if not has_groups else
+             (batch, nchunks, ngroups, chunk_size, chunk_size)),
+            device=a.device,
+            dtype=out_dtype,
+        )
     dot_dtype = (tl.bfloat16
                  if a.dtype == torch.bfloat16 or b.dtype == torch.bfloat16 else
                  (tl.float16 if a.dtype == torch.float16

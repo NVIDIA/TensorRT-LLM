@@ -143,6 +143,62 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
             num_stages=2,
             num_warps=4,
         ),
+        # GB200 (SM100) high-warp configs for better latency hiding
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=8,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=8,
+        ),
+        # SM100 16-warp configs (SM100 supports higher warp counts per SM)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
         # Original configs for smaller dstate values
         triton.Config(
             {
@@ -326,6 +382,7 @@ def _chunk_scan_fwd_kernel(
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
 ):
+    LOG2E: tl.constexpr = 1.4426950408889634  # log2(e), for exp(x) = exp2(x * LOG2E)
     pid_bc = tl.program_id(axis=1).to(tl.int64)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
@@ -475,21 +532,20 @@ def _chunk_scan_fwd_kernel(
                 # - this is for continuous batching where there is no init states
                 # Use exp2 for faster computation: exp(x) = exp2(x * log2(e))
                 scale_m = tl.where(seq_idx_m == seq_idx_prev,
-                                   tl.math.exp2(dA_cs_m * 1.4426950408889634),
-                                   0.0)
+                                   tl.math.exp2(dA_cs_m * LOG2E), 0.0)
             else:
                 # - if there is initstates, we will rely on prev_states, no zeroing
                 #   required.
-                scale_m = tl.math.exp2(
-                    (dA_cs_m - dA_cs_m_boundary) * 1.4426950408889634)
+                scale_m = tl.math.exp2((dA_cs_m - dA_cs_m_boundary) * LOG2E)
         else:
-            scale_m = tl.math.exp2(dA_cs_m * 1.4426950408889634)
+            scale_m = tl.math.exp2(dA_cs_m * LOG2E)
         if BLOCK_SIZE_DSTATE <= 128:
             C = tl.load(
                 C_ptrs,
                 mask=(offs_m[:, None] < chunk_size_limit)
                 & (offs_k_dstate[None, :] < dstate),
                 other=0.0,
+                eviction_policy="evict_last",
             )
 
             prev_states = tl.load(
@@ -497,6 +553,7 @@ def _chunk_scan_fwd_kernel(
                 mask=(offs_k_dstate[:, None] < dstate) &
                 (offs_n[None, :] < hdim),
                 other=0.0,
+                eviction_policy="evict_last",
             )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
@@ -536,17 +593,20 @@ def _chunk_scan_fwd_kernel(
             mask=(offs_m[:, None] < chunk_size) &
             (offs_k[None, :] < chunk_size - k),
             other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
         dA_cs_k = tl.load(dA_cumsum_ptrs,
                           mask=offs_k < chunk_size - k,
-                          other=0.0).to(tl.float32)
+                          other=0.0,
+                          eviction_policy="evict_first").to(tl.float32)
         # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
         # So we don't need masking wrt seq_idx here.
         # Use exp2 for faster computation: exp(x) = exp2(x * log2(e))
-        cb *= tl.math.exp2(
-            (dA_cs_m[:, None] - dA_cs_k[None, :]) * 1.4426950408889634)
-        dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k,
-                       other=0.0).to(tl.float32)
+        cb *= tl.math.exp2((dA_cs_m[:, None] - dA_cs_k[None, :]) * LOG2E)
+        dt_k = tl.load(dt_ptrs,
+                       mask=offs_k < chunk_size - k,
+                       other=0.0,
+                       eviction_policy="evict_first").to(tl.float32)
         cb *= dt_k
         if IS_CAUSAL:
             mask = offs_m[:, None] >= k + offs_k[None, :]
@@ -557,6 +617,7 @@ def _chunk_scan_fwd_kernel(
             mask=(offs_k[:, None] < chunk_size_limit - k) &
             (offs_n[None, :] < hdim),
             other=0.0,
+            eviction_policy="evict_first",
         )
         acc += tl.dot(cb, x)
         cb_ptrs += BLOCK_SIZE_K * stride_cb_csize_k

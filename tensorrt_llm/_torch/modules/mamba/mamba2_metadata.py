@@ -52,7 +52,7 @@ def _cu_seqlens_triton_kernel(
         in_range = (offsets >= s_chunk) & (offsets < e_chunk)
         chunk_indices = tl.where(in_range & mask, chunk_indices - p,
                                  chunk_indices)
-        is_start = (offsets == s_chunk)
+        is_start = offsets == s_chunk
         chunk_offsets = tl.where(is_start & mask, seq_start % chunk_size,
                                  chunk_offsets)
 
@@ -68,8 +68,10 @@ def cu_seqlens_to_chunk_indices_offsets_triton(
     num_seqs = cu_seqlens.numel() - 1
 
     if num_seqs == 0:
-        return (torch.empty(0, dtype=torch.int, device=device),
-                torch.empty(0, dtype=torch.int, device=device))
+        return (
+            torch.empty(0, dtype=torch.int, device=device),
+            torch.empty(0, dtype=torch.int, device=device),
+        )
 
     cu = cu_seqlens.to(dtype=torch.int64)
     total_seqlens = cu[-1].item()
@@ -77,8 +79,10 @@ def cu_seqlens_to_chunk_indices_offsets_triton(
     if num_seqs == 1:
         # Fast path for single sequence (no boundaries to process)
         N = (total_seqlens + chunk_size - 1) // chunk_size
-        return (torch.arange(N, device=device, dtype=torch.int),
-                torch.zeros(N, device=device, dtype=torch.int))
+        return (
+            torch.arange(N, device=device, dtype=torch.int),
+            torch.zeros(N, device=device, dtype=torch.int),
+        )
 
     seq_starts = cu[1:-1]
     misaligned = ((seq_starts % chunk_size) > 0).to(torch.int64)
@@ -151,9 +155,8 @@ def cu_seqlens_to_chunk_indices_offsets(
 
     p = 0  # num of insertions
     for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-
         # if does not divide chunk_size, then there is one chunk insertion
-        p += (s % chunk_size > 0)
+        p += s % chunk_size > 0
 
         # get the dimensions
         # - the + 1 for _e is to shift the boundary by one chunk
@@ -208,9 +211,11 @@ class Mamba2Metadata:
                          dim=0,
                          dtype=torch.int,
                          out=self.cu_seqlens[1:num_contexts + 1])
-            torch.add(self.cu_seqlens[num_contexts],
-                      self._arange_buffer[1:batch_size - num_contexts + 1],
-                      out=self.cu_seqlens[num_contexts + 1:batch_size + 1])
+            torch.add(
+                self.cu_seqlens[num_contexts],
+                self._arange_buffer[1:batch_size - num_contexts + 1],
+                out=self.cu_seqlens[num_contexts + 1:batch_size + 1],
+            )
             # Need both `query_start_loc` and `query_start_loc_long` because `causal_conv1d_fn`
             # accepts only `int32` while `chunk_gated_delta_rule` accepts only `long`.
             self.query_start_loc = self.cu_seqlens[:batch_size + 1]

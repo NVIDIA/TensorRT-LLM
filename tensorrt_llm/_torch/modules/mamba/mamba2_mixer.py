@@ -16,8 +16,6 @@
 from typing import Optional
 
 import torch
-from einops import rearrange, repeat
-from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -117,7 +115,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+        )
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -129,7 +128,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+        )
 
         # A
         self.A = nn.Parameter(
@@ -137,19 +137,16 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
-        # Choose between flashinfer and native implementation. (default to flashinfer)
+        # Use native (Triton) kernel for decode SSM update.
+        # With expand-based A/dt_bias (stride=0), the Triton kernel enables
+        # TIE_HDIM=True which loads A as a per-head scalar instead of a full
+        # (nheads, headdim, dstate) tensor, saving ~2 MB HBM reads per call.
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        supported_head_dim_in_flashinfer = [64, 128]
-        if head_dim in supported_head_dim_in_flashinfer:
-            logger.info_once(
-                "Using flashinfer for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
-            self.selective_state_update_func_no_mtp = selective_state_update_fi
-        else:
-            logger.info_once(
-                "Using native for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
-            self.selective_state_update_func_no_mtp = selective_state_update_native
+        logger.info_once(
+            "Using native (Triton TIE_HDIM) for selective state update for no MTP",
+            key="selective_state_update_no_mtp",
+        )
+        self.selective_state_update_func_no_mtp = selective_state_update_native
         # TODO: support MTP selective state update in flashinfer.
         logger.info_once("Using native for selective state update for MTP",
                          key="selective_state_update_mtp")
@@ -184,6 +181,17 @@ class Mamba2Mixer(nn.Module):
             is_nvfp4=self.is_nvfp4,
         )
 
+        # Auxiliary CUDA stream for overlapping BMM with chunk_state + state_passing
+        # during prefill. BMM (C^T @ B) is independent of steps 1-3 in the SSD
+        # pipeline, so it can run in parallel on a separate stream.
+        self._ssd_aux_stream = torch.cuda.Stream()
+
+        # Pre-expanded decode parameters (lazily initialized after weight loading).
+        # Avoids repeat() + dtype cast every decode step.
+        self._A_expanded = None
+        self._dt_bias_expanded = None
+        self._D_expanded = None
+
         # out_proj
         self.out_proj = Linear(
             d_inner,
@@ -194,14 +202,15 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+        )
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant.
 
         Called lazily on first forward (weights don't exist during __init__).
         """
-        if getattr(self.out_proj, 'input_scale', None) is not None:
+        if getattr(self.out_proj, "input_scale", None) is not None:
             self.norm.nvfp4_scale = self.out_proj.input_scale
         else:
             self.norm.is_nvfp4 = False
@@ -214,7 +223,6 @@ class Mamba2Mixer(nn.Module):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         # Lazily attach nvfp4_scale on first forward
         if self.norm.is_nvfp4 and self.norm.nvfp4_scale is None:
             self._try_attach_nvfp4_scale()
@@ -248,8 +256,10 @@ class Mamba2Mixer(nn.Module):
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
 
         # Decode path uses regular view since no transpose is needed.
-        xbc_d = zxbcdt[num_prefill_tokens:num_actual_tokens,
-                       self.tp_d_inner:self.tp_d_inner + self.tp_conv_dim]
+        xbc_d = zxbcdt[
+            num_prefill_tokens:num_actual_tokens,
+            self.tp_d_inner:self.tp_d_inner + self.tp_conv_dim,
+        ]
 
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
@@ -268,7 +278,6 @@ class Mamba2Mixer(nn.Module):
         )
 
         if num_prefills > 0:
-
             cu_seqlens = mamba_metadata.cu_seqlens[:num_prefills + 1]
             seq_idx = mamba_metadata.seq_idx
             has_initial_states = mamba_metadata.has_initial_states[:
@@ -278,14 +287,16 @@ class Mamba2Mixer(nn.Module):
             xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
                                                     self.tp_d_inner,
                                                     self.tp_conv_dim)
-            xbc_p = causal_conv1d_fn(xbc_p_t,
-                                     self.conv1d.weight,
-                                     self.conv1d.bias,
-                                     activation="silu",
-                                     conv_states=conv_states,
-                                     has_initial_state=has_initial_states,
-                                     query_start_loc=cu_seqlens,
-                                     cache_indices=state_indices_p)
+            xbc_p = causal_conv1d_fn(
+                xbc_p_t,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                activation="silu",
+                conv_states=conv_states,
+                has_initial_state=has_initial_states,
+                query_start_loc=cu_seqlens,
+                cache_indices=state_indices_p,
+            )
 
             # Fused kernel to avoid expensive .contiguous() calls after split/rearrange.
             x_p, B_p, C_p = fused_split_rearrange_after_conv1d(
@@ -297,9 +308,6 @@ class Mamba2Mixer(nn.Module):
                 self.head_dim,
             )
             dt_p = dt_p.unsqueeze(0)
-            z_p = rearrange(z_p.unsqueeze(0),
-                            "b l (h p) -> b l h p",
-                            h=self.tp_nheads)
 
             initial_states = None
             if mamba_metadata.use_initial_states:
@@ -329,14 +337,15 @@ class Mamba2Mixer(nn.Module):
                 out=preallocated_ssm_out_p.view(1, num_prefill_tokens, -1,
                                                 self.head_dim),
                 state_dtype=self._mamba_ssm_cache_dtype,
+                aux_stream=self._ssd_aux_stream,
             )
 
             # copy new ssm state
             ssm_states[state_indices_p] = current_ssm_states
 
         if num_decodes > 0:
-            is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
-            ) and spec_metadata is not None
+            is_target_verify = (attn_metadata.kv_cache_manager.is_speculative()
+                                and spec_metadata is not None)
             if is_target_verify:
                 # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
                 draft_token_num = spec_metadata.max_draft_len + 1
@@ -366,34 +375,43 @@ class Mamba2Mixer(nn.Module):
                     num_decode_tokens, -1)
 
             else:
-                xbc_d = causal_conv1d_update(xbc_d,
-                                             conv_states,
-                                             self.conv1d.weight,
-                                             self.conv1d.bias,
-                                             activation="silu",
-                                             conv_state_indices=state_indices_d)
+                xbc_d = causal_conv1d_update(
+                    xbc_d,
+                    conv_states,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    activation="silu",
+                    conv_state_indices=state_indices_d,
+                )
 
-            x_d, B_d, C_d = torch.split(
-                xbc_d,
-                [
-                    self.tp_d_inner,
-                    self.tp_ngroups * self.d_state,
-                    self.tp_ngroups * self.d_state,
-                ],
-                dim=-1,
-            )
+            # Split + reshape using direct view ops instead of einops to
+            # minimize Python dispatch overhead on the decode hot path.
+            x_d = xbc_d[:, :self.tp_d_inner].view(-1, self.tp_nheads,
+                                                  self.head_dim)
+            bc_offset = self.tp_d_inner
+            bc_size = self.tp_ngroups * self.d_state
+            B_d = xbc_d[:, bc_offset:bc_offset + bc_size].view(
+                -1, self.tp_ngroups, self.d_state)
+            C_d = xbc_d[:, bc_offset + bc_size:].view(-1, self.tp_ngroups,
+                                                      self.d_state)
             # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
-            dt_d = dt_d.to(dtype=torch.float32)
-            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
-            dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
-            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
-            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
-            z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
+            dt_d = dt_d.float().unsqueeze(-1).expand(-1, -1, self.head_dim)
+            z_d = z_d.view(-1, self.tp_nheads, self.head_dim)
 
-            A = repeat(self.A, "h -> h p n", p=self.head_dim,
-                       n=self.d_state).to(dtype=torch.float32)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
-            D = repeat(self.D, "h -> h p", p=self.head_dim)
+            if self._A_expanded is None:
+                # Use expand (stride=0) instead of repeat (copies) so the
+                # Triton kernel detects TIE_HDIM=True and loads A/dt_bias as
+                # per-head scalars, avoiding a 2 MB read of the expanded A
+                # tensor on every decode step.
+                self._A_expanded = (self.A.float().reshape(-1, 1, 1).expand(
+                    -1, self.head_dim, self.d_state))
+                self._dt_bias_expanded = (self.dt_bias.float().reshape(
+                    -1, 1).expand(-1, self.head_dim))
+                self._D_expanded = self.D.float().reshape(-1, 1).expand(
+                    -1, self.head_dim)
+            A = self._A_expanded
+            dt_bias = self._dt_bias_expanded
+            D = self._D_expanded
             if is_target_verify:
                 intermediate_ssm_states = layer_cache.intermediate_ssm
                 self.selective_state_update_func_mtp(

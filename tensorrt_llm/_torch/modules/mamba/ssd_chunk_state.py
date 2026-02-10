@@ -128,6 +128,34 @@ def _chunk_cumsum_fwd_kernel(
 
 @triton.autotune(
     configs=[
+        # SM100 (GB200) high-warp configs
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32
+            },
+            num_stages=2,
+            num_warps=16,
+        ),
         # Small headdim/dstate configs (hdim<=64, dstate<=128) - increased parallelism
         triton.Config(
             {
@@ -288,14 +316,12 @@ def _chunk_state_fwd_kernel(
     pid_n = tl.program_id(axis=0) % num_pid_n
     b_ptr += (pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen +
               (pid_h // nheads_ngroups_ratio) * stride_b_head)
-    x_ptr += (pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen +
-              pid_h * stride_x_head)
+    x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += (pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk +
                       pid_h * stride_dA_cs_head)
     if HAS_SEQ_IDX:
-        seq_idx_ptr += (pid_b * stride_seq_idx_batch +
-                        pid_c * chunk_size * stride_seq_idx_seqlen)
+        seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -323,30 +349,41 @@ def _chunk_state_fwd_kernel(
             mask=(offs_m[:, None] < hdim) &
             (offs_k[None, :] < chunk_size_limit - k),
             other=0.0,
+            eviction_policy="evict_first",
         )
         b = tl.load(
             b_ptrs,
             mask=(offs_k[:, None] < chunk_size_limit - k) &
             (offs_n[None, :] < dstate),
             other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
-        dA_cs_k = tl.load(dA_cumsum_ptrs,
-                          mask=offs_k < chunk_size_limit - k,
-                          other=0.0).to(tl.float32)
+        dA_cs_k = tl.load(
+            dA_cumsum_ptrs,
+            mask=offs_k < chunk_size_limit - k,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
         if HAS_SEQ_IDX:
             seq_idx_k = tl.load(seq_idx_ptrs,
                                 mask=offs_k < chunk_size_limit - k,
                                 other=-1)
-        dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size_limit - k,
-                       other=0.0).to(tl.float32)
+        dt_k = tl.load(dt_ptrs,
+                       mask=offs_k < chunk_size_limit - k,
+                       other=0.0,
+                       eviction_policy="evict_first").to(tl.float32)
         if not HAS_SEQ_IDX:
-            # scale = tl.exp((dA_cs_last - dA_cs_k)) * dt_k
-            scale = tl.exp(tl.minimum((dA_cs_last - dA_cs_k), 0.0)) * dt_k
+            # Use exp2 for faster computation: exp(x) = exp2(x * log2(e))
+            scale = (tl.math.exp2(
+                tl.minimum(
+                    (dA_cs_last - dA_cs_k), 0.0) * 1.4426950408889634) * dt_k)
         else:
-            # scale = tl.where(seq_idx_k == seq_idx_last, tl.exp((dA_cs_last - dA_cs_k)) * dt_k, 0.0)
             scale = tl.where(
                 seq_idx_k == seq_idx_last,
-                tl.exp(tl.minimum((dA_cs_last - dA_cs_k), 0.0)) * dt_k,
+                tl.math.exp2(
+                    tl.minimum(
+                        (dA_cs_last - dA_cs_k), 0.0) * 1.4426950408889634) *
+                dt_k,
                 0.0,
             )
         b *= scale[:, None]
@@ -414,7 +451,8 @@ def _chunk_state_fwd_kernel(
                 "BLOCK_SIZE_K": 64
             },
             num_stages=3,
-            num_warps=8),
+            num_warps=8,
+        ),
         triton.Config(
             {
                 "BLOCK_SIZE_M": 64,
@@ -430,7 +468,8 @@ def _chunk_state_fwd_kernel(
                 "BLOCK_SIZE_K": 32
             },
             num_stages=4,
-            num_warps=4),
+            num_warps=4,
+        ),
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
@@ -544,16 +583,20 @@ def _chunk_state_varlen_kernel(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
-        x = tl.load(x_ptrs,
-                    mask=(offs_m[:, None] < hdim) &
-                    (offs_k[None, :] < chunk_size_limit - k) &
-                    (offs_k[None, :] >= start_idx_cur - k),
-                    other=0.0)
-        b = tl.load(b_ptrs,
-                    mask=(offs_k[:, None] < chunk_size_limit - k) &
-                    (offs_n[None, :] < dstate) &
-                    (offs_k[:, None] >= start_idx_cur - k),
-                    other=0.0).to(tl.float32)
+        x = tl.load(
+            x_ptrs,
+            mask=(offs_m[:, None] < hdim)
+            & (offs_k[None, :] < chunk_size_limit - k)
+            & (offs_k[None, :] >= start_idx_cur - k),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < chunk_size_limit - k)
+            & (offs_n[None, :] < dstate)
+            & (offs_k[:, None] >= start_idx_cur - k),
+            other=0.0,
+        ).to(tl.float32)
         dA_cs_k = tl.load(dA_cumsum_ptrs,
                           mask=offs_k < chunk_size_limit - k,
                           other=0.0).to(tl.float32)
@@ -561,7 +604,9 @@ def _chunk_state_varlen_kernel(
                        other=0.0).to(tl.float32)
         scale = tl.where(
             (offs_k >= start_idx_cur - k) & (offs_k < chunk_size_limit - k),
-            tl.exp(dA_cs_last - dA_cs_k) * dt_k, 0.0)
+            tl.exp(dA_cs_last - dA_cs_k) * dt_k,
+            0.0,
+        )
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
         acc += tl.dot(x, b)
@@ -576,7 +621,6 @@ def _chunk_state_varlen_kernel(
     # - if state_idx >= pid * chunk_size, then we need to insert initstates
     if ((start_idx < pid_c * chunk_size)  # first chunk
             or (HAS_INITSTATES)):
-
         dA_cs_boundary = 0.0  # default
 
         if not HAS_INITSTATES:
@@ -584,7 +628,6 @@ def _chunk_state_varlen_kernel(
                 offs_m[:, None] * stride_chunk_states_hdim +
                 offs_n[None, :] * stride_chunk_states_dstate)
         else:
-
             # - this seems repetitve, buts its to help the compiler
             if start_idx < pid_c * chunk_size:
                 past_states_ptrs = chunk_states_ptr + (
@@ -824,9 +867,12 @@ def chunk_state_varlen(B,
             states.stride(1),
             states.stride(2),
             states.stride(3),
-            *((initial_states.stride(0), initial_states.stride(1),
-               initial_states.stride(2),
-               initial_states.stride(3)) if initial_states is not None else
-              (0, 0, 0, 0)),
-            HAS_INITSTATES=initial_states is not None)
+            *((
+                initial_states.stride(0),
+                initial_states.stride(1),
+                initial_states.stride(2),
+                initial_states.stride(3),
+            ) if initial_states is not None else (0, 0, 0, 0)),
+            HAS_INITSTATES=initial_states is not None,
+        )
     return states
