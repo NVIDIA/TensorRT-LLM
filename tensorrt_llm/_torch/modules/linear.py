@@ -2730,7 +2730,7 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
-        self.residual_dim = 256
+        self.residual_dim = 0
         self.in_features_with_residual = in_features + self.residual_dim
         self.reorder_index = torch.arange(in_features, dtype=torch.int16)
         super().create_weights(module, self.in_features_with_residual,
@@ -2745,15 +2745,12 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
                 assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
                 input = input * module.pre_quant_scale
 
-            # TODO: fuse global scale.
-            if input.dtype == torch.float8_e4m3fn:
-                # FP8_Scale = FP4_Scale / 6.0
-                # input = input / FP8_Scale * FP4_Scale
-                input = input.to(torch.bfloat16) * 6.0
-            else:
-                input = (input * module.input_scale).to(torch.bfloat16)
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
-                input, self.reorder_index, self.residual_dim, is_act=True)
+                input,
+                module.input_scale,
+                self.reorder_index,
+                self.residual_dim,
+                is_act=True)
         return act_fp4, act_sf
 
     def load_weights(self,

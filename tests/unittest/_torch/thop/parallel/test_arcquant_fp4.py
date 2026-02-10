@@ -33,7 +33,8 @@ import tensorrt_llm  # noqa: F401
         (1357, 4096, 12288),
     ],
 )
-def test_arcquant_fp4(mnk):
+@pytest.mark.parametrize("input_type", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+def test_arcquant_fp4(mnk, input_type):
     M, N, K = mnk
     step = 256
     for i in range(4096 // step + 1):
@@ -44,16 +45,25 @@ def test_arcquant_fp4(mnk):
         # reorder_index = torch.arange(K, dtype=torch.int16, device="cuda")
         reorder_index = torch.randperm(K, dtype=torch.int16, device="cuda")
 
-        scale_w = torch.max(W.abs()) / (448.0 * 6.0)
-        scale_x = torch.max(X.abs()) / (448.0 * 6.0)
+        scale_x = (448.0 * 6.0) / torch.max(X.abs()).float()
+        scale_w = (448.0 * 6.0) / torch.max(W.abs()).float()
+        if input_type == torch.float8_e4m3fn:
+            FP8_Scale = 448.0 / torch.max(X.abs()).float()
+            X_fp8 = (X * FP8_Scale).to(torch.float8_e4m3fn)
 
-        A, SFA = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
-            X / scale_x, reorder_index, KE, is_act=True
-        )
+            A, SFA = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
+                X_fp8, scale_x, reorder_index, KE, is_act=True
+            )
+        else:
+            A, SFA = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
+                X, scale_x, reorder_index, KE, is_act=True
+            )
         B, SFB = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
-            W / scale_w, reorder_index, KE, is_act=False
+            W, scale_w, reorder_index, KE, is_act=False
         )
 
-        C = torch.ops.trtllm.nvfp4_gemm(A, B, SFA, SFB, (scale_x * scale_w).float(), torch.bfloat16)
+        C = torch.ops.trtllm.nvfp4_gemm(
+            A, B, SFA, SFB, 1.0 / (scale_x * scale_w).float(), torch.bfloat16
+        )
         D = F.linear(X, W)
         assert F.cosine_similarity(C.flatten(), D.flatten(), dim=0).item() > 0.98
