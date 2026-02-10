@@ -481,14 +481,14 @@ class RemoteMpiCommSessionServer():
                 # they occur rather than blocking behind a stuck future.
                 for future in as_completed(pending_futures):
                     try:
-                        future.result()
+                        future.result()  # Wait for completion
                     except Exception as e:
                         n_failed += 1
                         if first_exc is None:
                             first_exc = e
-                        logger.error(
+                        print_colored(
                             f"RemoteMpiCommSessionServer: MPI worker future "
-                            f"failed: {type(e).__name__}: {e}")
+                            f"failed: {type(e).__name__}: {e}\n", "red")
                         if n_failed == len(pending_futures):
                             # All workers failed — no point waiting further.
                             break
