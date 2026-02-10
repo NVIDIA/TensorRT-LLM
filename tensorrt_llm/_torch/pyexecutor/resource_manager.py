@@ -22,7 +22,6 @@ from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
-from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
                                                       AttentionLayerConfig,
@@ -1624,10 +1623,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if kv_cache_config.max_tokens is not None:
             quota = int(
-                ceil_div(
-                    kv_cache_config.max_tokens *
-                    self.get_cache_bytes_per_token(),
-                    kv_cache_config.max_util_for_resume))
+                math.ceil(kv_cache_config.max_tokens *
+                          self.get_cache_bytes_per_token() /
+                          kv_cache_config.max_util_for_resume))
             if kv_cache_config.free_gpu_memory_fraction is not None:
                 logger.warning(
                     f"Both max_tokens and free_gpu_memory_fraction are set to {kv_cache_config.max_tokens} and {kv_cache_config.free_gpu_memory_fraction}, the smaller value will be used."
@@ -1829,7 +1827,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         element_per_container = 1
         dtype = self.dtype
-        if self.dtype == DataType.NVFP4:
+        if dtype == DataType.NVFP4:
             element_per_container = 2
             dtype = torch.int8
 
