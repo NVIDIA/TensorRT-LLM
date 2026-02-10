@@ -1700,8 +1700,7 @@ class RequestTimeBreakdown:
         }});
 '''
 
-        full_html = f"""<!DOCTYPE html>"""  # nosec B608 - HTML template, not SQL
-        full_html += f"""
+        full_html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -1952,7 +1951,7 @@ class RequestTimeBreakdown:
     </script>
 </body>
 </html>
-"""
+"""  # nosec B608 - HTML template, not SQL
         with open(output_file, 'w') as f:
             f.write(full_html)
 
