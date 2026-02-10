@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/executor/dataTransceiverState.h"
+#include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <memory>
@@ -33,8 +34,6 @@ namespace kv_cache_manager
 {
 class BaseCacheFormatter;
 } // namespace kv_cache_manager
-
-class RnnCacheFormatter;
 
 using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;

@@ -118,6 +118,10 @@ class CppMambaCacheManager(BaseResourceManager):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # For Mamba cache manager, we always need one slot per request.
         return 1
+    
+    def is_speculative(self) -> bool:
+        # C++ MambaCacheManager does not support speculative decoding
+        return False
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -594,9 +598,6 @@ class MambaCacheManager(BaseResourceManager):
         return self._impl.get_intermediate_conv_states(layer_idx)
 
     def is_speculative(self) -> bool:
-        if self._use_cpp:
-            # CppMambaCacheManager does not support speculative decoding for now.
-            return False
         return self._impl.is_speculative()
 
     def mamba_layer_cache(
