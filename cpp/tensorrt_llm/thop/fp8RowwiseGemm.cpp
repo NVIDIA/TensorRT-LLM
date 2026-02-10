@@ -52,7 +52,7 @@ void check_input_dtypes(torch::Tensor const& mat, torch::Tensor const& matScale)
 
 template <typename OutputType>
 torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int output_buffer_kind = 0,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t output_buffer_kind = 0,
     tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     check_input_dtypes(mat1, mat1Scale);
@@ -101,15 +101,15 @@ torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor c
 }
 
 template torch::Tensor fp8_rowwise_gemm_launch<half>(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int output_buffer_kind = 0,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t output_buffer_kind = 0,
     tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt);
 template torch::Tensor fp8_rowwise_gemm_launch<__nv_bfloat16>(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int output_buffer_kind = 0,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t output_buffer_kind = 0,
     tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt);
 
 torch::Tensor fp8_rowwise_gemm_dispatch(torch::Tensor const& mat1, torch::Tensor const& mat2,
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, at::ScalarType outDataType,
-    int output_buffer_kind = 0, tkc::CutlassGemmConfig const* maybe_config = nullptr,
+    int64_t output_buffer_kind = 0, tkc::CutlassGemmConfig const* maybe_config = nullptr,
     c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     // The functional version of this op does not do any profiling; use the profiler class below instead for
@@ -152,7 +152,7 @@ public:
     }
 
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-        at::Tensor const& mat2Scale, int output_buffer_kind, int64_t configIdx,
+        at::Tensor const& mat2Scale, int64_t output_buffer_kind, int64_t configIdx,
         c10::optional<torch::List<int64_t>> group = c10::nullopt) const
     {
         tkc::CutlassGemmConfig const* config = nullptr;
