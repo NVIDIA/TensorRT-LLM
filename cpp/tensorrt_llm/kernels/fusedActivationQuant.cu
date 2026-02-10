@@ -19,6 +19,7 @@
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -109,8 +110,8 @@ __global__ void fusedRelu2QuantizeKernel(T const* __restrict__ input, float cons
 }
 
 template <typename T>
-void invokeFusedRelu2Quantize(T const* input, float const* sfScale, uint8_t* outputFp4, uint8_t* outputSf, int m, int n,
-    int sfVecSize, cudaStream_t stream)
+void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
+    int m, int n, int sfVecSize, cudaStream_t stream)
 {
     int numColThreads = n / kEltsPerThread;
     int threadsPerBlock = min(512, numColThreads);
@@ -121,11 +122,11 @@ void invokeFusedRelu2Quantize(T const* input, float const* sfScale, uint8_t* out
 }
 
 template void invokeFusedRelu2Quantize<half>(
-    half const*, float const*, uint8_t*, uint8_t*, int, int, int, cudaStream_t);
+    half const*, float const*, std::uint8_t*, std::uint8_t*, int, int, int, cudaStream_t);
 
 #ifdef ENABLE_BF16
 template void invokeFusedRelu2Quantize<__nv_bfloat16>(
-    __nv_bfloat16 const*, float const*, uint8_t*, uint8_t*, int, int, int, cudaStream_t);
+    __nv_bfloat16 const*, float const*, std::uint8_t*, std::uint8_t*, int, int, int, cudaStream_t);
 #endif
 
 } // namespace kernels

@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -24,8 +25,8 @@ namespace kernels
 {
 
 template <typename T>
-void invokeFusedRelu2Quantize(T const* input, float const* sfScale, uint8_t* outputFp4, uint8_t* outputSf, int m, int n,
-    int sfVecSize, cudaStream_t stream);
+void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
+    int m, int n, int sfVecSize, cudaStream_t stream);
 
 } // namespace kernels
 
