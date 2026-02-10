@@ -86,13 +86,11 @@ class MLP(nn.Module):
             reduce_output=reduce_output,
         )
 
-        self._fused_checked = False
         self._use_fused_relu2_quant = False
 
-    def _init_fused_path(self):
-        if self._fused_checked:
-            return
-        self._fused_checked = True
+    def create_weights(self):
+        self.up_proj.create_weights()
+        self.down_proj.create_weights()
 
         has_nvfp4 = hasattr(self.down_proj,
                             'has_nvfp4') and self.down_proj.has_nvfp4
@@ -109,9 +107,6 @@ class MLP(nn.Module):
     ) -> torch.Tensor:
         if lora_params is not None:
             return self.forward_lora(x, lora_params=lora_params)
-
-        if not self._fused_checked:
-            self._init_fused_path()
 
         x_up = self.up_proj(x)
 

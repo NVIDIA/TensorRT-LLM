@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/fusedActivationQuant.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -26,15 +27,6 @@
 #include <cuda_fp16.h>
 
 TRTLLM_NAMESPACE_BEGIN
-
-namespace kernels
-{
-
-template <typename T>
-void invokeFusedRelu2Quantize(T const* input, float const* sfScale, uint8_t* outputFp4, uint8_t* outputSf, int m, int n,
-    int sfVecSize, cudaStream_t stream);
-
-} // namespace kernels
 
 namespace torch_ext
 {

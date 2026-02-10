@@ -138,14 +138,13 @@ class RMSNorm(nn.Module):
 
             hidden_states_fused = Fp4QuantizedTensor(normed_fp4_u8, sf_fused)
 
-            if not self.return_hp_output:
-                return (hidden_states_fused,
-                        residual_out) if has_residual else hidden_states_fused
-            else:
+            outputs = [hidden_states_fused]
+            if has_residual:
+                outputs.append(residual_out)
+            if self.return_hp_output:
                 high_precision_normed_output = results[3].reshape(orig_shape)
-                return (hidden_states_fused, residual_out,
-                        high_precision_normed_output) if has_residual else (
-                            hidden_states_fused, high_precision_normed_output)
+                outputs.append(high_precision_normed_output)
+            return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
         if self.return_hp_output:
             raise ValueError(

@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/fusedActivationQuant.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 
