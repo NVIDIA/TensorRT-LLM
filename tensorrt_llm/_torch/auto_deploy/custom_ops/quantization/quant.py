@@ -274,7 +274,6 @@ class FP8Linear(nn.Linear):
 
 
 @torch.library.custom_op("auto_deploy::torch_quant_nvfp4_linear", mutates_args=())
-@torch.compile(dynamic=True)
 def nvfp4_linear(
     input: torch.Tensor,
     weight_fp4: torch.Tensor,
