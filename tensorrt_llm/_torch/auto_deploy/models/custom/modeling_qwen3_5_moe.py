@@ -505,10 +505,16 @@ class Qwen3_5MoeMLP(nn.Module):
 
 
 class Qwen3_5MoeExperts(nn.Module):
-    """Expert weights stored as fused 3D tensors for checkpoint compatibility.
+    """Expert weights stored as fused 3D tensors.
+
+    The checkpoint stores ``gate_up_proj`` in HF format ``[gate(w1), up(w3)]``.
+    A load-time pre-hook swaps the halves so that the parameter is stored in
+    TRT-LLM format ``[up(w3), gate(w1)]``, which is what ``torch_moe_fused``
+    expects as ``w3_w1_stacked_weight``.
 
     Parameters:
         gate_up_proj: shape [num_experts, 2 * intermediate_dim, hidden_dim]
+                      stored in TRT-LLM order [up(w3), gate(w1)] after loading.
         down_proj:    shape [num_experts, hidden_dim, intermediate_dim]
     """
 
@@ -523,6 +529,16 @@ class Qwen3_5MoeExperts(nn.Module):
         self.down_proj = nn.Parameter(
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
+        # Swap gate/up halves at load time: HF [gate, up] -> TRT-LLM [up, gate]
+        self._register_load_state_dict_pre_hook(self._swap_gate_up)
+
+    @staticmethod
+    def _swap_gate_up(state_dict, prefix, *args):
+        key = prefix + "gate_up_proj"
+        if key in state_dict:
+            w = state_dict[key]
+            I = w.shape[1] // 2  # noqa: E741
+            state_dict[key] = torch.cat([w[:, I:, :], w[:, :I, :]], dim=1)
 
 
 class Qwen3_5MoeTopKRouter(nn.Module):
@@ -548,10 +564,12 @@ class Qwen3_5MoeTopKRouter(nn.Module):
 
 
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
-    """MoE block using torch_moe custom op for routed experts.
+    """MoE block using torch_moe_fused custom op for routed experts.
 
-    Adapted from the Qwen3Next MoE patch. Splits the fused gate_up_proj into
-    per-expert gate and up weight lists for the torch_moe op.
+    Uses ``torch_moe_fused`` which accepts pre-stacked 3D weight tensors
+    directly, avoiding the overhead of slicing into per-expert lists.
+    The expert weights are stored in TRT-LLM format (gate/up halves swapped
+    at load time by ``Qwen3_5MoeExperts``).
     """
 
     def __init__(self, config: Qwen3_5MoeTextConfig):
@@ -570,22 +588,13 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # Router
         routing_weights, selected_experts = self.gate(hidden_states_flat)
 
-        # Split fused expert weights into per-expert gate / up / down lists
-        I = self.experts.intermediate_dim  # noqa: E741
-        E = self.experts.num_experts
-        gate_up = self.experts.gate_up_proj  # [E, 2*I, H]
-        gate_proj_weights = [gate_up[i, :I, :] for i in range(E)]
-        up_proj_weights = [gate_up[i, I:, :] for i in range(E)]
-        down_proj_weights = [self.experts.down_proj[i] for i in range(E)]
-
-        # Routed experts via torch_moe (w1=gate, w2=down, w3=up per Qwen3Next convention)
-        expert_output = torch.ops.auto_deploy.torch_moe(
+        # Routed experts via fused MoE (weights already in TRT-LLM format from load hook)
+        expert_output = torch.ops.auto_deploy.torch_moe_fused(
             hidden_states_flat,
             selected_experts,
             routing_weights,
-            w1_weight=gate_proj_weights,
-            w2_weight=down_proj_weights,
-            w3_weight=up_proj_weights,
+            self.experts.gate_up_proj,  # [E, 2*I, H] in [up(w3), gate(w1)] order
+            self.experts.down_proj,  # [E, H, I]
         )
 
         # Shared expert with sigmoid gating
