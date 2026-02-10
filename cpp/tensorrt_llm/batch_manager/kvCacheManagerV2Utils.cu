@@ -186,7 +186,6 @@ CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, 
 
 // dst_tensor[:, :num_seqs, 0] = src_tensor[:, copy_idx]
 // dst_tensor[:, :num_seqs, 1] = dst_tensor[:, :num_seqs, 0] + 1
-template <bool COPY_V_IDX = true>
 __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ srcPtr,
     SizeType32* __restrict__ dstPtr, SizeType32 const srcMaxNumSequences, SizeType32 const dstMaxNumSequences,
     SizeType32 numBlocksPerSeq, SizeType32 const* __restrict__ copyIndex, SizeType32 const* __restrict__ indexScales,

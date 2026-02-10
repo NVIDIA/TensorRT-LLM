@@ -673,7 +673,7 @@ class PyTorchModelEngine(ModelEngine):
                         reverse: bool = False):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        token_num_upper_bound = max(self.max_num_tokens,
+        token_num_upper_bound = min(self.max_num_tokens,
                                     self.batch_size * (self.max_seq_len - 1))
         curr_max_num_tokens = min(
             kv_cache_manager.get_num_available_tokens(
@@ -728,7 +728,7 @@ class PyTorchModelEngine(ModelEngine):
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        token_num_upper_bound = max(self.max_num_tokens,
+        token_num_upper_bound = min(self.max_num_tokens,
                                     self.batch_size * (self.max_seq_len - 1))
         curr_max_num_tokens = min(
             kv_cache_manager.get_num_available_tokens(
@@ -1121,7 +1121,9 @@ class PyTorchModelEngine(ModelEngine):
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
-                batch_size=batch_size, token_num_upper_bound=max_seq_len, max_num_draft_tokens=draft_len)
+                batch_size=batch_size,
+                token_num_upper_bound=max_seq_len,
+                max_num_draft_tokens=draft_len)
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
