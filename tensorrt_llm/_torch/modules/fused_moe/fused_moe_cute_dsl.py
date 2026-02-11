@@ -19,8 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm._utils import is_sm_100f
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
@@ -326,6 +325,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
+        use_cute_dsl_fp8 (bool): Whether to use CuteDSL FP8 blockwise gemm.
     """
 
     @classmethod
@@ -387,6 +387,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 return _warn_and_return(
                     f"NVFP4 requires SM100 or SM103, got SM{sm_version}")
             return True, None
+        elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            if sm_version not in {100, 103}:
+                return _warn_and_return(
+                    f"FP8_BLOCK_SCALES requires SM100 or SM103, got SM{sm_version}")
+            return True, None
 
         return _warn_and_return(
             f"CuteDslFusedMoE does not support quant_algo={quant_algo}")
@@ -409,6 +414,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        use_cute_dsl_fp8: bool = False,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -435,6 +441,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
+        self.use_cute_dsl_fp8 = use_cute_dsl_fp8
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled
@@ -681,22 +688,40 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             use_fp8_block_scaling=True,
         )
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        x = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=x,
-            b=self.w3_w1_weight.view(weight_dtype),
-            a_sf=x_sf,
-            b_sf=self.quant_scales[0],
-            offset_array=expert_first_token_offset,
-        )
+        if is_sm_100f() and self.use_cute_dsl_fp8:
+            x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+                input=x,
+                weight=self.w3_w1_weight.view(weight_dtype),
+                input_scale=x_sf,
+                weight_scale=self.quant_scales[0],
+                group_offset=expert_first_token_offset,
+            )
+        else:
+            x = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=x,
+                b=self.w3_w1_weight.view(weight_dtype),
+                a_sf=x_sf,
+                b_sf=self.quant_scales[0],
+                offset_array=expert_first_token_offset,
+            )
         x = swiglu_fused_moe(x)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        x = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=x,
-            b=self.w2_weight.view(weight_dtype),
-            a_sf=x_sf,
-            b_sf=self.quant_scales[1],
-            offset_array=expert_first_token_offset,
-        )
+        if is_sm_100f() and self.use_cute_dsl_fp8:
+            x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+                input=x,
+                weight=self.w2_weight.view(weight_dtype),
+                input_scale=x_sf,
+                weight_scale=self.quant_scales[1],
+                group_offset=expert_first_token_offset,
+            )
+        else:
+            x = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=x,
+                b=self.w2_weight.view(weight_dtype),
+                a_sf=x_sf,
+                b_sf=self.quant_scales[1],
+                offset_array=expert_first_token_offset,
+            )
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases
