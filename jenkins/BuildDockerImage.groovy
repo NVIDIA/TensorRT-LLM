@@ -28,7 +28,7 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
-// Default to true to avoid making the build fail in both pre-merge and post-merge jobs
+// Default to true to prevent NSPECT check from causing build failure in both pre-merge and post-merge jobs.
 SKIP_NSPECT_FAILURE = true
 // In post-merge job, only warn the build failure
 SKIP_BUILD_FAILURE = RUN_SANITY_CHECK
