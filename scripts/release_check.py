@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import re
 import subprocess as sp
 import sys
@@ -35,13 +36,13 @@ def run_cmd(cmd):
     return result
 
 
-def run_precommit_with_timing():
+def run_precommit_with_timing(params):
     """Run pre-commit with timing information for each hook"""
 
     print("Running pre-commit checks with performance monitoring...")
     print("=" * 80)
 
-    cmd = "pre-commit run -a --show-diff-on-failure --verbose"
+    cmd = f"pre-commit run {params} --show-diff-on-failure --verbose"
 
     # Track hook execution times
     # Since hooks run sequentially, we can estimate each hook's duration
@@ -158,6 +159,18 @@ def handle_check_failure(error_msg):
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Release Check")
+    parser.add_argument("--params",
+                        default="-a",
+                        help="Parameters for pre-commit")
+    args = parser.parse_args()
+
+    if args.params == "-a":
+        print("Running pre-commit on all files")
+    else:
+        print("Running pre-commit on changed files")
+
     # Install pre-commit and bandit from requirements-dev.txt
     with open("requirements-dev.txt") as f:
         reqs = f.readlines()
@@ -172,7 +185,7 @@ def main():
 
     # Run pre-commit on all files with performance monitoring
     try:
-        run_precommit_with_timing()
+        run_precommit_with_timing(args.params)
     except SystemExit:
         handle_check_failure("pre-commit checks failed")
 

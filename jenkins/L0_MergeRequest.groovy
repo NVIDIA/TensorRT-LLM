@@ -430,7 +430,12 @@ def launchReleaseCheck(pipeline)
         }
 
         // Step 3: Run pre-commit checks
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
+        def params = "-a"
+        def targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+        if (!(env.JOB_NAME ==~ /.*PostMerge.*/ || env.alternativeTRT)) {
+            params = "--from-ref origin/${targetBranch} --to-ref HEAD"
+        }
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py --params=${params} || (git restore . && false)")
 
         // Step 4: Run license check
         withEnv(['GONOSUMDB=*.nvidia.com']) {
