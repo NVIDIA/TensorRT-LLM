@@ -1394,6 +1394,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         }
     } catch (InterruptedException e) {
         stageIsInterrupted = true
+        throw e
     } finally {
         uploadResults(pipeline, cluster, jobUID, stageName, stageIsInterrupted)
         stage("Clean Up Slurm Resource") {
