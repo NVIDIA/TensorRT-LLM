@@ -106,7 +106,19 @@ add_library(
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp
   dsv3RopeOp.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  moeCommOp.cpp
+  moeOp.cpp
+  moeUtilOp.cpp
+  moeAlltoAllOp.cpp
+  moeAlignOp.cpp
+  moeLoadBalanceOp.cpp
+  customMoeRoutingOp.cpp
+  fp8BlockScaleMoe.cpp
+  fp8PerTensorScaleMoe.cpp
+  fp4BlockScaleMoe.cpp
+  cuteDslMoeUtilsOp.cpp
+  mxFp8Quantize.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}

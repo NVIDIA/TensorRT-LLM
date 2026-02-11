@@ -894,10 +894,10 @@ def nvfp4_gemm(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
-    allowed_backends: str = "cutlass,cublaslt,cuda_core",
+    allowed_backends: Optional[str] = None,
 ) -> torch.Tensor:
     """Unified NVFP4 GEMM with automatic backend selection.
-
+    
     This function automatically chooses the best backend from the allowed list:
     - CUTLASS: Predefined CUTLASS configurations with auto-tuning
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
@@ -927,6 +927,7 @@ def nvfp4_gemm(
     Raises:
         ValueError: If backend is invalid/unavailable
     """
+    if allowed_backends is None: allowed_backends = "cutlass,cublaslt,cuda_core"
 
     valid_individual_backends = {'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'}
 
@@ -987,9 +988,10 @@ def _(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
-    allowed_backends: str = "cutlass,cublaslt,cuda_core",
+    allowed_backends: Optional[str] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile support."""
+    if allowed_backends is None: allowed_backends = "cutlass,cublaslt,cuda_core"
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
 
@@ -1140,8 +1142,9 @@ def fp8_batched_gemm_trtllmgen(
     dq_sfs_a: Optional[torch.Tensor] = None,
     dq_sfs_b: Optional[torch.Tensor] = None,
     scale_c: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = torch.half
+    out_dtype: Optional[torch.dtype] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if out_dtype is None: out_dtype = torch.half
 
     kernel_runner = FP8BatchedGemmRunner(output_dtype=out_dtype,
                                          use_deep_seek_fp8=use_deep_seek_fp8,
@@ -1181,6 +1184,7 @@ def _(
     scale_c: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if out_dtype is None: out_dtype = torch.half
 
     b = mat1.size(0)
     m = mat1.size(1)
@@ -1509,10 +1513,11 @@ def fp8_swap_ab_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: Optional[torch.dtype] = None,
     disable_ue8m0_cast: bool = False,
     tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
+    if output_dtype is None: output_dtype = torch.bfloat16
     tuner = AutoTuner.get()
     fp8_swap_ab_gemm_runner = fp8SwapABGemmRunner(
         output_dtype,
@@ -1536,10 +1541,11 @@ def _(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: Optional[torch.dtype] = None,
     disable_ue8m0_cast: bool = False,
     tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
+    if output_dtype is None: output_dtype = torch.bfloat16
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
