@@ -244,16 +244,7 @@ class ModelLoader:
             return self.model_obj.model_dir
 
         if self.llm_args.parallel_config.is_multi_gpu:
-            device_id = self.global_rank % self.mapping.gpus_per_node
-            # Debug: Log device selection
-            import os as _os
-            print(
-                f"[llm_utils.py] set_device: pid={_os.getpid()}, global_rank={self.global_rank}, "
-                f"gpus_per_node={self.mapping.gpus_per_node}, device_id={device_id}, "
-                f"CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}, "
-                f"device_count={torch.cuda.device_count()}",
-                flush=True)
-            torch.cuda.set_device(device_id)
+            torch.cuda.set_device(self.global_rank % self.mapping.gpus_per_node)
 
         pipeline = ModelLoader.BuildPipeline(
             self.llm_args.enable_tqdm,
@@ -683,7 +674,7 @@ class CachedModelLoader:
         *args,
         **kwargs,
     ) -> List[Any]:
-        if self.llm_args.parallel_config.is_multi_gpu and self.mpi_session is not None:
+        if self.llm_args.parallel_config.is_multi_gpu:
             return self.mpi_session.submit_sync(task, *args, **kwargs)
         else:
             return [task(*args, **kwargs)]

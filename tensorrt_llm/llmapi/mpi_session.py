@@ -135,10 +135,9 @@ class MpiSession(abc.ABC):
 
 class MpiPoolSession(MpiSession):
 
-    def __init__(self, n_workers: int, env: Optional[Dict[str, str]] = None):
+    def __init__(self, n_workers: int):
         self.n_workers = n_workers
         self.mpi_pool: Optional[MPIPoolExecutor] = None
-        self._env = env
         self._start_mpi_pool()
         if ENABLE_MULTI_DEVICE:
             self.comm = mpi4py.MPI.COMM_WORLD
@@ -154,9 +153,10 @@ class MpiPoolSession(MpiSession):
         ]
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
-        futures = []
-        for i in range(self.n_workers):
-            futures.append(self.mpi_pool.submit(task, *args, **kwargs))
+        futures = [
+            self.mpi_pool.submit(task, *args, **kwargs)
+            for i in range(self.n_workers)
+        ]
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
@@ -170,15 +170,11 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
-        # Pass TRTLLM/TLLM env vars to workers
         env = {
             key: value
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
-        # Set CUDA_VISIBLE_DEVICES from TRTLLM_VISIBLE_DEVICES if present
-        if "TRTLLM_VISIBLE_DEVICES" in env:
-            env["CUDA_VISIBLE_DEVICES"] = env["TRTLLM_VISIBLE_DEVICES"]
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env)
