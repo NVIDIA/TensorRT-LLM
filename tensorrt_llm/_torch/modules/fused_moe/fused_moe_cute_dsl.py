@@ -4,8 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm._utils import is_sm_100f
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
@@ -311,70 +310,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
+        use_cute_dsl_fp8 (bool): Whether to use CuteDSL FP8 blockwise gemm.
     """
-
-    @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        Check if CuteDslFusedMoE can implement the given quantization algorithm.
-
-        CuteDslFusedMoE supports:
-        - NVFP4: SM in {100, 103}
-
-        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
-        Does NOT support gptoss_style (bias/swiglu with custom alpha/beta/limit).
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation input data type. Only bfloat16 is supported
-                because output dtype is hardcoded to bfloat16 (input/output dtype must match).
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                CuteDslFusedMoE does NOT support gptoss_style.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-        """
-        from .interface import _warn_and_return
-
-        sm_version = get_sm_version()
-
-        # CuteDslFusedMoE requires at least SM90
-        if sm_version < 90:
-            return _warn_and_return(
-                f"CuteDslFusedMoE requires SM >= 90, got SM{sm_version}")
-
-        # Check dtype_activation: output is hardcoded to bfloat16, so input must also be bfloat16
-        # to maintain input/output dtype consistency
-        if dtype_activation != torch.bfloat16:
-            return _warn_and_return(
-                f"CuteDslFusedMoE only supports bfloat16 activation (output is hardcoded to bfloat16), "
-                f"got {dtype_activation}")
-
-        # CuteDslFusedMoE does NOT support unquantized mode
-        if quant_algo is None:
-            return _warn_and_return(
-                "CuteDslFusedMoE does not support unquantized mode")
-
-        # CuteDslFusedMoE does NOT support gptoss_style
-        if gptoss_style:
-            return _warn_and_return(
-                "CuteDslFusedMoE does not support gptoss_style (bias/swiglu with custom alpha/beta/limit)"
-            )
-
-        # NVFP4 - SM in {100, 103}
-        if quant_algo == QuantAlgo.NVFP4:
-            if sm_version not in {100, 103}:
-                return _warn_and_return(
-                    f"NVFP4 requires SM100 or SM103, got SM{sm_version}")
-            return True, None
-
-        return _warn_and_return(
-            f"CuteDslFusedMoE does not support quant_algo={quant_algo}")
 
     def __init__(
         self,
@@ -394,6 +331,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        use_cute_dsl_fp8: bool = False,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -420,6 +358,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
+        self.use_cute_dsl_fp8 = use_cute_dsl_fp8
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled
@@ -666,22 +605,40 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             use_fp8_block_scaling=True,
         )
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        x = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=x,
-            b=self.w3_w1_weight.view(weight_dtype),
-            a_sf=x_sf,
-            b_sf=self.quant_scales[0],
-            offset_array=expert_first_token_offset,
-        )
+        if is_sm_100f() and self.use_cute_dsl_fp8:
+            x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+                input=x,
+                weight=self.w3_w1_weight.view(weight_dtype),
+                input_scale=x_sf,
+                weight_scale=self.quant_scales[0],
+                group_offset=expert_first_token_offset,
+            )
+        else:
+            x = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=x,
+                b=self.w3_w1_weight.view(weight_dtype),
+                a_sf=x_sf,
+                b_sf=self.quant_scales[0],
+                offset_array=expert_first_token_offset,
+            )
         x = swiglu_fused_moe(x)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        x = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=x,
-            b=self.w2_weight.view(weight_dtype),
-            a_sf=x_sf,
-            b_sf=self.quant_scales[1],
-            offset_array=expert_first_token_offset,
-        )
+        if is_sm_100f() and self.use_cute_dsl_fp8:
+            x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+                input=x,
+                weight=self.w2_weight.view(weight_dtype),
+                input_scale=x_sf,
+                weight_scale=self.quant_scales[1],
+                group_offset=expert_first_token_offset,
+            )
+        else:
+            x = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=x,
+                b=self.w2_weight.view(weight_dtype),
+                a_sf=x_sf,
+                b_sf=self.quant_scales[1],
+                offset_array=expert_first_token_offset,
+            )
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases

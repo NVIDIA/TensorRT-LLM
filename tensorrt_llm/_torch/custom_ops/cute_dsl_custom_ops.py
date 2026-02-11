@@ -316,6 +316,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
+    from ..cute_dsl_kernels.blackwell.blockwise_gemm.contiguous_offset_grouped_gemm import \
+        Sm100BlockwiseContiguousGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
@@ -2173,6 +2175,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0, 0, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(2, 1, fp8_scale_infer_shape), ),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self,
@@ -2484,6 +2487,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0, 1, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(2, 2, fp8_scale_infer_shape), ),
+            use_cold_l2_cache=True,
         )
 
         def __init__(self,
@@ -2789,3 +2793,251 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
+
+    class CuteDSLFp8BlackwellGroupedGemmRunner(TunableRunner):
+        kernel_class = Sm100BlockwiseContiguousGroupedGemmKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(use_cold_l2_cache=True, )
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            super().__init__()
+            self.use_tvm_ffi = use_tvm_ffi
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL FP8 Group Gemm only supports SM 100 family. Skipping all tactics."
+                )
+                return []
+            # [m, k]
+            m, k = inputs[0].shape[0], inputs[0].shape[1]
+            # [group_size, n, k]
+            group_size, n, k = inputs[1].shape[0], inputs[1].shape[1], inputs[
+                1].shape[2]
+            batch_size = 1
+            # m,k
+            a_major = "k"
+            # n, k
+            b_major = "k"
+            # m, n
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.Float8E4M3FN,  # ab_dtype,
+                    cutlass.Float32,  # acc_dtype,
+                    cutlass.BFloat16,  # c_dtype,
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> torch.Tensor:
+            """
+            Performs fp8 grouped gemm operation using CuTe DSL.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (m, k), dtype: fp8.
+                    inputs[1]: Weight tensor of shape (group_size, n, k), dtype: fp8.
+                    inputs[2]: Input scale tensor of shape (k // 128, m), dtype: fp32.
+                    inputs[3]: Weight scale tensor of shape (group_size, n // 128, k // 128), dtype: fp32.
+                    inputs[4]: Group offset tensor of shape (group_size + 1), dtype: int32.
+                tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
+
+            Returns:
+                torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
+            """
+
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                # fallback to default tactic
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+
+            a, b, a_sf, b_sf, group_offset = inputs
+            m, k, n = a.shape[0], a.shape[1], b.shape[1]
+            group_size = b.shape[0]
+            sf_m = m
+            sf_n = ceil_div(n, 128)
+            sf_k = ceil_div(k, 128)
+            c = torch.empty(*(m, n), dtype=torch.bfloat16, device=a.device)
+
+            a_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                a.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                b.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            c_ptr = make_ptr(
+                cutlass.BFloat16,
+                c.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            a_sf_ptr = make_ptr(
+                cutlass.Float32,
+                a_sf.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_sf_ptr = make_ptr(
+                cutlass.Float32,
+                b_sf.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            group_offset_ptr = make_ptr(
+                cutlass.Int32,
+                group_offset.data_ptr(),
+                cute.AddressSpace.gmem,
+            )
+
+            # get stream
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype,
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                # Compute max active clusters on current device
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    1,  # batch
+                    group_size,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    group_offset_ptr,
+                    max_active_clusters,
+                    stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                1,  # batch
+                group_size,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                group_offset_ptr,
+                stream=stream,
+            )
+            return c
+
+    # a/b: fp8, scale: fp32, out: bf16
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_fp8_blockwise_grouped_gemm_blackwell",
+        mutates_args=(),
+        device_types="cuda")
+    def cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        group_offset: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> torch.Tensor:
+
+        tuner = AutoTuner.get()
+        runner = CuteDSLFp8BlackwellGroupedGemmRunner(use_tvm_ffi=use_tvm_ffi)
+
+        inputs = [input, weight, input_scale, weight_scale, group_offset]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_fp8_blockwise_grouped_gemm_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        return runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_fp8_blockwise_grouped_gemm_blackwell")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        group_offset: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> torch.Tensor:
+        m, k = input.shape[0], input.shape[1]
+        num_group, n, k = weight.shape[0], weight.shape[1], weight.shape[2]
+        return input.new_empty((m, n), dtype=torch.bfloat16)
