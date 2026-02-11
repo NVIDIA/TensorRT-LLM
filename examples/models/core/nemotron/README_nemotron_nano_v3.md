@@ -37,15 +37,16 @@ enable_chunked_prefill: true
 attn_backend: flashinfer
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
-free_mem_ratio: 0.9
 cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
 kv_cache_config:
-  # disable kv_cache reuse since not supported for hybrid/ssm models
-  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.88
+  # tunable mamba cache dtype
+  # --> use float32 for accuracy and default (auto) for speed
+  # mamba_ssm_cache_dtype: float32
 transforms:
   detect_sharding:
-    sharding_dims: ['ep', 'bmm']
     allreduce_strategy: 'SYMM_MEM'
+    sharding_dims: ['ep', 'bmm']
     manual_config:
       head_dim: 128
       tp_plan:
@@ -69,9 +70,8 @@ transforms:
   multi_stream_moe:
     stage: compile
     enabled: true
-  insert_cached_ssm_attention:
-      cache_config:
-        mamba_dtype: float32
+  gather_logits_before_lm_head:
+    enabled: true
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
@@ -83,7 +83,7 @@ TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
 --port 8000 \
 --backend _autodeploy \
 --trust_remote_code \
---extra_llm_api_options nano_v3.yaml
+--config nano_v3.yaml
 
 # OR you can launch trtllm-server to support reasoning content parsing.
 TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
@@ -92,7 +92,7 @@ TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
 --backend _autodeploy \
 --trust_remote_code \
 --reasoning_parser nano-v3 \
---extra_llm_api_options nano_v3.yaml
+--config nano_v3.yaml
 
 # OR you can launch trtllm-server to support tool-calling.
 TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
@@ -102,7 +102,7 @@ TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
 --trust_remote_code \
 --reasoning_parser nano-v3 \
 --tool_parser qwen3_coder \
---extra_llm_api_options nano_v3.yaml
+--config nano_v3.yaml
 ```
 
 For the client:

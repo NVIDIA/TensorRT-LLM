@@ -28,7 +28,7 @@ jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
 ruff==0.9.4
-lm_eval[api]==0.4.9.2
+lm_eval[api]==0.4.10
 docstring_parser
 genai-perf==0.0.13
 opentelemetry-sdk>=1.26.0
@@ -37,3 +37,6 @@ opentelemetry-exporter-otlp>=1.26.0
 opentelemetry-semantic-conventions-ai>=0.4.1
 fuzzywuzzy==0.18.0
 aiperf==0.3.0
+nanobind>=2.9.0
+nixl==0.8.0
+hf-transfer==0.1.9

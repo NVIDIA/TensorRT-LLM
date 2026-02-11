@@ -13,23 +13,18 @@ from utils.util import similar
 
 
 # # ============================================================================
-# # Fixture: Force single-worker mode for all tests in this module
+# # Fixture: Force single-worker mode (only for tests that use mocking)
 # # ============================================================================
-@pytest.fixture(scope="module", autouse=True)
-def enforce_single_worker():
-    """Force single-worker mode for all tests in this module."""
-    import os
-
-    os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
+@pytest.fixture(scope="function")
+def enforce_single_worker(monkeypatch):
+    """Mock functions don't work with multiple processes, so we enforce single worker."""
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
-    if "TLLM_WORKER_USE_SINGLE_PROCESS" in os.environ:
-        del os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"]
 
 
 # # ============================================================================
 # # test 1:  Generation correctness check
 # # ============================================================================
-@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5680911")
 @pytest.mark.parametrize(
     "drafter_type,schedule",
     [
@@ -77,7 +72,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     else:
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model_dir=str(draft_model),
+            speculative_model=str(draft_model),
             draft_len_schedule=schedule,
         )
 
@@ -123,7 +118,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     else:
         spec_config_fixed = DraftTargetDecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model_dir=str(draft_model),
+            speculative_model=str(draft_model),
             draft_len_schedule=None,  # No schedule - fixed draft length
         )
     llm_fixed = LLM(**llm_common_config, speculative_config=spec_config_fixed)
@@ -151,8 +146,9 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     ],
 )
 @pytest.mark.high_cuda_memory
-@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5680911")
-def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dict):
+def test_draft_len_schedule_functionality(
+    enforce_single_worker, drafter_type: str, draft_schedule: dict
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -186,9 +182,7 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
     else:
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=5,
-            speculative_model_dir=str(
-                llm_models_root() / "llama-3.2-models" / "Llama-3.2-3B-Instruct"
-            ),
+            speculative_model=str(llm_models_root() / "llama-3.2-models" / "Llama-3.2-3B-Instruct"),
             draft_len_schedule=draft_schedule,
         )
     prompts = ["The capital of France is" for i in range(7)]

@@ -32,6 +32,7 @@ import contextlib
 import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -44,6 +45,7 @@ import pandas as pd
 import pytest
 import requests
 import yaml
+from defs.common import get_free_port_in_ci, parse_gsm8k_output
 from defs.conftest import get_device_count, get_device_memory, llm_models_root
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
@@ -71,10 +73,18 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 GRACEFUL_TERMINATION_TIMEOUT = 300  # seconds - set longer when stress large model
 
 
+def _get_default_port() -> int:
+    """Get a default port using CI allocation if available, otherwise use 8000."""
+    try:
+        return get_free_port_in_ci()
+    except Exception:
+        return 8000
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     """Dataclass to store server configuration for trtllm-serve"""
-    port: int = 8000
+    port: int = field(default_factory=_get_default_port)
     host: str = "localhost"
     pp_size: int = 1
     ep_size: Optional[int] = 1
@@ -166,8 +176,7 @@ class PerformanceParams:
     # Ensure indefinite runs specially for different concurrency values
     test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
     concurrency_list: List[int] = field(
-        default_factory=lambda:
-        [8, 16, 32, 64, 128, 256, 384, 512, 640, 768, 896, 1024])
+        default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
     @property
     def request_count_list(self) -> List[int]:
@@ -338,6 +347,26 @@ def check_server_health(server_url: str,
         return False, f"Server health check failed: {str(e)}"
     except Exception as e:
         return False, f"Unexpected error during health check: {str(e)}"
+
+
+def is_port_available(port: int,
+                      host: str = "localhost") -> Tuple[bool, Optional[str]]:
+    """
+    Check if a port is available for binding.
+
+    Args:
+        port: Port number to check
+        host: Host to bind to
+
+    Returns:
+        Tuple of (is_available, error_message)
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+            return True, None
+        except OSError as e:
+            return False, f"Port {port} is already in use on {host}: {e}"
 
 
 @pytest.mark.parametrize(
@@ -518,6 +547,10 @@ def stress_test(config,
     else:
         stress_config = None
 
+    # Check if port is available
+    is_available, port_error = is_port_available(test_server_config.port,
+                                                 test_server_config.host)
+
     # Check if server is already running
     is_healthy, _ = check_server_health(test_server_config.url,
                                         test_server_config.health_check_timeout)
@@ -529,6 +562,9 @@ def stress_test(config,
     # Start server
     print_info("Starting trtllm-serve server...")
     print_info(f"Model path: {model_path}")
+    print_info(
+        f"Server port: {test_server_config.port} (allocated via CI port mechanism)"
+    )
 
     # Verify that model path exists
     if not os.path.exists(model_path):
@@ -551,7 +587,7 @@ def stress_test(config,
             extra_llm_options.update({
                 "cuda_graph_config": {
                     "enable_padding": True,
-                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
                 },
                 "print_iter_log": True,
             })
@@ -758,6 +794,7 @@ def create_aiperf_command(model_name,
                           model_path,
                           request_count,
                           concurrency,
+                          server_url,
                           input_len_mean=PerformanceParams.input_len_mean,
                           input_len_std=PerformanceParams.input_len_std,
                           output_len_mean=PerformanceParams.output_len_mean,
@@ -771,6 +808,7 @@ def create_aiperf_command(model_name,
         model_path: Path to the model
         request_count: Number of requests to send
         concurrency: Number of concurrent requests
+        server_url: URL of the server (e.g., "localhost:8000")
         input_len_mean: Mean input length
         input_len_std: Standard deviation of input length
         output_len_mean: Mean output length
@@ -789,6 +827,8 @@ def create_aiperf_command(model_name,
         model_path,
         "--endpoint-type",
         "completions",
+        "-u",
+        server_url,
         "--random-seed",
         "123",
         "--synthetic-input-tokens-mean",
@@ -805,7 +845,7 @@ def create_aiperf_command(model_name,
         str(concurrency),
         "--warmup-request-count",
         str(warmup_request_count),
-        "--verbose",
+        # "--verbose",
     ]
 
 
@@ -927,6 +967,7 @@ def measure_capacity_stage(model_name,
             model_path=model_path,
             request_count=request_count,
             concurrency=concurrency,
+            server_url=f"{server_config.host}:{server_config.port}",
             input_len_mean=performance_params.input_len_mean,
             input_len_std=performance_params.input_len_std,
             output_len_mean=performance_params.output_len_mean,
@@ -1022,6 +1063,7 @@ def stress_stage(model_name,
         model_path=model_path,
         request_count=request_count,
         concurrency=stress_concurrency,
+        server_url=f"{server_config.host}:{server_config.port}",
         input_len_mean=PerformanceParams.input_len_mean,
         input_len_std=PerformanceParams.input_len_std,
         output_len_mean=PerformanceParams.output_len_mean,
@@ -1065,35 +1107,6 @@ def format_time(seconds: int) -> str:
         return f"{minutes}m {seconds}s"
     else:
         return f"{seconds}s"
-
-
-def parse_accuracy_from_lm_eval_output(output_text: str) -> float:
-    """
-    Parse accuracy value from lm_eval output for GSM8K flexible-extract exact_match
-
-    Args:
-        output_text: The output text from lm_eval command
-
-    Returns:
-        float: The accuracy value (0.7582 in the example)
-    """
-    import re
-
-    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
-    patterns = [
-        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, output_text)
-        if match:
-            accuracy_value = float(match.group(1))
-            print_info(f"Extracted accuracy value: {accuracy_value}")
-            return accuracy_value
-
-    print_warning("Could not find accuracy value in lm_eval output")
-    print_warning(f"Output text: {output_text}")
-    return None
 
 
 def run_accuracy_test(model_path: str,
@@ -1155,7 +1168,7 @@ def run_accuracy_test(model_path: str,
 
             # Parse accuracy value from output
             output_text = result.stdout
-            accuracy_value = parse_accuracy_from_lm_eval_output(output_text)
+            accuracy_value = parse_gsm8k_output(output_text)
             return True, accuracy_value
         else:
             print_warning(
@@ -1173,15 +1186,21 @@ def run_accuracy_test(model_path: str,
         return False, None
 
 
-def extract_stress_test_metrics(artifacts_dir="./artifacts",
-                                current_model=None):
+def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     """
     Extract stress test metrics from the artifacts directory
 
     Args:
-        artifacts_dir (str): Path to the artifacts directory
+        artifacts_dir (str): Path to the artifacts directory. If None, defaults to
+                            the 'artifacts' directory at the defs level (parent of stress_test)
         current_model (str, optional): If provided, only analyze artifacts for this model
     """
+    # Set default artifacts_dir relative to this script's location
+    # The artifacts are at defs/artifacts/, one level up from stress_test/
+    if artifacts_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+
     # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,
                                    "**/profile_export_aiperf.json"),
@@ -1239,17 +1258,25 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                conCurrency = results.get("input_config", {}).get(
-                    "perf_analyzer", {}).get("stimulus",
-                                             {}).get("concurrency", 0)
+                conCurrency = results.get("input_config",
+                                          {}).get("loadgen",
+                                                  {}).get("concurrency", 0)
+                if conCurrency == 0:
+                    conCurrency = results.get("input_config", {}).get(
+                        "perf_analyzer", {}).get("stimulus",
+                                                 {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:
                     modelName = model_name_map[first_dir]
                 else:
                     # Fall back to model name from JSON if we can't extract from directory
-                    modelName = results.get("input_config",
-                                            {}).get("model", ["unknown"])
+                    modelName = results.get("input_config", {}).get(
+                        "endpoint", {}).get("model_names", None)
+                    if modelName is None:
+                        modelName = results.get("input_config",
+                                                {}).get("model_names",
+                                                        ["unknown"])
                     modelName = modelName[0] if isinstance(modelName,
                                                            list) else modelName
 

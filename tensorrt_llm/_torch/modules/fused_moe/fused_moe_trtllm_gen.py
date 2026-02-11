@@ -1,6 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import inspect
 import os
 from functools import cached_property
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -9,19 +25,20 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod,
-    UnquantizedFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEBaseMethod,
+    NVFP4TRTLLMGenFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
     W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
@@ -60,6 +77,88 @@ class TRTLLMGenFusedMoE(MoE):
     There should be at lease `num_experts` slots in the model engine. More than that is OK, in that case, some experts may have multiple replicas.
     """
 
+    # Supported quantization algorithms for TRTLLMGenFusedMoE
+    _SUPPORTED_QUANT_ALGOS = {
+        QuantAlgo.NVFP4,
+        QuantAlgo.FP8_BLOCK_SCALES,
+        QuantAlgo.W4A8_NVFP4_FP8,
+        QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    }
+
+    # Quantization algorithms that support gptoss_style
+    _GPTOSS_SUPPORTED_ALGOS = {
+        QuantAlgo.NVFP4,
+        QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    }
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if TRTLLMGenFusedMoE can implement the given quantization algorithm.
+
+        TRTLLMGenFusedMoE only supports SM in {100, 103} and the following quantizations:
+        - NVFP4
+        - FP8_BLOCK_SCALES
+        - W4A8_NVFP4_FP8
+        - W4A16_MXFP4
+        - W4A8_MXFP4_FP8
+        - W4A8_MXFP4_MXFP8
+
+        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation input data type. Only bfloat16 is supported.
+                See: forward_impl() assert x.dtype == torch.bfloat16 (line 722).
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                Only supported for nvfp4 and mxfp4 variants.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        # TRTLLMGenFusedMoE requires SM in {100, 103}
+        if sm_version not in {100, 103}:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
+            )
+
+        # Check dtype_activation: only bfloat16 is supported
+        if dtype_activation != torch.bfloat16:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE only supports bfloat16 activation, got {dtype_activation}"
+            )
+
+        # TRTLLMGenFusedMoE does NOT support unquantized mode
+        if quant_algo is None:
+            return _warn_and_return(
+                "TRTLLMGenFusedMoE does not support unquantized mode")
+
+        # Check if quant_algo is supported
+        if quant_algo not in cls._SUPPORTED_QUANT_ALGOS:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE does not support quant_algo={quant_algo}")
+
+        # Check gptoss_style support: only supported for nvfp4 and mxfp4 variants
+        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+            return _warn_and_return(
+                f"TRTLLMGenFusedMoE supports gptoss_style (bias/swiglu) only for nvfp4 and mxfp4 variants, "
+                f"got quant_algo={quant_algo}")
+
+        return True, None
+
     def __init__(
         self,
         *,
@@ -81,6 +180,7 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -98,6 +198,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
 
         sm_version = get_sm_version()
@@ -139,15 +240,22 @@ class TRTLLMGenFusedMoE(MoE):
                     dtype = self.dtype or torch.bfloat16
 
                     workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-                        ep_size, self.routing_method.experts_per_token,
-                        max_num_tokens, hidden_size, dtype)
+                        ep_size,
+                        self.routing_method.experts_per_token,
+                        max_num_tokens,
+                        hidden_size,
+                        dtype,
+                        self.num_experts if self.layer_load_balancer else None,
+                    )
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_slots,
-                        workspace_size_per_rank=workspace_size)
+                        num_slots=self.num_slots,
+                        workspace_size_per_rank=workspace_size,
+                        num_experts=self.num_experts
+                        if self.layer_load_balancer else None)
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
                         "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"
@@ -168,6 +276,15 @@ class TRTLLMGenFusedMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+    def _to_trtllm_gen_activation_type(self,
+                                       activation_type: ActivationType) -> int:
+        if activation_type == ActivationType.Swiglu:
+            return 0
+        elif activation_type == ActivationType.Relu2:
+            return 1
+        else:
+            raise ValueError(f"Unsupported activation type: {activation_type}")
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         # If no attention DP, no need to use AlltoAll.
@@ -214,7 +331,7 @@ class TRTLLMGenFusedMoE(MoE):
             or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
         if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
-            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports mxfp4 quantization with bias, swiglu_alpha, swiglu_beta and swiglu_limit."
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE supports bias/swiglu only for nvfp4 and mxfp4 variants."
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -222,7 +339,9 @@ class TRTLLMGenFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
-                return NVFP4TRTLLMGenFusedMoEMethod()
+                return NVFP4TRTLLMGenFusedMoEMethod(
+                ) if self.swiglu_alpha is not None or self.activation_type == ActivationType.Relu2 else NVFP4TRTLLMGenFusedMoEBaseMethod(
+                )
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
@@ -271,16 +390,12 @@ class TRTLLMGenFusedMoE(MoE):
         assert len(weights) == 1
         weights = weights[0]
 
-        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-            assert not allow_partial_loading, "Partial loading is not supported for quantized MoE now"
-            self.quant_method.load_weights(self, weights,
-                                           self.weight_loading_mode)
-        else:
-            self.quant_method.load_weights(
-                self,
-                weights,
-                self.weight_loading_mode,
-                allow_partial_loading=allow_partial_loading)
+        kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(
+                self.quant_method.load_weights).args:
+            kargs["allow_partial_loading"] = allow_partial_loading
+        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
+                                       **kargs)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
@@ -324,6 +439,11 @@ class TRTLLMGenFusedMoE(MoE):
                         self,
                         'fc31_act_scale') and self.fc31_act_scale is not None:
                     x = x * self.fc31_act_scale
+
+                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                if pad_size > 0:
+                    x = torch.nn.functional.pad(x, (0, pad_size))
+
                 x_row = x.shape[0]
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
                     x, self.fc31_input_scale, self.scaling_vector_size, False,
@@ -411,6 +531,10 @@ class TRTLLMGenFusedMoE(MoE):
 
         routing_bias = routing_bias if router_logits is not None else None
 
+        if token_selected_experts is not None:
+            # for cases like deepep low latency where fake top_k=1 might be used
+            top_k = token_selected_experts.shape[-1]
+
         # Ensure x_sf is 2D before flattening
         if x_sf is not None:
             assert len(
@@ -446,7 +570,10 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_ids=token_selected_experts,
             )
         elif self.has_nvfp4:
-
+            factor = 1 if self.activation_type == ActivationType.Relu2 else 2
+            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
+                -2] // factor
+            act_type = self._to_trtllm_gen_activation_type(self.activation_type)
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -454,8 +581,13 @@ class TRTLLMGenFusedMoE(MoE):
                 x_sf.view(torch.float8_e4m3fn),
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                self.w3_w1_bias if self.bias else None,
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale.view(torch.float8_e4m3fn),
+                self.w2_bias if self.bias else None,
                 self.fc31_scale_c.data,
                 self.fc31_alpha.data,
                 self.fc2_alpha.data,
@@ -463,12 +595,13 @@ class TRTLLMGenFusedMoE(MoE):
                 top_k,
                 n_group,
                 topk_group,
-                self.intermediate_size_per_partition,
+                intermediate_size_per_partition_padded,
                 self.slot_start,
                 self.expert_size_per_partition,
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
+                act_type=act_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
             )
@@ -478,6 +611,11 @@ class TRTLLMGenFusedMoE(MoE):
                 return outputs
             else:
                 final_hidden_states = outputs[0]
+                # Slice output if it was padded
+                if final_hidden_states.shape[1] > self.hidden_size:
+                    final_hidden_states = final_hidden_states[:, :self.
+                                                              hidden_size].contiguous(
+                                                              )
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
 
@@ -591,7 +729,7 @@ class TRTLLMGenFusedMoE(MoE):
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
 
-            final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+            result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 x,
@@ -621,6 +759,10 @@ class TRTLLMGenFusedMoE(MoE):
                 token_selected_experts,
                 output=moe_output,
             )
+
+            # When output is provided, use it directly as the result
+            # (custom op returns empty tensor to avoid PyTorch aliasing constraints)
+            final_hidden_states = moe_output if moe_output is not None else result
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."
@@ -670,7 +812,10 @@ class TRTLLMGenFusedMoE(MoE):
 
             self._load_balancer_done_wait_gpu_stage(is_first_call)
 
-            ignore_allreduce = self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type in (
+                AlltoallMethodType.NVLinkTwoSided,
+                AlltoallMethodType.NVLinkOneSided,
+            )
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -758,14 +903,32 @@ class TRTLLMGenFusedMoE(MoE):
                 payloads.append(token_selected_experts)
                 payloads.append(token_final_scales)
 
-                recv_tensors = self.moe_a2a.dispatch(
-                    token_selected_experts,
-                    payloads,
-                    runtime_max_tokens_per_rank,
-                    invalid_token_expert_id=
-                    -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
-                    expert_id_payload_index=expert_id_payload_index,
-                )
+                loadbalancer_local_statistic_info = None
+                if self.layer_load_balancer and is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
+                    )
+                if loadbalancer_local_statistic_info is not None:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_experts,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=
+                        -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                        eplb_local_stats=loadbalancer_local_statistic_info,
+                    )
+                    gathered_stats = self.moe_a2a._state.eplb_gathered_stats
+                    self._load_balancer_update_statistic_with_gathered_statistic(
+                        gathered_stats)
+                else:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_experts,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=
+                        -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                    )
 
                 if x_sf is not None:
                     x_recv, x_sf_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors

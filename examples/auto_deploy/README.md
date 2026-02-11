@@ -1,6 +1,6 @@
 # 🔥🚀⚡ AutoDeploy Examples
 
-This folder contains runnable examples for **AutoDeploy**. For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/torch/auto_deploy/auto-deploy.html).
+This folder contains runnable examples for **AutoDeploy**. For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
 
 ______________________________________________________________________
 
@@ -49,7 +49,6 @@ Below is a non-exhaustive list of common configuration options:
 | `--args.mla-backend` | Specifies implementation for multi-head latent attention |
 | `--args.max-seq-len` | Maximum sequence length for inference/cache |
 | `--args.max-batch-size` | Maximum dimension for statically allocated KV cache |
-| `--args.attn-page-size` | Page size for attention |
 | `--prompt.batch-size` | Number of queries to generate |
 | `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
@@ -125,10 +124,8 @@ llm = LLM(
     compile_backend="torch-compile",
     model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
     attn_backend="flashinfer", # choose between "triton" and "flashinfer"
-    attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
     skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory
-    free_mem_ratio=0.8, # fraction of available memory for cache
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,
 )
@@ -334,4 +331,5 @@ the current progress in AutoDeploy and where you can help.
 
 ## Disclaimer
 
-This project is under active development and is currently in a prototype stage. The code is experimental, subject to change, and may include backward-incompatible updates. While we strive for correctness, there are no guarantees regarding functionality, stability, or reliability.
+This project is under active development and is currently released as beta feature. The code is
+subject to change, and may include backward-incompatible updates.

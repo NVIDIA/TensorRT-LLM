@@ -17,9 +17,11 @@ l0_a10:
   - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/sampler/test_torch_multi_arange.py
   - unittest/utils/test_util.py
+  - unittest/_torch/test_model_config.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
+  - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
@@ -29,10 +31,17 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
+  - unittest/disaggregated/test_openai_disagg_service.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
+  - unittest/disaggregated/test_agent_multi_backends.py
+  - unittest/disaggregated/test_messenger.py
   - unittest/disaggregated/test_disagg_cluster_manager_worker.py
   - unittest/disaggregated/test_cluster_storage.py
+  - unittest/disaggregated/test_extractor.py
+  - unittest/disaggregated/test_extractor_v2.py
+  - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/region/test_block.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
@@ -44,6 +53,7 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
@@ -52,7 +62,6 @@ l0_a10:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
-  - test_e2e.py::test_openai_chat_guided_decoding
   - test_e2e.py::test_get_ci_container_port
   - test_e2e.py::test_openai_chat_multimodal_example ISOLATION
   - test_e2e.py::test_openai_mmencoder_example
@@ -65,6 +74,7 @@ l0_a10:
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]
   - test_e2e.py::test_openai_tool_call
+  - test_e2e.py::test_openai_responses_entrypoint
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
@@ -181,6 +191,7 @@ l0_a10:
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - unittest/trt/attention/test_gpt_attention_no_cache.py
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
+  - unittest/kv_cache_manager_v2_tests/ # 4 min
 - condition:
     ranges:
       system_gpu_count:
@@ -237,8 +248,8 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
   - accuracy/test_llm_api.py::TestEagleVicuna_7B_v1_3::test_auto_dtype
   - accuracy/test_llm_api.py::TestEagle2Vicuna_7B_v1_3::test_auto_dtype
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test]
   - test_e2e.py::test_gpt3_175b_1layers_build_only # 6 mins
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/model/test_mamba.py # 3 mins
@@ -258,8 +269,8 @@ l0_a10:
       stage: post_merge
       backend: pytorch
   tests:
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
 - condition:
     ranges:
       system_gpu_count:
@@ -274,19 +285,3 @@ l0_a10:
       backend: fmha
   tests:
   - test_fmha.py::test_fmha TIMEOUT (90)
-l0_a10_pybind:
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*a10*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-  tests:
-  - unittest/bindings
-  - test_e2e.py::test_openai_chat_example[trt]
-  - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)

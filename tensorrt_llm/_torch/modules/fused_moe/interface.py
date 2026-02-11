@@ -1,3 +1,4 @@
+import os
 import weakref
 from abc import abstractmethod
 from enum import Enum, IntEnum
@@ -6,7 +7,30 @@ from typing import Dict, List, Optional, Tuple, Union, final
 import torch
 from torch import nn
 
+from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
+
 from ...distributed.ops import reducescatter
+
+
+def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
+    """
+    Log a warning and return (False, reason) for can_implement() checks.
+
+    This is a common utility function used by all MoE backend implementations
+    to provide consistent logging and return values when a configuration
+    is not supported.
+
+    Args:
+        reason: The reason why the configuration is not supported.
+
+    Returns:
+        Tuple[bool, Optional[str]]: Always returns (False, reason)
+    """
+    logger.warning(reason)
+    return False, reason
+
+
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
@@ -128,6 +152,40 @@ class MoE(nn.Module):
         aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
     """
 
+    @classmethod
+    @abstractmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if this MoE backend can implement the given quantization algorithm.
+
+        NOTE: This is a TRANSITIONAL interface. In the future, this method will be moved
+        to the MoEBackend interface as part of the backend abstraction layer. During this
+        transition period, it remains in the MoE base class to maintain compatibility.
+
+        This method checks both:
+        1. Whether the backend supports the specified quantization algorithm
+        2. Whether the current platform (SM version) supports the backend and quantization
+
+        Each backend MUST override this method to provide accurate capability information.
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation data type.
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+                - can_implement: True if the backend can implement this configuration
+                - skip_reason: None if can_implement is True, otherwise a string explaining why not
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} must implement can_implement method")
+
     def __init__(
         self,
         *,
@@ -200,11 +258,19 @@ class MoE(nn.Module):
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
         self.all_reduce = None
+        # Debug function for eliminating imbalance during performance analysis.
+        self.enable_dummy_allreduce = os.environ.get(
+            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
         if not self.use_dp and self.mapping.tp_size > 1:
             self.all_reduce = AllReduce(
                 mapping=self.mapping,
                 strategy=model_config.allreduce_strategy,
                 dtype=self.dtype)
+        elif self.enable_dummy_allreduce:
+            from tensorrt_llm.functional import AllReduceStrategy
+            self.all_reduce = AllReduce(mapping=self.mapping,
+                                        strategy=AllReduceStrategy.NCCL,
+                                        dtype=self.dtype)
 
         # Initialize load balancer related attributes
         if init_load_balancer:
@@ -512,11 +578,43 @@ class MoE(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
+        """
+        Args:
+            weights: List of weight dictionaries to load.
+            allow_partial_loading: Whether to enable partial loading for module parameters.
+                When True, weights are loaded without applying quantization transformations.
+                When False (default), weights are loaded and quantized together.
+        """
         raise NotImplementedError
 
     def post_load_weights(self):
         pass
+
+    def process_weights_after_loading(self):
+        """
+        Apply quantization processing to loaded weights.
+
+        When allow_partial_loading=True is used in load_weights(), this method
+        must be called separately to complete the loading setup.
+        """
+        if hasattr(self.quant_method, 'process_weights_after_loading'):
+            self.quant_method.process_weights_after_loading(self)
+
+    def pre_reload_weights(self):
+        """
+        Prepare tensors for weight reloading by reverting them to their original creation shape.
+        """
+        assert hasattr(
+            self.quant_method, 'pre_reload_weights'
+        ), "pre_reload_weights is not supported for this quant method"
+        if self._using_load_balancer():
+            raise NotImplementedError(
+                "Weight reloading is not compatible with Expert Parallel Load Balancer (EPLB). "
+            )
+        self.quant_method.pre_reload_weights(self)
 
     @abstractmethod
     def quantize_input(
@@ -748,3 +846,14 @@ class MoE(nn.Module):
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
         return outputs
+
+    def dummy_allreduce(self):
+        assert self.enable_dummy_allreduce and self.all_reduce is not None, "Dummy allreduce is not enabled"
+        """
+        Debug function for eliminating imbalance during performance analysis.
+        Creates a small dummy tensor and performs allreduce to synchronize processes
+        and eliminate timing imbalances for more accurate profiling measurements.
+        """
+        dummy_tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
+        dummy_tensor = self.all_reduce(dummy_tensor)
+        return dummy_tensor

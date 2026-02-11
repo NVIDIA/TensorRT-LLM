@@ -907,7 +907,7 @@ std::vector<IdType> Executor::Impl::enqueueRequests(common::ArrayView<Request co
         auto now = std::chrono::steady_clock::now();
         for (auto const& req : requests)
         {
-            ids.emplace_back(generateReqId());
+            ids.emplace_back(generateReqId(req));
             TLLM_LOG_DEBUG("Enqueue new request with id %d", ids.back());
 
             std::vector<IdType> childReqIds;
@@ -917,7 +917,7 @@ std::vector<IdType> Executor::Impl::enqueueRequests(common::ArrayView<Request co
                 childReqIds.reserve(numChildRequests);
                 for (int childId = 0; childId < numChildRequests; childId++)
                 {
-                    childReqIds.emplace_back(generateReqId());
+                    childReqIds.emplace_back(generateLocalReqId());
                     TLLM_LOG_DEBUG("Add new child request with id %d", childReqIds.back());
                 }
             }
@@ -1319,7 +1319,7 @@ std::vector<RequestWithId> Executor::Impl::getLeaderNewReqWithIds(
         return reqWithIds;
     }
 
-    if (mQueuedRequests.front().id == mTerminateReqId)
+    if (mQueuedRequests.front().id == kTerminateReqId)
     {
         reqWithIds.emplace_back(std::move(mQueuedRequests.front()));
         mQueuedRequests.pop_front();
@@ -1468,7 +1468,7 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
     double newActiveRequestsQueueLatencyMS{0.};
     for (auto& reqWithId : reqWithIds)
     {
-        if (reqWithId.id == mTerminateReqId)
+        if (reqWithId.id == kTerminateReqId)
         {
             mShutdown = true;
             mResponsesCv.notify_all();
@@ -2179,11 +2179,11 @@ void Executor::Impl::terminateContextFinishedRequests(InTransList& inTransmissio
         auto req = item.request;
         if (req->isDisaggContextCompleteState())
         {
-            // If lastBlockId was tracked, unpin it. Otherwise, just terminate.
+            // If pinnedBlockIds were tracked, unpin them. Otherwise, just terminate.
             auto kvMgr = mModel->getKVCacheManager();
-            if (kvMgr && item.lastBlockId.has_value())
+            if (kvMgr && !item.pinnedBlockIds.empty())
             {
-                kvMgr->unpinBlocksById(item.lastBlockId.value());
+                kvMgr->unpinBlocksById(item.pinnedBlockIds);
             }
             else
             {
@@ -2234,14 +2234,14 @@ Executor::Impl::RequestList Executor::Impl::populateNewResponses(
             // move the in transmission requests to another tracker
             if (llmReq->isDisaggContextTransmissionState())
             {
-                std::optional<SizeType32> lastBlockId{};
+                std::vector<SizeType32> pinnedBlockIds{};
                 auto kvMgr = mModel->getKVCacheManager();
                 if (kvMgr && kvMgr->isEnableBlockReuse() && !kvMgr->getBlockManager().isVariableWindow())
                 {
-                    lastBlockId = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
+                    pinnedBlockIds = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
                     mModel->terminateRequest(llmReq);
                 }
-                inTransmissionRequests.push_back(InTransmissionItem{*it, lastBlockId});
+                inTransmissionRequests.push_back(InTransmissionItem{*it, pinnedBlockIds});
             }
             finishedRequests.push_back(*it);
             it = activeRequests.erase(it);
@@ -2357,7 +2357,6 @@ void Executor::Impl::executionLoop()
                 }
             }
         }
-
         if (!activeRequests.empty())
         {
             forwardAsync(activeRequests);
@@ -2411,7 +2410,7 @@ void Executor::Impl::enqueueTerminateRequest()
     {
         std::scoped_lock<std::mutex> lck(mQueuedReqMtx);
         Request dummyReq({1}, 1);
-        RequestWithId reqWithId{std::move(dummyReq), mTerminateReqId};
+        RequestWithId reqWithId{std::move(dummyReq), kTerminateReqId};
         mQueuedRequests.emplace_back(reqWithId);
     }
     mQueuedReqCv.notify_one();

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import faulthandler
 import math
 import os
@@ -106,6 +107,9 @@ skip_pre_ada = pytest.mark.skipif(
 skip_pre_hopper = pytest.mark.skipif(
     getSMVersion() < 90,
     reason="This test is not supported in pre-Hopper architecture")
+skip_no_hopper = pytest.mark.skipif(
+    getSMVersion() != 90,
+    reason="This test is only supported in Hopper architecture")
 skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
@@ -386,6 +390,23 @@ def run_session(session: Session,
     stream.synchronize()
 
     return outputs
+
+
+@contextlib.contextmanager
+def altered_env(**kwargs):
+    old = {}
+    for k, v in kwargs.items():
+        if k in os.environ:
+            old[k] = os.environ[k]
+        os.environ[k] = v
+    try:
+        yield
+    finally:
+        for k in kwargs:
+            if k not in old:
+                os.environ.pop(k)
+            else:
+                os.environ[k] = old[k]
 
 
 def similarity_score(a, b):

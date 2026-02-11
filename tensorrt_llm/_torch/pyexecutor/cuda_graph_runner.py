@@ -10,14 +10,16 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.mapping import Mapping
 
 from ...inputs.multimodal import MultimodalParams
-from ..distributed import MPIDist
+from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import get_draft_token_length
+from .mamba_cache_manager import MambaCacheManager, use_cpp_mamba_cache_manager
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -74,7 +76,7 @@ class CUDAGraphRunnerConfig:
     enable_attention_dp: bool
     batch_size: int
     mapping: Optional[Mapping]
-    dist: Optional[MPIDist]
+    dist: Optional[Distributed]
     kv_cache_manager_key: Any
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
 
@@ -433,22 +435,35 @@ class CUDAGraphRunner:
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
         if self.padding_dummy_request is None:
-            available_blocks = kv_cache_manager.get_num_free_blocks()
-            # No padding if not enough KV cache space
-            if available_blocks < 1:
-                return 0
+
+            # Get draft KV cache manager only for one-model speculative decoding.
+            # In two-model mode, each model has its own KV cache manager, so
+            # draft_kv_cache_manager should be None.
+            draft_kv_cache_manager = get_draft_kv_cache_manager(
+                self.spec_config, resource_manager)
 
             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
-                max_beam_width=self.config.max_beam_width)[0]
+                max_beam_width=self.config.max_beam_width,
+                draft_kv_cache_manager=draft_kv_cache_manager)
+
+            if self.padding_dummy_request is None:
+                return 0
+            else:
+                self.padding_dummy_request = self.padding_dummy_request[0]
             self.padding_dummy_request.is_cuda_graph_dummy = True
             spec_res_mgr = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_res_mgr:
                 spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
+
+        if (isinstance(kv_cache_manager, MambaCacheManager)
+                and not use_cpp_mamba_cache_manager()):
+            kv_cache_manager.reorder_state_indices_when_padding_requests(
+                batch_size, padding_size)
 
         self.padding_dummy_request.py_draft_tokens = [0] * runtime_draft_len
         batch.generation_requests.extend([self.padding_dummy_request] *

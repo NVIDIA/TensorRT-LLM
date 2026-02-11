@@ -83,7 +83,7 @@ def wget(url, out):
 def llm_models_root() -> str:
     """Return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path."""
 
-    root = Path("/home/scratch.trt_llm_data/llm-models/")
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ.get("LLM_MODELS_ROOT"))
 
@@ -2689,8 +2689,7 @@ def get_gpu_memory_wo_pynvml():
     import psutil
 
     logger.warning(
-        f"\nWarning: pynvml not available, using fallback commands for memory monitoring"
-    )
+        f"pynvml not available, using fallback commands for memory monitoring")
 
     gpu_memory = {}
     system_total_mb = 0

@@ -130,7 +130,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        capture_graph = self.is_cuda_graph
 
         if self.workspace_buffer is None:
             # Note: even though flashinfer only recommends 128 MB, we have to push it
@@ -204,6 +204,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.tokens_per_block
 
     def prepare(self) -> None:
+        super().prepare()
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
@@ -425,6 +426,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 paged_kv_indices_buffer=self._paged_kv_indices,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
                 use_tensor_cores=use_tensor_cores,
+                backend="fa2"
+                if torch.cuda.get_device_capability(0) == (9, 0) else "auto",
             )
 
         def decode_plan():

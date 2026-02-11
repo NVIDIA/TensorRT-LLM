@@ -1,5 +1,5 @@
 from operator import getitem
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
@@ -14,13 +14,13 @@ aten = torch.ops.aten
 from tensorrt_llm.mapping import Mapping
 
 
-def register_ar_residual_norm(custom_pass: PatternMatcherPass,
-                              mapping: Mapping):
+def register_ar_residual_norm(custom_pass: PatternMatcherPass, mapping: Mapping,
+                              allreduce_func: Callable):
     residual_key = KeywordArg("residual")
     trtllm_allreduce_default = CallFunction(
-        torch.ops.trtllm.allreduce.default, KeywordArg("input"), None, None,
-        None, None, KeywordArg("workspace"), mapping.tp_group,
-        KeywordArg("strategy"), int(AllReduceFusionOp.NONE), Ignored(),
+        allreduce_func.default, KeywordArg("input"), None, None, None, None,
+        KeywordArg("workspace"), mapping.tp_group, KeywordArg("strategy"),
+        int(AllReduceFusionOp.NONE), Ignored(),
         KeywordArg("trigger_completion_at_end"))
     getitem_x = CallFunction(getitem, trtllm_allreduce_default, 0)
     add_Tensor = CallFunction(aten.add.Tensor,
@@ -56,7 +56,7 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass,
         eps: float,
         trigger_completion_at_end: bool,
     ):
-        all_reduce_output = torch.ops.trtllm.allreduce(
+        all_reduce_output = allreduce_func(
             input, residual, norm_weight, None, None, workspace,
             mapping.tp_group, int(strategy),
             int(AllReduceFusionOp.RESIDUAL_RMS_NORM), float(eps),
@@ -111,10 +111,11 @@ def check_non_ub_strategy(match, strategy_node) -> bool:
 
 
 def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
-                                            mapping: Mapping):
+                                            mapping: Mapping,
+                                            allreduce_func: Callable):
     input_node = KeywordArg("input")
     strategy_node = KeywordArg("strategy")
-    allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
+    allreduce_default = CallFunction(allreduce_func.default,
                                      input_node,
                                      KeywordArg("residual"),
                                      KeywordArg("gamma"),
@@ -165,7 +166,7 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
         scale: torch.Tensor,
         trigger_completion_at_end: bool,
     ):
-        allreduce = torch.ops.trtllm.allreduce(
+        allreduce = allreduce_func(
             input, residual, gamma, scale, None, workspace, mapping.tp_group,
             int(strategy),
             int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8), float(eps),
@@ -188,10 +189,11 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
 
 
 def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
-                                        mapping: Mapping):
+                                        mapping: Mapping,
+                                        allreduce_func: Callable):
     input_node = KeywordArg("input")
     strategy_node = KeywordArg("strategy")
-    allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
+    allreduce_default = CallFunction(allreduce_func.default,
                                      input_node,
                                      KeywordArg("residual"),
                                      KeywordArg("gamma"),
@@ -242,7 +244,7 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
         scale: torch.Tensor,
         trigger_completion_at_end: bool,
     ):
-        allreduce = torch.ops.trtllm.allreduce(
+        allreduce = allreduce_func(
             input, residual, gamma, scale, None, workspace, mapping.tp_group,
             int(strategy), int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8),
             float(eps), trigger_completion_at_end)
@@ -264,10 +266,11 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
 
 
 def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
-                                            mapping: Mapping):
+                                            mapping: Mapping,
+                                            allreduce_func: Callable):
     input_node = KeywordArg("input")
     strategy_node = KeywordArg("strategy")
-    allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
+    allreduce_default = CallFunction(allreduce_func.default,
                                      input_node,
                                      KeywordArg("residual"),
                                      KeywordArg("gamma"),
@@ -313,7 +316,7 @@ def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
         scale: torch.Tensor,
         trigger_completion_at_end: bool,
     ):
-        allreduce = torch.ops.trtllm.allreduce(
+        allreduce = allreduce_func(
             input, residual, gamma, scale, None, workspace, mapping.tp_group,
             int(strategy),
             int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4),
@@ -336,10 +339,11 @@ def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
 
 
 def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass,
-                                        mapping: Mapping):
+                                        mapping: Mapping,
+                                        allreduce_func: Callable):
     input_node = KeywordArg("input")
     strategy_node = KeywordArg("strategy")
-    allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
+    allreduce_default = CallFunction(allreduce_func.default,
                                      input_node,
                                      KeywordArg("residual"),
                                      KeywordArg("gamma"),
@@ -385,7 +389,7 @@ def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass,
         scale: torch.Tensor,
         trigger_completion_at_end: bool,
     ):
-        allreduce = torch.ops.trtllm.allreduce(
+        allreduce = allreduce_func(
             input, residual, gamma, scale, None, workspace, mapping.tp_group,
             int(strategy), int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4),
             float(eps), trigger_completion_at_end)
@@ -407,17 +411,20 @@ def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass,
 
 
 def register_ub_patterns(custom_passes: List[PatternMatcherPass],
-                         mapping: Mapping):
+                         mapping: Mapping, allreduce_func: Callable):
 
     def register_convert_supported_ar_to_ub(custom_pass: PatternMatcherPass):
         strategy = int(AllReduceStrategy.AUTO)
         input_node = KeywordArg('input')
         fusion = KeywordArg('fusion_op')
-        trtllm_allreduce_default = CallFunction(
-            torch.ops.trtllm.allreduce.default, input_node,
-            KeywordArg('residual_in'), KeywordArg('gamma'), KeywordArg('scale'),
-            None, Ignored(), mapping.tp_group, strategy, fusion,
-            KeywordArg('eps'), Ignored())
+        trtllm_allreduce_default = CallFunction(allreduce_func.default,
+                                                input_node,
+                                                KeywordArg('residual_in'),
+                                                KeywordArg('gamma'),
+                                                KeywordArg('scale'), None,
+                                                Ignored(), mapping.tp_group,
+                                                strategy, fusion,
+                                                KeywordArg('eps'), Ignored())
 
         def empty_convert_supported_ar_to_ub(
             input: torch.Tensor,
@@ -667,7 +674,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             torch.ops.trtllm.userbuffers_allreduce_finalize.default,
             KeywordArg("sharded_residual"), False)
         trtllm_allreduce_default = CallFunction(
-            torch.ops.trtllm.allreduce.default, KeywordArg("input"),
+            torch.ops.trtllm.allreduce, KeywordArg("input"),
             trtllm_userbuffers_allreduce_finalize_default, KeywordArg("gamma"),
             KeywordArg("scale"), Ignored(), Ignored(), mapping.tp_group,
             int(AllReduceStrategy.UB), KeywordArg("fusion_op"),
@@ -706,6 +713,65 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             search_fn_pattern=trtllm_allreduce_default,
         )
 
+    def insert_copy_for_graph_output(custom_pass: PatternMatcherPass):
+        trtllm_allreduce_default = CallFunction(
+            torch.ops.trtllm.allreduce.default, KeywordArg("input"),
+            KeywordArg("residual"), KeywordArg("gamma"), KeywordArg("scale"),
+            None, None, mapping.tp_group, int(AllReduceStrategy.UB),
+            KeywordArg("fusion_op"), KeywordArg("eps"), Ignored())
+
+        def empty_copy_for_graph_output_pattern(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            gamma: torch.Tensor,
+            scale: Optional[torch.Tensor],
+            fusion_op: int,
+            eps: float,
+        ):
+            return
+
+        def target_copy_for_graph_output_pattern(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            gamma: torch.Tensor,
+            scale: Optional[torch.Tensor],
+            fusion_op: int,
+            eps: float,
+        ):
+            allreduce_output = torch.ops.trtllm.allreduce(
+                input, residual, gamma, scale, None, None, mapping.tp_group,
+                int(AllReduceStrategy.UB), fusion_op, eps, False)
+            non_ub_tensor = torch.empty_like(allreduce_output[0])
+            non_ub_tensor.copy_(allreduce_output[0])
+            allreduce_output[0] = non_ub_tensor
+            return allreduce_output
+
+        def extra_check(match: Match) -> bool:
+            ar_node = match.ctx.pattern_to_node[trtllm_allreduce_default]
+            assert isinstance(ar_node, torch.fx.graph.Node)
+            for user_node in ar_node.users:
+                if not isinstance(user_node, torch.fx.graph.Node):
+                    continue
+                if user_node.op == "call_function" and user_node.target == getitem and user_node.args[
+                        1] == 0:
+                    # Check whether the getitem is connected to output
+                    for getitem_user in user_node.users:
+                        if not isinstance(getitem_user, torch.fx.graph.Node):
+                            continue
+                        if getitem_user.op == "output":
+                            return True
+            return False
+
+        register_replacement(
+            empty_copy_for_graph_output_pattern,
+            target_copy_for_graph_output_pattern,
+            [],
+            fwd_only,
+            custom_pass,
+            search_fn_pattern=trtllm_allreduce_default,
+            extra_check=extra_check,
+        )
+
     custom_passes.append(PatternMatcherPass())
     register_convert_supported_ar_to_ub(custom_passes[-1])
 
@@ -715,18 +781,34 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
     custom_passes.append(PatternMatcherPass())
     register_ub_finalize_patterns(custom_passes[-1])
 
+    custom_passes.append(PatternMatcherPass())
+    insert_copy_for_graph_output(custom_passes[-1])
+
 
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],
                         mapping: Mapping, enable_ub: bool):
-    register_ar_residual_norm(custom_passes[-1], mapping)
+    register_ar_residual_norm(custom_passes[-1], mapping,
+                              torch.ops.trtllm.allreduce)
+    register_ar_residual_norm(custom_passes[-1], mapping,
+                              torch.ops.trtllm.tunable_allreduce)
 
     custom_passes.append(PatternMatcherPass())
-    register_ar_residual_norm_fp8_quant(custom_passes[-1], mapping)
-    register_ar_residual_norm_fp4_quant(custom_passes[-1], mapping)
-    # AR-Residual-Norm-Out-Quant-X is not supported by Userbuffers kernel.
-    if not enable_ub:
-        register_ar_residual_norm_out_fp8_quant(custom_passes[-1], mapping)
-        register_ar_residual_norm_out_fp4_quant(custom_passes[-1], mapping)
+    for allreduce_func in [
+            torch.ops.trtllm.allreduce, torch.ops.trtllm.tunable_allreduce
+    ]:
+        register_ar_residual_norm_fp8_quant(custom_passes[-1], mapping,
+                                            allreduce_func)
+        register_ar_residual_norm_fp4_quant(custom_passes[-1], mapping,
+                                            allreduce_func)
+
+        # AR-Residual-Norm-Out-Quant-X is not supported by Userbuffers kernel.
+        if not enable_ub:
+            register_ar_residual_norm_out_fp8_quant(custom_passes[-1], mapping,
+                                                    allreduce_func)
+            register_ar_residual_norm_out_fp4_quant(custom_passes[-1], mapping,
+                                                    allreduce_func)
 
     if enable_ub:
-        register_ub_patterns(custom_passes, mapping)
+        register_ub_patterns(custom_passes, mapping, torch.ops.trtllm.allreduce)
+        register_ub_patterns(custom_passes, mapping,
+                             torch.ops.trtllm.tunable_allreduce)

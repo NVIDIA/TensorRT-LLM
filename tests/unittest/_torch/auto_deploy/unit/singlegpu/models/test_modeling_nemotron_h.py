@@ -11,7 +11,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHForCausalLM
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
@@ -164,7 +164,7 @@ def test_custom_model_implementation_can_be_exported(
                 "dtype": "bfloat16",
             },
         }
-    llm_args = AutoDeployConfig(**llm_args)
+    llm_args = LlmArgs(**llm_args)
 
     factory = llm_args.create_factory()
     model = factory.build_model("meta")
@@ -184,12 +184,11 @@ def test_custom_model_implementation_can_be_exported(
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).repeat(
         input_ids.shape[0], 1
     )
+    batch_size_dynamic = Dim.DYNAMIC
+    seq_len_dynamic = Dim.DYNAMIC
     dynamic_shapes = (
-        {0: Dim("batch_size", min=0, max=8), 1: Dim("seq_len", min=0, max=512)},
-        {
-            0: Dim("batch_size", min=0, max=8),
-            1: Dim("seq_len", min=0, max=512),
-        },
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
     )
 
     def _run_torch_export_to_gm():

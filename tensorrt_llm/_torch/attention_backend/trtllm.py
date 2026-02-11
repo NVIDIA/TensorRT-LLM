@@ -35,7 +35,6 @@ class TrtllmAttentionWrapper:
     host_context_lengths: torch.Tensor
     host_request_types: torch.Tensor
     kv_cache_block_offsets: torch.Tensor
-    host_kv_cache_block_offsets: torch.Tensor
     host_kv_cache_pool_pointers: torch.Tensor
     host_kv_cache_pool_mapping: torch.Tensor
     workspace: Optional[torch.Tensor]
@@ -181,7 +180,6 @@ class TrtllmAttentionWrapper:
         host_context_lengths: torch.Tensor = ...,
         host_request_types: torch.Tensor = ...,
         kv_cache_block_offsets: Optional[torch.Tensor] = None,
-        host_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
         host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
         block_ids_per_seq: Optional[torch.Tensor] = None,
@@ -242,8 +240,7 @@ class TrtllmAttentionWrapper:
             context_lengths (torch.Tensor): The context-phase sequence length of each request with shape (batch_size) on GPU.
             host_context_lengths (torch.Tensor): Same as context_lengths, but on CPU.
             host_request_types (torch.Tensor): The tensor that indicates whether a request is in context or generation phase, with shape (batch_size) on CPU.
-            kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
-            host_kv_cache_block_offsets (torch.Tensor): Same as kv_cache_block_offsets, but on CPU.
+            kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block. If kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
             host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory.
             host_kv_cache_pool_mapping (torch.Tensor): The index of the pool used by each attention layer on CPU, its shape is (num_local_attention_layers). The local attention layers mean all attention layers in the current PP stage in the pipeline parallelism case.
             workspace (torch.Tensor): An optional workspace tensor on GPU.
@@ -284,7 +281,6 @@ class TrtllmAttentionWrapper:
         self.host_context_lengths = host_context_lengths
         self.host_request_types = host_request_types
         self.kv_cache_block_offsets = kv_cache_block_offsets
-        self.host_kv_cache_block_offsets = host_kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
         self.workspace = workspace
@@ -511,7 +507,6 @@ class TrtllmAttentionWrapper:
             self.host_context_lengths,
             self.host_request_types,
             self.kv_cache_block_offsets,
-            self.host_kv_cache_block_offsets,
             self.host_kv_cache_pool_pointers,
             self.host_kv_cache_pool_mapping,
             self.cache_indirection,
@@ -684,6 +679,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_is_inactive_rank: Optional[torch.Tensor] = None
     helix_is_inactive_rank_cpu: Optional[torch.Tensor] = None
 
+    # Block offsets for the target and draft KV caches
+    kv_cache_block_offsets: Optional[torch.Tensor] = None
+    host_kv_cache_block_offsets: Optional[torch.Tensor] = None
+    draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+    draft_host_kv_cache_block_offsets: Optional[torch.Tensor] = None
+
     @property
     def max_seq_len(self) -> int:
         """
@@ -737,7 +738,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.max_num_sequences is None:
             self.max_num_sequences = self.max_num_requests
 
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        capture_graph = self.is_cuda_graph
 
         self.prompt_lens_cuda = self.get_empty(
             buffers,
@@ -789,13 +790,29 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            self.host_kv_cache_block_offsets = torch.empty_like(
-                self.kv_cache_block_offsets,
-                device='cpu',
-                pin_memory=True,
-            )
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
+
+            # Allocate separate block offset tensors for draft KV cache manager
+            # Used in one-model speculative decoding with different KV cache layouts
+            if self.draft_kv_cache_manager is not None:
+                self.draft_kv_cache_block_offsets = self.get_empty(
+                    buffers,
+                    [
+                        self.draft_kv_cache_manager.num_pools,
+                        self.max_num_sequences, 2,
+                        self.draft_kv_cache_manager.max_blocks_per_seq
+                    ],
+                    cache_name="draft_kv_cache_block_offsets",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
+                self.draft_host_kv_cache_block_offsets = torch.empty_like(
+                    self.draft_kv_cache_block_offsets,
+                    device='cpu',
+                    pin_memory=True,
+                )
+
             if self.enable_flash_mla:
                 self.block_ids_per_seq = self.get_empty(
                     buffers,
@@ -916,6 +933,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
 
     def prepare(self) -> None:
+        super().prepare()
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
@@ -933,7 +951,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # set params that are used in wrapper.plan()
             self.kv_cache_block_offsets = None
-            self.host_kv_cache_block_offsets = None
             self.block_ids_per_seq = None
 
         prompt_lens = torch.tensor(
@@ -986,19 +1003,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # kv block offsets
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
-            # Copy blocks for all context requests
-            self.kv_cache_manager.impl.copy_batch_block_offsets(
-                self.host_kv_cache_block_offsets,
-                self.request_ids[:self.num_contexts], 1, 0)
-            # Copy blocks for all generation requests
-            self.kv_cache_manager.impl.copy_batch_block_offsets(
-                self.host_kv_cache_block_offsets,
-                self.request_ids[self.num_contexts:], self.beam_width,
-                self.num_contexts)
-            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
-                self.kv_cache_block_offsets[pool_idx, :self.num_seqs].copy_(
-                    self.host_kv_cache_block_offsets[pool_idx, :self.num_seqs],
-                    non_blocking=True)
+            self.kv_cache_manager.copy_batch_block_offsets(
+                self.kv_cache_block_offsets, self.request_ids, self.beam_width,
+                self.num_contexts, self.num_seqs)
+
             error_message = (
                 f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
                 f"exceeds the KV cache manager's maximum supported length "
@@ -1006,6 +1014,25 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             assert self.kv_lens[:self.num_seqs].max(
             ) <= self.kv_cache_manager.max_seq_len, error_message
+
+            # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
+            if self.draft_kv_cache_manager is not None:
+                # Copy blocks for all context requests
+                self.draft_kv_cache_manager.impl.copy_batch_block_offsets(
+                    self.draft_host_kv_cache_block_offsets,
+                    self.request_ids[:self.num_contexts], 1, 0)
+                # Copy blocks for all generation requests
+                self.draft_kv_cache_manager.impl.copy_batch_block_offsets(
+                    self.draft_host_kv_cache_block_offsets,
+                    self.request_ids[self.num_contexts:], self.beam_width,
+                    self.num_contexts)
+                for pool_idx in range(
+                        self.draft_host_kv_cache_block_offsets.shape[0]):
+                    self.draft_kv_cache_block_offsets[
+                        pool_idx, :self.num_seqs].copy_(
+                            self.draft_host_kv_cache_block_offsets[
+                                pool_idx, :self.num_seqs],
+                            non_blocking=True)
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         # Don't use self.kv_lens here because it includes extra tokens.
@@ -1569,6 +1596,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
 
+        # This is a workaround for https://nvbugs/5624818
+        # Paged context FMHA is forced on SM90 for correctness
+        if get_sm_version() == 90:
+            use_paged_context_fmha = True
+
         return self.wrapper.is_nvfp4_output_kernel_available(
             tokens_per_block=metadata.tokens_per_block,
             attention_mask=attention_mask,
@@ -1668,6 +1700,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
 
+        # This is a workaround for https://nvbugs/5624818
+        # Paged context FMHA is forced on SM90 for correctness
+        if get_sm_version() == 90:
+            use_paged_context_fmha = True
+
         if self.is_mla_enable:
             # Context MLA uses separate qkv instead of paged_context_fmha
             use_paged_context_fmha = False
@@ -1723,7 +1760,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_context_lengths=metadata.prompt_lens_cpu_runtime,
             host_request_types=metadata.host_request_types_runtime,
             kv_cache_block_offsets=metadata.kv_cache_block_offsets,
-            host_kv_cache_block_offsets=metadata.host_kv_cache_block_offsets,
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
@@ -1847,7 +1883,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.max_ctx_kv_len,
             metadata.ctx_kv_indptr,
             metadata.kv_cache_block_offsets,
-            metadata.host_kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,
@@ -1938,7 +1973,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.qk_rope_head_dim,
             self.mla_params.kv_lora_rank,
             metadata.kv_cache_block_offsets,
-            metadata.host_kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,
@@ -2052,7 +2086,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.prompt_lens_cpu_runtime,  # host_context_lengths,
             metadata.num_contexts,
             metadata.kv_cache_block_offsets,
-            metadata.host_kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,

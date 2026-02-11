@@ -18,7 +18,50 @@ from pathlib import Path
 from typing import List
 
 from setuptools import find_packages, setup
+from setuptools.command.build_py import build_py
 from setuptools.dist import Distribution
+
+
+class BuildPyWithProtoCompile(build_py):
+    """Custom build_py command that compiles protobuf files before building."""
+
+    def run(self):
+        self.compile_grpc_protos()
+        super().run()
+
+    def compile_grpc_protos(self):
+        """Compile gRPC protobuf files if the proto file exists."""
+        grpc_dir = Path(__file__).parent / "tensorrt_llm" / "grpc"
+        proto_file = grpc_dir / "trtllm_service.proto"
+        compile_script = grpc_dir / "compile_protos.py"
+
+        if not proto_file.exists():
+            return
+
+        # Check if pb2 files need to be generated
+        pb2_file = grpc_dir / "trtllm_service_pb2.py"
+        pb2_grpc_file = grpc_dir / "trtllm_service_pb2_grpc.py"
+
+        # Regenerate if pb2 files don't exist or are older than proto file
+        needs_compile = (not pb2_file.exists() or not pb2_grpc_file.exists() or
+                         pb2_file.stat().st_mtime < proto_file.stat().st_mtime)
+
+        if needs_compile and compile_script.exists():
+            import subprocess
+            import sys
+
+            print("Compiling gRPC protobuf files...")
+            try:
+                subprocess.run(
+                    [sys.executable, str(compile_script)],
+                    check=True,
+                    cwd=str(grpc_dir.parent.parent),
+                )
+                print("gRPC protobuf compilation successful")
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: Failed to compile gRPC protos: {e}")
+            except Exception as e:
+                print(f"Warning: gRPC proto compilation skipped: {e}")
 
 
 def parse_requirements(filename: os.PathLike):
@@ -110,23 +153,46 @@ if on_windows:
     ]
 else:
     package_data = [
-        'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
+        'bin/executorWorker',
+        'libs/libtensorrt_llm.so',
+        'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
-        'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
-        'libs/libtensorrt_llm_nixl_wrapper.so', 'libs/nixl/**/*',
-        'libs/libtensorrt_llm_mooncake_wrapper.so', 'libs/ucx/**/*',
-        'libs/libpg_utils.so', 'libs/libdecoder_attention_1.so',
-        'libs/nvshmem/License.txt', 'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
-        'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
-        'deep_ep/LICENSE', 'deep_ep/*.py', 'deep_ep_cpp_tllm.*.so',
-        "include/**/*", 'deep_gemm/LICENSE', 'deep_gemm/include/**/*',
-        'deep_gemm/*.py', 'deep_gemm_cpp_tllm.*.so',
-        'scripts/install_tensorrt.sh', 'flash_mla/LICENSE', 'flash_mla/*.py',
-        'flash_mla_cpp_tllm.*.so'
+        'libs/libtensorrt_llm_ucx_wrapper.so',
+        'libs/libdecoder_attention_0.so',
+        'libs/libtensorrt_llm_nixl_wrapper.so',
+        'libs/nixl/**/*',
+        'tensorrt_llm_transfer_agent_binding*.so',
+        'tensorrt_llm_transfer_agent_binding.pyi',
+        'libs/libtensorrt_llm_mooncake_wrapper.so',
+        'libs/ucx/**/*',
+        'libs/libpg_utils.so',
+        'libs/libdecoder_attention_1.so',
+        'libs/nvshmem/License.txt',
+        'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
+        'libs/nvshmem/nvshmem_transport_ibgda.so.103',
+        'bindings.*.so',
+        'deep_ep/LICENSE',
+        'deep_ep/*.py',
+        'deep_ep_cpp_tllm.*.so',
+        "include/**/*",
+        'deep_gemm/LICENSE',
+        'deep_gemm/include/**/*',
+        'deep_gemm/*.py',
+        'deep_gemm_cpp_tllm.*.so',
+        'scripts/install_tensorrt.sh',
+        'flash_mla/LICENSE',
+        'flash_mla/*.py',
+        'flash_mla_cpp_tllm.*.so',
+        'runtime/kv_cache_manager_v2/*.so',
+        'runtime/kv_cache_manager_v2/**/*.so',
+        'runtime/kv_cache_manager_v2/*.pyi',
+        'runtime/kv_cache_manager_v2/**/*.pyi',
+        'runtime/kv_cache_manager_v2/rawref/*.py',
+        'runtime/kv_cache_manager_v2/rawref/*.pyi',
+        'runtime/*__mypyc*.so',
     ]
 
 package_data += [
-    'bindings.pyi',
     'bindings/*.pyi',
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
@@ -162,16 +228,71 @@ def download_precompiled(workspace: str, version: str) -> str:
 
 def extract_from_precompiled(precompiled_location: str, package_data: List[str],
                              workspace: str) -> None:
-    """Extract package data (binaries and other materials) from a precompiled wheel to the working directory.
+    """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
     This allows skipping the compilation, and repackaging the binaries and Python files in the working directory to a new wheel.
+
+    Supports three source types:
+    - Local directory (git clone structure): e.g., /home/dev/TensorRT-LLM
+    - Local wheel file: e.g., /path/to/tensorrt_llm-*.whl
+    - Remote URL: Downloads and extracts from URL (wheel or tar.gz)
     """
     import fnmatch
+    import shutil
     import tarfile
     import zipfile
     from urllib.request import urlretrieve
 
     from setuptools.errors import SetupError
 
+    # Handle local directory (assuming repo structure)
+    if os.path.isdir(precompiled_location):
+        precompiled_location = os.path.abspath(precompiled_location)
+        print(
+            f"Using local directory as precompiled source: {precompiled_location}"
+        )
+        source_tensorrt_llm = os.path.join(precompiled_location, "tensorrt_llm")
+        if not os.path.isdir(source_tensorrt_llm):
+            raise SetupError(
+                f"Directory {precompiled_location} does not contain a tensorrt_llm folder."
+            )
+
+        # Walk through all files and match using fnmatch (consistent with wheel extraction)
+        for root, dirs, files in os.walk(source_tensorrt_llm):
+            for filename in files:
+                src_file = os.path.join(root, filename)
+                # Get path relative to precompiled_location (e.g., "tensorrt_llm/libs/libtensorrt_llm.so")
+                rel_path = os.path.relpath(src_file, precompiled_location)
+                dst_file = rel_path
+
+                # Skip yaml files
+                if dst_file.endswith(".yaml"):
+                    continue
+
+                # Skip .py files EXCEPT for generated C++ extension wrappers
+                # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
+                if dst_file.endswith(".py"):
+                    allowed_dirs = ("tensorrt_llm/deep_gemm/",
+                                    "tensorrt_llm/deep_ep/",
+                                    "tensorrt_llm/flash_mla/")
+                    if not any(dst_file.startswith(d) for d in allowed_dirs):
+                        continue
+
+                # Check if file matches any pattern using fnmatch (same as wheel extraction)
+                for filename_pattern in package_data:
+                    if fnmatch.fnmatchcase(rel_path,
+                                           f"tensorrt_llm/{filename_pattern}"):
+                        break
+                else:
+                    continue
+
+                dst_dir = os.path.dirname(dst_file)
+                if dst_dir:
+                    os.makedirs(dst_dir, exist_ok=True)
+                print(f"Copying {rel_path} from local directory.")
+                shutil.copy2(src_file, dst_file)
+        return
+
+    # Handle local file or remote URL
     if os.path.isfile(precompiled_location):
         precompiled_path = precompiled_location
         print(f"Using local precompiled file: {precompiled_path}.")
@@ -212,10 +333,16 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
             # Skip .py files EXCEPT for generated C++ extension wrappers
             # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
             if file.filename.endswith(".py"):
-                allowed_dirs = ("tensorrt_llm/deep_gemm/",
-                                "tensorrt_llm/deep_ep/",
-                                "tensorrt_llm/flash_mla/")
+                allowed_dirs = (
+                    "tensorrt_llm/deep_gemm/", "tensorrt_llm/deep_ep/",
+                    "tensorrt_llm/flash_mla/",
+                    "tensorrt_llm/runtime/kv_cache_manager_v2/rawref/__init__.py"
+                )
                 if not any(file.filename.startswith(d) for d in allowed_dirs):
+                    # Exclude all .py files in kv_cache_manager_v2 except rawref/__init__.py
+                    if file.filename.startswith("tensorrt_llm/runtime/kv_cache_manager_v2/") and \
+                       not file.filename.endswith("rawref/__init__.py"):
+                        continue
                     continue
 
             for filename_pattern in package_data:
@@ -249,10 +376,48 @@ sanity_check()
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
+    # We use find_packages with a custom exclude filter to handle the mypyc compiled modules.
+    # We want to exclude the .py source files for modules that are compiled to .so.
+    # We exclude the kv_cache_manager_v2 package entirely from the source list,
+    # but explicitly add back the rawref subpackage (which is not compiled by mypyc).
+    # The .so and .pyi files for kv_cache_manager_v2 are added via package_data.
+enable_mypyc = os.getenv("TRTLLM_ENABLE_MYPYC", "0") == "1"
+if enable_mypyc:
+    packages = find_packages(exclude=[
+        "tensorrt_llm.runtime.kv_cache_manager_v2",
+        "tensorrt_llm.runtime.kv_cache_manager_v2.*",
+    ]) + ["tensorrt_llm.runtime.kv_cache_manager_v2.rawref"]
+    exclude_package_data = {
+        "tensorrt_llm": [
+            "runtime/kv_cache_manager_v2/*.py",
+            "runtime/kv_cache_manager_v2/**/*.py"
+        ],
+        "tensorrt_llm.runtime.kv_cache_manager_v2": ["*.py", "**/*.py"],
+    }
+else:
+    packages = find_packages()
+    exclude_package_data = {}
+
+    # Remove mypyc shared objects from package_data to avoid packaging stale files
+    package_data = [
+        p for p in package_data if p not in [
+            'runtime/kv_cache_manager_v2/*.so',
+            'runtime/kv_cache_manager_v2/**/*.so', 'runtime/*__mypyc*.so'
+        ]
+    ]
+    # Ensure rawref is included
+    package_data.append('runtime/kv_cache_manager_v2/rawref/*.so')
+
+# Add vendored triton_kernels as an explicit top-level package.
+# This is vendored from the Triton project and kept at repo root so its
+# internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
+packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
     version=get_version(),
+    cmdclass={'build_py': BuildPyWithProtoCompile},
     description=
     ('TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports '
      'state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.'
@@ -262,7 +427,8 @@ setup(
     author="NVIDIA Corporation",
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
-    packages=find_packages(),
+    packages=packages,
+    exclude_package_data=exclude_package_data,
     # TODO Add windows support for python bindings.
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -275,6 +441,7 @@ setup(
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
         'tensorrt_llm': package_data,
+        'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
     },
     license_files=get_license(),
     entry_points={

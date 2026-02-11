@@ -456,9 +456,11 @@ class TestResourceManager(unittest.TestCase):
 
         model_config.num_hidden_layers = len(total_layers)
         model_config.num_attention_layers = len(total_layers)
+        model_config.layer_types = [LayerType.ATTENTION
+                                    ] * model_config.num_attention_layers
 
         kv_factor = 2
-        cache_bytes_per_token_per_layer = 8
+        cache_bytes_per_token_per_layer = 32
 
         # Define test cases:
         #    (memory_bytes, expected_window_sizes, max_tokens, description)
@@ -466,7 +468,7 @@ class TestResourceManager(unittest.TestCase):
         test_cases = [
             (
                 # Case 1: Limited memory - windows get clamped
-                cache_bytes_per_token_per_layer * (100 * 9 + 30 * 5) + 4,
+                cache_bytes_per_token_per_layer * (100 * 4 + 130 * 5) + 4,
                 {
                     100: [0, 1, 2, 3],
                     130: [4, 5, 6, 7, 8],
@@ -477,7 +479,7 @@ class TestResourceManager(unittest.TestCase):
             (
                 # Case 2: Less limited memory - the largest window get clamped
                 cache_bytes_per_token_per_layer *
-                (100 * 9 + 100 * 5 + 817 * 2) + 4,
+                (100 * 4 + 200 * 3 + 1017 * 2) + 4,
                 {
                     100: [0, 1, 2, 3],
                     200: [4, 5, 6],
@@ -510,8 +512,7 @@ class TestResourceManager(unittest.TestCase):
             (
                 # Case 5: Less limited memory but max_tokens is given.
                 # memory is enough for 1017 tokens, it will be clamped by max_tokens=134.
-                cache_bytes_per_token_per_layer *
-                (100 * 9 + 100 * 5 + 817 * 2) + 4,
+                cache_bytes_per_token_per_layer * (100 * 4 + 134 * 5) + 4,
                 {
                     100: [0, 1, 2, 3],
                     134: [4, 5, 6, 7, 8],
@@ -523,8 +524,33 @@ class TestResourceManager(unittest.TestCase):
 
         for memory_bytes, expected_window_sizes, expected_max_attention_window_vec, max_tokens, description in test_cases:
             with self.subTest(case=description, memory_bytes=memory_bytes):
-                kv_cache_config = tllm.KvCacheConfig(max_tokens=max_tokens)
-                adjusted, adjusted_max_attention_window_vec = KVCacheManager.adjust_window_sizes_for_vswa(
+                kv_cache_config_params = {
+                    "max_attention_window": max_attention_window_vec,
+                    "free_gpu_memory_fraction": 1.0,
+                    "host_cache_size": 0,
+                    "max_gpu_total_bytes": memory_bytes,
+                }
+                kv_cache_config = TestResourceManager._create_kv_cache_config_for_kv_cache_manager(
+                    kv_cache_config_params)
+                mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+
+                manager = KVCacheManager(
+                    kv_cache_config=kv_cache_config,
+                    kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+                    CacheType.SELF,
+                    num_layers=model_config.num_attention_layers,
+                    num_kv_heads=8,
+                    head_dim=model_config.head_size,
+                    tokens_per_block=32,
+                    max_seq_len=max(max_attention_window_vec),
+                    max_batch_size=1,
+                    mapping=mapping,
+                    dtype=model_config.data_type,
+                    model_config=model_config,
+                    max_beam_width=1,
+                )
+
+                adjusted, adjusted_max_attention_window_vec = manager.adjust_window_sizes_for_vswa(
                     window_size_to_layers=window_size_to_layers,
                     max_attention_window_vec=max_attention_window_vec,
                     model_config=model_config,
@@ -581,7 +607,7 @@ class TestResourceManager(unittest.TestCase):
         """
         return KvCacheConfig(**params)
 
-    def test_calculate_max_num_blocks_from_cpp(self):
+    def test_calculate_max_num_blocks_for_vswa(self):
         # Construct a minimal mapping (single-rank, no TP/PP)
         mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
 
@@ -651,7 +677,7 @@ class TestResourceManager(unittest.TestCase):
                     kv_cache_config_params)
                 with patch('torch.cuda.mem_get_info',
                            return_value=(fixed_free_mem, fixed_total_mem)):
-                    # Create a real KVCacheManager, it will run calculate_max_num_blocks_from_cpp in __init__
+                    # Create a real KVCacheManager, it will run calculate_max_num_blocks_for_vswa in __init__
                     manager = KVCacheManager(
                         kv_cache_config=kv_cache_config,
                         kv_cache_type=tensorrt_llm.bindings.internal.
@@ -763,6 +789,93 @@ class TestResourceManager(unittest.TestCase):
             f"reused_blocks after reset: {reused_blocks_after_reset}, after third request: {stats_after_third.reused_blocks}"
         )
         kv_cache_manager.free_resources(req3)
+
+    def test_kv_cache_manager_with_execution_stream(self):
+        """
+        Test that KVCacheManager uses the provided execution_stream.
+        """
+        # Create a dedicated execution stream
+        execution_stream = torch.cuda.Stream()
+
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.1,
+            max_tokens=256,
+        )
+
+        # Create KVCacheManager with the execution stream
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(),
+            execution_stream=execution_stream,
+        )
+
+        # Verify the KVCacheManager uses the provided execution stream
+        # The internal stream should be the same as the execution stream we provided
+        self.assertEqual(
+            kv_cache_manager._stream.cuda_stream, execution_stream.cuda_stream,
+            "KVCacheManager should use the provided execution_stream")
+
+        kv_cache_manager.shutdown()
+
+    def test_kv_cache_manager_without_execution_stream(self):
+        """Test that KVCacheManager creates its own stream when no execution_stream is provided.
+
+        This verifies backward compatibility.
+        """
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.1,
+            max_tokens=256,
+        )
+
+        # Create KVCacheManager without providing an execution stream
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(),
+        )
+
+        # Verify the KVCacheManager creates its own stream
+        self.assertIsNotNone(
+            kv_cache_manager._stream,
+            "KVCacheManager should create its own stream when none is provided")
+
+        # The stream should not be the default stream (0)
+        self.assertNotEqual(kv_cache_manager._stream.cuda_stream, 0,
+                            "KVCacheManager should not use the default stream")
+
+        kv_cache_manager.shutdown()
+
+    def test_peft_cache_manager_with_execution_stream(self):
+        """Test that PeftCacheManager uses the provided execution_stream.
+        """
+        peft_cache_config = self.create_peft_cache_config()
+        execution_stream = torch.cuda.Stream()
+
+        # Create PeftCacheManager with execution_stream
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=peft_cache_config,
+            lora_config=LoraConfig(),
+            model_config=self.model_config,
+            execution_stream=execution_stream,
+        )
+
+        # The PeftCacheManager should be created successfully with the provided stream
+        self.assertTrue(peft_cache_manager.impl.enabled)
 
 
 if __name__ == "__main__":

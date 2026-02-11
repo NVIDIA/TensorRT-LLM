@@ -16,6 +16,7 @@ import copy
 import json
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import click
@@ -39,7 +40,7 @@ from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .interface import Evaluator
+from .interface import Evaluator, dump_inference_results
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
@@ -52,12 +53,16 @@ class LmEvalWrapper(TemplateLM):
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 model_type: str | None = None,
+                 is_force_single_image: bool = False,
+                 output_dir: Optional[str] = None):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
+        self.output_dir = output_dir
 
     @property
     def eot_token_id(self) -> int:
@@ -142,6 +147,10 @@ class LmEvalWrapper(TemplateLM):
                            disable=disable_tqdm):
             outputs.append(output.result())
 
+        if self.output_dir:
+            dump_inference_results(self.output_dir, outputs,
+                                   getattr(self.llm, 'tokenizer', None))
+
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
@@ -163,7 +172,10 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
                  max_images: int = 999,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 model_type: str | None = None,
+                 is_force_single_image: bool = False,
+                 output_dir: Optional[str] = None):
         """
         Initialize the multimodal wrapper.
 
@@ -172,14 +184,18 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             sampling_params: Parameters for text generation
             streaming: Whether to use streaming generation
             max_images: Maximum number of images per prompt (currently unlimited in TRT-LLM), set to 999 from lm_eval's default value.
+            chat_template_kwargs: Chat template kwargs as JSON string
+            output_dir: Directory to save the task infos.
         """
-        super().__init__(llm, sampling_params, streaming)
+        super().__init__(llm, sampling_params, streaming, output_dir=output_dir)
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
         self.MULTIMODAL = True
         self.max_images = max_images
         self.chat_template_kwargs = chat_template_kwargs
-        self.model_type = self._get_model_type(llm)
+        self.model_type = model_type if model_type is not None else self._get_model_type(
+            llm)
+        self.is_force_single_image = is_force_single_image
 
         # NOTE: In TRT-LLM, currently we do not support interleaved text and image. Instead, we are adding image placeholders at the end of the text or at the beginning of the text.
         # So, until we support interleaved text and image, we set this to False.
@@ -287,9 +303,14 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             prompt = prompt_inputs(prompt)
 
             # NOTE: Convert RGBA format to RGB format
-            images = [
-                convert_image_mode(img, "RGB") for img in media_data["visual"]
-            ]
+            if self.is_force_single_image:
+                # NOTE: This is a workaround to force single image for models which only support single image.
+                images = [convert_image_mode(media_data["visual"][0], "RGB")]
+            else:
+                images = [
+                    convert_image_mode(img, "RGB")
+                    for img in media_data["visual"]
+                ]
             prompt["multi_modal_data"] = {"image": images}
 
             sampling_params = self._get_sampling_params(gen_kwargs)
@@ -303,6 +324,10 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                            desc="Fetching responses",
                            disable=disable_tqdm):
             outputs.append(output.result())
+
+        if self.output_dir:
+            dump_inference_results(self.output_dir, outputs,
+                                   getattr(self.llm, 'tokenizer', None))
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
@@ -323,7 +348,10 @@ class LmEvalEvaluator(Evaluator):
                  fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None,
                  is_multimodal: bool = False,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 log_samples: bool = False,
+                 output_path: Optional[str] = None,
+                 output_dir: Optional[str] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -342,10 +370,13 @@ class LmEvalEvaluator(Evaluator):
                          apply_chat_template=apply_chat_template,
                          fewshot_as_multiturn=fewshot_as_multiturn,
                          system_prompt=system_prompt,
-                         chat_template_kwargs=chat_template_kwargs)
+                         chat_template_kwargs=chat_template_kwargs,
+                         output_dir=output_dir)
         self.task_name = task_name
         self.dataset_path = dataset_path
         self.num_samples = num_samples
+        self.log_samples = log_samples
+        self.output_path = output_path
 
         task_manager = TaskManager(
             include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
@@ -380,23 +411,43 @@ class LmEvalEvaluator(Evaluator):
 
     @contextmanager
     def _patch_lm_eval(self):
-        if self.dataset_path is None:
-            yield
-            return
+        from pathlib import Path
 
         import lm_eval
-        self._task_config_post_init = lm_eval.api.task.TaskConfig.__post_init__
+        import lm_eval.tasks
 
-        def _patched(task_config, *args, **kwargs):
-            task_config.dataset_path = self.dataset_path
-            self._task_config_post_init(task_config, *args, **kwargs)
+        # Patch Path.relative_to to handle custom task paths outside lm_eval/tasks
+        # This is needed with lm_eval>=0.4.9.2 with new function pretty_print_task (a local function inside
+        # get_task_dict) calls yaml_path.relative_to(lm_eval_tasks_path) which fails
+        # when the yaml is from tensorrt_llm/evaluate/lm_eval_tasks
+        original_relative_to = Path.relative_to
 
-        lm_eval.api.task.TaskConfig.__post_init__ = _patched
+        def _patched_relative_to(self, other, *args, **kwargs):
+            try:
+                return original_relative_to(self, other, *args, **kwargs)
+            except ValueError:
+                # Return absolute path if relative_to fails (path not under base)
+                return self
+
+        Path.relative_to = _patched_relative_to
+
+        # Optionally patch dataset_path if provided
+        original_post_init = None
+        if self.dataset_path is not None:
+            original_post_init = lm_eval.api.task.TaskConfig.__post_init__
+
+            def _patched_post_init(task_config, *args, **kwargs):
+                task_config.dataset_path = self.dataset_path
+                original_post_init(task_config, *args, **kwargs)
+
+            lm_eval.api.task.TaskConfig.__post_init__ = _patched_post_init
 
         try:
             yield
         finally:
-            lm_eval.api.task.TaskConfig.__post_init__ = self._task_config_post_init
+            Path.relative_to = original_relative_to
+            if original_post_init is not None:
+                lm_eval.api.task.TaskConfig.__post_init__ = original_post_init
 
     def generate_samples(self) -> Iterable[tuple]:
         raise NotImplementedError()
@@ -405,23 +456,39 @@ class LmEvalEvaluator(Evaluator):
                       *auxiliaries) -> float:
         raise NotImplementedError()
 
+    def save_results(self, results: dict) -> None:
+        path = Path(self.output_path)
+        path.mkdir(parents=True, exist_ok=True)
+        result_path = (path / f"samples_{self.task_name}.json")
+        with open(result_path, "w") as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"Results saved to {result_path}")
+
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 scores_filter: str = None) -> float:
+                 scores_filter: str = None,
+                 model_type: str = None,
+                 is_force_single_image: bool = False) -> float:
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
+
         results = lm_eval.evaluate(
             lm=lm_cls(llm,
                       sampling_params=sampling_params,
                       streaming=streaming,
-                      chat_template_kwargs=self.chat_template_kwargs),
+                      chat_template_kwargs=self.chat_template_kwargs,
+                      model_type=model_type,
+                      is_force_single_image=is_force_single_image,
+                      output_dir=self.output_dir),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
             fewshot_as_multiturn=self.fewshot_as_multiturn,
-            system_instruction=self.system_prompt)
+            system_instruction=self.system_prompt,
+            log_samples=self.log_samples)
+
         # Normalize scores to range 0~100
         scores = results["results"][self.task_name]
         for metric in scores.keys():
@@ -430,6 +497,11 @@ class LmEvalEvaluator(Evaluator):
         logger.info(
             f"lm-eval {self.task_name} results (scores normalized to range 0~100):\n{lm_eval.utils.make_table(results)}"
         )
+
+        # Save results if output_path is specified
+        if self.output_path:
+            self.save_results(results)
+
         if scores_filter is not None:
             result_acc = results["results"][self.task_name][scores_filter]
             logger.info(
@@ -456,7 +528,10 @@ class LmEvalEvaluator(Evaluator):
                         system_prompt=kwargs.pop("system_prompt", None),
                         is_multimodal=kwargs.pop("is_multimodal", False),
                         chat_template_kwargs=kwargs.pop("chat_template_kwargs",
-                                                        None))
+                                                        None),
+                        log_samples=kwargs.pop("log_samples", False),
+                        output_path=kwargs.pop("output_path", None),
+                        output_dir=kwargs.pop("output_dir", None))
         sampling_params = SamplingParams(
             max_tokens=kwargs.pop("max_output_length"),
             truncate_prompt_tokens=kwargs.pop("max_input_length"),
@@ -513,6 +588,18 @@ class GSM8K(LmEvalEvaluator):
                   type=int,
                   default=256,
                   help="Maximum generation length.")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -567,6 +654,18 @@ class GPQADiamond(LmEvalEvaluator):
                   type=int,
                   default=32768,
                   help="Maximum generation length.")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -617,6 +716,18 @@ class GPQAMain(LmEvalEvaluator):
                   type=int,
                   default=32768,
                   help="Maximum generation length.")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -667,6 +778,18 @@ class GPQAExtended(LmEvalEvaluator):
                   type=int,
                   default=32768,
                   help="Maximum generation length.")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -718,6 +841,18 @@ class MMMU(LmEvalEvaluator):
         default=
         512,  # NOTE: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/mmmu/_template_yaml#L13
         help="Maximum generation length.")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -783,16 +918,21 @@ class LongBenchV1(LmEvalEvaluator):
             lm=lm_cls(llm,
                       sampling_params=sampling_params,
                       streaming=streaming,
-                      chat_template_kwargs=self.chat_template_kwargs),
+                      chat_template_kwargs=self.chat_template_kwargs,
+                      output_dir=self.output_dir),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
             fewshot_as_multiturn=self.fewshot_as_multiturn,
-            system_instruction=self.system_prompt)
-
+            system_instruction=self.system_prompt,
+            log_samples=self.log_samples)
         logger.info(
             f"lm-eval {self.task_name} results:\n{lm_eval.utils.make_table(results)}"
         )
+
+        # Save results if output_path is specified
+        if self.output_path:
+            self.save_results(results)
 
         # LongBench is a group task in lm-eval. lm-eval already computes subgroup
         # "score" values (e.g., `longbench_fewshot`, `longbench_single`, ...).
@@ -862,6 +1002,18 @@ class LongBenchV1(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -873,7 +1025,10 @@ class LongBenchV1(LmEvalEvaluator):
             random_seed=kwargs.pop("random_seed", 0),
             apply_chat_template=kwargs.pop("apply_chat_template", True),
             system_prompt=kwargs.pop("system_prompt", None),
-            chat_template_kwargs=kwargs.pop("chat_template_kwargs", None))
+            chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
+            log_samples=kwargs.pop("log_samples", False),
+            output_path=kwargs.pop("output_path", None),
+            output_dir=kwargs.pop("output_dir", None))
 
         # Let lm-eval task configs control sampling via gen_kwargs.
         sampling_params = None

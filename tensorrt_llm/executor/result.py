@@ -427,6 +427,8 @@ class GenerationResultBase:
                     ctx_request_id=context_phase_params.req_id,
                     opaque_state=context_phase_params.opaque_state,
                     draft_tokens=context_phase_params.draft_tokens,
+                    ctx_dp_rank=context_phase_params.ctx_dp_rank,
+                    ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     multimodal_embedding_handles=None,
                 )
 
@@ -448,8 +450,6 @@ class GenerationResultBase:
             if hasattr(response_result, 'mm_embedding_handle'
                        ) and response_result.mm_embedding_handle is not None:
                 self._mm_embedding_handle = response_result.mm_embedding_handle
-                mrope_position_ids_handle = response_result.mrope_position_ids_handle
-                mrope_position_deltas_handle = response_result.mrope_position_deltas_handle
                 if self.disaggregated_params is not None:
                     self.disaggregated_params.multimodal_embedding_handles = [
                         response_result.mm_embedding_handle
@@ -461,8 +461,17 @@ class GenerationResultBase:
                             response_result.mm_embedding_handle
                         ],
                         multimodal_hashes=self._multimodal_hashes)
-                self.disaggregated_params.mrope_position_ids_handle = mrope_position_ids_handle
-                self.disaggregated_params.mrope_position_deltas_handle = mrope_position_deltas_handle
+
+            # Handle mrope handles for both:
+            # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
+            # 2. Prefill-only EPD requests (mm_embedding_handle is None because embeddings
+            #    were already computed in encode phase, but mrope still needs forwarding)
+            if (getattr(response_result, "mrope_position_ids_handle", None)
+                    is not None and self.disaggregated_params is not None):
+                self.disaggregated_params.mrope_position_ids_handle = (
+                    response_result.mrope_position_ids_handle)
+                self.disaggregated_params.mrope_position_deltas_handle = (
+                    response_result.mrope_position_deltas_handle)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -933,6 +942,21 @@ def compute_logprobs(
             logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
+
+        # only return sampled token
+        if top_k == 0:
+            results: TokenLogprobs = []
+            if tokens is not None:
+                for t in range(logprobs.size(0)):
+                    token_id = tokens[t]
+                    token_logprob = logprobs[t, token_id].item()
+                    rank = (logprobs[t] > token_logprob).sum().item() + 1
+                    token_dict = {
+                        token_id: Logprob(logprob=token_logprob, rank=rank)
+                    }
+                    results.append(token_dict)
+            return results
+
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
 
         results: TokenLogprobs = []
@@ -961,7 +985,7 @@ def compute_logprobs(
         None) if k_prompt_logprobs and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
-    ) if k_logprobs and generation_logits is not None else None
+    ) if k_logprobs is not None and generation_logits is not None else None
 
     return LogProbsResult(prompt=prompt_logprobs,
                           generation=generation_logprobs)

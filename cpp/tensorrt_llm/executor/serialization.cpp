@@ -544,12 +544,13 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto attentionType = su::deserialize<decltype(CacheState::AttentionConfig::mAttentionType)>(is);
     auto kvFactor = su::deserialize<decltype(CacheState::AttentionConfig::mKvFactor)>(is);
     auto enableBlockReuse = su::deserialize<bool>(is);
+    auto enablePartialReuse = su::deserialize<bool>(is);
     auto hasIndexerKCache = su::deserialize<bool>(is);
     auto indexerDimPerHead = su::deserialize<decltype(CacheState::ModelConfig::mSizePerHead)>(is);
     auto indexerKCacheQuantBlockSize = su::deserialize<decltype(CacheState::ModelConfig::mTokensPerBlock)>(is);
     return CacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
         contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
-        DPsize, enableBlockReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
+        DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
 }
 
 void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& os)
@@ -568,6 +569,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.mAttentionConfig.mAttentionType, os);
     su::serialize(state.mAttentionConfig.mKvFactor, os);
     su::serialize(state.mEnableBlockReuse, os);
+    su::serialize(state.mEnablePartialReuse, os);
     su::serialize(state.getHasIndexerKCache(), os);
     su::serialize(state.getIndexerDimPerHead(), os);
     su::serialize(state.getIndexerKCacheQuantBlockSize(), os);
@@ -590,6 +592,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.mAttentionConfig.mAttentionType);
     totalSize += su::serializedSize(state.mAttentionConfig.mKvFactor);
     totalSize += su::serializedSize(state.mEnableBlockReuse);
+    totalSize += su::serializedSize(state.mEnablePartialReuse);
     totalSize += su::serializedSize(state.getHasIndexerKCache());
     totalSize += su::serializedSize(state.getIndexerDimPerHead());
     totalSize += su::serializedSize(state.getIndexerKCacheQuantBlockSize());
@@ -652,14 +655,18 @@ ContextPhaseParams Serialization::deserializeContextPhaseParams(std::istream& is
     auto reqId = su::deserialize<decltype(ContextPhaseParams::mReqId)>(is);
     auto firstGenTokens = su::deserialize<decltype(ContextPhaseParams::mFirstGenTokens)>(is);
     auto draftTokens = su::deserialize<decltype(ContextPhaseParams::mDraftTokens)>(is);
+    auto ctxDpRank = su::deserialize<decltype(ContextPhaseParams::mCtxDpRank)>(is);
+    auto disaggInfoEndpoint = su::deserialize<decltype(ContextPhaseParams::mDisaggInfoEndpoint)>(is);
     auto hasState = su::deserialize<bool>(is);
     if (hasState)
     {
         auto state = std::make_unique<DataTransceiverState>();
         *state = deserializeDataTransceiverState(is);
-        return ContextPhaseParams{std::move(firstGenTokens), reqId, state.release(), std::move(draftTokens)};
+        return ContextPhaseParams{std::move(firstGenTokens), reqId, state.release(), std::move(draftTokens), ctxDpRank,
+            std::move(disaggInfoEndpoint)};
     }
-    return ContextPhaseParams{std::move(firstGenTokens), reqId, nullptr, std::move(draftTokens)};
+    return ContextPhaseParams{
+        std::move(firstGenTokens), reqId, std::move(draftTokens), ctxDpRank, std::move(disaggInfoEndpoint)};
 }
 
 void Serialization::serialize(ContextPhaseParams const& contextPhaseParams, std::ostream& os)
@@ -667,6 +674,8 @@ void Serialization::serialize(ContextPhaseParams const& contextPhaseParams, std:
     su::serialize(contextPhaseParams.mReqId, os);
     su::serialize(contextPhaseParams.mFirstGenTokens, os);
     su::serialize(contextPhaseParams.mDraftTokens, os);
+    su::serialize(contextPhaseParams.mCtxDpRank, os);
+    su::serialize(contextPhaseParams.mDisaggInfoEndpoint, os);
     su::serialize(static_cast<bool>(contextPhaseParams.mState), os);
     if (contextPhaseParams.mState)
     {
@@ -680,6 +689,8 @@ size_t Serialization::serializedSize(ContextPhaseParams const& contextPhaseParam
     totalSize += su::serializedSize(contextPhaseParams.mReqId);
     totalSize += su::serializedSize(contextPhaseParams.mFirstGenTokens);
     totalSize += su::serializedSize(contextPhaseParams.mDraftTokens);
+    totalSize += su::serializedSize(contextPhaseParams.mCtxDpRank);
+    totalSize += su::serializedSize(contextPhaseParams.mDisaggInfoEndpoint);
     totalSize += su::serializedSize(bool{});
     if (contextPhaseParams.mState)
     {
@@ -732,6 +743,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
         : std::nullopt;
     auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
+    auto disaggRequestId = su::deserialize<std::optional<IdType>>(is);
 
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
@@ -741,7 +753,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, cacheSaltID);
+        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, cacheSaltID, disaggRequestId);
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)

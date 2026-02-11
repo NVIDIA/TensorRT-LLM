@@ -8,7 +8,9 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
+from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
@@ -20,6 +22,10 @@ from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4BlackwellRunner
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -246,14 +252,32 @@ def fused_moe(
     )
 
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
-    output = run_moe(input, token_selected_experts, token_final_scales,
-                     fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-                     fc2_expert_biases, quant_scales, input_sf,
-                     swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
-                     tp_size, tp_rank, ep_size, ep_rank, cluster_size,
-                     cluster_rank, enable_alltoall, min_latency_mode,
-                     [gemm_tactic_1, gemm_tactic_2], activation_type,
-                     unpadded_hidden_size, tuner_num_tokens, out_tensor)
+    try:
+        output = run_moe(input, token_selected_experts, token_final_scales,
+                         fc1_expert_weights, fc1_expert_biases,
+                         fc2_expert_weights, fc2_expert_biases, quant_scales,
+                         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
+                         swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
+                         cluster_size, cluster_rank, enable_alltoall,
+                         min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
+                         activation_type, unpadded_hidden_size,
+                         tuner_num_tokens, out_tensor)
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "DeepGEMM only supports Hopper" in error_msg:
+            raise RuntimeError(
+                f"{error_msg}"
+                "Note: This is the Cutlass backend with DeepGemm JIT path. "
+                "For Blackwell (SM100+) support, please use the DEEPGEMM backend instead."
+            ) from e
+        raise
+
+    # When out_tensor is provided, the result is written in-place to out_tensor.
+    # Return empty list to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use out_tensor directly when they provide it.
+    if out_tensor is not None and not min_latency_mode:
+        return []
 
     return output if min_latency_mode else [output]
 
@@ -698,8 +722,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             0, 0, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
-        # nested tuning should always be independent
-        distributed_tuning_strategy=DistributedTuningStrategy.INDEPENDENT,
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
     def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype,
@@ -725,12 +748,12 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
-                          **kwargs) -> List[Tuple]:
+                          **kwargs) -> List[Tuple[str, int]]:
         # return valid nvfp4 gemm implementations from allowed_backends
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
-        # Add CUDA Core backend if available
+        # Add CUDA Core tactics if available
         if self._is_backend_allowed("cuda_core"):
             is_cuda_core_supported = False
             m = act_fp4.shape[0]
@@ -746,7 +769,12 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     and m <= CudaCoreNVFP4Runner.MAX_M_DIMENSION)
 
             if is_cuda_core_supported:
-                tactics.append("cuda_core")
+                cuda_core_runner = CudaCoreNVFP4Runner(self.to_userbuffers,
+                                                       self.output_dtype)
+                cuda_core_tactics = cuda_core_runner.get_valid_tactics(
+                    inputs, profile)
+                tactics.extend([("cuda_core", tactic)
+                                for tactic in cuda_core_tactics])
             elif self._is_only_backend("cuda_core"):
                 # Explicitly forced but conditions not met - raise error
                 error_msg = f"CUDA Core backend requires SM >= {CudaCoreNVFP4Runner.MIN_SM_VERSION} and M <= {CudaCoreNVFP4Runner.MAX_M_DIMENSION}. "
@@ -754,21 +782,30 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                 error_msg += "Please add other backends to allowed_backends."
                 raise ValueError(error_msg)
 
-        # Add CUTLASS runner (always available)
+        # Add CUTLASS tactics if available
         if self._is_backend_allowed("cutlass"):
-            tactics.append("cutlass")
+            cutlass_runner = FP4GemmRunner(
+                fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4, self.to_userbuffers,
+                self.output_dtype)
+            cutlass_tactics = cutlass_runner.get_valid_tactics(inputs, profile)
+            tactics.extend([("cutlass", tactic) for tactic in cutlass_tactics])
 
-        # Add cuBLASLt runner if available
+        # Add cuBLASLt tactics if available
         if self._is_backend_allowed("cublaslt"):
             if IS_CUBLASLT_AVAILABLE:
-                tactics.append("cublaslt")
+                cublaslt_runner = CublasLtFP4GemmRunner(self.to_userbuffers,
+                                                        self.output_dtype)
+                cublaslt_tactics = cublaslt_runner.get_valid_tactics(
+                    inputs, profile)
+                tactics.extend([("cublaslt", tactic)
+                                for tactic in cublaslt_tactics])
             elif self._is_only_backend("cublaslt"):
                 raise ValueError(
                     "cuBLASLt backend is not available. "
                     "Please check cuBLASLt installation or add other backends to allowed_backends."
                 )
 
-        # Add CuteDSL runner if available
+        # Add CuteDSL tactics if available
         if self._is_backend_allowed("cutedsl"):
             if IS_CUTLASS_DSL_AVAILABLE:
                 # Check SM version first - CuteDSL NVFP4 only supports SM 100 (B200)
@@ -782,16 +819,15 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                             "Please add other backends to allowed_backends.")
                 else:
                     # SM version OK, check if CuteDSL supports the current shape
-                    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-                        CuteDSLNVFP4BlackwellLinear
-                    cutedsl_runner = CuteDSLNVFP4BlackwellLinear(
+                    cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
                         self.output_dtype)
                     cutedsl_tactics = cutedsl_runner.get_valid_tactics(
                         inputs, profile)
 
                     if cutedsl_tactics:
                         # CuteDSL supports this shape
-                        tactics.append("cutedsl")
+                        tactics.extend([("cutedsl", tactic)
+                                        for tactic in cutedsl_tactics])
                     elif self._is_only_backend("cutedsl"):
                         # Explicitly forced CuteDSL but it doesn't support this shape
                         m, n, k = inputs[0].shape[0], inputs[1].shape[
@@ -815,65 +851,36 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: Union[
-            str, int] = "cutlass",  # str: backend name, or int: -1 for fallback
+            Tuple,
+            int] = -1,  # tuple: (backend name, sub_tactic_id), or int: -1 for fallback
         **kwargs,
     ) -> torch.Tensor:
-        act_fp4, weight, act_sf, weight_scale, alpha = inputs
-
-        # Handle fallback tactic (-1) on cache miss
+        # Handle fallback tactic on cache miss
         if tactic == -1:
-            # Get valid tactics and use first available
-            from tensorrt_llm._torch.autotuner import OptimizationProfile
-            valid_tactics = self.get_valid_tactics(inputs,
-                                                   OptimizationProfile())
-            if valid_tactics:
-                # Prefer cutlass as fallback if available, otherwise use first valid tactic
-                tactic = "cutlass" if "cutlass" in valid_tactics else valid_tactics[
-                    0]
-            else:
-                m, n, k = inputs[0].shape[0], inputs[1].shape[
-                    0], inputs[0].shape[1] * 2
-                raise ValueError(
-                    f"No valid backends available for the current shape:\n"
-                    f"  M={m}, N={n}, K={k}\n"
-                    f"  Allowed backends: {self.allowed_backends}")
+            # Prefer cutlass as fallback if available, otherwise use first valid backend
+            assert len(
+                self.allowed_backends) > 0, "No allowed backends available"
+            tactic = ("cutlass",
+                      -1) if "cutlass" in self.allowed_backends else (
+                          self.allowed_backends[0], -1)
 
-        if tactic == "cuda_core":
-            # Unswizzle the activation scale factors
-            # act_sf is swizzled, need to reverse it for cuda_core_nvfp4_gemm
-            m = act_fp4.shape[0]
-            act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                act_sf.view((m + 128 - 1) // 128 * 128, -1))
-
-            # Call CUDA Core NVFP4 GEMM
-            return torch.ops.trtllm.cuda_core_nvfp4_gemm(
-                act_fp4,
-                weight,
-                act_sf_unswizzled,
-                weight_scale,
-                alpha,
-                bias=None,
-                out_dtype=self.output_dtype,
-                to_userbuffers=self.to_userbuffers)
-        elif tactic == "cutlass":
-            return torch.ops.trtllm.nvfp4_gemm_cutlass(act_fp4, weight, act_sf,
-                                                       weight_scale, alpha,
-                                                       self.output_dtype,
-                                                       self.to_userbuffers)
-        elif tactic == "cublaslt":
-            return torch.ops.trtllm.nvfp4_gemm_cublaslt(act_fp4, weight, act_sf,
-                                                        weight_scale, alpha,
-                                                        self.output_dtype,
-                                                        self.to_userbuffers)
-        elif tactic == "cutedsl":
-            return torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                act_fp4, weight, act_sf, weight_scale, alpha, self.output_dtype,
-                self.to_userbuffers)
-        elif tactic == -1:
-            return torch.ops.trtllm.nvfp4_gemm_cutlass(act_fp4, weight, act_sf,
-                                                       weight_scale, alpha,
-                                                       self.output_dtype,
-                                                       self.to_userbuffers)
+        backend, sub_tactic = tactic
+        if backend == "cuda_core":
+            return CudaCoreNVFP4Runner(self.to_userbuffers,
+                                       self.output_dtype)(inputs,
+                                                          tactic=sub_tactic)
+        elif backend == "cutlass":
+            return FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                                 self.to_userbuffers,
+                                 self.output_dtype)(inputs, tactic=sub_tactic)
+        elif backend == "cublaslt":
+            return CublasLtFP4GemmRunner(self.to_userbuffers,
+                                         self.output_dtype)(inputs,
+                                                            tactic=sub_tactic)
+        elif backend == "cutedsl":
+            return CuteDSLNVFP4BlackwellRunner(
+                self.output_dtype, self.to_userbuffers)(inputs,
+                                                        tactic=sub_tactic)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
 
@@ -1327,7 +1334,7 @@ def _(
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
-    MAX_SUPPORTED_SM_VERSION = 90
+    MAX_SUPPORTED_SM_VERSION = 103
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
@@ -1362,7 +1369,7 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
 
         if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
             raise ValueError(
-                f"SM version {get_sm_version()} is not supported for W4A16 GEMM"
+                f"SM version {get_sm_version()} is not supported for W4A16/W4A8 finegrained mixed dtype GEMM"
             )
 
         activation, weights_packed, scales = inputs
@@ -1443,17 +1450,17 @@ def _(
 
 def deep_gemm_gen_tuning_buckets(x: int):
     buckets = tuple(range(8, 128, 8))
+    # Clamp x to be between 4096 and 8192.
     if x >= 128:
+        x = min(x, 8192)
+        x = max(x, 4096)
         buckets += tuple(range(128, x, 128))
     return buckets
 
 
 class fp8SwapABGemmRunner(TunableRunner):
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
-        tune_max_num_tokens=4096,
-    )
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, deep_gemm_gen_tuning_buckets), ), )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool):
         self.output_dtype = output_dtype
@@ -1470,9 +1477,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        # Encode swap_ab as False (0) and True (1). Currently enabled when GEMM m <= 128.
-        input, _, _ = inputs
-        return [0, 1] if input.shape[0] <= 128 else [0]
+        return [0]
 
     def forward(
         self,
@@ -1487,8 +1492,7 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
-        forward_func = deep_gemm.fp8_gemm_ntt if tactic == 1 else deep_gemm.fp8_gemm_nt
-        forward_func(
+        deep_gemm.fp8_gemm_nt(
             (a, a_sf),
             (weight, weight_scale),
             output,
@@ -1504,14 +1508,13 @@ def fp8_swap_ab_gemm(
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
-    tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
     tuner = AutoTuner.get()
     fp8_swap_ab_gemm_runner = fp8SwapABGemmRunner(
         output_dtype,
         disable_ue8m0_cast,
     )
-    fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
         [fp8_swap_ab_gemm_runner],
@@ -1531,7 +1534,6 @@ def _(
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
-    tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
@@ -1652,6 +1654,171 @@ def _(
     return x.new_empty((b, d), dtype=o_dtype)
 
 
+class AllReduceRunner(TunableRunner):
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+            last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE,
+    )
+
+    def __init__(
+        self,
+        tp_size: int,
+        group: List[int],
+        op: int,
+        eps: float,
+        trigger_completion_at_end: bool,
+    ):
+        self.tp_size = tp_size
+        self.op = op
+        self.group = group
+        self.eps = eps
+        self.trigger_completion_at_end = trigger_completion_at_end
+
+    def unique_id(self):
+        return (
+            self.tp_size,
+            self.op,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        valid_strategies = [
+            AllReduceStrategy.NCCL_SYMMETRIC.value,
+            AllReduceStrategy.NCCL.value,
+        ]
+        # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
+        # So we need to check if the workspace size is too large to avoid hanging.
+        workspace_size = inputs[0].numel() * inputs[0].element_size()
+        max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(
+            self.tp_size,
+            support_deterministic=False,
+        )
+        if workspace_size > max_workspace_size:
+            return valid_strategies
+
+        valid_strategies.append(AllReduceStrategy.ONESHOT.value)
+
+        # Additional restrictions for TWOSHOT strategy
+        if inputs[0].shape[0] >= self.tp_size:
+            valid_strategies.append(AllReduceStrategy.TWOSHOT.value)
+
+        return valid_strategies
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        input, residual, norm_weight, scale, bias, workspace = inputs
+        if tactic == -1:
+            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+
+        return torch.ops.trtllm.allreduce(
+            input,
+            residual,
+            norm_weight,
+            scale,
+            bias,
+            workspace,
+            self.group,
+            tactic,
+            self.op,
+            self.eps,
+            self.trigger_completion_at_end,
+        )
+
+
+@torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
+def tunable_allreduce(
+    input: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    norm_weight: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    workspace: Optional[torch.Tensor],
+    group: List[int],
+    strategy: int,
+    op: int,
+    eps: float,
+    trigger_completion_at_end: bool,
+) -> List[torch.Tensor]:
+
+    tuner = AutoTuner.get()
+
+    allreduce_runner = AllReduceRunner(
+        len(group),
+        group,
+        op,
+        eps,
+        trigger_completion_at_end,
+    )
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::tunable_allreduce::allreduce",
+        [allreduce_runner],
+        AllReduceRunner.tuning_config,
+        [input, residual, norm_weight, scale, bias, workspace],
+    )
+
+    return allreduce_runner(
+        [input, residual, norm_weight, scale, bias, workspace],
+        tactic=best_tactic,
+    )
+
+
+@tunable_allreduce.register_fake
+def _(
+    input: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    norm_weight: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    workspace: Optional[torch.Tensor],
+    group: List[int],
+    strategy: int,
+    op: int,
+    eps: float,
+    trigger_completion_at_end: bool,
+) -> List[torch.Tensor]:
+    if op == int(AllReduceFusionOp.NONE):
+        return [torch.empty_like(input)]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM):
+        norm_out = torch.empty_like(input)
+        residual_out = torch.empty_like(input)
+        return [norm_out, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
+        quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        residual_out = torch.empty_like(input)
+        return [quant_out, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8):
+        norm_out = torch.empty_like(input)
+        quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        residual_out = torch.empty_like(input)
+        return [norm_out, quant_out, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4):
+        fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+        quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+        scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+        residual_out = torch.empty_like(input)
+        return [quant_fp4, scale_fp4, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4):
+        fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+        quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+        scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+        norm_out = torch.empty_like(input)
+        residual_out = torch.empty_like(input)
+        return [norm_out, quant_fp4, scale_fp4, residual_out]
+    else:
+        return [torch.empty_like(input)]
+
+
 def get_event(event_idx: int):
     from ..utils import get_model_extra_attrs
     extra_attrs = get_model_extra_attrs()
@@ -1700,3 +1867,99 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     stream = get_stream(stream_id)
     assert stream is not None
     tensor.record_stream(stream)
+
+
+class Fp4GemmAllreduceRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+                                 constraint_specs=(ConstraintSpec(
+                                     2, 0, fp4_scale_infer_shape), ))
+
+    def __init__(
+        self,
+        output_dtype: torch.dtype,
+        tp_rank: int,
+        tp_group: List[int],
+    ):
+        self.output_dtype = output_dtype
+        self.tp_rank = tp_rank
+        self.tp_group_str = '-'.join(str(g) for g in tp_group)
+        instance_key = (output_dtype, self.tp_group_str)
+        if instance_key not in Fp4GemmAllreduceRunner.runner_dict:
+            Fp4GemmAllreduceRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.Fp4GemmAllreduceRunner(
+                    output_dtype, tp_rank, tp_group)
+        self.fp4_gemm_all_reduce_runner = Fp4GemmAllreduceRunner.runner_dict[
+            instance_key]
+
+    def unique_id(self):
+        return (self.output_dtype, self.tp_group_str)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return list(range(self.fp4_gemm_all_reduce_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = 0,
+    ) -> torch.Tensor:
+        mat1, mat2, mat1_scale, mat2_scale, global_scale = inputs
+        return self.fp4_gemm_all_reduce_runner.run_gemm(
+            mat1,
+            mat2,
+            mat1_scale,
+            mat2_scale,
+            global_scale,
+            tactic,
+        )
+
+
+@torch.library.custom_op("trtllm::nvfp4_gemm_allreduce", mutates_args=())
+def nvfp4_gemm_allreduce(
+    act_fp4: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    tp_rank: int,
+    tp_group: List[int],
+) -> torch.Tensor:
+    AutoTuner.get()
+
+    # Use Cutlass runner with predefined configs
+    nvfp4_gemm_allreduce_runner = Fp4GemmAllreduceRunner(
+        output_dtype, tp_rank, tp_group)
+
+    # TODO: Enable auto-tuning
+    # runner_type = type(nvfp4_gemm_allreduce_runner).__name__
+    # _, best_tactic = tuner.choose_one(
+    #     f"trtllm::nvfp4_gemm_allreduce::{runner_type}",
+    #     [nvfp4_gemm_allreduce_runner],
+    #     nvfp4_gemm_allreduce_runner.tuning_config,
+    #     [act_fp4, weight, act_sf, weight_scale, alpha],
+    # )
+
+    best_tactic = -1
+
+    return nvfp4_gemm_allreduce_runner(
+        inputs=[act_fp4, weight_fp4, act_sf, weight_scale, alpha],
+        tactic=best_tactic)
+
+
+@nvfp4_gemm_allreduce.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    tp_rank: int,
+    tp_group: List[int],
+) -> torch.Tensor:
+    return act_fp4.new_empty((act_fp4.size(0), weight_fp4.size(0)),
+                             dtype=output_dtype)

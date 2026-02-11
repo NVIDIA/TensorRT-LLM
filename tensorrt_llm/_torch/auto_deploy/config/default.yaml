@@ -48,6 +48,10 @@ transforms:
   match_rope_layout:
     stage: pattern_matcher
     expected_layout: bsnd
+  match_rmsnorm_pattern:
+    stage: pattern_matcher
+  match_l2norm_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -58,6 +62,8 @@ transforms:
   optimize_rope:
     stage: pattern_matcher
   quantize_int4_linear_from_config:
+    stage: pattern_matcher
+  quantize_int4_gptq_linear_from_config:
     stage: pattern_matcher
   quantize_fp8_linear_from_config:
     stage: pattern_matcher
@@ -97,9 +103,11 @@ transforms:
     stage: weight_load
     run_per_gm: false
     checkpoint_device: null
+    expect_mem_change: true
   move_inputs_to_device:
     stage: weight_load
     run_per_gm: false
+    expect_mem_change: true
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
@@ -120,23 +128,27 @@ transforms:
     backend: trtllm
   fuse_moe:
     stage: post_load_fusion
-    enabled: true
+    expect_mem_change: true
     backend: trtllm
   fuse_fp8_moe:
     stage: post_load_fusion
-    enabled: true
+    expect_mem_change: true
     backend: trtllm
+    allow_different_input_scales: false
   fuse_nvfp4_moe:
     stage: post_load_fusion
-    enabled: false
+    expect_mem_change: true
+    allow_different_input_scales: false
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
-  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
   fuse_rmsnorm:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  fuse_l2norm:
+    stage: post_load_fusion
+    backend: fla
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
@@ -149,16 +161,17 @@ transforms:
   ############################################################################################
   visualize_namespace:
     stage: visualize
-    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/8460
-  ############################################################################################
+    enabled: false
+  ###########################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
-  ############################################################################################
+  ###########################################################################################
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer
   insert_cached_mla_attention:
     stage: cache_init
-    backend: MultiHeadLatentAttention
+    requires_shape_prop: true
+    backend: flashinfer_mla
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm
@@ -173,11 +186,12 @@ transforms:
     backend: cached_residual_add
   initialize_cache:
     stage: cache_init
+    expect_mem_change: true
     run_per_gm: false
   resize_kv_cache:
     stage: cache_init
+    expect_mem_change: true
     run_per_gm: false
-    free_mem_ratio: 0.0
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
@@ -188,6 +202,7 @@ transforms:
     enabled: false
   compile_model:
     stage: compile
+    expect_mem_change: true
     run_per_gm: false
     cuda_graph_batch_sizes: null
     backend: torch-compile

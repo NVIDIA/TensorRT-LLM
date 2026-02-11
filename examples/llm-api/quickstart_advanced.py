@@ -5,7 +5,7 @@ import time
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  CudaGraphConfig, DraftTargetDecodingConfig,
-                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
+                                 Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
 
@@ -55,13 +55,17 @@ def add_llm_args(parser):
                             'VANILLA', 'TRTLLM', 'FLASHINFER',
                             'FLASHINFER_STAR_ATTENTION'
                         ])
-    parser.add_argument('--moe_backend',
-                        type=str,
-                        default='CUTLASS',
-                        choices=[
-                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
-                        ])
+    parser.add_argument(
+        '--moe_backend',
+        type=str,
+        default='AUTO',
+        choices=[
+            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP', 'DEEPGEMM',
+            'CUTEDSL', 'TRITON'
+        ],
+        help=
+        'MoE backend to use. AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.'
+    )
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
@@ -97,9 +101,20 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument("--tokens_per_block", type=int, default=32)
+    parser.add_argument('--mamba_ssm_cache_dtype',
+                        type=str,
+                        default='bfloat16',
+                        choices=['auto', 'float16', 'bfloat16', 'float32'],
+                        help='Data type for Mamba SSM cache.')
     parser.add_argument('--log_kv_cache_events',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--use_kv_cache_manager_v2',
+        default=False,
+        action='store_true',
+        help='Use KVCacheManagerV2 for KV cache management (PyTorch backend).',
+    )
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
@@ -205,6 +220,8 @@ def setup_llm(args, **kwargs):
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
         tokens_per_block=args.tokens_per_block,
+        use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
+        mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         event_buffer_max_size=1024 if args.log_kv_cache_events else 0)
 
     spec_decode_algo = args.spec_decode_algo.upper(
@@ -220,11 +237,11 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
-            speculative_model_dir=args.model_dir)
+            speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
-            speculative_model_dir=args.draft_model_dir,
+            speculative_model=args.draft_model_dir,
             eagle3_one_model=args.use_one_model,
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
@@ -234,7 +251,7 @@ def setup_llm(args, **kwargs):
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
-            speculative_model_dir=args.draft_model_dir)
+            speculative_model=args.draft_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,

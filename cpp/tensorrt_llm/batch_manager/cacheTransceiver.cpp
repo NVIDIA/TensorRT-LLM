@@ -131,10 +131,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mGroupComm = std::make_shared<CacheTransceiverComm>(tensorrt_llm::pg_utils::get_world_pg());
     }
 
-    if (worldConfig.isTensorParallel())
+    if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
     {
         mGroupTensorParaComm = std::make_shared<CacheTransceiverComm>(
-            mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getTensorParallelRank()));
+            mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getRank()));
     }
     int kvFactor = 2;
     if (cacheManager->getCacheType() == kv_cache_manager::CacheType::kSELFKONLY)
@@ -143,25 +143,24 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
     mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
         attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(),
-        cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
-        cacheManager->getIndexerKCacheQuantBlockSize());
+        cacheManager->isEnablePartialReuse(), cacheManager->isEnableIndexerKCache(),
+        cacheManager->getIndexerKCacheIndexHeadDim(), cacheManager->getIndexerKCacheQuantBlockSize());
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
-        int TPSizeInDPGroup
-            = mCacheState->getParallelConfig().mTensorParallelism / mCacheState->getParallelConfig().mDPsize;
-        int DPSize = mCacheState->getParallelConfig().mDPsize;
-        int TPRankInDPGroup = worldConfig.getTensorParallelRank() % TPSizeInDPGroup;
+        int dpSize = mCacheState->getParallelConfig().mDPsize;
 
-        int DPRank = (worldConfig.getRank() - TPSizeInDPGroup * DPSize * worldConfig.getPipelineParallelRank()
-                         - TPRankInDPGroup)
-            / TPSizeInDPGroup;
-        // <PP,DP,TP>
-        mGroupDataComm = std::make_shared<CacheTransceiverComm>(mGroupComm->split(DPRank, worldConfig.getRank()));
-        if (worldConfig.isTensorParallel())
+        // dpRank is derived from the tensor parallel rank, which already accounts for CP.
+        // Layout: rank = ppRank * (TP * CP) + tpRank * CP + cpRank.
+        // getTensorParallelRank() correctly extracts tpRank regardless of CP.
+        int dpRank = mCacheState->getParallelConfig().mDPrank;
+        // <PP,DP,TP,CP>
+        mGroupDataComm = std::make_shared<CacheTransceiverComm>(mGroupComm->split(dpRank, worldConfig.getRank()));
+        if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
         {
+            // Group ranks with same (ppRank, dpRank) accounting for CP.
             mGroupTPInDPComm = std::make_shared<CacheTransceiverComm>(
-                mGroupComm->split(worldConfig.getRank() / TPSizeInDPGroup, worldConfig.getRank()));
+                mGroupComm->split(worldConfig.getPipelineParallelRank() * dpSize + dpRank, worldConfig.getRank()));
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
@@ -427,7 +426,8 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     }
 }
 
-void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
+RequestStatuses CacheTransceiver::checkContextTransferStatus(
+    std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
@@ -486,6 +486,8 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    RequestStatuses requestsStatus{};
+
     // Complete all the requests in toCompleteIdSet
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
@@ -499,7 +501,11 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                    requestsStatus.completedRequestIds.insert(request->mRequestId);
+                    if (markComplete)
+                    {
+                        request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                    }
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
@@ -514,6 +520,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                         "Future returned unexpected status for request %ld. Marking as error", request->mRequestId);
 
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    requestsStatus.errorRequestIds.insert(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
             }
@@ -522,6 +529,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                 TLLM_LOG_ERROR(
                     "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                requestsStatus.errorRequestIds.insert(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
@@ -530,6 +538,8 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
             ++it;
         }
     }
+
+    return requestsStatus;
 }
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)

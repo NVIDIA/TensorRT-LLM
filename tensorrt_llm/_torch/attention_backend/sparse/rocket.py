@@ -48,7 +48,7 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         assert self.page_size == next_power_of_2(
             self.page_size), "Page size must be a power of 2"
 
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        capture_graph = self.is_cuda_graph
 
         # Cumulative valid sequence lengths for query and key
         self.q_cu_seqlens_cuda = self.get_empty(
@@ -974,6 +974,7 @@ class RocketKVCacheManager(KVCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         num_extra_decoding_steps: int = 0,
+        draft_kv_cache_manager=None,
     ):
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -984,6 +985,7 @@ class RocketKVCacheManager(KVCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if prepare_resource:
             for req in requests:

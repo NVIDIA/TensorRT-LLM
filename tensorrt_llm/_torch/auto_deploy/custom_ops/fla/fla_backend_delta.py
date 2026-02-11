@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Cached attention op for delta rule using the fla kernel library.
 
 Delta Rule is based on this paper: https://arxiv.org/abs/2406.06484
@@ -11,17 +26,16 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
+from .....llmapi.llm_args import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
     Constant,
     MHACallable,
-    SequenceInfo,
+    ResourceHandlerDict,
+    StateResourceHandler,
 )
 from .delta_rule.chunk import chunk_delta_rule_fwd
 from .delta_rule.fused_recurrent import fused_recurrent_delta_rule_fwd
@@ -35,7 +49,7 @@ def fla_cached_delta_rule(
     v: torch.Tensor,
     beta: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
@@ -58,7 +72,7 @@ def fla_cached_delta_rule(
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
     y_flat = y.view(b * s, num_heads, -1)
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
 
     # clean up metadata
@@ -120,7 +134,7 @@ def fla_cached_delta_rule_fake(
     v: torch.Tensor,
     beta: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
@@ -136,11 +150,6 @@ def fla_cached_delta_rule_fake(
 
 @AttentionRegistry.register("fla_delta")
 class FlaDeltaBackend(AttentionDescriptor):
-    @classmethod
-    def is_paged(cls) -> bool:
-        # TODO: we should refine our notion of "is_paged" --> seems counterintuitive for ssm nows
-        return True
-
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         return "bsnd"
@@ -160,12 +169,12 @@ class FlaDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info", "cu_seqlen", "slot_idx", "use_initial_states"]
+        return ["batch_info_host", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         key_node = source_attn_node.args[1]
         value_node = source_attn_node.args[2]
         num_heads = key_node.meta["val"].shape[-2]
@@ -173,21 +182,15 @@ class FlaDeltaBackend(AttentionDescriptor):
         value_dim = value_node.meta["val"].shape[-1]
         key_dtype = key_node.meta["val"].dtype
 
-        def _get_delta_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_state_slots,
+        return {
+            "delta_cache": StateResourceHandler(
                 num_heads,
                 key_dim,
                 value_dim,
-                device=si.device,
-                dtype=cache_config.delta_dtype or key_dtype,
+                # NOTE: not configurable at the moment, using auto to match the key dtype
+                dtype=cls.resolve_cache_dtype("auto", key_dtype),
             )
-
-        return {"delta_cache": _get_delta_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
+        }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

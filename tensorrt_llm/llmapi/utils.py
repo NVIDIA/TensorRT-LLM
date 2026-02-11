@@ -15,7 +15,7 @@ import time
 import traceback
 import warnings
 import weakref
-from functools import cache, wraps
+from functools import wraps
 from pathlib import Path
 from queue import Queue
 from typing import (Any, Callable, Iterable, List, Optional, Tuple, Type,
@@ -224,6 +224,7 @@ class DisabledTqdm(tqdm):
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
     ignore_patterns = ["original/**/*"]
+    logger.info(f"Downloading model {model} from HuggingFace")
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
@@ -231,6 +232,7 @@ def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
             ignore_patterns=ignore_patterns,
             revision=revision,
             tqdm_class=DisabledTqdm)
+    logger.info(f"Finished downloading model {model} from HuggingFace")
     return Path(hf_folder)
 
 
@@ -353,7 +355,6 @@ def enable_llmapi_debug() -> bool:
     return _enable_llmapi_debug_
 
 
-@cache
 def enable_worker_single_process_for_tp1() -> bool:
     ''' Tell whether to make worker use single process for TP1.
     This is helpful for return-logits performance and debugging. '''

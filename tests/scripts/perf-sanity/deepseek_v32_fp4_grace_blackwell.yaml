@@ -1,0 +1,136 @@
+metadata:
+  model_name: deepseek_v32_fp4
+  supported_gpus:
+  - GB200
+server_configs:
+  # 1k1k configs - TEP4 with TRTLLM, MTP3
+  - name: "v32_fp4_tep4_mtp3_1k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 3
+    client_configs:
+      - name: "con2_iter10_1k1k"
+        concurrency: 2
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/deepseek_v32-1k1k-20480-ratio-1_for_serve.json
+
+  # 1k1k configs - DEP4 with CUTLASS, MTP1
+  - name: "v32_fp4_dep4_mtp1_1k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 256
+    max_num_tokens: 8192
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 256
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 1
+    client_configs:
+      - name: "con1024_iter10_1k1k"
+        concurrency: 1024
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/deepseek_v32-1k1k-20480-ratio-1_for_serve.json
+
+  # 8k1k configs - TEP4 with TRTLLM, MTP3
+  - name: "v32_fp4_tep4_mtp3_8k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 12288
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 3
+    client_configs:
+      - name: "con2_iter10_8k1k"
+        concurrency: 2
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/deepseek_v32-8k1k-20480-ratio-1_for_serve.json
+
+  # 8k1k configs - DEP4 with CUTLASS, MTP1
+  - name: "v32_fp4_dep4_mtp1_8k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 64
+    max_num_tokens: 12288
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 64
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 1
+    client_configs:
+      - name: "con256_iter10_8k1k"
+        concurrency: 256
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/deepseek_v32-8k1k-20480-ratio-1_for_serve.json

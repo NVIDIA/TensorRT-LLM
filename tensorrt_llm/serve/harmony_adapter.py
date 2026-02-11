@@ -25,7 +25,7 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
                               DeltaFunctionCall, DeltaMessage, DeltaToolCall,
-                              UsageInfo)
+                              UsageInfo, to_disaggregated_params)
 
 # yapf: enable
 
@@ -1521,10 +1521,10 @@ class HarmonyAdapter:
         return True
 
 
-_SERVE_HARMONY_ADAPTER: HarmonyAdapter = None
+_SERVE_HARMONY_ADAPTER: HarmonyAdapter | None = None
 
 
-def get_harmony_adapter():
+def get_harmony_adapter() -> HarmonyAdapter:
     global _SERVE_HARMONY_ADAPTER
     if _SERVE_HARMONY_ADAPTER is None:
         _SERVE_HARMONY_ADAPTER = HarmonyAdapter()
@@ -1535,8 +1535,8 @@ def get_harmony_adapter():
 def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                               tool_choice: str, result: GenerationResult,
                               model: str, request_id: str, done: bool,
-                              num_prompt_tokens: int) -> List[str]:
-    first_iteration = True
+                              num_prompt_tokens: int,
+                              first_iteration: bool) -> List[str]:
     output = result.outputs[0]
 
     # Convert tools to dictionary format for harmony adapter (standard pattern)
@@ -1644,18 +1644,35 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
         tools_for_parser = tools_dict
 
     output = outputs[0]
-    parsed_output = harmony_adapter.harmony_output_to_openai(
-        output.token_ids, tools_for_parser, tool_choice)
+    disaggregated_params = output.disaggregated_params
 
-    # CONVERTED OUTPUT (after harmony to openai conversion)
-    logger.debug(f"✅ CONVERTED OUTPUT: {json.dumps(parsed_output, indent=2)}")
+    response_message = {}
+    finish_reason = output.finish_reason
+    usage_info = None
+    # skip harmony parsing for context only requests
+    if disaggregated_params is None or disaggregated_params.request_type != "context_only":
+        parsed_output = harmony_adapter.harmony_output_to_openai(
+            output.token_ids, tools_for_parser, tool_choice)
 
-    # Create response message
-    response_message = _create_response_message(parsed_output)
+        # CONVERTED OUTPUT (after harmony to openai conversion)
+        logger.debug(
+            f"✅ CONVERTED OUTPUT: {json.dumps(parsed_output, indent=2)}")
 
-    # Determine finish reason
-    finish_reason = _determine_finish_reason(parsed_output,
-                                             output.finish_reason)
+        # Create response message
+        response_message = _create_response_message(parsed_output)
+
+        # Determine finish reason
+        finish_reason = _determine_finish_reason(parsed_output,
+                                                 output.finish_reason)
+        # Optional: Log if harmony parsing failed (for debugging)
+        if parsed_output.get('_harmony_parsing_failed'):
+            logger.warning(
+                f"⚠️ Harmony parsing fell back to raw text decoding, {parsed_output}"
+            )
+    else:
+        # Context only requests don't need a full response message,
+        # the real response will be responded by generation server
+        response_message = {"role": "assistant", "content": ""}
 
     # Create usage info from metrics (RequestOutput doesn't have usage in v1)
     usage_info = _create_usage_info(num_prompt_tokens, outputs)
@@ -1667,14 +1684,12 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
             ChatCompletionResponseChoice(
                 index=0,
                 message=ChatMessage(**response_message),
-                finish_reason=finish_reason)
+                finish_reason=finish_reason,
+                disaggregated_params=to_disaggregated_params(
+                    output.disaggregated_params))
         ],
         usage=usage_info,
     )
-    # Optional: Log if harmony parsing failed (for debugging)
-    if parsed_output.get('_harmony_parsing_failed'):
-        logger.warning("⚠️ Harmony parsing fell back to raw text decoding")
-        logger.debug(f"response\n\n{response}\n")
 
     return response
 

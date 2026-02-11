@@ -2,10 +2,7 @@ import pytest
 import torch
 from utils.util import check_accuracy
 
-from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-    GatherGroupedGemmInputsHelper,
-    GroupedGemmInputsHelper,
-)
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
 from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
@@ -594,7 +591,7 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     get_sm_version() not in (100, 103),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
-@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
@@ -740,55 +737,31 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
 
     # Generate routing information
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
-    _, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
     token_selected_experts = token_selected_experts.to(torch.int32)
-    num_tokens_per_expert = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
-    num_tokens_per_expert = num_tokens_per_expert[:num_local_experts]
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
     # Ensure at least one valid token
-    if num_tokens_per_expert.sum().item() == 0:
-        num_tokens_per_expert[0] = 1
-    num_tiles_per_expert = (num_tokens_per_expert + tile_size - 1) // tile_size
-    num_tokens_per_expert = num_tokens_per_expert.cpu()
-    num_tiles_per_expert = num_tiles_per_expert.cpu()
-    num_valid_tiles = num_tiles_per_expert.sum().item()
-    num_valid_permuted_tokens = num_valid_tiles * tile_size
+    token_selected_experts[0] = 0
 
-    # Create helper
-    helper = GatherGroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
-    max_num_tiles = helper.get_max_num_tiles(num_tokens)
-    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
-    assert 0 <= num_valid_tiles <= max_num_tiles
-    assert 0 <= num_valid_permuted_tokens <= max_num_permuted_tokens
-
-    # Generate tile metadata
-    num_non_exiting_tiles = torch.tensor([num_valid_tiles], dtype=torch.int32, device="cuda")
-    tile_idx_to_group_idx = torch.empty(max_num_tiles, dtype=torch.int32)
-    tile_idx_to_mn_limit = torch.empty(max_num_tiles, dtype=torch.int32)
-    tile_idx_to_group_idx.fill_(int(-2e9))
-    tile_idx_to_mn_limit.fill_(int(-2e9))
-
-    tile_idx_to_group_idx_list = helper.generate_tile_idx_to_group_idx(
-        num_tokens_per_expert.tolist()
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
     )
-    tile_idx_to_mn_limit_list = helper.generate_tile_idx_to_mn_limit(num_tokens_per_expert.tolist())
 
-    for idx, (group_idx, mn_limit) in enumerate(
-        zip(tile_idx_to_group_idx_list, tile_idx_to_mn_limit_list)
-    ):
-        tile_idx_to_group_idx[idx] = group_idx
-        tile_idx_to_mn_limit[idx] = mn_limit
-
-    tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
-    tile_idx_to_mn_limit = tile_idx_to_mn_limit.cuda()
-
-    # Generate permuted_idx_to_expanded_idx for gather operation
-    permuted_idx_to_expanded_idx_list = helper.generate_permuted_idx_to_expanded_idx(
-        num_tokens, num_tokens_per_expert.tolist(), max_num_permuted_tokens
-    )
-    permuted_idx_to_expanded_idx = torch.tensor(
-        permuted_idx_to_expanded_idx_list, dtype=torch.int32, device="cuda"
-    )
-    assert permuted_idx_to_expanded_idx.size(0) == max_num_permuted_tokens
+    max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+    num_valid_permuted_tokens = total_num_padded_tokens.item()
 
     # Create input tensors (original size, not permuted)
     a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
@@ -826,18 +799,22 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     )
 
     # Compute reference: manually gather, compute GEMM, apply SwiGLU, then quantize
-    a_gathered = torch.empty(
-        max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype, device=a.device
-    )
+    permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
+    tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
+
+    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
     a_sf_gathered = torch.empty(
-        max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype, device=a_sf.device
+        max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
-        expanded_idx = permuted_idx_to_expanded_idx[i].item()
-        if expanded_idx != helper.pad_val:
-            token_id = expanded_idx // top_k
-            a_gathered[i] = a[token_id]
-            a_sf_gathered[i] = a_sf_unswizzled[token_id]
+        if i >= tile_idx_to_mn_limit_list[i // tile_size]:
+            continue
+        expanded_idx = permuted_idx_to_expanded_idx_list[i]
+        token_id = expanded_idx // top_k
+        a_gathered[i] = a[token_id]
+        a_sf_gathered[i] = a_sf_unswizzled[token_id]
+    a_gathered = a_gathered.to(a.device)
+    a_sf_gathered = a_sf_gathered.to(a.device)
 
     # Swizzle a_sf_gathered for reference GEMM
     a_sf_gathered_swizzled = swizzle_sf(
@@ -886,8 +863,9 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     # Create mask for valid tokens
     valid_token_mask = torch.zeros(num_valid_permuted_tokens, dtype=torch.bool, device="cuda")
     for i in range(num_valid_permuted_tokens):
-        if permuted_idx_to_expanded_idx[i].item() != helper.pad_val:
-            valid_token_mask[i] = True
+        if i >= tile_idx_to_mn_limit_list[i // tile_size]:
+            continue
+        valid_token_mask[i] = True
 
     num_valid_tokens = valid_token_mask.sum().item()
     if num_valid_tokens > 0:
@@ -905,9 +883,10 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         c_sf_valid = []
         c_sf_ref_valid = []
         for i in range(num_valid_permuted_tokens):
-            if permuted_idx_to_expanded_idx[i].item() != helper.pad_val:
-                c_sf_valid.append(c_sf_unswizzled[i])
-                c_sf_ref_valid.append(c_sf_ref_unswizzled[i])
+            if i >= tile_idx_to_mn_limit_list[i // tile_size]:
+                continue
+            c_sf_valid.append(c_sf_unswizzled[i])
+            c_sf_ref_valid.append(c_sf_ref_unswizzled[i])
 
         c_sf_valid = torch.cat(c_sf_valid)
         c_sf_ref_valid = torch.cat(c_sf_ref_valid)

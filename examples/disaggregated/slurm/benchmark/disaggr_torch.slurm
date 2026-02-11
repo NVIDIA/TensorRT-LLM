@@ -56,14 +56,16 @@ cleanup_on_failure() {
 replace_placeholder() {
     file_path="$1"
     all_nodes_str="$2"
+    new_file_path="$3"
+    cp "$file_path" "$new_file_path"
     IFS=',' read -r -a node_array <<< "$all_nodes_str"
     for i in "${!node_array[@]}"; do
         current_val="${node_array[$i]}"
         placeholder="<node${i}_placeholder>"
 
         # Use sed to replace the placeholder with the value in-place
-        sed -i "s|$placeholder|$current_val|g" "${file_path}"
-        echo "Replaced $placeholder with $current_val in ${file_path}"
+        sed -i "s|$placeholder|$current_val|g" "${new_file_path}"
+        echo "Replaced $placeholder with $current_val in ${new_file_path}"
     done
 }
 
@@ -86,7 +88,7 @@ if [ -n "${trtllm_wheel_path}" ]; then
     if ! srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "pip install ${trtllm_wheel_path}" \
+        bash -c "pip install ${trtllm_wheel_path}[devel]" \
         &> ${full_logdir}/2_install.log; then
         cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/2_install.log for details"
     fi
@@ -117,16 +119,23 @@ elif [ -d "${trtllm_repo}" ]; then
     if ! srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && pip install -e ." \
+        bash -c "cd ${trtllm_repo} && pip install -e .[devel]" \
         &> ${full_logdir}/2_install.log; then
         cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/2_install.log for details"
     fi
     echo "TensorRT-LLM installation completed successfully"
 else
     echo "trtllm_wheel_path and trtllm_repo are not provided, will use the installed TensorRT-LLM from the container"
-    if [ -v TRT_LLM_GIT_COMMIT ]; then
-        echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
+    # get_env file is in the same directory as this script
+    get_env_file=${work_dir}/get_env.py
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
+        bash -c "python ${get_env_file} -e ${full_logdir}/env_vars.json" \
+        &> ${full_logdir}/2_get_env.log; then
+        cleanup_on_failure "Failed to get TensorRT-LLM environment variables. Check ${full_logdir}/2_get_env.log for details"
     fi
+    echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
 # Get node lists and replace the placeholder with the actual node names
@@ -135,12 +144,15 @@ all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
 echo "all_nodes_str: ${all_nodes_str}"
 
+start_server_cmds_base_file=${full_logdir}/start_server_cmds_base.sh
 start_server_cmds_file=${full_logdir}/start_server_cmds.sh
-replace_placeholder ${start_server_cmds_file} ${all_nodes_str}
+replace_placeholder "${start_server_cmds_base_file}" "${all_nodes_str}" "${start_server_cmds_file}"
+server_config_base_file=${full_logdir}/server_config_base.yaml
 server_config_file=${full_logdir}/server_config.yaml
-replace_placeholder ${server_config_file} ${all_nodes_str}
+replace_placeholder "${server_config_base_file}" "${all_nodes_str}" "${server_config_file}"
+client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
-replace_placeholder ${client_cmds_file} ${all_nodes_str}
+replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
 # start the servers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
 echo "Starting worker commands from ${start_server_cmds_file}..."
@@ -157,7 +169,6 @@ done
 echo "Server is ready!"
 
 # Start client commands
-client_cmds_file=${full_logdir}/client_cmds.sh
 echo "Starting client commands from ${client_cmds_file}..."
 while read -r cmd <&3; do
     echo "Starting client command: ${cmd}"

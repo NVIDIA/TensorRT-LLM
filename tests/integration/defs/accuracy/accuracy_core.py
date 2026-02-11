@@ -402,6 +402,8 @@ class MMMU(AccuracyTask):
                             is_multimodal=True,
                             apply_chat_template=True)
 
+    EVALUATE_KWARGS = dict(model_type=None, is_force_single_image=False)
+
 
 class PassKeyRetrieval64k(AccuracyTask):
     DATASET = "passkey_retrieval_64k"
@@ -450,7 +452,7 @@ class LongBenchV2(AccuracyTask):
     EVALUATOR_KWARGS = dict(
         dataset_path=DATASET_DIR,
         length="medium",
-        max_len=120000,
+        max_input_length=120000,
         apply_chat_template=True,
         random_seed=0,
     )

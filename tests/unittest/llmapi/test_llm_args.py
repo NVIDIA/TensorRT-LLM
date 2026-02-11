@@ -138,6 +138,61 @@ max_seq_len: 128
         assert llm_args.max_num_tokens == 256
         assert llm_args.max_seq_len == 128
 
+    @pytest.mark.parametrize("llm_args_cls", [TrtLlmArgs, TorchLlmArgs])
+    def test_llm_args_with_model_kwargs(self, llm_args_cls):
+        yaml_content = """
+model_kwargs:
+    num_hidden_layers: 2
+    """
+        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args = llm_args_cls(model=llama_model_path)
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
+                                                        dict_content)
+        llm_args = llm_args_cls(**llm_args_dict)
+        assert llm_args.model_kwargs['num_hidden_layers'] == 2
+
+
+def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
+    spec_cfg = DecodingBaseConfig.from_dict(
+        dict(decoding_type="Eagle3",
+             max_draft_len=3,
+             speculative_model_dir="/path/to/draft/model"))
+    assert isinstance(spec_cfg, Eagle3DecodingConfig)
+
+
+def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
+    import tensorrt_llm.llmapi.llm_args as llm_args_mod
+
+    warnings_seen: list[str] = []
+
+    def _capture_warning(msg, *args, **kwargs):
+        warnings_seen.append(str(msg))
+
+    monkeypatch.setattr(llm_args_mod.logger, "warning", _capture_warning)
+
+    spec_cfg = DecodingBaseConfig.from_dict(dict(
+        decoding_type="Eagle",
+        max_draft_len=3,
+        speculative_model_dir="/path/to/draft/model"),
+                                            backend="pytorch")
+    assert isinstance(spec_cfg, Eagle3DecodingConfig)
+
+    TorchLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
+
+    assert any(
+        "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3" in m
+        for m in warnings_seen)
+
+
+def test_decoding_type_eagle3_errors_on_tensorrt_backend():
+    spec_cfg = DecodingBaseConfig.from_dict(
+        dict(decoding_type="Eagle3",
+             max_draft_len=3,
+             speculative_model_dir="/path/to/draft/model"))
+    with pytest.raises(ValueError,
+                       match="only supported on the PyTorch backend"):
+        TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
+
 
 def check_defaults(py_config_cls, pybind_config_cls):
     py_config = py_config_cls()
@@ -444,6 +499,31 @@ class TestTorchLlmArgs:
         with pytest.raises(ValueError):
             args = TorchLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
+
+    def test_speculative_model_alias(self):
+        """Test that speculative_model_dir is accepted as an alias for speculative_model."""
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model_dir="/path/to/model",
+            eagle3_one_model=False,
+        )
+
+        args = TorchLlmArgs(model=llama_model_path,
+                            speculative_config=spec_config)
+        assert args.speculative_model == "/path/to/model"
+
+    @print_traceback_on_error
+    def test_model_kwargs_with_num_hidden_layers(self):
+        """Test that model_kwargs can override num_hidden_layers."""
+        from tensorrt_llm._torch.model_config import ModelConfig
+        config_no_kwargs = ModelConfig.from_pretrained(
+            llama_model_path).pretrained_config
+        model_kwargs = {'num_hidden_layers': 2}
+        config_with_kwargs = ModelConfig.from_pretrained(
+            llama_model_path, model_kwargs=model_kwargs).pretrained_config
+        assert config_no_kwargs.num_hidden_layers != config_with_kwargs.num_hidden_layers
+        assert config_with_kwargs.num_hidden_layers == 2
 
 
 class TestTrtLlmArgs:

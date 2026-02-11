@@ -33,6 +33,8 @@ namespace torch_ext
 namespace moe_comm
 {
 
+static constexpr size_t CACHELINE_ALIGNMENT = 128;
+
 // TODO: Is Alignment necessary?
 // Helper function to align offset to specified byte boundary
 inline size_t alignOffset(size_t offset, size_t alignment)
@@ -41,12 +43,11 @@ inline size_t alignOffset(size_t offset, size_t alignment)
 }
 
 // Calculate auxiliary data offsets
-MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens)
+MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNumExperts)
 {
     // TODO: Use lambdas to encapsulate offset and alignment for each entry, which is less error prone and easier to
     // read.
     constexpr size_t SIZEOF_INT32 = 4;
-    constexpr size_t CACHELINE_ALIGNMENT = 128;
 
     MoeA2ADataOffsets offsets;
     size_t offset = 0;
@@ -89,6 +90,11 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens)
     offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
         * SIZEOF_INT32;
 
+    // eplb gathered stats: [epSize, eplbStatsNumExperts]
+    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
+    offsets[EPLB_GATHERED_STATS_OFFSET_INDEX] = offset;
+    offset += static_cast<size_t>(epSize) * static_cast<size_t>(eplbStatsNumExperts) * SIZEOF_INT32;
+
     // payload data
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[PAYLOAD_DATA_OFFSET_INDEX] = offset;
@@ -104,10 +110,12 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens)
 //   - epRank: Current expert parallel rank
 //   - epSize: Total expert parallel size
 //   - maxNumTokens: Maximum number of tokens supported
+//   - eplbStatsNumExperts: (Optional) Number of experts used for EPLB stats
 //
 // Returns:
 //   - metainfo: Tensor containing offsets for auxiliary data
-torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens)
+torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens,
+    torch::optional<int64_t> eplbStatsNumExperts)
 {
     // Validate inputs
     CHECK_TH_CUDA(workspace);
@@ -119,8 +127,11 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
     // Initialize workspace to zero
     workspace[epRank].zero_();
 
+    int64_t eplbStatsNumExpertsValue = eplbStatsNumExperts.value_or(0);
+    TORCH_CHECK(eplbStatsNumExpertsValue >= 0, "eplbStatsNumExperts must be positive if not None.");
+
     // Calculate auxiliary data offsets
-    MoeA2ADataOffsets offsets = calculateOffsets(epSize, maxNumTokens);
+    MoeA2ADataOffsets offsets = calculateOffsets(epSize, maxNumTokens, static_cast<int>(eplbStatsNumExpertsValue));
 
     // Return metainfo as a tensor containing offsets
     torch::Tensor metainfo = torch::empty(
@@ -154,18 +165,23 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
 //   - epRank: Current expert parallel rank
 //   - epSize: Total expert parallel size
 //   - topK: Number of experts selected per token
-//   - numExperts: Total number of experts (must be divisible by epSize)
+//   - numExperts: Total number of routing slots (tokenSelectedExperts values are in [0, numExperts))
+//   - eplbStatsNumExperts: Number of experts used for EPLB stats (may be <= numExperts)
+//   - eplbLocalStats: [eplbStatsNumExperts] tensor containing local statistics for EPLB.
 //
 // Return values:
 //   - recvTensors: Vector of receive buffers (one tensor per payload), each [ep_size, runtimeMaxTokensPerRank,
 //   elements_per_token]
 //   - combinePayloadOffset: Offset into workspace for the combine payload region, to be used by the combine operation
+//   - eplbGatheredStats: (Optional) [ep_size, eplbStatsNumExperts] tensor containing gathered statistics for EPLB, or
+//   an empty tensor if eplbLocalStats is None.
 //
 // Note: token_selected_experts is used for routing but is NOT automatically included as a payload.
 //       If you want to dispatch token_selected_experts, include it explicitly in inputPayloads.
-std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor const& tokenSelectedExperts,
-    std::vector<torch::Tensor> const& inputPayloads, torch::Tensor const& workspace, torch::Tensor const& metainfo,
-    int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK, int64_t numExperts)
+std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
+    torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
+    torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
+    int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -193,6 +209,19 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
     TORCH_CHECK(inputPayloads.size() <= kMaxPayloads, "Too many input payloads");
     TORCH_CHECK(numExperts >= epSize, "numExperts must be greater than or equal to epSize");
     TORCH_CHECK(numExperts % epSize == 0, "numExperts must be divisible by epSize for contiguous partitioning");
+    bool enableEplb = eplbLocalStats.has_value();
+    int64_t eplbStatsNumExperts = 0;
+    if (enableEplb)
+    {
+        TORCH_CHECK(eplbLocalStats.has_value(), "enable_eplb requires eplb_local_stats");
+        torch::Tensor const& eplbLocalStatsTensor = eplbLocalStats.value();
+        eplbStatsNumExperts = eplbLocalStatsTensor.size(0);
+        TORCH_CHECK(eplbStatsNumExperts > 0, "eplb_local_stats must not be empty");
+        TORCH_CHECK(eplbStatsNumExperts <= numExperts, "eplb_local_stats size must be <= numExperts (slots)");
+        CHECK_INPUT(eplbLocalStatsTensor, torch::kInt32);
+        TORCH_CHECK(eplbLocalStatsTensor.is_contiguous(), "eplb_local_stats must be contiguous");
+        TORCH_CHECK(eplbLocalStatsTensor.dim() == 1, "eplb_local_stats must be a 1D tensor");
+    }
 
     // All input payloads must have the same first dimension (localNumTokens)
     for (auto const& payload : inputPayloads)
@@ -203,12 +232,18 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
         TORCH_CHECK(payload.is_contiguous(), "All payloads must be contiguous");
     }
 
-    // Calculate buffer sizes for all payloads
-    // Each payload buffer needs space for data from ALL ranks: epSize * maxTokensPerRank * elementsPerToken
-    int64_t totalBytesNeeded = 0;
-    std::vector<int64_t> payloadByteSizes;
+    // Record the cacheline aligned start offset for each payload's recv buffer.
+    // 1. We assume the base workspace ptr of each rank is aligned (checked in this OP)
+    // 2. offsets[PAYLOAD_DATA_OFFSET_INDEX] is aligned (ensured in calculateOffsets)
+    // 3. We align the currentOffset during update.
+    // In this way, it is guaranteed that the recv buffer is (over-)aligned, sufficient for 128bit vectorized ld/st.
+
     std::vector<int> payloadElementSizes;
     std::vector<int> payloadElementsPerToken;
+    std::vector<size_t> payloadRecvBufferOffsets;
+
+    // Start offset for the first payload
+    size_t currentOffset = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
     for (auto const& payload : inputPayloads)
     {
         CHECK_CONTIGUOUS(payload);
@@ -216,16 +251,24 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
         TORCH_CHECK(payload.dim() == 2, "payload must be a 2D tensor");
         TORCH_CHECK(
             payload.size(0) == localNumTokens, "payload must have the same first dimension as tokenSelectedExperts");
+        // Unlike recv buffer for payloads, payload itself is not allocated by us and we cannot control its alignment.
+        // We only make sure the payload start offset is 16-byte aligned, while the actual vectorized ld/st width is
+        // dynamically determined based on bytes per token of this payload.
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(payload.data_ptr()) % 16 == 0, "payload must be 16-byte aligned");
 
         int elementsPerToken = static_cast<int>(payload.size(1));
         int elementSize = static_cast<int>(payload.dtype().itemsize());
         // Each payload buffer stores data from ALL ranks
         int64_t bytesPerPayload = epSize * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
 
-        payloadByteSizes.push_back(bytesPerPayload);
         payloadElementSizes.push_back(elementSize);
         payloadElementsPerToken.push_back(elementsPerToken);
-        totalBytesNeeded += bytesPerPayload;
+
+        payloadRecvBufferOffsets.push_back(currentOffset);
+
+        // Update offset and align to cacheline boundary for the next payload recv buffer.
+        currentOffset += bytesPerPayload;
+        currentOffset = alignOffset(currentOffset, CACHELINE_ALIGNMENT);
     }
 
     CHECK_TH_CUDA(workspace);
@@ -236,16 +279,18 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
 
     // Validate workspace size - must include space for auxiliary data + payloads
     int64_t sizePerRank = workspace.size(1);
-    int64_t requiredSize = offsets[PAYLOAD_DATA_OFFSET_INDEX] + totalBytesNeeded;
+    int64_t requiredSize = static_cast<int64_t>(currentOffset);
     TORCH_CHECK(sizePerRank >= requiredSize,
         "Workspace size per rank insufficient for dispatch. "
         "Need at least ",
-        requiredSize, " bytes (", offsets[PAYLOAD_DATA_OFFSET_INDEX], " for auxiliary data + ", totalBytesNeeded,
-        " for payloads), but got ", sizePerRank);
+        requiredSize, " bytes (", offsets[PAYLOAD_DATA_OFFSET_INDEX], " for auxiliary data + payloads), but got ",
+        sizePerRank);
 
     // Get base workspace pointer
     uint8_t* workspacePtr = workspace.data_ptr<uint8_t>();
     uint8_t* rankWorkSpacePtr = workspacePtr + epRank * workspace.stride(0);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(rankWorkSpacePtr) % CACHELINE_ALIGNMENT == 0,
+        "rankWorkSpacePtr must be %d-byte aligned", CACHELINE_ALIGNMENT);
 
     // Setup payload descriptors for source data
     int num_payloads = static_cast<int>(inputPayloads.size());
@@ -263,10 +308,12 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
         = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken(); // TODO: Decide this based on the workload
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
-    params.num_experts_per_rank = static_cast<int>(numExperts) / static_cast<int>(epSize);
+    params.num_experts = static_cast<int>(numExperts);
     params.local_num_tokens = static_cast<int>(localNumTokens);
     params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
     params.top_k = static_cast<int>(topK);
+    params.enable_eplb = enableEplb;
+    params.eplb_stats_num_experts = static_cast<int>(eplbStatsNumExperts);
 
     params.token_selected_experts = tokenSelectedExperts.data_ptr<int32_t>();
 
@@ -287,15 +334,30 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
             = reinterpret_cast<int*>(targetWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
         params.completion_flags[target_rank]
             = reinterpret_cast<uint32_t*>(targetWorkSpacePtr + offsets[DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX]);
+        if (enableEplb)
+        {
+            params.eplb_gathered_stats[target_rank]
+                = reinterpret_cast<int*>(targetWorkSpacePtr + offsets[EPLB_GATHERED_STATS_OFFSET_INDEX]);
+        }
+        else
+        {
+            params.eplb_gathered_stats[target_rank] = nullptr;
+        }
 
-        size_t offset = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
         for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
         {
-            // Store pointer for current payload
-            params.recv_buffers[target_rank][payload_idx] = targetWorkSpacePtr + offset;
-            // Update offset for next payload
-            offset += payloadByteSizes[payload_idx];
+            // Store pointer for current payload using pre-calculated aligned offset
+            params.recv_buffers[target_rank][payload_idx] = targetWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
         }
+    }
+
+    if (enableEplb)
+    {
+        params.eplb_local_stats = eplbLocalStats.value().data_ptr<int32_t>();
+    }
+    else
+    {
+        params.eplb_local_stats = nullptr;
     }
 
     params.stream = at::cuda::getCurrentCUDAStream();
@@ -310,24 +372,32 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
 
     // Create tensor views for the current rank's receive buffers only
     std::vector<torch::Tensor> recvTensors;
-    size_t offset = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
     for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
     {
         auto const& payload = inputPayloads[payload_idx];
-        // Create tensor view for this payload
-        auto recvTensor = torch::from_blob(rankWorkSpacePtr + offset,
+        // Create tensor view for this payload using pre-calculated aligned offset
+        auto recvTensor = torch::from_blob(rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx],
             {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]}, payload.options());
         recvTensors.push_back(recvTensor);
-
-        // Update offset for next payload
-        offset += payloadByteSizes[payload_idx];
     }
 
     // Compute aligned offset after dispatch payloads for combine payload region
-    constexpr size_t CACHELINE_ALIGNMENT = 128;
-    int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(static_cast<size_t>(offset), CACHELINE_ALIGNMENT));
+    int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(currentOffset, CACHELINE_ALIGNMENT));
 
-    return std::make_tuple(std::move(recvTensors), combinePayloadOffset);
+    torch::Tensor eplbGatheredStats;
+    if (enableEplb)
+    {
+        int* gatheredStatsPtr = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[EPLB_GATHERED_STATS_OFFSET_INDEX]);
+        auto statsOptions = workspace.options().dtype(torch::kInt32);
+        eplbGatheredStats = torch::from_blob(
+            gatheredStatsPtr, {static_cast<int64_t>(epSize), static_cast<int64_t>(eplbStatsNumExperts)}, statsOptions);
+    }
+    else
+    {
+        eplbGatheredStats = torch::empty({0}, workspace.options().dtype(torch::kInt32));
+    }
+
+    return std::make_tuple(std::move(recvTensors), combinePayloadOffset, std::move(eplbGatheredStats));
 }
 
 // MoE All-to-All Combine Operation
@@ -356,6 +426,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     TORCH_CHECK(payload.size(0) == epSize, "payload first dimension must equal epSize");
     TORCH_CHECK(
         payload.size(1) == runtimeMaxTokensPerRank, "payload second dimension must equal runtimeMaxTokensPerRank");
+    // We only make sure the payload start offset is 16-byte aligned, while the actual vectorized ld/st width is
+    // dynamically determined based on bytes per token of this payload.
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(payload.data_ptr()) % 16 == 0, "payload must be 16-byte aligned");
     int64_t elementsPerToken = payload.size(2);
     TORCH_CHECK(elementsPerToken > 0, "elementsPerToken must be positive");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
@@ -411,6 +484,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         " for payload), but got ", sizePerRank);
 
     // Create output tensor (local on current rank), no need for initialization
+    // Typically, newly allocated GPU torch tensors are at least 16-byte aligned.
     torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, payload.options());
 
     // Setup combine parameters
@@ -512,9 +586,12 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
 }
 
 // Return the size of auxiliary data in workspace
-int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int64_t maxNumTokens)
+int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int64_t maxNumTokens, torch::optional<int64_t> eplbStatsNumExperts)
 {
-    MoeA2ADataOffsets offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxNumTokens));
+    int64_t eplbStatsNumExpertsValue = eplbStatsNumExperts.value_or(0);
+    TORCH_CHECK(eplbStatsNumExpertsValue >= 0, "eplbStatsNumExperts must be positive if not None.");
+    MoeA2ADataOffsets offsets = calculateOffsets(
+        static_cast<int>(epSize), static_cast<int>(maxNumTokens), static_cast<int>(eplbStatsNumExpertsValue));
     return static_cast<int64_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
 }
 
@@ -533,14 +610,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def(
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, "
         "Tensor(a!->*) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
-        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor(a!)[], int)");
+        "int ep_rank, int ep_size, int top_k, int num_experts, "
+        "Tensor? eplb_local_stats=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int combine_payload_offset, "
         "bool payload_in_workspace) -> Tensor");
     module.def(
-        "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank) -> Tensor");
+        "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
+        "int? eplb_stats_num_experts=None) -> Tensor");
     module.def(
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");
@@ -548,7 +627,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, int ep_rank, int ep_size, int "
         "runtime_max_tokens_per_rank, "
         "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
-    module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens) -> int",
+    module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens, int? eplb_stats_num_experts=None) -> int",
         &tensorrt_llm::torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
 }
 

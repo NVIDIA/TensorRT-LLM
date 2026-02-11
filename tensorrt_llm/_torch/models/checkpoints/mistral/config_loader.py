@@ -8,6 +8,7 @@ from transformers import PretrainedConfig, WhisperConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -103,17 +104,14 @@ def _remap_mistral_yarn_args(config: dict) -> dict:
         "apply_scale": "apply_yarn_scaling",
     }
     yarn_config = config.get("yarn") or {}
-    config["rope_parameters"] = {
+    config["rope_scaling"] = {
         "rope_type": "yarn",
         "mscale_all_dim": 1,
     }
 
-    if rope_theta := config.pop("rope_theta", None):
-        config["rope_parameters"]["rope_theta"] = rope_theta
-
     for old_name, new_name in yarn_config_map.items():
         if old_name in yarn_config:
-            config["rope_parameters"][new_name] = yarn_config.pop(old_name)
+            config["rope_scaling"][new_name] = yarn_config.pop(old_name)
 
     assert len(yarn_config) == 0, f"Unparsed yarn config: {yarn_config}"
 
@@ -330,6 +328,15 @@ class MistralConfigLoader(BaseConfigLoader):
                     block_size = (128, 128)
                 quant_config.group_size = block_size[0]
 
+        # model_kwargs is not supported for Mistral format checkpoints
+        # Extract it from kwargs to avoid passing to ModelConfig.__init__ (which doesn't accept it)
+        model_kwargs = kwargs.pop("model_kwargs", None)
+        if model_kwargs:
+            logger.warning(
+                "model_kwargs is not supported for Mistral format checkpoints. "
+                f"Ignoring model_kwargs: {model_kwargs}"
+            )
+
         kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
         model_config = ModelConfig(
             pretrained_config=pretrained_config,
@@ -340,5 +347,6 @@ class MistralConfigLoader(BaseConfigLoader):
         from tensorrt_llm._torch.models.modeling_mistral_large3 import Mistral3Gate
 
         model_config.pretrained_config.gate_cls = Mistral3Gate
+        model_config.pretrained_config.input_processor_type = "mistral_large_3"
         model_config._frozen = True
         return model_config

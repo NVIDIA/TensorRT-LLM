@@ -125,7 +125,7 @@ def check_generation_logits(beam: CompletionOutput,
 def check_logprobs(beam: CompletionOutput, sampling_params: SamplingParams,
                    valid_tokens: int | None) -> None:
     """Check if the logprobs have the correct shape"""
-    if sampling_params.logprobs:
+    if sampling_params.logprobs is not None:
         generated_tokens = valid_tokens if valid_tokens is not None else sampling_params.max_tokens
         assert len(
             beam.logprobs
@@ -345,7 +345,7 @@ class GeneralTestParams:
     prompt_len = len(input_tokens)
     num_generated_tokens = 5
     seq_len = prompt_len + num_generated_tokens
-    num_logprobs = 1
+    num_logprobs = 0
     seq_slot = 4
     end_id = 99
     batch_size = 2
@@ -436,7 +436,6 @@ def test_beam_search_sampling_batch_basic():
             beam_width_out=beam_width,
             beam_search_args=beam_search_args,
             temperature=temperature,
-            generator=None,
             return_probs=True,
         )
 
@@ -541,7 +540,7 @@ def create_default_request(test_params: GeneralTestParams) -> LlmRequest:
                       end_id=test_params.end_id,
                       sampling_config=SamplingConfig(
                           sampling_params._get_sampling_config()),
-                      return_log_probs=test_params.num_logprobs > 0,
+                      return_log_probs=test_params.num_logprobs >= 0,
                       num_logprobs=test_params.num_logprobs,
                       is_streaming=False)
 
@@ -590,7 +589,7 @@ def test_create_beam_history():
     num_generated_tokens = test_params.num_generated_tokens
     seq_slot = test_params.seq_slot
     vocab_size = test_params.vocab_size
-    num_logprobs = test_params.num_logprobs
+    num_logprobs = test_params.num_logprobs + 1
     cache_indirection = sampler.store.cache_indirection
     original_tokens = sampler.store.original_tokens
     original_logprobs = torch.zeros(
@@ -635,7 +634,8 @@ def test_create_beam_history():
     # set the logprobs in the request:
     token_logprobs = sampler._convert_logprobs_tensor_to_list(
         original_logprob_indices[:beam_width, :num_generated_tokens - 1],
-        original_logprobs[:beam_width, :num_generated_tokens - 1])
+        original_logprobs[:beam_width, :num_generated_tokens - 1],
+    )
     request.py_result.set_log_probs(
         token_logprobs,
         cum_log_probs=torch.zeros_like(
@@ -657,27 +657,28 @@ def test_create_beam_history():
         ) > 0, "Deterministic offsets must not only contain zeros. Otherwise change the seed."
 
     # set the new log probs and tokens for the beam search sampling
-    sampler.store.new_log_probs[
+    sampler.store.sampled_log_probs[
         seq_slot, :beam_width] = original_logprobs[:beam_width,
-                                                   num_generated_tokens - 1, 0]
+                                                   num_generated_tokens - 1,
+                                                   0:1]
     sampler.store.new_tokens[
         0,
         seq_slot, :beam_width] = original_logprob_indices[:beam_width,
                                                           num_generated_tokens -
                                                           1, 0]
     # test
-    beam_history = sampler._create_beam_history(request)
+    beam_history_builder = sampler._prepare_beam_history(
+        request, finish_reasons=torch.ones((beam_width, ), dtype=torch.int))
+    torch.cuda.synchronize()
+    beam_history = beam_history_builder()
 
     # expected selection:
     # Currently beam history only contains the generated tokens, not the prompt tokens.
     expected_tokens = torch.zeros(
-        (sampler.max_beam_width, num_generated_tokens),
-        dtype=torch.int32,
-        device=original_tokens.device)
+        (sampler.max_beam_width, num_generated_tokens), dtype=torch.int32)
     expected_logprobs = torch.zeros(
         (beam_width, num_generated_tokens, original_logprobs.shape[-1]),
-        dtype=torch.float32,
-        device=original_logprobs.device)
+        dtype=torch.float32)
     for gen_idx in range(num_generated_tokens):
         token_idx = prompt_len + gen_idx
         expected_tokens[:, gen_idx] = original_tokens[
@@ -690,10 +691,9 @@ def test_create_beam_history():
     # test logprobs as well
     torch.testing.assert_close(beam_history.logprobs[:beam_width],
                                expected_logprobs[:beam_width])
-    torch.testing.assert_close(beam_history.cum_logprobs[:beam_width],
-                               original_cum_logprobs[seq_slot, :beam_width])
-
-    return
+    torch.testing.assert_close(
+        beam_history.cum_logprobs[:beam_width],
+        original_cum_logprobs[seq_slot, :beam_width].to("cpu"))
 
 
 def test_finish_beams():

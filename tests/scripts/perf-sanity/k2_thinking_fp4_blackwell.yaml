@@ -1,0 +1,134 @@
+metadata:
+  model_name: k2_thinking_fp4
+  supported_gpus:
+  - B200
+server_configs:
+  # 8k1k configs - TEP8 with TRTLLM
+  - name: "k2_thinking_fp4_tep8_8k1k"
+    model_name: "k2_thinking_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 12288
+    trust_remote_code: true
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.6
+    client_configs:
+      - name: "con2_iter10_8k1k"
+        concurrency: 2
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: datasets/perf-ci/k2_thinking-8k1k-20480-ratio-1_for_serve.json
+
+  # 8k1k configs - DEP8 with CUTLASS
+  - name: "k2_thinking_fp4_dep8_8k1k"
+    model_name: "k2_thinking_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 64
+    max_num_tokens: 12288
+    trust_remote_code: true
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 64
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.6
+    client_configs:
+      - name: "con512_iter10_8k1k"
+        concurrency: 512
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: datasets/perf-ci/k2_thinking-8k1k-20480-ratio-1_for_serve.json
+
+  # 32k8k configs - TEP8 with TRTLLM
+  - name: "k2_thinking_fp4_tep8_32k8k"
+    model_name: "k2_thinking_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    trust_remote_code: true
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.6
+    client_configs:
+      - name: "con2_iter10_32k8k"
+        concurrency: 2
+        iterations: 10
+        isl: 32768
+        osl: 8192
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: datasets/perf-ci/k2_thinking-32k8k-20480-ratio-1_for_serve.json
+
+  # 32k8k configs - DEP8 with CUTLASS
+  - name: "k2_thinking_fp4_dep8_32k8k"
+    model_name: "k2_thinking_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 32
+    max_num_tokens: 8192
+    trust_remote_code: true
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 32
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.6
+    client_configs:
+      - name: "con128_iter10_32k8k"
+        concurrency: 128
+        iterations: 10
+        isl: 32768
+        osl: 8192
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: datasets/perf-ci/k2_thinking-32k8k-20480-ratio-1_for_serve.json

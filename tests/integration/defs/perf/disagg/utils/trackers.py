@@ -4,10 +4,10 @@ from typing import Dict
 
 import pandas as pd
 
-# Import run_job from execution (cross-package import)
-from execution.executor import run_job
+# Import JobManager from execution
+from execution.executor import JobManager
 
-from utils.common import SESSION_COLLECT_CMD_TYPE, EnvManager
+from utils.common import EnvManager
 from utils.logger import logger
 
 
@@ -74,25 +74,48 @@ class SessionTracker:
         logger.info(f"Session started: {self.start_time}")
 
     def end_and_collect(self):
-        """Record end time and trigger information collection."""
+        """Record end time and trigger session collection.
+
+        Uses the new sbatch-based approach for non-blocking execution.
+        Submits the job and waits for completion using JobManager.
+        """
+        from utils.job_tracker import JobTracker
+
         self.end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"Session ended: {self.end_time}")
 
-        # Prepare log file path
+        # Submit session collect job (non-blocking sbatch)
+        success, job_id = JobManager.submit_session_collect_job()
+
+        if not success:
+            logger.error(f"Failed to submit session collect job: {job_id}")
+            return False
+
+        # Record session collect job ID for cleanup
+        JobTracker.record_job(job_id)
+
+        # Wait for job completion (reuses wait_for_completion method)
+        logger.info(f"Waiting for session collect job {job_id} to complete...")
+        JobManager.wait_for_completion(
+            job_id=job_id,
+            timeout=7200,  # 2 hours
+            test_config=None,  # No test config for session collect
+            check_early_failure=False,  # Don't check early failures
+        )
+
+        # Check if log file was created (indicates success)
         output_path = EnvManager.get_output_path()
         log_file = os.path.join(output_path, "session_collect.log")
 
-        job_name = f"{EnvManager.get_slurm_job_name()}-session-collect"
-        run_result = run_job(SESSION_COLLECT_CMD_TYPE, job_name, log_file=log_file)
-
-        if run_result["status"]:
-            # update timestamps in CSV
+        if os.path.exists(log_file):
+            # Update timestamps in CSV
             self._update_csv_timestamps()
             logger.success("Session properties collected successfully")
+            logger.info(f"Session collect log: {log_file}")
+            return True
         else:
-            logger.error(f"Failed to collect session properties: {run_result['msg']}")
-
-        return run_result["status"]
+            logger.error(f"Session collect log not found: {log_file}")
+            return False
 
     def _update_csv_timestamps(self):
         """Update timestamps in CSV using pandas."""

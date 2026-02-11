@@ -22,7 +22,7 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: '538'
+  concurrency_list: '512'
   input_length: 8192
   output_length: 1024
   dataset_file: <dataset_file>
@@ -43,9 +43,6 @@ profiling:
   nsys_on: false
 accuracy:
   enable_accuracy_test: false
-  model: local-completions
-  tasks: gsm8k
-  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
     enable_layerwise_nvtx_marker: true

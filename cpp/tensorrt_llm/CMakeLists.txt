@@ -157,6 +157,7 @@ set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
 
 if(NIXL_ROOT)
   set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
+  set(TRANSFER_AGENT_BINDING_TARGET tensorrt_llm_transfer_agent_binding)
 endif()
 
 if(MOONCAKE_ROOT)
@@ -292,13 +293,7 @@ if(BUILD_PYT)
   add_subdirectory(thop)
 endif()
 
-if(BINDING_TYPE STREQUAL "pybind")
-  add_subdirectory(pybind)
-endif()
-
-if(BINDING_TYPE STREQUAL "nanobind")
-  add_subdirectory(nanobind)
-endif()
+add_subdirectory(nanobind)
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)

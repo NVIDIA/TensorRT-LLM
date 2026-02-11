@@ -23,6 +23,7 @@ from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.auto_deploy.utils._graph import get_input_embeddings, get_lm_head_weights
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
@@ -40,16 +41,17 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     EagleDecodingConfig,
+    KvCacheConfig,
     LoadFormat,
     SamplerType,
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
-from ...._utils import mpi_rank, mpi_world_size
-from ....bindings.internal.batch_manager import CacheType
+from ...._utils import get_free_port, mpi_rank, mpi_world_size
 from ....mapping import Mapping
-from ...distributed import MPIDist
+from ...distributed import Distributed
+from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import (
@@ -66,8 +68,7 @@ from ...pyexecutor.scheduler import (
     ScheduledRequests,
     SimpleScheduler,
 )
-from ..custom_ops.attention_interface import SequenceInfo
-from ..distributed import common as dist
+from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
@@ -79,44 +80,6 @@ class ReportingInfo:
     print_log: bool = False
     enable_iter_perf_stats: bool = False
     enable_iter_req_stats: bool = False
-
-
-class _CacheManagerWithFakePool(KVCacheManager):
-    """We use the default KVCacheManager but with a fake pool by setting head_dim=0.
-
-    The actual cache pools are managed by auto_deploy layerwise cache pools.
-    """
-
-    def __init__(
-        self,
-        kv_cache_config,
-        num_blocks: int,
-        tokens_per_block: int,
-        max_seq_len: int,
-        max_batch_size: int,
-    ):
-        self.num_blocks = num_blocks
-        super().__init__(
-            kv_cache_config=kv_cache_config,
-            kv_cache_type=CacheType.SELF,
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=0,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            mapping=Mapping(),
-        )
-
-    def calculate_max_num_blocks(
-        self, kv_cache_config, head_dim, tokens_per_block, mapping, dtype, kv_factor
-    ) -> Tuple[int, int]:
-        """Calculate the maximum number of blocks needed for the cache."""
-        # TODO: this is VERY hacky... Ideally, we want to compute the number of blocks
-        # just like in the original implementation. However, let's wait for the layer-wise attention
-        # implementation before over-optimizing the function here
-        ad_logger.info("Using fake cache manager with head_dim=0 and num pages:", self.num_blocks)
-        return self.num_blocks, 0
 
 
 class ADHiddenStateManager(Eagle3ResourceManager):
@@ -274,6 +237,7 @@ def construct_draft_llm_args(
 def create_draft_kv_cache_manager_maybe(
     draft_model_engine: Optional[PyTorchModelEngine],
     ad_config: LlmArgs,
+    kv_cache_config_tuned: KvCacheConfig,
     dist_mapping: Mapping,
 ) -> Optional[KVCacheManager]:
     if draft_model_engine is None or not draft_model_engine.model.model_config.is_generation:
@@ -286,8 +250,8 @@ def create_draft_kv_cache_manager_maybe(
         model_engine=draft_model_engine,
         kv_cache_manager_cls=kv_cache_manager_cls,
         mapping=dist_mapping,
-        kv_cache_config=ad_config.kv_cache_config,
-        tokens_per_block=ad_config.attn_page_size,
+        kv_cache_config=kv_cache_config_tuned,
+        tokens_per_block=kv_cache_config_tuned.tokens_per_block,
         max_seq_len=ad_config.max_seq_len,
         max_batch_size=ad_config.max_batch_size,
         spec_config=ad_config.speculative_config,
@@ -320,19 +284,33 @@ def _generate_dummy_request(
         ResourceManagerType.SPEC_RESOURCE_MANAGER
     )
 
-    # check if we have a free slot available and free page available
-    if not slot_manager.slot_manager.free_slots or kv_cache_manager.get_num_free_blocks() == 0:
+    # check if it's a hybrid kv-cache manager
+    is_hybrid_cache = isinstance(kv_cache_manager, MambaHybridCacheManager)
+
+    # check if we have a free page and free state available
+    if not kv_cache_manager.get_num_free_blocks():
+        return None
+    if is_hybrid_cache and not kv_cache_manager.mamba_cache_free_blocks:
         return None
 
     # generate a dummy request
     dummy_request = kv_cache_manager.add_dummy_requests([request_id], **request_kwargs)[0]
     dummy_request.is_cuda_graph_dummy = True
 
+    # generate a dummy scheduled requests object
+    dummy_scheduled_requests = ScheduledRequests()
+    dummy_scheduled_requests.generation_requests.append(dummy_request)
+
+    # if it's a hybrid kv-cache manager, we need to manually call prepare_resources again (not done
+    # in add_dummy_requests)
+    if is_hybrid_cache:
+        kv_cache_manager.prepare_resources(dummy_scheduled_requests)
+
     # add to spec resource manager
     if spec_res_mgr:
         spec_res_mgr.add_dummy_requests([request_id])
 
-    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9883 clean up this hack
+    # NOTE: hack to avoid blocking a slot for the dummy request
     dummy_request.seq_slot = slot_manager.get_max_resource_count()
     dummy_request.py_seq_slot = dummy_request.seq_slot
 
@@ -350,13 +328,14 @@ def maybe_pad_for_cuda_graph(func):
         def _call_func():
             return func(self, scheduled_requests, resource_manager, *args, **kwargs)
 
-        # check if we use cuda graph and we can run it
-        if not (self.cuda_graph_used and scheduled_requests.can_run_cuda_graph):
-            return _call_func()
+        # check conditions for current rank
+        can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
+        batch_size = scheduled_requests.batch_size
 
         # generate a persistent dummy request right away to ensure we can reserve the necessary
-        # resources (kv page and slot)
-        if self.padding_dummy_request is None:
+        # resources (kv page and slot) the first time we can actually run cuda graph according to
+        # this rank
+        if can_run_cuda_graph and self.padding_dummy_request is None:
             self.padding_dummy_request = _generate_dummy_request(
                 resource_manager,
                 request_id=CUDA_GRAPH_DUMMY_REQUEST_ID,
@@ -366,20 +345,48 @@ def maybe_pad_for_cuda_graph(func):
                 max_beam_width=self.max_beam_width,
             )
 
-        # check closest cuda graph batch size
-        closest_cg_bs = _round_up_to_closest(
-            self.cuda_graph_batch_sizes, scheduled_requests.batch_size
-        )
+        # check if we can pad the batch based on the availability of the dummy request
+        can_pad = self.padding_dummy_request is not None
 
-        # check if we need to pad
-        num_padding = closest_cg_bs - scheduled_requests.batch_size
+        # in attention DP mode, we check all ranks
+        if self.enable_attention_dp and self.mapping.tp_size > 1:
+            assert self.dist is not None, "Distributed object is required for attention DP mode"
+            all_rank_info = self.dist.tp_allgather([can_run_cuda_graph, can_pad, batch_size])
+        else:
+            all_rank_info = [[can_run_cuda_graph, can_pad, batch_size]]
 
-        if num_padding <= 0:
+        # now let's check if we can in principle run cuda graph across all ranks
+        can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
+
+        if not can_run_cuda_graph_all:
             return _call_func()
 
-        # check if we have a dummy request to use
-        if self.padding_dummy_request is None:
-            ad_logger.error("No CUDA graph padding possible due to missing dummy request.")
+        # get closest cudagraph batch size based on max_batch_size across ALL ranks
+        # NOTE: we assume uniform cudagraph batch sizes across all ranks ensuring all ranks get the
+        # same closest cudagraph batch size here based on the max batch size across all ranks
+        max_batch_size = max(r_info[2] for r_info in all_rank_info)
+        cg_batch_size = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
+
+        if cg_batch_size is None:
+            return _call_func()
+
+        # let's check if all ranks can pad the batch if they need to
+        can_pad_all = all(r_info[1] or (r_info[2] == cg_batch_size) for r_info in all_rank_info)
+
+        # fall back if we cannot run cudagraph due to padding issues
+        if not can_pad_all:
+            return _call_func()
+
+        # check actual amount of padding needed
+        num_padding = cg_batch_size - batch_size
+
+        # we should only hit this point for either of these conditions
+        assert num_padding == 0 or (num_padding > 0 and self.padding_dummy_request is not None), (
+            "Padding should not be needed or available at this point"
+        )
+
+        # no padding needed on current rank
+        if num_padding == 0:
             return _call_func()
 
         # pad the scheduled requests with the dummy request
@@ -410,13 +417,13 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.device
 
     @classmethod
-    def build_from_config(cls, ad_config: LlmArgs, mapping: Optional[Mapping] = None):
+    def build_from_config(
+        cls,
+        ad_config: LlmArgs,
+        mapping: Optional[Mapping] = None,
+        dist: Optional[Distributed] = None,
+    ):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
-
-        max_batch_size = ad_config.max_batch_size
-        max_seq_len = ad_config.max_seq_len
-        attn_page_size = ad_config.attn_page_size
-        max_num_tokens = ad_config.max_num_tokens
 
         # update device to contain the current default device if it's in cuda
         device = torch.device(ad_config.device)
@@ -426,14 +433,17 @@ class ADEngine(ModelEngine):
 
         factory = ad_config.create_factory()
 
-        # initialize seq info object
-        seq_info = SequenceInfo(
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            page_size=attn_page_size,
-            max_num_tokens=max_num_tokens,
+        # Initialize CachedSequenceInterface - it will create SequenceInfo internally
+        # using tokens_per_block from kv_cache_config
+        cache_seq_interface = CachedSequenceInterface(
+            max_seq_len=ad_config.max_seq_len,
+            max_batch_size=ad_config.max_batch_size,
+            device=device,
+            kv_cache_config=ad_config.kv_cache_config,
+            max_num_tokens=ad_config.max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
         )
+
         reporting_info = ReportingInfo(
             print_log=False,
             enable_iter_perf_stats=ad_config.enable_iter_perf_stats,
@@ -448,10 +458,10 @@ class ADEngine(ModelEngine):
         # construct engine
         return cls(
             build_and_optimize,
-            seq_info,
-            device,
+            cache_seq_interface,
             ad_config=ad_config,
             mapping=mapping,
+            dist=dist,
             reporting_info=reporting_info,
         )
 
@@ -459,13 +469,21 @@ class ADEngine(ModelEngine):
     def __init__(
         self,
         get_inference_model: GetInferenceModel,
-        seq_info: SequenceInfo,
-        device: DeviceLikeType,
+        cache_seq_interface: CachedSequenceInterface,
         ad_config: Optional[LlmArgs] = None,
         mapping: Optional[Mapping] = None,
+        dist: Optional[Distributed] = None,
         reporting_info: ReportingInfo = ReportingInfo(),
     ) -> None:
-        """Initialize the engine with model and sequence information."""
+        """Initialize the engine with model and CachedSequenceInterface.
+
+        Args:
+            get_inference_model: Callable that builds the inference model.
+            cache_seq_interface: The CachedSequenceInterface containing sequence and cache config.
+            ad_config: Optional LLM configuration.
+            mapping: Optional distributed mapping configuration.
+            reporting_info: Reporting configuration for logging.
+        """
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
         # This is not correctly declared in the base ModelEngine class though...
         self.llm_args = SimpleNamespace()
@@ -477,22 +495,24 @@ class ADEngine(ModelEngine):
         self.llm_args.batch_wait_timeout_ms = 0
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
-        self.llm_args.max_num_tokens = seq_info.max_num_tokens
-        self.llm_args.max_seq_len = seq_info.max_seq_len
+        self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
+        self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
-        self.enable_attention_dp = False
+        self.enable_attention_dp = mapping.enable_attention_dp if mapping else False
 
         if ad_config is not None:
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
+            self.llm_args.max_stats_len = ad_config.max_stats_len
         else:
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
+            self.llm_args.max_stats_len = 1000
 
         # check for max total draft tokens
         if self.spec_config is not None:
@@ -507,13 +527,10 @@ class ADEngine(ModelEngine):
         )
 
         # For compatibility with PyTorchModelEngine utilities
-        self.batch_size = seq_info.max_batch_size
+        self.batch_size = cache_seq_interface.info.max_batch_size
 
-        # construct cache sequence interface
-        self.cache_seq_interface = CachedSequenceInterface(
-            sequence_info=seq_info,
-            device=device,
-        )
+        # Store the cache sequence interface
+        self.cache_seq_interface = cache_seq_interface
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
@@ -534,6 +551,7 @@ class ADEngine(ModelEngine):
 
         # Reuse _execute_logit_post_processors from PyTorchModelEngine
         self.mapping = mapping
+        self.dist = dist
         self._execute_logit_post_processors = types.MethodType(
             PyTorchModelEngine._execute_logit_post_processors, self
         )
@@ -588,11 +606,17 @@ class ADEngine(ModelEngine):
         # gather indices for logits
         logits_gather_indices: List[int] = []
 
-        page_size = self.cache_seq_interface.info.page_size
+        page_size = kv_cache_manager.tokens_per_block
         dummy_token = -1
         num_ctx_requests = len(context_requests)
         num_ctx_tokens = 0
         num_generation_tokens = 0
+
+        # Helper to get slot index - use mamba_cache_index if available (MambaHybridCacheManager)
+        def _get_slot_idx(request) -> int:
+            if hasattr(kv_cache_manager, "mamba_cache_index"):
+                return kv_cache_manager.mamba_cache_index[request.py_request_id]
+            return request.seq_slot
 
         # look at context requests first
         for request in context_requests:
@@ -629,8 +653,8 @@ class ADEngine(ModelEngine):
 
             position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
 
-            # store seq slot idx
-            slot_idx.append(request.seq_slot)
+            # store seq slot idx (use mamba_cache_index if available)
+            slot_idx.append(_get_slot_idx(request))
             use_initial_states.append(input_pos[-1] > 0)
 
             # store extra arguments
@@ -709,7 +733,8 @@ class ADEngine(ModelEngine):
 
             num_generation_tokens += 1 + get_draft_token_length(request)
             request.py_batch_idx = request.seq_slot
-            slot_idx.append(request.seq_slot)
+            # store seq slot idx (use mamba_cache_index if available)
+            slot_idx.append(_get_slot_idx(request))
             use_initial_states.append(input_pos[-1] > 0)
 
             seq_len.append(len(input_ids[-1]))
@@ -879,7 +904,7 @@ def share_target_weights_with_draft(
 
 
 def create_draft_model_engine_maybe(
-    ad_config: LlmArgs, target_engine: ADEngine, dist_mapping: Mapping, mpi_dist: MPIDist
+    ad_config: LlmArgs, target_engine: ADEngine, dist_mapping: Mapping, dist: Distributed
 ) -> Optional[PyTorchModelEngine]:
     """Create a draft model engine for speculative decoding.
 
@@ -887,7 +912,7 @@ def create_draft_model_engine_maybe(
         ad_config: The AutoDeploy LLM configuration
         engine: The target model engine (ADEngine)
         dist_mapping: The distributed mapping configuration
-        mpi_dist: The MPI distribution object
+        dist: The distribution object
 
     Returns:
         PyTorchModelEngine configured as a draft model, or None if not needed
@@ -901,11 +926,11 @@ def create_draft_model_engine_maybe(
 
     draft_spec_config = copy.copy(spec_config)
 
-    kv_cache_config = ad_config.kv_cache_config
+    kv_cache_config_tuned = target_engine.cache_seq_interface.kv_cache_config_tuned
 
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=ad_config.enable_chunked_prefill,
-        cache_reuse=kv_cache_config.enable_block_reuse,
+        cache_reuse=kv_cache_config_tuned.enable_block_reuse,
         has_speculative_draft_tokens=has_spec_drafter,
         chunk_size=target_engine.llm_args.max_num_tokens,
     )
@@ -920,11 +945,11 @@ def create_draft_model_engine_maybe(
     drafting_loop_wrapper = None
 
     draft_model_engine = PyTorchModelEngine(
-        model_path=draft_spec_config.speculative_model_dir,
+        model_path=draft_spec_config.speculative_model,
         llm_args=draft_llm_args,
         mapping=dist_mapping,
         attn_runtime_features=attn_runtime_features,
-        dist=mpi_dist,
+        dist=dist,
         spec_config=draft_spec_config,
         is_draft_model=True,
         drafting_loop_wrapper=drafting_loop_wrapper,
@@ -1002,12 +1027,26 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize process groups
     world_size = mpi_world_size()
     rank = mpi_rank()
-    dist_mapping = Mapping(rank=rank, world_size=world_size, tp_size=world_size)
-    mpi_dist = MPIDist(dist_mapping)
+    enable_attention_dp = ad_config.transforms.get("detect_sharding", {}).get(
+        "enable_attention_dp", False
+    )
+    dist_mapping = Mapping(
+        rank=rank,
+        world_size=world_size,
+        tp_size=world_size,
+        enable_attention_dp=enable_attention_dp,
+    )
+    dist = Distributed.get(dist_mapping)
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
-    port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port
-    dist.initialize_or_skip(rank, world_size, port)
+    port = dist.broadcast(get_free_port())  # use MPI broadcast to pick a free port
+    initialize_or_skip(rank, world_size, port)
+
+    ad_logger.info(f"{dist_mapping=}, {dist=}, {port=}")
+
+    # Setup AutoTuner with distributed state for allreduce autotuning
+    AutoTuner.get().setup_distributed_state(dist_mapping)
+
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
@@ -1023,7 +1062,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     )
 
     # initialize model engine
-    engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping)
+    engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping, dist=dist)
 
     spec_config = ad_config.speculative_config
     if spec_config is not None and not (
@@ -1039,7 +1078,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         )
 
     draft_model_engine = create_draft_model_engine_maybe(
-        ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, mpi_dist=mpi_dist
+        ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, dist=dist
     )
 
     spec_resource_manager = (
@@ -1054,40 +1093,15 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         else None
     )
 
-    # check kvcache config for partial block reuse
-    # TODO: copy_on_partial_reuse is not supported yet, see
-    # https://github.com/NVIDIA/TensorRT-LLM/issues/7142 for more details.
-    enable_block_reuse = ad_config.kv_cache_config.enable_block_reuse
-    enable_partial_reuse = ad_config.kv_cache_config.enable_partial_reuse
-    copy_on_partial_reuse = ad_config.kv_cache_config.copy_on_partial_reuse
-    if enable_block_reuse and enable_partial_reuse and copy_on_partial_reuse:
-        raise RuntimeError(
-            f"partial block reuse with {copy_on_partial_reuse=} set to True is NOT supported"
-            " in AutoDeploy. Please set it to False via the kv_cache_config.copy_on_partial_reuse "
-            "field in tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs."
-        )
-
-    # TODO: detect whether SSM layer is present in the model and raise an error or disable block
-    # reuse with a warning --> see https://github.com/NVIDIA/TensorRT-LLM/issues/7142. For now, we
-    # just emit a general warning.
-    if enable_block_reuse:
-        ad_logger.warning(
-            f"{enable_block_reuse=} is enabled. Note that this is not supported for SSM layers and"
-            " may lead to incorrect results if the model contains SSM layers."
-        )
-
     # resource managers
-    kv_cache_manager = _CacheManagerWithFakePool(
-        ad_config.kv_cache_config,
-        num_blocks=engine.cache_seq_interface.info.num_pages,
-        tokens_per_block=ad_config.attn_page_size,
-        max_seq_len=ad_config.max_seq_len,
-        max_batch_size=ad_config.max_batch_size,
-    )
+    # KVCacheManager is now created and managed by CachedSequenceInterface during the
+    # initialize_cache/resize_kv_cache transform pipeline. Get it from the interface.
+    kv_cache_manager = engine.cache_seq_interface.kv_cache_manager
+    kv_cache_config_tuned = engine.cache_seq_interface.kv_cache_config_tuned
     seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
 
     draft_kv_cache_manager = create_draft_kv_cache_manager_maybe(
-        draft_model_engine, ad_config, dist_mapping
+        draft_model_engine, ad_config, kv_cache_config_tuned, dist_mapping
     )
 
     resource_manager = ResourceManager(
@@ -1106,7 +1120,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
 
     # Chunked prefill
     if ad_config.enable_chunked_prefill:
-        chunk_unit_size = ad_config.attn_page_size
+        chunk_unit_size = kv_cache_config_tuned.tokens_per_block
         chunking_policy = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
         ctx_chunk_config: Tuple[StrEnum, int] = (chunking_policy, chunk_unit_size)
     else:
@@ -1166,7 +1180,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         scheduler,
         model_engine=engine,
         sampler=sampler,
-        dist=mpi_dist,
+        dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,

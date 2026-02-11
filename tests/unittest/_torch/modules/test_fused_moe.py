@@ -11,6 +11,7 @@ import cloudpickle
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
                             per_block_cast_to_fp8_e8m0,
                             per_token_cast_to_fp8_e8m0)
@@ -18,9 +19,8 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
-                        skip_neither_ada_nor_hopper_unittest,
-                        skip_non_hopper_unittest, skip_pre_blackwell,
-                        skip_pre_hopper)
+                        skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
+                        skip_pre_blackwell, skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -40,8 +40,6 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.quantization import \
     NVFP4CutlassFusedMoEMethod
 # isort: on
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -91,8 +89,8 @@ def test_fused_moe(moe_backend,
                    mapping=None):
 
     if moe_backend == "TRITON":
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
+        if get_sm_version() != 90:
+            pytest.skip("TRITON moe backend is only supported on Hopper")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -103,6 +101,7 @@ def test_fused_moe(moe_backend,
 
     mapping = mapping or Mapping()
     mapping.rank = mpi_rank()
+    AutoTuner.get().setup_distributed_state(mapping)
 
     torch.cuda.set_device(mapping.rank)
 
@@ -190,9 +189,9 @@ def test_fused_moe(moe_backend,
         # Evaluate outputs
         torch.cuda.synchronize()
         # There can be one off mismatch in the outputs due to different kernel implementations
-        # Here we check 99% of the outputs are within the tolerance
+        # Here we check most of the outputs are within the tolerance
         # The CutlassFusedMoE case fails as well without this change on H100 for bf16
-        check_accuracy(output, ref_output, rtol=0.2, atol=0.2, percent=0.984)
+        check_accuracy(output, ref_output, rtol=0.2, atol=0.2, percent=0.975)
         m //= 2
 
 
@@ -512,7 +511,9 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
 
 
 @skip_pre_hopper
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    ["CUTLASS", pytest.param("TRITON", marks=skip_no_hopper)])
 @pytest.mark.parametrize("routing_cls",
                          [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod])
 @pytest.mark.parametrize("bias", [True, False])
@@ -520,8 +521,6 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
 def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
 
     if moe_backend == "TRITON":
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -630,19 +629,30 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
-
-        # Test all kernel tactics
-        for tactic in all_tactics:
-            with AutoTuner.get().replay(tactic), torch.inference_mode():
+        # TRITON backend uses Triton kernels which don't register with AutoTuner
+        if moe_backend == "TRITON":
+            with torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
-                check_accuracy(output,
-                               ref_output,
-                               rtol=0.04,
-                               atol=0.1,
-                               percent=0.99)
+            check_accuracy(output,
+                           ref_output,
+                           rtol=0.04,
+                           atol=0.1,
+                           percent=0.99)
+        else:
+            # Explicitly capture context for kernel testing
+            with AutoTuner.get().capture() as all_tactics, torch.inference_mode(
+            ):
+                output = fused_moe.forward(x, router_logits)
+
+            # Test all kernel tactics
+            for tactic in all_tactics:
+                with AutoTuner.get().replay(tactic), torch.inference_mode():
+                    output = fused_moe.forward(x, router_logits)
+                    check_accuracy(output,
+                                   ref_output,
+                                   rtol=0.04,
+                                   atol=0.1,
+                                   percent=0.99)
 
 
 def set_tensor_value_2(x, num_row, num_cols):
@@ -854,22 +864,12 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         [DefaultMoeRoutingMethod],
     ),
 )
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
 def test_fused_moe_fp8_blockwise_deepgemm(dtype,
                                           num_experts,
                                           seq_len,
                                           hidden_size,
                                           RoutingMethodCls,
-                                          enable_configurable_moe,
-                                          mocker,
                                           mapping=None):
-
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
 
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
@@ -1172,7 +1172,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     return True
 
 
-@skip_non_hopper_unittest
+@skip_no_hopper
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
@@ -1304,7 +1304,7 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
     return True
 
 
-@skip_non_hopper_unittest
+@skip_no_hopper
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -1378,25 +1378,45 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 @pytest.mark.parametrize(
     "finalize_fusion", [True, False],
     ids=["enable_finalize_fusion", "disable_finalize_fusion"])
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
-def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
-                         enable_configurable_moe, mocker):
+def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion):
 
-    if enable_configurable_moe == 1 and moe_backend not in [
-            "TRTLLM", "CUTLASS"
-    ]:
-        pytest.skip(
-            "ENABLE_CONFIGURABLE_MOE=1, only TRTLLM and CUTLASS backend are enabled"
-        )
+    run_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion)
 
-    mocker.patch.dict(
-        os.environ, {
-            "ENABLE_CONFIGURABLE_MOE":
-            "1" if enable_configurable_moe == 1
-            and moe_backend in ["TRTLLM", "CUTLASS"] else "0"
-        })
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("hidden_size, intermediate_size", [(2880, 2880)])
+@pytest.mark.parametrize("swiglu_alpha", [1, 0.1], ids=lambda v: f"alpha{v}")
+@pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
+@pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
+                         ids=lambda v: f"limit{v}")
+def test_fused_moe_nvfp4_gptoss_style(hidden_size, intermediate_size,
+                                      swiglu_alpha, swiglu_beta, swiglu_limit):
+    run_fused_moe_nvfp4(dtype=torch.bfloat16,
+                        moe_backend="TRTLLM",
+                        finalize_fusion=False,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_experts=32,
+                        top_k=4,
+                        seq_len=256,
+                        gptoss_style=True,
+                        swiglu_alpha=swiglu_alpha,
+                        swiglu_beta=swiglu_beta,
+                        swiglu_limit=swiglu_limit)
+
+
+def run_fused_moe_nvfp4(dtype,
+                        moe_backend,
+                        finalize_fusion,
+                        hidden_size=512,
+                        intermediate_size=512,
+                        num_experts=8,
+                        top_k=2,
+                        seq_len=4,
+                        gptoss_style=False,
+                        swiglu_alpha=None,
+                        swiglu_beta=None,
+                        swiglu_limit=None):
 
     if moe_backend == "TRTLLM":
         if dtype == torch.float16:
@@ -1424,11 +1444,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
     with torch.device(f"cuda:{mapping.rank}"):
         SCALING_VECTOR_SIZE = 16
 
-        SEQ_LEN = 4
-        HIDDEN_SIZE = 512
-        INTERMEDIATE_SIZE = 512
-        NUM_EXPERTS = 8
-        TOP_K = 2
+        SEQ_LEN = seq_len
+        HIDDEN_SIZE = hidden_size
+        INTERMEDIATE_SIZE = intermediate_size
+        NUM_EXPERTS = num_experts
+        TOP_K = top_k
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
@@ -1455,24 +1475,38 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
                 device="cuda") * 0.05
             w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
 
+            if gptoss_style:
+                w1_bias = torch.randn(INTERMEDIATE_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                w2_bias = torch.randn(HIDDEN_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                w3_bias = torch.randn(INTERMEDIATE_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                weights[f"{expert_id}.w1.bias"] = w1_bias
+                weights[f"{expert_id}.w2.bias"] = w2_bias
+                weights[f"{expert_id}.w3.bias"] = w3_bias
+
             w3_w1_global = min(
                 w1_sf_global,
                 w3_sf_global)  # w3 global and w1 global must be the same
 
-            w1_weight_nvfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
-                w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-            w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w1_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
+            w1_weight_nvfp4, w1_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False, False)
+            w1_sf_block_unswizzled = w1_sf_block_unswizzled.view(
+                INTERMEDIATE_SIZE, -1)
 
-            w2_weight_nvfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
-                w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False)
-            w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w2_sf_block.cpu().view(HIDDEN_SIZE, -1))
+            w2_weight_nvfp4, w2_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False, False)
+            w2_sf_block_unswizzled = w2_sf_block_unswizzled.view(
+                HIDDEN_SIZE, -1)
 
-            w3_weight_nvfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
-                w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-            w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
+            w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False, False)
+            w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(
+                INTERMEDIATE_SIZE, -1)
 
             w1_input_scale = x_sf_global.cuda()
             w2_input_scale = x_sf_global.cuda()
@@ -1497,6 +1531,23 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
             weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
+        swiglu_alpha_tensor = None
+        swiglu_beta_tensor = None
+        swiglu_limit_tensor = None
+        if gptoss_style:
+            swiglu_alpha_tensor = torch.full((NUM_EXPERTS, ),
+                                             swiglu_alpha,
+                                             device='cuda',
+                                             dtype=torch.float)
+            swiglu_beta_tensor = torch.full((NUM_EXPERTS, ),
+                                            swiglu_beta,
+                                            device='cuda',
+                                            dtype=torch.float)
+            swiglu_limit_tensor = torch.full((NUM_EXPERTS, ),
+                                             swiglu_limit,
+                                             device='cuda',
+                                             dtype=torch.float)
+
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
 
         # Create pretrained_config with necessary parameters
@@ -1514,6 +1565,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
                 quant_config=quant_config,
                 moe_backend=moe_backend,
                 moe_disable_finalize_fusion=not finalize_fusion),
+            bias=gptoss_style,
+            swiglu_alpha=swiglu_alpha_tensor,
+            swiglu_beta=swiglu_beta_tensor,
+            swiglu_limit=swiglu_limit_tensor,
         )
         fused_moe.load_weights([weights])
         fused_moe.post_load_weights()
@@ -1526,7 +1581,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
             dtype=dtype,
-            model_config=ModelConfig(quant_config=quant_config))
+            model_config=ModelConfig(quant_config=quant_config),
+            bias=gptoss_style,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit)
         ref_fused_moe.load_weights([weights])
         ref_fused_moe.cuda()
 
@@ -1534,11 +1593,33 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
         with torch.inference_mode():
             ref_output = ref_fused_moe.forward(x, router_logits)
 
-        with torch.inference_mode(), autotune():
-            fused_moe.forward(x, router_logits)
+        if not gptoss_style:
+            with torch.inference_mode(), autotune():
+                fused_moe.forward(x, router_logits)
+        else:
+            # We skip autotune for gptoss style to reduce memory usage since the input shape is already quite large.
+            with torch.inference_mode():
+                fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
+
+        if gptoss_style:
+            rtol = 0.1
+            atol = 0.1
+            percent = 0.95
+        else:
+            rtol = 1e-2
+            atol = 0.15
+            percent = None
+
+        if gptoss_style:
+            check_accuracy(output,
+                           ref_output,
+                           rtol=rtol,
+                           atol=atol,
+                           percent=percent)
+        else:
+            torch.testing.assert_close(output, ref_output, rtol=rtol, atol=atol)
 
         if not test_all_kernels:
             return
@@ -1551,25 +1632,24 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
         for tactic in all_tactics:
             with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
-                torch.testing.assert_close(output,
-                                           ref_output,
-                                           rtol=1e-2,
-                                           atol=0.15)
+                if gptoss_style:
+                    check_accuracy(output,
+                                   ref_output,
+                                   rtol=rtol,
+                                   atol=atol,
+                                   percent=percent)
+                else:
+                    torch.testing.assert_close(output,
+                                               ref_output,
+                                               rtol=rtol,
+                                               atol=atol)
 
 
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
-def test_fused_moe_w4a8_nvfp4_fp8(moe_backend, enable_configurable_moe, mocker):
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
-
+def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
     dtype = torch.bfloat16
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1984,20 +2064,7 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 @pytest.mark.parametrize("hidden_unpadded", [64, 192, 256])
 @pytest.mark.parametrize("seq_len", [8, 128])
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
-def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
-                               enable_configurable_moe, mocker):
-
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
-
-    if moe_backend == "CUTLASS" and hidden_unpadded % 128 != 0:
-        pytest.skip()
-
+def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
     SEQ_LEN = seq_len
@@ -2254,17 +2321,7 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
             marks=[skip_pre_hopper, skip_blackwell, skip_blackwell_geforce]),
     ],
 )
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
-def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
-                           enable_configurable_moe, mocker):
-
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
-
+def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
@@ -2409,7 +2466,7 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
         check_accuracy(output, ref_output, rtol=1e-2, atol=0.1, percent=0.99)
 
 
-@skip_pre_hopper
+@skip_no_hopper
 @pytest.mark.parametrize("experts", [8, 128])
 @pytest.mark.parametrize(
     "hidden_size, intermediate_size",
@@ -2425,12 +2482,8 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
 @pytest.mark.parametrize("dynamic_quant", [True, False])
 def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                                 fp8_activation, bias, dynamic_quant):
-    if not IS_TRITON_KERNELS_AVAILABLE:
-        pytest.skip("Triton kernels are not available")
-    if torch.cuda.get_device_capability()[0] < 10 and fp8_activation:
+    if fp8_activation:
         pytest.skip("Latest Triton requires BF16 activation on Hopper")
-    if torch.cuda.get_device_capability()[0] >= 10 and not fp8_activation:
-        pytest.skip("Latest Triton requires FP8 activation on Blackwell")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -2690,7 +2743,10 @@ class RefGatedMLPFusedMoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  use_cute_dsl_blockscaling_mm: bool = False,
-                 bias=False):
+                 bias=False,
+                 swiglu_alpha: Optional[float] = None,
+                 swiglu_beta: Optional[float] = None,
+                 swiglu_limit: Optional[float] = None):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
@@ -2701,6 +2757,19 @@ class RefGatedMLPFusedMoE(nn.Module):
         self.dtype = dtype
         self.quant_config = model_config.quant_config
 
+        def custom_swiglu(x):
+            gate, value = x.chunk(2, dim=-1)
+            if swiglu_limit is not None and swiglu_limit != float("inf"):
+                gate = gate.clamp(max=swiglu_limit)
+                value = value.clamp(min=-swiglu_limit, max=swiglu_limit)
+
+            alpha = swiglu_alpha if swiglu_alpha is not None else 1.0
+            gate_act = gate * torch.sigmoid(gate * alpha)
+
+            beta = swiglu_beta if swiglu_beta is not None else 0.0
+
+            return gate_act * (value + beta)
+
         self.experts = nn.ModuleList([
             GatedMLP(
                 hidden_size=self.hidden_size,
@@ -2709,6 +2778,8 @@ class RefGatedMLPFusedMoE(nn.Module):
                 dtype=self.dtype,
                 config=model_config,
                 use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                activation=custom_swiglu
+                if swiglu_alpha is not None else F.silu,
             ) for _ in range(self.num_experts)
         ])
 

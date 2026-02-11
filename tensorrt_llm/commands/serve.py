@@ -7,7 +7,7 @@ import socket
 import subprocess  # nosec B404
 import sys
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Literal, Mapping, Optional, Sequence
 
 import click
 import torch
@@ -40,6 +40,13 @@ from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
+
+
+def help_info_with_stability_tag(
+        help_str: str, tag: Literal["stable", "beta", "prototype",
+                                    "deprecated"]) -> str:
+    """Append stability info to help string."""
+    return f":tag:`{tag}` {help_str}"
 
 
 def _signal_handler_cleanup_child(signum, frame):
@@ -179,9 +186,17 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                   socket.SOCK_STREAM)
+    address_family = socket.AF_INET6 if all(
+        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    with socket.socket(address_family, socket.SOCK_STREAM) as s:
+        # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
+        assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
         try:
             s.bind((host, port))
+            if port == 0:
+                port = s.getsockname()[1]
         except OSError as e:
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
@@ -216,6 +231,124 @@ def launch_server(
             gc.disable()
 
         asyncio.run(server(host, port, sockets=[s]))
+
+
+def launch_grpc_server(host: str, port: int, llm_args: dict):
+    """
+    Launch a gRPC server for TensorRT-LLM.
+
+    This provides a high-performance gRPC interface designed for external routers
+    (e.g., sgl-router) using pre-tokenized input and raw token ID output.
+
+    Args:
+        host: Host to bind to
+        port: Port to bind to
+        llm_args: Arguments for LLM initialization (from get_llm_args)
+    """
+    import grpc
+
+    try:
+        from grpc_reflection.v1alpha import reflection
+        REFLECTION_AVAILABLE = True
+    except ImportError:
+        REFLECTION_AVAILABLE = False
+
+    from tensorrt_llm.grpc import trtllm_service_pb2, trtllm_service_pb2_grpc
+    from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
+    from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
+
+    async def serve_grpc_async():
+        logger.info("Initializing TensorRT-LLM gRPC server...")
+
+        backend = llm_args.get("backend")
+        model_path = llm_args.get("model", "")
+
+        if backend == "pytorch":
+            llm_args.pop("build_config", None)
+            llm = PyTorchLLM(**llm_args)
+        elif backend == "_autodeploy":
+            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+            llm_args.pop("build_config", None)
+            llm = AutoDeployLLM(**llm_args)
+        elif backend == "tensorrt" or backend == "trt":
+            llm_args.pop("backend")
+            llm = LLM(**llm_args)
+        else:
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
+
+        logger.info("Model loaded successfully")
+
+        # Create request manager
+        request_manager = GrpcRequestManager(llm)
+
+        # Create servicer
+        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
+
+        # Create gRPC server
+        server = grpc.aio.server(
+            options=[
+                ("grpc.max_send_message_length", -1),  # Unlimited
+                ("grpc.max_receive_message_length", -1),  # Unlimited
+                ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
+                ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
+            ], )
+
+        # Add servicer to server
+        trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(
+            servicer, server)
+
+        # Enable reflection for grpcurl and other tools
+        if REFLECTION_AVAILABLE:
+            service_names = (
+                trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
+                full_name,
+                reflection.SERVICE_NAME,
+            )
+            reflection.enable_server_reflection(service_names, server)
+            logger.info("gRPC reflection enabled")
+
+        # Bind to address
+        address = f"{host}:{port}"
+        server.add_insecure_port(address)
+
+        # Start server
+        await server.start()
+        logger.info(f"TensorRT-LLM gRPC server started on {address}")
+        logger.info("Server is ready to accept requests")
+
+        # Handle shutdown signals
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def signal_handler():
+            logger.info("Received shutdown signal")
+            stop_event.set()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+
+        # Serve until shutdown signal
+        try:
+            await stop_event.wait()
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        finally:
+            logger.info("Shutting down TensorRT-LLM gRPC server...")
+
+            # Stop gRPC server
+            await server.stop(grace=5.0)
+            logger.info("gRPC server stopped")
+
+            # Shutdown LLM
+            if hasattr(llm, "shutdown"):
+                llm.shutdown()
+            logger.info("LLM engine stopped")
+
+            logger.info("Shutdown complete")
+
+    asyncio.run(serve_grpc_async())
 
 
 def launch_mm_encoder_server(
@@ -262,27 +395,33 @@ class ChoiceWithAlias(click.Choice):
 @click.option("--tokenizer",
               type=str,
               default=None,
-              help="Path | Name of the tokenizer."
-              "Specify this value only if using TensorRT engine as model.")
+              help=help_info_with_stability_tag("Path | Name of the tokenizer.",
+                                                "beta"))
 @click.option(
     "--custom_tokenizer",
     type=str,
     default=None,
-    help=
-    "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
-    "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer'). [Experimental]"
-)
+    help=help_info_with_stability_tag(
+        "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
+        "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').",
+        "prototype"))
 @click.option("--host",
               type=str,
               default="localhost",
-              help="Hostname of the server.")
-@click.option("--port", type=int, default=8000, help="Port of the server.")
+              help=help_info_with_stability_tag("Hostname of the server.",
+                                                "beta"))
+@click.option("--port",
+              type=int,
+              default=8000,
+              help=help_info_with_stability_tag("Port of the server.", "beta"))
 @click.option(
     "--backend",
     type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
                          {"trt": "tensorrt"}),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.")
+    help=help_info_with_stability_tag(
+        "The backend to use to serve the model. Default is pytorch backend.",
+        "beta"))
 @click.option(
     "--custom_module_dirs",
     type=click.Path(exists=True,
@@ -291,143 +430,176 @@ class ChoiceWithAlias(click.Choice):
                     resolve_path=True),
     default=None,
     multiple=True,
-    help="Paths to custom module directories to import.",
+    help=help_info_with_stability_tag(
+        "Paths to custom module directories to import.", "prototype"),
 )
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
-              help="The logging level.")
+              help=help_info_with_stability_tag("The logging level.", "beta"))
 @click.option("--max_beam_width",
               type=int,
               default=BuildConfig.model_fields["max_beam_width"].default,
-              help="Maximum number of beams for beam search decoding.")
+              help=help_info_with_stability_tag(
+                  "Maximum number of beams for beam search decoding.", "beta"))
 @click.option("--max_batch_size",
               type=int,
               default=BuildConfig.model_fields["max_batch_size"].default,
-              help="Maximum number of requests that the engine can schedule.")
+              help=help_info_with_stability_tag(
+                  "Maximum number of requests that the engine can schedule.",
+                  "beta"))
 @click.option(
     "--max_num_tokens",
     type=int,
     default=BuildConfig.model_fields["max_num_tokens"].default,
-    help=
-    "Maximum number of batched input tokens after padding is removed in each batch."
-)
+    help=help_info_with_stability_tag(
+        "Maximum number of batched input tokens after padding is removed in each batch.",
+        "beta"))
 @click.option(
     "--max_seq_len",
     type=int,
     default=BuildConfig.model_fields["max_seq_len"].default,
-    help="Maximum total length of one request, including prompt and outputs. "
-    "If unspecified, the value is deduced from the model config.")
+    help=help_info_with_stability_tag(
+        "Maximum total length of one request, including prompt and outputs. "
+        "If unspecified, the value is deduced from the model config.", "beta"))
 @click.option("--tensor_parallel_size",
               "--tp_size",
               type=int,
               default=1,
-              help='Tensor parallelism size.')
+              help=help_info_with_stability_tag('Tensor parallelism size.',
+                                                'beta'))
 @click.option("--pipeline_parallel_size",
               "--pp_size",
               type=int,
               default=1,
-              help='Pipeline parallelism size.')
+              help=help_info_with_stability_tag('Pipeline parallelism size.',
+                                                'beta'))
 @click.option("--context_parallel_size",
               "--cp_size",
               type=int,
               default=1,
-              help='Context parallelism size.')
+              help=help_info_with_stability_tag('Context parallelism size.',
+                                                'beta'))
 @click.option("--moe_expert_parallel_size",
               "--ep_size",
               type=int,
               default=None,
-              help="expert parallelism size")
+              help=help_info_with_stability_tag("expert parallelism size",
+                                                "beta"))
 @click.option("--moe_cluster_parallel_size",
               "--cluster_size",
               type=int,
               default=None,
-              help="expert cluster parallelism size")
-@click.option("--gpus_per_node",
-              type=int,
-              default=None,
-              help="Number of GPUs per node. Default to None, and it will be "
-              "detected automatically.")
+              help=help_info_with_stability_tag(
+                  "expert cluster parallelism size", "beta"))
+@click.option(
+    "--gpus_per_node",
+    type=int,
+    default=None,
+    help=help_info_with_stability_tag(
+        "Number of GPUs per node. Default to None, and it will be detected automatically.",
+        "beta"))
 @click.option("--free_gpu_memory_fraction",
               "--kv_cache_free_gpu_memory_fraction",
               type=float,
               default=0.9,
-              help="Free GPU memory fraction reserved for KV Cache, "
-              "after allocating model weights and buffers.")
-@click.option(
-    "--num_postprocess_workers",
-    type=int,
-    default=0,
-    help="[Experimental] Number of workers to postprocess raw responses "
-    "to comply with OpenAI protocol.")
+              help=help_info_with_stability_tag(
+                  "Free GPU memory fraction reserved for KV Cache, "
+                  "after allocating model weights and buffers.", "beta"))
+@click.option("--num_postprocess_workers",
+              type=int,
+              default=0,
+              help=help_info_with_stability_tag(
+                  "Number of workers to postprocess raw responses "
+                  "to comply with OpenAI protocol.", "prototype"))
 @click.option("--trust_remote_code",
               is_flag=True,
               default=False,
-              help="Flag for HF transformers.")
+              help=help_info_with_stability_tag("Flag for HF transformers.",
+                                                "beta"))
 @click.option("--revision",
               type=str,
               default=None,
-              help="The revision to use for the HuggingFace model "
-              "(branch name, tag name, or commit id).")
+              help=help_info_with_stability_tag(
+                  "The revision to use for the HuggingFace model "
+                  "(branch name, tag name, or commit id).", "beta"))
 @click.option(
     "--config",
     "--extra_llm_api_options",
     "extra_llm_api_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
-    "Can be specified as either --config or --extra_llm_api_options.")
+    help=help_info_with_stability_tag(
+        "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
+        "Can be specified as either --config or --extra_llm_api_options.",
+        "prototype"))
 @click.option(
     "--reasoning_parser",
     type=click.Choice(ReasoningParserFactory.parsers.keys()),
     default=None,
-    help="[Experimental] Specify the parser for reasoning models.",
+    help=help_info_with_stability_tag(
+        "Specify the parser for reasoning models.", "prototype"),
 )
 @click.option(
     "--tool_parser",
     type=click.Choice(ToolParserFactory.parsers.keys()),
     default=None,
-    help="[Experimental] Specify the parser for tool models.",
+    help=help_info_with_stability_tag("Specify the parser for tool models.",
+                                      "prototype"),
 )
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
-              help="Path to metadata server config file")
+              help=help_info_with_stability_tag(
+                  "Path to metadata server config file", "prototype"))
 @click.option(
     "--server_role",
     type=str,
     default=None,
-    help="Server role. Specify this value only if running in disaggregated mode."
-)
+    help=help_info_with_stability_tag(
+        "Server role. Specify this value only if running in disaggregated mode.",
+        "prototype"))
 @click.option(
     "--fail_fast_on_attention_window_too_large",
     is_flag=True,
     default=False,
-    help=
-    "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
-)
+    help=help_info_with_stability_tag(
+        "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.",
+        "prototype"))
 @click.option("--otlp_traces_endpoint",
               type=str,
               default=None,
-              help="Target URL to which OpenTelemetry traces will be sent.")
+              help=help_info_with_stability_tag(
+                  "Target URL to which OpenTelemetry traces will be sent.",
+                  "prototype"))
 @click.option("--disagg_cluster_uri",
               type=str,
               default=None,
-              help="URI of the disaggregated cluster.")
+              help=help_info_with_stability_tag(
+                  "URI of the disaggregated cluster.", "prototype"))
 @click.option("--enable_chunked_prefill",
               is_flag=True,
               default=False,
-              help="Enable chunked prefill")
+              help=help_info_with_stability_tag("Enable chunked prefill",
+                                                "prototype"))
 @click.option("--media_io_kwargs",
               type=str,
               default=None,
-              help="Keyword arguments for media I/O.")
+              help=help_info_with_stability_tag(
+                  "Keyword arguments for media I/O.", "prototype"))
 @click.option("--chat_template",
               type=str,
               default=None,
-              help="[Experimental] Specify a custom chat template. "
-              "Can be a file path or one-liner template string")
+              help=help_info_with_stability_tag(
+                  "Specify a custom chat template. "
+                  "Can be a file path or one-liner template string",
+                  "prototype"))
+@click.option(
+    "--grpc",
+    is_flag=True,
+    default=False,
+    help="Run gRPC server instead of OpenAI HTTP server. "
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
@@ -443,8 +615,9 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str]):
-    """Running an OpenAI API compatible server
+        custom_module_dirs: list[Path], chat_template: Optional[str],
+        grpc: bool):
+    """Running an OpenAI API compatible server (or gRPC server with --grpc flag)
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
@@ -521,9 +694,29 @@ def serve(
 
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, tool_parser, chat_template,
-                  metadata_server_cfg, server_role, disagg_cluster_config,
-                  multimodal_server_config)
+
+    if grpc:
+        # gRPC mode: launch gRPC server instead of OpenAI HTTP server
+        # Check for unsupported arguments that are silently ignored in gRPC mode
+        unsupported_args = {
+            "tool_parser": tool_parser,
+            "chat_template": chat_template,
+            "metadata_server_config_file": metadata_server_config_file,
+            "server_role": server_role,
+            "disagg_cluster_config": disagg_cluster_config,
+        }
+        for name, value in unsupported_args.items():
+            if value is not None:
+                raise ValueError(
+                    f"Argument '{name}' is not supported when running in gRPC mode. "
+                    f"The gRPC server is designed for use with external routers that handle "
+                    f"these features (e.g., tool parsing, chat templates).")
+        launch_grpc_server(host, port, llm_args)
+    else:
+        # Default: launch OpenAI HTTP server
+        launch_server(host, port, llm_args, tool_parser, chat_template,
+                      metadata_server_cfg, server_role, disagg_cluster_config,
+                      multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")

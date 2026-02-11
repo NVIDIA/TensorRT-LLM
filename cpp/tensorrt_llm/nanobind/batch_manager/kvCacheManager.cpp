@@ -34,6 +34,7 @@
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
 #include <torch/extension.h>
@@ -123,7 +124,7 @@ public:
         NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest, pinOnRelease);
     }
 
-    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
+    std::vector<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
     {
         NB_OVERRIDE_PURE(storeBlocksForReuse, requestId, llmRequest, pinBlocks);
@@ -164,6 +165,11 @@ public:
     bool isEnableBlockReuse() const override
     {
         NB_OVERRIDE_PURE(isEnableBlockReuse);
+    }
+
+    bool isEnablePartialReuse() const override
+    {
+        NB_OVERRIDE_PURE(isEnablePartialReuse);
     }
 
     void rewindKVCache(tb::LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override
@@ -481,6 +487,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             nb::call_guard<nb::gil_scoped_release>())
+        .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),
+            nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
@@ -491,7 +499,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, nb::call_guard<nb::gil_scoped_release>())
         .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, nb::call_guard<nb::gil_scoped_release>())
-        .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>());
+        .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_priority_by_block_id", &BaseKVCacheManager::getPriorityByBlockId, nb::arg("block_id"),
+            nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());
 
     nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
         .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })
@@ -524,7 +534,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
             nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
-            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "scheduling_has_free_blocks",
+            [](tbk::KVCacheManager& self, SizeType32 numRequired, SizeType32 windowSize)
+            { return self.getBlockManager().schedulingHasFreeBlocks(numRequired, windowSize); },
+            nb::arg("num_required"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); });
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
@@ -554,6 +571,11 @@ void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("config"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("is_task_cached", &tb::PeftCacheManager::isTaskCached, nb::arg("taskId"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_task_cached_device", &tb::PeftCacheManager::isTaskCachedDevice, nb::arg("taskId"),
+            nb::call_guard<nb::gil_scoped_release>()) // ;
+        .def("ensure_batch_map_task_id", &tb::PeftCacheManager::ensureBatchMapTaskId, nb::arg("context_requests"),
+            nb::arg("generation_requests"), nb::arg("reset_gpu_cache") = false,
             nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tb::NoOpPeftCacheManager, tb::BasePeftCacheManager>(m, "NoOpPeftCacheManager")

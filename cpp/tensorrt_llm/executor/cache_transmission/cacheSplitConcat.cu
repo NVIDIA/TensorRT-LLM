@@ -107,9 +107,9 @@ TargetRanksInfo TargetRanksInfoForDP(
     auto const peerCPNum = peerParConfig.mContextParallelism;
     auto const selfCPNum = selfParConfig.mContextParallelism;
 
-    auto const selfTPRank = selfRank % selfTPNum;
+    auto const selfCPRank = selfRank % selfCPNum;
+    auto const selfTPRank = (selfRank % (selfTPNum * selfCPNum)) / selfCPNum;
     auto const selfPPRank = selfRank / (selfTPNum * selfCPNum);
-    auto const selfCPRank = (selfRank % (selfTPNum * selfCPNum)) / selfTPNum;
 
     int peerPPRankStart = 0;
     int mDomainPPSize = 1;
@@ -205,13 +205,14 @@ TargetRanksInfo TargetRanksInfoForDP(
     }
 
     std::vector<int> retRanks;
-    for (int i = peerTPRankStart; i < peerTPRankEnd; i++)
+    for (int i = peerCPRankStart; i < peerCPRankEnd; i++)
     {
-        for (int j = peerCPRankStart; j < peerCPRankEnd; j++)
+        for (int j = peerTPRankStart; j < peerTPRankEnd; j++)
         {
             for (int k = peerPPRankStart; k < peerPPRankEnd; k++)
             {
-                int irank = (k * peerTPNum * peerCPNum) + (j * peerTPNum) + i;
+                // Rank formula: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank.
+                int irank = (k * peerTPNum * peerCPNum) + (j * peerCPNum) + i;
                 retRanks.push_back(irank);
             }
         }

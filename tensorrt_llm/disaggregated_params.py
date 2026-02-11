@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -11,6 +12,11 @@ import tensorrt as trt  # noqa
 from tensorrt_llm.bindings import executor as tllme
 
 
+class DisaggScheduleStyle(IntEnum):
+    CONTEXT_FIRST = 0
+    GENERATION_FIRST = 1
+
+
 @dataclass(slots=True, kw_only=True)
 class DisaggregatedParams:
     """Disaggregated serving parameters.
@@ -21,6 +27,8 @@ class DisaggregatedParams:
         ctx_request_id (int): The context request id
         opaque_state(bytes): Any additional state needing to be exchanged between context and gen instances
         draft_tokens (List[int]): The draft tokens of the generation request
+        disagg_request_id (int): The disaggregated request id, if set, both context and generation requests will use it
+         as underlying request id.
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
@@ -32,6 +40,11 @@ class DisaggregatedParams:
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None
     draft_tokens: Optional[List[int]] = None
+    # If disagg_request_id is set, both context and generation requests will use it as underlying request id.
+    disagg_request_id: Optional[int] = None
+    ctx_dp_rank: Optional[int] = None
+    ctx_info_endpoint: Optional[List[str]] = None
+    schedule_style: Optional[DisaggScheduleStyle] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (
@@ -44,8 +57,17 @@ class DisaggregatedParams:
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
+        # Prefer disagg_request_id over ctx_request_id
+        request_id = (
+            self.disagg_request_id if self.disagg_request_id is not None else self.ctx_request_id
+        )
         return tllme.ContextPhaseParams(
-            self.first_gen_tokens, self.ctx_request_id, self.opaque_state, self.draft_tokens
+            self.first_gen_tokens,
+            request_id,
+            self.opaque_state,
+            self.draft_tokens,
+            self.ctx_dp_rank,
+            self.ctx_info_endpoint,
         )
 
     def get_request_type(self) -> tllme.RequestType:

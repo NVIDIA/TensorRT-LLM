@@ -256,6 +256,9 @@ class ModelLoader:
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
+            finally:
+                if 'memo' in locals():
+                    del memo
 
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)
@@ -278,7 +281,7 @@ class ModelLoader:
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model_dir,
+                        self.spec_config.speculative_model,
                         mapping=self.mapping)
 
                     draft_model_arch = model.draft_config.pretrained_config.architectures[
@@ -338,8 +341,8 @@ class ModelLoader:
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
-        config = checkpoint_loader.load_config(
-            checkpoint_dir,
+        load_config_kwargs = dict(
+            checkpoint_dir=checkpoint_dir,
             trust_remote_code=True,
             mapping=self.mapping,
             enable_min_latency=self.llm_args.enable_min_latency,
@@ -361,7 +364,18 @@ class ModelLoader:
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
-            allowed_backends)
+            allowed_backends,
+            use_cute_dsl_blockscaling_mm=self.llm_args.
+            use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_blockscaling_bmm=self.llm_args.
+            use_cute_dsl_blockscaling_bmm,
+        )
+
+        # Only pass model_kwargs if it's explicitly set (not None)
+        if self.llm_args.model_kwargs is not None:
+            load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
+
+        config = checkpoint_loader.load_config(**load_config_kwargs)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
@@ -373,9 +387,13 @@ class ModelLoader:
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
 
         # Allow overriding the number of layers via environment variable
+        # Note: This is kept for backward compatibility, but model_kwargs is preferred
         num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",
                                                  "0"))
         if num_layers_override > 0:
+            logger.warning(
+                f"TLLM_OVERRIDE_LAYER_NUM is deprecated. Use model_kwargs instead: "
+                f"model_kwargs={{'num_hidden_layers': {num_layers_override}}}")
             config.pretrained_config.num_hidden_layers = num_layers_override
             for sub_config in ["text_config", "vision_config"]:
                 if hasattr(config.pretrained_config, sub_config):

@@ -13,7 +13,7 @@ from typing import (Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple,
 
 import torch
 import yaml
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel
 from pydantic import Field as PydanticField
 from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
@@ -287,9 +287,8 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                                       description="The topk for the indexer.")
     indexer_max_chunk_size: Optional[int] = Field(
         default=None, description="The maximum chunk size for the indexer.")
-    # TODO: enable this by default once the memory usage in attention metadata is optimized
     skip_indexer_for_short_seqs: bool = Field(
-        default=False,
+        default=True,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
 
@@ -445,10 +444,13 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA",
-                     "TRITON"] = Field(default='CUTLASS',
-                                       description="MoE backend to use.")
+    backend: Literal[
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
+        "TRITON"] = Field(
+            default='AUTO',
+            description="MoE backend to use. "
+            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+        )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -652,7 +654,14 @@ class DecodingBaseConfig(StrictBaseModel):
     # If it's a static or dynamic tree, each draft layer may generate more than one draft token.
     # In this case, max_total_draft_tokens >= max_draft_len.
     max_total_draft_tokens: Optional[int] = None
-    speculative_model_dir: Optional[Union[str, Path]] = None
+    # The speculative (draft) model. Accepts either:
+    # - A HuggingFace Hub model ID (str), e.g., "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+    #   which will be automatically downloaded.
+    # - A local filesystem path to a downloaded model directory.
+    speculative_model: Optional[Union[str, Path]] = Field(
+        default=None,
+        validation_alias=AliasChoices("speculative_model",
+                                      "speculative_model_dir"))
 
     # PyTorch only.
     # When specified, speculation will be disabled at batch sizes above
@@ -709,6 +718,10 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
+    # Internal: record decoding_type alias used during parsing (for warnings).
+    _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
+    # If set, drafting will use separate KV cache in one-model speculative decoding.
+    _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -756,13 +769,14 @@ class DecodingBaseConfig(StrictBaseModel):
         return v
 
     @classmethod
-    def from_dict(cls, data: dict):
+    def from_dict(cls, data: dict, backend: Optional[str] = None):
         # dispatch to the correct decoding config
         decoding_type = data.get("decoding_type")
         config_classes = {
             "MTP": MTPDecodingConfig,
             "Medusa": MedusaDecodingConfig,
             "Eagle": EagleDecodingConfig,
+            "Eagle3": Eagle3DecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
@@ -770,6 +784,14 @@ class DecodingBaseConfig(StrictBaseModel):
             "UserProvided": UserProvidedDecodingConfig,
             "AUTO": AutoDecodingConfig,
         }
+
+        backend = backend.lower() if isinstance(backend, str) else backend
+        if decoding_type == "Eagle" and backend in ("pytorch", "_autodeploy"):
+            data = dict(data)
+            data.pop("decoding_type")
+            spec_cfg = Eagle3DecodingConfig(**data)
+            spec_cfg._decoding_type_alias = "Eagle"
+            return spec_cfg
 
         config_class = config_classes.get(decoding_type)
         if config_class is None:
@@ -823,6 +845,37 @@ class KvCacheConnectorConfig(StrictBaseModel):
         ..., description="The class name of the worker within the module.")
 
 
+class LayerwiseBenchmarksConfig(StrictBaseModel):
+    """
+    Configuration for layer-wise benchmarks calibration.
+    """
+    calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
+        default="NONE",
+        description=
+        "Instruct the layer-wise benchmarks calibrator to work on MARK mode, or COLLECT mode",
+        status="prototype")
+
+    calibration_file_path: Optional[str] = Field(
+        default=None,
+        description=
+        "The file path which the layer-wise benchmarks calibrator saves to or loads from",
+        status="prototype")
+
+    calibration_layer_indices: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Layer indices to filter. If None, all layers are collected in COLLECT mode.",
+        status="prototype")
+
+    @model_validator(mode='after')
+    def validate_calibration_file_path(self) -> 'LayerwiseBenchmarksConfig':
+        if self.calibration_mode == "COLLECT" and not self.calibration_file_path:
+            raise ValueError(
+                f"Expect calibration_file_path not to be empty when work on {self.calibration_mode} mode"
+            )
+        return self
+
+
 class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
@@ -859,28 +912,29 @@ class EagleDecodingConfig(DecodingBaseConfig):
     # choices: llama3, mistral_large3
     eagle3_model_arch: str = "llama3"
 
-    def __init__(self, **kwargs):
-        super().__init__()
-        for attr_name, attr_value in kwargs.items():
-            if attr_name == 'max_draft_len':
-                self.num_eagle_layers = attr_value
-                self.max_total_draft_tokens = attr_value  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
-            # Convert the data type of Eagle choice from str to List[List[int]]
-            if attr_name == 'eagle_choices' and attr_value is not None:
-                logger.warning(
-                    "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
-                )
-                if not isinstance(attr_value, list):
-                    if isinstance(attr_value, str):
-                        attr_value = ast.literal_eval(
-                            attr_value.replace(" ", ""))
-                    else:
-                        raise ValueError(
-                            "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
-                        )
-            setattr(self, attr_name, attr_value)
+    @field_validator('eagle_choices', mode='before')
+    @classmethod
+    def validate_eagle_choices(cls, v):
+        if v is not None:
+            logger.warning(
+                "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+            )
+            if not isinstance(v, list):
+                if isinstance(v, str):
+                    v = ast.literal_eval(v.replace(" ", ""))
+                else:
+                    raise ValueError(
+                        "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
+                    )
+        return v
 
-        assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
+    @model_validator(mode='after')
+    def validate_eagle_config(self) -> 'EagleDecodingConfig':
+        if self.max_draft_len is None:
+            raise ValueError("max_draft_len is required for Eagle")
+        self.num_eagle_layers = self.max_draft_len
+        self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
+
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
             self.eagle3_layers_to_capture = {-1}
@@ -890,7 +944,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
         # and reset the max_draft_len and num_eagle_layers if necessary
         if self.eagle_choices is not None:
             # If eagle_choices is provided, use_dynamic_tree should not be used
-            assert not self.use_dynamic_tree, "If eagle_choices is provided, use_dynamic_tree need to be False"
+            if self.use_dynamic_tree:
+                raise ValueError(
+                    "If eagle_choices is provided, use_dynamic_tree need to be False"
+                )
 
             # Get num_eagle_layers from eagle_choices
             num_eagle_layers_from_choices = self.check_eagle_choices()
@@ -907,10 +964,23 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
         # Dynamic tree logic
         if self.use_dynamic_tree:
-            assert self.eagle_choices is None, "If use_dynamic_tree is True, eagle_choices should be None"
-            assert self.max_draft_len is not None and self.max_draft_len > 0, "max_draft_len should be provided, which indicates the number of drafter layers"
-            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
-            assert self.max_total_draft_tokens is not None and self.max_total_draft_tokens > 0, "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+            if self.eagle_choices is not None:
+                raise ValueError(
+                    "If use_dynamic_tree is True, eagle_choices should be None")
+            if self.max_draft_len is None or self.max_draft_len <= 0:
+                raise ValueError(
+                    "max_draft_len should be provided, which indicates the number of drafter layers"
+                )
+            if self.dynamic_tree_max_topK is None or self.dynamic_tree_max_topK <= 0:
+                raise ValueError(
+                    "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
+                )
+            if self.max_total_draft_tokens is None or self.max_total_draft_tokens <= 0:
+                raise ValueError(
+                    "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+                )
+
+        return self
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -919,7 +989,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Eagle"
 
     def validate(self) -> None:
-        if self.speculative_model_dir is None:
+        if self.speculative_model is None:
             raise ValueError("Draft model must be provided for EAGLE")
 
     def check_eagle_choices(self):
@@ -965,6 +1035,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle_choices is None and self.use_dynamic_tree is False:
             return True
         return False
+
+
+class Eagle3DecodingConfig(EagleDecodingConfig):
+    decoding_type: ClassVar[str] = "Eagle3"
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
@@ -1165,7 +1239,7 @@ class AutoDecodingConfig(DecodingBaseConfig):
 class RayPlacementConfig(StrictBaseModel):
     """
     Configuration for Ray GPU workers placement.
-    This config is only used with AsyncLLM for RL scenarios.
+    Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
         default=False,
@@ -1179,8 +1253,11 @@ class RayPlacementConfig(StrictBaseModel):
 
     placement_bundle_indices: Optional[List[List[int]]] = Field(
         default=None,
-        description="List of bundle indices for each placement group. "
-        "Outer list corresponds to placement_groups, inner list contains bundle indices for that group."
+        description=
+        "List of lists of bundle indices. The outer list corresponds to "
+        "`placement_groups`. Each inner list specifies the bundle indices to use within "
+        "that placement group. For example, if `placement_groups=[pg1, pg2]`, "
+        "`[[0, 1], [0, 1]]` assigns bundles 0 and 1 from `pg1` and bundles 0 and 1 from `pg2`."
     )
 
     per_worker_gpu_share: Optional[float] = Field(
@@ -1205,12 +1282,15 @@ class RayPlacementConfig(StrictBaseModel):
                     f"placement_groups length ({len(self.placement_groups)}) must equal "
                     f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
                 )
-            if PlacementGroup is not None:
-                for i, pg in enumerate(self.placement_groups):
-                    if not isinstance(pg, PlacementGroup):
-                        raise TypeError(
-                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
-                            f"got {type(pg).__name__}")
+            if PlacementGroup is None:
+                raise ValueError(
+                    "Ray must be installed to use `placement_groups`")
+
+            for i, pg in enumerate(self.placement_groups):
+                if not isinstance(pg, PlacementGroup):
+                    raise TypeError(
+                        f"placement_groups[{i}] must be a Ray PlacementGroup, "
+                        f"got {type(pg).__name__}")
 
         if self.per_worker_gpu_share is not None:
             if not (0 < self.per_worker_gpu_share <= 1.0):
@@ -1682,6 +1762,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    use_kv_cache_manager_v2: bool = Field(
+        default=False,
+        status="prototype",
+        description="Whether to use the KV cache manager v2 (experimental).")
+
+    max_util_for_resume: float = Field(
+        default=0.95,
+        status="prototype",
+        description=
+        "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
+    )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1740,6 +1832,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive"
                 )
+        return v
+
+    @field_validator('max_util_for_resume')
+    @classmethod
+    def validate_max_util_for_resume(cls, v: float):
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
 
@@ -1907,6 +2007,13 @@ class BaseLlmArgs(StrictBaseModel):
         default=None, description="The revision to use for the tokenizer.")
 
     # Below are all remaining arguments
+
+    model_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional parameters overriding model config defaults. "
+        "Precedence: (1) model_kwargs, (2) model config file, (3) model config class defaults. "
+        "Unknown keys are ignored",
+        status="prototype")
 
     pipeline_parallel_size: int = Field(
         default=1, description="The pipeline parallel size.")
@@ -2097,6 +2204,12 @@ class BaseLlmArgs(StrictBaseModel):
                                       description="Return perf metrics.",
                                       status="prototype")
 
+    perf_metrics_max_requests: int = Field(
+        default=0,
+        description=
+        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
+        status="prototype")
+
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
         default=None,
         description=
@@ -2120,9 +2233,6 @@ class BaseLlmArgs(StrictBaseModel):
 
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
-    _speculative_model: Optional[str] = PrivateAttr(default=None)
-    _speculative_model_format: Optional[_ModelFormatKind] = PrivateAttr(
-        default=None)
 
     @property
     def parallel_config(self) -> _ParallelConfig:
@@ -2133,12 +2243,8 @@ class BaseLlmArgs(StrictBaseModel):
         return self._model_format
 
     @property
-    def speculative_model_dir(self) -> Optional[_ModelFormatKind]:
-        return self._speculative_model
-
-    @property
-    def speculative_model_format(self) -> _ModelFormatKind:
-        return self._speculative_model_format
+    def speculative_model(self) -> Optional[Union[str, Path]]:
+        return self.speculative_config.speculative_model if self.speculative_config is not None else None
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
@@ -2507,9 +2613,14 @@ class TrtLlmArgs(BaseLlmArgs):
                     decoding_mode=DecodingMode.Medusa(),
                     medusa_choices=self.speculative_config.medusa_choices)
 
+            elif isinstance(self.speculative_config, Eagle3DecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'Eagle3' is only supported on the PyTorch backend. "
+                    "Use decoding_type 'Eagle' for the TensorRT backend.")
+
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
+                assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 eagle_config = _EagleConfig(
@@ -2528,14 +2639,6 @@ class TrtLlmArgs(BaseLlmArgs):
 
         else:
             self.decoding_config = None
-
-        self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model_dir", None)
-        speculative_model_obj = _ModelWrapper(
-            self._speculative_model
-        ) if self._speculative_model is not None else None
-        if self._speculative_model and speculative_model_obj.is_local_model:
-            self._speculative_model_format = _ModelFormatKind.HF
 
         return self
 
@@ -2823,12 +2926,6 @@ class TorchLlmArgs(BaseLlmArgs):
                                  description="Print iteration logs.",
                                  status="beta")
 
-    perf_metrics_max_requests: int = Field(
-        default=0,
-        description=
-        "The maximum number of requests for perf metrics. Must also set request_perf_metrics to true to get perf metrics.",
-        status="prototype")
-
     batch_wait_timeout_ms: float = Field(
         default=0,
         description=
@@ -2894,6 +2991,7 @@ class TorchLlmArgs(BaseLlmArgs):
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
                                    description="Allreduce strategy to use.",
                                    status="beta")
+
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description=
@@ -2954,6 +3052,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    # fp8 cute dsl configs
+    use_cute_dsl_blockscaling_mm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling mm implementation.",
+        status="prototype",
+    )
+    use_cute_dsl_blockscaling_bmm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2963,6 +3073,17 @@ class TorchLlmArgs(BaseLlmArgs):
         "Disable the use of FlashInfer.sampling. This option is likely to be removed in the future.",
         status="prototype",
     )
+
+    max_stats_len: int = Field(
+        default=1000,
+        description="The max number of performance statistic entries.",
+        status="prototype",
+    )
+
+    layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
+        default_factory=LayerwiseBenchmarksConfig,
+        description="Configuration for layer-wise benchmarks calibration.",
+        status="prototype")
 
     @property
     def quant_config(self) -> QuantConfig:
@@ -3025,13 +3146,21 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"support backend {self.backend}")
 
             if isinstance(self.speculative_config, EagleDecodingConfig):
+                if (getattr(self.speculative_config, "_decoding_type_alias",
+                            None) == "Eagle" or type(self.speculative_config)
+                        is EagleDecodingConfig):
+                    logger.warning(
+                        "speculative_config.decoding_type 'Eagle' is not supported on the PyTorch backend; only 'Eagle3' is supported. "
+                        "'Eagle' is treated as 'Eagle3' for backward compatibility. "
+                        "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3—use an Eagle3 draft model."
+                    )
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
+                assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."
+                assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 assert self.speculative_config.num_nextn_predict_layers > 0
                 self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers
@@ -3057,14 +3186,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
         else:
             self.decoding_config = None
-
-        self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model_dir", None)
-        speculative_model_obj = _ModelWrapper(
-            self._speculative_model
-        ) if self._speculative_model is not None else None
-        if self._speculative_model and speculative_model_obj.is_local_model:
-            self._speculative_model_format = _ModelFormatKind.HF
 
         return self
 
@@ -3324,8 +3445,14 @@ def update_llm_args_with_extra_dict(
         if field_name in llm_args_dict:
             # Some fields need to be converted manually.
             if field_name in ["speculative_config", "sparse_attention_config"]:
-                llm_args_dict[field_name] = field_type.from_dict(
-                    llm_args_dict[field_name])
+                if field_name == "speculative_config":
+                    backend = llm_args_dict.get("backend") or llm_args.get(
+                        "backend")
+                    llm_args_dict[field_name] = field_type.from_dict(
+                        llm_args_dict[field_name], backend=backend)
+                else:
+                    llm_args_dict[field_name] = field_type.from_dict(
+                        llm_args_dict[field_name])
             else:
                 llm_args_dict[field_name] = field_type(
                     **llm_args_dict[field_name])

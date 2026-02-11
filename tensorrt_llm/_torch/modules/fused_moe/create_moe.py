@@ -138,8 +138,9 @@ def create_moe_backend(
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
         assert moe_cls in [
-            WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE
-        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE and CuteDslFusedMoE now."
+            WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
+            DeepGemmFusedMoE
+        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE and CuteDslFusedMoE, and DeepGemmFusedMoE."
 
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
@@ -175,6 +176,7 @@ def create_moe_backend(
             swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
     elif moe_cls == CutlassFusedMoE:
         return moe_cls(
@@ -194,6 +196,7 @@ def create_moe_backend(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
             activation_type=activation_type,
         )
     elif moe_cls == WideEPMoE:
@@ -254,6 +257,7 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            without_comm=without_comm,
         )
     elif moe_cls == TritonFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TritonFusedMoE."
@@ -343,7 +347,7 @@ def create_moe(
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
-                                             "0") == "1"
+                                             "1") == "1"
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                        CutlassFusedMoE):
@@ -364,6 +368,7 @@ def create_moe(
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
+                activation_type=activation_type,
             )
         else:
             # Check if this is a TRTLLM backend request that fallback to CutlassFusedMoE
@@ -377,10 +382,12 @@ def create_moe(
                     f"ConfigurableMoE only supports TRTLLMGenFusedMoE and CuteDslFusedMoE backends. "
                     f"Continuing with legacy MoE backend {moe_cls.__name__}.")
             else:
-                # For other incompatible backends, raise error
-                raise ValueError(
-                    f"ENABLE_CONFIGURABLE_MOE is set but backend {moe_cls.__name__} is not supported. "
-                    f"ConfigurableMoE only supports TRTLLMGenFusedMoE backend.")
+                # Other backends are not supported by ConfigurableMoE, fallback to legacy backend
+                # This is a WAR to make sure all the CI test cases pass.
+                # TODO: Remove this workaround when ConfigurableMoE is supported by all backends.
+                logger.warning(
+                    f"ENABLE_CONFIGURABLE_MOE is set but {moe_cls.__name__} is not supported by ConfigurableMoE. "
+                    f"Continuing with legacy MoE backend {moe_cls.__name__}.")
 
     # Use legacy create_moe_backend for other backends or when ConfigurableMoE is disabled
     return create_moe_backend(

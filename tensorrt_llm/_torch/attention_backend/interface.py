@@ -3,7 +3,7 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Dict, Generic, List, Optional, Protocol,
+from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional, Protocol,
                     Tuple, Type, TypeVar, Union)
 
 import torch
@@ -21,8 +21,17 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
-from ..pyexecutor.resource_manager import KVCacheManager
+from ..pyexecutor.mamba_cache_manager import MambaCacheManager
+from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from ..utils import get_model_extra_attrs
+
+try:
+    # Transformers v5
+    from transformers.configuration_utils import ALLOWED_ATTENTION_LAYER_TYPES
+except ImportError:
+    # Transformers v4
+    from transformers.configuration_utils import \
+        ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES
 
 
 @dataclass
@@ -55,7 +64,9 @@ class AttentionMetadata:
     # The max number of sequences in a single batch.
     max_num_sequences: Optional[int] = None
     # The KV cache manager.
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2]
+    # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
+    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
@@ -136,6 +147,9 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
+
+    mamba_metadata: Optional[Any] = None
+    mamba_chunk_size: int = 128
 
     # The number of tokens in the padded sequence.
     padded_num_tokens: Optional[int] = None
@@ -280,6 +294,23 @@ class AttentionMetadata:
         """
         Hook to be called before the forward step of the model.
         """
+        self._prepare_mamba_metadata()
+
+    def _prepare_mamba_metadata(self):
+        if self.mamba_metadata is False:
+            return
+
+        if self.mamba_metadata is None:
+            if (self.kv_cache_manager is not None
+                    and isinstance(self.kv_cache_manager, MambaCacheManager)):
+                from ..modules.mamba.mamba2_metadata import Mamba2Metadata
+                self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
+                                                     self.mamba_chunk_size)
+            else:
+                self.mamba_metadata = False
+                return
+
+        self.mamba_metadata.prepare(self)
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -447,6 +478,13 @@ class RopeParams:
     @staticmethod
     def from_config(config) -> "RopeParams":
         rope_params = RopeParams()
+
+        hf_rope_parameters = getattr(config, 'rope_parameters', None)
+        if hf_rope_parameters is not None:
+            assert not set(hf_rope_parameters.keys()).issubset(
+                ALLOWED_ATTENTION_LAYER_TYPES), (
+                    "Per-layer-type RoPE configuration is not supported yet.")
+            config.update(hf_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size

@@ -37,13 +37,12 @@ def parse_arguments():
         '--model_path',
         type=str,
         default=
-        "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+        "/home/scratch.trt_llm_data_ci/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
     )
     parser.add_argument(
         '--input_file',
         type=str,
-        default="tests/unittest/_torch/multi_gpu/test_star_attention_input.jsonl"
-    )
+        default="tests/unittest/_torch/multi_gpu/NIAH_simple_data.jsonl")
 
     # Build config
     parser.add_argument('--algo',

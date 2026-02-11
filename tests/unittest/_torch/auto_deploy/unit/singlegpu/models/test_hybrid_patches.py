@@ -4,7 +4,7 @@ from _model_test_utils import get_small_model_config
 from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
@@ -51,7 +51,7 @@ def test_bamba_patches(
                 "dtype": "bfloat16",
             },
         }
-    llm_args = AutoDeployConfig(**llm_args)
+    llm_args = LlmArgs(**llm_args)
 
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -72,12 +72,11 @@ def test_bamba_patches(
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).repeat(
         input_ids.shape[0], 1
     )
+    batch_size_dynamic = Dim.DYNAMIC
+    seq_len_dynamic = Dim.DYNAMIC
     dynamic_shapes = (
-        {0: Dim("batch_size", min=0, max=8), 1: Dim("seq_len", min=0, max=512)},
-        {
-            0: Dim("batch_size", min=0, max=8),
-            1: Dim("seq_len", min=0, max=512),
-        },
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
     )
 
     def _run_torch_export_to_gm():

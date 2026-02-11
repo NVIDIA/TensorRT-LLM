@@ -8,6 +8,7 @@ from pydantic import Field
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import move_to_device
+from ...utils.cuda_mem_tracker import bytes_to
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -23,6 +24,10 @@ class MoveDeviceConfig(TransformConfig):
     checkpoint_device: Optional[str] = Field(
         default=None,
         description="Optional device to init checkpoint before move to shared_config.local_device.",
+    )
+    disable_preload: bool = Field(
+        default=False,
+        description="If True, disable preloading weights.",
     )
 
 
@@ -43,9 +48,14 @@ class LoadWeightsToDevice(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
+        params_size = sum(p.numel() * p.element_size() for p in mod.parameters())
+        total_size_GB = bytes_to(params_size, unit="GB")
+        self._log_info(f"Estimated parameters memory: {total_size_GB:.2f} GB")
+
         factory.load_or_random_init(
             mod,
             device=self.config.checkpoint_device or cm.device,
+            disable_preload=self.config.disable_preload,
         )
         move_to_device(mod, cm.device)
 

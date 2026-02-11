@@ -9,6 +9,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -24,6 +25,7 @@ from ..distributed import (
     MoEAllReduceParams,
 )
 from ..model_config import ModelConfig
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MoE, MoEWeightLoadingMode, create_moe
@@ -52,7 +54,7 @@ class Glm4WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self, weights: Dict, allow_partial_loading: bool = False):
+    def load_weights(self, weights: ConsumableWeightsDict, allow_partial_loading: bool = False):
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
             result = {}
             for key, value in weights.items():
@@ -79,6 +81,9 @@ class Glm4WeightLoader:
             and self.config.num_key_value_heads is not None
             else self.config.num_attention_heads
         )
+
+        # Check if weights supports mark_consumed (ConsumableWeightsDict)
+        can_mark_consumed = hasattr(weights, "mark_consumed")
 
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
@@ -115,6 +120,10 @@ class Glm4WeightLoader:
                             }
                         module_weights.append(fw)
                     module.load_weights(weights=module_weights)
+                    # Mark consumed source weights (e.g., q_proj, k_proj, v_proj)
+                    if can_mark_consumed:
+                        for src_name in params_map[names[-1]]:
+                            weights.mark_consumed(".".join(names[:-1] + [src_name]))
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
                     module_weights = rename_moe_weight(
@@ -128,6 +137,9 @@ class Glm4WeightLoader:
                     module.load_weights(
                         weights=[module_weights], allow_partial_loading=allow_partial_loading
                     )
+                    # Mark consumed experts weights
+                    if can_mark_consumed:
+                        weights.mark_consumed(name)
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
@@ -148,6 +160,9 @@ class Glm4WeightLoader:
                     module.load_weights(
                         weights=[module_weights], allow_partial_loading=allow_partial_loading
                     )
+                    # Mark consumed MoE weights using parent name
+                    if can_mark_consumed:
+                        weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     continue
                 elif names[-1] == "next_layer_layernorm":
@@ -172,6 +187,9 @@ class Glm4WeightLoader:
                                 assert n in module_weights
                             if n in module_weights:
                                 p.data.copy_(module_weights[n][:])
+                    # Mark consumed weights
+                    if can_mark_consumed:
+                        weights.mark_consumed(name)
 
 
 class Glm4Attention(QKNormRoPEAttention):
@@ -194,6 +212,32 @@ class Glm4Attention(QKNormRoPEAttention):
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
             fuse_qk_norm_rope=True,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            dense_bias=False,
+            config=model_config,
+        )
+
+
+class Glm4AirAttention(Attention):
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        layer_idx: Optional[int] = None,
+    ):
+        config = model_config.pretrained_config
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.yarn,
+            rope=RopeParams.from_config(config),
+        )
+
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=config.attention_bias,
+            pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
@@ -436,10 +480,10 @@ class Glm4DecoderLayer(DecoderLayer):
             # KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
-        self.self_attn = Glm4Attention(
-            model_config,
-            layer_idx=layer_idx_for_attention,
-        )
+        if getattr(config, "use_qk_norm", False) and config.use_qk_norm:
+            self.self_attn = Glm4Attention(model_config, layer_idx=layer_idx_for_attention)
+        else:
+            self.self_attn = Glm4AirAttention(model_config, layer_idx=layer_idx_for_attention)
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
@@ -982,8 +1026,6 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
                                 )
                     self.model_config.quant_config.exclude_modules.extend(extend_exclude_modules)
             self.model.layers.extend(self.draft_model.mtp_layers)
-            self.epilogue.extend(self.draft_model.mtp_layers)
-            self.epilogue.append(self.spec_worker)
 
     def forward(
         self,
@@ -1005,7 +1047,7 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
             **kwargs,
         )
 
-    def load_weights(self, weights: Dict, allow_partial_loading: bool = False):
+    def load_weights(self, weights: ConsumableWeightsDict, allow_partial_loading: bool = False):
         weight_loader = Glm4WeightLoader(self)
         weight_loader.load_weights(weights, allow_partial_loading=allow_partial_loading)
 

@@ -302,6 +302,17 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
                 phase ^= 1;
             }
         }
+        // Wait for pending loads to be consumed before exiting, to avoid race
+        for (int i = 0; i < (STAGES / 4) - 1; i++)
+        {
+            bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
+            stage += 4;
+            if (stage >= STAGES)
+            {
+                stage = warp_id % 4;
+                phase ^= 1;
+            }
+        }
     }
     // Compute threads
     else if (warp_id < 4)

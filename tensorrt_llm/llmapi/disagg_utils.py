@@ -1,10 +1,14 @@
 import logging
+import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
+from mpi4py.util import pkl5
 
 from .._utils import global_mpi_rank, global_mpi_size
 
@@ -76,6 +80,11 @@ class DisaggServerConfig():
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
+    node_id: int = uuid.getnode(
+    ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
+    # If this causes collisions, users can set node_id manually within range [0, 1023] in config
+    schedule_style: Literal['context_first',
+                            'generation_first'] = 'context_first'
 
 
 @dataclass
@@ -319,7 +328,7 @@ def split_world_comm(
         f"global_rank: {global_rank}, instance_idx: {instance_idx}, sub_rank: {sub_rank}, is_leader: {is_leader}"
     )
 
-    return is_leader, instance_idx, sub_comm
+    return is_leader, instance_idx, pkl5.Intracomm(sub_comm)
 
 
 def parse_metadata_server_config_file(
@@ -331,3 +340,48 @@ def parse_metadata_server_config_file(
     with open(metadata_server_config_file, 'r') as file:
         config = yaml.safe_load(file)
         return MetadataServerConfig(**config)
+
+
+MIN_GLOBAL_ID = 1 << 42
+
+# Consider GIL being removed in the future, use a lock to protect the counter
+_global_disagg_request_id_lock = threading.Lock()
+_global_disagg_request_id_counter = 0
+
+
+def get_global_disagg_request_id(machine_id: int) -> int:
+    """
+    a snowflake global disagg request id that doesn't guarantee monotonicity
+    0: positive integer
+    1-41  41 bits: timestamp_ms
+    42-51 10 bits: machine_id
+    52-63 12 bits: counter
+    """
+    global _global_disagg_request_id_lock
+    global _global_disagg_request_id_counter
+
+    COUNTER_BITS = 12
+    MACHINE_ID_BITS = 10
+    COUNTER_MASK = (1 << COUNTER_BITS) - 1
+    MAX_INT64 = (1 << 63) - 1
+
+    if machine_id not in range(0, (1 << MACHINE_ID_BITS) - 1):
+        raise ValueError(
+            f"machine_id must be in range [0, {(1 << MACHINE_ID_BITS) - 1})")
+
+    timestamp_ms = int(time.monotonic() * 1000)
+    with _global_disagg_request_id_lock:
+        counter = _global_disagg_request_id_counter & COUNTER_MASK
+        _global_disagg_request_id_counter += 1
+
+    # Rotate in [MIN_GLOBAL_ID, MAX_INT64)
+    # [0, MIN_GLOBAL_ID) is reserved for local ids
+    global_id = (timestamp_ms << (MACHINE_ID_BITS + COUNTER_BITS)) | (
+        machine_id << COUNTER_BITS) | counter
+    global_id_int64 = global_id % (MAX_INT64 - MIN_GLOBAL_ID) + MIN_GLOBAL_ID
+    return global_id_int64
+
+
+def get_local_request_id(last_id: int) -> int:
+    """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
+    return (last_id + 1) & (MIN_GLOBAL_ID - 1)

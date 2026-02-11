@@ -10,6 +10,7 @@ set(SRCS
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
+    batch_manager/kvCacheManagerV2Utils.cpp
     batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
@@ -65,4 +66,9 @@ if(NOT WIN32)
   set_target_properties(
     ${TRTLLM_NB_MODULE} PROPERTIES LINK_FLAGS
                                    "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+endif()
+
+# Build transfer_agent_binding when building bindings (if NIXL is enabled)
+if(TARGET ${TRANSFER_AGENT_BINDING_TARGET})
+  add_dependencies(${TRTLLM_NB_MODULE} ${TRANSFER_AGENT_BINDING_TARGET})
 endif()

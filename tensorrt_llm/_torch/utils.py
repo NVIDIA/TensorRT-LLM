@@ -8,7 +8,8 @@ from typing import Dict, List
 import torch
 from torch.nn import functional as F
 
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
+                                 torch_dtype_to_str)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
@@ -301,6 +302,16 @@ def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
     return scale_shape * 2
 
 
+def fp8_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp8 scale tensor.
+    """
+    input_shape = input_shapes[0]
+    assert len(input_shape) == 2 or len(input_shape) == 3
+    has_batch = len(input_shape) == 3
+    m = input_shape[-2]
+    return pad_up(m, 4) if has_batch else m
+
+
 _enable_piecewise_cuda_graph = True
 
 
@@ -404,3 +415,72 @@ def split(x: torch.Tensor,
 
 def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
+
+
+def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
+    # Pass num_elements=-1 will print the whole tensor
+    if num_elements < 0:
+        num_elements = torch.numel(x)
+    if x.dtype in (torch.int32, torch.int64):
+        float_x = x.to(dtype=float)
+    else:
+        float_x = x
+    return ("Tensor("
+            f"shape={tuple(x.shape)}, "
+            f"dtype={torch_dtype_to_str(x.dtype)}, "
+            f"device={x.device}, "
+            f"stats=("
+            f"abs_mean={float_x.abs().mean().item():.3f}, "
+            f"mean={float_x.mean().item():.3f}, "
+            f"std={float_x.std().item():.3f}, "
+            f"max={x.max().item():.3f}, "
+            f"min={x.min().item():.3f}"
+            "), "
+            f"values={x.flatten()[:num_elements].tolist()}"
+            ")")
+
+
+@maybe_compile
+def maybe_compiled_copy_(dst, src):
+    dst.copy_(src)
+
+
+@maybe_compile
+def maybe_compiled_cat(tensors, dim):
+    return torch.cat(tensors, dim)
+
+
+def replace_parameter_and_save_metadata(
+        module: torch.nn.Module, param_name: str,
+        new_param: torch.nn.Parameter | torch.Tensor, metadata_dict: Dict):
+    """
+    Replace a parameter in a module and save the metadata of the original parameter.
+    On first call: saves original param's meta tensor and new param's tensor, then replaces.
+    On subsequent calls: copies new_param data into the saved tensor, then registers it.
+    """
+    saved_param = None
+    if param_name not in metadata_dict:
+        # First time: save original meta tensor and the new param tensor reference
+        original_meta = getattr(module, param_name).to("meta")
+        # Convert new_param to Parameter if it's a Tensor, otherwise use directly
+        if isinstance(new_param, torch.nn.Parameter):
+            saved_param = new_param
+        elif isinstance(new_param, torch.Tensor):
+            saved_param = torch.nn.Parameter(new_param, requires_grad=False)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+        metadata_dict[param_name] = {
+            'meta': original_meta,
+            'param': saved_param
+        }
+    else:
+        # Subsequent calls: copy new_param into the saved tensor
+        saved_param = metadata_dict[param_name]['param']
+        if isinstance(new_param, torch.nn.Parameter):
+            saved_param.data.copy_(new_param.data)
+        elif isinstance(new_param, torch.Tensor):
+            saved_param.data.copy_(new_param)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+
+    module.register_parameter(param_name, saved_param)

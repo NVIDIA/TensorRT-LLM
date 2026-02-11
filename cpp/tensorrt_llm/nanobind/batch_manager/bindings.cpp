@@ -132,6 +132,7 @@ void initBindings(nb::module_& m)
         .def_rw("max_new_tokens", &GenLlmReq::mMaxNewTokens)
         .def_rw("sampling_config", &GenLlmReq::mSamplingConfig)
         .def_prop_rw("state", &GenLlmReq::getState, &GenLlmReq::setState)
+        .def_prop_ro("state_value", [](GenLlmReq const& self) { return static_cast<int>(self.getState()); })
         .def_prop_rw("streaming", &GenLlmReq::isStreaming, &GenLlmReq::setStreaming)
         .def_rw("end_id", &GenLlmReq::mEndId)
         .def_rw("pad_id", &GenLlmReq::mPadId)
@@ -161,19 +162,24 @@ void initBindings(nb::module_& m)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, nb::arg("finish_reason"), nb::arg("beam"))
         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
         .def_prop_ro("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
+        .def_prop_ro("is_finished_due_to_cancellation", &GenLlmReq::isFinishedDueToCancellation)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
+        .def("set_prepopulated_prompt_len", &GenLlmReq::setPrepopulatedPromptLen, nb::arg("prepopulated_prompt_len"),
+            nb::arg("kv_tokens_per_block"))
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
-        .def_prop_ro("context_phase_params", &GenLlmReq::getContextPhaseParams)
+        .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
         .def_prop_ro("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
+        .def_prop_ro("is_generation_to_complete_state", &GenLlmReq::isGenerationToCompleteState)
         .def_prop_ro("is_generation_complete_state", &GenLlmReq::isGenerationCompleteState)
         .def_prop_ro("is_context_finished", &GenLlmReq::isContextFinished)
         .def_prop_ro("is_disagg_generation_init_state", &GenLlmReq::isDisaggGenerationInitState)
         .def_prop_ro("is_disagg_generation_transmission_complete", &GenLlmReq::isDisaggGenerationTransmissionComplete)
         .def_prop_ro(
             "is_disagg_generation_transmission_in_progress", &GenLlmReq::isDisaggGenerationTransmissionInProgress)
+        .def_prop_ro("is_encoder_init_state", &GenLlmReq::isEncoderInitState)
         .def_prop_ro("is_context_init_state", &GenLlmReq::isContextInitState)
         .def_prop_ro("is_generation_in_progress_state", &GenLlmReq::isGenerationInProgressState)
         .def_prop_ro("is_disagg_context_transmission_state", &GenLlmReq::isDisaggContextTransmissionState)
@@ -192,6 +198,7 @@ void initBindings(nb::module_& m)
         .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
         .def_prop_ro("is_child", &GenLlmReq::isChild)
         .def_prop_ro("cache_salt_id", &GenLlmReq::getCacheSaltID)
+        .def_prop_ro("kv_cache_retention_config", &GenLlmReq::getKvCacheRetentionConfig)
         .def_prop_ro("multimodal_hashes",
             [](GenLlmReq& self)
             {
@@ -252,7 +259,20 @@ void initBindings(nb::module_& m)
             })
         .def_prop_rw("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
         .def_prop_ro("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
-        .def_prop_rw("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
+        .def_prop_rw("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel)
+        .def("get_unique_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getUniqueTokens, nb::const_),
+            nb::arg("beam"))
+        .def("get_unique_tokens", nb::overload_cast<>(&GenLlmReq::getUniqueTokens, nb::const_))
+        .def("get_encoder_unique_tokens",
+            [](GenLlmReq& self)
+            {
+                auto const& encoderUniqueTokens = self.getEncoderUniqueTokens();
+                if (encoderUniqueTokens.has_value() && encoderUniqueTokens.value())
+                {
+                    return std::optional<GenLlmReq::VecUniqueTokens>(*encoderUniqueTokens.value());
+                }
+                return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
+            });
 
     nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
         .def(
@@ -396,7 +416,36 @@ void initBindings(nb::module_& m)
 
     nb::class_<tb::rnn_state_manager::RnnStateManager>(m, "RnnStateManager")
         .def(nb::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
-            nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"));
+            nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
+                 tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
+                 std::vector<tr::SizeType32> const&>(),
+            nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
+            nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),
+            nb::arg("ssm_cache_dtype"), nb::arg("pp_layers"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_conv_states",
+            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
+            {
+                auto tensor = self.getConvStates(layerIdx);
+                return tr::Torch::tensor(tensor);
+            },
+            nb::arg("layer_idx"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_ssm_states",
+            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
+            {
+                auto tensor = self.getSsmStates(layerIdx);
+                return tr::Torch::tensor(tensor);
+            },
+            nb::arg("layer_idx"), nb::call_guard<nb::gil_scoped_release>())
+        .def("allocate_cache_blocks", &tb::rnn_state_manager::RnnStateManager::allocateCacheBlocks,
+            nb::arg("request_ids"), nb::call_guard<nb::gil_scoped_release>())
+        .def("free_cache_block", &tb::rnn_state_manager::RnnStateManager::freeCacheBlock, nb::arg("request_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_state_indices", &tb::rnn_state_manager::RnnStateManager::getStateIndices, nb::arg("request_ids"),
+            nb::arg("is_padding"), nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "add_new_tokens_to_requests",

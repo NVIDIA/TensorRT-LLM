@@ -29,7 +29,6 @@ from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
 from subprocess import DEVNULL, CalledProcessError, check_output, run
-from textwrap import dedent
 from typing import Sequence
 
 try:
@@ -368,12 +367,10 @@ def check_missing_libs(lib_name: str) -> list[str]:
     return missing
 
 
-def generate_python_stubs_linux(binding_type: str, venv_python: Path,
-                                deep_ep: bool, flash_mla: bool,
+def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
+                                flash_mla: bool, transfer_agent_binding: bool,
                                 binding_lib_name: str):
-    is_nanobind = binding_type == "nanobind"
-    if is_nanobind:
-        build_run(f"\"{venv_python}\" -m pip install nanobind")
+    build_run(f"\"{venv_python}\" -m pip install nanobind")
     build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
 
     env_stub_gen = os.environ.copy()
@@ -392,14 +389,8 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
         link_dir = None
 
     try:
-        if is_nanobind:
-            build_run(
-                f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
-                env=env_stub_gen)
-        else:
-            build_run(
-                f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
-                env=env_stub_gen)
+        build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
+                  env=env_stub_gen)
         build_run(
             f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
@@ -411,39 +402,63 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
             build_run(
                 f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                 env=env_stub_gen)
+        if transfer_agent_binding:
+            # Generate stubs for tensorrt_llm_transfer_agent_binding
+
+            build_run(
+                f"\"{venv_python}\" -m nanobind.stubgen -m tensorrt_llm_transfer_agent_binding -O .",
+                env=env_stub_gen)
+
     finally:
         if link_dir:
             rmtree(link_dir)
 
 
-def generate_python_stubs_windows(binding_type: str, venv_python: Path,
-                                  pkg_dir: Path, lib_dir: Path):
-    if binding_type == "nanobind":
-        print("Windows not yet supported for nanobind stubs")
-        exit(1)
-    else:
-        build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
-        stubgen = "stubgen.py"
-        stubgen_contents = """
-                        # Loading torch, trt before bindings is required to avoid import errors on windows.
-                        # isort: off
-                        import torch
-                        import tensorrt as trt
-                        # isort: on
-                        import os
-                        import platform
+def generate_python_stubs_windows(venv_python: Path, pkg_dir: Path,
+                                  lib_dir: Path):
 
-                        from pybind11_stubgen import main
+    print("Windows not supported for nanobind stubs")
+    exit(1)
 
-                        if __name__ == "__main__":
-                            # Load dlls from `libs` directory before launching bindings.
-                            if platform.system() == "Windows":
-                                os.add_dll_directory(r\"{lib_dir}\")
-                            main()
-                        """.format(lib_dir=lib_dir)
-        (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-        build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
-        (pkg_dir / stubgen).unlink()
+
+def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
+    print("-- Building kv_cache_manager_v2...")
+    kv_cache_mgr_dir = project_dir / "tensorrt_llm/runtime/kv_cache_manager_v2"
+    runtime_dir = project_dir / "tensorrt_llm/runtime"
+
+    # Clean up any existing mypyc artifacts in runtime directory to prevent stale inclusion
+    # when switching from --mypyc to standard build
+    if not use_mypyc:
+        for so_file in runtime_dir.glob("*__mypyc*.so"):
+            print(f"Removing stale mypyc artifact: {so_file}")
+            so_file.unlink()
+
+        # Also clean up any .so files inside kv_cache_manager_v2
+        for so_file in kv_cache_mgr_dir.rglob("*.so"):
+            print(f"Removing stale artifact: {so_file}")
+            so_file.unlink()
+
+    # Build rawref
+    print("-- Building kv_cache_manager_v2 rawref extension...", end=" ")
+    rawref_dir = kv_cache_mgr_dir / "rawref"
+    build_run(f'"{venv_python}" setup.py build_ext --inplace', cwd=rawref_dir)
+    print("Done")
+
+    if use_mypyc:
+        # Build mypyc
+        print("-- Building kv_cache_manager_v2 mypyc extensions...", end=" ")
+        # setup_mypyc.py is in kv_cache_manager_v2 but executed from runtime dir
+        setup_mypyc = kv_cache_mgr_dir / "setup_mypyc.py"
+        build_run(f'"{venv_python}" "{setup_mypyc}" build_ext --inplace',
+                  cwd=runtime_dir)
+
+        # Verify that the shared library was generated
+        if not list(runtime_dir.glob("*__mypyc*.so")):
+            raise RuntimeError(
+                "Failed to build kv_cache_manager_v2: no shared library generated."
+            )
+        print("Done")
+    print("-- Done building kv_cache_manager_v2.")
 
 
 def main(*,
@@ -469,14 +484,14 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         binding_type: str = "nanobind",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
          skip_stubs: bool = False,
          generate_fmha: bool = False,
          no_venv: bool = False,
-         nvrtc_dynamic_linking: bool = False):
+         nvrtc_dynamic_linking: bool = False,
+         mypyc: bool = False):
 
     if clean:
         clean_wheel = True
@@ -572,39 +587,6 @@ def main(*,
         clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_binding_type_from_cache():
-        cmake_cache_file = build_dir / "CMakeCache.txt"
-        if not cmake_cache_file.exists():
-            return None
-
-        with open(cmake_cache_file, 'r') as f:
-            for line in f:
-                if line.startswith("BINDING_TYPE:STRING="):
-                    cashed_binding_type = line.split("=", 1)[1].strip()
-                    if cashed_binding_type in ['pybind', 'nanobind']:
-                        return cashed_binding_type
-            return None
-
-    cached_binding_type = get_binding_type_from_cache()
-
-    if not first_build and cached_binding_type != binding_type:
-        # Clean up of previous binding build artifacts
-        nanobind_dir = build_dir / "tensorrt_llm" / "nanobind"
-        if nanobind_dir.exists():
-            rmtree(nanobind_dir)
-        nanobind_stub_dir = project_dir / "tensorrt_llm" / "bindings"
-        if nanobind_stub_dir.exists():
-            rmtree(nanobind_stub_dir)
-
-        pybind_dir = build_dir / "tensorrt_llm" / "pybind"
-        if pybind_dir.exists():
-            rmtree(pybind_dir)
-        pybind_stub_dir = project_dir / "tensorrt_llm" / "bindings"
-        if pybind_stub_dir.exists():
-            rmtree(pybind_stub_dir)
-
-        configure_cmake = True
-
     if use_ccache:
         cmake_def_args.append(
             f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"
@@ -667,7 +649,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}" -DBUILD_FLASH_MLA="{build_flash_mla}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}" -DBUILD_FLASH_MLA="{build_flash_mla}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -801,17 +783,15 @@ def main(*,
                 build_run(
                     f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
                 )
-        if os.path.exists(
-                build_dir /
-                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
-        ):
-            install_file(
-                build_dir /
-                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
-                lib_dir / "libtensorrt_llm_nixl_wrapper.so")
+        # NIXL wrapper and libraries
+        nixl_utils_dir = build_dir / "tensorrt_llm/executor/cache_transmission/nixl_utils"
+        if os.path.exists(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so"):
+            install_file(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so",
+                         lib_dir / "libtensorrt_llm_nixl_wrapper.so")
             build_run(
                 f'patchelf --set-rpath \'$ORIGIN/nixl/\' {lib_dir / "libtensorrt_llm_nixl_wrapper.so"}'
             )
+            # Copy NIXL libraries
             if os.path.exists("/opt/nvidia/nvda_nixl"):
                 nixl_dir = lib_dir / "nixl"
                 if nixl_dir.exists():
@@ -825,6 +805,15 @@ def main(*,
                 build_run(
                     f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
                 )
+        # Install tensorrt_llm_transfer_agent_binding Python module (standalone agent bindings)
+        # This is built when either NIXL or Mooncake is enabled
+        # Install to tensorrt_llm/ (same level as bindings.so)
+        agent_binding_so = list(
+            nixl_utils_dir.glob("tensorrt_llm_transfer_agent_binding*.so"))
+        if agent_binding_so:
+            trtllm_dir = project_dir / "tensorrt_llm"
+            install_file(agent_binding_so[0],
+                         trtllm_dir / agent_binding_so[0].name)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so"
@@ -891,7 +880,7 @@ def main(*,
             ) == 1, f"Exactly one binding library should be present: {binding_lib}"
             return binding_lib[0]
 
-        binding_lib_dir = get_binding_lib(binding_type, "bindings")
+        binding_lib_dir = get_binding_lib("nanobind", "bindings")
         binding_lib_file_name = binding_lib_dir.name
         install_file(binding_lib_dir, pkg_dir)
 
@@ -939,14 +928,15 @@ def main(*,
         if not skip_stubs:
             with working_directory(pkg_dir):
                 if on_windows:
-                    generate_python_stubs_windows(binding_type, venv_python,
-                                                  pkg_dir, lib_dir)
+                    generate_python_stubs_windows(venv_python, pkg_dir, lib_dir)
                 else:  # on linux
                     generate_python_stubs_linux(
-                        binding_type, venv_python,
-                        bool(deep_ep_cuda_architectures),
+                        venv_python, bool(deep_ep_cuda_architectures),
                         bool(flash_mla_cuda_architectures),
+                        nixl_root is not None or mooncake_root is not None,
                         binding_lib_file_name)
+
+    build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=mypyc)
 
     if not skip_building_wheel:
         if dist_dir is None:
@@ -969,6 +959,15 @@ def main(*,
         build_run(
             f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
         )
+        env = os.environ.copy()
+        if mypyc:
+            env["TRTLLM_ENABLE_MYPYC"] = "1"
+        else:
+            env["TRTLLM_ENABLE_MYPYC"] = "0"
+
+        build_run(
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"',
+            env=env)
 
     if install:
         build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
@@ -1010,7 +1009,6 @@ def add_arguments(parser: ArgumentParser):
                         action="store_true",
                         help="Always configure cmake before building")
     parser.add_argument("--use_ccache",
-                        "-ccache",
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")
@@ -1087,10 +1085,6 @@ def add_arguments(parser: ArgumentParser):
         help=
         "Install the built binary by creating symbolic links instead of copying files"
     )
-    parser.add_argument("--binding_type",
-                        choices=["pybind", "nanobind"],
-                        default="nanobind",
-                        help="Which binding library to use: pybind or nanobind")
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime")
@@ -1116,6 +1110,9 @@ def add_arguments(parser: ArgumentParser):
         "--nvrtc_dynamic_linking",
         action="store_true",
         help="Link against dynamic NVRTC libraries instead of static ones")
+    parser.add_argument("--mypyc",
+                        action="store_true",
+                        help="Compile kv_cache_manager_v2 with mypyc")
 
 
 if __name__ == "__main__":
