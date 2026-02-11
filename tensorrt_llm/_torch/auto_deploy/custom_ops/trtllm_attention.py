@@ -162,16 +162,15 @@ class TrtllmLayerState:
     context_lengths: torch.Tensor = field(default=None)
     kv_cache_block_offsets: torch.Tensor = field(default=None)
 
-    # Host tensors (pinned for async H2D)
+    # Pinned host tensors consumed by thop.attention.
+    # Note: this wrapper passes these CPU tensors directly to the C++ op; any
+    # host->device transfer is handled internally by the kernel/op (not here).
     host_past_key_value_lengths: torch.Tensor = field(default=None)
     host_context_lengths: torch.Tensor = field(default=None)
     host_request_types: torch.Tensor = field(default=None)
     host_total_kv_lens: torch.Tensor = field(default=None)
     host_kv_cache_pool_pointers: torch.Tensor = field(default=None)
     host_kv_cache_pool_mapping: torch.Tensor = field(default=None)
-
-    # Interleaved KV cache buffer for kernel (allocated lazily)
-    interleaved_kv_cache: torch.Tensor = field(default=None)
 
     def __post_init__(self):
         """Initialize tensors - use shared tensors from global state where possible."""
@@ -548,7 +547,7 @@ class TrtllmAttentionGlobalState:
             global_state.set_max_blocks_per_seq(max_blocks)
             total_pages = int(cu_num_pages[num_seq])
 
-            # H2D copies using pinned memory (non-blocking) - only fill active slots
+            # Copy small active slices to device (non-blocking)
             global_state._shared_sequence_length[:num_seq].copy_(
                 seq_len_with_cache, non_blocking=True
             )
@@ -917,13 +916,23 @@ def trtllm_mha_with_cache(
     # Prepare output tensor
     output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
-    # Get num_layers from config for block offset calculation
+    # Get num_layers for block offset calculation.
+    # This should be known once the cache is initialized (pool mapping) or once
+    # we've observed all attention layers (tracked via _trtllm_config).
     if _global_state._pool_num_layers > 0:
         num_layers = _global_state._pool_num_layers
     elif _trtllm_config._num_layers > 0:
         num_layers = _trtllm_config._num_layers
+    elif _trtllm_config._kv_cache_pool_mapping is not None:
+        # KVCacheManager provides a (num_layers, 2) mapping: layer -> (pool_id, offset)
+        num_layers = int(_trtllm_config._kv_cache_pool_mapping.shape[0])
     else:
-        num_layers = 32
+        raise RuntimeError(
+            "TRT-LLM attention backend could not determine num_layers. "
+            "Expected either KV cache pool mapping (cache_init) or a populated "
+            "TRTLLM model config. Ensure the KV cache manager is initialized and "
+            "pool pointers/mapping are configured before running attention."
+        )
     state = _global_state.get_or_create_layer_state(
         layer_idx=layer_idx,
         num_heads=num_heads,
@@ -1136,9 +1145,9 @@ class TrtllmAttentionConfig:
         self._kv_scale_quant_orig: Optional[torch.Tensor] = None
         self._quant_mode: int = 0
 
-        # Store SequenceInfo reference for AD pool pointer access
+        # Store SequenceInfo reference (for basic config like max_batch_size/seq_len).
         self._sequence_info: Optional[SequenceInfo] = None
-        # Pool pointers and mapping from KVCacheManager
+        # Pool pointers and mapping from KVCacheManager (set by shim/interface.py).
         self._kv_cache_pool_pointers: Optional[torch.Tensor] = None
         self._kv_cache_pool_mapping: Optional[torch.Tensor] = None
 
