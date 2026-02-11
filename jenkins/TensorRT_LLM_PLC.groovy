@@ -44,10 +44,10 @@ def createKubernetesPodConfig()
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
-                      privileged: true
-                      capabilities:
-                        add:
-                        - SYS_ADMIN
+                        privileged: true
+                        capabilities:
+                            add:
+                            - SYS_ADMIN
                 qosClass: Guaranteed
         """.stripIndent(),
     ]
@@ -175,22 +175,35 @@ def pulseScan(llmRepo, branchName) {
                         "PULSE_SCAN_PROJECT_VERSION=${branchName}",
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
                     ]) {
-                        sh 'pulse scan --no-fail .'
+                        sh 'pulse scan --no-fail --sbom .'
                     }
                   }
             }
         }
-        sh "ls"
+    }
+    container("alpine") {
+        sh "apt update"
+        sh "apt install -y python3-dev python3-venv unzip"
         sh "cat nspect_scan_report.json"
+        sh "cat sbom.cdx.json"
+        sh """
+            SBOM_ZIP="./sbom.zip"
+            if [ -f "\$SBOM_ZIP" ]; then
+                EXTRACTED_FOLDER=\$(unzip -Z1 "\$SBOM_ZIP" | head -1 | cut -d/ -f1)
+                JSON_FILE=\$(find "\$EXTRACTED_FOLDER" -type f -name "*.json" | head -n 1)
+                cat \$JSON_FILE
+            else
+                echo "SBOM zip does not exist"
+            fi
+        """
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
             def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
             sh """
                 export TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}
                 python3 -m venv venv
-                source venv/bin/activate
-                pip install requests
-                python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
+                venv/bin/pip install requests
+                venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
             """
         }
     }
@@ -208,7 +221,7 @@ pipeline {
     options {
         skipDefaultCheckout()
         timestamps()
-        timeout(time: 60, unit: 'MINUTES')
+        timeout(time: 150, unit: 'MINUTES')
     }
     environment {
         LLM_REPO = getLLMRepo()
