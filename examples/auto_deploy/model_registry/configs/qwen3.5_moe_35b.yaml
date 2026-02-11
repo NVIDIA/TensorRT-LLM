@@ -1,0 +1,13 @@
+runtime: trtllm
+compile_backend: torch-cudagraph
+max_seq_len: 4096
+max_num_tokens: 4096
+max_batch_size: 512
+enable_chunked_prefill: true
+model_factory: AutoModelForCausalLM
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.7
+  tokens_per_block: 64
+model_kwargs:
+  torch_dtype: bfloat16
