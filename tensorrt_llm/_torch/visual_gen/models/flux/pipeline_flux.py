@@ -147,7 +147,8 @@ class FluxPipeline(BasePipeline):
         """Load transformer weights."""
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
             logger.info("Loading transformer weights...")
-            self.transformer.load_weights(weights)
+            transformer_weights = weights.get("transformer", weights)
+            self.transformer.load_weights(transformer_weights)
             logger.info("Transformer weights loaded successfully.")
 
         self._target_dtype = self.model_config.torch_dtype
