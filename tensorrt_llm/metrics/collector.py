@@ -184,8 +184,8 @@ class MetricsCollector:
         - kv_cache_utilization
 
         Args:
-            iteration_stats: A dictionary containing iteration-level statistics with the following
-                expected structure:
+            iteration_stats: A JSON dict returned from `BaseLLM.get_stats()` containing iteration-level statistics
+                with the following expected structure:
                 - "kvCacheStats" (dict): KV cache statistics containing:
                     - "cacheHitRate" (float): Cache hit rate (0.0 to 1.0). If present (including zero),
                       the kv_cache_hit_rate gauge is updated.
