@@ -2,7 +2,8 @@
 # @article{
 #   li2024svdquant,
 #   title={SVDQuant: Absorbing Outliers by Low-Rank Components for 4-Bit Diffusion Models},
-#   author={Li*, Muyang and Lin*, Yujun and Zhang*, Zhekai and Cai, Tianle and Li, Xiuyu and Guo, Junxian and Xie, Enze and Meng, Chenlin and Zhu, Jun-Yan and Han, Song},
+#   author={Li*, Muyang and Lin*, Yujun and Zhang*, Zhekai and Cai, Tianle and Li, Xiuyu and
+#           Guo, Junxian and Xie, Enze and Meng, Chenlin and Zhu, Jun-Yan and Han, Song},
 #   journal={arXiv preprint arXiv:2411.05007},
 #   year={2024}
 # }
@@ -76,6 +77,7 @@ except ImportError:
 
 try:
     from deep_gemm import fp8_gemm_nt
+
     from visual_gen.ops.deep_gemm_quant import quant_and_transform_ue8m0
 except ImportError:
     logger.warning("Deep_gemm is not installed")
@@ -86,7 +88,11 @@ class BaseLinear:
         pass
 
     def register_tunable_params(
-        self, value: Any, param_range: Optional[List[Any]], name: Optional[str], description: Optional[str]
+        self,
+        value: Any,
+        param_range: Optional[List[Any]],
+        name: Optional[str],
+        description: Optional[str],
     ):
         return TunableParam(value, param_range, name, description)
 
@@ -115,7 +121,6 @@ class TrtllmFp8BlockLinear(BaseLinear):
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-
         if tensorrt_llm is None:
             logger.error("TensorRT-LLM is not installed")
 
@@ -128,7 +133,9 @@ class TrtllmFp8BlockLinear(BaseLinear):
             input = input.reshape(-1, input.shape[-1])
 
         act_input_fp8, input_scale = torch.ops.trtllm.fp8_quantize_1x128(input)
-        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_input_fp8, weight, input_scale, weight_scale)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(
+            act_input_fp8, weight, input_scale, weight_scale
+        )
 
         if bias is not None:
             if bias.dtype != output.dtype:
@@ -167,8 +174,15 @@ class TrtllmFp8PerTensorLinear(BaseLinear):
         qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(input)
         cur_input_scale = cur_input_scale.to(torch.float32)
         # This op does not support bias now.
-        if qinput.dim() == 3:
+        if qinput.dim() >= 3:
             qinput = qinput.reshape(-1, qinput.shape[-1])
+
+        K = qinput.shape[-1]
+        kp = (K + 15) // 16 * 16
+        qinput = F.pad(qinput, (0, kp - K))
+        weight = F.pad(weight, (0, 0, 0, kp - K))
+        weight = weight.t().contiguous().t()
+        cur_input_scale = cur_input_scale.reshape(-1, cur_input_scale.shape[-1])
 
         output = torch.ops.trtllm.cublas_scaled_mm(
             qinput,
@@ -204,7 +218,6 @@ class TeFp8BlockLinear(BaseLinear):
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-
         # input
         origin_shape = input.shape
         origin_dtype = input.dtype
@@ -218,7 +231,9 @@ class TeFp8BlockLinear(BaseLinear):
             input = input.reshape(-1, input.shape[-1])
         if input.shape[0] % 8 != 0:
             act_input_fp8, input_scale = torch.ops.trtllm.fp8_quantize_1x128(input)
-            output = torch.ops.trtllm.fp8_block_scaling_gemm(act_input_fp8, weight, input_scale, weight_scale)
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                act_input_fp8, weight, input_scale, weight_scale
+            )
             if bias is not None:
                 output = output + bias
         else:
@@ -251,7 +266,9 @@ class TeFp8BlockLinear(BaseLinear):
                 is_2D_scaled=True,
                 quantizer=w_quantizer_cur,
             )
-            output, *_ = ext.general_gemm(A=w_fp8_te, B=x_fp8_te, out_dtype=torch.bfloat16, bias=bias)
+            output, *_ = ext.general_gemm(
+                A=w_fp8_te, B=x_fp8_te, out_dtype=torch.bfloat16, bias=bias
+            )
 
         if output.dim() != len(origin_shape):
             output_shape = list(origin_shape)
@@ -265,7 +282,6 @@ class TeFp8BlockLinear(BaseLinear):
 
 @LinearOpManager.register_linear("te-MXFP8-blockwise-32")
 class TeMXFP8Blockwise32Linear(BaseLinear):
-
     @torch.compiler.disable()
     def run_te_gemm(self, input, weight, bias):
         input_quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3)
@@ -292,7 +308,6 @@ class TeMXFP8Blockwise32Linear(BaseLinear):
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-
         # input
         origin_shape = input.shape
         origin_dtype = input.dtype
@@ -330,7 +345,9 @@ class TeMXFP8Blockwise32Linear(BaseLinear):
 @LinearOpManager.register_linear("te-fp8-per-tensor")
 class TeFp8PerTensorLinear(BaseLinear):
     def __init__(self):
-        self.quantizer_cur = Float8CurrentScalingQuantizer(fp8_dtype=tex.DType.kFloat8E4M3, device="cuda")
+        self.quantizer_cur = Float8CurrentScalingQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3, device="cuda"
+        )
 
     def __call__(
         self,
@@ -359,12 +376,21 @@ class TeFp8PerTensorLinear(BaseLinear):
             fp8_scale_inv=weight_scale.flatten().to(dtype=torch.float32),
         )
         if hasgelu:
-            gelu_in = torch.randn((input.shape[0], weight.shape[1]), dtype=torch.bfloat16, device="cuda")
+            gelu_in = torch.randn(
+                (input.shape[0], weight.shape[1]), dtype=torch.bfloat16, device="cuda"
+            )
             output, *_ = ext.general_gemm(
-                A=w_fp8_te, B=input_fp8_te, out_dtype=torch.bfloat16, bias=bias, gelu=True, gelu_in=gelu_in
+                A=w_fp8_te,
+                B=input_fp8_te,
+                out_dtype=torch.bfloat16,
+                bias=bias,
+                gelu=True,
+                gelu_in=gelu_in,
             )
         else:
-            output, *_ = ext.general_gemm(A=w_fp8_te, B=input_fp8_te, out_dtype=torch.bfloat16, bias=bias)
+            output, *_ = ext.general_gemm(
+                A=w_fp8_te, B=input_fp8_te, out_dtype=torch.bfloat16, bias=bias
+            )
 
         if output.dim() != len(origin_shape):
             output_shape = list(origin_shape)
@@ -380,7 +406,6 @@ class TeFp8PerTensorLinear(BaseLinear):
 @torch.compiler.disable()
 @LinearOpManager.register_linear("svd-nvfp4")
 class SvdNvfp4Linear(BaseLinear):
-
     def __call__(
         self,
         input: torch.Tensor,
@@ -397,7 +422,6 @@ class SvdNvfp4Linear(BaseLinear):
         svd_wcscales=None,
         svd_bias=None,
     ) -> torch.Tensor:
-
         B, M, K = input.shape
         N = svd_qweight.shape[0]
         R = svd_lora_up.shape[1]
@@ -407,7 +431,9 @@ class SvdNvfp4Linear(BaseLinear):
         assert N % 128 == 0, "N must be divisible by 128"
 
         act = torch.empty(B * M, int(K / 2), dtype=torch.int8, device=input.device).contiguous()
-        ascales = torch.empty(int(K / 16), B * M, dtype=torch.float8_e4m3fn, device=input.device).contiguous()
+        ascales = torch.empty(
+            int(K / 16), B * M, dtype=torch.float8_e4m3fn, device=input.device
+        ).contiguous()
         lora_act = torch.empty(B * M, R, dtype=torch.float32, device=input.device).contiguous()
         out = torch.empty(B, M, N, dtype=torch.bfloat16, device=input.device).contiguous()
         lora_scales = [1.0] * (R // 16)
@@ -469,7 +495,6 @@ class TrtllmNVFP4Linear(BaseLinear):
         scaling_vector_size: int = 16,
         input_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-
         if tensorrt_llm is None:
             logger.error("TensorRT-LLM is not installed")
 
@@ -486,7 +511,9 @@ class TrtllmNVFP4Linear(BaseLinear):
 
         alpha = 1 / (input_scale_2 * weight_scale_2)
         if input.dim() == 3:
-            act_fp4, act_sf = torch.ops.trtllm.fp4_batched_quantize(input, input_scale_2, scaling_vector_size, False)
+            act_fp4, act_sf = torch.ops.trtllm.fp4_batched_quantize(
+                input, input_scale_2, scaling_vector_size, False
+            )
             if not self.trtllm_tuned:
                 with torch.inference_mode(), autotune():
                     output = torch.ops.trtllm.fp4_bmm(
@@ -510,7 +537,9 @@ class TrtllmNVFP4Linear(BaseLinear):
                     out_dtype=origin_dtype,
                 )
         else:
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(input, input_scale_2, scaling_vector_size, False)
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                input, input_scale_2, scaling_vector_size, False
+            )
             output = torch.ops.trtllm.nvfp4_gemm(
                 act_fp4, weight, act_sf, weight_scale, alpha, output_dtype=origin_dtype
             )
@@ -538,7 +567,6 @@ class ComfyKitchenNVFP4Linear(BaseLinear):
         scaling_vector_size: int = 16,
         input_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-
         origin_dtype = input.dtype
         if origin_dtype != torch.bfloat16:
             input = input.to(torch.bfloat16)
@@ -560,14 +588,18 @@ class ComfyKitchenNVFP4Linear(BaseLinear):
             batch_size = input.shape[0]
             input = input.reshape(-1, input.shape[-1])
             # currently still reuse trtllm fp4 quantize kernel for better performance
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(input, input_scale_2, scaling_vector_size, False)
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                input, input_scale_2, scaling_vector_size, False
+            )
 
             output = scaled_mm_nvfp4(
                 act_fp4,
                 weight,
                 1 / input_scale_2,
                 1 / weight_scale_2,
-                act_sf.reshape(-1, input.shape[1] // scaling_vector_size).view(torch.float8_e4m3fn).contiguous(),
+                act_sf.reshape(-1, input.shape[1] // scaling_vector_size)
+                .view(torch.float8_e4m3fn)
+                .contiguous(),
                 weight_scale.reshape(-1, weight.shape[1] * 2 // scaling_vector_size)
                 .view(torch.float8_e4m3fn)
                 .contiguous(),
@@ -576,14 +608,18 @@ class ComfyKitchenNVFP4Linear(BaseLinear):
             )
             output = output.reshape(batch_size, -1, output.shape[-1])
         else:
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(input, input_scale_2, scaling_vector_size, False)
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                input, input_scale_2, scaling_vector_size, False
+            )
             output = scaled_mm_nvfp4(
                 act_fp4,
                 weight,
                 1 / input_scale_2,
                 1 / weight_scale_2,
                 act_sf.reshape(-1, input.shape[1] // scaling_vector_size).view(torch.float8_e4m3fn),
-                weight_scale.reshape(-1, weight.shape[1] * 2 // scaling_vector_size).view(torch.float8_e4m3fn),
+                weight_scale.reshape(-1, weight.shape[1] * 2 // scaling_vector_size).view(
+                    torch.float8_e4m3fn
+                ),
                 out_dtype=origin_dtype,
                 bias=bias.to(origin_dtype) if bias is not None else None,
             )
@@ -613,7 +649,9 @@ class TorchAOLinear(BaseLinear):
 
 class FlashInferNVFP4Linear:
     def __init__(self):
-        self.input_scale_2 = torch.tensor([8.0], dtype=torch.float32, device=torch.cuda.current_device())
+        self.input_scale_2 = torch.tensor(
+            [8.0], dtype=torch.float32, device=torch.cuda.current_device()
+        )
 
     def _nvfp4_gemm(
         self,
@@ -644,7 +682,9 @@ class FlashInferNVFP4Linear:
         else:
             # TODO: magic number for static quantization scale, it should be passed by a quantized ckpt
             input_global_sf = self.input_scale_2
-        input_fp4, input_sf = nvfp4_quantize(input, input_global_sf, sfLayout=sfLayout, do_shuffle=do_shuffle)
+        input_fp4, input_sf = nvfp4_quantize(
+            input, input_global_sf, sfLayout=sfLayout, do_shuffle=do_shuffle
+        )
 
         output = mm_fp4(
             input_fp4,
@@ -765,7 +805,6 @@ class FlashInferNVFP4CutlassLinear(BaseLinear, FlashInferNVFP4Linear):
 
 @LinearOpManager.register_linear("deepgemm-MXFP8")
 class DeepgemmFp8Linear(BaseLinear):
-
     def __call__(
         self,
         input: torch.Tensor,
@@ -774,7 +813,6 @@ class DeepgemmFp8Linear(BaseLinear):
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-
         origin_dtype = input.dtype
         if origin_dtype != torch.bfloat16:
             input = input.to(torch.bfloat16)
@@ -790,7 +828,7 @@ class DeepgemmFp8Linear(BaseLinear):
             (input_fp8, input_scale),
             (weight, weight_scale),
             output,
-            None, # bias
+            None,  # bias
             disable_ue8m0_cast=False,
         )
 
