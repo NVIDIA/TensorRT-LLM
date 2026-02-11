@@ -501,9 +501,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
-
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape

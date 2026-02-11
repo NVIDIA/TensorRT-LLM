@@ -591,7 +591,11 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states,
+                            all_reduce_params=all_reduce_params,
+                            allow_window_output=allow_window_output,
+                            lora_params=lora_params,
+                            layer_idx=self.layer_idx)
 
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
