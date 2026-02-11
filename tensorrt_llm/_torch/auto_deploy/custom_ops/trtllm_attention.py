@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,19 +21,26 @@ This module provides a TRT-LLM attention backend that wraps the optimized
 Architecture Overview:
 ---------------------
 TRT-LLM's thop.attention expects:
-- Combined KV cache or separate K/V with specific layout
+- (For this backend) **fused QKV** input: ``qkv_fused`` with shape
+  ``[num_tokens, (num_heads + 2 * num_kv_heads) * head_dim]`` (contiguous),
+  passed with ``is_fused_qkv=True`` and ``update_kv_cache=True``.
+- A paged KV cache view in **HND** layout:
+  ``[num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]``.
 - Many metadata tensors (sequence_length, context_lengths, request_types, etc.)
 - Pool pointers for multi-pool KV cache management
 - Per-layer wrapper state
 
 AD provides:
-- Separate K/V caches per layer: [num_pages, page_size, num_kv_heads, head_dim]
+- Q/K/V in ``bsnd`` layout: ``[batch, seqlen, num_heads, head_dim]``.
+- A paged KV cache managed by ``KVCacheManager`` (we request ``kv_layout="HND"``)
+  and consume it as a combined K+V view:
+  ``[num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]``.
 - Simpler metadata: batch_info, cu_seqlen, cu_num_pages, cache_loc, etc.
 
 This implementation bridges the gap by:
 1. Converting AD's metadata to TRT-LLM's format
-2. Using AD's separate K/V caches with TRT-LLM's paged context FMHA
-3. Managing per-layer state through global state dictionary
+2. Feeding AD's HND paged KV cache view + pool pointers/mapping into thop.attention
+3. Managing per-layer wrapper state via shared + per-layer state objects
 """
 
 from dataclasses import dataclass, field
@@ -117,9 +124,6 @@ class TrtllmKVResourceHandler(KVPagedResourceHandler):
         super().__init__(num_kv_heads, head_dim, dtype=dtype, kv_factor=2, kv_layout="HND")
 
         # Store additional attributes for TRT-LLM attention
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.kv_factor = 2  # Unified K+V cache
         self.layer_idx = layer_idx
         self._trtllm_config = trtllm_config
         self._cache_config = cache_config
