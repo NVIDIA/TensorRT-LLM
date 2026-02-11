@@ -226,6 +226,28 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
+    def _(
+        X: torch.Tensor,
+        input_scale: torch.Tensor,
+        reorder_index: torch.Tensor,
+        KE: int,
+        is_act: bool,
+    ):
+        M = X.size(0)
+        KQ = X.size(1)
+        K = KQ + KE
+
+        # QX shape: [M, K/2]
+        QX = X.new_empty((M, K // 2), dtype=torch.uint8)
+
+        # SFX shape: swizzled layout size for scale factors
+        # isSfSwizzledLayout = True, sf_vec_size = 16
+        SFSize = fp4_utils.pad_up(M, 128) * fp4_utils.pad_up(K // 16, 4)
+        SFX = X.new_empty((SFSize, ), dtype=torch.uint8)
+
+        return QX, SFX
+
     @torch.library.register_fake("trtllm::mxfp8_quantize")
     def _(
         input: torch.Tensor,
