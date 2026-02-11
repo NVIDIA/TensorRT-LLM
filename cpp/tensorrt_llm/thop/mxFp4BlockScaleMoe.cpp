@@ -530,7 +530,8 @@ public:
         std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
         int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
         int64_t routing_method_type, std::vector<int64_t> moeConfigIndex,
-        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+        torch::optional<torch::Tensor> const& output = torch::nullopt)
 
     {
         // moeConfigIndex corresponds to pair (tileN, config)
@@ -555,8 +556,7 @@ public:
             gemm2_weights_scale, gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group,
             topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size, local_expert_offset,
             local_num_experts, routed_scaling_factor, tileN, routing_method_type, mDtypeAct, *mRunners[tileN], config,
-            topk_weights, topk_ids,
-            /*out_tensor=*/torch::nullopt); // TODO: Support user-provided output
+            topk_weights, topk_ids, output);
     }
 
 private:

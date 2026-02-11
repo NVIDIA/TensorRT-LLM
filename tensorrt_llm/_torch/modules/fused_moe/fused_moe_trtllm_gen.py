@@ -476,7 +476,8 @@ class TRTLLMGenFusedMoE(MoE):
         return x, x_sf
 
     def supports_moe_output_in_alltoall_workspace(self):
-        return self.has_w4a8_mxfp4_mxfp8
+        return (self.has_w4a8_mxfp4_mxfp8 or self.has_w4a8_mxfp4_fp8
+                or self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8)
 
     def run_moe(
         self,
@@ -621,7 +622,7 @@ class TRTLLMGenFusedMoE(MoE):
 
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
-            final_hidden_states = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
+            result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 x,
@@ -648,9 +649,13 @@ class TRTLLMGenFusedMoE(MoE):
                 0,  # act_type
                 token_final_scales,
                 token_selected_experts,
+                output=moe_output,
             )
-            final_hidden_states = final_hidden_states[:, :self.
-                                                      hidden_size].contiguous()
+            # When output is provided, use it directly as the result
+            final_hidden_states = moe_output if moe_output is not None else result
+            if moe_output is None:
+                final_hidden_states = final_hidden_states[:, :self.
+                                                          hidden_size].contiguous()
         elif self.has_w4a8_nvfp4_fp8:
 
             outputs = torch.ops.trtllm.fp8_fp4_block_scale_moe_runner(
@@ -677,19 +682,21 @@ class TRTLLMGenFusedMoE(MoE):
                 act_type=0,
                 topk_ids=token_selected_experts,
                 topk_weights=token_final_scales,
+                output=moe_output,
             )
 
             if not do_finalize:
                 assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
                 return outputs
             else:
-                final_hidden_states = outputs[0]
+                # When output is provided, use it directly as the result
+                final_hidden_states = moe_output if moe_output is not None else outputs[0]
         elif self.has_w4a8_mxfp4_fp8:
 
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
 
-            final_hidden_states = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
+            result = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 x,
@@ -719,9 +726,13 @@ class TRTLLMGenFusedMoE(MoE):
                 0,  # act_type
                 token_final_scales,
                 token_selected_experts,
+                output=moe_output,
             )
-            final_hidden_states = final_hidden_states[:, :self.
-                                                      hidden_size].contiguous()
+            # When output is provided, use it directly as the result
+            final_hidden_states = moe_output if moe_output is not None else result
+            if moe_output is None:
+                final_hidden_states = final_hidden_states[:, :self.
+                                                          hidden_size].contiguous()
         elif self.has_w4a8_mxfp4_mxfp8:
 
             mxfp8_x, sf = x, x_sf
@@ -964,8 +975,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         moe_output: Optional[torch.Tensor] = None
         use_workspace_output = False
-        # TODO: use_workspace_output only supports w4a8_mxfp4_mxfp8 (gpt-oss) for now
-        if self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided and self.has_w4a8_mxfp4_mxfp8:
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided and self.supports_moe_output_in_alltoall_workspace():
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
             use_workspace_output = True
