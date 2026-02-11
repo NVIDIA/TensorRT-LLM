@@ -555,8 +555,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         pytest.param("mistralai/Codestral-22B-v0.1", {"world_size": 4},
                      [MMLU, GSM8K],
                      id="mistralai_Codestral-22B-v0.1"),
-        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {"world_size": 4},
-                     [MMLU, GSM8K],
+        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
         pytest.param(
             "Qwen/QwQ-32B",
@@ -588,10 +587,11 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
                                       accuracy_check):
         model_path = hf_id_to_local_model_dir(model_name)
-        yaml_paths, world_size = _get_registry_yaml_extra(model_name)
-        if get_device_count() < world_size:
-            pytest.skip("Not enough devices for world size, skipping test")
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
         merged = deep_merge_dicts(self.BASE_ACCURACY, config_overrides)
+        effective_world_size = merged.get("world_size", registry_world_size)
+        if get_device_count() < effective_world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
         sampling_params = self.get_default_sampling_params()
 
         with AutoDeployLLM(model=model_path,
