@@ -33,7 +33,6 @@ from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
-
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
     VANILLA = 'vanilla'
@@ -155,6 +154,7 @@ def load_weight_shard(
     slice_obj = [slice(d) for d in tensor_shape]
     slice_obj[split_dim] = slice(slice_start, slice_end)
     return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
+
 
 
 def copy_weight(dst: Parameter, src: torch.Tensor):
