@@ -357,9 +357,21 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     )
 
 
+def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
+    return not params.use_beam_search
+
+
 def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
+    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
+    # resolve it on every iteration.
+    if hasattr(request, "py_sampling_strategy"):
+        return request.py_sampling_strategy
+
     params = _request_get_sampling_params(request)
-    return resolve_sampling_strategy(params, vocab_size=vocab_size)
+    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    if _request_sampling_params_cachable(params):
+        request.py_sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    return sampling_strategy
 
 
 def _group_requests_by_strategy_key(
@@ -1971,8 +1983,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         #     Since read-caching is expected to help in typical cases, option (ii) is implemented here.
 
         # Track which logits require logit bias application
-        logits_bias_mask = torch.zeros((logits.size(0),), dtype=torch.bool, pin_memory=True)
-
+        request_steps_list = request_steps.tolist()
+        logits_bias_masks = [False] * logits.size(0)
         _next_bias_index = 0
 
         def provision_bias_index() -> int:
@@ -1992,11 +2004,11 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         # Collect bias information
         req_bias = None
-        for i, (req, steps) in enumerate(zip(requests, request_steps)):
-            steps = int(steps.item())
+        for i, (req, steps) in enumerate(zip(requests, request_steps_list)):
             req_bias = req._py_embedding_bias_1d
             if req_bias is not None:
-                logits_bias_mask[i : (i + steps)] = True
+                for j in range(i, i + steps):
+                    logits_bias_masks[j] = True
                 req_bias_index = bias_to_index[req_bias]
                 bias_gather_indices.extend(repeat(req_bias_index, steps))
 
@@ -2007,7 +2019,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         bias_gather_indices_cuda = torch.tensor(
             bias_gather_indices, pin_memory=True, dtype=torch.int32
         ).to(logits.device, non_blocking=True)
-        logits_bias_mask_cuda = logits_bias_mask.to(logits.device, non_blocking=True)
+        logits_bias_mask_cuda = torch.tensor(
+            logits_bias_masks, pin_memory=True, dtype=torch.bool
+        ).to(logits.device, non_blocking=True)
         biases_tensor = torch.empty((len(bias_to_index), *req_bias.shape), pin_memory=True)
         biases_tensor = torch.stack(
             tuple(bias_to_index.keys()),
@@ -2166,7 +2180,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
             group_strategies_per_step = [  # convert from per-request to per-step
                 strat
-                for strat, steps in zip(group_strategies, req_num_steps[group_req_indices])
+                for strat, steps in zip(group_strategies, req_num_steps[group_req_indices].tolist())
                 for _ in range(steps)
             ]
 
