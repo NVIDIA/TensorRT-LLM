@@ -74,7 +74,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.ctx_need_tp_sync = mapping.tp_size > 1 and (not mapping.enable_attention_dp)
 
         self.gen_need_sync = not (
-            mapping.world_size == 1 or (mapping.enable_attention_dp and mapping.pp_size > 1)
+            mapping.world_size == 1 or (mapping.enable_attention_dp and mapping.pp_size == 1)
         )
         self.gen_sync_allgather_fun = (
             self.dist.pp_allgather if mapping.enable_attention_dp else self.dist.allgather

@@ -594,9 +594,9 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 {
-    // Coalesce contiguous memory regions to reduce registration overhead (enabled by default)
-    // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
-    auto coalescedDescs = common::getEnvNixlDisableCoalesce() ? descs : NixlHelper::coalesceMemoryDescs(descs);
+    // Coalesce contiguous memory regions to reduce registration overhead (disabled by default)
+    // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
+    auto coalescedDescs = common::getEnvNixlEnableCoalesce() ? NixlHelper::coalesceMemoryDescs(descs) : descs;
 
     nixl_status_t status;
     status = mRawAgent->registerMem(NixlHelper::convertRegDlist(coalescedDescs), &mExtraParams);
@@ -609,9 +609,9 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
 {
-    // Coalesce contiguous memory regions to match what was registered (enabled by default)
-    // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
-    auto coalescedDescs = common::getEnvNixlDisableCoalesce() ? descs : NixlHelper::coalesceMemoryDescs(descs);
+    // Coalesce contiguous memory regions to match what was registered (disabled by default)
+    // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
+    auto coalescedDescs = common::getEnvNixlEnableCoalesce() ? NixlHelper::coalesceMemoryDescs(descs) : descs;
 
     nixl_status_t status;
     status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(coalescedDescs), &mExtraParams);
@@ -660,19 +660,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // UCX AM with desc list is faster than listener thread can recv/load MD with sockets
     // Will be deprecated with ETCD or callbacks
 
-    // Coalesce contiguous memory regions to reduce transfer count (enabled by default)
+    // Coalesce contiguous memory regions to reduce transfer count (disabled by default)
     // This matches the coalescing done during registerMemory()
-    // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
-    if (common::getEnvNixlDisableCoalesce())
-    {
-        // do
-        // {
-        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
-            NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
-            request.getRemoteName(), handle, &mExtraParams);
-        // } while (status == NIXL_ERR_NOT_FOUND);
-    }
-    else
+    // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
+    if (common::getEnvNixlEnableCoalesce())
     {
         auto [coalescedSrc, coalescedDst]
             = NixlHelper::coalesceTransferDescs(request.getSrcDescs(), request.getDstDescs());
@@ -681,6 +672,15 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         status
             = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
                 NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &mExtraParams);
+        // } while (status == NIXL_ERR_NOT_FOUND);
+    }
+    else
+    {
+        // do
+        // {
+        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
+            NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
+            request.getRemoteName(), handle, &mExtraParams);
         // } while (status == NIXL_ERR_NOT_FOUND);
     }
 
