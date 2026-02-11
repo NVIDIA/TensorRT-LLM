@@ -1957,7 +1957,7 @@ def _process_mla_sharding(
         # set 3rd arg (num_heads * v_head_dim) to -1
         reshape_args = list(candidate_reshape.args)
         reshape_sizes = list(reshape_args[1])
-        reshape_sizes[2] = reshape_sizes[2] // world_size
+        reshape_sizes[2] = -1
         reshape_args[1] = tuple(reshape_sizes)
         transform_container.add(
             ParameterUpdateInfo(

@@ -225,16 +225,30 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             biases=[],
         )
     elif is_weight_node(node):
-        return WeightNodes(
-            weights=[
+        weights = []
+        biases = []
+        
+        if node.target.endswith("bias"):
+                biases=[
+                    WeightNode(
+                        node=node,
+                        node_key=node.target,
+                        tensor=get_param_or_buffer(node.target, gm),
+                        submod=gm.get_submodule(node.target.rpartition(".")[0]),
+                    )
+                ]
+        else:
+            weights = [
                 WeightNode(
                     node=node,
                     node_key=node.target,
                     tensor=get_param_or_buffer(node.target, gm),
                     submod=gm.get_submodule(node.target.rpartition(".")[0]),
                 )
-            ],
-            biases=[],
+                ]
+        return WeightNodes(
+            weights=weights,
+            biases=biases,
         )
     # for other parametrized nodes, we need to find the weight node
     else:
@@ -437,6 +451,7 @@ def is_any_attention_op(node: Node) -> bool:
 
 
 def is_any_mla_op(node: Node) -> bool:
+    """Check if the node is a mla op."""
     return is_op(
         node,
         ops=[
