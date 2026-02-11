@@ -300,7 +300,7 @@ def get_model_yaml_config(model_label: str,
         # GPT-OSS 120B speculative decoding with Eagle3
         {
             'patterns': [
-                'gpt_oss_120b_eagle3',
+                'gpt_oss_120b_eagle3-bench-pytorch',
             ],
             'config': {
                 'enable_attention_dp': False,
@@ -326,7 +326,7 @@ def get_model_yaml_config(model_label: str,
         # GPT-OSS 120B speculative decoding with Eagle3-throughput (https://nvbugspro.nvidia.com/bug/5832481)
         {
             'patterns': [
-                'gpt_oss_120b_eagle3_throughput',
+                'gpt_oss_120b_eagle3_throughput-bench-pytorch',
             ],
             'config': {
                 'enable_attention_dp': False,
