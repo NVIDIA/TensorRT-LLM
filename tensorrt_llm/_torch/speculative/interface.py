@@ -552,7 +552,6 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         if logits.dtype == torch.float32:
             from ..cute_dsl_kernels.argmax import argmax as cutedsl_argmax
-            print(f"using cutedsl_argmax in _draft_sampler_greedy logits.dtype: {logits.dtype}")
             draft_tokens = cutedsl_argmax(logits)[:, 1].long()
         else:
             draft_tokens = torch.argmax(logits, dim=-1)
@@ -708,7 +707,6 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             if logits.dtype == torch.float32:
                 from ..cute_dsl_kernels.argmax import argmax as cutedsl_argmax
-                print(f"using cutedsl_argmax logits.dtype: {logits.dtype}")
                 sampled_tokens = cutedsl_argmax(logits)[:, 1].long()
             else:
                 sampled_tokens = torch.argmax(logits, dim=-1)
