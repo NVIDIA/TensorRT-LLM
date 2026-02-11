@@ -9,14 +9,13 @@ from typing import List, Optional
 
 import msgpack
 import torch
+
 try:
     from cuda.bindings import runtime as cudart
 except ImportError:
     from cuda import cudart
 
 import tensorrt_llm.bindings
-from tensorrt_llm.runtime.generation import CUASSERT
-
 from tensorrt_llm import Mapping, logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
@@ -47,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.runtime.generation import CUASSERT
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType

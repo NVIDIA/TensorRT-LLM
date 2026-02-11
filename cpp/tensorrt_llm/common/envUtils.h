@@ -143,7 +143,7 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 uint16_t getEnvNixlPort();
 
-bool getEnvNixlDisableCoalesce();
+bool getEnvNixlEnableCoalesce();
 
 bool getEnvDisaggBenchmarkGenOnly();
 
