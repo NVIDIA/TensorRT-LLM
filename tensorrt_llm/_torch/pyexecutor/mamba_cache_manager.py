@@ -593,7 +593,9 @@ class MambaCacheManager(BaseResourceManager):
         return self._impl.get_intermediate_conv_states(layer_idx)
 
     def is_speculative(self) -> bool:
-        assert not self._use_cpp, "is_speculative is not supported in CppMambaCacheManager"
+        if self._use_cpp:
+            # CppMambaCacheManager does not support speculative decoding for now.
+            return False
         return self._impl.is_speculative()
 
     def mamba_layer_cache(
