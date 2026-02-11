@@ -31,6 +31,16 @@ class WorkerExtension:
 
         >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
     """
+    @control_action_decorator
+    def supports_partial_loading(self) -> bool:
+        """Check if the model supports partial weight loading."""
+        try:
+            model = self.engine.model_engine.model
+            load_weights_args = inspect.getfullargspec(model.load_weights).args
+            return "allow_partial_loading" in load_weights_args
+        except Exception as e:
+            logger.warning(f"Failed to check partial loading support: {e}")
+            return False
 
     @control_action_decorator
     def update_weights(self, ipc_handles: Optional[dict] = None):
@@ -110,9 +120,14 @@ class WorkerExtension:
                     weights[param_name] = tensor
 
                 logger.info(f"weights key size: {len(weights.keys())}")
-                self.engine.model_engine.model_loader.reload(
-                    self.engine.model_engine.model, weights, allow_partial_loading=True
-                )
+                model = self.engine.model_engine.model
+                load_weights_args = inspect.getfullargspec(model.load_weights).args
+                supports_partial_loading = "allow_partial_loading" in load_weights_args
+
+                if supports_partial_loading:
+                    self.engine.model_engine.model_loader.reload(model, weights, allow_partial_loading=True)
+                else:
+                    self.engine.model_engine.model_loader.reload(model, weights, allow_partial_loading=False)
             else:
                 logger.info("Finalize update weights")
                 for module in self.engine.model_engine.model.modules():
