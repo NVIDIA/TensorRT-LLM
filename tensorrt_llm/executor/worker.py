@@ -7,7 +7,63 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Union
 
+# Set CUDA_VISIBLE_DEVICES from TRTLLM_VISIBLE_DEVICES before any CUDA imports
+# This is used by multi-instance Triton deployments to assign specific GPUs to each instance
+_trtllm_gpus = os.environ.get('TRTLLM_VISIBLE_DEVICES')
+if _trtllm_gpus:
+    os.environ['CUDA_VISIBLE_DEVICES'] = _trtllm_gpus
+# Debug: print ALL CUDA/NVIDIA env vars to check for overrides
+_cuda_env = {
+    k: v
+    for k, v in os.environ.items() if 'CUDA' in k or 'NVIDIA' in k or 'GPU' in k
+}
+print(
+    f"[worker.py import] pid={os.getpid()}, CUDA/NVIDIA env vars: {_cuda_env}",
+    flush=True)
+
+import subprocess as _sp
+
+# Debug: Check what torch/CUDA actually sees - use before/after memory to identify physical GPU
+import torch
 import zmq
+
+
+def _get_gpu_memory():
+    """Get memory usage per physical GPU from nvidia-smi"""
+    try:
+        out = _sp.check_output([
+            'nvidia-smi', '--query-gpu=index,memory.used',
+            '--format=csv,noheader,nounits'
+        ],
+                               text=True)
+        return {
+            line.split(',')[0].strip(): int(line.split(',')[1].strip())
+            for line in out.strip().split('\n')
+        }
+    except:
+        return {}
+
+
+_device_count = torch.cuda.device_count()
+_device_info = []
+for i in range(_device_count):
+    _before = _get_gpu_memory()
+    torch.cuda.set_device(i)
+    _test = torch.zeros(1024 * 1024, device=f'cuda:{i}')  # 4MB
+    torch.cuda.synchronize()
+    _after = _get_gpu_memory()
+    # Find which physical GPU had memory increase
+    _increased = [gpu for gpu in _after if _after[gpu] > _before.get(gpu, 0)]
+    del _test
+    torch.cuda.empty_cache()
+    _device_info.append(f"logical{i}->physical{_increased}")
+
+print(
+    f"[worker.py GPU info] pid={os.getpid()}, "
+    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}, "
+    f"device_count={_device_count}, "
+    f"mapping=[{', '.join(_device_info)}]",
+    flush=True)
 
 from tensorrt_llm.logger import logger
 

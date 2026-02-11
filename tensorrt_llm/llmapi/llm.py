@@ -144,6 +144,7 @@ class BaseLLM:
 
         try:
             env_overrides = kwargs.get("env_overrides", None)
+            self._env_overrides = env_overrides  # Store for passing to MpiPoolSession
             self._process_env_overrides(env_overrides)
 
             backend = kwargs.get('backend', None)
@@ -214,9 +215,15 @@ class BaseLLM:
                     mpi_process_pre_spawned: bool = get_spawn_proxy_process_env(
                     )
                     if not mpi_process_pre_spawned:
+                        # Debug: Log env_overrides being passed to MpiPoolSession
+                        print(
+                            f"[llm.py] Creating MpiPoolSession: pid={os.getpid()}, "
+                            f"env_overrides={self._env_overrides}",
+                            flush=True)
                         logger_debug(f"LLM create MpiPoolSession\n", "yellow")
                         self.mpi_session = MpiPoolSession(
-                            n_workers=self.args.parallel_config.world_size)
+                            n_workers=self.args.parallel_config.world_size,
+                            env=self._env_overrides)
                     else:
                         logger_debug(f"LLM create MpiCommSession\n", "yellow")
                         self.mpi_session = create_mpi_comm_session(

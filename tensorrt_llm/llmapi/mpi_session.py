@@ -135,9 +135,10 @@ class MpiSession(abc.ABC):
 
 class MpiPoolSession(MpiSession):
 
-    def __init__(self, n_workers: int):
+    def __init__(self, n_workers: int, env: Optional[Dict[str, str]] = None):
         self.n_workers = n_workers
         self.mpi_pool: Optional[MPIPoolExecutor] = None
+        self._env = env
         self._start_mpi_pool()
         if ENABLE_MULTI_DEVICE:
             self.comm = mpi4py.MPI.COMM_WORLD
@@ -153,10 +154,9 @@ class MpiPoolSession(MpiSession):
         ]
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
-        futures = [
-            self.mpi_pool.submit(task, *args, **kwargs)
-            for i in range(self.n_workers)
-        ]
+        futures = []
+        for i in range(self.n_workers):
+            futures.append(self.mpi_pool.submit(task, *args, **kwargs))
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
@@ -170,11 +170,17 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
+        # Pass TRTLLM/TLLM env vars plus CUDA_VISIBLE_DEVICES for GPU assignment
+        # CUDA_VISIBLE_DEVICES must be in the env dict (not just set in worker code)
+        # because it needs to be set before Python/CUDA initialization
         env = {
             key: value
-            for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM")
+            for key, value in os.environ.items() if key.startswith("TRTLLM")
+            or key.startswith("TLLM") or key == "CUDA_VISIBLE_DEVICES"
         }
+        # Also set CUDA_VISIBLE_DEVICES from TRTLLM_VISIBLE_DEVICES if present
+        if "TRTLLM_VISIBLE_DEVICES" in env and "CUDA_VISIBLE_DEVICES" not in env:
+            env["CUDA_VISIBLE_DEVICES"] = env["TRTLLM_VISIBLE_DEVICES"]
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env)
