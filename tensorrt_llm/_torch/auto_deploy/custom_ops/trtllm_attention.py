@@ -54,6 +54,7 @@ from torch.fx import Node
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.quantization import QuantMode
 
 from ....llmapi.llm_args import KvCacheConfig
 from ..utils.cuda_graph import cuda_graph_state
@@ -245,7 +246,11 @@ class TrtllmAttentionGlobalState:
         return cls._instance
 
     def _init_shared_tensors(
-        self, max_num_requests: int, max_context_length: int, tokens_per_block: int
+        self,
+        max_num_requests: int,
+        max_context_length: int,
+        tokens_per_block: int,
+        max_num_layers: int,
     ) -> bool:
         """Initialize shared tensors used by all layers.
 
@@ -256,6 +261,7 @@ class TrtllmAttentionGlobalState:
         """
         device = "cuda"
         max_blocks_per_seq = (max_context_length + tokens_per_block - 1) // tokens_per_block
+        max_num_layers = max(1, int(max_num_layers))
 
         # Check if reallocation is needed (current size < requested size)
         needs_realloc = (
@@ -264,6 +270,7 @@ class TrtllmAttentionGlobalState:
             and (
                 self._shared_sequence_length.shape[0] < max_num_requests
                 or self._shared_kv_cache_block_offsets.shape[3] < max_blocks_per_seq
+                or self._shared_host_kv_cache_pool_mapping.shape[0] < max_num_layers
             )
         )
 
@@ -299,7 +306,7 @@ class TrtllmAttentionGlobalState:
         )
         # Pool mapping: [num_layers, 2] - layer to pool mapping
         self._shared_host_kv_cache_pool_mapping = torch.zeros(
-            64, 2, dtype=torch.int32, device="cpu", pin_memory=True
+            max_num_layers, 2, dtype=torch.int32, device="cpu", pin_memory=True
         )
 
         self._shared_tensors_initialized = True
@@ -410,7 +417,7 @@ class TrtllmAttentionGlobalState:
     ) -> TrtllmLayerState:
         """Get or create per-layer state."""
         did_realloc = self._init_shared_tensors(
-            max_num_requests, max_context_length, tokens_per_block
+            max_num_requests, max_context_length, tokens_per_block, num_layers
         )
 
         if did_realloc:
@@ -488,13 +495,20 @@ class TrtllmAttentionGlobalState:
             if first_state.sequence_length is None:
                 return
 
-            # Prefer pool_num_layers (most accurate for hybrid models)
+            # Determine num_layers (required for block offset computation).
+            # Prefer pool_num_layers (most accurate for hybrid models), then per-layer
+            # state, then KV cache pool mapping.
             if global_state._pool_num_layers > 0:
                 num_layers = global_state._pool_num_layers
             elif first_state.num_layers > 0:
                 num_layers = first_state.num_layers
+            elif _trtllm_config._kv_cache_pool_mapping is not None:
+                num_layers = int(_trtllm_config._kv_cache_pool_mapping.shape[0])
             else:
-                num_layers = 32
+                raise RuntimeError(
+                    "TRT-LLM attention host_prepare could not determine num_layers. "
+                    "Expected KV cache pool mapping or a populated per-layer state."
+                )
 
             # Initialize buffers once (lazy initialization)
             if not global_state._cpu_buffers_initialized:
@@ -619,18 +633,6 @@ class TrtllmAttentionGlobalState:
 
         return _host_prepare_trtllm_metadata
 
-    def reset(self) -> None:
-        """Reset all state (useful for testing)."""
-        self._layer_states.clear()
-        self._workspace = None
-        self._max_blocks_per_seq = 0
-        self._host_prepare_called = False
-        self._current_num_seq = 0
-        self._cpu_buffers_initialized = False
-        self._gpu_buffers_initialized = False
-        self._pool_pointers_initialized = False
-        self._pool_num_layers = 0
-
 
 # Global state singleton
 _global_state = TrtllmAttentionGlobalState()
@@ -670,7 +672,7 @@ def _prepare_trtllm_metadata(
     # Check if shared tensors need reallocation (batch size > allocated size)
     if state.sequence_length is not None and state.sequence_length.shape[0] < num_seq:
         did_realloc = _global_state._init_shared_tensors(
-            num_seq, state.max_context_length, state.tokens_per_block
+            num_seq, state.max_context_length, state.tokens_per_block, state.num_layers
         )
         if did_realloc:
             state.init_from_shared(_global_state)
@@ -703,8 +705,9 @@ def _prepare_trtllm_metadata(
 
         # Update pool pointers if not yet initialized
         if ad_pool_pointers is not None and ad_pool_mapping is not None:
-            num_layers = state.num_layers if state.num_layers > 0 else 32
-            _global_state._update_pool_pointers(ad_pool_pointers, ad_pool_mapping, num_layers)
+            _global_state._update_pool_pointers(
+                ad_pool_pointers, ad_pool_mapping, int(ad_pool_mapping.shape[0])
+            )
 
         max_blocks_per_seq = state.kv_cache_block_offsets.shape[3]
         return (
@@ -746,8 +749,13 @@ def _prepare_trtllm_metadata(
             )
     elif state.num_layers > 0:
         num_layers = state.num_layers
+    elif _trtllm_config._kv_cache_pool_mapping is not None:
+        num_layers = int(_trtllm_config._kv_cache_pool_mapping.shape[0])
     else:
-        num_layers = 32
+        raise RuntimeError(
+            "TRT-LLM attention could not determine num_layers while preparing metadata. "
+            "Expected KV cache pool mapping or a populated per-layer state."
+        )
 
     # Compute input sequence lengths from cumulative sums
     input_seq_lens = (cu_seqlen_host[1 : num_seq + 1] - cu_seqlen_host[:num_seq]).int()
@@ -780,7 +788,10 @@ def _prepare_trtllm_metadata(
             f"Reallocating block offsets: need {max_blocks} blocks but have {block_offsets_shape[3]}."
         )
         did_realloc = _global_state._init_shared_tensors(
-            num_seq, max_blocks * state.tokens_per_block, state.tokens_per_block
+            num_seq,
+            max_blocks * state.tokens_per_block,
+            state.tokens_per_block,
+            state.num_layers,
         )
         if did_realloc:
             state.init_from_shared(_global_state)
@@ -884,17 +895,8 @@ def trtllm_mha_with_cache(
         f"got shape {kv_cache.shape}. Ensure TrtllmKVResourceHandler is used."
     )
 
-    # Lazy initialization of model config (done once on first attention call)
-    if _trtllm_config._num_layers == 0:
-        TrtllmAttention._track_layer_config(num_kv_heads, head_dim, kv_cache.dtype)
-        expected_num_layers = len(TrtllmAttention._num_kv_heads_per_layer)
-        if layer_idx == expected_num_layers - 1 or expected_num_layers >= 32:
-            _trtllm_config.set_model_config(
-                num_layers=expected_num_layers,
-                num_kv_heads_per_layer=TrtllmAttention._num_kv_heads_per_layer,
-                head_dim=head_dim,
-                dtype=kv_cache.dtype,
-            )
+    # Note: model config (num_layers / per-layer KV heads) is finalized via the
+    # KV cache pool mapping during metadata preparation.
 
     # Get batch dimensions
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
@@ -1182,15 +1184,27 @@ class TrtllmAttentionConfig:
         self._head_dim = head_dim
         self._dtype = dtype
 
-        # Initialize FP8 KV cache support if dtype is FP8
+        # KV-cache quantization mode + scales for thop.attention.
+        #
+        # Note: this backend currently supports:
+        # - Unquantized KV cache (BF16/FP16/FP32): quant_mode=0
+        # - FP8 KV cache (E4M3FN): QuantMode.FP8_KV_CACHE with unit scales
+        #
+        # INT8/NVFP4 KV cache modes require additional handling and are not yet supported.
         if dtype == torch.float8_e4m3fn:
-            self._quant_mode = 128
+            self._quant_mode = QuantMode.FP8_KV_CACHE
             self._kv_scale_orig_quant = torch.ones(1, dtype=torch.float32, device="cuda")
             self._kv_scale_quant_orig = torch.ones(1, dtype=torch.float32, device="cuda")
-        else:
-            self._quant_mode = 0
+        elif dtype in (torch.float16, torch.bfloat16, torch.float32):
+            self._quant_mode = QuantMode(0)
             self._kv_scale_orig_quant = None
             self._kv_scale_quant_orig = None
+        else:
+            raise NotImplementedError(
+                "TRT-LLM attention backend does not support KV cache dtype "
+                f"{dtype!r}. Supported: fp16/bf16/fp32 (unquantized) and "
+                f"{torch.float8_e4m3fn!r} (FP8 KV cache)."
+            )
 
 
 # Global config singleton
@@ -1215,16 +1229,6 @@ class TrtllmAttention(AttentionDescriptor):
         idx = cls._layer_counter
         cls._layer_counter += 1
         return idx
-
-    @classmethod
-    def _reset_layer_counter(cls) -> None:
-        """Reset layer counter (for testing or new model builds)."""
-        cls._layer_counter = 0
-        cls._num_kv_heads_per_layer = []
-        cls._head_dim = 0
-        cls._dtype = torch.float16
-        _global_state.reset()
-        _trtllm_config.reset()
 
     @classmethod
     def _track_layer_config(cls, num_kv_heads: int, head_dim: int, dtype: torch.dtype) -> None:
@@ -1381,8 +1385,3 @@ class TrtllmAttention(AttentionDescriptor):
 # =============================================================================
 # Public API Functions
 # =============================================================================
-
-
-def reset_trtllm_attention_state() -> None:
-    """Reset all TRT-LLM attention state."""
-    TrtllmAttention._reset_layer_counter()
