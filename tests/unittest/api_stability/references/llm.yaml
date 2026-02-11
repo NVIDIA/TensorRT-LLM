@@ -283,6 +283,19 @@ methods:
         default: null
         status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+  preprocess:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]
+        default: inspect._empty
+      sampling_params:
+        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
+        default: null
+      disaggregated_params:
+        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+        default: null
+    return_annotation: tensorrt_llm.llmapi.llm.PreprocessedInputs
+    status: prototype
   get_kv_cache_events:
     parameters:
       timeout:

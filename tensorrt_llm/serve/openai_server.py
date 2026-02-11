@@ -687,8 +687,15 @@ class OpenAIServer:
 
             trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
+            generate_inputs = prompt
+            preprocess_fn = getattr(self.generator, "preprocess", None)
+            if preprocess_fn is not None:
+                generate_inputs = await asyncio.to_thread(
+                    preprocess_fn, prompt, sampling_params,
+                    disaggregated_params)
+
             promise = self.generator.generate_async(
-                inputs=prompt,
+                inputs=generate_inputs,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
