@@ -44,7 +44,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     int64_t const intermediate_size, int64_t const local_expert_offset, int64_t const local_num_experts,
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     MoeRunnerType& moe_runner, int64_t moeConfigIndex, std::optional<at::Tensor> const& topk_weights,
-    std::optional<at::Tensor> const& topk_ids)
+    std::optional<at::Tensor> const& topk_ids, std::optional<at::Tensor> const& out_tensor = std::nullopt)
 {
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP8 block scale MOE");
 
@@ -272,9 +272,22 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     TORCH_CHECK(gemm2_weights_scale.sizes()[1] == args.hidden_size / 128, "gemm2_weights_scale has incorrect shape.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[2] == intermediate_size / 128, "gemm2_weights_scale has incorrect shape.");
 
-    // allocate output
-    at::Tensor output = at::detail::empty_cuda(
-        {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    // allocate or use provided output
+    at::Tensor output;
+    if (out_tensor.has_value())
+    {
+        TORCH_CHECK(out_tensor->scalar_type() == at::ScalarType::BFloat16, "out_tensor must be bfloat16.");
+        TORCH_CHECK(out_tensor->dim() == 2, "out_tensor must be 2D.");
+        TORCH_CHECK(out_tensor->sizes()[0] == args.num_tokens && out_tensor->sizes()[1] == args.hidden_size,
+            "out_tensor has incorrect shape.");
+        TORCH_CHECK(out_tensor->device() == hidden_states.device(), "out_tensor must be on the same device as inputs.");
+        output = out_tensor.value();
+    }
+    else
+    {
+        output = at::detail::empty_cuda(
+            {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    }
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
@@ -361,7 +374,7 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t routing_method_type,
         std::vector<int64_t> tile_config_pair, std::optional<at::Tensor> const& topk_weights,
-        std::optional<at::Tensor> const& topk_ids)
+        std::optional<at::Tensor> const& topk_ids, std::optional<at::Tensor> const& output = std::nullopt)
     {
         // tile_config_pair corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(tile_config_pair[0], tile_config_pair[1]);
@@ -382,7 +395,7 @@ public:
         return run_fp8_block_scale_moe(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
             gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, n_group, topk_group,
             intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
-            routing_method_type, *mRunners.at(tileN), config, topk_weights, topk_ids);
+            routing_method_type, *mRunners.at(tileN), config, topk_weights, topk_ids, output);
     }
 
 private:
