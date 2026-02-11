@@ -28,7 +28,7 @@ from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
 from ....modules.fla.chunk import chunk_gated_delta_rule
-from ....modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
+from ....modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update_fwd
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
@@ -41,7 +41,7 @@ from ..attention_interface import (
 )
 
 
-@torch.library.custom_op("auto_deploy::fla_cached_gated_delta_rule", mutates_args=())
+@torch.library.custom_op("auto_deploy::fla_cached_gated_delta_rule", mutates_args=("delta_cache",))
 def fla_cached_gated_delta_rule(
     # INPUTS (dense but may be flattened across sequences)
     q: torch.Tensor,
@@ -109,23 +109,20 @@ def fla_cached_gated_delta_rule(
         del y_prefill, initial_states, final_state
 
     if num_decode > 0:
-        # NOTE: avoiding state clone here and adopting the kernel to handle
-        # indexed initial states would give a boost
-        y_decode, final_state = fused_recurrent_gated_delta_rule_fwd(
+        y_decode = fused_recurrent_gated_delta_rule_update_fwd(
             q=q_flat[num_prefill_tokens:, None],
             k=k_flat[num_prefill_tokens:, None],
             v=v_flat[num_prefill_tokens:, None],
             g=g_flat[num_prefill_tokens:, None],
             beta=beta_flat[num_prefill_tokens:, None],
             scale=scale,
-            initial_state=delta_cache[slot_idx[num_prefill:]].clone(),
-            output_final_state=True,
+            initial_state_source=delta_cache,
+            initial_state_indices=slot_idx[num_prefill:],
         )
 
         y_flat[num_prefill_tokens:, None] = y_decode.to(y_flat.dtype)
-        delta_cache.index_copy_(0, slot_idx[num_prefill:], final_state.to(delta_cache.dtype))
 
-        del y_decode, final_state
+        del y_decode
 
     return y
 
