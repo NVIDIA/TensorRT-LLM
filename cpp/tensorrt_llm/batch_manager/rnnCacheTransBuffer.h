@@ -35,7 +35,7 @@ class RnnCacheTransBufferManager : public BaseTransBufferManager
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    // using RnnCacheState = executor::rnn_cache::RnnCacheState;
+    using CacheState = executor::kv_cache::CacheState;
 
     /// @brief Constructor.
     /// @param rnnStateManager Pointer to the RNN state manager.

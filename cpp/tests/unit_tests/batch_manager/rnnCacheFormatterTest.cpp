@@ -19,24 +19,21 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 class RnnTargetIRanksTest : public ::testing::Test
 {
 protected:
-    // Helper to create RnnCacheState
-    static texec::rnn_cache::RnnCacheState makeRnnCacheState(
+    // Helper to create CacheState with RNN config
+    static texec::kv_cache::CacheState makeRnnCacheState(
         SizeType32 numLayers, SizeType32 tp, SizeType32 pp, std::vector<SizeType32> const& layersPerPP)
     {
-        // Model config (use consistent values)
-        SizeType32 dState = 16;
-        SizeType32 dConv = 4;
-        SizeType32 hiddenSize = 256;
-        SizeType32 headDim = 64;
-        SizeType32 convDimSize = 128;
-        SizeType32 nGroups = 1;
-        SizeType32 numHeads = 4;
-        auto convDtype = nvinfer1::DataType::kFLOAT;
-        auto ssmDtype = nvinfer1::DataType::kFLOAT;
+        // Create a CacheState with dummy KV fields and proper RNN config
+        std::vector<SizeType32> kvLayersPerPP(pp, 0); // No attention layers
+        auto state = texec::kv_cache::CacheState(
+            /*nbAttentionLayers=*/0, /*nbKvHeads=*/1, /*sizePerHead=*/64, /*tokensPerBlock=*/32, tp, pp,
+            /*contextParallelism=*/1, kvLayersPerPP, nvinfer1::DataType::kFLOAT);
 
-        return texec::rnn_cache::RnnCacheState(dState, dConv, hiddenSize, headDim, convDimSize, nGroups, numLayers,
-            numHeads, tp, pp, /*enableAttentionDP=*/false, /*DPrank=*/0, /*DPsize=*/1, layersPerPP, convDtype,
-            ssmDtype);
+        texec::kv_cache::CacheState::RnnModelConfig rnnModelConfig{/*mDState=*/16, /*mDConv=*/4, /*mHiddenSize=*/256,
+            /*mHeadDim=*/64,
+            /*mConvDimSize=*/128, /*mNGroups=*/1, /*mNumLayers=*/numLayers, /*mNumHeads=*/4};
+        state.setRnnConfig(rnnModelConfig, layersPerPP, nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kFLOAT);
+        return state;
     }
 };
 
@@ -52,21 +49,21 @@ TEST_F(RnnTargetIRanksTest, SamePPSameTP)
     auto genState = makeRnnCacheState(numLayers, tp, pp, layersPerPP);
 
     // Rank 0: PP=0, TP=0 -> should communicate with gen rank 0
-    auto result0 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 0);
+    auto result0 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 0);
     EXPECT_EQ(result0.mIRanks, std::vector<int>({0}));
     EXPECT_EQ(result0.mDomainPPSize, 1);
     EXPECT_EQ(result0.mDomainTPSize, 1);
 
     // Rank 1: PP=0, TP=1 -> should communicate with gen rank 1
-    auto result1 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 1);
+    auto result1 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 1);
     EXPECT_EQ(result1.mIRanks, std::vector<int>({1}));
 
     // Rank 2: PP=1, TP=0 -> should communicate with gen rank 2
-    auto result2 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 2);
+    auto result2 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 2);
     EXPECT_EQ(result2.mIRanks, std::vector<int>({2}));
 
     // Rank 3: PP=1, TP=1 -> should communicate with gen rank 3
-    auto result3 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 3);
+    auto result3 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 3);
     EXPECT_EQ(result3.mIRanks, std::vector<int>({3}));
 }
 
@@ -87,7 +84,7 @@ TEST_F(RnnTargetIRanksTest, ContextPP1GenPP2)
     // Context rank 0 (PP=0, TP=0, has layers 0-7) needs data from:
     //   Gen PP=0 (layers 0-3) at TP=0 -> rank 0
     //   Gen PP=1 (layers 4-7) at TP=0 -> rank 2
-    auto result0 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 0);
+    auto result0 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 0);
     EXPECT_EQ(result0.mIRanks, (std::vector<int>{0, 2}));
     EXPECT_EQ(result0.mDomainPPSize, 2);
     EXPECT_EQ(result0.mPeerLayerNumInDomainPP, (std::vector<int>{4, 4}));
@@ -95,7 +92,7 @@ TEST_F(RnnTargetIRanksTest, ContextPP1GenPP2)
     // Context rank 1 (PP=0, TP=1, has layers 0-7) needs:
     //   Gen PP=0 at TP=1 -> rank 1
     //   Gen PP=1 at TP=1 -> rank 3
-    auto result1 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 1);
+    auto result1 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 1);
     EXPECT_EQ(result1.mIRanks, (std::vector<int>{1, 3}));
     EXPECT_EQ(result1.mDomainPPSize, 2);
 }
@@ -116,13 +113,13 @@ TEST_F(RnnTargetIRanksTest, ContextPP2GenPP1)
 
     // Context rank 0 (PP=0, TP=0, has layers 0-3) needs:
     //   Gen PP=0 (layers 0-7) at TP=0 -> rank 0 (but only 4 layers overlap)
-    auto result0 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 0);
+    auto result0 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 0);
     EXPECT_EQ(result0.mIRanks, std::vector<int>({0}));
     EXPECT_EQ(result0.mDomainPPSize, 1);
     EXPECT_EQ(result0.mPeerLayerNumInDomainPP, std::vector<int>({4}));
 
     // Context rank 2 (PP=1, TP=0, has layers 4-7) also needs gen rank 0
-    auto result2 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 2);
+    auto result2 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 2);
     EXPECT_EQ(result2.mIRanks, std::vector<int>({0}));
     EXPECT_EQ(result2.mPeerLayerNumInDomainPP, std::vector<int>({4}));
 }
@@ -157,7 +154,7 @@ TEST_F(RnnTargetIRanksTest, NonUniformLayers)
     //   Gen PP=0 (layers 0-3)  at TP=0 -> rank 0  (4 layers overlap)
     //   Gen PP=1 (layers 4-7)  at TP=0 -> rank 4  (4 layers overlap)
     //   Gen PP=2 (layers 8-11) at TP=0 -> rank 8  (2 layers overlap: 8-9)
-    auto result0 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 0);
+    auto result0 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 0);
     EXPECT_EQ(result0.mIRanks, (std::vector<int>{0, 4, 8}));
     EXPECT_EQ(result0.mDomainPPSize, 3);
     EXPECT_EQ(result0.mPeerLayerNumInDomainPP, (std::vector<int>{4, 4, 2}));
@@ -166,14 +163,14 @@ TEST_F(RnnTargetIRanksTest, NonUniformLayers)
     //   Gen PP=0 at TP=1 -> rank 1
     //   Gen PP=1 at TP=1 -> rank 5
     //   Gen PP=2 at TP=1 -> rank 9
-    auto result1 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 1);
+    auto result1 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 1);
     EXPECT_EQ(result1.mIRanks, (std::vector<int>{1, 5, 9}));
     EXPECT_EQ(result1.mDomainPPSize, 3);
 
     // Context rank 4 (PP=1, TP=0, has layers 10-15) needs:
     //   Gen PP=2 (layers 8-11)  at TP=0 -> rank 8  (2 layers overlap: 10-11)
     //   Gen PP=3 (layers 12-15) at TP=0 -> rank 12 (4 layers overlap)
-    auto result4 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 4);
+    auto result4 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 4);
     EXPECT_EQ(result4.mIRanks, (std::vector<int>{8, 12}));
     EXPECT_EQ(result4.mDomainPPSize, 2);
     EXPECT_EQ(result4.mPeerLayerNumInDomainPP, (std::vector<int>{2, 4}));
@@ -181,7 +178,7 @@ TEST_F(RnnTargetIRanksTest, NonUniformLayers)
     // Context rank 7 (PP=1, TP=3, has layers 10-15) needs:
     //   Gen PP=2 at TP=3 -> rank 11
     //   Gen PP=3 at TP=3 -> rank 15
-    auto result7 = tensorrt_llm::executor::kv_cache::targetIRanks(genState, contextState, 7);
+    auto result7 = tensorrt_llm::executor::kv_cache::targetIRanksForRnn(genState, contextState, 7);
     EXPECT_EQ(result7.mIRanks, (std::vector<int>{11, 15}));
     EXPECT_EQ(result7.mDomainPPSize, 2);
 }
@@ -224,23 +221,15 @@ protected:
             /*enableAttentionDP=*/false, /*DPrank=*/0, /*DPsize=*/1);
     }
 
-    // Helper to create RnnCacheState (same as in RnnTargetIRanksTest)
-    static texec::rnn_cache::RnnCacheState makeRnnCacheState(
-        SizeType32 numLayers, SizeType32 tp, SizeType32 pp, std::vector<SizeType32> const& layersPerPP)
+    // Helper to create a hybrid CacheState with both KV and RNN config
+    static texec::kv_cache::CacheState makeHybridState(SizeType32 kvNumLayers, SizeType32 rnnNumLayers, SizeType32 tp,
+        SizeType32 pp, std::vector<SizeType32> const& kvLayersPerPP, std::vector<SizeType32> const& rnnLayersPerPP,
+        SizeType32 numHeads = 8, SizeType32 sizePerHead = 64, SizeType32 tokensPerBlock = 32)
     {
-        SizeType32 dState = 16;
-        SizeType32 dConv = 4;
-        SizeType32 hiddenSize = 256;
-        SizeType32 headDim = 64;
-        SizeType32 convDimSize = 128;
-        SizeType32 nGroups = 1;
-        SizeType32 numHeads = 4;
-        auto convDtype = nvinfer1::DataType::kFLOAT;
-        auto ssmDtype = nvinfer1::DataType::kFLOAT;
-
-        return texec::rnn_cache::RnnCacheState(dState, dConv, hiddenSize, headDim, convDimSize, nGroups, numLayers,
-            numHeads, tp, pp, /*enableAttentionDP=*/false, /*DPrank=*/0, /*DPsize=*/1, layersPerPP, convDtype,
-            ssmDtype);
+        auto state = makeKvCacheState(kvNumLayers, tp, pp, kvLayersPerPP, numHeads, sizePerHead, tokensPerBlock);
+        texec::kv_cache::CacheState::RnnModelConfig rnnModelConfig{16, 4, 256, 64, 128, 1, rnnNumLayers, 4};
+        state.setRnnConfig(rnnModelConfig, rnnLayersPerPP, nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kFLOAT);
+        return state;
     }
 
     // Helper to compute merged counterparts (union of KV and RNN)
@@ -278,13 +267,9 @@ TEST_F(HybridModelCounterpartsTest, DifferentPPDistributionKvRnn)
 
     SizeType32 const tp = 2;
 
-    // KV states
-    auto contextKvState = makeKvCacheState(/*numLayers=*/10, tp, /*pp=*/1, {10});
-    auto genKvState = makeKvCacheState(/*numLayers=*/10, tp, /*pp=*/2, {5, 5});
-
-    // RNN states
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/6, tp, /*pp=*/1, {6});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/6, tp, /*pp=*/2, {3, 3});
+    // Unified states with both KV and RNN config
+    auto contextState = makeHybridState(/*kvNumLayers=*/10, /*rnnNumLayers=*/6, tp, /*pp=*/1, {10}, {6});
+    auto genState = makeHybridState(/*kvNumLayers=*/10, /*rnnNumLayers=*/6, tp, /*pp=*/2, {5, 5}, {3, 3});
 
     // Use dummy formatter pointers (we only need them to call getCounterparts)
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
@@ -304,8 +289,8 @@ TEST_F(HybridModelCounterpartsTest, DifferentPPDistributionKvRnn)
 
     SizeType32 contextRank0 = 0;
 
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
 
     // Both should need the same ranks (0, 2) in this symmetric case
     // Note: targetIRanks returns std::vector<int>, getCounterparts returns std::vector<SizeType32>
@@ -315,8 +300,9 @@ TEST_F(HybridModelCounterpartsTest, DifferentPPDistributionKvRnn)
     auto mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{0, 2}));
 
+    auto rnnTargetInfo = texec::kv_cache::targetIRanksForRnn(genState, contextState, contextRank0);
     auto [rnnPickUp, rnnLocalRankIndices] = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
-        mergedCounterParts.size(), contextRnnState, contextRank0, genRnnState, mergedCounterParts);
+        mergedCounterParts.size(), contextState, contextRank0, genState, mergedCounterParts, rnnTargetInfo);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
     EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 }
@@ -347,13 +333,9 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
 
     SizeType32 const tp = 2;
 
-    // KV states (all 4 PP stages have attention layers)
-    auto contextKvState = makeKvCacheState(/*numLayers=*/8, tp, /*pp=*/1, {8});
-    auto genKvState = makeKvCacheState(/*numLayers=*/8, tp, /*pp=*/4, {2, 2, 2, 2});
-
-    // RNN states (only first 2 PP stages have RNN layers)
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/4, tp, /*pp=*/1, {4});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/4, tp, /*pp=*/4, {2, 2, 0, 0});
+    // Unified states with both KV and RNN config
+    auto contextState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/4, tp, /*pp=*/1, {8}, {4});
+    auto genState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/4, tp, /*pp=*/4, {2, 2, 2, 2}, {2, 2, 0, 0});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -366,21 +348,22 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     //   Gen PP1 (layers 2-3) at TP=0 -> rank 2
     //   Gen PP2 (layers 4-5) at TP=0 -> rank 4
     //   Gen PP3 (layers 6-7) at TP=0 -> rank 6
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
     EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2, 4, 6}));
 
     // RNN: Needs 4 layers from Gen (only PP0 and PP1 have RNN layers)
     //   Gen PP0 (layers 0-1) at TP=0 -> rank 0
     //   Gen PP1 (layers 2-3) at TP=0 -> rank 2
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 2}));
 
     // Merged counterparts: union of {0,2,4,6} and {0,2} = {0,2,4,6}
     auto mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{0, 2, 4, 6}));
 
+    auto rnnTargetInfo = texec::kv_cache::targetIRanksForRnn(genState, contextState, contextRank0);
     auto [rnnPickUp, rnnLocalRankIndices] = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
-        mergedCounterParts.size(), contextRnnState, contextRank0, genRnnState, mergedCounterParts);
+        mergedCounterParts.size(), contextState, contextRank0, genState, mergedCounterParts, rnnTargetInfo);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
     EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 
@@ -392,20 +375,21 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricKvRnnDistribution)
     //   Gen PP1 at TP=1 -> rank 3
     //   Gen PP2 at TP=1 -> rank 5
     //   Gen PP3 at TP=1 -> rank 7
-    kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank1).mIRanks;
+    kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank1).mIRanks;
     EXPECT_EQ(kvCounterParts, (std::vector<int>{1, 3, 5, 7}));
 
     // RNN:
     //   Gen PP0 at TP=1 -> rank 1
     //   Gen PP1 at TP=1 -> rank 3
-    rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank1, genRnnState);
+    rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank1, genState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{1, 3}));
 
     mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{1, 3, 5, 7}));
 
+    rnnTargetInfo = texec::kv_cache::targetIRanksForRnn(genState, contextState, contextRank1);
     std::tie(rnnPickUp, rnnLocalRankIndices) = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
-        mergedCounterParts.size(), contextRnnState, contextRank1, genRnnState, mergedCounterParts);
+        mergedCounterParts.size(), contextState, contextRank1, genState, mergedCounterParts, rnnTargetInfo);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
     EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 }
@@ -430,13 +414,11 @@ TEST_F(HybridModelCounterpartsTest, DisjointKvRnnCounterparts)
     // Context rank 0 (PP=0, TP=0) only has KV layers
     // Context rank 2 (PP=1, TP=0) only has RNN layers
 
-    // KV layers on Context PP=0, Gen has PP={0,1} for KV
-    auto contextKvState = makeKvCacheState(/*numLayers=*/4, tp, /*pp=*/2, {4, 0});
-    auto genKvState = makeKvCacheState(/*numLayers=*/4, tp, /*pp=*/4, {2, 2, 0, 0});
-
-    // RNN layers on Context PP=1, Gen has PP={2,3} for RNN
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/4, tp, /*pp=*/2, {0, 4});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/4, tp, /*pp=*/4, {0, 0, 2, 2});
+    // Unified states: KV layers on Context PP=0, RNN layers on Context PP=1
+    auto contextState = makeHybridState(
+        /*kvNumLayers=*/4, /*rnnNumLayers=*/4, tp, /*pp=*/2, {4, 0}, {0, 4});
+    auto genState = makeHybridState(
+        /*kvNumLayers=*/4, /*rnnNumLayers=*/4, tp, /*pp=*/4, {2, 2, 0, 0}, {0, 0, 2, 2});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -445,12 +427,12 @@ TEST_F(HybridModelCounterpartsTest, DisjointKvRnnCounterparts)
     SizeType32 contextRank0 = 0;
 
     // KV counterparts: needs layers 0-3 from Gen PP0 (rank 0) and PP1 (rank 2)
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
     EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2}));
 
     // RNN counterparts: Context PP=0 has 0 RNN layers, should need nothing from Gen
     // But targetIRanks for RNN should still work correctly
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
     // Context PP0 has 0 RNN layers, so it doesn't need any Gen RNN data
     EXPECT_TRUE(rnnCounterParts.empty());
 
@@ -461,18 +443,19 @@ TEST_F(HybridModelCounterpartsTest, DisjointKvRnnCounterparts)
     SizeType32 contextRank2 = 2;
 
     // KV counterparts: Context PP=1 has 0 KV layers
-    kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank2).mIRanks;
+    kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank2).mIRanks;
     EXPECT_TRUE(kvCounterParts.empty());
 
     // RNN counterparts: needs layers 0-3 from Gen PP2 (rank 4) and PP3 (rank 6)
-    rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank2, genRnnState);
+    rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank2, genState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{4, 6}));
 
     mergedCounterParts = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(mergedCounterParts, (std::vector<SizeType32>{4, 6})); // Only RNN ranks
 
+    auto rnnTargetInfo = texec::kv_cache::targetIRanksForRnn(genState, contextState, contextRank2);
     auto [rnnPickUp, rnnLocalRankIndices] = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
-        mergedCounterParts.size(), contextRnnState, contextRank2, genRnnState, mergedCounterParts);
+        mergedCounterParts.size(), contextState, contextRank2, genState, mergedCounterParts, rnnTargetInfo);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
     EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 }
@@ -599,12 +582,9 @@ TEST_F(HybridModelCounterpartsTest, InterleavedLayers)
     // Context: PP=1, Gen: PP=2
     SizeType32 const tp = 2;
 
-    // Both attention and RNN have 8 layers, distributed evenly
-    auto contextKvState = makeKvCacheState(/*numLayers=*/8, tp, /*pp=*/1, {8});
-    auto genKvState = makeKvCacheState(/*numLayers=*/8, tp, /*pp=*/2, {4, 4});
-
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/8, tp, /*pp=*/1, {8});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/8, tp, /*pp=*/2, {4, 4});
+    // Unified states: both attention and RNN have 8 layers, distributed evenly
+    auto contextState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/8, tp, /*pp=*/1, {8}, {8});
+    auto genState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/8, tp, /*pp=*/2, {4, 4}, {4, 4});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -612,8 +592,8 @@ TEST_F(HybridModelCounterpartsTest, InterleavedLayers)
     SizeType32 contextRank0 = 0;
 
     // Both KV and RNN should have same counterparts
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
 
     EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2}));
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 2}));
@@ -628,13 +608,9 @@ TEST_F(HybridModelCounterpartsTest, RnnMorePPThanKv)
 {
     SizeType32 const tp = 2;
 
-    // KV: 4 layers, Gen PP=2
-    auto contextKvState = makeKvCacheState(/*numLayers=*/4, tp, /*pp=*/1, {4});
-    auto genKvState = makeKvCacheState(/*numLayers=*/4, tp, /*pp=*/2, {2, 2});
-
-    // RNN: 8 layers, Gen PP=4 (more distributed)
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/8, tp, /*pp=*/1, {8});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/8, tp, /*pp=*/4, {2, 2, 2, 2});
+    // Unified states: PP=4 (the physical deployment), KV only on first 2 PP stages
+    auto contextState = makeHybridState(/*kvNumLayers=*/4, /*rnnNumLayers=*/8, tp, /*pp=*/1, {4}, {8});
+    auto genState = makeHybridState(/*kvNumLayers=*/4, /*rnnNumLayers=*/8, tp, /*pp=*/4, {2, 2, 0, 0}, {2, 2, 2, 2});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -642,11 +618,11 @@ TEST_F(HybridModelCounterpartsTest, RnnMorePPThanKv)
     SizeType32 contextRank0 = 0;
 
     // KV needs ranks 0, 2 (from Gen PP0, PP1)
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
     EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2}));
 
     // RNN needs ranks 0, 2, 4, 6 (from Gen PP0, PP1, PP2, PP3)
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 2, 4, 6}));
 
     // Merged should include all RNN ranks (superset)
@@ -659,13 +635,9 @@ TEST_F(HybridModelCounterpartsTest, KvMorePPThanRnn)
 {
     SizeType32 const tp = 2;
 
-    // KV: 8 layers, Gen PP=4
-    auto contextKvState = makeKvCacheState(/*numLayers=*/8, tp, /*pp=*/1, {8});
-    auto genKvState = makeKvCacheState(/*numLayers=*/8, tp, /*pp=*/4, {2, 2, 2, 2});
-
-    // RNN: 4 layers, Gen PP=2 (less distributed)
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/4, tp, /*pp=*/1, {4});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/4, tp, /*pp=*/4, {2, 2, 0, 0});
+    // Unified states: PP=4, RNN only on first 2 PP stages
+    auto contextState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/4, tp, /*pp=*/1, {8}, {4});
+    auto genState = makeHybridState(/*kvNumLayers=*/8, /*rnnNumLayers=*/4, tp, /*pp=*/4, {2, 2, 2, 2}, {2, 2, 0, 0});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -673,19 +645,20 @@ TEST_F(HybridModelCounterpartsTest, KvMorePPThanRnn)
     SizeType32 contextRank0 = 0;
 
     // KV needs ranks 0, 2, 4, 6 (from Gen PP0, PP1, PP2, PP3)
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
     EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 2, 4, 6}));
 
     // RNN needs ranks 0, 2 only (from Gen PP0, PP1 - PP2,PP3 have 0 RNN layers)
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 2}));
 
     // Merged should be KV ranks (superset)
     auto merged = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(merged, (std::vector<SizeType32>{0, 2, 4, 6}));
 
+    auto rnnTargetInfo = texec::kv_cache::targetIRanksForRnn(genState, contextState, contextRank0);
     auto [rnnPickUp, rnnLocalRankIndices] = tensorrt_llm::batch_manager::cache_formatter_utils::pickRecvConnections(
-        merged.size(), contextRnnState, contextRank0, genRnnState, merged);
+        merged.size(), contextState, contextRank0, genState, merged, rnnTargetInfo);
     EXPECT_EQ(rnnPickUp, (std::vector<size_t>{0, 1}));
     EXPECT_EQ(rnnLocalRankIndices, (std::vector<size_t>{0, 1}));
 }
@@ -695,13 +668,9 @@ TEST_F(HybridModelCounterpartsTest, RnnOnlyModel)
 {
     SizeType32 const tp = 2;
 
-    // KV: 0 layers (pure Mamba model)
-    auto contextKvState = makeKvCacheState(/*numLayers=*/0, tp, /*pp=*/1, {0});
-    auto genKvState = makeKvCacheState(/*numLayers=*/0, tp, /*pp=*/2, {0, 0});
-
-    // RNN: 8 layers
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/8, tp, /*pp=*/1, {8});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/8, tp, /*pp=*/2, {4, 4});
+    // Unified states: 0 KV layers, 8 RNN layers
+    auto contextState = makeHybridState(/*kvNumLayers=*/0, /*rnnNumLayers=*/8, tp, /*pp=*/1, {0}, {8});
+    auto genState = makeHybridState(/*kvNumLayers=*/0, /*rnnNumLayers=*/8, tp, /*pp=*/2, {0, 0}, {4, 4});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -709,11 +678,11 @@ TEST_F(HybridModelCounterpartsTest, RnnOnlyModel)
     SizeType32 contextRank0 = 0;
 
     // KV counterparts should be empty
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
     EXPECT_TRUE(kvCounterParts.empty());
 
     // RNN counterparts should have ranks
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 2}));
 
     // Merged is just RNN (kvCounterParts is empty)
@@ -729,13 +698,9 @@ TEST_F(HybridModelCounterpartsTest, LargeScaleMixedLayers)
     // Context: TP=4, PP=1 (4 GPUs total)
     // Gen: TP=4, PP=4 (16 GPUs total)
 
-    // KV: 32 attention layers
-    auto contextKvState = makeKvCacheState(/*numLayers=*/32, tp, /*pp=*/1, {32});
-    auto genKvState = makeKvCacheState(/*numLayers=*/32, tp, /*pp=*/4, {8, 8, 8, 8});
-
-    // RNN: 16 Mamba layers (only on first 2 PP stages of Gen)
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/16, tp, /*pp=*/1, {16});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/16, tp, /*pp=*/4, {8, 8, 0, 0});
+    // Unified states: KV 32 layers, RNN 16 layers (only on first 2 PP stages of Gen)
+    auto contextState = makeHybridState(/*kvNumLayers=*/32, /*rnnNumLayers=*/16, tp, /*pp=*/1, {32}, {16});
+    auto genState = makeHybridState(/*kvNumLayers=*/32, /*rnnNumLayers=*/16, tp, /*pp=*/4, {8, 8, 8, 8}, {8, 8, 0, 0});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -744,11 +709,11 @@ TEST_F(HybridModelCounterpartsTest, LargeScaleMixedLayers)
     SizeType32 contextRank0 = 0;
 
     // KV needs all 4 Gen PP stages at TP=0: ranks 0, 4, 8, 12
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
     EXPECT_EQ(kvCounterParts, (std::vector<int>{0, 4, 8, 12}));
 
     // RNN needs only first 2 Gen PP stages at TP=0: ranks 0, 4
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{0, 4}));
 
     // Merged
@@ -758,10 +723,10 @@ TEST_F(HybridModelCounterpartsTest, LargeScaleMixedLayers)
     // Context rank 3 (PP=0, TP=3) - different TP rank
     SizeType32 contextRank3 = 3;
 
-    kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank3).mIRanks;
+    kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank3).mIRanks;
     EXPECT_EQ(kvCounterParts, (std::vector<int>{3, 7, 11, 15}));
 
-    rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank3, genRnnState);
+    rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank3, genState);
     EXPECT_EQ(rnnCounterParts, (std::vector<SizeType32>{3, 7}));
 }
 
@@ -783,13 +748,11 @@ TEST_F(HybridModelCounterpartsTest, ContextPPGreaterThanGenPP)
 
     SizeType32 const tp = 2;
 
-    // KV states
-    auto contextKvState = makeKvCacheState(/*numLayers=*/16, tp, /*pp=*/4, {4, 4, 4, 4});
-    auto genKvState = makeKvCacheState(/*numLayers=*/16, tp, /*pp=*/1, {16});
-
-    // RNN states
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/8, tp, /*pp=*/4, {2, 2, 2, 2});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/8, tp, /*pp=*/1, {8});
+    // Unified states
+    auto contextState = makeHybridState(
+        /*kvNumLayers=*/16, /*rnnNumLayers=*/8, tp, /*pp=*/4, {4, 4, 4, 4}, {2, 2, 2, 2});
+    auto genState = makeHybridState(
+        /*kvNumLayers=*/16, /*rnnNumLayers=*/8, tp, /*pp=*/1, {16}, {8});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -800,10 +763,10 @@ TEST_F(HybridModelCounterpartsTest, ContextPPGreaterThanGenPP)
     // So both KV and RNN should only need Gen rank 0
     SizeType32 contextRank0 = 0;
 
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
     EXPECT_EQ(kvCounterParts, std::vector<int>({0}));
 
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
     EXPECT_EQ(rnnCounterParts, std::vector<SizeType32>({0}));
 
     auto merged = mergeCounterparts(kvCounterParts, rnnCounterParts);
@@ -814,20 +777,20 @@ TEST_F(HybridModelCounterpartsTest, ContextPPGreaterThanGenPP)
     // Still needs from Gen rank 0 only
     SizeType32 contextRank4 = 4;
 
-    kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank4).mIRanks;
+    kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank4).mIRanks;
     EXPECT_EQ(kvCounterParts, std::vector<int>({0}));
 
-    rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank4, genRnnState);
+    rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank4, genState);
     EXPECT_EQ(rnnCounterParts, std::vector<SizeType32>({0}));
 
     // ============= Test from Context rank 1 (PP=0, TP=1) =============
     // Should need Gen rank 1 (same TP rank)
     SizeType32 contextRank1 = 1;
 
-    kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank1).mIRanks;
+    kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank1).mIRanks;
     EXPECT_EQ(kvCounterParts, std::vector<int>({1}));
 
-    rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank1, genRnnState);
+    rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank1, genState);
     EXPECT_EQ(rnnCounterParts, std::vector<SizeType32>({1}));
 }
 
@@ -843,13 +806,11 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricContextPPGreaterThanGenPP)
 
     SizeType32 const tp = 2;
 
-    // KV: Context PP0,PP1 have layers, PP2,PP3 have 0
-    auto contextKvState = makeKvCacheState(/*numLayers=*/8, tp, /*pp=*/4, {4, 4, 0, 0});
-    auto genKvState = makeKvCacheState(/*numLayers=*/8, tp, /*pp=*/2, {4, 4});
-
-    // RNN: Context PP0,PP1 have 0 layers, PP2,PP3 have layers
-    auto contextRnnState = makeRnnCacheState(/*numLayers=*/6, tp, /*pp=*/4, {0, 0, 3, 3});
-    auto genRnnState = makeRnnCacheState(/*numLayers=*/6, tp, /*pp=*/2, {3, 3});
+    // Unified states: KV on PP0,PP1; RNN on PP2,PP3 for Context
+    auto contextState = makeHybridState(
+        /*kvNumLayers=*/8, /*rnnNumLayers=*/6, tp, /*pp=*/4, {4, 4, 0, 0}, {0, 0, 3, 3});
+    auto genState = makeHybridState(
+        /*kvNumLayers=*/8, /*rnnNumLayers=*/6, tp, /*pp=*/2, {4, 4}, {3, 3});
 
     tbm::RnnCacheFormatter rnnFormatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1),
         reinterpret_cast<tbm::rnn_state_manager::RnnCacheTransBufferManager*>(0x2));
@@ -858,11 +819,11 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricContextPPGreaterThanGenPP)
     SizeType32 contextRank0 = 0;
 
     // KV: Context PP0 has layers 0-3, Gen PP0 has 0-3 -> rank 0
-    auto kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank0).mIRanks;
+    auto kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank0).mIRanks;
     EXPECT_EQ(kvCounterParts, std::vector<int>({0}));
 
     // RNN: Context PP0 has 0 RNN layers
-    auto rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank0, genRnnState);
+    auto rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank0, genState);
     EXPECT_TRUE(rnnCounterParts.empty());
 
     auto merged = mergeCounterparts(kvCounterParts, rnnCounterParts);
@@ -872,11 +833,11 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricContextPPGreaterThanGenPP)
     SizeType32 contextRank4 = 4;
 
     // KV: Context PP2 has 0 KV layers
-    kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank4).mIRanks;
+    kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank4).mIRanks;
     EXPECT_TRUE(kvCounterParts.empty());
 
     // RNN: Context PP2 has layers 0-2, Gen PP0 has 0-2 -> rank 0
-    rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank4, genRnnState);
+    rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank4, genState);
     EXPECT_EQ(rnnCounterParts, std::vector<SizeType32>({0}));
 
     merged = mergeCounterparts(kvCounterParts, rnnCounterParts);
@@ -886,11 +847,11 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricContextPPGreaterThanGenPP)
     SizeType32 contextRank6 = 6;
 
     // KV: Context PP3 has 0 KV layers
-    kvCounterParts = texec::kv_cache::targetIRanks(genKvState, contextKvState, contextRank6).mIRanks;
+    kvCounterParts = texec::kv_cache::targetIRanks(genState, contextState, contextRank6).mIRanks;
     EXPECT_TRUE(kvCounterParts.empty());
 
     // RNN: Context PP3 has layers 3-5, Gen PP1 has 3-5 -> rank 2
-    rnnCounterParts = rnnFormatter.getCounterparts(contextRnnState, contextRank6, genRnnState);
+    rnnCounterParts = rnnFormatter.getCounterparts(contextState, contextRank6, genState);
     EXPECT_EQ(rnnCounterParts, std::vector<SizeType32>({2}));
 
     merged = mergeCounterparts(kvCounterParts, rnnCounterParts);

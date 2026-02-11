@@ -14,6 +14,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -379,12 +380,10 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
-    # Add sequence to hybrid manager (handles both KV and Mamba)
-    hybrid_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
-                                               ctx_request.prompt_len, 1,
-                                               ctx_request)
-    hybrid_cache_manager_ctx._impl.mamba_impl.allocate_cache_blocks(
-        [ctx_request.py_request_id])
+    # Prepare resources for hybrid manager (handles both KV and Mamba)
+    scheduled_ctx = ScheduledRequests()
+    scheduled_ctx.context_requests = [ctx_request]
+    hybrid_cache_manager_ctx.prepare_resources(scheduled_ctx)
 
     # Send ctx request (sends both KV and Mamba states)
     cache_transceiver_ctx.respond_and_send_async(ctx_request)
@@ -400,12 +399,10 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         context_phase_params=ctx_request.context_phase_params)
 
-    # Add sequence to hybrid manager on gen side
-    hybrid_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
-                                               gen_request.prompt_len, 1,
-                                               gen_request)
-    hybrid_cache_manager_gen._impl.mamba_impl.allocate_cache_blocks(
-        [gen_request.py_request_id])
+    # Prepare resources for hybrid manager on gen side
+    scheduled_gen = ScheduledRequests()
+    scheduled_gen.context_requests = [gen_request]
+    hybrid_cache_manager_gen.prepare_resources(scheduled_gen)
 
     cache_transceiver_gen.request_and_receive_async(gen_request)
 
@@ -469,11 +466,9 @@ def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
-    hybrid_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
-                                               ctx_request.prompt_len, 1,
-                                               ctx_request)
-    hybrid_cache_manager_ctx._impl.mamba_impl.allocate_cache_blocks(
-        [ctx_request.py_request_id])
+    scheduled_ctx = ScheduledRequests()
+    scheduled_ctx.context_requests = [ctx_request]
+    hybrid_cache_manager_ctx.prepare_resources(scheduled_ctx)
 
     # Send ctx request
     cache_transceiver_ctx.respond_and_send_async(ctx_request)
@@ -496,11 +491,9 @@ def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         context_phase_params=ctx_request.context_phase_params)
 
-    hybrid_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
-                                               gen_request.prompt_len, 1,
-                                               gen_request)
-    hybrid_cache_manager_gen._impl.mamba_impl.allocate_cache_blocks(
-        [gen_request.py_request_id])
+    scheduled_gen = ScheduledRequests()
+    scheduled_gen.context_requests = [gen_request]
+    hybrid_cache_manager_gen.prepare_resources(scheduled_gen)
 
     # Try to receive gen request
     cache_transceiver_gen.request_and_receive_async(gen_request)

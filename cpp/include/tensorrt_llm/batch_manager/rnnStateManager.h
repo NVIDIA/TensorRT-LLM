@@ -72,7 +72,7 @@ public:
 
     [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const noexcept;
 
-    [[nodiscard]] executor::rnn_cache::RnnCacheState::ModelConfig getRnnCacheStateModelConfig() const noexcept;
+    [[nodiscard]] executor::kv_cache::CacheState::RnnModelConfig getRnnCacheStateModelConfig() const noexcept;
 
     [[nodiscard]] SizeType32 getMaxBatchSize() const noexcept;
 

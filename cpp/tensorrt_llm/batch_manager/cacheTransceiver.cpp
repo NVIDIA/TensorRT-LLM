@@ -213,14 +213,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         auto const convStateDataType = mRnnStateManager->getConvStateDataType();
         auto const ssmStateDataType = mRnnStateManager->getSsmStateDataType();
 
-        executor::rnn_cache::RnnCacheState::ParallelConfig rnnParallelCfg{worldConfig.getTensorParallelism(),
-            worldConfig.getPipelineParallelism(),
-            // can reuse the same values as kv cache
-            mCacheState->getParallelConfig().mEnableAttentionDP, mCacheState->getParallelConfig().mDPrank,
-            mCacheState->getParallelConfig().mDPsize, 1 /* context parallelism */, rnnLayerNumPerPP};
-
-        mRnnCacheState = std::make_unique<executor::rnn_cache::RnnCacheState>(
-            rnnModelCfg, rnnParallelCfg, convStateDataType, ssmStateDataType);
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
 
         TLLM_LOG_INFO("RNN cache transfer components initialized.");
     }
@@ -279,11 +272,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         return nullptr;
     };
 
-    auto makeCacheTransferLayer = [&]()
-    {
-        return CacheTransferLayer(*mCacheState, makeFormatter(),
-            mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt, makeRnnFormatter());
-    };
+    auto makeCacheTransferLayer
+        = [&]() { return CacheTransferLayer(*mCacheState, makeFormatter(), makeRnnFormatter()); };
 
     mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
     mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
@@ -311,11 +301,6 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     auto contextState = std::make_unique<executor::DataTransceiverState>();
     contextState->setCommState(*mCommState);
     contextState->setCacheState(*mCacheState);
-    if (mRnnCacheState != nullptr)
-    {
-        TLLM_LOG_DEBUG("Setting RNN cache state for request %ld", llmRequest->mRequestId); // make debug
-        contextState->setRnnCacheState(*mRnnCacheState);
-    }
     if (!llmRequest->hasDraftTokens())
     {
         llmRequest->setContextPhaseParams(

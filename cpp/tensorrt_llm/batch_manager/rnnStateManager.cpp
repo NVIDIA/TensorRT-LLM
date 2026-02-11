@@ -338,9 +338,9 @@ RnnStateManager::SizeType32 RnnStateManager::getMaxBatchSize() const noexcept
     return mMaxNumSequences;
 }
 
-executor::rnn_cache::RnnCacheState::ModelConfig RnnStateManager::getRnnCacheStateModelConfig() const noexcept
+executor::kv_cache::CacheState::RnnModelConfig RnnStateManager::getRnnCacheStateModelConfig() const noexcept
 {
-    return executor::rnn_cache::RnnCacheState::ModelConfig{
+    return executor::kv_cache::CacheState::RnnModelConfig{
         mDState, mDConv, mHiddenSize, mHeadDim, mConvDimSize, mNGroups, mNumLayers, mNumHeads};
 }
 

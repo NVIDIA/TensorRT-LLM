@@ -92,37 +92,13 @@ int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, i
     }
 }
 
-namespace state_specific_detail
-{
-
-// ============ Layer Num Per PP ============
-inline std::vector<SizeType32> const& getLayerNumPerPP(kv_cache::CacheState::ParallelConfig const& config)
-{
-    return config.mAttentionLayerNumPerPP;
-}
-
-inline std::vector<SizeType32> const& getLayerNumPerPP(rnn_cache::RnnCacheState::ParallelConfig const& config)
-{
-    return config.mRnnLayerNumPerPP;
-}
-
-// ============ Heads Per Layer ============
-inline SizeType32 getNbHeadsPerLayer(kv_cache::CacheState::ModelConfig const& config)
-{
-    return config.mNbKvHeadsPerLayer[0];
-}
-
-inline SizeType32 getNbHeadsPerLayer(rnn_cache::RnnCacheState::ModelConfig const& config)
-{
-    return config.mNumHeads;
-}
-
-} // namespace state_specific_detail
-
 // inputBlockNums: [outputBlockNum, inputRanks.size]
 // [PP, TP]
-template <typename CacheStateT>
-TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheStateT const& selfCacheState, int selfRank)
+// Core implementation for computing target ranks info for data parallelism.
+// Takes explicit layer vectors and head counts so it can be reused for both KV and RNN cache.
+TargetRanksInfo TargetRanksInfoForDPImpl(kv_cache::CacheState const& peerCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfRank, std::vector<SizeType32> const& peerNumLayerPerPP,
+    std::vector<SizeType32> const& selfNumLayerPerPP, SizeType32 peerNbHeadsPerLayer, SizeType32 selfNbHeadsPerLayer)
 {
     auto const& peerParConfig = peerCacheState.getParallelConfig();
     auto const& selfParConfig = selfCacheState.getParallelConfig();
@@ -141,8 +117,6 @@ TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheSta
     int peerPPRankStart = 0;
     int mDomainPPSize = 1;
     int peerPPRankEnd = 0;
-    std::vector<SizeType32> const& peerNumLayerPerPP = state_specific_detail::getLayerNumPerPP(peerParConfig);
-    std::vector<SizeType32> const& selfNumLayerPerPP = state_specific_detail::getLayerNumPerPP(selfParConfig);
 
     if (selfNumLayerPerPP[selfPPRank] == 0)
     {
@@ -205,8 +179,6 @@ TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheSta
     int const selfTPSizePerDPGroup = selfParConfig.mEnableAttentionDP ? selfTPNum / selfParConfig.mDPsize : selfTPNum;
     int const peerTPSizePerDPGroup = peerParConfig.mEnableAttentionDP ? peerTPNum / peerParConfig.mDPsize : peerTPNum;
 
-    int const selfNbHeadsPerLayer = state_specific_detail::getNbHeadsPerLayer(selfCacheState.getModelConfig());
-    int const peerNbHeadsPerLayer = state_specific_detail::getNbHeadsPerLayer(peerCacheState.getModelConfig());
     int const selfTPrankInDPGroup = selfTPRank % selfTPSizePerDPGroup;
     for (auto val : {peerTPSizePerDPGroup, selfTPSizePerDPGroup})
     {
@@ -297,13 +269,20 @@ TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheSta
 TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
 {
-    return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
+    auto const& peerHeads = peerCacheState.getModelConfig().mNbKvHeadsPerLayer;
+    auto const& selfHeads = selfCacheState.getModelConfig().mNbKvHeadsPerLayer;
+    return TargetRanksInfoForDPImpl(peerCacheState, selfCacheState, selfRank,
+        peerCacheState.getParallelConfig().mAttentionLayerNumPerPP,
+        selfCacheState.getParallelConfig().mAttentionLayerNumPerPP, peerHeads.empty() ? 0 : peerHeads[0],
+        selfHeads.empty() ? 0 : selfHeads[0]);
 }
 
-TargetRanksInfo targetIRanks(
-    rnn_cache::RnnCacheState const& peerCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfRank)
+TargetRanksInfo targetIRanksForRnn(
+    kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
 {
-    auto targetInfo = TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
+    auto targetInfo = TargetRanksInfoForDPImpl(peerCacheState, selfCacheState, selfRank,
+        peerCacheState.getRnnCacheState().mLayerNumPerPP, selfCacheState.getRnnCacheState().mLayerNumPerPP,
+        peerCacheState.getRnnModelConfig().mNumHeads, selfCacheState.getRnnModelConfig().mNumHeads);
     targetInfo.mDupHeadFactor = 1;
     targetInfo.mPeerDupHeadFactor = 1; // RNN cache does not have head duplication.
     return targetInfo;
@@ -1842,8 +1821,4 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
     }
 }
 
-template TargetRanksInfo TargetRanksInfoForDP<kv_cache::CacheState>(
-    kv_cache::CacheState const&, kv_cache::CacheState const&, int);
-template TargetRanksInfo TargetRanksInfoForDP<rnn_cache::RnnCacheState>(
-    rnn_cache::RnnCacheState const&, rnn_cache::RnnCacheState const&, int);
 } // namespace tensorrt_llm::executor::kv_cache

@@ -278,14 +278,13 @@ public:
 
     Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
-        , mSelfState{cacheLayer.getKvState(), executor::kv_cache::CommState{manager->getCommState()}}
+        , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
-        mCacheTransferLayer.populateSelfState(mSelfState);
         mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
         int asyncSendThreadNum = common::getEnvKVCacheSendMaxConcurrenceNum();
@@ -382,21 +381,21 @@ public:
         auto requestId = info.getRequestId();
         mCacheTransferLayer.validateSupport(info.getTransState());
 
-        auto allCounterParts = mCacheTransferLayer.computeCounterparts(
+        auto allCounterparts = mCacheTransferLayer.computeCounterparts(
             mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
 
         auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx(); // Index of self in peer's comm state
         int peerIdx = std::distance(
-            allCounterParts.begin(), std::find(allCounterParts.begin(), allCounterParts.end(), peerSelfIdx));
-        TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterParts.size()),
+            allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
+        TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             auto it = mRequestToSession.find(requestId);
             if (it == mRequestToSession.end())
             {
-                auto session = TransferSession(std::vector<Connection const*>(allCounterParts.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId), mTerminate}, allCounterParts, mSelfState,
+                auto session = TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
+                    DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
                     info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                     !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
@@ -743,14 +742,13 @@ class CacheReceiver::Impl
 public:
     Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
-        , mSelfState{cacheLayer.getKvState(), executor::kv_cache::CommState{manager->getCommState()}}
+        , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
-        mCacheTransferLayer.populateSelfState(mSelfState);
     }
 
     [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest)
@@ -858,12 +856,12 @@ public:
             TLLM_CHECK(!cacheBufferIds.empty());
         }
 
-        auto allCounterParts
+        auto allCounterparts
             = mCacheTransferLayer.computeCounterparts(mSelfState.getCommState().value().getSelfIdx(), contextState);
 
         auto connections = mManager->getConnections(commState);
         std::vector<executor::kv_cache::Connection const*> allConnections;
-        for (auto index : allCounterParts)
+        for (auto index : allCounterparts)
         {
             auto const* connection = connections.at(index);
             allConnections.emplace_back(connection);
@@ -879,8 +877,8 @@ public:
                 // TODO: index -> validConnectionIdx conversion
                 // TODO(shreyasm): this will not work for RNN. Will error out in the constructor if used with RNN.
                 auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
-                    allCounterParts.size(), mSelfState.getCacheState().value(),
-                    mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterParts);
+                    allCounterparts.size(), mSelfState.getCacheState().value(),
+                    mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterparts);
                 auto validConnectionIdx = std::find(localRankIdx.begin(), localRankIdx.end(), i) - localRankIdx.begin();
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
@@ -895,7 +893,7 @@ public:
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
-            std::move(allCounterParts), mSelfState, contextState, resource->mBufferManager,
+            std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
             requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
             !common::getEnvKVCacheTimeOutputPath().empty());
     }

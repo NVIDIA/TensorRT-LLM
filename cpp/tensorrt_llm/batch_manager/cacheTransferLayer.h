@@ -17,8 +17,8 @@
 
 #pragma once
 
-#include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
+#include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <memory>
@@ -45,12 +45,10 @@ class CacheTransferLayer
 {
 public:
     /// @brief Constructor.
-    /// @param kvState The KV cache state.
+    /// @param cacheState The cache state (KV, and optionally RNN if hasRnnConfig() is true).
     /// @param kvFormatter The KV cache formatter.
-    /// @param rnnState Optional RNN cache state.
     /// @param rnnFormatter Optional RNN cache formatter.
-    CacheTransferLayer(executor::kv_cache::CacheState kvState, std::unique_ptr<BaseCacheFormatter> kvFormatter,
-        std::optional<executor::rnn_cache::RnnCacheState> rnnState = std::nullopt,
+    CacheTransferLayer(executor::kv_cache::CacheState cacheState, std::unique_ptr<BaseCacheFormatter> kvFormatter,
         std::unique_ptr<RnnCacheFormatter> rnnFormatter = nullptr);
 
     ~CacheTransferLayer();
@@ -76,20 +74,15 @@ public:
     /// @param session The transfer session.
     void unformat(TransferSession& session) const;
 
-    /// @brief Populates a DataTransceiverState with all cache states held by this layer.
-    /// @param state The DataTransceiverState to populate.
-    void populateSelfState(executor::DataTransceiverState& state) const;
-
-    [[nodiscard]] executor::kv_cache::CacheState const& getKvState() const noexcept;
+    [[nodiscard]] executor::kv_cache::CacheState const& getCacheState() const noexcept;
 
     [[nodiscard]] kv_cache_manager::BaseKVCacheManager* getCacheManager() const noexcept;
 
     [[nodiscard]] BaseCacheFormatter* getKvFormatter() const noexcept;
 
 private:
-    executor::kv_cache::CacheState mKvState;
+    executor::kv_cache::CacheState mCacheState;
     std::unique_ptr<BaseCacheFormatter> mKvFormatter;
-    std::optional<executor::rnn_cache::RnnCacheState> mRnnState;
     std::unique_ptr<RnnCacheFormatter> mRnnFormatter;
 };
 

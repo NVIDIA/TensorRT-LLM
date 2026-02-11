@@ -318,15 +318,15 @@ __global__ void concatRnnSsmStateKernel(T const** __restrict__ inputCaches, T** 
 template <typename T>
 void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConvBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
-    SizeType32 const maxBatchSize, rnn_cache::RnnCacheState const& destCacheState,
-    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    SizeType32 const maxBatchSize, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputConvBlocks.empty());
 
     size_t inputBlockNum = inputConvBlocks.size();
 
     // Get target rank information using the existing targetIRanks from kv_cache namespace
-    auto targetRankInfo = executor::kv_cache::targetIRanks(destCacheState, selfCacheState, selfIdx);
+    auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(destCacheState, selfCacheState, selfIdx);
 
     // Verify domain sizes
     TLLM_CHECK(targetRankInfo.mIRanks.size()
@@ -372,13 +372,13 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
 
     // Extract model and parallel configurations
     auto const& selfParallelConfig = selfCacheState.getParallelConfig();
-    auto const& selfModelConfig = selfCacheState.getModelConfig();
+    auto const& selfModelConfig = selfCacheState.getRnnModelConfig();
 
     int const selfTPNum = selfParallelConfig.mTensorParallelism;
     int const selfDPSize = selfParallelConfig.mDPsize;
     int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
     int const selfPPRank = selfIdx / selfTPNum;
-    int const numLayers = selfParallelConfig.mRnnLayerNumPerPP.at(selfPPRank);
+    int const numLayers = selfCacheState.getRnnCacheState().mLayerNumPerPP.at(selfPPRank);
 
     // Calculate conv dimensions
     int const convDimLocal = selfModelConfig.mConvDimSize / selfTPSizePerDPGroup;
@@ -451,13 +451,13 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
 template <typename T>
 void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
-    SizeType32 const maxBatchSize, size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
-    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    SizeType32 const maxBatchSize, size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSsmBlocks.empty());
 
     size_t inputBlockNum = inputSsmBlocks.size();
-    auto targetRankInfo = executor::kv_cache::targetIRanks(destCacheState, selfCacheState, selfIdx);
+    auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(destCacheState, selfCacheState, selfIdx);
     TLLM_CHECK(targetRankInfo.mIRanks.size()
         == (static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize)));
 
@@ -502,13 +502,13 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
     auto const& selfParallelConfig = selfCacheState.getParallelConfig();
-    auto const& selfModelConfig = selfCacheState.getModelConfig();
+    auto const& selfModelConfig = selfCacheState.getRnnModelConfig();
 
     int const selfTPNum = selfParallelConfig.mTensorParallelism;
     int const selfDPSize = selfParallelConfig.mDPsize;
     int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
     int const selfPPRank = selfIdx / selfTPNum;
-    int const numLayers = selfParallelConfig.mRnnLayerNumPerPP.at(selfPPRank);
+    int const numLayers = selfCacheState.getRnnCacheState().mLayerNumPerPP.at(selfPPRank);
 
     // Note: mNumHeads is GLOBAL, need to divide by TP
     int const numHeadsLocal = selfModelConfig.mNumHeads / selfTPSizePerDPGroup;
@@ -585,7 +585,7 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
 template <typename T>
 void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, SizeType32 const slotIdx, SizeType32 const maxBatchSize,
-    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
+    kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
     runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
@@ -593,7 +593,7 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
 
     size_t outputBlockNum = outputConvBlocks.size();
 
-    auto targetRankInfo = executor::kv_cache::targetIRanks(destCacheState, selfCacheState, selfIdx);
+    auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(destCacheState, selfCacheState, selfIdx);
     TLLM_CHECK(targetRankInfo.mIRanks.size()
         == (static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize)));
 
@@ -630,13 +630,13 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
     auto const& selfParallelConfig = selfCacheState.getParallelConfig();
-    auto const& selfModelConfig = selfCacheState.getModelConfig();
+    auto const& selfModelConfig = selfCacheState.getRnnModelConfig();
 
     int const selfTPNum = selfParallelConfig.mTensorParallelism;
     int const selfDPSize = selfParallelConfig.mDPsize;
     int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
     int const selfPPRank = selfIdx / selfTPNum;
-    int const numLayers = selfParallelConfig.mRnnLayerNumPerPP.at(selfPPRank);
+    int const numLayers = selfCacheState.getRnnCacheState().mLayerNumPerPP.at(selfPPRank);
     int const convDimLocal = selfModelConfig.mConvDimSize / selfTPSizePerDPGroup;
     int const dConvMinus1 = selfModelConfig.mDConv - 1;
 
@@ -701,15 +701,15 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
 template <typename T>
 void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, SizeType32 const slotIdx, SizeType32 const maxBatchSize,
-    size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
-    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState,
+    int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
     TLLM_CHECK(!outputSsmBlocks.empty());
 
     size_t outputBlockNum = outputSsmBlocks.size();
 
-    auto targetRankInfo = executor::kv_cache::targetIRanks(destCacheState, selfCacheState, selfIdx);
+    auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(destCacheState, selfCacheState, selfIdx);
     TLLM_CHECK(targetRankInfo.mIRanks.size()
         == (static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize)));
 
@@ -752,13 +752,13 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
     auto const& selfParallelConfig = selfCacheState.getParallelConfig();
-    auto const& selfModelConfig = selfCacheState.getModelConfig();
+    auto const& selfModelConfig = selfCacheState.getRnnModelConfig();
 
     int const selfTPNum = selfParallelConfig.mTensorParallelism;
     int const selfDPSize = selfParallelConfig.mDPsize;
     int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
     int const selfPPRank = selfIdx / selfTPNum;
-    int const numLayers = selfParallelConfig.mRnnLayerNumPerPP.at(selfPPRank);
+    int const numLayers = selfCacheState.getRnnCacheState().mLayerNumPerPP.at(selfPPRank);
     int const numHeadsLocal = selfModelConfig.mNumHeads / selfTPSizePerDPGroup;
     int const headDim = selfModelConfig.mHeadDim;
     int const dState = selfModelConfig.mDState;
@@ -832,8 +832,8 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
 
 void splitRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputConvBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
-    SizeType32 const maxBatchSize, rnn_cache::RnnCacheState const& destCacheState,
-    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    SizeType32 const maxBatchSize, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputConvBlocks.empty());
     auto dataType = inputConvBlocks.front()->getDataType();
@@ -863,8 +863,8 @@ void splitRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& i
 
 void splitRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
-    SizeType32 const maxBatchSize, size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
-    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    SizeType32 const maxBatchSize, size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSsmBlocks.empty());
     auto dataType = inputSsmBlocks.front()->getDataType();
@@ -894,7 +894,7 @@ void splitRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& in
 
 void concatRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, SizeType32 const slotIdx, SizeType32 const maxBatchSize,
-    rnn_cache::RnnCacheState const& destCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfIdx,
+    kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
     runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
@@ -925,8 +925,8 @@ void concatRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& 
 
 void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, SizeType32 const slotIdx, SizeType32 const maxBatchSize,
-    size_t convBytesPerLayer, rnn_cache::RnnCacheState const& destCacheState,
-    rnn_cache::RnnCacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState,
+    int selfIdx, runtime::BufferManager const& bufferManager)
 {
     TLLM_CHECK(!inputSplitBlocks.empty());
     auto dataType = outputSsmBlocks.front()->getDataType();

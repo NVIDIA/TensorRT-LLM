@@ -310,7 +310,7 @@ std::pair<std::vector<size_t>, std::vector<size_t>> CacheFormatter::pickRecvConn
     CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
     std::vector<SizeType32> const& counterPartRanks) const
 {
-    return cache_formatter_utils::pickRecvConnections<CacheState>(
+    return cache_formatter_utils::pickRecvConnections(
         numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
 }
 
@@ -330,12 +330,12 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto indexFromEnd = session.getIndexFromEnd();
     auto& bufferManager = session.getBufferManager();
     // Some TP rank don't need to send cache since duplicate header is not needed.
-    if (!cache_formatter_utils::needSendCache<CacheState>(selfConfig, destConfig, selfIdx))
+    if (!cache_formatter_utils::needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
     }
 
-    auto pickUpConnections = cache_formatter_utils::pickSendConnections<CacheState>(
+    auto pickUpConnections = cache_formatter_utils::pickSendConnections(
         connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     size_t targetNum = pickUpConnections.size();
     if (targetNum == 0)

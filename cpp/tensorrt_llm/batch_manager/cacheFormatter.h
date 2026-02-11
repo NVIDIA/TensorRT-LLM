@@ -53,14 +53,17 @@ void sendAllBuffers(TransferSession& session, int deviceId,
 
 namespace cache_formatter_utils
 {
+
+using CacheState = executor::kv_cache::CacheState;
+
 /**
- * @brief Check if this rank should send cache data
- * @tparam CacheStateT Either kv_cache::CacheState or rnn_cache::RnnCacheState
+ * @brief Check if this rank should send cache data, given a pre-computed TargetRanksInfo.
+ *
+ * Callers that need RNN-specific target ranks should pass the result of targetIRanksForRnn().
  */
-template <typename CacheStateT>
-bool needSendCache(CacheStateT const& selfConfig, CacheStateT const& destConfig, runtime::SizeType32 selfIdx)
+inline bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx,
+    executor::kv_cache::TargetRanksInfo const& targetInfo)
 {
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     if (targetInfo.mDupHeadFactor <= 1)
     {
         return true;
@@ -82,16 +85,21 @@ bool needSendCache(CacheStateT const& selfConfig, CacheStateT const& destConfig,
     return (destDPRank % targetInfo.mDupHeadFactor) == (selfTpRankInDpGroup % targetInfo.mDupHeadFactor);
 }
 
+/// @brief Convenience overload that computes KV-cache target ranks automatically.
+inline bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx)
+{
+    return needSendCache(
+        selfConfig, destConfig, selfIdx, executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx));
+}
+
 /**
- * @brief Pick send connections
- * @tparam CacheStateT Either kv_cache::CacheState or rnn_cache::RnnCacheState
+ * @brief Pick send connections, given a pre-computed TargetRanksInfo.
  */
-template <typename CacheStateT>
-std::vector<size_t> pickSendConnections(size_t numConnections, CacheStateT const& selfConfig, SizeType32 selfIdx,
-    CacheStateT const& destConfig, std::vector<SizeType32> const& counterPartRanks)
+inline std::vector<size_t> pickSendConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
+    CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks,
+    executor::kv_cache::TargetRanksInfo const& targetInfo)
 {
     TLLM_CHECK(numConnections == counterPartRanks.size());
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
 
     // NO duplicate head filtering - format/sendBuffer handles that
     std::vector<size_t> indices;
@@ -104,24 +112,30 @@ std::vector<size_t> pickSendConnections(size_t numConnections, CacheStateT const
     return indices;
 }
 
+/// @brief Convenience overload that computes KV-cache target ranks automatically.
+inline std::vector<size_t> pickSendConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
+    CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks)
+{
+    return pickSendConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks,
+        executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx));
+}
+
 /**
- * @brief Pick receive connections and their corresponding local rank indices.
- * @tparam CacheStateT Either kv_cache::CacheState or rnn_cache::RnnCacheState
+ * @brief Pick receive connections and their corresponding local rank indices, given a pre-computed TargetRanksInfo.
  * @return Pair of (pickUpConnections, localRankIndices) where pickUpConnections are indices into counterPartRanks
  *         and localRankIndices are the corresponding indices into targetInfo.mIRanks.
  */
-template <typename CacheStateT>
-std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
-    CacheStateT const& selfConfig, SizeType32 selfIdx, CacheStateT const& destConfig,
-    std::vector<SizeType32> const& counterPartRanks)
+inline std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks, executor::kv_cache::TargetRanksInfo const& targetInfo)
 {
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     if (targetInfo.mIRanks.empty())
     {
         return {{}, {}};
     }
 
-    auto baseIndices = pickSendConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
+    auto baseIndices
+        = pickSendConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks, targetInfo);
 
     if (targetInfo.mPeerDupHeadFactor <= 1)
     {
@@ -148,6 +162,16 @@ std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t n
     }
     return {pickUpConnections, localRankIndices};
 }
+
+/// @brief Convenience overload that computes KV-cache target ranks automatically.
+inline std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks)
+{
+    return pickRecvConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks,
+        executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx));
+}
+
 } // namespace cache_formatter_utils
 } // namespace tensorrt_llm::batch_manager
 

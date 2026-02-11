@@ -43,7 +43,6 @@ class RnnCacheFormatter : public kv_cache_manager::BaseCacheFormatter
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    using RnnCacheState = executor::rnn_cache::RnnCacheState;
     using CacheState = executor::kv_cache::CacheState;
     using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;
 
@@ -61,57 +60,23 @@ public:
     /// @param session The transfer session.
     void unformat(TransferSession& session) override;
 
-    // =========================================================================
-    // BaseCacheFormatter overrides (CacheState versions) - not supported for RNN
-    // =========================================================================
+    /// @brief Check if transfer is supported between two configurations.
+    [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 
-    /// @brief Not supported for RNN cache. Always throws.
-    [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override
-    {
-        TLLM_THROW("RnnCacheFormatter::inquireSupport(CacheState) not supported. Use RnnCacheState version.");
-        return false;
-    }
-
-    /// @brief Not supported for RNN cache. Always throws.
+    /// @brief Get the counterpart ranks for communication.
     [[nodiscard]] std::vector<SizeType32> getCounterparts(
-        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const override
-    {
-        TLLM_THROW("RnnCacheFormatter::getCounterparts(CacheState) not supported. Use RnnCacheState version.");
-        return {};
-    }
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const override;
 
-    /// @brief Not supported for RNN cache. Always throws.
+    /// @brief Pick receive connections and their corresponding local rank indices.
     [[nodiscard]] std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
         CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
-        std::vector<SizeType32> const& counterPartRanks) const override
-    {
-        TLLM_THROW("RnnCacheFormatter::pickRecvConnections(CacheState) not supported. Use RnnCacheState version.");
-        return {{}, {}};
-    }
+        std::vector<SizeType32> const& counterPartRanks) const override;
 
     /// @brief Returns nullptr since RNN cache formatter doesn't use KV cache manager.
     [[nodiscard]] kv_cache_manager::BaseKVCacheManager* getCacheManager() const noexcept override
     {
         return nullptr;
     }
-
-    // =========================================================================
-    // RNN-specific methods (use RnnCacheState)
-    // =========================================================================
-
-    /// @brief Check if transfer is supported between two configurations.
-    /// @param selfConfig Source configuration.
-    /// @param destConfig Destination configuration.
-    /// @return True if transfer is supported.
-    [[nodiscard]] bool inquireSupport(RnnCacheState const& selfConfig, RnnCacheState const& destConfig) const;
-
-    /// @brief Get the counterpart ranks for communication.
-    /// @param selfConfig Source configuration.
-    /// @param selfIdx The index of this process.
-    /// @param destConfig Destination configuration.
-    /// @return Vector of counterpart indices.
-    [[nodiscard]] std::vector<SizeType32> getCounterparts(
-        RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const;
 
     /// @brief Get the RNN state manager.
     /// @return Pointer to the RNN state manager.

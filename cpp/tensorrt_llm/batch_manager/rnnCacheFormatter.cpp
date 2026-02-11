@@ -27,7 +27,7 @@
 
 namespace tensorrt_llm::batch_manager
 {
-using RnnCacheState = executor::rnn_cache::RnnCacheState;
+using CacheState = executor::kv_cache::CacheState;
 
 RnnCacheFormatter::RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager,
     rnn_state_manager::RnnCacheTransBufferManager* rnnCacheTransBufferManager)
@@ -49,19 +49,19 @@ void RnnCacheFormatter::format(TransferSession& session)
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
 
     auto const& connections = session.getConnections();
-    auto const& selfConfig = session.getSelfState().getRnnCacheState().value();
-    auto const& destConfig = session.getOtherState().getRnnCacheState().value();
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
 
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    if (!cache_formatter_utils::needSendCache<RnnCacheState>(selfConfig, destConfig, selfIdx))
+    auto targetInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
+    if (!cache_formatter_utils::needSendCache(selfConfig, destConfig, selfIdx, targetInfo))
     {
         return;
     }
 
-    auto pickUpConnections = cache_formatter_utils::pickSendConnections<RnnCacheState>(
-        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto pickUpConnections = cache_formatter_utils::pickSendConnections(
+        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), targetInfo);
     auto const targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
@@ -76,7 +76,7 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto const& selfParallel = selfConfig.getParallelConfig();
     auto const selfTPNum = selfParallel.mTensorParallelism;
     auto const selfPPRank = selfIdx / selfTPNum;
-    auto const& selfLayersPerPP = selfParallel.mRnnLayerNumPerPP;
+    auto const& selfLayersPerPP = selfConfig.getRnnCacheState().mLayerNumPerPP;
     SizeType32 const numLocalLayers = selfLayersPerPP[selfPPRank];
 
     if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
@@ -121,7 +121,7 @@ void RnnCacheFormatter::format(TransferSession& session)
 
     // Calculate buffer sizes for each target
     //    Each target gets: conv states + ssm states for overlapping layers
-    auto const& modelConfig = selfConfig.getModelConfig();
+    auto const& modelConfig = selfConfig.getRnnModelConfig();
     auto const maxBatchSize = mRnnStateManager->getMaxBatchSize();
     int const selfTPSizePerDPGroup = selfConfig.getParallelConfig().mEnableAttentionDP
         ? selfTPNum / selfConfig.getParallelConfig().mDPsize
@@ -200,17 +200,17 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
 
     auto const& connections = session.getConnections();
-    auto const& selfConfig = session.getSelfState().getRnnCacheState().value();
-    auto const& destConfig = session.getOtherState().getRnnCacheState().value();
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
 
-    auto sourceInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
+    auto sourceInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
     int deviceId;
     TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
 
-    auto pickRecvConnResult = cache_formatter_utils::pickRecvConnections<RnnCacheState>(
-        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto pickRecvConnResult = cache_formatter_utils::pickRecvConnections(
+        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), sourceInfo);
     auto pickUpConnections = std::get<0>(pickRecvConnResult);
     auto localRankIndices = std::get<1>(pickRecvConnResult);
     auto const sourceNum = pickUpConnections.size();
@@ -233,7 +233,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     auto const& selfParallel = selfConfig.getParallelConfig();
     auto const selfTPNum = selfParallel.mTensorParallelism;
     auto const selfPPRank = selfIdx / selfTPNum;
-    auto const& selfLayersPerPP = selfParallel.mRnnLayerNumPerPP;
+    auto const& selfLayersPerPP = selfConfig.getRnnCacheState().mLayerNumPerPP;
     SizeType32 const numLocalLayers = selfLayersPerPP[selfPPRank];
 
     if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
@@ -276,7 +276,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     }
 
     // Calculate buffer sizes
-    auto const& modelConfig = selfConfig.getModelConfig();
+    auto const& modelConfig = selfConfig.getRnnModelConfig();
     int const selfTPSizePerDPGroup = selfParallel.mEnableAttentionDP ? selfTPNum / selfParallel.mDPsize : selfTPNum;
     SizeType32 selfConvDimLocal = modelConfig.mConvDimSize / selfTPSizePerDPGroup;
     int const selfNumHeadsLocal = modelConfig.mNumHeads / selfTPSizePerDPGroup;
@@ -451,8 +451,13 @@ void RnnCacheFormatter::unformat(TransferSession& session)
         mpi::MpiComm::world().getRank(), "End receiving RNN state for request ID: %ld.", llmRequest.mRequestId);
 }
 
-bool RnnCacheFormatter::inquireSupport(RnnCacheState const& selfConfig, RnnCacheState const& destConfig) const
+bool RnnCacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
+    if (!selfConfig.hasRnnConfig() || !destConfig.hasRnnConfig())
+    {
+        return false;
+    }
+
     if (selfConfig.getConvStateDataType() != destConfig.getConvStateDataType())
     {
         TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: conv state data type mismatch (self=%d, dest=%d)",
@@ -467,8 +472,8 @@ bool RnnCacheFormatter::inquireSupport(RnnCacheState const& selfConfig, RnnCache
         return false;
     }
 
-    auto const& selfModel = selfConfig.getModelConfig();
-    auto const& destModel = destConfig.getModelConfig();
+    auto const& selfModel = selfConfig.getRnnModelConfig();
+    auto const& destModel = destConfig.getRnnModelConfig();
 
     if (selfModel.mDState != destModel.mDState || selfModel.mHeadDim != destModel.mHeadDim
         || selfModel.mDConv != destModel.mDConv || selfModel.mNGroups != destModel.mNGroups
@@ -492,10 +497,19 @@ bool RnnCacheFormatter::inquireSupport(RnnCacheState const& selfConfig, RnnCache
 }
 
 std::vector<RnnCacheFormatter::SizeType32> RnnCacheFormatter::getCounterparts(
-    RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
 {
-    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
+    auto targetInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
     return targetInfo.mIRanks;
+}
+
+std::pair<std::vector<size_t>, std::vector<size_t>> RnnCacheFormatter::pickRecvConnections(size_t numConnections,
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks) const
+{
+    auto targetInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
+    return cache_formatter_utils::pickRecvConnections(
+        numConnections, selfConfig, selfIdx, destConfig, counterPartRanks, targetInfo);
 }
 
 } // namespace tensorrt_llm::batch_manager
