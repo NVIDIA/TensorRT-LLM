@@ -45,6 +45,9 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "zai-org/GLM-4.7-Flash": "GLM-4.7-Flash",
     "DeepInfra/GLM-4.7-Flash-NVFP4": "GLM-4.7-Flash-NVFP4",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726": "NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726": "NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726": "NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726",
 }
 
 
