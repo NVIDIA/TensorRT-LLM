@@ -232,6 +232,99 @@ python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_wan_i2v.py \
     --guidance_scale_2 5.0 \
     --boundary_ratio 0.85
 
+#############################################
+# FLUX.1 Text-to-Image Examples
+#############################################
+
+echo ""
+echo "=== FLUX.1 Example 1: Baseline ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_flux.py \
+    --height 1024 \
+    --width 1024 \
+    --prompt "A cat holding a sign that says hello world" \
+    --output_path flux1_cat_sign.png \
+    --model_path ${MODEL_ROOT}/FLUX.1-dev/ \
+    --guidance_scale 3.5
+
+echo ""
+echo "=== FLUX.1 Example 2: With FP8 Quantization ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_flux.py \
+    --height 1024 \
+    --width 1024 \
+    --prompt "A cat holding a sign that says hello world" \
+    --output_path flux1_cat_sign_fp8.png \
+    --model_path ${MODEL_ROOT}/FLUX.1-dev/ \
+    --guidance_scale 3.5 \
+    --linear_type trtllm-fp8-per-tensor
+
+#############################################
+# FLUX.2 Text-to-Image Examples
+#############################################
+
+echo ""
+echo "=== FLUX.2 Example 1: Baseline ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_flux.py \
+    --height 1024 \
+    --width 1024 \
+    --prompt "A cat holding a sign that says hello world" \
+    --output_path flux2_cat_sign.png \
+    --model_path ${MODEL_ROOT}/FLUX.2-dev/ \
+    --guidance_scale 4.0
+
+echo ""
+echo "=== FLUX.2 Example 2: With TeaCache ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_flux.py \
+    --height 1024 \
+    --width 1024 \
+    --prompt "A cat holding a sign that says hello world" \
+    --output_path flux2_cat_sign_teacache.png \
+    --model_path ${MODEL_ROOT}/FLUX.2-dev/ \
+    --guidance_scale 4.0 \
+    --enable_teacache
+
+#############################################
+# LTX2 Text-to-Video+Audio Examples
+#############################################
+
+if [ -z "$SKIP_LTX2" ]; then
+    echo ""
+    echo "=== LTX2 Example 1: Video with Audio (Standard) ==="
+    python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_ltx2.py \
+        --height 512 \
+        --width 768 \
+        --num_frames 121 \
+        --prompt "A woman with long brown hair and light skin smiles at another woman with long blonde hair. The woman with brown hair wears a black jacket and has a small, barely noticeable mole on her right cheek. The camera angle is a close-up, focused on the woman with brown hair's face. The lighting is warm and natural, likely from the setting sun, casting a soft glow on the scene. The scene appears to be real-life footage" \
+        --negative_prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
+        --frame_rate 24.0 \
+        --guidance_scale 4.0 \
+        --output_path ltx2_woman_smiling.mp4 \
+        --model_path ${MODEL_ROOT}/LTX-2/
+fi
+
+if [ -z "$SKIP_LTX2" ]; then
+    if [ -z "$SKIP_MULTI_GPU" ]; then
+        echo ""
+        echo "=== LTX2 Example 2: Video with Audio (CFG Parallel, 2 GPUs) ==="
+        python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_ltx2.py \
+            --height 512 \
+            --width 768 \
+            --num_frames 121 \
+            --prompt "A woman with long brown hair and light skin smiles at another woman with long blonde hair. The woman with brown hair wears a black jacket and has a small, barely noticeable mole on her right cheek. The camera angle is a close-up, focused on the woman with brown hair's face. The lighting is warm and natural, likely from the setting sun, casting a soft glow on the scene. The scene appears to be real-life footage" \
+            --negative_prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
+            --frame_rate 24.0 \
+            --guidance_scale 4.0 \
+            --output_path ltx2_woman_smiling_cfg_parallel.mp4 \
+            --model_path ${MODEL_ROOT}/LTX-2/ \
+            --cfg_size 2
+    else
+        echo ""
+        echo "=== LTX2 Example 2: Skipped (requires 2 GPUs) ==="
+    fi
+else
+    echo ""
+    echo "=== LTX2 Examples: Skipped (av package not installed) ==="
+fi
+
 echo ""
 echo "============================================"
 echo "All examples completed successfully!"

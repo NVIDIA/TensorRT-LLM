@@ -78,7 +78,7 @@ echo ""
 #############################################
 
 echo "============================================"
-echo "1/1: WAN Baseline Test"
+echo "1/4: WAN Baseline Test"
 echo "============================================"
 echo ""
 
@@ -102,6 +102,113 @@ if [ -d "$WAN_MODEL" ]; then
     echo "   Output: $WAN_OUTPUT"
 else
     echo "⚠️  SKIPPED: WAN model not found at $WAN_MODEL"
+fi
+
+echo ""
+
+#############################################
+# FLUX.1 Baseline Test
+#############################################
+
+echo "============================================"
+echo "2/4: FLUX.1 Baseline Test"
+echo "============================================"
+echo ""
+
+FLUX1_MODEL="${MODEL_ROOT}/FLUX.1-dev/"
+FLUX1_OUTPUT="${OUTPUT_DIR}/flux1_baseline.png"
+
+if [ -d "$FLUX1_MODEL" ]; then
+    echo "Testing FLUX.1 with official diffusers..."
+    python ${PROJECT_ROOT}/examples/visual_gen/hf_flux.py \
+        --model_path "$FLUX1_MODEL" \
+        --output_path "$FLUX1_OUTPUT" \
+        --prompt "A cat holding a sign that says hello world" \
+        --height 1024 \
+        --width 1024 \
+        --steps 50 \
+        --guidance_scale 3.5 \
+        --seed 42
+    echo ""
+    echo "✅ FLUX.1 baseline test completed"
+    echo "   Output: $FLUX1_OUTPUT"
+else
+    echo "⚠️  SKIPPED: FLUX.1 model not found at $FLUX1_MODEL"
+fi
+
+echo ""
+
+#############################################
+# FLUX.2 Baseline Test
+#############################################
+
+echo "============================================"
+echo "3/4: FLUX.2 Baseline Test"
+echo "============================================"
+echo ""
+
+FLUX2_MODEL="${MODEL_ROOT}/FLUX.2-dev/"
+FLUX2_OUTPUT="${OUTPUT_DIR}/flux2_baseline.png"
+
+if [ -d "$FLUX2_MODEL" ]; then
+    echo "Testing FLUX.2 with official diffusers..."
+    python ${PROJECT_ROOT}/examples/visual_gen/hf_flux2.py \
+        --model_path "$FLUX2_MODEL" \
+        --output_path "$FLUX2_OUTPUT" \
+        --prompt "A cat holding a sign that says hello world" \
+        --height 1024 \
+        --width 1024 \
+        --steps 50 \
+        --guidance_scale 3.5 \
+        --seed 42
+    echo ""
+    echo "✅ FLUX.2 baseline test completed"
+    echo "   Output: $FLUX2_OUTPUT"
+else
+    echo "⚠️  SKIPPED: FLUX.2 model not found at $FLUX2_MODEL"
+fi
+
+echo ""
+
+#############################################
+# LTX2 Baseline Test
+#############################################
+
+echo "============================================"
+echo "4/4: LTX2 Baseline Test"
+echo "============================================"
+echo ""
+
+LTX2_MODEL="${MODEL_ROOT}/LTX-2/"
+LTX2_OUTPUT="${OUTPUT_DIR}/ltx2_baseline.mp4"
+
+if [ -z "$SKIP_LTX2" ]; then
+    if [ -d "$LTX2_MODEL" ]; then
+        echo "Testing LTX2 with official diffusers..."
+        python ${PROJECT_ROOT}/examples/visual_gen/hf_ltx2.py \
+            --model_path "$LTX2_MODEL" \
+            --output_path "$LTX2_OUTPUT" \
+            --prompt "A woman with long brown hair and light skin smiles at another woman with long blonde hair. The woman with brown hair wears a black jacket and has a small, barely noticeable mole on her right cheek. The camera angle is a close-up, focused on the woman with brown hair's face. The lighting is warm and natural, likely from the setting sun, casting a soft glow on the scene. The scene appears to be real-life footage" \
+            --negative_prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
+            --height 512 \
+            --width 768 \
+            --num_frames 121 \
+            --frame_rate 24.0 \
+            --steps 40 \
+            --guidance_scale 4.0 \
+            --seed 42
+        echo ""
+        echo "✅ LTX2 baseline test completed"
+        echo "   Output: $LTX2_OUTPUT"
+        echo ""
+        echo "   Note: If audio is silent, this is expected with"
+        echo "         current LTX-2 model weights (known issue)."
+    else
+        echo "⚠️  SKIPPED: LTX2 model not found at $LTX2_MODEL"
+    fi
+else
+    echo "⚠️  SKIPPED: av package not installed"
+    echo "   Install with: pip install av"
 fi
 
 echo ""
