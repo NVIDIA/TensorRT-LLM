@@ -2650,20 +2650,22 @@ class Linear(nn.Module):
             return False
         if self.all_reduce is None:
             return False
-        # Use NCCL window when the effective strategy is NCCL_SYMMETRIC. For
-        # AUTO we resolve via the autotuner cache; on cache miss or when we
-        # don't get a definite non-symmetric strategy (e.g. ONESHOT), treat as
-        # NCCL_SYMMETRIC so the allreduce can use the registered buffer.
+        # Use NCCL window when the effective strategy is NCCL_SYMMETRIC or NCCL.
+        # For AUTO we resolve via the autotuner cache; on cache miss or when we
+        # get NCCL_SYMMETRIC or NCCL, use the window so the allreduce can use the
+        # registered buffer. Runtime may still select NCCL_SYMMETRIC even when the
+        # cache said NCCL (e.g. workspace limits), so use window for NCCL too.
         if self.all_reduce.strategy == AllReduceStrategy.NCCL_SYMMETRIC:
             use_window = True
         elif self.all_reduce.strategy == AllReduceStrategy.AUTO:
             output_shape = (input.shape[0], self.out_features)
             effective = self.all_reduce.get_effective_strategy_for_shape(
                 output_shape, all_reduce_params)
-            # Cache miss (None) or NCCL_SYMMETRIC: use window. Only skip when
-            # we definitely got another strategy (ONESHOT, TWOSHOT, NCCL, etc.).
+            # Cache miss (None), NCCL_SYMMETRIC, or NCCL: use window. Only skip
+            # when we got a different strategy (ONESHOT, TWOSHOT, etc.).
             use_window = (effective is None
-                          or effective == AllReduceStrategy.NCCL_SYMMETRIC)
+                          or effective == AllReduceStrategy.NCCL_SYMMETRIC
+                          or effective == AllReduceStrategy.NCCL)
         else:
             use_window = False
         if not use_window:
