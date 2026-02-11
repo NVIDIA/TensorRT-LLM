@@ -608,6 +608,10 @@ class KVCacheManager(BaseResourceManager):
             # during warmup.
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
+            # Helix active rank sets past_seen_token_num = seqlen_this_rank_cp - 1
+            # in _prepare_tp_inputs; need token_num >= 2 so that doesn't go negative.
+            if self.mapping.has_cp_helix():
+                token_num = max(token_num, 2)
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -650,12 +654,14 @@ class KVCacheManager(BaseResourceManager):
                         req.py_prompt_len = req.prompt_len
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                        req.py_decoding_iter = 1
                     else:
                         req.py_helix_is_inactive_rank = True
                         req.prompt_len = token_num
                         req.py_prompt_len = req.prompt_len
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                        req.py_decoding_iter = 1
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     for _ in range(max_num_draft_tokens):
