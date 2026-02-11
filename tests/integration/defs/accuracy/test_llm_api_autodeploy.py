@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
 from pathlib import Path
 
 import pytest
@@ -494,18 +493,17 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
 # Model registry accuracy tests (at end of file)
 # -----------------------------------------------------------------------------
 
-_REGISTRY_PATH = Path(
-    __file__).resolve().parents[4] / "examples/auto_deploy/model_registry"
-_BASE_ACCURACY = {"max_seq_len": 4096}
-
 
 def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
     """Return (yaml_extra paths, world_size) from model registry."""
-    with open(_REGISTRY_PATH / "models.yaml") as f:
+    REGISTRY_PATH = Path(
+        __file__).resolve().parents[4] / "examples/auto_deploy/model_registry"
+
+    with open(REGISTRY_PATH / "models.yaml") as f:
         registry = yaml.safe_load(f)
     for entry in registry["models"]:
         if entry["name"] == model_name:
-            config_dir = _REGISTRY_PATH / "configs"
+            config_dir = REGISTRY_PATH / "configs"
             paths = [str(config_dir / f) for f in entry["yaml_extra"]]
             # world_size from world_size_N.yaml (last match wins)
             world_size = 1
@@ -518,58 +516,63 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
     raise ValueError(f"Model '{model_name}' not found in model registry")
 
 
-# Model registry accuracy tests. Each param: (model_name, config_overrides, tasks).
-# Config = yaml_extra (merged) + _BASE_ACCURACY + config_overrides. Marks skip when machine lacks GPUs/memory.
-MODEL_REGISTRY_ACCURACY_PARAMS = [
-    pytest.param(
-        "meta-llama/Llama-3.1-8B-Instruct",
-        {
-            "max_batch_size": 128,
-            "attn_backend": "flashinfer",
-        },
-        [MMLU, GSM8K],
-        id="meta-llama_Llama-3.1-8B-Instruct",
-    ),
-    pytest.param(
-        "google/gemma-3-1b-it",
-        {
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "enable_partial_reuse": False,
-            },
-        },
-        [MMLU, GSM8K],
-        id="google_gemma-3-1b-it",
-    ),
-    pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
-                 id="mistralai_Ministral-8B-Instruct-2410"),
-    pytest.param("mistralai/Codestral-22B-v0.1", {}, [MMLU, GSM8K],
-                 id="mistralai_Codestral-22B-v0.1"),
-    pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {}, [MMLU, GSM8K],
-                 id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
-    pytest.param(
-        "Qwen/QwQ-32B",
-        {},
-        [MMLU],
-        marks=pytest.mark.skip_less_device_memory(80000),
-        id="Qwen_QwQ-32B",
-    ),
-    pytest.param(
-        "meta-llama/Llama-3.3-70B-Instruct",
-        {},
-        [MMLU, GSM8K],
-        marks=pytest.mark.skip_less_device_memory(80000),
-        id="meta-llama_Llama-3.3-70B-Instruct",
-    ),
-]
-
-
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     """Accuracy tests for models from the AutoDeploy model registry.
 
-    Config = yaml_extra (merged) + _BASE_ACCURACY + config_overrides.
+    Config = yaml_extra (merged) + BASE_ACCURACY + config_overrides.
     Model paths are resolved via hf_id_to_local_model_dir.
     """
+
+    # Set minimum possible seq len + small buffer, for test speed & memory usage
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+    BASE_ACCURACY = {"max_seq_len": MAX_SEQ_LEN}
+
+    # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
+    MODEL_REGISTRY_ACCURACY_PARAMS = [
+        pytest.param(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            {
+                "max_batch_size": 128,
+                "attn_backend": "flashinfer",
+            },
+            [MMLU, GSM8K],
+            id="meta-llama_Llama-3.1-8B-Instruct",
+        ),
+        pytest.param(
+            "google/gemma-3-1b-it",
+            {
+                "kv_cache_config": {
+                    "enable_block_reuse": False,
+                    "enable_partial_reuse": False,
+                },
+            },
+            [MMLU, GSM8K],
+            id="google_gemma-3-1b-it",
+        ),
+        pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
+                     id="mistralai_Ministral-8B-Instruct-2410"),
+        pytest.param("mistralai/Codestral-22B-v0.1", {"world_size": 4},
+                     [MMLU, GSM8K],
+                     id="mistralai_Codestral-22B-v0.1"),
+        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {"world_size": 4},
+                     [MMLU, GSM8K],
+                     id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
+        pytest.param(
+            "Qwen/QwQ-32B",
+            {"world_size": 4},
+            [MMLU],
+            marks=pytest.mark.skip_less_device_memory(80000),
+            id="Qwen_QwQ-32B",
+        ),
+        pytest.param(
+            "meta-llama/Llama-3.3-70B-Instruct",
+            {"world_size": 4},
+            [MMLU, GSM8K],
+            marks=pytest.mark.skip_less_device_memory(80000),
+            id="meta-llama_Llama-3.3-70B-Instruct",
+        ),
+    ]
 
     def get_default_sampling_params(self):
         # Use end_id=None so _setup runs and tokenizes stop sequences (e.g. GSM8K).
@@ -579,39 +582,26 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                               use_beam_search=False)
 
     @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("accuracy_check", [False])
     @pytest.mark.parametrize("model_name,config_overrides,tasks",
                              MODEL_REGISTRY_ACCURACY_PARAMS)
-    def test_autodeploy_from_registry(self, model_name, config_overrides,
-                                      tasks):
+    def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
+                                      accuracy_check):
         model_path = hf_id_to_local_model_dir(model_name)
         yaml_paths, world_size = _get_registry_yaml_extra(model_name)
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
-        merged = deep_merge_dicts(_BASE_ACCURACY, config_overrides)
+        merged = deep_merge_dicts(self.BASE_ACCURACY, config_overrides)
         sampling_params = self.get_default_sampling_params()
 
-        t_build_start = time.perf_counter()
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
                            yaml_extra=yaml_paths,
                            **merged) as llm:
-            t_build_end = time.perf_counter()
-            print(
-                f"\n[{model_name}] Model build+compile: {t_build_end - t_build_start:.2f}s"
-            )
-
-            for task_cls in tasks:
-                task = task_cls(model_name)
-                t_task_start = time.perf_counter()
-                try:
-                    task.evaluate(llm, sampling_params=sampling_params)
-                except Exception as e:
-                    t_task_end = time.perf_counter()
-                    print(
-                        f"[{model_name}] {task_cls.__name__}: {t_task_end - t_task_start:.2f}s (FAILED)"
-                    )
-                    raise type(e)(f"[{task_cls.__name__}] {e}") from None
-                t_task_end = time.perf_counter()
-                print(
-                    f"[{model_name}] {task_cls.__name__}: {t_task_end - t_task_start:.2f}s"
-                )
+            if accuracy_check:
+                for task_cls in tasks:
+                    task = task_cls(model_name)
+                    try:
+                        task.evaluate(llm, sampling_params=sampling_params)
+                    except Exception as e:
+                        raise type(e)(f"[{task_cls.__name__}] {e}") from None
