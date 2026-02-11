@@ -518,8 +518,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     Configuration derived from examples/auto_deploy/model_registry/configs/qwen3Next.yaml.
     """
 
-    MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
+    MODEL_NAME = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
     def get_default_kwargs(self):
         return {
@@ -538,6 +537,9 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             "transforms": {
                 "compile_model": {
                     "backend": "torch-simple",
+                },
+                "export_to_gm": {
+                    "num_moe_experts_for_export": 2,
                 },
                 "detect_sharding": {
                     "sharding_source": ['factory', 'heuristic'],
