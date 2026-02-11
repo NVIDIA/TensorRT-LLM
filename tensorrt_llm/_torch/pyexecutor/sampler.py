@@ -369,10 +369,6 @@ def _get_max_beam_width(request: LlmRequest) -> int:
     return max_beam_width
 
 
-def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
-    return not params.use_beam_search
-
-
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
     temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
@@ -393,17 +389,13 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
 
 
 def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
-    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
-    # resolve it on every iteration.
-    if request._py_sampling_strategy is not None:
-        return request._py_sampling_strategy
+    """Resolve the sampling strategy for a request.
 
+    Note: Callers inside _group_requests_by_strategy_key benefit from store.strategies
+    caching, which ensures this function is called at most once per request per slot.
+    """
     params = _request_get_sampling_params(request)
-    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
-    if _request_sampling_params_cachable(params):
-        # Cache the already-computed strategy (avoid redundant resolve call)
-        request._py_sampling_strategy = sampling_strategy
-    return sampling_strategy
+    return resolve_sampling_strategy(params, vocab_size=vocab_size)
 
 
 def _group_requests_by_strategy_key(
@@ -427,8 +419,8 @@ def _group_requests_by_strategy_key(
     if n == 0:
         return {}
 
-    seq_slots_cpu = seq_slots.cpu() if seq_slots.is_cuda else seq_slots
-    seq_slots_list = seq_slots_cpu.tolist()
+    assert not seq_slots.is_cuda, "seq_slots is expected to be a host tensor"
+    seq_slots_list = seq_slots.tolist()
 
     # Get strategies from cache, only recomputing for slots that need it.
     # Recompute is needed for:
@@ -442,13 +434,14 @@ def _group_requests_by_strategy_key(
 
     # Build slot→request_index mapping for targeted access
     slot_to_idx = {slot: i for i, slot in enumerate(seq_slots_list)}
+    active_slots = set(slot_to_idx)
 
     # 1) Slots pre-recorded for recompute (context-phase or beam search)
-    recompute_batch_slots = store.slots_needing_recompute & slot_to_idx.keys()
+    recompute_batch_slots = store.slots_needing_recompute & active_slots
 
     # 2) Non-greedy slots where draft-token status may have changed
     #    (For greedy: current_has_draft is always False, matching cached, so never stale)
-    draft_check_slots = (store.non_greedy_slots & slot_to_idx.keys()) - recompute_batch_slots
+    draft_check_slots = (store.non_greedy_slots & active_slots) - recompute_batch_slots
     for slot in draft_check_slots:
         i = slot_to_idx[slot]
         has_draft = bool(requests_list[i].py_draft_tokens)
@@ -459,13 +452,14 @@ def _group_requests_by_strategy_key(
             store.needs_probs[slot] = has_draft or store.need_processed[slot]
 
     # 3) Full recompute for the pre-recorded slots.
-    #    Also catch any uncached slots not in the recompute set (safety fallback
-    #    for code paths that bypass setup_sampler_step, e.g. unit tests).
-    if None in strategies:
-        # Some strategies are still None — include those slots for recompute
-        for i in range(n):
-            if strategies[i] is None:
-                recompute_batch_slots.add(seq_slots_list[i])
+    #    Every slot with a None strategy must already be in slots_needing_recompute
+    #    (populated by setup_sampler_step when a new request arrives).
+    assert None not in strategies or all(
+        seq_slots_list[i] in recompute_batch_slots for i in range(n) if strategies[i] is None
+    ), (
+        "Found slots with uncached strategies not registered in slots_needing_recompute. "
+        "Ensure setup_sampler_step is called before sample_async for new requests."
+    )
 
     for slot in recompute_batch_slots:
         i = slot_to_idx[slot]
@@ -512,8 +506,9 @@ def _group_requests_by_strategy_key(
     need_raw = torch.tensor(
         [store.need_raw[slot] for slot in seq_slots_list], dtype=torch.bool, device="cpu"
     )
-    # Build strategy ID mapping for vectorized comparison (all on CPU)
-    unique_strategies = list(dict.fromkeys(strategies))  # Preserve order, dedupe
+    # Build strategy ID mapping for vectorized comparison (all on CPU).
+    # NB: set() does not preserve insertion order, so we use dict.fromkeys() to deduplicate while preserving order.
+    unique_strategies = list(dict.fromkeys(strategies))
     strategy_to_id = {s: idx for idx, s in enumerate(unique_strategies)}
     strategy_ids = torch.tensor(
         [strategy_to_id[s] for s in strategies], dtype=torch.int32, device="cpu"
@@ -521,8 +516,16 @@ def _group_requests_by_strategy_key(
 
     # Pre-allocate group_ids array
     group_ids = torch.empty(n, dtype=torch.int32, device="cpu")
-    unique_keys: dict[tuple, int] = {}
-    gid = 0
+
+    _next_gid = 0
+
+    def _provision_gid() -> int:
+        nonlocal _next_gid
+        gid = _next_gid
+        _next_gid += 1
+        return gid
+
+    unique_keys: defaultdict[tuple, int] = defaultdict(_provision_gid)
 
     # Vectorized assignment: loop over unique combinations instead of all requests
     for sid, strategy in enumerate(unique_strategies):
@@ -535,28 +538,22 @@ def _group_requests_by_strategy_key(
             if torch.any(mask):
                 strategy_key = strategy_to_key(strategy)  # Called once per group!
                 key = (strategy_key, needs_probs_val)
-                if key not in unique_keys:
-                    unique_keys[key] = gid
-                    gid += 1
                 group_ids[mask] = unique_keys[key]  # Vectorized assignment
 
-    n_groups = len(unique_keys)
-
-    # Efficient grouping using argsort
-    sorted_order = torch.argsort(group_ids, stable=True)
-    sorted_group_ids = group_ids[sorted_order]
+    # Efficient grouping using sort
+    sorted_group_ids, sorted_order = torch.sort(group_ids, stable=True)
     # Use prepend to detect a "change" at position 0, giving us group_starts directly
-    group_starts = torch.where(
+    group_starts = torch.nonzero(
         torch.diff(sorted_group_ids, prepend=torch.tensor([-1], device="cpu")) != 0
-    )[0]
+    ).squeeze(1)
     group_ends = torch.cat([group_starts[1:], torch.tensor([n], device="cpu")])
-    id_to_key = {v: k for k, v in unique_keys.items()}
+    # Since groups are assigned in request order, gid → key is just list indexing
+    id_to_key = list(unique_keys)
 
     # Build result dictionary efficiently
     result: dict[RequestGroupKey, RequestGroupValue] = {}
 
-    for gid in range(n_groups):
-        start, end = group_starts[gid].item(), group_ends[gid].item()
+    for gid, (start, end) in enumerate(zip(group_starts.tolist(), group_ends.tolist())):
         group_sorted_indices = sorted_order[start:end]
         strategy_key, needs_probs_bool = id_to_key[gid]
 
@@ -565,7 +562,7 @@ def _group_requests_by_strategy_key(
         group_sorted_indices_list = group_sorted_indices.tolist()
         group_strategies = [strategies[i] for i in group_sorted_indices_list]
         spec_mask = speculation_needs_probs[group_sorted_indices]
-        spec_indices = group_sorted_indices[spec_mask].to(torch.int32)
+        spec_indices = indices_arr[spec_mask]
         processed_flags = need_processed[group_sorted_indices]
         raw_flags = need_raw[group_sorted_indices]
 

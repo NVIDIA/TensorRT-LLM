@@ -84,9 +84,6 @@ class TestStrategySelection:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
 
-        def __init__(self):
-            self._py_sampling_strategy: Strategy | None = None
-
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
@@ -1198,6 +1195,24 @@ class TestBatchedSampling:
             )
         )
 
+    @staticmethod
+    def _init_store_for_new_requests(
+        sampler: TorchSampler,
+        scheduled_requests: ScheduledRequests,
+    ) -> None:
+        """Initialize store for request slots that haven't been through setup_sampler_step.
+
+        In production, setup_sampler_step registers each new request's slot in
+        store.slots_needing_recompute so that _group_requests_by_strategy_key
+        knows to compute its strategy.  Tests skip setup_sampler_step, so we
+        replicate the relevant initialization here to exercise the same code
+        path as production.
+        """
+        for req in scheduled_requests.all_requests():
+            slot = req.py_seq_slot
+            if sampler.store.strategies[slot] is None:
+                sampler.store.slots_needing_recompute.add(slot)
+
     def _sample(
         self,
         sampler: TorchSampler,
@@ -1212,6 +1227,9 @@ class TestBatchedSampling:
         Optionally, run sampling repeatedly, e.g., to gather statistics.
         """
         assert not scheduled_requests.context_requests
+        # Simulate the store initialization that setup_sampler_step performs
+        # for new requests in production.
+        self._init_store_for_new_requests(sampler, scheduled_requests)
         num_actual_repeats = num_repeats if num_repeats is not None else 1
 
         T = TypeVar("T")
