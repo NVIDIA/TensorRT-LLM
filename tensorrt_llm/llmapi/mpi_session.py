@@ -170,16 +170,14 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
-        # Pass TRTLLM/TLLM env vars plus CUDA_VISIBLE_DEVICES for GPU assignment
-        # CUDA_VISIBLE_DEVICES must be in the env dict (not just set in worker code)
-        # because it needs to be set before Python/CUDA initialization
+        # Pass TRTLLM/TLLM env vars to workers
         env = {
             key: value
-            for key, value in os.environ.items() if key.startswith("TRTLLM")
-            or key.startswith("TLLM") or key == "CUDA_VISIBLE_DEVICES"
+            for key, value in os.environ.items()
+            if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
-        # Also set CUDA_VISIBLE_DEVICES from TRTLLM_VISIBLE_DEVICES if present
-        if "TRTLLM_VISIBLE_DEVICES" in env and "CUDA_VISIBLE_DEVICES" not in env:
+        # Set CUDA_VISIBLE_DEVICES from TRTLLM_VISIBLE_DEVICES if present
+        if "TRTLLM_VISIBLE_DEVICES" in env:
             env["CUDA_VISIBLE_DEVICES"] = env["TRTLLM_VISIBLE_DEVICES"]
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,

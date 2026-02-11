@@ -86,8 +86,16 @@ from helpers import (get_input_tensor_by_name, get_output_config_from_request,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi.llm import RequestOutput
+# NOTE: tensorrt_llm imports are deferred to initialize() to support multi-instance deployments.
+# Root cause: CUDA is not fork-safe. Importing tensorrt_llm imports torch, which initializes
+# CUDA and opens file descriptors to /dev/nvidia* devices. MPI_Comm_spawn (used by mpi4py)
+# inherits these FDs, causing child processes to ignore CUDA_VISIBLE_DEVICES.
+# Solution: Set CUDA_VISIBLE_DEVICES BEFORE importing tensorrt_llm, so CUDA only opens FDs
+# to the assigned GPUs, and children inherit the correct restricted state.
+# See: https://stackoverflow.com/questions/22950047/cuda-initialization-error-after-fork
+LLM = None
+SamplingParams = None
+RequestOutput = None
 
 
 @dataclass
@@ -227,13 +235,18 @@ class TritonPythonModel:
                 g.strip() for g in self._gpu_ids.split(",") if g.strip()
             ]
 
-            # Set TRTLLM_VISIBLE_DEVICES for workers (passed via env in mpi_session.py)
+            # Set CUDA_VISIBLE_DEVICES BEFORE importing tensorrt_llm (see module-level comment)
+            os.environ["CUDA_VISIBLE_DEVICES"] = self._gpu_ids
             os.environ["TRTLLM_VISIBLE_DEVICES"] = self._gpu_ids
 
             self.logger.log_info(
                 f"[trtllm] Instance {self._instance_idx}: gpu_ids={self._gpu_ids}, instance_count={instance_count}"
             )
 
+        # Import tensorrt_llm AFTER setting CUDA_VISIBLE_DEVICES
+        global LLM, SamplingParams, RequestOutput
+        from tensorrt_llm import LLM, SamplingParams
+        from tensorrt_llm.llmapi.llm import RequestOutput
         from tensorrt_llm.llmapi.llm_utils import \
             update_llm_args_with_extra_dict
 
@@ -258,9 +271,6 @@ class TritonPythonModel:
             # This will be automatically passed to MPI workers and converted to CUDA_VISIBLE_DEVICES
             if self._use_multi_instance:
                 self.llm_engine_args["gpus_per_node"] = len(self._gpu_id_list)
-                os.environ["TRTLLM_VISIBLE_DEVICES"] = self._gpu_ids
-                print(f"[model.py] Set TRTLLM_VISIBLE_DEVICES={self._gpu_ids}",
-                      flush=True)
 
             self.logger.log_info(
                 f"[trtllm] Starting trtllm engine with args: {self.llm_engine_args}"

@@ -864,28 +864,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         'gate_up_proj': ['gate_proj', 'up_proj']
     }
     device_id = local_mpi_rank()
-    # Debug: Log device selection and verify physical GPU
-    import os as _os
-
-    import torch as _torch
-    _torch.cuda.set_device(device_id)
-    # Get device properties to identify physical GPU
-    _props = _torch.cuda.get_device_properties(device_id)
-    # Try to get PCI bus ID via pynvml
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        _handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
-        _pci = pynvml.nvmlDeviceGetPciInfo(_handle)
-        _pci_bus = f"{_pci.busId.decode() if isinstance(_pci.busId, bytes) else _pci.busId}"
-    except Exception as e:
-        _pci_bus = f"error: {e}"
-    print(
-        f"[modeling_utils.py load_weights] pid={_os.getpid()}, device_id={device_id}, "
-        f"device_name={_props.name}, pci_bus={_pci_bus}, "
-        f"CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}, "
-        f"device_count={_torch.cuda.device_count()}",
-        flush=True)
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
@@ -1021,42 +999,6 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
         weights = weight_mapper.rename_by_params_map(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
     device_id = local_mpi_rank()
-    # Debug: Log device selection - use before/after memory to identify physical GPU
-    import os as _os
-    import subprocess as _sp
-
-    import torch as _torch
-
-    def _get_gpu_mem():
-        try:
-            out = _sp.check_output([
-                'nvidia-smi', '--query-gpu=index,memory.used',
-                '--format=csv,noheader,nounits'
-            ],
-                                   text=True)
-            return {
-                line.split(',')[0].strip(): int(line.split(',')[1].strip())
-                for line in out.strip().split('\n')
-            }
-        except:
-            return {}
-
-    _before = _get_gpu_mem()
-    _torch.cuda.set_device(device_id)
-    _test = _torch.zeros(1024 * 1024, device=f'cuda:{device_id}')  # 4MB
-    _torch.cuda.synchronize()
-    _after = _get_gpu_mem()
-    _increased = [
-        f"GPU{gpu}" for gpu in _after if _after[gpu] > _before.get(gpu, 0)
-    ]
-    del _test
-    _torch.cuda.empty_cache()
-    print(
-        f"[modeling_utils.py load_state_dict] pid={_os.getpid()}, device_id={device_id}, "
-        f"actual_physical_gpu={_increased}, "
-        f"CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}, "
-        f"device_count={_torch.cuda.device_count()}",
-        flush=True)
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
