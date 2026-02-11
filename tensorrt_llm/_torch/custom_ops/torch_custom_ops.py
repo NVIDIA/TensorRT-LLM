@@ -1687,10 +1687,11 @@ class AllReduceRunner(TunableRunner):
         )
 
     @classmethod
-    def _maybe_preallocate_buffers(cls, input_tensor: torch.Tensor,
-                                   group: List[int]) -> None:
-        if not AutoTuner.get().is_tuning_mode or not AutoTuner.get(
-        )._is_preparation:
+    def _maybe_preallocate_buffers(cls,
+                                   input_tensor: torch.Tensor,
+                                   group: List[int],
+                                   do_preparation: bool = False) -> None:
+        if not do_preparation:
             return
         if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
             return
@@ -1762,7 +1763,9 @@ class AllReduceRunner(TunableRunner):
                                                    OptimizationProfile(),
                                                    **kwargs)
             if AllReduceStrategy.NCCL_SYMMETRIC.value in valid_tactics:
-                self._maybe_preallocate_buffers(input, self.group)
+                self._maybe_preallocate_buffers(input,
+                                                self.group,
+                                                do_preparation=True)
             return input
         if tactic == -1:
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
