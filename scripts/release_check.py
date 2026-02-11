@@ -36,13 +36,20 @@ def run_cmd(cmd):
     return result
 
 
-def run_precommit_with_timing(params):
-    """Run pre-commit with timing information for each hook"""
+def run_precommit_with_timing(precommit_args):
+    """Run pre-commit with timing information for each hook.
+
+    Args:
+        precommit_args: Arguments to pass to `pre-commit run`, e.g.
+            "-a" for all files, or
+            "--from-ref origin/main --to-ref HEAD" for changed files.
+    """
 
     print("Running pre-commit checks with performance monitoring...")
     print("=" * 80)
 
-    cmd = f"pre-commit run {params} --show-diff-on-failure --verbose"
+    cmd = f"pre-commit run {precommit_args} --show-diff-on-failure --verbose"
+    print(f"Command: {cmd}")
 
     # Track hook execution times
     # Since hooks run sequentially, we can estimate each hook's duration
@@ -160,16 +167,39 @@ def handle_check_failure(error_msg):
 
 def main():
     # Parse command line arguments
+    # Usage:
+    #   All files:      python release_check.py -a
+    #   Changed files:  python release_check.py --from-ref origin/main --to-ref HEAD
     parser = argparse.ArgumentParser(description="Release Check")
-    parser.add_argument("--params",
-                        default="-a",
-                        help="Parameters for pre-commit")
+    parser.add_argument(
+        "-a",
+        "--all-files",
+        action="store_true",
+        help="Run pre-commit on all files",
+    )
+    parser.add_argument(
+        "--from-ref",
+        default=None,
+        help="Start ref for changed file detection (e.g. origin/main)",
+    )
+    parser.add_argument(
+        "--to-ref",
+        default=None,
+        help="End ref for changed file detection (e.g. HEAD)",
+    )
     args = parser.parse_args()
 
-    if args.params == "-a":
-        print("Running pre-commit on all files")
+    # Build pre-commit arguments
+    if args.all_files:
+        precommit_args = "--all-files"
+        print("=== Running pre-commit on ALL files ===")
+    elif args.from_ref and args.to_ref:
+        precommit_args = f"--from-ref {args.from_ref} --to-ref {args.to_ref}"
+        print(f"=== Running pre-commit on changed files ({args.from_ref}..{args.to_ref}) ===")
     else:
-        print("Running pre-commit on changed files")
+        # Default: all files (backward compatible)
+        precommit_args = "--all-files"
+        print("=== No ref range specified, running pre-commit on ALL files ===")
 
     # Install pre-commit and bandit from requirements-dev.txt
     with open("requirements-dev.txt") as f:
@@ -183,9 +213,9 @@ def main():
     # Install pre-commit hooks
     run_cmd("pre-commit install")
 
-    # Run pre-commit on all files with performance monitoring
+    # Run pre-commit with performance monitoring
     try:
-        run_precommit_with_timing(args.params)
+        run_precommit_with_timing(precommit_args)
     except SystemExit:
         handle_check_failure("pre-commit checks failed")
 

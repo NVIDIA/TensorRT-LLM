@@ -430,12 +430,13 @@ def launchReleaseCheck(pipeline, globalVars)
         }
 
         // Step 3: Run pre-commit checks
-        def params = "-a"
-        def targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+        // Post-merge CI runs on all files; pre-merge CI runs only on changed files.
+        def precommitArgs = "-a"
         if (!(env.JOB_NAME ==~ /.*PostMerge.*/ || env.alternativeTRT)) {
-            params = "--from-ref origin/${targetBranch} --to-ref HEAD"
+            def targetBranch = env.gitlabTargetBranch ?: "globalVars[TARGET_BRANCH]"
+            precommitArgs = "--from-ref origin/${targetBranch} --to-ref HEAD"
         }
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py --params=${params} || (git restore . && false)")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py ${precommitArgs} || (git restore . && false)")
 
         // Step 4: Run license check
         withEnv(['GONOSUMDB=*.nvidia.com']) {
