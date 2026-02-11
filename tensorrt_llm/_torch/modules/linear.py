@@ -2352,6 +2352,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        enable_gemm_allreduce_fusion: bool = True,
     ):
         """
         Args:
