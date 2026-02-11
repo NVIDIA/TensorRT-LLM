@@ -51,20 +51,28 @@ def apply_rope_with_input_pos_flashinfer(
     """
     q_shape = q.shape
     k_shape = k.shape
-    head_dim = cos_sin_cache.shape[-1]
 
-    position_ids = position_ids.view(-1).to(q.device).int()  # flashinfer requires int
-    num_nnz = position_ids.shape[0]
+    position_ids = position_ids.view(-1).to(device=q.device, dtype=torch.int32)
 
-    q_flat = q.reshape(num_nnz, -1)
-    k_flat = k.reshape(num_nnz, -1)
+    # Flatten batch and seq dims only (contiguous), keep (num_heads, head_dim) as-is.
+    # This avoids forcing .contiguous() on non-contiguous split_with_sizes outputs.
+    q_3d = q.flatten(0, -3)  # [B, S, H, D] -> [nnz, H, D]
+    k_3d = k.flatten(0, -3)
 
-    query_rotated_flash, key_rotated_flash = flashinfer.rope.apply_rope_with_cos_sin_cache(
-        position_ids, q_flat, k_flat, head_dim, cos_sin_cache, is_neox=is_neox
+    q_rope = torch.empty_like(q_3d)
+    k_rope = torch.empty_like(k_3d)
+
+    flashinfer.rope._apply_rope_pos_ids_cos_sin_cache(
+        q=q_3d,
+        k=k_3d,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=position_ids,
+        interleave=(not is_neox),
     )
-    query_rotated_flash = query_rotated_flash.reshape(q_shape)
-    key_rotated_flash = key_rotated_flash.reshape(k_shape)
-    return query_rotated_flash, key_rotated_flash
+
+    return q_rope.view(q_shape), k_rope.view(k_shape)
 
 
 @apply_rope_with_input_pos_flashinfer.register_fake

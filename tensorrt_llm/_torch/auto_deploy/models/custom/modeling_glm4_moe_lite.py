@@ -18,6 +18,7 @@ The GLM4 MoE Lite model uses Multi-head Latent Attention (MLA), similar to DeepS
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -29,6 +30,10 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
+    _rope_deinterleave_load_hook,
+    build_cos_sin_caches,
+)
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
 
@@ -189,19 +194,26 @@ class Glm4MoeLiteRotaryEmbedding(nn.Module):
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
         t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
+        freqs = torch.outer(t, self.inv_freq)  # [max_seq_len, D/2]
+
+        cos_full, sin_full, cos_sin_cache = build_cos_sin_caches(
+            freqs, scale=self.attention_scaling
+        )
+
         # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        self.register_buffer("_ad_cos_cached", emb.cos() * self.attention_scaling, persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin() * self.attention_scaling, persistent=False)
+        self.register_buffer("_ad_cos_cached", cos_full, persistent=False)
+        self.register_buffer("_ad_sin_cached", sin_full, persistent=False)
+        self.register_buffer("_ad_rope_cos_sin_cache", cos_sin_cache, persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached cos/sin (not sliced) for export compatibility
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Return full cached cos/sin (not sliced) for export compatibility,
+        # plus pre-fused cache for FlashInfer RoPE optimization
         return (
             self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
             self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
+            self._ad_rope_cos_sin_cache,
         )
 
 
@@ -257,11 +269,12 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
             / self._yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
         )
 
-        emb = torch.cat((freqs, freqs), dim=-1)
+        cos_full, sin_full, cos_sin_cache = build_cos_sin_caches(freqs, scale=_mscale)
+
         # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        # Note: attention_scaling is already incorporated in _mscale for YaRN
-        self.register_buffer("_ad_cos_cached", (emb.cos() * _mscale), persistent=False)
-        self.register_buffer("_ad_sin_cached", (emb.sin() * _mscale), persistent=False)
+        self.register_buffer("_ad_cos_cached", cos_full, persistent=False)
+        self.register_buffer("_ad_sin_cached", sin_full, persistent=False)
+        self.register_buffer("_ad_rope_cos_sin_cache", cos_sin_cache, persistent=False)
 
     @staticmethod
     def _yarn_find_correction_dim(
@@ -545,12 +558,13 @@ class Glm4MoeLiteAttention(nn.Module):
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
 
         # Get cos/sin from position_embeddings (full cached from shared rotary embedding)
-        cos, sin = position_embeddings  # Full table: [max_seq_len, head_dim]
+        cos = position_embeddings[0]  # Full table: [max_seq_len, head_dim]
+        sin = position_embeddings[1]  # Full table: [max_seq_len, head_dim]
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 
-        # Apply RoPE using custom op
-        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
+        # Apply RoPE using custom op (weights pre-permuted to NeoX format at load time)
+        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
             q_pe,
             k_pe,
             cos,
@@ -788,6 +802,19 @@ class Glm4MoeLiteForCausalLM(Glm4MoeLitePreTrainedModel, GenerationMixin):
         self.model = Glm4MoeLiteModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Pre-permute RoPE weight rows from interleaved to NeoX format at load time
+        # so the forward can use torch_rope_with_explicit_cos_sin (→ flashinfer_rope).
+        self._register_load_state_dict_pre_hook(
+            partial(
+                _rope_deinterleave_load_hook,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                num_heads=config.num_attention_heads,
+                kv_lora_rank=config.kv_lora_rank,
+                num_layers=config.num_hidden_layers,
+            )
+        )
 
         self.post_init()
 
