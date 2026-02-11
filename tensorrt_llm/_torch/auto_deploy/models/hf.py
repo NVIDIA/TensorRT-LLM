@@ -244,10 +244,12 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self._set_sharding_config(model.config)
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
-        model.eval()
-
+        # Apply quantization config reader post-processing (e.g., ModelOpt state restoration)
+        # This must happen before model.eval() and quantization transforms run
         if self._quant_config_reader is not None:
             model = self._quant_config_reader.post_process_model(model, model_config)
+
+        model.eval()
 
         return model
 

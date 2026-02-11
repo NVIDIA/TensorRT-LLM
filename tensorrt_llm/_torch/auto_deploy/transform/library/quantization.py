@@ -141,6 +141,13 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
+        # check modelopt quantizers from graph - must redirect args BEFORE extracting weights
+        if is_quantized_graph:
+            input_params, weight_params, output_params = get_quantization_params_from_linear_node(
+                node
+            )
+            node.args = (input_params.input_node, weight_params.input_node, *node.args[2:])
+
         lin_weight = get_weight_info(node)
         if lin_weight is None:
             raise ValueError(f"Linear node {node.name} has no weight")
@@ -150,14 +157,8 @@ class Quantization(BaseTransform):
 
         setattr(lin_weight.submod, attrname, new_param)
 
-        # check modelopt quantizers from graph
+        # handle modelopt quantizers from graph
         if is_quantized_graph:
-            input_params, weight_params, output_params = get_quantization_params_from_linear_node(
-                node
-            )
-            # redirect to input and weight
-            node.args = (input_params.input_node, weight_params.input_node, *node.args[2:])
-
             # redirect output to skip output quantizer if any
             user = list(node.users.keys())[0]
             if len(node.users) == 1 and is_quantized_op(user):

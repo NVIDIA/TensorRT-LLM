@@ -85,6 +85,10 @@ class QuantConfigReaderRegistry:
 class ModelOPTQuantConfigReader(QuantConfigReader):
     _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*", "*.mlp.gate")
 
+    def __init__(self):
+        super().__init__()
+        self._ckpt_dir: Optional[str] = None
+
     def read_config(self, config: Dict) -> Dict:
         producer = config.get("producer", {}).get("name")
         # sanity check
@@ -136,8 +140,77 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
         with open(quant_file, "r") as f:
             raw = json.load(f)
         reader = cls()
+        reader._ckpt_dir = ckpt_dir  # Store checkpoint directory for later use
         extra_model_kwargs = reader.read_config(raw)
         return reader, extra_model_kwargs
+
+    def post_process_model(self, model, model_config):
+        """Restore ModelOpt quantization state if modelopt_state.pth exists."""
+        if self._ckpt_dir is None:
+            return model
+
+        mto_ckpt_path = os.path.join(self._ckpt_dir, "modelopt_state.pth")
+        if os.path.exists(mto_ckpt_path):
+            import modelopt.torch.opt as mto
+            import torch
+
+            modelopt_state = torch.load(mto_ckpt_path, weights_only=False)
+            mto.restore_from_modelopt_state(model, modelopt_state)
+
+        return model
+
+
+@QuantConfigReaderRegistry.register("modelopt_fakequant")
+class ModelOPTFakeQuantConfigReader(QuantConfigReader):
+    """
+    Reader for ModelOpt fake-quantized checkpoints saved via mto.save_pretrained().
+
+    These checkpoints contain modelopt_state.pth.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._ckpt_dir: Optional[str] = None
+
+    def read_config(self, config: Dict) -> Dict:
+        """No config to read for fake-quant checkpoints."""
+        return {}
+
+    @classmethod
+    def from_file(
+        cls, ckpt_dir: str
+    ) -> Optional[Tuple["ModelOPTFakeQuantConfigReader", Dict[str, Any]]]:
+        """
+        Check for modelopt_state.pth in the checkpoint directory.
+
+        Args:
+            ckpt_dir: Path to the root directory containing the checkpoint.
+
+        Returns:
+            An initialized reader instance, or None if modelopt_state.pth doesn't exist.
+        """
+        mto_state_file = os.path.join(ckpt_dir, "modelopt_state.pth")
+        if not os.path.exists(mto_state_file):
+            return None
+
+        reader = cls()
+        reader._ckpt_dir = ckpt_dir
+        return reader, {}
+
+    def post_process_model(self, model, model_config):
+        """Restore ModelOpt quantization state from modelopt_state.pth."""
+        if self._ckpt_dir is None:
+            return model
+
+        mto_ckpt_path = os.path.join(self._ckpt_dir, "modelopt_state.pth")
+        if os.path.exists(mto_ckpt_path):
+            import modelopt.torch.opt as mto
+            import torch
+
+            modelopt_state = torch.load(mto_ckpt_path, weights_only=False)
+            mto.restore_from_modelopt_state(model, modelopt_state)
+
+        return model
 
 
 @QuantConfigReaderRegistry.register("hf")
@@ -220,15 +293,33 @@ class HFQuantConfigReader(QuantConfigReader):
 def autodetect_quant_config_reader(
     fetched_dir: str,
 ) -> Optional[Tuple["QuantConfigReader", Dict[str, Any]]]:
-    """Try ModelOPT first; if not found, fall back to HF. Returns (reader, extra_kwargs) or None."""
+    """
+    Auto-detect and return the appropriate quantization config reader.
+
+    Priority order:
+    1. ModelOPT (hf_quant_config.json) - unified HF checkpoint format
+    2. ModelOPT FakeQuant (modelopt_state.pth) - mto.save() checkpoint format
+    3. HF (config.json with quantization_config) - HuggingFace quantizer format
+
+    Returns (reader, extra_kwargs) or None.
+    """
+    # Try ModelOPT unified format first (hf_quant_config.json)
     reader_cls = QuantConfigReaderRegistry.get("modelopt")
     result = reader_cls.from_file(fetched_dir)
-    # Fallback to HF reader if ModelOPT not present
-    if result is None:
-        hf_cls = QuantConfigReaderRegistry.get("hf")
-        try:
-            result = hf_cls.from_file(fetched_dir)
-        except Exception:
-            # Skip HF reader if it errors out during probing
-            result = None
+    if result is not None:
+        return result
+
+    # Try ModelOPT FakeQuant format (modelopt_state.pth)
+    fakequant_cls = QuantConfigReaderRegistry.get("modelopt_fakequant")
+    result = fakequant_cls.from_file(fetched_dir)
+    if result is not None:
+        return result
+
+    # Fallback to HF reader
+    hf_cls = QuantConfigReaderRegistry.get("hf")
+    try:
+        result = hf_cls.from_file(fetched_dir)
+    except Exception:
+        # Skip HF reader if it errors out during probing
+        result = None
     return result
