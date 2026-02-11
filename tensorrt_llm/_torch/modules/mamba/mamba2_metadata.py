@@ -19,6 +19,10 @@ from typing import Tuple
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+    CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    use_cpp_mamba_cache_manager
 
 
 def cu_seqlens_to_chunk_indices_offsets(
@@ -107,11 +111,47 @@ class Mamba2Metadata:
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
+        self.state_indices_cpu = torch.zeros(max_batch_size,
+                                             dtype=torch.int32,
+                                             pin_memory=True)
+        self.state_indices = torch.zeros(max_batch_size,
+                                         dtype=torch.int32,
+                                         device="cuda")
+        self._query_start_loc_long_buf = torch.arange(0,
+                                                      max_batch_size + 1,
+                                                      dtype=torch.long,
+                                                      device="cuda")
+        self._query_start_loc_buf = torch.zeros(max_batch_size + 1,
+                                                dtype=torch.int,
+                                                device="cuda")
+        self.query_start_loc_long = self._query_start_loc_long_buf
+        self.query_start_loc = self._query_start_loc_buf
+
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
         num_ctx_tokens = attn_metadata.num_ctx_tokens
+
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        request_ids = attn_metadata.request_ids
+
+        if (kv_cache_manager is not None
+                and hasattr(kv_cache_manager, 'get_state_indices')
+                and request_ids is not None):
+            if use_cpp_mamba_cache_manager():
+                batch_request_ids = request_ids[:batch_size]
+                is_padding = [
+                    req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+                    for req_id in batch_request_ids
+                ]
+                indices = kv_cache_manager.get_state_indices(
+                    batch_request_ids, is_padding)
+                for i, idx in enumerate(indices):
+                    self.state_indices_cpu[i] = idx
+                self.state_indices[:batch_size].copy_(
+                    self.state_indices_cpu[:batch_size], non_blocking=True)
+
         if num_contexts > 0:
             torch.cumsum(context_lens,
                          dim=0,
@@ -125,8 +165,14 @@ class Mamba2Metadata:
                       out=self.cu_seqlens[num_contexts + 1:batch_size + 1])
             # Need both `query_start_loc` and `query_start_loc_long` because `causal_conv1d_fn`
             # accepts only `int32` while `chunk_gated_delta_rule` accepts only `long`.
-            self.query_start_loc = self.cu_seqlens[:batch_size + 1]
-            self.query_start_loc_long = self.query_start_loc.to(torch.long)
+            self._query_start_loc_buf[:batch_size +
+                                      1] = self.cu_seqlens[:batch_size + 1]
+            self.query_start_loc = self._query_start_loc_buf[:batch_size + 1]
+            self._query_start_loc_long_buf[:batch_size + 1].copy_(
+                self.query_start_loc.to(torch.long), non_blocking=True)
+            self.query_start_loc_long = self._query_start_loc_long_buf[:
+                                                                       batch_size
+                                                                       + 1]
             self.seq_idx = torch.repeat_interleave(
                 torch.arange(num_contexts,
                              dtype=torch.int,
@@ -148,8 +194,11 @@ class Mamba2Metadata:
                 self.chunk_offsets = None
         else:
             self.query_start_loc = None
-            self.query_start_loc_long = torch.arange(
-                0,
-                batch_size + 1,
-                dtype=torch.long,
-                device=self.cu_seqlens.device)
+            torch.arange(0,
+                         batch_size + 1,
+                         dtype=torch.long,
+                         device=self.cu_seqlens.device,
+                         out=self._query_start_loc_long_buf[:batch_size + 1])
+            self.query_start_loc_long = self._query_start_loc_long_buf[:
+                                                                       batch_size
+                                                                       + 1]
