@@ -22,7 +22,6 @@ from transformers import AutoConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.utils import ActivationType, relu2
 
 from ..attention_backend import AttentionMetadata
@@ -361,6 +360,10 @@ class NemotronHLayer(DecoderLayer):
                                    spec_metadata=spec_metadata,
                                    **kwargs)
         hidden_states = torch.add(hidden_states, residual)
+        if spec_metadata is not None and spec_metadata.is_layer_capture(
+                self.layer_idx):
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states, None)
 
         return hidden_states
 
@@ -420,8 +423,6 @@ class NemotronHModel(DecoderModel):
             dtype=config.torch_dtype,
         )
 
-        self.mamba_metadata: Optional[Mamba2Metadata] = None
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -436,11 +437,7 @@ class NemotronHModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        if self.mamba_metadata is None or self.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            self.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests,
-                chunk_size=self.model_config.pretrained_config.chunk_size)
-        self.mamba_metadata.prepare(attn_metadata)
+        mamba_metadata = attn_metadata.mamba_metadata
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -452,7 +449,7 @@ class NemotronHModel(DecoderModel):
                                   hidden_states,
                                   attn_metadata,
                                   spec_metadata=spec_metadata,
-                                  mamba_metadata=self.mamba_metadata)
+                                  mamba_metadata=mamba_metadata)
 
         hidden_states = self.norm_f(hidden_states)
 

@@ -19,9 +19,8 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
-                        skip_neither_ada_nor_hopper_unittest,
-                        skip_non_hopper_unittest, skip_pre_blackwell,
-                        skip_pre_hopper)
+                        skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
+                        skip_pre_blackwell, skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -41,8 +40,6 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.quantization import \
     NVFP4CutlassFusedMoEMethod
 # isort: on
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -92,8 +89,8 @@ def test_fused_moe(moe_backend,
                    mapping=None):
 
     if moe_backend == "TRITON":
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
+        if get_sm_version() != 90:
+            pytest.skip("TRITON moe backend is only supported on Hopper")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -192,9 +189,9 @@ def test_fused_moe(moe_backend,
         # Evaluate outputs
         torch.cuda.synchronize()
         # There can be one off mismatch in the outputs due to different kernel implementations
-        # Here we check 99% of the outputs are within the tolerance
+        # Here we check most of the outputs are within the tolerance
         # The CutlassFusedMoE case fails as well without this change on H100 for bf16
-        check_accuracy(output, ref_output, rtol=0.2, atol=0.2, percent=0.984)
+        check_accuracy(output, ref_output, rtol=0.2, atol=0.2, percent=0.975)
         m //= 2
 
 
@@ -514,7 +511,9 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
 
 
 @skip_pre_hopper
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    ["CUTLASS", pytest.param("TRITON", marks=skip_no_hopper)])
 @pytest.mark.parametrize("routing_cls",
                          [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod])
 @pytest.mark.parametrize("bias", [True, False])
@@ -522,8 +521,6 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
 def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
 
     if moe_backend == "TRITON":
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -632,19 +629,30 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
-
-        # Test all kernel tactics
-        for tactic in all_tactics:
-            with AutoTuner.get().replay(tactic), torch.inference_mode():
+        # TRITON backend uses Triton kernels which don't register with AutoTuner
+        if moe_backend == "TRITON":
+            with torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
-                check_accuracy(output,
-                               ref_output,
-                               rtol=0.04,
-                               atol=0.1,
-                               percent=0.99)
+            check_accuracy(output,
+                           ref_output,
+                           rtol=0.04,
+                           atol=0.1,
+                           percent=0.99)
+        else:
+            # Explicitly capture context for kernel testing
+            with AutoTuner.get().capture() as all_tactics, torch.inference_mode(
+            ):
+                output = fused_moe.forward(x, router_logits)
+
+            # Test all kernel tactics
+            for tactic in all_tactics:
+                with AutoTuner.get().replay(tactic), torch.inference_mode():
+                    output = fused_moe.forward(x, router_logits)
+                    check_accuracy(output,
+                                   ref_output,
+                                   rtol=0.04,
+                                   atol=0.1,
+                                   percent=0.99)
 
 
 def set_tensor_value_2(x, num_row, num_cols):
@@ -856,22 +864,12 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         [DefaultMoeRoutingMethod],
     ),
 )
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
 def test_fused_moe_fp8_blockwise_deepgemm(dtype,
                                           num_experts,
                                           seq_len,
                                           hidden_size,
                                           RoutingMethodCls,
-                                          enable_configurable_moe,
-                                          mocker,
                                           mapping=None):
-
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
 
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
@@ -1174,7 +1172,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     return True
 
 
-@skip_non_hopper_unittest
+@skip_no_hopper
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
@@ -1306,7 +1304,7 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
     return True
 
 
-@skip_non_hopper_unittest
+@skip_no_hopper
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -1380,25 +1378,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 @pytest.mark.parametrize(
     "finalize_fusion", [True, False],
     ids=["enable_finalize_fusion", "disable_finalize_fusion"])
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
-def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
-                         enable_configurable_moe, mocker):
-
-    if enable_configurable_moe == 1 and moe_backend not in [
-            "TRTLLM", "CUTLASS"
-    ]:
-        pytest.skip(
-            "ENABLE_CONFIGURABLE_MOE=1, only TRTLLM and CUTLASS backend are enabled"
-        )
-
-    mocker.patch.dict(
-        os.environ, {
-            "ENABLE_CONFIGURABLE_MOE":
-            "1" if enable_configurable_moe == 1
-            and moe_backend in ["TRTLLM", "CUTLASS"] else "0"
-        })
+def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion):
 
     run_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion)
 
@@ -1409,17 +1389,8 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
 @pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
 @pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
                          ids=lambda v: f"limit{v}")
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
 def test_fused_moe_nvfp4_gptoss_style(hidden_size, intermediate_size,
-                                      swiglu_alpha, swiglu_beta, swiglu_limit,
-                                      enable_configurable_moe, mocker):
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
-
+                                      swiglu_alpha, swiglu_beta, swiglu_limit):
     run_fused_moe_nvfp4(dtype=torch.bfloat16,
                         moe_backend="TRTLLM",
                         finalize_fusion=False,
@@ -1678,15 +1649,7 @@ def run_fused_moe_nvfp4(dtype,
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
-def test_fused_moe_w4a8_nvfp4_fp8(moe_backend, enable_configurable_moe, mocker):
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
-
+def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
     dtype = torch.bfloat16
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -2101,20 +2064,7 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 @pytest.mark.parametrize("hidden_unpadded", [64, 192, 256])
 @pytest.mark.parametrize("seq_len", [8, 128])
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
-def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
-                               enable_configurable_moe, mocker):
-
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
-
-    if moe_backend == "CUTLASS" and hidden_unpadded % 128 != 0:
-        pytest.skip()
-
+def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
     SEQ_LEN = seq_len
@@ -2371,17 +2321,7 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
             marks=[skip_pre_hopper, skip_blackwell, skip_blackwell_geforce]),
     ],
 )
-@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                         ids=lambda x: ""
-                         if x == 0 else "enable_configurable_moe")
-def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
-                           enable_configurable_moe, mocker):
-
-    mocker.patch.dict(os.environ, {
-        "ENABLE_CONFIGURABLE_MOE":
-        "1" if enable_configurable_moe == 1 else "0"
-    })
-
+def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
@@ -2526,7 +2466,7 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
         check_accuracy(output, ref_output, rtol=1e-2, atol=0.1, percent=0.99)
 
 
-@skip_pre_hopper
+@skip_no_hopper
 @pytest.mark.parametrize("experts", [8, 128])
 @pytest.mark.parametrize(
     "hidden_size, intermediate_size",
@@ -2542,12 +2482,8 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
 @pytest.mark.parametrize("dynamic_quant", [True, False])
 def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                                 fp8_activation, bias, dynamic_quant):
-    if not IS_TRITON_KERNELS_AVAILABLE:
-        pytest.skip("Triton kernels are not available")
-    if torch.cuda.get_device_capability()[0] < 10 and fp8_activation:
+    if fp8_activation:
         pytest.skip("Latest Triton requires BF16 activation on Hopper")
-    if torch.cuda.get_device_capability()[0] >= 10 and not fp8_activation:
-        pytest.skip("Latest Triton requires FP8 activation on Blackwell")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()

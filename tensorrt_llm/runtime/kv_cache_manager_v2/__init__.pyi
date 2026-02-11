@@ -23,6 +23,7 @@ from typing import (
     Final,
     Iterable,
     Iterator,
+    NamedTuple,
     NewType,
     Protocol,
     Sequence,
@@ -33,6 +34,7 @@ from typing import (
 
 # From _common.py
 NDEBUG: Final[int]
+DEFAULT_BEAM_INDEX: Final[BeamIndex]
 
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
@@ -49,6 +51,7 @@ CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
 MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
+PoolGroupIndex = NewType("PoolGroupIndex", int)
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -138,6 +141,9 @@ class _KVCache:
     def set_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
     ) -> None: ...
+    def set_base_page_index_buf(
+        self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
+    ) -> None: ...
     @property
     def manager(self) -> "KVCacheManager": ...
     @property
@@ -154,9 +160,15 @@ class _KVCache:
     @beam_width.setter
     def beam_width(self, beam_width: BeamIndex) -> None: ...
     def get_page_indices(self, layer_group_id: int, beam_id: BeamIndex = ...) -> IndexSeq: ...
-    def get_all_page_indices(
-        self, beam_id: BeamIndex, buf_ids: Iterable[tuple[LayerId, DataRole]]
-    ) -> Iterator[IndexSeq]: ...
+    def get_base_page_indices(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    ) -> IndexSeq: ...
+    def get_aggregated_page_indices(
+        self,
+        layer_group_id: LayerGroupId,
+        beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
+        valid_only: bool = False,
+    ) -> Iterator[int]: ...
     def resize(self, capacity: int | None, history_length: int | None = None) -> bool: ...
     @property
     def capacity(self) -> int: ...
@@ -183,6 +195,39 @@ class _KVCache:
     @property
     def tokens_per_block(self) -> int: ...
 
+@dataclass(slots=True, frozen=True)
+class MemoryPoolDesc:
+    base: MemAddress
+    page_size: int
+
+@dataclass(slots=True, frozen=True)
+class MemoryPoolGroupDesc:
+    num_pages: int
+    pools: Sequence[MemoryPoolDesc]
+
+class BufferId(NamedTuple):
+    layer_id: LayerId
+    role: DataRole
+
+@dataclass(slots=True, frozen=True)
+class BufferSlice:
+    buffer_id: BufferId
+    num_slices: int = 1
+    slice_index: int = 1
+
+@dataclass(slots=True, frozen=True)
+class AggregatedPageDesc:
+    """The data you need would be in the following byte ranges.
+
+    (base + stride * i + Range(0, size) for i in aggregated_page_indices)
+    """
+
+    base: MemAddress
+    size: int
+    stride: int
+    layer_group_id: LayerGroupId
+    buffers: Sequence[BufferSlice]
+
 # From _core/_kv_cache_manager.py
 class KVCacheManager:
     def __init__(self, config: KVCacheManagerConfig) -> None: ...
@@ -190,6 +235,7 @@ class KVCacheManager:
     def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress: ...
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,
@@ -200,14 +246,23 @@ class KVCacheManager:
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     @property
-    def cache_tier_list(self) -> tuple[CacheTier, ...]: ...
+    def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property
     def tokens_per_block(self) -> int: ...
     @property
     def allow_seq_rebasing(self) -> bool: ...
     @property
     def enable_partial_match(self) -> bool: ...
-    def get_layer_group_id(self, layer_id: LayerId) -> int: ...
     @property
-    def layer_grouping(self) -> tuple[tuple[LayerId, ...], ...]: ...
-    def clamp_max_seq_len_for_mem(self, batch_size: int, model_max_seq_len: int) -> int: ...
+    def num_layers(self) -> int: ...
+    @property
+    def layer_ids(self) -> Iterator[LayerId]: ...
+    def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
+    @property
+    def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
+    @property
+    def all_buffer_ids(self) -> Iterator[BufferId]: ...
+    def get_aggregated_pages(
+        self, buffers: Iterable[BufferSlice]
+    ) -> Iterator[AggregatedPageDesc]: ...
+    def clamp_max_seq_len_for_mem(self, batch_size: int) -> int: ...

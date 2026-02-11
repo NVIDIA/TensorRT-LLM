@@ -131,10 +131,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mGroupComm = std::make_shared<CacheTransceiverComm>(tensorrt_llm::pg_utils::get_world_pg());
     }
 
-    if (worldConfig.isTensorParallel())
+    if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
     {
         mGroupTensorParaComm = std::make_shared<CacheTransceiverComm>(
-            mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getTensorParallelRank()));
+            mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getRank()));
     }
     int kvFactor = 2;
     if (cacheManager->getCacheType() == kv_cache_manager::CacheType::kSELFKONLY)
@@ -143,25 +143,24 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
     mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
         attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(),
-        cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
-        cacheManager->getIndexerKCacheQuantBlockSize());
+        cacheManager->isEnablePartialReuse(), cacheManager->isEnableIndexerKCache(),
+        cacheManager->getIndexerKCacheIndexHeadDim(), cacheManager->getIndexerKCacheQuantBlockSize());
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
-        int TPSizeInDPGroup
-            = mCacheState->getParallelConfig().mTensorParallelism / mCacheState->getParallelConfig().mDPsize;
-        int DPSize = mCacheState->getParallelConfig().mDPsize;
-        int TPRankInDPGroup = worldConfig.getTensorParallelRank() % TPSizeInDPGroup;
+        int dpSize = mCacheState->getParallelConfig().mDPsize;
 
-        int DPRank = (worldConfig.getRank() - TPSizeInDPGroup * DPSize * worldConfig.getPipelineParallelRank()
-                         - TPRankInDPGroup)
-            / TPSizeInDPGroup;
-        // <PP,DP,TP>
-        mGroupDataComm = std::make_shared<CacheTransceiverComm>(mGroupComm->split(DPRank, worldConfig.getRank()));
-        if (worldConfig.isTensorParallel())
+        // dpRank is derived from the tensor parallel rank, which already accounts for CP.
+        // Layout: rank = ppRank * (TP * CP) + tpRank * CP + cpRank.
+        // getTensorParallelRank() correctly extracts tpRank regardless of CP.
+        int dpRank = mCacheState->getParallelConfig().mDPrank;
+        // <PP,DP,TP,CP>
+        mGroupDataComm = std::make_shared<CacheTransceiverComm>(mGroupComm->split(dpRank, worldConfig.getRank()));
+        if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
         {
+            // Group ranks with same (ppRank, dpRank) accounting for CP.
             mGroupTPInDPComm = std::make_shared<CacheTransceiverComm>(
-                mGroupComm->split(worldConfig.getRank() / TPSizeInDPGroup, worldConfig.getRank()));
+                mGroupComm->split(worldConfig.getPipelineParallelRank() * dpSize + dpRank, worldConfig.getRank()));
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;

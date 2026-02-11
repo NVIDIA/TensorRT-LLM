@@ -21,6 +21,7 @@ from . import rawref
 from ._block_radix_tree import Block
 from ._common import (
     BAD_PAGE_INDEX,
+    DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
     NDEBUG,
     BeamIndex,
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
 from ._eviction_controller import NodeRef
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
-from ._storage._core import Slot
+from ._storage._core import PoolIndex0, Slot
 from ._utils import (
     CachedCudaEvent,
     assert_critical,
@@ -142,7 +143,7 @@ class UncommittedPage(Page):
         life_cycle: LifeCycleId,
         cache_level: CacheLevel,
         slot: Slot,
-        beam_index: BeamIndex = BeamIndex(0),
+        beam_index: BeamIndex = DEFAULT_BEAM_INDEX,
     ):
         self.kv_cache = rawref.ref(kv_cache)
         self.ordinal = ordinal
@@ -389,6 +390,10 @@ class _SharedPageLock:
         if not skip_wait:
             self.page.ready_event.wait_in_stream(kv_cache.cuda_stream)
         self._user = LockOwner(rawref.ref(kv_cache), beam_index, ordinal, life_cycle)
+        old_base_index = kv_cache._update_base_page_index(
+            beam_index, ordinal, life_cycle, PageIndex(self.page.slot_id)
+        )
+        assert old_base_index == BAD_PAGE_INDEX
         new_index = self._get_page_index()
         old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle, new_index)
         assert old_index == BAD_PAGE_INDEX
@@ -401,18 +406,28 @@ class _SharedPageLock:
         assert self._uniq_lock is not None
         page = self.page
         self._uniq_lock.finish_events.append(unwrap_rawref(self._user.kv_cache).finish_event)
+        beam_index = self._user.beam_index
+        ordinal = self._user.ordinal
+        life_cycle = self._user.life_cycle
+        kv_cache = unwrap_rawref(self._user.kv_cache)
         new_index = BAD_PAGE_INDEX
-        old_index = unwrap_rawref(self._user.kv_cache)._update_page_index(
-            self._user.beam_index, self._user.ordinal, self._user.life_cycle, new_index
+        old_base_index = kv_cache._update_base_page_index(
+            beam_index, ordinal, life_cycle, new_index
         )
+        assert NDEBUG or old_base_index == self._get_base_page_index()
+        old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle, new_index)
         assert NDEBUG or old_index == self._get_page_index()
         self._uniq_lock = None
         return page
 
     def _get_page_index(self) -> PageIndex:
         storage = unwrap_rawref(self._user.kv_cache).manager._storage
-        num_buffers_per_slot = storage._slot_to_page_indices[self._user.life_cycle]
+        user = self._user
+        num_buffers_per_slot = storage._slot_to_page_indices[user.life_cycle][PoolIndex0]
         return PageIndex(self.page.slot_id * num_buffers_per_slot)
+
+    def _get_base_page_index(self) -> PageIndex:
+        return PageIndex(self.page.slot_id)
 
 
 BlockPage = _SharedPageLock | _PageHolder | None

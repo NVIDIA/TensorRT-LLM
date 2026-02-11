@@ -9,11 +9,16 @@ import jsonschema
 import openai
 import pytest
 import yaml
+from utils.llm_data import llm_datasets_root
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
+os.environ['TIKTOKEN_RS_CACHE_DIR'] = os.path.join(llm_datasets_root(),
+                                                   'tiktoken_vocab')
+os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
+                                                     'tiktoken_vocab')
 
 
 @pytest.fixture(

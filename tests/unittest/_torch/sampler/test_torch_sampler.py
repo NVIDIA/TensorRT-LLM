@@ -35,7 +35,6 @@ import torch
 from scipy.stats import power_divergence
 from utils.util import assert_no_cuda_sync, force_ampere
 
-from tensorrt_llm._torch.pyexecutor import sampling_utils_flashinfer
 from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
 from tensorrt_llm._torch.pyexecutor.sampler import (
     GREEDY,
@@ -84,6 +83,9 @@ class TestStrategySelection:
     class MockLlmRequest:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
+
+        def __init__(self):
+            self._py_sampling_strategy: Strategy | None = None
 
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
@@ -653,10 +655,13 @@ class RequestCase:
         finish_reasons: list[FinishReason],
         max_new_tokens: int = MAX_NEW_TOKENS,
         end_id: Optional[int] = None,
+        num_draft_tokens: int | None = None,
         stop_words_list: Optional[list[list[int]]] = None,
     ):
         seq_slot = self.seq_slots.pop()  # random seq slot in MAX_NUM_SEQUENCES
         self.prompt = prompt
+        if num_draft_tokens is None:
+            num_draft_tokens = len(new_tokens) - 1
         self.request = LlmRequest(
             request_id=seq_slot,
             seq_slot=seq_slot,
@@ -668,7 +673,7 @@ class RequestCase:
             end_id=end_id,
             sampling_config=SamplingConfig(),
             is_streaming=False,
-            draft_tokens=new_tokens[:-1],
+            draft_tokens=new_tokens[:num_draft_tokens],
         )
         assert len(new_tokens) == len(finish_reasons)
         self.new_tokens = new_tokens
@@ -701,16 +706,40 @@ class RequestCase:
         seq_slots = torch.tensor(
             [req.request.py_seq_slot for req in requests], device="cuda", dtype=torch.int64
         )
+        seq_lens = torch.tensor(
+            [req.request.max_beam_num_tokens for req in requests], dtype=torch.int32, device="cuda"
+        )
         new_tokens = torch.tensor(
             [req.new_tokens for req in requests], dtype=torch.int32, device="cuda"
         ).T
         sampler.store.new_tokens[:, seq_slots, BEAM] = new_tokens
+        max_seq_lens = torch.tensor(
+            [
+                min(
+                    sampler.max_seq_len, req.request.orig_prompt_len + req.request.py_max_new_tokens
+                )
+                for req in requests
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        end_ids = torch.tensor(
+            [
+                req.request.py_end_id if req.request.py_end_id is not None else -1
+                for req in requests
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        sampler.store.max_lengths_tensor[seq_slots] = max_seq_lens
+        sampler.store.end_ids[seq_slots] = end_ids
 
         def run():
             sampler._write_finish_reasons(
                 [req.request for req in requests],
                 finish_reasons=sampler.store.finish_reasons,
                 new_tokens=sampler.store.new_tokens,
+                seq_lens=seq_lens,
                 seq_slots=seq_slots,
             )
 
@@ -740,6 +769,15 @@ def test_write_finish_reasons():
                 stop_words_list=[[12, 13]],
                 new_tokens=[12, 13, 60],
                 finish_reasons=[NOT_FINISHED, STOP_WORDS, NOT_FINISHED],
+            ),
+            RequestCase(
+                prompt=[7, 8, 6],
+                stop_words_list=[[12, 13]],
+                new_tokens=[60, 12, 13],
+                # The request has stop words, but no draft is created
+                # Tokens at indices greater than 0 should be ignored
+                num_draft_tokens=0,
+                finish_reasons=[NOT_FINISHED, NOT_FINISHED, NOT_FINISHED],
             ),
             RequestCase(
                 prompt=[1, 2, 3, 4],
@@ -1538,12 +1576,15 @@ class TestBatchedSampling:
                 generator: Optional[torch.Generator] = None,
                 return_probs: bool,
                 group_metadata: StrategyMetadata | None = None,
-            ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-                assert issubclass(group_key, sampling_utils_flashinfer._StrategyImpls.StrategyImpl)
+            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
                 assert generator is sampler.get_generator(logits.device)
+                if isinstance(group_key, tuple):
+                    assert isinstance(group_key[0], str)
+                else:
+                    assert isinstance(group_key, str)
                 nonlocal flashinfer_keys_seen
-                assert group_key not in flashinfer_keys_seen
-                flashinfer_keys_seen.add(group_key)
+                assert (group_key, return_probs) not in flashinfer_keys_seen
+                flashinfer_keys_seen.add((group_key, return_probs))
                 return sample_grouped_strategies_orig(
                     group_key,
                     strategies,

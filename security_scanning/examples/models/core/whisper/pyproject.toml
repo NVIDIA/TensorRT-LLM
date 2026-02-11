@@ -14,7 +14,7 @@ dependencies = [
     "librosa (>=0.11.0,<0.12.0)",
     "soundfile (>=0.13.1,<0.14.0)",
     "safetensors (>=0.7.0,<0.8.0)",
-    "transformers (>=5.0.0,<6.0.0)",
+    "transformers (>=5.1.0,<6.0.0)",
     "janus (>=2.0.0,<3.0.0)"
 ]
 

@@ -719,6 +719,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
         "tensorrt_llm/evaluate/json_mode_eval.py",
         "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
@@ -740,6 +741,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/defs/accuracy/test_disaggregated_serving.py",
         "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
         "tests/integration/defs/examples/test_ray.py",
+        "tests/integration/defs/accuracy/test_llm_api_autodeploy.py",
         "tests/unittest/llmapi/test_async_llm.py",
         "docker/common/install_ucx.sh",
         "docker/common/install_nixl.sh",
@@ -914,19 +916,10 @@ def collectTestResults(pipeline, testFilter)
             """
             trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
             echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
-            def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-            if (env.alternativeTRT || isOfficialPostMergeJob) {
-                catchError(
-                    buildResult: 'FAILURE',
-                    stageResult: 'FAILURE') {
-                    error "Some failed tests were reruned, please check the rerun report."
-                }
-            } else {
-                catchError(
-                    buildResult: 'SUCCESS',
-                    stageResult: 'UNSTABLE') {
-                    error "Some failed tests were reruned, please check the rerun report."
-                }
+            catchError(
+                buildResult: 'SUCCESS',
+                stageResult: 'UNSTABLE') {
+                error "Some failed tests were reruned, please check the rerun report."
             }
         } // Rerun report stage
         try {

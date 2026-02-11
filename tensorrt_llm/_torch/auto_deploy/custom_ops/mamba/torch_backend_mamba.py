@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Custom op collection for cached mamba2 ssm transform (linear attention) in pure PyTorch.
 
 This file contains two kinds of functionality:
@@ -21,7 +36,7 @@ from ..attention_interface import (
     Constant,
     MHACallable,
     ResourceHandlerDict,
-    StateResourceHandler,
+    SSMResourceHandler,
 )
 from .torch_mamba import _torch_ssm_prefill
 
@@ -312,8 +327,11 @@ class TorchBackendSSM(AttentionDescriptor):
         ssm_state_dtype = cls.resolve_cache_dtype(cache_config.mamba_ssm_cache_dtype, hs_fake.dtype)
 
         return {
-            "ssm_state_cache": StateResourceHandler(
-                num_heads, head_dim, ssm_state_size, dtype=ssm_state_dtype
+            "ssm_state_cache": SSMResourceHandler(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                d_state=ssm_state_size,
+                dtype=ssm_state_dtype,
             )
         }
 

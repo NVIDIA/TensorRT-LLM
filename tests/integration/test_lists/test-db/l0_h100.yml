@@ -27,6 +27,7 @@ l0_h100:
   - unittest/_torch/speculative -k "not eagle3"
   - unittest/_torch/thop/parallel
   - unittest/_torch/thop/serial
+  - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # Only key models in H100: llama/mixtral/nemotron/deepseek
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
@@ -39,6 +40,10 @@ l0_h100:
   - unittest/disaggregated/test_remoteDictionary.py
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_messenger.py
+  - unittest/disaggregated/test_extractor.py
+  - unittest/disaggregated/test_extractor_v2.py
+  - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/region/test_block.py
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse
@@ -49,6 +54,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler
+  - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_disable_overlap_scheduler
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=TRTLLM] TIMEOUT (90)
@@ -432,12 +438,17 @@ l0_h100:
       orchestrator: mpi
   tests:
   - unittest/_torch/auto_deploy/unit/singlegpu
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-True-1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[flashinfer_ssm-False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16[1]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
+  - examples/test_ad_speculative_decoding.py::test_eagle_model_with_weights
+  - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[1]
+  - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[2]
+  - examples/test_ad_export_onnx.py::test_ad_export_onnx[Qwen/Qwen2.5-3B-Instruct-/tmp/test_ad_export_onnx_qwen2.5-3b-36]

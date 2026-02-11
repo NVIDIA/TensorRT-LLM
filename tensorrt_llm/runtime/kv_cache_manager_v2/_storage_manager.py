@@ -38,7 +38,7 @@ from ._exceptions import OutOfPagesError
 from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry
 from ._page import Page
 from ._storage import CacheLevelStorage
-from ._storage._config import BufferAttr, BufferId, StorageConfig
+from ._storage._config import BufferAttr, BufferId, SlotDesc, StorageConfig
 from ._storage._core import (
     DiskCacheLevelStorage,
     GpuCacheLevelStorage,
@@ -46,6 +46,7 @@ from ._storage._core import (
     PoolGroupBase,
     PoolGroupIndex,
     PoolIndex,
+    PoolIndex0,
     Slot,
     SlotId,
 )
@@ -154,15 +155,17 @@ class StorageManager:
         "_life_cycle_grouping",
         "_levels",
         "_cached_num_pool_groups",
+        "_slot_desc_list",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
-    _layer_to_life_cycle_ids: TypedIndexList[LayerId, LifeCycleId]
-    _slot_to_page_indices: TypedIndexList[LifeCycleId, int]
+    _layer_to_life_cycle_ids: dict[LayerId, LifeCycleId]
+    _slot_to_page_indices: TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]]
     _buffer_attr: dict[BufferId, BufferAttr]
     _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _cached_num_pool_groups: PoolGroupIndex
+    _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(self, life_cycles: LifeCycleRegistry, config: StorageConfig) -> None:
@@ -175,9 +178,11 @@ class StorageManager:
         self._slot_to_page_indices = config.slot_to_page_indices()
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
-        slot_size_lists = [pg.slot_size_list for pg in config.pool_groups]
+        slot_size_lists = [pg.slot_size_list for pg in config.slot_desc_list]
         # @TODO: accept an optional avg_seq_len param and consider sliding window.
-        init_ratio = [float(sum(pg.slot_size_list) * len(pg.slots)) for pg in config.pool_groups]
+        init_ratio = [
+            float(sum(pg.slot_size_list) * len(pg.variants)) for pg in config.slot_desc_list
+        ]
         total = sum(init_ratio)
         init_ratio = [x / total for x in init_ratio]
         num_levels = CacheLevel(len(config.cache_tiers))
@@ -193,6 +198,7 @@ class StorageManager:
         self._cached_num_pool_groups = get_uniform_attribute(
             self._levels, lambda level: level.storage.num_pool_groups
         )
+        self._slot_desc_list = config.slot_desc_list
 
     def __del__(self) -> None:
         self.__rawref__.invalidate()
@@ -475,7 +481,8 @@ class StorageManager:
         self, lc_id: LifeCycleId, pages: Iterator[Page | None]
     ) -> Iterator[int | None]:
         "Reference implementation. Not fast enough for production."
-        scale = self._slot_to_page_indices[lc_id]
+        scale = self._slot_to_page_indices[lc_id][PoolIndex0]
+        assert all(scale == s for s in self._slot_to_page_indices[lc_id])
         return (map_optional(page, lambda p: scale * int(p.slot_id)) for page in pages)
 
     def get_buffer_attr(self, layer_id: LayerId, data_role: DataRole) -> BufferAttr:
@@ -487,8 +494,8 @@ class StorageManager:
         return self._levels[level].storage.slot_address(pg_idx, pool_idx, slot_id)
 
     def get_page_indices_for_slot(self, life_cycle: LifeCycleId, slot_id: SlotId) -> PageIndex:
-        scale = self._slot_to_page_indices[life_cycle]
-        return PageIndex(scale * slot_id)
+        scale = self._slot_to_page_indices[life_cycle][PoolIndex0]
+        return PageIndex(scale * int(slot_id))
 
     def get_statistics(
         self, level: CacheLevel = GPU_LEVEL

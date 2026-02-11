@@ -1,10 +1,13 @@
 __pycache__/
 .vscode
+.cursor
 *.engine
 *.engine.config
 *.cache
 *.nsys-rep
 *.npy
+*.so
+*.whl
 .VSCodeCounter
 cpp/build*
 cpp/Release
@@ -86,6 +89,7 @@ cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.cpp
 /examples/layer_wise_benchmarks/profiles/
 
 # User config files
+CLAUDE.local.md
 CMakeUserPresets.json
 compile_commands.json
 *.bin

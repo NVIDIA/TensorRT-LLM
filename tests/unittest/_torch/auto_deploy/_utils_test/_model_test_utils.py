@@ -400,7 +400,8 @@ _SMALL_MODEL_CONFIGS = {
             "num_hidden_layers": 2,
             "hidden_size": 32,
             "intermediate_size": 64,
-            "kv_lora_rank": 128,
+            "kv_lora_rank": 512,  # NOTE: must be 512 (default) for flashinfer_mla to work
+            "qk_rope_head_dim": 64,  # NOTE: must be 64 (default) for flashinfer_mla to work
             "moe_intermediate_size": 128,
             "n_group": 2,
             "topk_group": 2,
@@ -483,6 +484,11 @@ _SMALL_MODEL_CONFIGS = {
         "model_kwargs": {
             "num_hidden_layers": 8,
         },
+    },
+    "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": {
+        "model_kwargs": {
+            "hidden_size": 64,
+        }
     },
 }
 

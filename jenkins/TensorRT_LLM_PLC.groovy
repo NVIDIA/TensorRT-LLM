@@ -14,7 +14,6 @@ def createKubernetesPodConfig()
             apiVersion: v1
             kind: Pod
             spec:
-                qosClass: Guaranteed
                 nodeSelector: ${selectors}
                 containers:
                   - name: alpine
@@ -31,10 +30,27 @@ def createKubernetesPodConfig()
                         memory: 32Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
+                  - name: docker
+                    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: 16
+                        memory: 72Gi
+                        ephemeral-storage: 200Gi
+                      limits:
+                        cpu: 16
+                        memory: 256Gi
+                        ephemeral-storage: 200Gi
+                    imagePullPolicy: Always
+                    securityContext:
+                      privileged: true
+                      capabilities:
+                        add:
+                        - SYS_ADMIN
                 qosClass: Guaranteed
         """.stripIndent(),
     ]
-
     return podConfig
 }
 
@@ -58,24 +74,34 @@ def checkoutSource ()
 {
     def LLM_REPO = getLLMRepo()
     sh "git config --global --add safe.directory ${env.WORKSPACE}"
-    sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
-    sh "git config --global user.name \"TensorRT LLM\""
     trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
 }
 
-def generate()
-{
-    sh "pwd && ls -alh"
+def getPulseToken() {
+    def token
+    //Configure credential 'starfleet-client-id' under Jenkins Credential Manager
+    withCredentials([usernamePassword(
+        credentialsId: "NSPECT_CLIENT-prod",
+        usernameVariable: 'SF_CLIENT_ID',
+        passwordVariable: 'SF_CLIENT_SECRET'
+    )]) {
+        def AuthHeader = sh(script: "set +x && echo -n $SF_CLIENT_ID:$SF_CLIENT_SECRET | base64 -w0", returnStdout: true).trim()
+        token= sh(script: "curl -s --request POST --header \"Authorization: Basic ${AuthHeader}\" --header \"Content-Type: application/x-www-form-urlencoded\" \"https://4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i.ssa.nvidia.com/token?grant_type=client_credentials&scope=verify:nspectid%20sourcecode:blackduck%20update:report\" | jq \".access_token\" |  tr -d '\"'", returnStdout: true).trim()
+    }
+    return token
+}
 
+def generateLockFiles(llmRepo, branchName)
+{
     container("alpine") {
         sh "apt update"
         sh "apt install -y python3-dev git curl git-lfs"
-        def LLM_REPO = getLLMRepo()
-        checkoutSource()
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | python3 -"
-        sh "cd ${env.WORKSPACE}"
         sh "/root/.local/bin/poetry -h"
+        sh "git config --global --add safe.directory ${env.WORKSPACE}"
+        sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
+        sh "git config --global user.name \"TensorRT LLM\""
         sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
@@ -96,15 +122,15 @@ def generate()
             ]) {
                 def authedUrl
                 if (params.repoUrlKey == "tensorrt_llm_internal") {
-                    authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${GITLAB_API_TOKEN}@")
+                    authedUrl = llmRepo.replaceFirst('https://', "https://svc_tensorrt:${GITLAB_API_TOKEN}@")
                 } else {
-                    authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${GITHUB_API_TOKEN}@")
+                    authedUrl = llmRepo.replaceFirst('https://', "https://svc_tensorrt:${GITHUB_API_TOKEN}@")
                 }
                 sh "git remote set-url origin ${authedUrl}"
-                sh "git fetch origin ${params.branchName}"
+                sh "git fetch origin ${branchName}"
                 sh "git status"
-                sh "git rebase origin/${params.branchName}"
-                sh "git push origin HEAD:${params.branchName}"
+                sh "git rebase origin/${branchName}"
+                sh "git push origin HEAD:${branchName}"
             }
         }
     }
@@ -125,6 +151,51 @@ def sonar_scan()
     }
 }
 
+def pulseScan(llmRepo, branchName) {
+    container("docker") {
+        sh "apk add jq curl"
+        def token = getPulseToken()
+        withCredentials([
+            usernamePassword(
+                credentialsId: "svc_tensorrt_gitlab_read_api_token",
+                usernameVariable: 'USERNAME',
+                passwordVariable: 'PASSWORD'
+            ),
+            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+        ]) {
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
+            docker.withRegistry("https://${DEFAULT_GIT_URL}:5005") {
+                docker.image("pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable")
+                  .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
+                    withEnv([
+                        "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
+                        "PULSE_BEARER_TOKEN=${token}",
+                        "PULSE_REPO_URL=${llmRepo}",
+                        "PULSE_SCAN_PROJECT=TRT-LLM",
+                        "PULSE_SCAN_PROJECT_VERSION=${branchName}",
+                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
+                    ]) {
+                        sh 'pulse scan --no-fail .'
+                    }
+                  }
+            }
+        }
+        sh "ls"
+        sh "cat nspect_scan_report.json"
+        withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+            def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
+            def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
+            sh """
+                export TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}
+                python3 -m venv venv
+                source venv/bin/activate
+                pip install requests
+                python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
+            """
+        }
+    }
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig()
@@ -139,6 +210,10 @@ pipeline {
         timestamps()
         timeout(time: 60, unit: 'MINUTES')
     }
+    environment {
+        LLM_REPO = getLLMRepo()
+        BRANCH_NAME = "${params.branchName}"
+    }
 
     triggers {
         parameterizedCron('''
@@ -150,13 +225,30 @@ pipeline {
     stages {
         stage('TRT-LLM PLC Jobs') {
             parallel {
-                stage("Generating Poetry Locks"){
+                stage("Source Code OSS Scanning"){
                     agent {
                         kubernetes createKubernetesPodConfig()
                     }
-                    steps
-                    {
-                        generate()
+                    stages {
+                        stage("Prepare Environment"){
+                            steps
+                            {
+                                checkoutSource()
+                                sh "cd ${env.WORKSPACE}"
+                            }
+                        }
+                        stage("Generate Lock Files"){
+                            steps
+                            {
+                                generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                            }
+                        }
+                        stage("Run Pulse Scanning"){
+                            steps
+                            {
+                                pulseScan(env.LLM_REPO, env.BRANCH_NAME)
+                            }
+                        }
                     }
                 }
                 stage("SonarQube Code Analysis"){

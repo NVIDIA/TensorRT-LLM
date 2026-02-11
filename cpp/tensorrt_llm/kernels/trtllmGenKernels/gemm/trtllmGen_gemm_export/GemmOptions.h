@@ -112,7 +112,7 @@ struct GemmOptions
         bool patchF2fp, std::optional<int32_t> sfBlockSizeA, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
         tg::SfLayout sfLayoutC, int sfReshapeFactor, bool sliceK, SplitK splitK, int tileK, int tileM, int tileN,
         TileScheduler tileScheduler, bool transposeMmaOutput, bool useCustomMmaSchedule, bool useDeepSeekFp8,
-        bool useHoistTryWaitForCustomMmaSchedule, bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrixA,
+        bool useHoistTryWaitForCustomMmaSchedule, bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix,
         bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int worldSize)
         : mAllReduceAlgo{allReduceAlgo}
         , mBiasType{biasType}
@@ -177,7 +177,7 @@ struct GemmOptions
         , mUseHoistTryWaitForCustomMmaSchedule{useHoistTryWaitForCustomMmaSchedule}
         , mUsePerTokenSfA{usePerTokenSfA}
         , mUsePerTokenSfB{usePerTokenSfB}
-        , mUseShuffledMatrixA{useShuffledMatrixA}
+        , mUseShuffledMatrix{useShuffledMatrix}
         , mUseTmaStore{useTmaStore}
         , mUseTwoTmaLoadWarps{useTwoTmaLoadWarps}
         , mUseTwoMmaWarps{useTwoMmaWarps}
@@ -331,7 +331,7 @@ struct GemmOptions
     // Apply per-token scales from B
     bool mUsePerTokenSfB{false};
     // Reorder rows/cols in the A matrix for the better memory accesses in the M-major epilogue.
-    bool mUseShuffledMatrixA{false};
+    bool mUseShuffledMatrix{false};
     // Use TMA to store the result.
     bool mUseTmaStore{true};
     // Use two different warps for A and B matrix load.
@@ -520,7 +520,7 @@ inline std::string dumpOptions(GemmOptions const& options)
     ss << "mUseHoistTryWaitForCustomMmaSchedule=" << options.mUseHoistTryWaitForCustomMmaSchedule << "," << std::endl;
     ss << "mUsePerTokenSfA=" << options.mUsePerTokenSfA << "," << std::endl;
     ss << "mUsePerTokenSfB=" << options.mUsePerTokenSfB << "," << std::endl;
-    ss << "mUseShuffledMatrixA=" << options.mUseShuffledMatrixA << "," << std::endl;
+    ss << "mUseShuffledMatrix=" << options.mUseShuffledMatrix << "," << std::endl;
     ss << "mUseTmaStore=" << options.mUseTmaStore << "," << std::endl;
     ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
     ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
@@ -868,7 +868,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
         int const hiddenGranularity = 4 * tg::dtypeNumEltsPerSf(options.mDtypeC);
         TLLM_CHECK_ERROR(hiddenDim % hiddenGranularity == 0, "Hidden dim (", hiddenDim, ") must be a multiple of ",
             hiddenGranularity, " for block-scaled outputs.");
-        TLLM_CHECK_ERROR(!options.mTransposeMmaOutput || options.mUseShuffledMatrixA,
+        TLLM_CHECK_ERROR(!options.mTransposeMmaOutput || options.mUseShuffledMatrix,
             "Transposing block-scaled outputs requires shuffled A.");
     }
 
@@ -947,7 +947,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     TLLM_CHECK_ERROR(options.mM > 0 && options.mN > 0 && options.mK > 0, "M, N and K must be larger than 0");
     TLLM_CHECK_ERROR(options.mNumSlicesForSplitK > 0, "Split K must be larger than 0.");
 
-    if (options.mUseShuffledMatrixA)
+    if (options.mUseShuffledMatrix)
     {
         auto const shuffleBlockSize = getShuffleBlockSize(options.mEpilogueTileM);
         TLLM_CHECK_ERROR(options.mM % shuffleBlockSize == 0, "M must be a multiple of shuffle block size (",
@@ -974,7 +974,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     }
 
     // When the A-matrix is shuffled, the output must be transposed.
-    if (options.mUseShuffledMatrixA)
+    if (options.mUseShuffledMatrix)
     {
         // TODO add matrix shuffle for N-major epilogue.
         TLLM_CHECK_ERROR(options.mTransposeMmaOutput,
@@ -1162,7 +1162,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
         TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "DeepSeek Fp8 GEMM is not supported for slice-K");
         TLLM_CHECK_ERROR(options.mUseTwoTmaLoadWarps, "Slice-K requires two warp load for A and B");
         TLLM_CHECK_ERROR(options.mTransposeMmaOutput, "Slice-K requires transpose mma output");
-        TLLM_CHECK_ERROR(options.mUseShuffledMatrixA, "Slice-K requires shuffled matrix A");
+        TLLM_CHECK_ERROR(options.mUseShuffledMatrix, "Slice-K requires shuffled matrix A");
         TLLM_CHECK_ERROR(options.mTileK % 128 == 0, "Slice-K requires TileK be a multiple of 128");
         TLLM_CHECK_ERROR(options.mMmaM == 128, "Slice-K requires MmaM == 128");
         TLLM_CHECK_ERROR(options.mTileN == options.mEpilogueTileN, "TileN must be equal to EpilogueTileN for slice-K");

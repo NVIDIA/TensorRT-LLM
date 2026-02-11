@@ -1,9 +1,10 @@
 """Main export functionality with utilities for torch.export."""
 
+import re
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.export as te
@@ -14,6 +15,9 @@ from ..utils._graph import canonicalize_graph, lift_to_meta, load_buffers_and_pa
 from ..utils.logger import ad_logger
 from ..utils.node_utils import is_op
 from .interface import apply_export_patches
+
+if TYPE_CHECKING:
+    from ..llm_args import LlmArgs
 
 try:
     from modelopt.torch.quantization.utils import export_torch_mode as torch_export_context
@@ -185,6 +189,49 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
+def _rename_nodes_with_module_hierarchy(gm: fx.GraphModule) -> None:
+    """Rename call_function nodes to reflect their module hierarchy.
+
+    Uses nn_module_stack metadata to build hierarchical names like:
+    'layers_0_self_attn_linear' instead of 'linear_2'
+    """
+    graph = gm.graph
+
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+
+        meta = getattr(node, "meta", None)
+        if not isinstance(meta, dict):
+            continue
+
+        nn_stack = meta.get("nn_module_stack")
+        if not nn_stack or not isinstance(nn_stack, dict):
+            continue
+
+        # Get innermost module path from the stack
+        # nn_module_stack is OrderedDict: {path: (qualified_name, module_class), ...}
+        module_path = list(nn_stack.keys())[-1] if nn_stack else ""
+        # Strip the "L__self__" prefix that torch.export adds (internal representation)
+        module_path = re.sub(r"^L__self__[._]?", "", module_path)
+
+        # Get op name from target
+        target = node.target
+        if hasattr(target, "__name__"):
+            op_name = target.__name__
+        elif hasattr(target, "_name"):
+            op_name = target._name
+        else:
+            op_name = str(target).split(".")[-1]
+
+        unique_name = graph._graph_namespace.create_name(op_name, node)
+        # Build new name: module_path + op_name (dots -> underscores)
+        if module_path:
+            node.name = f"{module_path}_{unique_name}".replace(".", "_")
+
+    gm.recompile()
+
+
 def _clean_up_assertions_and_guards(gm: fx.GraphModule):
     """This transformations removes shape checks and assertions from the graph."""
     check_ops = {
@@ -338,7 +385,64 @@ def torch_export_to_gm(
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
 
+    # Rename nodes to reflect module hierarchy for better debuggability
+    _rename_nodes_with_module_hierarchy(egm)
+
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))
 
     return egm
+
+
+def export_onnx(ad_config: "LlmArgs") -> nn.Module:
+    """Export model to ONNX using InferenceOptimizer directly.
+
+    This is a lightweight export path that avoids initializing the full LLM executor,
+    which requires KVCacheManager and other runtime components not needed for ONNX export.
+
+    Args:
+        ad_config: The AutoDeploy configuration for the model. Should use a mode like
+            "export_edgellm_onnx" that includes the export_to_onnx transform.
+
+    Returns:
+        The transformed model after running through the inference optimizer pipeline.
+
+    Example:
+        >>> from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
+        >>> from tensorrt_llm._torch.auto_deploy.export import export_onnx
+        >>>
+        >>> ad_config = LlmArgs(
+        ...     model="meta-llama/Llama-2-7b-hf",
+        ...     mode="export_edgellm_onnx",
+        ...     max_batch_size=13,
+        ...     max_seq_len=4,
+        ...     device="cpu",
+        ... )
+        >>> ad_config.transforms["export_to_onnx"]["output_dir"] = "/tmp/onnx_output"
+        >>> model = export_onnx(ad_config)
+    """
+    # Import here to avoid circular imports
+    from ..shim.interface import CachedSequenceInterface
+    from ..transform.optimizer import InferenceOptimizer
+
+    # 1. Create factory from config
+    factory = ad_config.create_factory()
+
+    # 2. Create CachedSequenceInterface (lightweight, no KVCacheManager initialization)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=ad_config.max_seq_len,
+        max_batch_size=ad_config.max_batch_size,
+        device=ad_config.device,
+        kv_cache_config=ad_config.kv_cache_config,
+        max_num_tokens=ad_config.max_num_tokens,
+        vocab_size_padded=factory.vocab_size_padded,
+    )
+
+    # 3. Create InferenceOptimizer with transform config
+    inference_optimizer = InferenceOptimizer(
+        factory=factory,
+        config=ad_config.transforms,
+    )
+
+    # 4. Run the transform pipeline (includes export_to_onnx transform)
+    return inference_optimizer(cache_seq_interface)

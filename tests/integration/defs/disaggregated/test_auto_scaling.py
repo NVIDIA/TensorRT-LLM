@@ -147,14 +147,14 @@ def _run_worker(model_name,
         env = os.environ.copy()
         log_file = None
         log_path = None
+        stdout = None
+        stderr = None
         if save_log:
             log_path = os.path.join(work_dir, f"worker_{role}_{port}.log")
             log_file = open(log_path, "w+")
             stdout = log_file
             stderr = log_file
-        else:
-            stdout = sys.stdout
-            stderr = sys.stderr
+
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
         print(f"Running {role} on port {port}")
@@ -465,7 +465,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                      worker_config,
                                      work_dir,
                                      port=0,
-                                     device=2)
+                                     device=0)
         await wait_for_disagg_server_status(disagg_port, 1, 1)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 1, 1, port=disagg_port)
@@ -487,7 +487,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                      worker_config,
                                      work_dir,
                                      port=0,
-                                     device=3)
+                                     device=1)
         await wait_for_disagg_server_status(disagg_port, 1, 1)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 1, 1, port=disagg_port)
