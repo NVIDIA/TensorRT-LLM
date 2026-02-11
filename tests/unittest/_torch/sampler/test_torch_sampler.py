@@ -373,7 +373,8 @@ class UutProvider(Protocol):
 def _run_test_with_warmup(
     uut_provider: UutProvider,
     warmup_sizes_bytes: tuple[int] = (4 * 2**30,),
-    max_sync_s: Optional[float] = None,
+    *,
+    max_sync_s: Optional[float],
 ):
     """Run UUT including setup and warmup.
 
@@ -854,7 +855,7 @@ class TestFinishReasons:
             ]
         )
 
-        _run_test_with_warmup(uut_provider)
+        _run_test_with_warmup(uut_provider, max_sync_s=0.5)
 
     @classmethod
     def test_are_stop_words_isnt_called_when_no_stop_words(cls, monkeypatch: pytest.MonkeyPatch):
@@ -881,13 +882,13 @@ class TestFinishReasons:
             ],
             extra_context=lambda: raising_stop_words_ctx(True),
         )
-        _run_test_with_warmup(uut_provider_with_stop_words)
+        _run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
 
         uut_provider_without_stop_words = cls.RequestCase.build(
             [cls.RequestCase(prompt=[1], new_tokens=[4], finish_reasons=[cls.NOT_FINISHED])],
             extra_context=lambda: raising_stop_words_ctx(False),
         )
-        _run_test_with_warmup(uut_provider_without_stop_words)
+        _run_test_with_warmup(uut_provider_without_stop_words, max_sync_s=0.5)
 
 
 class TestBatchedSampling:
@@ -1513,7 +1514,10 @@ class TestBatchedSampling:
 
                 logit_offset += steps
 
-        _run_test_with_warmup(_uut_provider)
+        _run_test_with_warmup(
+            _uut_provider,
+            max_sync_s=None,  # NB: assert_no_cuda_sync called in TestBatchedSampler._sample
+        )
 
     def _compute_probs(
         self,
@@ -2225,7 +2229,10 @@ class TestBatchedSampling:
                         num_samples=num_samples,
                     )
 
-        _run_test_with_warmup(_uut_provider)
+        _run_test_with_warmup(
+            _uut_provider,
+            max_sync_s=None,  # NB: assert_no_cuda_sync called in TestBatchedSampler._sample
+        )
 
     @staticmethod
     def _build_seq_slot_assignments() -> list[tuple[list[int], int, str]]:
