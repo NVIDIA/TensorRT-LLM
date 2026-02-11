@@ -393,7 +393,7 @@ def preparation(pipeline, testFilter, globalVars)
     })
 }
 
-def launchReleaseCheck(pipeline)
+def launchReleaseCheck(pipeline, globalVars)
 {
     stages = {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip")
@@ -1056,7 +1056,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     stages = [
         "Release-Check": {
             script {
-                launchReleaseCheck(this)
+                launchReleaseCheck(this, globalVars)
             }
         },
         "x86_64-Linux": {
@@ -1370,7 +1370,7 @@ pipeline {
                     if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
-                                launchReleaseCheck(this)
+                                launchReleaseCheck(this, globalVars)
                             }
                         }
                     } else {
