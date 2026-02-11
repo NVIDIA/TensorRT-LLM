@@ -119,6 +119,25 @@ def _init_block_weights(module, std=0.02):
 # equivalent results.
 
 
+class OriginalQwen3_5MoeRMSNorm(torch.nn.Module):
+    """Original HF Qwen3.5 MoE RMSNorm with (1 + weight) scaling, zero-init.
+
+    Used as a reference to validate the modified Qwen3_5MoeRMSNorm (which uses a
+    load-time pre-hook to fold the +1 offset into the weight parameter).
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = x.float()
+        output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+
 def ref_l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """L2 norm. Copied from HF modeling_qwen3_5_moe.py l2norm."""
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
@@ -717,6 +736,51 @@ def test_decoder_layer_matches_hf_reference():
                 f"custom-ops forward should match HF reference"
             ),
         )
+
+
+# =============================================================================
+# RMSNorm Load Hook Correctness Test
+# =============================================================================
+
+
+@torch.no_grad()
+def test_rmsnorm_load_hook_matches_original():
+    """Verify modified Qwen3_5MoeRMSNorm (load hook + simplified forward)
+    produces identical output to the original (1 + weight) formulation."""
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
+
+    dim = 64
+    eps = 1e-6
+
+    # Create original (HF-style) norm with learned weights
+    torch.manual_seed(42)
+    original = OriginalQwen3_5MoeRMSNorm(dim, eps)
+    original.weight.data.normal_(mean=0.0, std=0.1)  # non-trivial weights
+
+    # Create modified norm with load hook, load original's state dict
+    modified = Qwen3_5MoeRMSNorm(dim, eps)
+    modified.load_state_dict(original.state_dict())
+
+    # The load hook should have added 1.0:
+    # modified.weight == original.weight + 1.0
+    torch.testing.assert_close(
+        modified.weight.data,
+        original.weight.data + 1.0,
+        msg="Load hook should offset weight by +1.0",
+    )
+
+    # Forward pass: both should produce identical outputs
+    x = torch.randn(2, 8, dim)
+    out_original = original(x)
+    out_modified = modified(x)
+
+    torch.testing.assert_close(
+        out_original,
+        out_modified,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Modified RMSNorm with load hook should match original (1+weight) RMSNorm",
+    )
 
 
 # =============================================================================

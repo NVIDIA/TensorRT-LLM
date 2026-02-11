@@ -139,18 +139,31 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
 
 
 class Qwen3_5MoeRMSNorm(nn.Module):
-    """RMSNorm with (1 + weight) scaling. Weight is initialized to zeros."""
+    """RMSNorm with weight scaling.
+
+    The HF checkpoint stores weights in ``(1 + w)`` parameterisation (zeros
+    init). A load-time pre-hook adds 1.0 so that the forward can use a plain
+    ``weight * x`` multiply, which matches the autodeploy RMSNorm pattern and
+    gets fused into a single ``flashinfer_rms_norm`` kernel.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
+        self._register_load_state_dict_pre_hook(self._offset_weight)
+
+    @staticmethod
+    def _offset_weight(state_dict, prefix, *args):
+        key = prefix + "weight"
+        assert key in state_dict, f"RMSNorm: Key {key} not found in state_dict"
+        state_dict[key] = state_dict[key] + 1.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = x.float()
+        input_dtype = x.dtype
+        output = x.to(torch.float32)
         output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+        return (self.weight.to(torch.float32) * output).to(input_dtype)
 
 
 class Qwen3_5MoeRMSNormGated(nn.Module):
@@ -679,7 +692,7 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModel):
         super()._init_weights(module)
         std = getattr(self.config, "initializer_range", 0.02)
         if isinstance(module, Qwen3_5MoeRMSNorm):
-            module.weight.data.zero_()
+            module.weight.data.fill_(1.0)
         elif isinstance(module, Qwen3_5MoeRMSNormGated):
             module.weight.data.fill_(1.0)
         elif isinstance(module, Qwen3_5MoeGatedDeltaNet):
