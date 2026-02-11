@@ -404,9 +404,20 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         TORCH_CHECK(do_finalize, "out_tensor is only supported when do_finalize=true.");
         TORCH_CHECK(out_tensor->scalar_type() == at::ScalarType::BFloat16, "out_tensor must be bfloat16.");
         TORCH_CHECK(out_tensor->dim() == 2, "out_tensor must be 2D.");
-        TORCH_CHECK(out_tensor->sizes()[0] == args.num_tokens && out_tensor->sizes()[1] == args.hidden_size,
-            "out_tensor has incorrect shape.");
+        TORCH_CHECK(out_tensor->sizes()[0] == args.num_tokens, "out_tensor dim0 must match num_tokens.");
         TORCH_CHECK(out_tensor->device() == hidden_states.device(), "out_tensor must be on the same device as inputs.");
+        auto const out_hidden = out_tensor->sizes()[1];
+        if (out_hidden < args.hidden_size)
+        {
+            // out_tensor has unpadded hidden dim (e.g., nvfp4 with padding).
+            // Set valid_hidden_size so the finalize kernel writes only the needed columns.
+            args.valid_hidden_size = out_hidden;
+            args.output_hidden_size = tensorrt_llm::common::roundUp(out_hidden, static_cast<int64_t>(128));
+        }
+        else
+        {
+            TORCH_CHECK(out_hidden == args.hidden_size, "out_tensor hidden dim must match hidden_size.");
+        }
         output = out_tensor.value();
     }
     else
@@ -523,7 +534,7 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids)
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
     {
         // moeConfigIndex corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
@@ -548,7 +559,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *mRunners[tileN], config,
-            topk_weights, topk_ids);
+            topk_weights, topk_ids, output);
     }
 
 private:
@@ -612,8 +623,7 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids,
-        torch::optional<torch::Tensor> const& output = torch::nullopt)
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
     {
         // moeConfigIndex corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
