@@ -2729,28 +2729,19 @@ class Linear(nn.Module):
             like_tensor = torch.empty((),
                                       device=input.device,
                                       dtype=output_dtype)
-        try:
-            out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
-                like_tensor, self.mapping.tp_group, output_shape)
-        except Exception as exc:
+        window = self.all_reduce.get_nccl_window_for_shape(
+            tuple(output_shape),
+            all_reduce_params=all_reduce_params,
+            like_tensor=like_tensor,
+        )
+        if window is None:
             logger.debug(
-                "create_nccl_window_tensor raised: %s (shape=%s, group=%s)",
-                type(exc).__name__,
+                "create_nccl_window_tensor skipped (get_nccl_window_for_shape "
+                "returned None; shape=%s, group=%s)",
                 tuple(output_shape),
                 tuple(self.mapping.tp_group),
             )
-            return None
-        if not bool(is_valid) or out is None or out.numel() == 0:
-            logger.debug(
-                "create_nccl_window_tensor invalid (is_valid=%s, out_defined=%s, numel=%d, shape=%s, group=%s)",
-                bool(is_valid),
-                out is not None,
-                0 if out is None else out.numel(),
-                tuple(output_shape),
-                tuple(self.mapping.tp_group),
-            )
-            return None
-        return out
+        return window
 
     def apply_linear_allreduce(self,
                                input,
