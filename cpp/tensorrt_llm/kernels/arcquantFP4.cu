@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,32 +14,85 @@
  * limitations under the License.
  */
 
-#include "cutlass/numeric_conversion.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/kernels/arcquantFP4.h"
-#include <cmath>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-TRTLLM_NAMESPACE_BEGIN
+using namespace tensorrt_llm::common;
 
-namespace cg = cooperative_groups;
+TRTLLM_NAMESPACE_BEGIN
 
 namespace
 {
 
 #define FP4_MAX 6
-#define FP8_MAX 448
-#define SCALE_EPS 0.001953125
+#define SCALE_EPS 0.001953125f
 #define MAX_HIDDEN_DIM 16384
 #define GROUP_NUM(x) ((x) / 16)
 
-__forceinline__ __device__ __host__ float clamp(float x, float a, float b)
+// Fast reciprocal.
+inline __device__ float reciprocal_approximate_ftz(float a)
 {
-    return max((float) a, min((float) b, (float) x));
+    float b;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
+    return b;
+}
+
+// PTX-based vectorized FP4 quantization - quantize only using hardware instructions
+// Converts 4 floats to 4 e2m1 values (packed into uint16_t) using PTX
+inline __device__ uint16_t fp32_vec4_to_e2m1(float (&scaled_inputs)[4])
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    uint16_t packed_e2m1;
+
+    // Use PTX hardware cvt.rn.satfinite.e2m1x2.f32 instruction (bypasses ALU pipeline)
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0, byte1;\n"
+
+        // Quantize: 4 scaled floats -> 4 e2m1 (2 e2m1 values per byte)
+        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+
+        // Pack 2 bytes into uint16_t output
+        "mov.b16 %0, {byte0, byte1};\n"
+        "}"
+        : "=h"(packed_e2m1)
+        : "f"(scaled_inputs[0]), "f"(scaled_inputs[1]), "f"(scaled_inputs[2]), "f"(scaled_inputs[3]));
+
+    return packed_e2m1;
+#else
+    return 0;
+#endif
+}
+
+// PTX-based vectorized FP4 quantization - quantize only using hardware instructions
+// Converts 4 e2m1 values (packed into uint16_t) to 4 floats using PTX
+inline __device__ float4 e2m1_to_float(uint16_t const& packed_e2m1)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    uint32_t out_fp16[2];
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0, byte1;\n"
+        "mov.b16 {byte0, byte1}, %2;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
+        "cvt.rn.f16x2.e2m1x2 %1, byte1;\n"
+        "}\n"
+        : "=r"(out_fp16[0]), "=r"(out_fp16[1])
+        : "h"(packed_e2m1));
+
+    float2 res0 = __half22float2(reinterpret_cast<__half2&>(out_fp16[0]));
+    float2 res1 = __half22float2(reinterpret_cast<__half2&>(out_fp16[1]));
+    return {res0.x, res0.y, res1.x, res1.y};
+#else
+    return {0.0f, 0.0f, 0.0f, 0.0f};
+#endif
 }
 
 template <typename T, typename U, int Size = sizeof(U) / sizeof(T)>
@@ -85,15 +138,14 @@ __global__ void quantize_reorder_nvfp4_kernel(
     int const K = KQ + KE;
     int const bdx = hidden_dim / GROUP_SIZE;
     constexpr int elements_per_thread = GROUP_SIZE;
-    cg::thread_block cta = cg::this_thread_block();
 
     T* input = reinterpret_cast<T*>(hidden_states);
-    cutlass::float_ue4m3_t* q_scale_tensor = reinterpret_cast<cutlass::float_ue4m3_t*>(q_scale);
+    __nv_fp8_e4m3* q_scale_tensor = reinterpret_cast<__nv_fp8_e4m3*>(q_scale);
     // One block solves one row of hidden states.
     __shared__ uint8_t smem[MAX_HIDDEN_DIM * sizeof(T)];
     T* input_smem = reinterpret_cast<T*>(smem);
     // Local memory stores the reordered hidden states.
-    cutlass::bfloat16_t input_frag[elements_per_thread];
+    __nv_bfloat16 input_frag[elements_per_thread];
     int8_t output_frag[elements_per_thread];
     // Row are independent
     int row_id = blockIdx.x;
@@ -115,14 +167,6 @@ __global__ void quantize_reorder_nvfp4_kernel(
     int tid = threadIdx.x;
     int const bytes_per_iter = bdx * 16;
     int const iters = hidden_dim * sizeof(T) / bytes_per_iter;
-    cutlass::NumericConverter<cutlass::float_e2m1_t, float, cutlass::FloatRoundStyle::round_to_nearest> Float2E2m1;
-    cutlass::NumericConverter<float, cutlass::float_e2m1_t, cutlass::FloatRoundStyle::round_to_nearest> E2m12Float;
-    cutlass::NumericConverter<cutlass::float_ue4m3_t, float,
-        arcquant_type == ArcQuantType::ACT ? cutlass::FloatRoundStyle::round_to_nearest
-                                           : cutlass::FloatRoundStyle::round_toward_infinity>
-        Float2Ue4m3;
-    cutlass::NumericConverter<float, cutlass::float_ue4m3_t, cutlass::FloatRoundStyle::round_to_nearest> Ue4m32Float;
-    cutlass::NumericConverter<cutlass::bfloat16_t, float, cutlass::FloatRoundStyle::round_to_nearest> Float2Bfloat16;
 #pragma unroll
     for (int i = 0; i < iters; ++i)
     {
@@ -131,53 +175,73 @@ __global__ void quantize_reorder_nvfp4_kernel(
         *(float4*) (reinterpret_cast<uint8_t*>(input_smem) + offset)
             = *(float4*) (reinterpret_cast<uint8_t*>(input) + offset);
     }
-    cta.sync();
+    __syncthreads();
     // Reorder and convert to BF16
 #pragma unroll 4
     for (int i = 0; i < elements_per_thread; ++i)
     {
         int offset = tid * elements_per_thread + i;
         // Convert to BF16 and apply FP8 scale if needed
-        input_frag[i] = Float2Bfloat16((float) input_smem[reorder_index[offset]] * global_scale);
+        input_frag[i] = __float2bfloat16_rn((float) input_smem[reorder_index[offset]] * global_scale);
     }
     // Reduce to get max
     // Each ty should get its max value
     float4* input_frag_float4 = reinterpret_cast<float4*>(input_frag);
-    constexpr int float4_per_thread = elements_per_thread * sizeof(cutlass::bfloat16_t) / sizeof(float4);
+    constexpr int float4_per_thread = elements_per_thread * sizeof(__nv_bfloat16) / sizeof(float4);
     float maxv = 0, scale = 1.0, r_scale = 1.0;
 #pragma unroll
     for (int i = 0; i < float4_per_thread; ++i)
     {
-        maxv = local_abs_max<cutlass::bfloat16_t, float4>(input_frag_float4 + i, maxv);
+        maxv = local_abs_max<__nv_bfloat16, float4>(input_frag_float4 + i, maxv);
     }
     // Q quantize
-    float lower_bound = -FP4_MAX;
-    float upper_bound = FP4_MAX;
-    scale = clamp(maxv / FP4_MAX, SCALE_EPS, FP8_MAX);
+    scale = cuda_max(maxv / FP4_MAX, SCALE_EPS);
     int pos = tid + max(0, tid - GROUP_NUM(KQ - KE));
     int64_t sf_offset = get_sf_offset(row_id, pos, K);
-    q_scale_tensor[sf_offset] = Float2Ue4m3(scale);
+    __nv_fp8_e4m3 scale_ue4m3 = (__nv_fp8_e4m3) scale;
+    q_scale_tensor[sf_offset] = scale_ue4m3;
     // Use reverse scale to replace division by multiplication
-    float qdq_scale = Ue4m32Float(Float2Ue4m3(scale));
-    r_scale = 1.0 / qdq_scale;
-    // Quantize each thread's value
-    // Each iteration quantize two things, convenient for packing int4
+    float qdq_scale = (float) scale_ue4m3;
+    r_scale = reciprocal_approximate_ftz(qdq_scale);
+    // Quantize each thread's value using PTX hardware instructions
+    // Each iteration processes 4 elements using vectorized PTX operations
     PackFp4* output_frag_fp4 = reinterpret_cast<PackFp4*>(output_frag);
+#pragma unroll 4
     for (int i = 0; i < elements_per_thread; i += 4)
     {
-        float result_0, result_1, result_2, result_3;
-        result_0 = clamp(((float) input_frag[i + 0] * r_scale), lower_bound, upper_bound);
-        result_1 = clamp(((float) input_frag[i + 1] * r_scale), lower_bound, upper_bound);
-        result_2 = clamp(((float) input_frag[i + 2] * r_scale), lower_bound, upper_bound);
-        result_3 = clamp(((float) input_frag[i + 3] * r_scale), lower_bound, upper_bound);
-        input_frag[i + 0] = Float2Bfloat16((float) input_frag[i + 0] - E2m12Float(Float2E2m1(result_0)) * qdq_scale);
-        input_frag[i + 1] = Float2Bfloat16((float) input_frag[i + 1] - E2m12Float(Float2E2m1(result_1)) * qdq_scale);
-        input_frag[i + 2] = Float2Bfloat16((float) input_frag[i + 2] - E2m12Float(Float2E2m1(result_2)) * qdq_scale);
-        input_frag[i + 3] = Float2Bfloat16((float) input_frag[i + 3] - E2m12Float(Float2E2m1(result_3)) * qdq_scale);
-        output_frag_fp4[i / 2 + 0].low = Float2E2m1(result_0).storage;
-        output_frag_fp4[i / 2 + 0].high = Float2E2m1(result_1).storage;
-        output_frag_fp4[i / 2 + 1].low = Float2E2m1(result_2).storage;
-        output_frag_fp4[i / 2 + 1].high = Float2E2m1(result_3).storage;
+        // Prepare scaled inputs for quantization
+        float scaled_inputs[4];
+        scaled_inputs[0] = (float) input_frag[i + 0] * r_scale;
+        scaled_inputs[1] = (float) input_frag[i + 1] * r_scale;
+        scaled_inputs[2] = (float) input_frag[i + 2] * r_scale;
+        scaled_inputs[3] = (float) input_frag[i + 3] * r_scale;
+
+        // PTX-based quantization: converts 4 floats -> 4 e2m1 using hardware instruction
+        // Uses cvt.rn.satfinite.e2m1x2.f32 which bypasses ALU pipeline
+        uint16_t packed_e2m1 = fp32_vec4_to_e2m1(scaled_inputs);
+
+        // Unpack e2m1 values and dequantize for residual computation
+        uint8_t byte0 = packed_e2m1 & 0xFF;
+        uint8_t byte1 = (packed_e2m1 >> 8) & 0xFF;
+
+        // Extract e2m1 values (4 bits each)
+        uint8_t e2m1_0 = byte0 & 0xF;
+        uint8_t e2m1_1 = (byte0 >> 4) & 0xF;
+        uint8_t e2m1_2 = byte1 & 0xF;
+        uint8_t e2m1_3 = (byte1 >> 4) & 0xF;
+
+        // Dequantize e2m1 to float and compute residuals using PTX instructions
+        float4 e2m1_float = e2m1_to_float(packed_e2m1);
+        input_frag[i + 0] = __float2bfloat16_rn((float) input_frag[i + 0] - e2m1_float.x * qdq_scale);
+        input_frag[i + 1] = __float2bfloat16_rn((float) input_frag[i + 1] - e2m1_float.y * qdq_scale);
+        input_frag[i + 2] = __float2bfloat16_rn((float) input_frag[i + 2] - e2m1_float.z * qdq_scale);
+        input_frag[i + 3] = __float2bfloat16_rn((float) input_frag[i + 3] - e2m1_float.w * qdq_scale);
+
+        // Store packed e2m1 values to PackFp4 struct
+        output_frag_fp4[i / 2 + 0].low = e2m1_0;
+        output_frag_fp4[i / 2 + 0].high = e2m1_1;
+        output_frag_fp4[i / 2 + 1].low = e2m1_2;
+        output_frag_fp4[i / 2 + 1].high = e2m1_3;
     }
     int const ke_thread_count = GROUP_NUM(KE);
     int const kq_thread_count = bdx - ke_thread_count;
@@ -189,35 +253,51 @@ __global__ void quantize_reorder_nvfp4_kernel(
 #pragma unroll
             for (int i = 0; i < float4_per_thread; ++i)
             {
-                maxv = local_abs_max<cutlass::bfloat16_t, float4>(input_frag_float4 + i, maxv);
+                maxv = local_abs_max<__nv_bfloat16, float4>(input_frag_float4 + i, maxv);
             }
-            scale = clamp(maxv / FP4_MAX, SCALE_EPS, FP8_MAX);
+            scale = cuda_max(maxv / FP4_MAX, SCALE_EPS);
             // logical_coord1 = make_coord(make_coord(0, (pos + 1) % 4), (pos + 1) / 4);
             // q_scale_tensor(make_coord(logical_coord0, logical_coord1, logical_coord2)) = Float2Ue4m3(scale);
             sf_offset = get_sf_offset(row_id, pos + 1, K);
-            q_scale_tensor[sf_offset] = Float2Ue4m3(scale);
-
-            r_scale = 1.0 / Ue4m32Float(Float2Ue4m3(scale));
+            __nv_fp8_e4m3 scale_ue4m3_res = (__nv_fp8_e4m3) scale;
+            q_scale_tensor[sf_offset] = scale_ue4m3_res;
+            r_scale = reciprocal_approximate_ftz((float) scale_ue4m3_res);
             int q_offset = elements_per_thread / 2;
+#pragma unroll 4
             for (int i = 0; i < elements_per_thread; i += 4)
             {
-                float result_0, result_1, result_2, result_3;
-                result_0 = clamp(((float) input_frag[i + 0] * r_scale), lower_bound, upper_bound);
-                result_1 = clamp(((float) input_frag[i + 1] * r_scale), lower_bound, upper_bound);
-                result_2 = clamp(((float) input_frag[i + 2] * r_scale), lower_bound, upper_bound);
-                result_3 = clamp(((float) input_frag[i + 3] * r_scale), lower_bound, upper_bound);
-                output_frag_fp4[i / 2 + q_offset + 0].low = Float2E2m1(result_0).storage;
-                output_frag_fp4[i / 2 + q_offset + 0].high = Float2E2m1(result_1).storage;
-                output_frag_fp4[i / 2 + q_offset + 1].low = Float2E2m1(result_2).storage;
-                output_frag_fp4[i / 2 + q_offset + 1].high = Float2E2m1(result_3).storage;
+                // Prepare scaled residuals for quantization
+                float scaled_inputs[4];
+                scaled_inputs[0] = (float) input_frag[i + 0] * r_scale;
+                scaled_inputs[1] = (float) input_frag[i + 1] * r_scale;
+                scaled_inputs[2] = (float) input_frag[i + 2] * r_scale;
+                scaled_inputs[3] = (float) input_frag[i + 3] * r_scale;
+
+                // PTX-based quantization of residuals
+                uint16_t packed_e2m1 = fp32_vec4_to_e2m1(scaled_inputs);
+
+                // Unpack e2m1 values and store to PackFp4 struct
+                uint8_t byte0 = packed_e2m1 & 0xFF;
+                uint8_t byte1 = (packed_e2m1 >> 8) & 0xFF;
+
+                uint8_t e2m1_0 = byte0 & 0xF;
+                uint8_t e2m1_1 = (byte0 >> 4) & 0xF;
+                uint8_t e2m1_2 = byte1 & 0xF;
+                uint8_t e2m1_3 = (byte1 >> 4) & 0xF;
+
+                output_frag_fp4[i / 2 + q_offset + 0].low = e2m1_0;
+                output_frag_fp4[i / 2 + q_offset + 0].high = e2m1_1;
+                output_frag_fp4[i / 2 + q_offset + 1].low = e2m1_2;
+                output_frag_fp4[i / 2 + q_offset + 1].high = e2m1_3;
             }
         }
         else if constexpr (arcquant_type == ArcQuantType::WEIGHT)
         {
             sf_offset = get_sf_offset(row_id, pos + 1, K);
-            q_scale_tensor[sf_offset] = Float2Ue4m3(scale);
+            q_scale_tensor[sf_offset] = scale_ue4m3;
 
             int q_offset = elements_per_thread / 2;
+#pragma unroll 4
             for (int i = 0; i < elements_per_thread; i += 4)
             {
                 output_frag_fp4[i / 2 + q_offset + 0].low = output_frag_fp4[i / 2 + 0].low;
