@@ -536,8 +536,8 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
 
 
 def force_all_reduce_deterministic():
-    return envs.get_env("FORCE_DETERMINISTIC") or envs.get_env(
-        "FORCE_ALL_REDUCE_DETERMINISTIC")
+    return envs.get_env(envs.FORCE_DETERMINISTIC) or envs.get_env(
+        envs.FORCE_ALL_REDUCE_DETERMINISTIC)
 
 
 class CustomAllReduceHelper:
@@ -604,12 +604,12 @@ class CustomAllReduceHelper:
         """
         if force_all_reduce_deterministic() and support_deterministic:
             workspace_size = envs.get_env(
-                "FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE")
+                envs.FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE)
             return workspace_size
 
         # Allow override via environment variable for edge cases
         workspace_size_env = envs.get_env(
-            "TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE")
+            envs.TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE)
         if workspace_size_env is not None:
             size = workspace_size_env
             logger.info(

@@ -642,7 +642,7 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[2] == w_scale_shape[2]
     w = maybe_update_stride(w)
     #num_warps = 4 if batch <= 512 else 8
-    num_warps = envs.get_env("TRITON_MOE_MXFP4_NUM_WARPS")
+    num_warps = envs.get_env(envs.TRITON_MOE_MXFP4_NUM_WARPS)
     assert num_warps in [4, 8], \
         f"TRITON_MOE_MXFP4_NUM_WARPS should be 4 or 8, got {num_warps}"
     value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(

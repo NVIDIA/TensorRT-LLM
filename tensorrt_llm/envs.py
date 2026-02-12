@@ -12,6 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Centralized environment variable management for TensorRT-LLM.
+
+This module provides a single source of truth for all TensorRT-LLM environment
+variables with type-safe access, comprehensive documentation, and IDE-friendly
+constant exports.
+
+Usage
+-----
+
+Reading variables (type-safe):
+    from tensorrt_llm import envs
+
+    # Use module constants for IDE autocomplete
+    log_level = envs.get_env(envs.TLLM_LOG_LEVEL)
+    enable_debug = envs.get_env(envs.TLLM_LLMAPI_ENABLE_DEBUG)
+
+    # Type coercion is automatic based on EnvSpec definition
+    # - bool: "true", "1", "yes", "on" → True; "false", "0", "no", "off" → False
+    # - int: string converted to integer
+    # - float: string converted to float
+    # - str: passthrough
+
+Writing variables (for subprocess propagation or context management):
+    import os
+
+    # Set environment variables to propagate to child processes
+    os.environ["TLLM_DISABLE_MPI"] = "1"
+
+    # Or use context managers for temporary state
+    with _BuildingFlag():
+        # IS_BUILDING is "1" within this context
+        pass
+
+Design Principles
+-----------------
+
+1. **All TensorRT-LLM variables defined in ENV_SPECS registry**
+   - Single source of truth for variable names, types, defaults, and documentation
+   - 103 environment variables covering all subsystems
+
+2. **External framework variables use os.environ directly**
+   - MPI variables (OMPI_COMM_WORLD_RANK, SLURM_PROCID)
+   - Ray variables (RAY_LOCAL_WORLD_SIZE)
+   - PyTorch variables (MASTER_ADDR, RANK, WORLD_SIZE, PYTORCH_ALLOC_CONF)
+   - CUDA variables (CUDA_VISIBLE_DEVICES, TORCH_CUDA_ARCH_LIST)
+   - Other external libraries (TOKENIZERS_PARALLELISM, NVSHMEM_QP_DEPTH)
+
+3. **Reading uses envs.get_env() for type safety**
+   - Prevents manual type coercion and parsing errors
+   - Provides default values from ENV_SPECS
+   - Enables AST-based linting to enforce consistency
+
+4. **Writing uses os.environ for subprocess inheritance**
+   - Child processes need to inherit environment variable changes
+   - Context managers may need to temporarily modify environment state
+   - Direct writes are legitimate for these use cases
+
+Examples:
+--------
+Basic usage:
+    >>> from tensorrt_llm import envs
+    >>> # Get with default from registry
+    >>> log_level = envs.get_env(envs.TLLM_LOG_LEVEL)
+    >>> # Override default
+    >>> max_retries = envs.get_env(envs.TLLM_PP_SCHEDULER_MAX_RETRY_COUNT, default=5)
+
+Introspection:
+    >>> # Get metadata for a variable
+    >>> spec = envs.get_spec(envs.TLLM_LOG_LEVEL)
+    >>> print(f"{spec.name}: {spec.doc}")
+    >>> # List all registered variables
+    >>> all_specs = envs.list_envs()
+"""
+
 import os
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -32,6 +106,9 @@ class EnvSpec:
                 return env_name
         raise ValueError("EnvSpec instance is not registered in ENV_SPECS.")
 
+
+# Env-name symbols are exported after ENV_SPECS to avoid repeating
+# `NAME = "NAME"` for every entry.
 
 ENV_SPECS = {
     "AD_DUMP_GRAPHS_DIR": EnvSpec("str", None, "Directory for dumping AutoDeploy graphs."),
@@ -351,6 +428,16 @@ ENV_SPECS = {
     "XGRAMMAR_CACHE_LIMIT_GB": EnvSpec("float", 1.0, "XGrammar cache size limit in GB."),
     "tllm_mpi_size": EnvSpec("int", 1, "MPI world size override used by TensorRT-LLM."),
 }
+
+# Export env-name symbols for IDE-friendly callsites:
+# envs.get_env(envs.TLLM_ALLOW_LONG_MAX_MODEL_LEN)
+for _env_name in ENV_SPECS:
+    if _env_name.isupper():
+        globals()[_env_name] = _env_name
+del _env_name
+
+# Alias for the lowercase runtime env key.
+TLLM_MPI_SIZE = "tllm_mpi_size"
 
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off"}

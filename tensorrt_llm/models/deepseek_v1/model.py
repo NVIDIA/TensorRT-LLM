@@ -228,7 +228,7 @@ class DeepseekForCausalLM(DecoderModelForCausalLM):
                                                                mapping=mapping,
                                                                **kwargs)
         deepseek = cls.from_config(pretrained_config)
-        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if envs.get_env(envs.TRTLLM_DISABLE_UNIFIED_CONVERTER) is None:
 
             custom_dict = {}
 

@@ -61,7 +61,7 @@ class NVLinkTwoSided(Communication):
         self.use_low_precision_combine = use_low_precision_combine
         self.alltoall_result_do_sum = alltoall_result_do_sum
         # Read from environment variable, same as wideEP
-        self.enable_postquant_alltoall = envs.get_env("TRTLLM_MOE_POST_QUANT_ALLTOALLV")
+        self.enable_postquant_alltoall = envs.get_env(envs.TRTLLM_MOE_POST_QUANT_ALLTOALLV)
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-coded to support -1 only.
         # CutlassFusedMoE kernels support any invalid value.

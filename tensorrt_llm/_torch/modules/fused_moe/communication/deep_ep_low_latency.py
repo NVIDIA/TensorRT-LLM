@@ -64,12 +64,12 @@ class DeepEPLowLatency(Communication):
             use_low_precision_combine and self.supports_low_precision_combine()
         )
         # Read from environment variable, same as wideEP
-        self.enable_postquant_alltoall = envs.get_env("TRTLLM_MOE_POST_QUANT_ALLTOALLV")
+        self.enable_postquant_alltoall = envs.get_env(envs.TRTLLM_MOE_POST_QUANT_ALLTOALLV)
 
         # Calculate deep_ep_max_num_tokens
         assert moe_max_num_tokens is not None
         default_limit = min(max_num_tokens, moe_max_num_tokens)
-        self.deep_ep_max_num_tokens = envs.get_env("TRTLLM_DEEP_EP_TOKEN_LIMIT")
+        self.deep_ep_max_num_tokens = envs.get_env(envs.TRTLLM_DEEP_EP_TOKEN_LIMIT)
         if self.deep_ep_max_num_tokens is None:
             self.deep_ep_max_num_tokens = default_limit
 
@@ -85,7 +85,7 @@ class DeepEPLowLatency(Communication):
         """
         Check if DeepEP Low Latency is supported on the current platform
         """
-        if not envs.get_env("TRTLLM_CAN_USE_DEEP_EP"):
+        if not envs.get_env(envs.TRTLLM_CAN_USE_DEEP_EP):
             return False
         if not deep_ep_installed:
             return False

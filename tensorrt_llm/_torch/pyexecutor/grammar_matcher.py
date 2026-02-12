@@ -82,7 +82,7 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
             add_prefix_space=add_prefix_space)
 
         # Default cache limit is 1GB.
-        cache_limit_gb = envs.get_env("XGRAMMAR_CACHE_LIMIT_GB")
+        cache_limit_gb = envs.get_env(envs.XGRAMMAR_CACHE_LIMIT_GB)
         cache_limit_bytes = int(cache_limit_gb * 1024 * 1024 * 1024)
         self._xgrammar_compiler = xgrammar.GrammarCompiler(
             tokenizer_info,

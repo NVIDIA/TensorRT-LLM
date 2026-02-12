@@ -98,7 +98,7 @@ class RPCClient:
         self._timeout = timeout
 
         # Check if PAIR mode is enabled via environment variable
-        use_pair_mode = envs.get_env('TLLM_LLMAPI_ZMQ_PAIR')
+        use_pair_mode = envs.get_env(envs.TLLM_LLMAPI_ZMQ_PAIR)
         socket_type = zmq.PAIR if use_pair_mode else zmq.DEALER
 
         if use_pair_mode:

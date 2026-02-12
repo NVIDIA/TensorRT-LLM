@@ -71,7 +71,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
-    force_mn = envs.get_env("TRTLLM_FORCE_MNNVL_AR")
+    force_mn = envs.get_env(envs.TRTLLM_FORCE_MNNVL_AR)
     use_fabric_handle = force_mn or mapping.is_multi_node()
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
@@ -543,7 +543,7 @@ class MNNVLAllReduce(nn.Module):
         arch = platform.machine().lower()
         is_on_aarch64 = "aarch64" in arch
         # Add a bypass so that we can run the unittest on single-node
-        is_testing = envs.get_env("TLLM_TEST_MNNVL")
+        is_testing = envs.get_env(envs.TLLM_TEST_MNNVL)
         return is_testing or (dtype in MNNVLAllReduce.get_supported_dtypes() and
                               not mapping.has_cp() and mapping.is_multi_node()
                               and MnnvlMemory.supports_mnnvl()
@@ -833,7 +833,7 @@ class AllReduce(nn.Module):
         # In case that AutoTuner brings potential perf regression
         # TODO: Remove this if no perf regression is observed.
         disable_allreduce_autotune = envs.get_env(
-            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE")
+            envs.TLLM_DISABLE_ALLREDUCE_AUTOTUNE)
 
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
             output = torch.ops.trtllm.tunable_allreduce(

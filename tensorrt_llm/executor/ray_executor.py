@@ -60,7 +60,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         }
 
         try:
-            if not envs.get_env("TLLM_RAY_FORCE_LOCAL_CLUSTER"):
+            if not envs.get_env(envs.TLLM_RAY_FORCE_LOCAL_CLUSTER):
                 try:
                     ray.init(address="auto", **ray_init_args)
                     logger.info(f"Attached to an existing Ray cluster.")
@@ -115,7 +115,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
-        num_gpus = envs.get_env("TRTLLM_RAY_PER_WORKER_GPUS")
+        num_gpus = envs.get_env(envs.TRTLLM_RAY_PER_WORKER_GPUS)
         if placement_config and placement_config.per_worker_gpu_share is not None:
             num_gpus = placement_config.per_worker_gpu_share
 
@@ -452,7 +452,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         if placement_config and placement_config.placement_groups is not None:
             return _get_from_placement_config(placement_config)
         # path 1
-        if bundle_indices := envs.get_env("TRTLLM_RAY_BUNDLE_INDICES"):
+        if bundle_indices := envs.get_env(envs.TRTLLM_RAY_BUNDLE_INDICES):
             return _get_from_env(bundle_indices)
         # path 2
         return _get_default(tp_size)

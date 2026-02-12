@@ -19,7 +19,7 @@ from typing import Final, NewType
 
 from tensorrt_llm import envs
 
-NDEBUG: Final[int] = envs.get_env("TLLM_KV_CACHE_MANAGER_V2_DEBUG")
+NDEBUG: Final[int] = envs.get_env(envs.TLLM_KV_CACHE_MANAGER_V2_DEBUG)
 
 
 class PageStatus(enum.IntEnum):

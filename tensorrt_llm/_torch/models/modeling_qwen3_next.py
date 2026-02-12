@@ -878,7 +878,7 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         self.fusion_config = EagerFusionConfig()
         ### TODO: enable eager_fusion by default
         self.enable_fusion = not envs.get_env(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "1")
+            envs.TRTLLM_QWEN3_EAGER_FUSION_DISABLED, "1")
         self.enable_fusion &= not self.enable_attention_dp
 
         # has_tp = self.mapping.has_tp()
@@ -1037,7 +1037,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = not envs.get_env(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED")
+            envs.TRTLLM_QWEN3_EAGER_FUSION_DISABLED)
         self.enable_fusion &= not self.enable_attention_dp
 
         # has_tp = self.mapping.has_tp()

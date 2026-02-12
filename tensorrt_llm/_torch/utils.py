@@ -358,7 +358,7 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     lm_head_tp_size_raw = 256 // token_count
     # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
     lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
-    lm_head_tp_size = envs.get_env("LM_HEAD_TP_SIZE")
+    lm_head_tp_size = envs.get_env(envs.LM_HEAD_TP_SIZE)
     if lm_head_tp_size is None:
         lm_head_tp_size = nearest_in_buckets(lm_head_tp_size_raw,
                                              [1, lm_head_tp_size_upper_bound])

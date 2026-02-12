@@ -57,7 +57,7 @@ from .session import _scoped_stream
 
 # When variable is set, this will disable torch.cuda.set_device(...) calls
 # Useful in situations where device is already assigned by another library, i.e., megatron.
-DISABLE_TORCH_DEVICE_SET = envs.get_env("DISABLE_TORCH_DEVICE_SET")
+DISABLE_TORCH_DEVICE_SET = envs.get_env(envs.DISABLE_TORCH_DEVICE_SET)
 
 
 def decode_words_list(word_dict: List[List[str]],

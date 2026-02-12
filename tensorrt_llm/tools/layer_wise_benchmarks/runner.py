@@ -97,7 +97,7 @@ def get_balanced_selection_impl_random(
 
 
 def get_balanced_selection_no_cache(*args, **kwargs):
-    if envs.get_env("TRTLLM_LAYERWISE_BENCHMARK_BALANCED_IMPL") == "RANDOM":
+    if envs.get_env(envs.TRTLLM_LAYERWISE_BENCHMARK_BALANCED_IMPL) == "RANDOM":
         return get_balanced_selection_impl_random(*args, **kwargs)
     else:
         return get_balanced_selection_impl_default(*args, **kwargs)

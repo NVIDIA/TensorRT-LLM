@@ -18,8 +18,8 @@ from tensorrt_llm import envs
 
 logger = logging.getLogger(__name__)
 
-COMPILER_MODE = envs.get_env("FLA_COMPILER_MODE")
-FLA_CI_ENV = envs.get_env("FLA_CI_ENV")
+COMPILER_MODE = envs.get_env(envs.FLA_COMPILER_MODE)
+FLA_CI_ENV = envs.get_env(envs.FLA_CI_ENV)
 
 
 @lru_cache(maxsize=1)
@@ -88,7 +88,7 @@ def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
         assert error_rate < ratio, msg
 
 
-SUPPRESS_LEVEL = envs.get_env("GDN_RECOMPUTE_SUPPRESS_LEVEL")
+SUPPRESS_LEVEL = envs.get_env(envs.GDN_RECOMPUTE_SUPPRESS_LEVEL)
 
 
 def tensor_cache(
@@ -265,7 +265,7 @@ is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_n
     0)
 is_nvidia_hopper = is_nvidia and ("NVIDIA H" in torch.cuda.get_device_name(0)
                                   or torch.cuda.get_device_capability()[0] >= 9)
-use_cuda_graph = is_nvidia and envs.get_env("FLA_USE_CUDA_GRAPH")
+use_cuda_graph = is_nvidia and envs.get_env(envs.FLA_USE_CUDA_GRAPH)
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8

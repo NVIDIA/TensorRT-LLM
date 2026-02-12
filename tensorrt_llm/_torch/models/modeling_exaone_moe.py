@@ -163,7 +163,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         self.fusion_config = EagerFusionConfig()
         # MoE fusions are disabled by default in K-EXAONE since
         # it may cause a slight accuracy drop due to numerical gap.
-        self.enable_fusion = envs.get_env("TRTLLM_EXAONE_EAGER_FUSION_ENABLED")
+        self.enable_fusion = envs.get_env(envs.TRTLLM_EXAONE_EAGER_FUSION_ENABLED)
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode

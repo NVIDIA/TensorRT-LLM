@@ -327,7 +327,7 @@ class SamplingParams:
             self.best_of is not None
             and self.best_of > 1
             and self._greedy_decoding
-            and not envs.get_env("TLLM_ALLOW_N_GREEDY_DECODING")
+            and not envs.get_env(envs.TLLM_ALLOW_N_GREEDY_DECODING)
         ):
             raise ValueError(
                 f"Greedy decoding in the LLM API does not allow multiple "

@@ -164,7 +164,7 @@ def worker_main(
             logger.error(f"Printing stacks {counter} times")
             print_all_stacks()
 
-    print_stacks_period = envs.get_env("TRTLLM_WORKER_PRINT_STACKS_PERIOD")
+    print_stacks_period = envs.get_env(envs.TRTLLM_WORKER_PRINT_STACKS_PERIOD)
     if print_stacks_period > 0:
         print_stacks_thread = threading.Thread(target=_print_stacks,
                                                daemon=True)
@@ -301,7 +301,7 @@ def worker_main(
         return
 
     # Optionally disable GC (default: not disabled)
-    if envs.get_env("TRTLLM_WORKER_DISABLE_GC"):
+    if envs.get_env(envs.TRTLLM_WORKER_DISABLE_GC):
         gc.disable()
 
     with worker:

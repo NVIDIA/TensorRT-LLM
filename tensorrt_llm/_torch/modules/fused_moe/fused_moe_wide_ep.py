@@ -124,7 +124,7 @@ class WideEPMoE(MoE):
         self.use_low_precision_combine = False
         if self.enable_alltoall:
             self.use_postquant_alltoall = envs.get_env(
-                "TRTLLM_MOE_POST_QUANT_ALLTOALLV")
+                envs.TRTLLM_MOE_POST_QUANT_ALLTOALLV)
             self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
             if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
@@ -139,7 +139,7 @@ class WideEPMoE(MoE):
                 self.deep_ep_buffer.reserve(hidden_size, dtype)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 self.deep_ep_max_num_tokens = envs.get_env(
-                    "TRTLLM_DEEP_EP_TOKEN_LIMIT")
+                    envs.TRTLLM_DEEP_EP_TOKEN_LIMIT)
                 if self.deep_ep_max_num_tokens is None:
                     self.deep_ep_max_num_tokens = min(
                         model_config.max_num_tokens, self.moe_max_num_tokens)
@@ -204,7 +204,8 @@ class WideEPMoE(MoE):
             num_rdma_nodes = num_ranks // mpi_size
             return num_rdma_nodes in NUM_INTERNODE_SUPPORTED_RDMA_RANKS
 
-        all2all_method_type_env = envs.get_env("TRTLLM_FORCE_ALLTOALL_METHOD")
+        all2all_method_type_env = envs.get_env(
+            envs.TRTLLM_FORCE_ALLTOALL_METHOD)
         if all2all_method_type_env is not None:
             alltoall_method_type = AlltoallMethodType[all2all_method_type_env]
             if alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
@@ -225,7 +226,7 @@ class WideEPMoE(MoE):
         if MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.NVLinkTwoSided
 
-        if envs.get_env("TRTLLM_CAN_USE_DEEP_EP"):
+        if envs.get_env(envs.TRTLLM_CAN_USE_DEEP_EP):
             if deep_ep_installed and dtype == torch.bfloat16:
                 # Choose DeepEP if feasible
                 if is_deepep_feasible(mapping.moe_ep_size):

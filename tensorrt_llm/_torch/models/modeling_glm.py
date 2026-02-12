@@ -490,7 +490,7 @@ class Glm4DecoderLayer(DecoderLayer):
         self.is_p2p_supported = can_access_peer(mapping)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = not envs.get_env("TRTLLM_GLM_EAGER_FUSION_DISABLED")
+        self.enable_fusion = not envs.get_env(envs.TRTLLM_GLM_EAGER_FUSION_DISABLED)
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode

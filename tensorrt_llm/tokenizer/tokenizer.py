@@ -8,9 +8,8 @@ from tensorrt_llm import envs
 from .._utils import nvtx_range_debug
 from ..logger import logger
 
-TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = envs.get_env(
-    "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND")
-TLLM_STREAM_INTERVAL_THRESHOLD = envs.get_env("TLLM_STREAM_INTERVAL_THRESHOLD")
+TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = envs.get_env(envs.TLLM_INCREMENTAL_DETOKENIZATION_BACKEND)
+TLLM_STREAM_INTERVAL_THRESHOLD = envs.get_env(envs.TLLM_STREAM_INTERVAL_THRESHOLD)
 try:
     from tokenizers.decoders import DecodeStream  # noqa
 except ImportError:

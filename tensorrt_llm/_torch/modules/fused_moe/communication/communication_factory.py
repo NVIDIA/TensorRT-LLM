@@ -105,7 +105,7 @@ class CommunicationFactory:
             return AllGatherReduceScatter(mapping)
 
         # Check if forced method is specified via environment variable
-        force_method = envs.get_env("TRTLLM_FORCE_COMM_METHOD")
+        force_method = envs.get_env(envs.TRTLLM_FORCE_COMM_METHOD)
 
         if force_method is not None:
             return CommunicationFactory._create_forced_method(
@@ -154,7 +154,7 @@ class CommunicationFactory:
             logger.debug(f"NVLinkTwoSided not available: {e}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
-        if envs.get_env("TRTLLM_CAN_USE_DEEP_EP") and act_dtype == torch.bfloat16:
+        if envs.get_env(envs.TRTLLM_CAN_USE_DEEP_EP) and act_dtype == torch.bfloat16:
             try:
                 strategy = DeepEP(
                     mapping,

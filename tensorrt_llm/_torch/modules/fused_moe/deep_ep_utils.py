@@ -121,7 +121,7 @@ class VariableLengthLowLatencyBuffer:
             num_max_dispatch_tokens_per_rank, hidden_size, world_size,
             num_experts)
         allow_nvlink_for_low_latency_mode = not envs.get_env(
-            "TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE")
+            envs.TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE)
 
         assert self.num_experts is None or self.num_experts == num_experts
         # Allocate a buffer if not existed or not enough buffer size

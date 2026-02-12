@@ -21,9 +21,9 @@ def get_build_cache_config_from_env() -> tuple[bool, str]:
     """
     Get the build cache configuration from the environment variables
     """
-    build_cache_enabled = envs.get_env('TLLM_LLMAPI_BUILD_CACHE')
+    build_cache_enabled = envs.get_env(envs.TLLM_LLMAPI_BUILD_CACHE)
     build_cache_root = envs.get_env(
-        'TLLM_LLMAPI_BUILD_CACHE_ROOT')  # nosec B108
+        envs.TLLM_LLMAPI_BUILD_CACHE_ROOT)  # nosec B108
     return build_cache_enabled, build_cache_root
 
 

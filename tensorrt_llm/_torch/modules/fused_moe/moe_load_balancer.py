@@ -868,7 +868,7 @@ class MoeLoadBalancer:
         self._previous_balancer = None
         self.single_layer_load_balancers = []
         self.shared_memory_base_name = shared_memory_base_name or envs.get_env(
-            'TRTLLM_EPLB_SHM_NAME')
+            envs.TRTLLM_EPLB_SHM_NAME)
         self._setup_mpi_comm()
         self.is_shutdown = False
 

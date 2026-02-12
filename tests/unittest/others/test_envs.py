@@ -21,55 +21,84 @@ import pytest
 from tensorrt_llm import envs
 
 
+def _resolve_env_name_arg(node: ast.AST):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "envs"
+        and hasattr(envs, node.attr)
+    ):
+        attr_value = getattr(envs, node.attr)
+        if isinstance(attr_value, str):
+            return attr_value
+    return None
+
+
 def test_get_env_returns_default_when_unset(monkeypatch):
-    monkeypatch.delenv("TLLM_BENCHMARK_REQ_QUEUES_SIZE", raising=False)
-    assert envs.get_env("TLLM_BENCHMARK_REQ_QUEUES_SIZE") == 0
+    monkeypatch.delenv(envs.TLLM_BENCHMARK_REQ_QUEUES_SIZE, raising=False)
+    assert envs.get_env(envs.TLLM_BENCHMARK_REQ_QUEUES_SIZE) == 0
 
 
 def test_get_env_parses_boolean_values(monkeypatch):
-    monkeypatch.setenv("TRTLLM_SERVER_DISABLE_GC", "1")
-    assert envs.get_env("TRTLLM_SERVER_DISABLE_GC") is True
+    monkeypatch.setenv(envs.TRTLLM_SERVER_DISABLE_GC, "1")
+    assert envs.get_env(envs.TRTLLM_SERVER_DISABLE_GC) is True
 
-    monkeypatch.setenv("TRTLLM_SERVER_DISABLE_GC", "false")
-    assert envs.get_env("TRTLLM_SERVER_DISABLE_GC") is False
+    monkeypatch.setenv(envs.TRTLLM_SERVER_DISABLE_GC, "false")
+    assert envs.get_env(envs.TRTLLM_SERVER_DISABLE_GC) is False
 
 
 def test_get_env_parses_int_and_float(monkeypatch):
-    monkeypatch.setenv("TLLM_BENCHMARK_REQ_QUEUES_SIZE", "17")
-    assert envs.get_env("TLLM_BENCHMARK_REQ_QUEUES_SIZE") == 17
+    monkeypatch.setenv(envs.TLLM_BENCHMARK_REQ_QUEUES_SIZE, "17")
+    assert envs.get_env(envs.TLLM_BENCHMARK_REQ_QUEUES_SIZE) == 17
 
-    monkeypatch.setenv("TRTLLM_RAY_PER_WORKER_GPUS", "2.5")
-    assert envs.get_env("TRTLLM_RAY_PER_WORKER_GPUS") == 2.5
+    monkeypatch.setenv(envs.TRTLLM_RAY_PER_WORKER_GPUS, "2.5")
+    assert envs.get_env(envs.TRTLLM_RAY_PER_WORKER_GPUS) == 2.5
 
 
 def test_get_env_returns_structured_range_as_string(monkeypatch):
-    monkeypatch.setenv("EXPERT_STATISTIC_ITER_RANGE", "100-200")
-    assert envs.get_env("EXPERT_STATISTIC_ITER_RANGE") == "100-200"
+    monkeypatch.setenv(envs.EXPERT_STATISTIC_ITER_RANGE, "100-200")
+    assert envs.get_env(envs.EXPERT_STATISTIC_ITER_RANGE) == "100-200"
 
 
 def test_get_env_raises_for_invalid_value(monkeypatch):
-    monkeypatch.setenv("TRTLLM_SERVER_DISABLE_GC", "maybe")
-    with pytest.raises(ValueError, match="TRTLLM_SERVER_DISABLE_GC"):
-        envs.get_env("TRTLLM_SERVER_DISABLE_GC")
+    monkeypatch.setenv(envs.TRTLLM_SERVER_DISABLE_GC, "maybe")
+    with pytest.raises(ValueError, match=envs.TRTLLM_SERVER_DISABLE_GC):
+        envs.get_env(envs.TRTLLM_SERVER_DISABLE_GC)
 
 
 def test_get_env_parses_override_default_by_spec_type(monkeypatch):
-    monkeypatch.delenv("TRTLLM_SERVER_DISABLE_GC", raising=False)
-    assert envs.get_env("TRTLLM_SERVER_DISABLE_GC", "1") is True
-    assert envs.get_env("TRTLLM_SERVER_DISABLE_GC", "0") is False
+    monkeypatch.delenv(envs.TRTLLM_SERVER_DISABLE_GC, raising=False)
+    assert envs.get_env(envs.TRTLLM_SERVER_DISABLE_GC, "1") is True
+    assert envs.get_env(envs.TRTLLM_SERVER_DISABLE_GC, "0") is False
 
 
 def test_list_envs_and_get_spec():
     specs = envs.list_envs()
     assert specs
-    assert any(spec.name == "TLLM_ALLOW_LONG_MAX_MODEL_LEN" for spec in specs)
-    assert envs.get_spec("TLLM_ALLOW_LONG_MAX_MODEL_LEN").type == "bool"
-    assert envs.get_spec("EXPERT_STATISTIC_ITER_RANGE").type == "str"
+    assert any(spec.name == envs.TLLM_ALLOW_LONG_MAX_MODEL_LEN for spec in specs)
+    assert envs.get_spec(envs.TLLM_ALLOW_LONG_MAX_MODEL_LEN).type == "bool"
+    assert envs.get_spec(envs.EXPERT_STATISTIC_ITER_RANGE).type == "str"
 
 
 def test_env_specs_cover_all_env_names():
     for key, spec in envs.ENV_SPECS.items():
         assert spec.name == key
+
+
+def test_env_constants_cover_all_env_names():
+    env_symbol_by_name = {}
+    for attr_name, attr_value in vars(envs).items():
+        if isinstance(attr_value, str) and attr_value in envs.ENV_SPECS:
+            env_symbol_by_name.setdefault(attr_value, set()).add(attr_name)
+
+    for env_name in envs.ENV_SPECS:
+        assert env_name in env_symbol_by_name
+        if env_name == "tllm_mpi_size":
+            assert "TLLM_MPI_SIZE" in env_symbol_by_name[env_name]
+        else:
+            assert env_name in env_symbol_by_name[env_name]
 
 
 def test_env_specs_do_not_use_generic_placeholder_docs():
@@ -136,6 +165,43 @@ def test_internal_code_uses_get_env_only():
     )
 
 
+def test_internal_code_uses_env_constants_for_known_env_names():
+    project_root = Path(__file__).resolve().parents[3]
+    violations = []
+
+    for py_file in (project_root / "tensorrt_llm").rglob("*.py"):
+        if py_file.name == "envs.py":
+            continue
+        content = py_file.read_text(encoding="utf-8")
+        tree = ast.parse(content)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "get_env":
+                continue
+            if not isinstance(node.func.value, ast.Name):
+                continue
+            if node.func.value.id != "envs":
+                continue
+            if not node.args:
+                continue
+            arg0 = node.args[0]
+            if not isinstance(arg0, ast.Constant):
+                continue
+            if not isinstance(arg0.value, str):
+                continue
+            if arg0.value not in envs.ENV_SPECS:
+                continue
+            violations.append(f"{py_file}:{node.lineno}:{arg0.value}")
+
+    assert not violations, (
+        "Use envs.<ENV_NAME> constants instead of string literals in envs.get_env for known env vars:\n"
+        + "\n".join(violations)
+    )
+
+
 def test_internal_code_has_no_redundant_typed_wrappers():
     expected_wrapper_by_type = {
         "int": "int",
@@ -171,9 +237,7 @@ def test_internal_code_has_no_redundant_typed_wrappers():
                 continue
             if not inner.args:
                 continue
-            if not isinstance(inner.args[0], ast.Constant):
-                continue
-            env_name = inner.args[0].value
+            env_name = _resolve_env_name_arg(inner.args[0])
             if env_name not in envs.ENV_SPECS:
                 continue
             if envs.ENV_SPECS[env_name].type == wrapper_type:
@@ -236,13 +300,11 @@ def test_internal_code_has_no_redundant_defaults_equal_env_specs():
                 continue
             if len(node.args) < 2:
                 continue
-            if not isinstance(node.args[0], ast.Constant):
-                continue
-            if not isinstance(node.args[0].value, str):
+            env_name = _resolve_env_name_arg(node.args[0])
+            if env_name is None:
                 continue
             if not isinstance(node.args[1], ast.Constant):
                 continue
-            env_name = node.args[0].value
             if env_name not in envs.ENV_SPECS:
                 continue
             if default_equals_spec(env_name, node.args[1].value):

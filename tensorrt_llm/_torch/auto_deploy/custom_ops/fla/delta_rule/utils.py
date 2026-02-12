@@ -5,7 +5,7 @@ import triton
 
 from tensorrt_llm import envs
 
-FLA_CACHE_RESULTS = envs.get_env("FLA_CACHE_RESULTS")
+FLA_CACHE_RESULTS = envs.get_env(envs.FLA_CACHE_RESULTS)
 
 
 supports_autotune_cache = "cache_results" in inspect.signature(triton.autotune).parameters

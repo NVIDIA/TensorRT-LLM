@@ -22,7 +22,7 @@ def convert_to_pytorch_benchmark_format(args: argparse.Namespace,
     https://github.com/pytorch/pytorch/wiki/How-to-integrate-with-PyTorch-OSS-benchmark-database
     """
     records = []
-    if not envs.get_env("SAVE_TO_PYTORCH_BENCHMARK_FORMAT"):
+    if not envs.get_env(envs.SAVE_TO_PYTORCH_BENCHMARK_FORMAT):
         return records
 
     for name, benchmark_values in metrics.items():

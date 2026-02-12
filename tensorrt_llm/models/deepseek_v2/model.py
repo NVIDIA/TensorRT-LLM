@@ -285,7 +285,7 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
             deepseek.load(weights)
             return deepseek
 
-        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if envs.get_env(envs.TRTLLM_DISABLE_UNIFIED_CONVERTER) is None:
 
             custom_dict = {}
             rank_experts = mapping.ep_experts(pretrained_config.moe.num_experts)

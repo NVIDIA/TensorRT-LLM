@@ -1333,10 +1333,10 @@ class KVCacheManager(BaseResourceManager):
         logger.info(
             f"Secondary pool memory bytes: {self._secondary_pool_memory_bytes}")
 
-        if envs.get_env("TRTLLM_WINDOW_SIZE_SHARES") is not None:
+        if envs.get_env(envs.TRTLLM_WINDOW_SIZE_SHARES) is not None:
             logger.info("Environment variable TRTLLM_WINDOW_SIZE_SHARES is set")
             window_size_shares = envs.get_env(
-                "TRTLLM_WINDOW_SIZE_SHARES").split(",")
+                envs.TRTLLM_WINDOW_SIZE_SHARES).split(",")
             window_size_shares = [float(share) for share in window_size_shares]
             assert len(window_size_shares) == len(
                 window_size_to_layers

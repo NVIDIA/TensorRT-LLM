@@ -9,7 +9,7 @@ IS_FLASHINFER_AVAILABLE = False
 
 
 def get_env_enable_pdl():
-    enabled = envs.get_env("TRTLLM_ENABLE_PDL")
+    enabled = envs.get_env(envs.TRTLLM_ENABLE_PDL)
     if enabled and not getattr(get_env_enable_pdl, "_printed", False):
         logger.info("PDL enabled")
         setattr(get_env_enable_pdl, "_printed", True)

@@ -72,11 +72,11 @@ Phi4MMConfig = None
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 def _is_torch_compile() -> bool:
-    return envs.get_env("TLLM_MULTIMODAL_ENCODER_TORCH_COMPILE")
+    return envs.get_env(envs.TLLM_MULTIMODAL_ENCODER_TORCH_COMPILE)
 
 
 def _is_disagg() -> bool:
-    return envs.get_env("TLLM_MULTIMODAL_DISAGGREGATED")
+    return envs.get_env(envs.TLLM_MULTIMODAL_DISAGGREGATED)
 
 
 # Load the Phi4MM classes from HuggingFace Phi-4-multimodal-instruct repo.

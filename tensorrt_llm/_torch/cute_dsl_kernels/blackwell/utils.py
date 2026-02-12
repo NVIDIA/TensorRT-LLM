@@ -56,7 +56,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm import envs
 
-TRTLLM_ENABLE_PDL = envs.get_env("TRTLLM_ENABLE_PDL")
+TRTLLM_ENABLE_PDL = envs.get_env(envs.TRTLLM_ENABLE_PDL)
 
 
 # WAR for CuTeDSL make_ptr implementation

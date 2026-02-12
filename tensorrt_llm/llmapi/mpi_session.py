@@ -561,7 +561,7 @@ def get_mpi_world_size() -> int:
 
     # If the proxy process is spawned, the MPI-related env will be cleaned in the proxy process, thus we made another env for the mpi_world_size
     if get_spawn_proxy_process_env():
-        return envs.get_env("tllm_mpi_size")
+        return envs.get_env(envs.TLLM_MPI_SIZE)
     else:
         return mpi_world_size()
 

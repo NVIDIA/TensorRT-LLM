@@ -54,7 +54,7 @@ def use_cpp_mamba_cache_manager() -> bool:
     Returns True if TRTLLM_USE_CPP_MAMBA='1' is set, False otherwise.
     By default, PythonMambaCacheManager is used.
     """
-    return envs.get_env('TRTLLM_USE_CPP_MAMBA')
+    return envs.get_env(envs.TRTLLM_USE_CPP_MAMBA)
 
 
 class CppMambaCacheManager(BaseResourceManager):

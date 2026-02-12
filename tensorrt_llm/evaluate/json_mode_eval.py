@@ -61,7 +61,7 @@ class JsonModeEval(Evaluator):
             if i >= self.num_samples:
                 break
             schema = sample["schema"]
-            if envs.get_env("TRTLLM_XGUIDANCE_LENIENT"):
+            if envs.get_env(envs.TRTLLM_XGUIDANCE_LENIENT):
                 schema = json.loads(schema)
                 schema["x-guidance"] = {"lenient": True}
                 schema = json.dumps(schema)

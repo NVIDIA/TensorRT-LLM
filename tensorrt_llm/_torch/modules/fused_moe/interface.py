@@ -260,7 +260,7 @@ class MoE(nn.Module):
         self.all_reduce = None
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = envs.get_env(
-            "TRTLLM_ENABLE_DUMMY_ALLREDUCE")
+            envs.TRTLLM_ENABLE_DUMMY_ALLREDUCE)
         if not self.use_dp and self.mapping.tp_size > 1:
             self.all_reduce = AllReduce(
                 mapping=self.mapping,

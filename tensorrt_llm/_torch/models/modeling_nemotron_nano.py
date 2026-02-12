@@ -35,14 +35,14 @@ from .modeling_multimodal_utils import (
 from .modeling_radio import RADIOVisionModel
 from .modeling_utils import register_auto_model
 
-VIDEO_PRUNING_RATIO = envs.get_env("TLLM_VIDEO_PRUNING_RATIO")
+VIDEO_PRUNING_RATIO = envs.get_env(envs.TLLM_VIDEO_PRUNING_RATIO)
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 def _is_disagg() -> bool:
-    return envs.get_env("TLLM_MULTIMODAL_DISAGGREGATED")
+    return envs.get_env(envs.TLLM_MULTIMODAL_DISAGGREGATED)
 
 
 class SquaredReLU(nn.Module):

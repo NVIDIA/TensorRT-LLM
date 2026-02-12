@@ -48,7 +48,7 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
 
-DISAGG = envs.get_env('TLLM_MULTIMODAL_DISAGGREGATED')
+DISAGG = envs.get_env(envs.TLLM_MULTIMODAL_DISAGGREGATED)
 
 
 class Llama4Attention(Attention):
@@ -393,7 +393,7 @@ class Llama4DecoderLayer(DecoderLayer):
                              1) % config.interleave_moe_layer_step != 0
 
         self.enable_fusion = not envs.get_env(
-            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED")
+            envs.TRTLLM_LLAMA_EAGER_FUSION_DISABLED)
 
         # MLP layer supports pre and post AR + Res + RMSNorm + NVFP4/FP8
         # MOE layer supports pre AR + Res + RMSNorm
@@ -660,7 +660,7 @@ class LlamaDecoderLayer(DecoderLayer):
                     self.num_hidden_layers) != self.mapping.pp_rank_of_layer(
                         prev_layer_idx, self.num_hidden_layers))
         self.disable_nvfp4_layernorm_fusion = envs.get_env(
-            "TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION")
+            envs.TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION)
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -687,12 +687,12 @@ class LlamaDecoderLayer(DecoderLayer):
             self.attention_mask = PredefinedAttentionMask.FULL
 
         self.enable_fusion = not envs.get_env(
-            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED")
+            envs.TRTLLM_LLAMA_EAGER_FUSION_DISABLED)
         # Disable fusion for small models due to accuracy issues
         self.enable_fusion &= config.hidden_size > 4096
 
-        enable_gemm_allreduce_fusion = (
-            envs.get_env("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED"))
+        enable_gemm_allreduce_fusion = (envs.get_env(
+            envs.TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED))
         mpi_enabled = not mpi_disabled()
         dtype_supported = config.torch_dtype in (torch.float16, torch.bfloat16)
         tp_valid = self.mapping.tp_size > 1

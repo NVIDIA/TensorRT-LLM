@@ -36,7 +36,7 @@ def get_spawn_proxy_process_ipc_addr_env() -> str | None:
 
 def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
     ''' Get the HMAC key for the spawn proxy process dynamically. '''
-    if key := envs.get_env("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"):
+    if key := envs.get_env(envs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY):
         return bytes.fromhex(key)
 
 

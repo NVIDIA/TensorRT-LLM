@@ -99,7 +99,7 @@ class RPCServer:
         self._address = address
 
         # Check if PAIR mode is enabled via environment variable
-        use_pair_mode = envs.get_env('TLLM_LLMAPI_ZMQ_PAIR')
+        use_pair_mode = envs.get_env(envs.TLLM_LLMAPI_ZMQ_PAIR)
         socket_type = zmq.PAIR if use_pair_mode else zmq.ROUTER
 
         if use_pair_mode:

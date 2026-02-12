@@ -105,7 +105,7 @@ class LlavaNextVisionWrapper(PretrainedModel):
                           **kwargs):
         ''' Create a LlavaNextVisionWrapper object from give parameters
         '''
-        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is not None:
+        if envs.get_env(envs.TRTLLM_DISABLE_UNIFIED_CONVERTER) is not None:
             logger.error(
                 "Please enable unified converter to convert llava-next checkpoints."
             )

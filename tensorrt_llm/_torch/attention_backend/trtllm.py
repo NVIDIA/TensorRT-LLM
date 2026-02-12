@@ -31,7 +31,7 @@ from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable.
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = envs.get_env(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION")
+    envs.TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION)
 
 
 @dataclass(kw_only=True, init=False)
@@ -166,7 +166,7 @@ class TrtllmAttentionWrapper:
                                              device='cuda')
         # Default disabled, but allow manual enabling through `TRTLLM_PRINT_SKIP_SOFTMAX_STAT=1`
         self.print_skip_softmax_stat = envs.get_env(
-            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT")
+            envs.TRTLLM_PRINT_SKIP_SOFTMAX_STAT)
 
     def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
         quant_config = quant_config or QuantConfig()
@@ -1711,7 +1711,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return False
 
         # Default enabled, but allow manual disabling through `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0`
-        if not envs.get_env("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT"):
+        if not envs.get_env(envs.TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT):
             return False
 
         use_paged_context_fmha = (

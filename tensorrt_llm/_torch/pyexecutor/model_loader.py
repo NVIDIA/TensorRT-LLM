@@ -388,7 +388,7 @@ class ModelLoader:
 
         # Allow overriding the number of layers via environment variable
         # Note: This is kept for backward compatibility, but model_kwargs is preferred
-        num_layers_override = envs.get_env("TLLM_OVERRIDE_LAYER_NUM")
+        num_layers_override = envs.get_env(envs.TLLM_OVERRIDE_LAYER_NUM)
         if num_layers_override > 0:
             logger.warning(
                 f"TLLM_OVERRIDE_LAYER_NUM is deprecated. Use model_kwargs instead: "

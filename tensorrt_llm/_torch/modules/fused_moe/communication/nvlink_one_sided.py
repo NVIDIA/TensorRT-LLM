@@ -199,7 +199,7 @@ class NVLinkOneSided(Communication):
                 dtype,
                 eplb_stats_num_experts=self.eplb_stats_num_experts,
             )
-        workspace_mb_env = envs.get_env("TRTLLM_MOE_A2A_WORKSPACE_MB")
+        workspace_mb_env = envs.get_env(envs.TRTLLM_MOE_A2A_WORKSPACE_MB)
         if workspace_mb_env:
             self.workspace_size_per_rank = workspace_mb_env * 1024 * 1024
             msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env})."

@@ -341,7 +341,7 @@ def enable_llm_debug() -> bool:
     ''' Tell whether to enable the debug mode for LLM class.  '''
     global _enable_llm_debug_
     if _enable_llm_debug_ is None:
-        _enable_llm_debug_ = envs.get_env("TLLM_LLM_ENABLE_DEBUG")
+        _enable_llm_debug_ = envs.get_env(envs.TLLM_LLM_ENABLE_DEBUG)
     return _enable_llm_debug_
 
 
@@ -351,14 +351,14 @@ _enable_llmapi_debug_ = None
 def enable_llmapi_debug() -> bool:
     global _enable_llmapi_debug_
     if _enable_llmapi_debug_ is None:
-        _enable_llmapi_debug_ = envs.get_env("TLLM_LLMAPI_ENABLE_DEBUG")
+        _enable_llmapi_debug_ = envs.get_env(envs.TLLM_LLMAPI_ENABLE_DEBUG)
     return _enable_llmapi_debug_
 
 
 def enable_worker_single_process_for_tp1() -> bool:
     ''' Tell whether to make worker use single process for TP1.
     This is helpful for return-logits performance and debugging. '''
-    return envs.get_env("TLLM_WORKER_USE_SINGLE_PROCESS")
+    return envs.get_env(envs.TLLM_WORKER_USE_SINGLE_PROCESS)
 
 
 class AsyncQueue:

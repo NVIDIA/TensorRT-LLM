@@ -751,7 +751,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         self.rescale_fused_weights(module)
 
         # Handle kv_scales for NVFP4 KV cache
-        if envs.get_env("TRTLLM_LOAD_KV_SCALES"):
+        if envs.get_env(envs.TRTLLM_LOAD_KV_SCALES):
             k_scales = getattr(module, "tmp_k_scales", [])
             v_scales = getattr(module, "tmp_v_scales", [])
             if k_scales:
@@ -1360,7 +1360,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Load k and v scales, used for NVFP4 KV cache
         k_scale, v_scale = self.load_kv_scales(weights)
-        if envs.get_env("TRTLLM_LOAD_KV_SCALES"):
+        if envs.get_env(envs.TRTLLM_LOAD_KV_SCALES):
             if len(k_scale) != 0:
                 assert len(v_scale) != 0
                 copy_weight(
@@ -2430,8 +2430,8 @@ class Linear(nn.Module):
         )
 
         device_supported = get_sm_version() >= 100
-        enable_gemm_allreduce_fusion_env = (
-            envs.get_env("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED"))
+        enable_gemm_allreduce_fusion_env = (envs.get_env(
+            envs.TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED))
 
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,

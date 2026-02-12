@@ -382,7 +382,7 @@ class PyExecutor:
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = envs.get_env(
-            "TLLM_BENCHMARK_REQ_QUEUES_SIZE")
+            envs.TLLM_BENCHMARK_REQ_QUEUES_SIZE)
 
         # list of requests in each PP micro batch
         self.num_micro_batches = max(self.dist.pp_size,
@@ -395,9 +395,9 @@ class PyExecutor:
         self.send_expected_batch_num_handles = [None] * self.num_micro_batches
         self.unhandled_batch_counter = 0
         self.pp_scheduler_max_retry_count = envs.get_env(
-            "TLLM_PP_SCHEDULER_MAX_RETRY_COUNT")
+            envs.TLLM_PP_SCHEDULER_MAX_RETRY_COUNT)
         self.pp_multi_stream_sample = envs.get_env(
-            "TRTLLM_PP_MULTI_STREAM_SAMPLE")
+            envs.TRTLLM_PP_MULTI_STREAM_SAMPLE)
         self.sample_stream = torch.cuda.Stream()
         self.finish_sample_event = torch.cuda.Event()
         if (self.dist.pp_size > 1 and self.pp_multi_stream_sample
@@ -502,7 +502,7 @@ class PyExecutor:
             # It is only for debugging purposes.
             # Some tests can disable it to get a deterministic behavior.
             self.pp_async_broadcast_sample_state = envs.get_env(
-                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE")
+                envs.TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE)
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
@@ -2684,12 +2684,12 @@ class PyExecutor:
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
         # For gen-only benchmarking, mark new gen request as transmission complete right away
-        if envs.get_env("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"):
+        if envs.get_env(envs.TRTLLM_DISAGG_BENCHMARK_GEN_ONLY):
             for req in new_gen_reqs:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
-        if envs.get_env("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"):
+        if envs.get_env(envs.TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP):
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
         else:

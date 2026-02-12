@@ -472,7 +472,7 @@ class ModelConfig(Generic[TConfig]):
 
     @staticmethod
     def override_quant_algo():
-        new_algo = envs.get_env("OVERRIDE_QUANT_ALGO")
+        new_algo = envs.get_env(envs.OVERRIDE_QUANT_ALGO)
         supported_algos = {
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,

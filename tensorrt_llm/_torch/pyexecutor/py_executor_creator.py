@@ -235,7 +235,7 @@ def create_py_executor(
 
     assert llm_args.kv_cache_config, "Expect llm_args.kv_cache_config is not None"
     kv_cache_config = llm_args.kv_cache_config
-    if envs.get_env("FORCE_DETERMINISTIC"):
+    if envs.get_env(envs.FORCE_DETERMINISTIC):
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
         kv_cache_config.enable_partial_reuse = False

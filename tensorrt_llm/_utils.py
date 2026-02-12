@@ -552,7 +552,7 @@ def torch_comm():
 
 def mpi_disabled() -> bool:
     """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
-    return envs.get_env("TLLM_DISABLE_MPI")
+    return envs.get_env(envs.TLLM_DISABLE_MPI)
 
 
 def mpi_rank():
@@ -957,8 +957,8 @@ def nvtx_range_debug(msg: str,
         contextmanager: A context manager that either marks the NVTX range if enabled,
                         or a null context manager that does nothing if disabled.
     """
-    if envs.get_env("TLLM_LLMAPI_ENABLE_NVTX") or envs.get_env(
-            "TLLM_NVTX_DEBUG"):
+    if envs.get_env(envs.TLLM_LLMAPI_ENABLE_NVTX) or envs.get_env(
+            envs.TLLM_NVTX_DEBUG):
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
         return _null_context_manager()
@@ -971,8 +971,8 @@ def nvtx_mark_debug(msg: str,
     """
     Creates an NVTX marker for debugging purposes.
     """
-    if envs.get_env("TLLM_LLMAPI_ENABLE_NVTX") or envs.get_env(
-            "TLLM_NVTX_DEBUG"):
+    if envs.get_env(envs.TLLM_LLMAPI_ENABLE_NVTX) or envs.get_env(
+            envs.TLLM_NVTX_DEBUG):
         nvtx_mark(msg, color=color, domain=domain, category=category)
 
 

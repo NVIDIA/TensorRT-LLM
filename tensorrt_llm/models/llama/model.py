@@ -439,7 +439,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
         quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)
         use_autoawq = kwargs.pop('use_autoawq', None)
-        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER"
+        if envs.get_env(envs.TRTLLM_DISABLE_UNIFIED_CONVERTER
                         ) is not None and not isinstance(
                             hf_model_or_dir, transformers.PreTrainedModel):
             if "vila" in hf_model_or_dir or "llava" in hf_model_or_dir:
@@ -469,7 +469,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                **kwargs)
         if config.remove_duplicated_kv_heads:
             config.num_key_value_heads = config.num_key_value_heads // 2
-        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if envs.get_env(envs.TRTLLM_DISABLE_UNIFIED_CONVERTER) is None:
             custom_dict = {}
             model_name = hf_model.config.model_type if use_preloading else hf_model_or_dir
             if "llava" in model_name:

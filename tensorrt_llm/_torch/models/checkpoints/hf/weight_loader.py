@@ -44,7 +44,7 @@ class HfWeightLoader(BaseWeightLoader):
             prefetch_size = sum(os.path.getsize(file) for file in weight_files)
             # If the layer number is overridden, it indicates that only a subset of layers are loaded.
             # Prefetching all layers is unnecessary.
-            num_layers = envs.get_env("TLLM_OVERRIDE_LAYER_NUM")
+            num_layers = envs.get_env(envs.TLLM_OVERRIDE_LAYER_NUM)
             enable_prefetch = prefetch_size < psutil.virtual_memory(
             ).available * 0.9 and num_layers == 0
             if enable_prefetch:

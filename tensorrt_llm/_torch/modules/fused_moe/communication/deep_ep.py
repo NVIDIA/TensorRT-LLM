@@ -68,7 +68,7 @@ class DeepEP(Communication):
 
         self.expert_size_per_partition = expert_size_per_partition
         self.use_cuda_graph = use_cuda_graph
-        self.enable_postquant_alltoall = envs.get_env("TRTLLM_MOE_POST_QUANT_ALLTOALLV")
+        self.enable_postquant_alltoall = envs.get_env(envs.TRTLLM_MOE_POST_QUANT_ALLTOALLV)
 
         # Initialize DeepEP buffer
         self.deep_ep_buffer = buffer_pool.get_buffer(mapping)
@@ -79,7 +79,7 @@ class DeepEP(Communication):
         """
         Check if DeepEP is supported on the current platform
         """
-        if not envs.get_env("TRTLLM_CAN_USE_DEEP_EP"):
+        if not envs.get_env(envs.TRTLLM_CAN_USE_DEEP_EP):
             return False
         return deep_ep_installed
 

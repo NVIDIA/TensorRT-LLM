@@ -951,7 +951,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     if hasattr(weights, 'mark_consumed'):
                         weights.mark_consumed(name)
 
-    if envs.get_env("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"):
+    if envs.get_env(envs.TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL):
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
@@ -1065,7 +1065,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                     if hasattr(weights, 'mark_consumed'):
                         weights.mark_consumed(name)
 
-    if envs.get_env("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"):
+    if envs.get_env(envs.TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL):
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):

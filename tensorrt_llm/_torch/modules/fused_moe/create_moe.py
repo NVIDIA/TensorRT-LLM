@@ -346,7 +346,7 @@ def create_moe(
 
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
-    enable_configurable_moe = envs.get_env("ENABLE_CONFIGURABLE_MOE")
+    enable_configurable_moe = envs.get_env(envs.ENABLE_CONFIGURABLE_MOE)
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                        CutlassFusedMoE):

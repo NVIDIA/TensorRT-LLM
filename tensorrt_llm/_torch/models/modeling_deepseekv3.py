@@ -1002,7 +1002,7 @@ class Deepseekv3MoE(nn.Module):
         self.dtype = dtype
 
         # Perfect router caching - precompute common logits if enabled.
-        if envs.get_env('ENABLE_PERFECT_ROUTER'):
+        if envs.get_env(envs.ENABLE_PERFECT_ROUTER):
             precompute_common_perfect_router_logits(
                 num_experts=num_experts,
                 experts_per_token=top_k,
@@ -1086,7 +1086,7 @@ class Deepseekv3MoE(nn.Module):
         router_logits = self.gate(hidden_states)
 
         # Use ideal load balanced logits if enabled, otherwise use gate output.
-        if envs.get_env('ENABLE_PERFECT_ROUTER'):
+        if envs.get_env(envs.ENABLE_PERFECT_ROUTER):
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing.
             # Only use this for testing load balancing strategies, not for actual inference.
             # The gate is still computed to maintain realistic performance measurement.
@@ -1220,7 +1220,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = not envs.get_env(
-            "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED")
+            envs.TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED)
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode

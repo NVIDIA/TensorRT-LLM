@@ -328,7 +328,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                               quant_config=quant_config,
                                               **kwargs)
 
-        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if envs.get_env(envs.TRTLLM_DISABLE_UNIFIED_CONVERTER) is None:
             arg_dict = {"use_autoawq": True} if use_autoawq else {}
             custom_dict = {}
 

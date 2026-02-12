@@ -30,7 +30,7 @@ from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import register_auto_model
 
-DISAGG = envs.get_env('TLLM_MULTIMODAL_DISAGGREGATED')
+DISAGG = envs.get_env(envs.TLLM_MULTIMODAL_DISAGGREGATED)
 
 
 def select_best_resolution(original_size: tuple,

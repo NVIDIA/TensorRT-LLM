@@ -227,7 +227,7 @@ def launch_server(
                               chat_template=chat_template)
 
         # Optionally disable GC (default: not disabled)
-        if envs.get_env("TRTLLM_SERVER_DISABLE_GC"):
+        if envs.get_env(envs.TRTLLM_SERVER_DISABLE_GC):
             gc.disable()
 
         asyncio.run(server(host, port, sockets=[s]))
@@ -867,7 +867,7 @@ def disaggregated(
         #   increment, and observed that `count0` (obtained by `gc.get_count()`)
         #   increases by fewer than 1,000 after every 200,000 requests, while the
         #   maximum value of `count0` exceeded 3,000,000 during the test.
-        if envs.get_env("TRTLLM_DISAGG_SERVER_DISABLE_GC"):
+        if envs.get_env(envs.TRTLLM_DISAGG_SERVER_DISABLE_GC):
             gc.disable()
 
         asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
@@ -901,7 +901,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
 
     from tensorrt_llm._utils import mpi_rank
-    if not envs.get_env("TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"):
+    if not envs.get_env(envs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT):
         set_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to war an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
@@ -912,8 +912,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     disagg_cfg = parse_disagg_config_file(config_file)
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
-    if envs.get_env("TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"):
-        instance_idx = envs.get_env("TLLM_DISAGG_INSTANCE_IDX")
+    if envs.get_env(envs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT):
+        instance_idx = envs.get_env(envs.TLLM_DISAGG_INSTANCE_IDX)
         assert instance_idx is not None, (
             f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
         )
@@ -966,7 +966,7 @@ class DisaggLauncherEnvs(StrEnum):
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     # Launching the server
-    instance_idx = envs.get_env("TLLM_DISAGG_INSTANCE_IDX")
+    instance_idx = envs.get_env(envs.TLLM_DISAGG_INSTANCE_IDX)
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
     disagg_config = parse_disagg_config_file(disagg_config_file)
     server_cfg = disagg_config.server_configs[instance_idx]

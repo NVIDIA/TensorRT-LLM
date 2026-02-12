@@ -221,7 +221,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         return None, True
 
     async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:
-        if envs.get_env("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"):
+        if envs.get_env(envs.TRTLLM_DISAGG_BENCHMARK_GEN_ONLY):
             # Hard-code first token, ctx_request_id for testing
             request.disaggregated_params = DisaggregatedParams(
                 request_type="generation_only",
@@ -293,7 +293,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _wait_for_all_servers_ready(self) -> None:
         # Skip context servers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set
-        gen_only = envs.get_env("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
+        gen_only = envs.get_env(envs.TRTLLM_DISAGG_BENCHMARK_GEN_ONLY)
 
         async def check_servers_ready():
             elapsed_time = 0

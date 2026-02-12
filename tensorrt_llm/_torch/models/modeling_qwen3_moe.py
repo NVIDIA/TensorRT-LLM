@@ -201,7 +201,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = not envs.get_env(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED")
+            envs.TRTLLM_QWEN3_EAGER_FUSION_DISABLED)
         self.enable_fusion &= not self.enable_attention_dp
 
         has_tp = self.mapping.has_tp()

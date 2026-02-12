@@ -140,7 +140,7 @@ class MoeAlltoAll:
                 Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
         """
         # Check for environment variable override
-        workspace_mb_env = envs.get_env("TRTLLM_MOE_A2A_WORKSPACE_MB")
+        workspace_mb_env = envs.get_env(envs.TRTLLM_MOE_A2A_WORKSPACE_MB)
         if workspace_mb_env:
             workspace_size_env = workspace_mb_env * 1024 * 1024
             tllm_logger.warning(

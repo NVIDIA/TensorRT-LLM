@@ -84,7 +84,7 @@ class BaseTransferAgent(ABC):
 
 def _force_py_nixl_kv_transfer() -> bool:
     try:
-        env_value = envs.get_env("TRTLLM_USE_PY_NIXL_KVCACHE")
+        env_value = envs.get_env(envs.TRTLLM_USE_PY_NIXL_KVCACHE)
     except ValueError:
         logger.warning(
             "Invalid value for TRTLLM_USE_PY_NIXL_KVCACHE. "

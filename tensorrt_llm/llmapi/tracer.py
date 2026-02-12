@@ -14,7 +14,7 @@ def enable_llm_tracer() -> bool:
     global _enable_llm_tracer_
     if _enable_llm_tracer_ is not None:
         return _enable_llm_tracer_
-    _enable_llm_tracer_ = envs.get_env("TLLM_LLM_ENABLE_TRACER")
+    _enable_llm_tracer_ = envs.get_env(envs.TLLM_LLM_ENABLE_TRACER)
     return _enable_llm_tracer_
 
 

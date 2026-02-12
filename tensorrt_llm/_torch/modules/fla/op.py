@@ -9,7 +9,7 @@ import triton.language.extra.libdevice as tldevice
 from tensorrt_llm import envs
 from tensorrt_llm._torch.modules.fla.utils import is_gather_supported
 
-if envs.get_env("FLA_USE_FAST_OPS"):
+if envs.get_env(envs.FLA_USE_FAST_OPS):
     exp = tldevice.fast_expf
     exp2 = tldevice.exp2
     log = tldevice.fast_logf

@@ -33,7 +33,7 @@ from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_utils import register_auto_model, register_vision_encoder
 
-DISAGG = envs.get_env('TLLM_MULTIMODAL_DISAGGREGATED')
+DISAGG = envs.get_env(envs.TLLM_MULTIMODAL_DISAGGREGATED)
 
 
 class LlavaNextInputProcessor(BaseMultimodalInputProcessor,

@@ -298,7 +298,7 @@ class TRTLLMGenFusedMoE(MoE):
         if not MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.NotEnabled
 
-        all2all_method_type = envs.get_env("TRTLLM_FORCE_ALLTOALL_METHOD")
+        all2all_method_type = envs.get_env(envs.TRTLLM_FORCE_ALLTOALL_METHOD)
         if all2all_method_type is not None:
             if AlltoallMethodType[all2all_method_type] in [
                     AlltoallMethodType.DeepEP,

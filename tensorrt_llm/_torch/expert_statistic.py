@@ -18,7 +18,7 @@ class ExpertStatistic:
     @staticmethod
     def create(rank_id: int):
         # Enabled if EXPERT_STATISTIC_ITER_RANGE is set.
-        span = envs.get_env("EXPERT_STATISTIC_ITER_RANGE")
+        span = envs.get_env(envs.EXPERT_STATISTIC_ITER_RANGE)
         if span is None:
             return
         try:
@@ -71,7 +71,7 @@ class ExpertStatistic:
             logger.info(
                 f'[ExpertStatistic] Rank={self.rank_id}, saving iter={iter_id}, start={self.start}, stop={self.stop}'
             )
-            path = envs.get_env("EXPERT_STATISTIC_PATH")
+            path = envs.get_env(envs.EXPERT_STATISTIC_PATH)
             if not os.path.exists(path):
                 os.makedirs(path, exist_ok=True)
             if self.rank_id == 0:

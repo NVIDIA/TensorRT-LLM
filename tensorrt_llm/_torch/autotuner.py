@@ -718,7 +718,7 @@ class AutoTuner:
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
         # Increase log level for AutoTuner associated logger`
         self._log_level_to_info = envs.get_env(
-            "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO")
+            envs.TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO)
         self._debug_logger = logger.info if self._log_level_to_info else logger.debug
 
         self.repeat = repeat
@@ -1201,7 +1201,7 @@ class AutoTuner:
         fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
 
         disable_short_profile = envs.get_env(
-            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE")
+            envs.TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE)
 
         # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
         if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \
