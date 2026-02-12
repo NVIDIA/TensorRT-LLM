@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -72,11 +72,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Architecture Overview" href="../developer-guide/overview.html" />
+    <link rel="prev" title="KV Cache Connector" href="kv-cache-connector.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc2" />
+  <meta name="docsearch:version" content="1.3.0rc3" />
 
 
   </head>
@@ -406,7 +408,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
-<ul class="nav bd-sidenav">
+<ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
@@ -428,6 +430,7 @@
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Sparse Attention</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -447,6 +450,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -525,30 +529,33 @@
 <h1>Sparse Attention<a class="headerlink" href="#sparse-attention" title="Link to this heading">#</a></h1>
 <ul class="simple">
 <li><p><a class="reference internal" href="#background-and-motivation">Background and Motivation</a></p></li>
+<li><p><a class="reference internal" href="#algorithm-overview">Algorithm Overview</a></p></li>
 <li><p><a class="reference internal" href="#quick-start">Quick Start</a></p>
 <ul>
 <li><p><a class="reference internal" href="#python-api">Python API</a></p></li>
-<li><p><a class="reference internal" href="#usage-with-trtllm-bench-or-trtllm-serve">Usage with trtllm-bench or trtllm-serve</a></p></li>
+<li><p><a class="reference internal" href="#configure-via-yaml-file">Configure via YAML file</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#developer-guide">Developer Guide</a></p>
+<li><p><a class="reference internal" href="#sparse-attention-implementation">Sparse Attention Implementation</a></p>
 <ul>
-<li><p><a class="reference internal" href="#architecture-overview">Architecture Overview</a></p></li>
+<li><p><a class="reference internal" href="#framework-level-sparse-attention">Framework-Level Sparse Attention</a></p>
+<ul>
+<li><p><a class="reference internal" href="#overview">Overview</a></p></li>
+<li><p><a class="reference internal" href="#architecture">Architecture</a></p></li>
 <li><p><a class="reference internal" href="#framework-implementation">Framework Implementation</a></p></li>
-<li><p><a class="reference internal" href="#implementing-a-new-algorithm">Implementing a New Algorithm</a></p>
+<li><p><a class="reference internal" href="#implementing-a-new-algorithm"><span class="xref myst">Implementing a New Algorithm</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#configuration-class">1. Configuration Class</a></p></li>
 <li><p><a class="reference internal" href="#implement-the-prediction-module-in-attention-backend">2. Implement the prediction module in Attention Backend</a></p></li>
 <li><p><a class="reference internal" href="#manage-auxiliary-memory-pool">3. Manage Auxiliary Memory Pool</a></p></li>
 <li><p><a class="reference internal" href="#registration-and-dispatch">4. Registration and Dispatch</a></p></li>
-</ul>
-</li>
-</ul>
-</li>
-<li><p><a class="reference internal" href="#summary-and-future-work">Summary and Future Work</a></p>
-<ul>
-<li><p><a class="reference internal" href="#current-status">Current Status</a></p></li>
 <li><p><a class="reference internal" href="#future-work">Future Work</a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#kernel-level-sparse-attention">Kernel-Level Sparse Attention</a></p></li>
+<li><p><a class="reference internal" href="#summary">Summary</a></p></li>
 </ul>
 </li>
 </ul>
@@ -559,40 +566,43 @@
 <li><p><strong>Context Phase</strong>: Processing long prompts requires substantial memory bandwidth and computation, affecting time-to-first-token (TTFT). Since the context phase is typically compute-bound, reducing the computational load here is critical.</p></li>
 <li><p><strong>Generation Phase</strong>: The Key-Value (KV) cache grows with every generated token, consuming vast amounts of GPU memory and bandwidth. Since the generation phase is usually memory-bound, reducing the memory footprint directly alleviates memory pressure, improves token-to-token latency (TPOT), and allows for larger batch sizes.</p></li>
 </ul>
-<p>Fortunately, key observations indicate that attention scores naturally exhibit sparsity, meaning not all K/V tokens are necessary for attention computation. To enhance the efficiency of long-sequence LLMs, numerous methods have been proposed to optimize performance by leveraging approximate sparse attention. Among those methods, sparsity can be applied to different dimensions of the attention: head dimension, hidden dimension, and sequence dimension. When applying sparsity to the sequence dimension, those methods selectively compute only the most important query-key pairs. This approach can be referred to as token sparsity. Token sparsity has been widely explored in lots of recent academic works, and it is also a kind of structured sparse method that is friendly for GPU. Currently, TensorRT LLM focuses on the sparse attention methods that leverages token sparsity.</p>
-<p>Token sparsity can be applied to two distinct aspects of LLM inference:</p>
+<p>Sparse attention methods aim to exploit structured sparsity in attention. Especially, exploiting the token sparsity in the sequence dimension to concentrate on the most important query-key pairs is very common. The goal of sparse attention is accelerating long-context inference, while balancing performance gains with acceptable approximation error and system complexity.</p>
+</section>
+<section id="algorithm-overview">
+<h2>Algorithm Overview<a class="headerlink" href="#algorithm-overview" title="Link to this heading">#</a></h2>
+<p>The design space of sparse attention is quite large, so we cannot assume there is a single implementation strategy that covers all variants. TensorRT LLM uses <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code> in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> API as a unified interface for <strong>describing and enabling</strong> different sparse attention algorithms, while allowing each technique to choose the most suitable implementation path. Each <em>algorithm</em> has its own configuration class inheriting from <code class="docutils literal notranslate"><span class="pre">BaseSparseAttentionConfig</span></code>.</p>
+<p>TensorRT LLM currently exposes the following algorithms differentiated by <code class="docutils literal notranslate"><span class="pre">sparse_attention_config.algorithm</span></code>:</p>
 <ul class="simple">
-<li><p><strong>Sparse Computation</strong>: If a query token does not require the entire history, just skip the computation for irrelevant tokens, thereby reducing attention computational costs.</p></li>
-<li><p><strong>Sparse KV cache</strong>: Evicts KV tokens from the cache that are not required for future generation steps. This reduces GPU memory usage and lowers computation overhead for subsequent steps.</p></li>
+<li><p><strong>RocketKV</strong> (<code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">rocket</span></code>, <code class="docutils literal notranslate"><span class="pre">RocketSparseAttentionConfig</span></code>, <a class="reference external" href="https://arxiv.org/pdf/2502.14051">ref</a>): A two-stage algorithm, where the first stage performs permanent KV cache eviction and the second stage performs dynamic token selection.</p></li>
+<li><p><strong>DeepSeek Sparse Attention (DSA)</strong> (<code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">dsa</span></code>, <code class="docutils literal notranslate"><span class="pre">DeepSeekSparseAttentionConfig</span></code>, <a class="reference external" href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf">ref</a>): DeepSeek’s model-native sparse attention solution, introduced in DeepSeek V3.2.</p></li>
+<li><p><strong>Skip Softmax Attention (BLASST)</strong> (<code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">skip_softmax</span></code>, <code class="docutils literal notranslate"><span class="pre">SkipSoftmaxAttentionConfig</span></code>, <a class="reference external" href="https://arxiv.org/pdf/2512.12087">ref</a>): A drop-in method that dynamically skips Softmax and BMM2 work for unimportant KV blocks, which could be fully implemented inside the attention kernels.</p></li>
 </ul>
-<p>Both methods can be enabled simultaneously to achieve better performance.</p>
-<p>To support these emerging techniques, TensorRT LLM has designed a general, extensible and flexible <strong>sparse attention framework</strong> (which is continuously being optimized) to compatibly integrate advanced sparse algorithms. Currently we can support <a class="reference external" href="https://arxiv.org/pdf/2502.14051">RocketKV</a> and <a class="reference external" href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf">DSA</a>.</p>
 </section>
 <section id="quick-start">
 <h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h2>
-<p>This section provides a brief guide on enabling sparse attention in TensorRT LLM, using RocketKV as an example. For more details, please refer to <a class="reference internal" href="#../../examples/sparse_attention/RocketKV.md"><span class="xref myst">RocketKV sparse attention</span></a>.</p>
+<p>This section shows how to enable sparse attention through the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> API or YAML config.</p>
 <section id="python-api">
 <h3>Python API<a class="headerlink" href="#python-api" title="Link to this heading">#</a></h3>
-<p>To use sparse attention, you need to configure a specific <code class="docutils literal notranslate"><span class="pre">SparseAttentionConfig</span></code> (for example, <code class="docutils literal notranslate"><span class="pre">RocketSparseAttentionConfig</span></code>) and pass it to the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> constructor.</p>
+<p>To use sparse attention, configure a <code class="docutils literal notranslate"><span class="pre">BaseSparseAttentionConfig</span></code> subclass and pass it to the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> constructor. Each algorithm has its own configuration class inheriting from <code class="docutils literal notranslate"><span class="pre">BaseSparseAttentionConfig</span></code>. To learn about the meaning of specific parameters, please refer to the docstring of the corresponding configuration class.</p>
+<section id="rocketkv">
+<h4>RocketKV<a class="headerlink" href="#rocketkv" title="Link to this heading">#</a></h4>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">RocketSparseAttentionConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span>
 
-<span class="c1"># 1. Configure Sparse Attention</span>
-<span class="c1"># Example: RocketKV configuration</span>
-<span class="n">rocket_config</span> <span class="o">=</span> <span class="n">RocketSparseAttentionConfig</span><span class="p">(</span>
+<span class="c1"># 1. Configure sparse attention (RocketKV)</span>
+<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">RocketSparseAttentionConfig</span><span class="p">(</span>
     <span class="n">prompt_budget</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
     <span class="n">kt_cache_dtype</span><span class="o">=</span><span class="s1">&#39;float8_e5m2&#39;</span>
 <span class="p">)</span>
 
-<span class="c1"># 2. Configure KV Cache</span>
-<span class="c1"># Note: Some sparse algorithms (like RocketKV) may require disabling block reuse</span>
+<span class="c1"># 2. Configure KV cache</span>
+<span class="c1"># Note: some framework-based algorithms may require disabling block reuse.</span>
 <span class="n">kv_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
 <span class="c1"># 3. Initialize LLM</span>
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;&lt;path_to_model&gt;&quot;</span><span class="p">,</span>
-    <span class="n">backend</span><span class="o">=</span><span class="s1">&#39;pytorch&#39;</span><span class="p">,</span>    <span class="c1"># Currently requires the PyTorch backend</span>
-    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">rocket_config</span><span class="p">,</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;&lt;path_or_hf_id&gt;&quot;</span><span class="p">,</span>
+    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">sparse_attention_config</span><span class="p">,</span>
     <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
 <span class="p">)</span>
 
@@ -602,19 +612,70 @@
 </pre></div>
 </div>
 </section>
-<section id="usage-with-trtllm-bench-or-trtllm-serve">
-<h3>Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code><a class="headerlink" href="#usage-with-trtllm-bench-or-trtllm-serve" title="Link to this heading">#</a></h3>
-<p>You can enable sparse attention in benchmarking and serving tools by providing a <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code> in an <code class="docutils literal notranslate"><span class="pre">extra_config.yaml</span></code> file.</p>
-<p><strong>extra_config.yaml:</strong></p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pytorch</span>
-<span class="nt">attn_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
-<span class="nt">sparse_attention_config</span><span class="p">:</span><span class="w"> </span><span class="c1"># RocketKV as an example</span>
+<section id="dsa">
+<h4>DSA<a class="headerlink" href="#dsa" title="Link to this heading">#</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">DeepSeekSparseAttentionConfig</span>
+
+<span class="c1"># Example: DSA configuration (exact values depend on model + use case)</span>
+<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">DeepSeekSparseAttentionConfig</span><span class="p">(</span>
+    <span class="n">index_topk</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;&lt;path_or_hf_id&gt;&quot;</span><span class="p">,</span>
+    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">sparse_attention_config</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="skip-softmax-attention">
+<h4>Skip Softmax Attention<a class="headerlink" href="#skip-softmax-attention" title="Link to this heading">#</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">SkipSoftmaxAttentionConfig</span>
+
+<span class="c1"># One value for both phases:</span>
+<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span><span class="n">threshold_scale_factor</span><span class="o">=</span><span class="mf">1000.0</span><span class="p">)</span>
+
+<span class="c1"># Or configure prefill/decode separately:</span>
+<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span>
+    <span class="n">threshold_scale_factor</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;prefill&quot;</span><span class="p">:</span> <span class="mf">1000.0</span><span class="p">,</span> <span class="s2">&quot;decode&quot;</span><span class="p">:</span> <span class="mf">500.0</span><span class="p">}</span>
+<span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;&lt;path_or_hf_id&gt;&quot;</span><span class="p">,</span>
+    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">sparse_attention_config</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="configure-via-yaml-file">
+<h3>Configure via YAML file<a class="headerlink" href="#configure-via-yaml-file" title="Link to this heading">#</a></h3>
+<p>Besides Python API, you can also configure sparse attention via YAML file. This is typically more convenient in bash commands, such as <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code>.</p>
+<p><strong>Rocket KV</strong></p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rocket</span>
 <span class="w">  </span><span class="nt">kt_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">float8_e5m2</span>
 <span class="w">  </span><span class="nt">prompt_budget</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
 <span class="nt">kv_cache_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
 <span class="nt">enable_chunked_prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+</pre></div>
+</div>
+<p><strong>DSA</strong></p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dsa</span>
+<span class="w">  </span><span class="nt">index_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">64</span>
+</pre></div>
+</div>
+<p><strong>Skip Softmax Attention</strong></p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attn_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
+<span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
+<span class="w">  </span><span class="nt">threshold_scale_factor</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1000.0</span>
+<span class="w">    </span><span class="nt">decode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">500.0</span>
 </pre></div>
 </div>
 <p>Run the command with the config file:</p>
@@ -627,21 +688,34 @@
 </div>
 </section>
 </section>
-<section id="developer-guide">
-<h2>Developer Guide<a class="headerlink" href="#developer-guide" title="Link to this heading">#</a></h2>
-<p>This section describes the sparse attention framework architecture and guides developers on how to implement new sparse attention algorithms in TensorRT LLM. Unless otherwise specified, this framework primarily targets <strong>MQA/GQA/MLA-based</strong> attention mechanisms.</p>
-<section id="architecture-overview">
-<h3>Architecture Overview<a class="headerlink" href="#architecture-overview" title="Link to this heading">#</a></h3>
+<section id="sparse-attention-implementation">
+<h2>Sparse Attention Implementation<a class="headerlink" href="#sparse-attention-implementation" title="Link to this heading">#</a></h2>
+<p>This section provides deeper technical details on how each algorithm of sparse attention is implemented in TensorRT LLM. If you just want to enable sparse attention, see <a class="reference internal" href="#quick-start">Quick Start</a> above.</p>
+<p>Ideologically, the current available sparse attention algorithms can be categorized into two types:</p>
+<ul class="simple">
+<li><p><strong>Framework-level sparse attention</strong>: uses TensorRT LLM’s sparse-attention framework (prediction hooks + metadata) to drive sparse computation and/or KV-cache behavior. Examples: <strong>RocketKV</strong>, <strong>DSA</strong>.</p></li>
+<li><p><strong>Kernel-level sparse attention</strong>: implemented directly inside the attention kernels, with no extra modification on the runtime logic. Example: <strong>Skip Softmax Attention</strong>.</p></li>
+</ul>
+<section id="framework-level-sparse-attention">
+<h3>Framework-Level Sparse Attention<a class="headerlink" href="#framework-level-sparse-attention" title="Link to this heading">#</a></h3>
+<p>Framework-level sparse attention refers to methods that use TensorRT LLM’s extensible sparse-attention framework—a set of prediction hooks and metadata interfaces that drive sparse computation and/or KV-cache behavior. Currently, <strong>RocketKV</strong> and <strong>DSA</strong> are the supported framework-level sparse attention algorithms in TensorRT LLM.</p>
+<section id="overview">
+<h4>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h4>
+<p>Attention scores often exhibit strong structure and sparsity: for many queries, only a small fraction of the historical tokens meaningfully contribute to the output. To exploit this, a wide range of approximate sparse-attention methods have been proposed. These methods can introduce sparsity along different dimensions (e.g., sequence, head, hidden). TensorRT LLM’s <strong>framework-level</strong> support for sparse attention primarily targets approaches that leverage <strong>token/sequence sparsity</strong> into a GPU-friendly, structured way.</p>
+</section>
+<section id="architecture">
+<h4>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h4>
+<p>This section describes the framework architecture and guides developers on how to implement new framework-level sparse attention algorithms in TensorRT LLM.</p>
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_framework.png" width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: The sparse attention framework in TensorRT LLM.</em></sub></p>
+<p align="center"><sub><em>Figure 1: The framework support for sparse attention in TensorRT LLM.</em></sub></p>
 <p>Our goal is to design a general, extensible, and flexible sparse attention framework. In this framework, the attention operator provides the unified APIs to support both <strong>sparse computation</strong> and <strong>sparse KV cache</strong> that leverage token sparsity, while the users/developers can only focus on the algorithm of sparse attentions, i.e. how to accurately identify important query-key pairs.</p>
 <p>For the generality, TensorRT LLM abstracts sparse attention into a prediction-based workflow: <em>a prediction module first identifies the sparse indices (tokens/blocks to keep or attend to), which are then used by the subsequent attention operator</em>. Currently, for standard attention (MQA/GQA), TensorRT LLM supports <strong>sparse KV cache</strong> in the context phase and <strong>sparse computation</strong> in the generation phase. Different KV heads are allowed to use different sparse indices, while Q heads that map to the same KV head share the same sparse pattern. It does <strong>not</strong> yet support sparse computation in the context phase or sparse KV cache in the generation phase.</p>
-<p>For the scalability, figure 1 illustrates the overall design. The architecture is built by inheriting from the existing <code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code> to define algorithm-specific sparse attention backends. Within these backends, <code class="docutils literal notranslate"><span class="pre">prediction</span></code> methods are implemented to generate the corresponding sparse indices. These indices are then passed as arguments to the <code class="docutils literal notranslate"><span class="pre">AttentionOp</span></code> to perform the sparse attention computation. This approach balances system flexibility with extensibility, allowing new algorithms to be integrated by simply defining their prediction logic <strong>without</strong> modifying the core attention kernels.</p>
-<p>TensorRT LLM currently supports the following features:</p>
+<p>For the scalability, Figure 1 illustrates the overall design. The architecture is built by inheriting from the existing <code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code> to define algorithm-specific sparse attention backends. Within these backends, <code class="docutils literal notranslate"><span class="pre">prediction</span></code> methods are implemented to generate the corresponding sparse indices. These indices are then passed as arguments to the <code class="docutils literal notranslate"><span class="pre">AttentionOp</span></code> to perform the sparse attention computation. This approach balances system flexibility with extensibility, allowing new algorithms to be integrated by simply defining their prediction logic <strong>without</strong> modifying the core attention kernels.</p>
+<p>TensorRT LLM currently supports the following features in the framework:</p>
 <ol class="arabic simple">
 <li><p><strong>Context Phase</strong>:</p>
 <ul class="simple">
@@ -658,7 +732,7 @@
 </ol>
 </section>
 <section id="framework-implementation">
-<h3>Framework Implementation<a class="headerlink" href="#framework-implementation" title="Link to this heading">#</a></h3>
+<h4>Framework Implementation<a class="headerlink" href="#framework-implementation" title="Link to this heading">#</a></h4>
 <p>To hide the complexity of sparse algorithms, the main prediction logic is encapsulated within the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch.attention_backend</span></code> module.</p>
 <p>We have extended the existing <code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code> to include a prediction step that retrieves sparse indices before the attention operation. These indices are generated using two prediction methods:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Predict indices for sparse KV Cache</span>
@@ -684,10 +758,10 @@
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
 <p>In <code class="docutils literal notranslate"><span class="pre">AttentionOp</span></code>, currently, the MQA/GQA sparse attention only supports sparse computation at block granularity in the generation phase, where the block size equals to the page size of the KV cache. It means that we can skip the attention computation of those unimportant pages. In addition, we provide a sparse MLA kernel that supports token-level sparse computation in both the context and generation phases.</p>
-<p>To support those features, as illustrated in figure 2, we have implemented two kernels for the MQA/GQA path, <code class="docutils literal notranslate"><span class="pre">updateSparseKvCacheAfterFmha</span></code> and <code class="docutils literal notranslate"><span class="pre">gatherKvPageOffsetsKernel</span></code>, applied in the context and generation phases respectively:</p>
+<p>To support those features, as illustrated in Figure 2, we have implemented two kernels for the MQA/GQA path, <code class="docutils literal notranslate"><span class="pre">updateSparseKvCacheAfterFmha</span></code> and <code class="docutils literal notranslate"><span class="pre">gatherKvPageOffsetsKernel</span></code>, applied in the context and generation phases respectively:</p>
 <ul class="simple">
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">updateSparseKvCacheAfterFmha</span></code></strong>: Invoked in the post-processing stage after the context attention computation. It selects the important KV tokens and write those K/V vectors to the KV cache to reduce the KV cache size.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">gatherKvPageOffsetsKernel</span></code></strong>: Executed before the attention computation in the generation phase. It converts the input sparse indices (which can be of arbitrary granularity) into page-aligned indices. This means that if a single token is selected, the entire page it is included in the attention computation. After this conversion, we will get a new <code class="docutils literal notranslate"><span class="pre">kv_page_offsets</span></code> and also an updated <code class="docutils literal notranslate"><span class="pre">kv_len</span></code> that is the number of those selected KV tokens. Then these new metadata are fed into the subsequent attention kernel for computation.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">gatherKvPageOffsetsKernel</span></code></strong>: Executed before the attention computation in the generation phase. It converts the input sparse indices (which can be of arbitrary granularity) into page-aligned indices. This means that if a single token is selected, the entire page is included in the attention computation. After this conversion, we will get a new <code class="docutils literal notranslate"><span class="pre">kv_page_offsets</span></code> and also an updated <code class="docutils literal notranslate"><span class="pre">kv_len</span></code> that is the number of those selected KV tokens. Then these new metadata are fed into the subsequent attention kernel for computation.</p></li>
 </ul>
 <p>For sparse MLA, the kernel supports token sparsity directly, eliminating the need for <code class="docutils literal notranslate"><span class="pre">gatherKvPageOffsetsKernel</span></code>. However, please note that sparse KV cache support is not yet available.</p>
 <p>Many sparse attention algorithms also require additional auxiliary memory. In the current system, there are two paths to support this feature:</p>
@@ -697,8 +771,9 @@
 </ul>
 <p>Each option has its own advantages and disadvantages, please refer to the <a class="reference internal" href="#manage-auxiliary-memory-pool">Manage Auxiliary Memory Pool</a> for more details.</p>
 </section>
-<section id="implementing-a-new-algorithm">
-<h3>Implementing a New Algorithm<a class="headerlink" href="#implementing-a-new-algorithm" title="Link to this heading">#</a></h3>
+<section id="implementing-a-new-algorithm-inside-the-sparse-attention-framework">
+<h4>Implementing a New Algorithm Inside the Sparse Attention Framework<a class="headerlink" href="#implementing-a-new-algorithm-inside-the-sparse-attention-framework" title="Link to this heading">#</a></h4>
+</section>
 <section id="configuration-class">
 <h4>1. Configuration Class<a class="headerlink" href="#configuration-class" title="Link to this heading">#</a></h4>
 <p>Define a configuration class in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/llm_args.py</span></code> inheriting from <code class="docutils literal notranslate"><span class="pre">BaseSparseAttentionConfig</span></code>. This class should hold user-tunable parameters for your algorithm.</p>
@@ -769,27 +844,73 @@
 <li><p>Add initialization logic in <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/thop/attentionOp.cpp</span></code> and <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/sparseAttentionKernels.h</span></code> if new C++ level parameters are required.</p></li>
 </ul>
 </section>
-</section>
-</section>
-<section id="summary-and-future-work">
-<h2>Summary and Future Work<a class="headerlink" href="#summary-and-future-work" title="Link to this heading">#</a></h2>
-<section id="current-status">
-<h3>Current Status<a class="headerlink" href="#current-status" title="Link to this heading">#</a></h3>
-<p>Currently, the status of the sparse attention framework is as follows:</p>
-<ol class="arabic simple">
-<li><p><strong>Supported Operations</strong>: The <code class="docutils literal notranslate"><span class="pre">AttentionOp</span></code> currently supports <strong>sparse KV cache</strong> in the context phase and <strong>sparse computation</strong> in the generation phase. Other combinations (for example, sparse computation in the context phase) are not yet supported for MQA/GQA. For MLA, sparse computation is supported in both the context and generation phases.</p></li>
-<li><p><strong>Algorithm Support</strong>: RocketKV is supported in both the vanilla (PyTorch) backend and the TRTLLM backend, while DSA is supported in the TRTLLM backend. These implementations validate the generality and scalability of the framework.</p></li>
-</ol>
-</section>
 <section id="future-work">
-<h3>Future Work<a class="headerlink" href="#future-work" title="Link to this heading">#</a></h3>
+<h4>Future Work<a class="headerlink" href="#future-work" title="Link to this heading">#</a></h4>
 <ul class="simple">
-<li><p><strong>Sparse Computation in Context Phase</strong>: We plan to introduce sparse computation support for the context phase for MQA/GQA, allowing the TensorRT LLM sparse attention framework to cover more scenarios.</p></li>
-<li><p><strong>Dynamic Eviction in Generation Phase</strong>: Dynamically evicting KV cache blocks during the generation phase poses significant challenges to KV cache flexibility. While difficult to implement in the current framework, block-level eviction appears to be a promising compromise and is under further exploration.</p></li>
-<li><p><strong>Unified Auxiliary Memory Management</strong>: We are exploring a unified mechanism to manage auxiliary memory pools. This would allow users to define custom auxiliary spaces more flexibly while automatically inheriting advanced features from the KV cache, such as reuse and offloading.</p></li>
+<li><p><strong>Sparse Computation in Context Phase</strong>: We plan to introduce sparse computation support for the context phase for MQA/GQA, allowing the framework to cover more scenarios.</p></li>
+<li><p><strong>Dynamic Eviction in Generation Phase</strong>: Dynamically evicting KV cache blocks during the generation phase poses significant challenges to KV cache flexibility. Block-level eviction appears to be a promising compromise and is under exploration.</p></li>
+<li><p><strong>Unified Auxiliary Memory Management</strong>: We are exploring a unified mechanism to manage auxiliary memory pools, allowing custom auxiliary spaces to automatically inherit advanced features from the KV cache (e.g., reuse, offloading).</p></li>
 <li><p><strong>Code Refactoring</strong>: As more sparse attention algorithms are integrated, the framework will undergo refactoring to unify code and improve maintainability.</p></li>
-<li><p><strong>Optimizations</strong>: We are discussing further optimizations, such as improving DSA performance.</p></li>
 </ul>
+</section>
+</section>
+<section id="kernel-level-sparse-attention">
+<h3>Kernel-Level Sparse Attention<a class="headerlink" href="#kernel-level-sparse-attention" title="Link to this heading">#</a></h3>
+<p>Unlike framework-level methods, <strong>kernel-level sparse attention</strong> is implemented directly inside the attention kernels. There is no external prediction/gather workflow—the kernel itself decides what to skip based on runtime criteria.</p>
+<p><strong>Skip Softmax Attention (BLASST)</strong> is TensorRT LLM’s kernel-level sparse attention method, supported on both <strong>Hopper</strong> and <strong>Blackwell</strong> GPUs for MHA/GQA/MLA, in both prefill and decode phases. It dynamically skips Softmax and BMM2 computation for KV blocks whose contribution falls below a threshold. Because the logic lives entirely inside the kernel, it requires no auxiliary data structures or framework hooks—just set <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> in the config. As a result, the runtime overhead is zero and the attention kernel performance improvement could be directly reflected in the end-to-end speedup.</p>
+<p>For algorithm details and end-to-end results, please refer to the following resources:</p>
+<ul class="simple">
+<li><p><strong>Paper</strong>: <a class="reference external" href="https://arxiv.org/pdf/2512.12087">BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding</a></p></li>
+<li><p><strong>NVIDIA developer blog</strong>: <a class="reference external" href="https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/">Accelerating Long-Context Inference with Skip Softmax Attention</a></p></li>
+<li><p><strong>Tech blog</strong>: <a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html"><span class="std std-doc">Accelerating Long-Context Inference with Skip Softmax Attention</span></a></p></li>
+</ul>
+<p>Skip Softmax Attention is supported only with the <strong>trtllm</strong> attention backend, implemented inside TensorRT-LLM’s high-performance attention kernels:</p>
+<ul class="simple">
+<li><p><strong>Hopper prefill</strong>: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/fmha_v2">fmha_v2</a></p></li>
+<li><p><strong>Hopper decode</strong>: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa">XQA</a></p></li>
+<li><p><strong>Blackwell</strong>: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels">trtllm-gen</a></p></li>
+</ul>
+</section>
+<section id="summary">
+<h3>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h3>
+<p>The following table compares the three sparse attention algorithms available in TensorRT LLM:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Aspect</p></th>
+<th class="head"><p>RocketKV</p></th>
+<th class="head"><p>DSA</p></th>
+<th class="head"><p>Skip Softmax</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Prefill Acceleration</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-odd"><td><p>Decode Acceleration</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p>KV Cache Reduction</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+</tr>
+<tr class="row-odd"><td><p>Framework-Level Support Required</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+</tr>
+<tr class="row-even"><td><p>Model Native</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 </section>
 </section>
 </section>
@@ -804,6 +925,24 @@
                 <footer class="prev-next-footer d-print-none">
                   
 <div class="prev-next-area">
+    <a class="left-prev"
+       href="kv-cache-connector.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">KV Cache Connector</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../developer-guide/overview.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Architecture Overview</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
 </div>
                 </footer>
               
@@ -826,26 +965,32 @@
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background-and-motivation">Background and Motivation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithm-overview">Algorithm Overview</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start">Quick Start</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#python-api">Python API</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#usage-with-trtllm-bench-or-trtllm-serve">Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#python-api">Python API</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#rocketkv">RocketKV</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dsa">DSA</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#skip-softmax-attention">Skip Softmax Attention</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#developer-guide">Developer Guide</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture-overview">Architecture Overview</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#framework-implementation">Framework Implementation</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implementing-a-new-algorithm">Implementing a New Algorithm</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configure-via-yaml-file">Configure via YAML file</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sparse-attention-implementation">Sparse Attention Implementation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#framework-level-sparse-attention">Framework-Level Sparse Attention</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture">Architecture</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#framework-implementation">Framework Implementation</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#implementing-a-new-algorithm-inside-the-sparse-attention-framework">Implementing a New Algorithm Inside the Sparse Attention Framework</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-class">1. Configuration Class</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#implement-the-prediction-module-in-attention-backend">2. Implement the prediction module in Attention Backend</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#manage-auxiliary-memory-pool">3. Manage Auxiliary Memory Pool</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#registration-and-dispatch">4. Registration and Dispatch</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work">Future Work</a></li>
 </ul>
 </li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#summary-and-future-work">Summary and Future Work</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#current-status">Current Status</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work">Future Work</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-level-sparse-attention">Kernel-Level Sparse Attention</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
 </ul>
 </li>
 </ul>
@@ -939,9 +1084,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 30, 2026.</p>
+  <p>Last updated on February 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/f42a6cb">f42a6cb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b464c75">b464c75</a>.</p>
   
 </div></div>
       

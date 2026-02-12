@@ -6,6 +6,7 @@
   - [NIXL Backend Configuration](#nixl-backend-configuration)
   - [Overlap Optimization](#Overlap-Optimization)
   - [Cache Layout Transformation](#Cache-Layout-Transformation)
+  - [Unique Global Request ID](`#Unique-Global-Request-ID`)
 - [Usage](#Usage)
   - [Dynamo](#Dynamo)
   - [trtllm-serve](#trtllm-serve)
@@ -89,6 +90,14 @@ To minimize KV cache transmission latency, TensorRT LLM currently uses direct tr
 <p align="center"><sub><em>Figure 5. KV cache layout conversion</em></sub></p>
 
 The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
+
+### Unique Global Request ID
+
+A disaggregated-serving request can provide a unique global request ID via `DisaggregatedParams.disagg_request_id`.
+When this field is a positive integer, the context and generation requests share that value as their internal request ID, which enables end-to-end tracking.
+To avoid collisions with worker-local or warm-up requests, it is recommended to use a value larger than `1 << 42 = 4398046511104`.
+If the field is unset or non-positive, the context and generation requests instead receive separate local sequence IDs, rotating within the range `(0, 1<<42)`, assigned by the respective workers. When `disagg_request_id` is specified, do not route the context and generation requests to the same worker.
+This field is optional at present; however, some forthcoming features will depend on this unique identifier.
 
 ## Usage
 
