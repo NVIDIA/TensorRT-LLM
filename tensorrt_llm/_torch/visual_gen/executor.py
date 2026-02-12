@@ -166,11 +166,8 @@ class DiffusionExecutor:
         while True:
             req = None
             if self.rank == 0:
-                if self.requests_ipc.poll(timeout=1):
-                    logger.info(f"Worker {self.device_id}: Request available")
-                    req = self.requests_ipc.get()
-                else:
-                    continue
+                req = self.requests_ipc.get()
+                logger.info(f"Worker {self.device_id}: Request available")
 
             # Broadcast to all ranks
             obj_list = [req]

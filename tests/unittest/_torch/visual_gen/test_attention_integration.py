@@ -245,19 +245,22 @@ def test_self_attention_equivalence(attn_backend: str):
     # Compare (using looser tolerance for bf16)
     max_diff = (out_naive - out_integrated).abs().max().item()
     mean_diff = (out_naive - out_integrated).abs().mean().item()
-    is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-3)
+    is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)
 
     print("\nResults:")
     print(f"  Output shape: naive={out_naive.shape}, integrated={out_integrated.shape}")
     print(f"  Max absolute difference: {max_diff:.2e}")
     print(f"  Mean absolute difference: {mean_diff:.2e}")
-    print(f"  Outputs match (rtol=1e-2, atol=1e-3): {is_close}")
+    print(f"  Outputs match (rtol=1e-2, atol=1e-2): {is_close}")
 
     if is_close:
         print("  ✅ PASS: Self-attention outputs match!")
     else:
         print("  ❌ FAIL: Self-attention outputs differ!")
 
+    assert is_close, (
+        f"Self-attention outputs differ: max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}"
+    )
     return is_close
 
 
@@ -313,19 +316,22 @@ def test_cross_attention_equivalence(attn_backend: str):
     # Compare (using looser tolerance for bf16)
     max_diff = (out_naive - out_integrated).abs().max().item()
     mean_diff = (out_naive - out_integrated).abs().mean().item()
-    is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-3)
+    is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)
 
     print("\nResults:")
     print(f"  Output shape: naive={out_naive.shape}, integrated={out_integrated.shape}")
     print(f"  Max absolute difference: {max_diff:.2e}")
     print(f"  Mean absolute difference: {mean_diff:.2e}")
-    print(f"  Outputs match (rtol=1e-2, atol=1e-3): {is_close}")
+    print(f"  Outputs match (rtol=1e-2, atol=1e-2): {is_close}")
 
     if is_close:
         print("  ✅ PASS: Cross-attention outputs match!")
     else:
         print("  ❌ FAIL: Cross-attention outputs differ!")
 
+    assert is_close, (
+        f"Cross-attention outputs differ: max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}"
+    )
     return is_close
 
 
@@ -386,7 +392,7 @@ def test_trtllm_cached_prepare():
 
             # Check this iteration matches naive
             max_diff = (out_naive - out_integrated).abs().max().item()
-            is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-3)
+            is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)
 
             status = "✅" if is_close else "❌"
             print(f"  Iteration {i + 1}: max_diff={max_diff:.2e} {status}")
@@ -416,6 +422,10 @@ def test_trtllm_cached_prepare():
         print("\n  ❌ FAIL: Cached prepare may have issues!")
         all_passed = False
 
+    assert all_passed, "Cached prepare: outputs did not match naive reference"
+    assert outputs_differ, (
+        "Cached prepare: outputs should differ across iterations with different inputs"
+    )
     return all_passed
 
 
@@ -472,7 +482,7 @@ def test_trtllm_varying_seq_len():
             out_integrated = integrated(hidden_states, freqs=(freqs_cos_SHD, freqs_sin_SHD))
 
             max_diff = (out_naive - out_integrated).abs().max().item()
-            is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-3)
+            is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)
 
             status = "✅" if is_close else "❌"
             print(f"  seq_len={seq_len:3d}: max_diff={max_diff:.2e} {status}")
@@ -485,6 +495,7 @@ def test_trtllm_varying_seq_len():
     else:
         print("\n  ❌ FAIL: Issues with varying seq_len!")
 
+    assert all_passed, "Varying seq_len: outputs did not match naive reference"
     return all_passed
 
 

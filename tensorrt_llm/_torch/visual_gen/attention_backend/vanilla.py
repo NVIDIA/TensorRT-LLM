@@ -23,7 +23,7 @@ No KV cache - full recompute each diffusion step.
 """
 
 import math
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -73,7 +73,7 @@ class VanillaAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         batch_size: int,
-        seq_len: Union[int, torch.Tensor],
+        seq_len: int,
         seq_len_kv: Optional[int] = None,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         **kwargs,

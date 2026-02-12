@@ -191,7 +191,7 @@ class TrtllmAttention(BaseTrtllmAttention):
         k: torch.Tensor,
         v: torch.Tensor,
         batch_size: int,
-        seq_len: Union[int, torch.Tensor],
+        seq_len: int,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         seq_len_kv: Optional[int] = None,
         **kwargs,

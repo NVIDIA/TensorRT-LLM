@@ -1,28 +1,11 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/030496eb06472f76fcb11de53d93f10cefb4604f/python/sglang/cli/utils.py#L27
-import hashlib
 import json
 import logging
 import os
-import tempfile
-from typing import Optional
-
-import filelock
 
 from tensorrt_llm.llmapi.utils import download_hf_partial
 
 logger = logging.getLogger(__name__)
-
-temp_dir = tempfile.gettempdir()
-
-
-def _get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
-    lock_dir = cache_dir or temp_dir
-    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
-    model_name = model_name_or_path.replace("/", "-")
-    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
-    lock_file_name = hash_name + model_name + ".lock"
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
-    return lock
 
 
 def _maybe_download_model(
@@ -70,7 +53,7 @@ def _maybe_download_model(
 
 
 # Copied and adapted from hf_diffusers_utils.py
-def is_diffusers_model_path(model_path: str) -> True:
+def is_diffusers_model_path(model_path: str) -> bool:
     """Verify if the model directory contains a valid diffusers configuration.
 
     Args:

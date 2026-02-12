@@ -51,9 +51,15 @@ def parse_visual_gen_params(
         if request.num_inference_steps is not None:
             params.num_inference_steps = request.num_inference_steps
         if request.input_reference is not None:
+            if media_storage_path is None:
+                raise ValueError("media_storage_path is required when input_reference is provided")
             params.input_reference = os.path.join(media_storage_path, f"{id}_reference.png")
-            with open(params.input_reference, "wb") as f:
-                shutil.copyfileobj(request.input_reference.file, f)
+            if isinstance(request.input_reference, str):
+                with open(params.input_reference, "wb") as f:
+                    f.write(base64.b64decode(request.input_reference))
+            else:
+                with open(params.input_reference, "wb") as f:
+                    shutil.copyfileobj(request.input_reference.file, f)
 
         params.frame_rate = request.fps
         params.num_frames = int(request.seconds * request.fps)
