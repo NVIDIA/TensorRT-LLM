@@ -33,18 +33,29 @@ remove_unused_variables = true
 ####################################################################################################
 [tool.ruff]
 line-length = 100 # Line length limit for code
+# "Boy scout rule": ruff lints the ENTIRE file when you touch it, not just
+# your changes. Auto-fixable issues (unused imports, import sorting) are fixed
+# automatically. Remaining lint errors must be resolved before committing.
+# This ensures every touched file gets cleaner over time.
 fix = true
-# Exclude 3rdparty and files to be formatted by isort, yapf, and autoflake.
-# Keep this list in sync with .pre-commit-config.yaml.
-# Progressively enable ruff on all the repo to keep individual changes reasonably-sized, and
-# keep merge conflicts manageable.
-# Since keeping both `yapf` and `ruff` makes no sense (given that their formatting philosophies
-# are quite different), we should move towards removing one in favor of the other. ruff's
-# formatting mirrors black's, and both are much more widely adopted than yapf. ruff is also
-# orders of magnitude faster, so we should move to deprecate `yapf`.
 exclude = [
     "**3rdparty/**",
     "triton_kernels/**",
+]
+
+
+[tool.ruff.format]
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+docstring-code-format = true
+# Set the line length limit used when formatting code snippets in docstrings.
+docstring-code-line-length = "dynamic"
+# Legacy files (previously formatted by yapf at 80-char line width).
+# These files are EXCLUDED from ruff formatting but INCLUDED in ruff linting.
+# When you modify a file on this list, ruff will lint the entire file and
+# auto-fix what it can. You are responsible for fixing remaining lint errors.
+# This list will be removed when we complete formatter unification.
+exclude = [
     ".devcontainer/make_env.py",
     ".github/scripts/label_community_user.py",
     ".github/scripts/pr_checklist_check.py",
@@ -113,8 +124,6 @@ exclude = [
     "examples/bindings/executor/example_debug.py",
     "examples/bindings/executor/example_logits_processor.py",
     "examples/disaggregated/clients/disagg_client.py",
-    "examples/disaggregated/slurm/benchmark/gen_server_config.py",
-    "examples/disaggregated/slurm/benchmark/gen_worker_config.py",
     "examples/disaggregated/slurm/benchmark/submit.py",
     "examples/dora/normalize_weights.py",
     "examples/eagle/convert_checkpoint.py",
@@ -155,7 +164,6 @@ exclude = [
     "examples/llm-api/star_attention.py",
     "examples/llm-eval/lm-eval-harness/lm_eval_tensorrt_llm.py",
     "examples/longbench/eval_longbench_v1.py",
-    "examples/longbench/eval_longbench_v2.py",
     "examples/medusa/convert_checkpoint.py",
     "examples/mmlu.py",
     "examples/models/contrib/baichuan/convert_checkpoint.py",
@@ -260,7 +268,6 @@ exclude = [
     "examples/redrafter/convert_checkpoint.py",
     "examples/run.py",
     "examples/scaffolding/contrib/AsyncGeneration/stream_generation_controller.py",
-    "examples/scaffolding/contrib/AsyncGeneration/stream_generation_run.py",
     "examples/scaffolding/contrib/DeepConf/run_generation.py",
     "examples/scaffolding/contrib/Dynasor/scaffolding_dynasor_run.py",
     "examples/scaffolding/contrib/mcp/e2b/e2bserver.py",
@@ -400,7 +407,6 @@ exclude = [
     "tensorrt_llm/_torch/models/modeling_mllama.py",
     "tensorrt_llm/_torch/models/modeling_multimodal_encoder.py",
     "tensorrt_llm/_torch/models/modeling_multimodal_utils.py",
-    "tensorrt_llm/_torch/models/modeling_nanov2vlm.py",
     "tensorrt_llm/_torch/models/modeling_nemotron_h.py",
     "tensorrt_llm/_torch/models/modeling_nemotron_nas.py",
     "tensorrt_llm/_torch/models/modeling_nemotron.py",
@@ -484,7 +490,6 @@ exclude = [
     "tensorrt_llm/_torch/pyexecutor/__init__.py",
     "tensorrt_llm/_torch/pyexecutor/_util.py",
     "tensorrt_llm/_torch/pyexecutor/config_utils.py",
-    "tensorrt_llm/_torch/pyexecutor/config.py",
     "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
     "tensorrt_llm/_torch/pyexecutor/executor_request_queue.py",
     "tensorrt_llm/_torch/pyexecutor/finish_reason.py",
@@ -802,7 +807,6 @@ exclude = [
     "tensorrt_llm/scaffolding/__init__.py",
     "tensorrt_llm/scaffolding/benchmark.py",
     "tensorrt_llm/scaffolding/contrib/__init__.py",
-    "tensorrt_llm/scaffolding/contrib/AsyncGeneration/__init__.py",
     "tensorrt_llm/scaffolding/contrib/AsyncGeneration/stream_generation.py",
     "tensorrt_llm/scaffolding/contrib/DeepConf/__init__.py",
     "tensorrt_llm/scaffolding/contrib/DeepConf/deep_conf_controller.py",
@@ -860,7 +864,6 @@ exclude = [
     "tensorrt_llm/tools/plugin_gen/core.py",
     "tensorrt_llm/tools/plugin_gen/plugin_gen.py",
     "tensorrt_llm/tools/plugin_gen/shape_infer.py",
-    "tensorrt_llm/tools/plugin_gen/templates/functional.py",
     "tensorrt_llm/tools/ppl.py",
     "tensorrt_llm/tools/profiler/nsys_profile_tools/gputrc2graph.py",
     "tensorrt_llm/version.py",
@@ -945,7 +948,6 @@ exclude = [
     "tests/integration/defs/perf/misc.py",
     "tests/integration/defs/perf/open_search_db_utils.py",
     "tests/integration/defs/perf/pytorch_model_config.py",
-    "tests/integration/defs/perf/sample_options_config.py",
     "tests/integration/defs/perf/sampler_options_config.py",
     "tests/integration/defs/perf/sanity_perf_check.py",
     "tests/integration/defs/perf/session_data_writer.py",
@@ -1037,7 +1039,6 @@ exclude = [
     "tests/unittest/_torch/modules/tests_lora_modules/test_lora_attention_pytorch_flow_vs_trt.py",
     "tests/unittest/_torch/modules/tests_lora_modules/test_lora_plugin_vs_lora_op.py",
     "tests/unittest/_torch/multi_gpu_modeling/test_deepseek.py",
-    "tests/unittest/_torch/multi_gpu_modeling/test_llama3.py",
     "tests/unittest/_torch/multi_gpu/test_allreduce.py",
     "tests/unittest/_torch/multi_gpu/test_alltoall.py",
     "tests/unittest/_torch/multi_gpu/test_ar_residual_norm.py",
@@ -1058,9 +1059,7 @@ exclude = [
     "tests/unittest/_torch/ray_orchestrator/conftest.py",
     "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py",
     "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_mapping.py",
-    "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_ops_ray.py",
     "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py",
-    "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_placement.py",
     "tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py",
     "tests/unittest/_torch/sampler/test_beam_search.py",
     "tests/unittest/_torch/sampler/test_best_of_n.py",
@@ -1409,14 +1408,6 @@ exclude = [
     "triton_backend/tools/utils/utils.py",
     "triton_backend/tools/whisper/client.py"
 ]
-
-
-[tool.ruff.format]
-# Like Black, respect magic trailing commas.
-skip-magic-trailing-comma = false
-docstring-code-format = true
-# Set the line length limit used when formatting code snippets in docstrings.
-docstring-code-line-length = "dynamic"
 
 
 [tool.ruff.lint]

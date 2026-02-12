@@ -49,6 +49,12 @@ mdformat.................................................................Passed
 
 If any files were modified by this hook, you will need to stage and commit them again.
 
+> **Note:** Pre-commit runs whole-file linting on every Python file you touch.
+> You may see auto-fixes for import sorting or unused imports. If pre-commit
+> modifies files, re-stage them (`git add`) and commit again. See
+> [CODING_GUIDELINES.md](CODING_GUIDELINES.md#pre-commit-linting-boy-scout-rule)
+> for details.
+
 In addition, please try to keep pull requests (PRs) as concise as possible:
 * Avoid committing commented-out code.
 * Wherever possible, each PR should address a single concern. If there are several otherwise-unrelated things that should be fixed to reach a desired endpoint, our recommendation is to open several PRs and indicate the dependencies in the description. The more complex the changes are in a single PR, the more time it will take to review those changes.

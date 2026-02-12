@@ -487,6 +487,23 @@ else:
     f.read()
 ```
 
+## Pre-commit Linting (Boy Scout Rule)
+
+All Python files are linted by ruff via pre-commit. When you modify any Python
+file and commit, ruff will:
+1. Lint the **entire file** (not just your changes)
+2. Auto-fix what it can (unused imports, import sorting, etc.)
+3. Report remaining issues that you must fix manually
+
+This is intentional — every commit should leave touched files cleaner than before.
+If you see pre-existing lint errors in a file you're modifying, fix them as part
+of your change. Use a separate commit for lint fixes if the diff is large.
+
+> **Note:** Some legacy files are formatted by yapf (80-char line width) rather
+> than ruff. Ruff will still *lint* these files but will not *reformat* them.
+> The formatting boundary is managed by the `[tool.ruff.format] exclude` list
+> in `pyproject.toml`.
+
 ## Documentation Guidelines
 
 #### CLI Options in Documentation
