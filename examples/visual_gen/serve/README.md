@@ -33,12 +33,10 @@ Before running these examples, ensure you have:
    e.g.
 
    ```bash
-   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
-   trtllm-serve $LLM_MODEL_DIR/LTX-2 --extra_visual_gen_options ./configs/ltx2.yml
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml
 
    # Run server on background:
-   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml > /tmp/serve.log 2>&1 &
+   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml > /tmp/serve.log 2>&1 &
 
    ## Check if the server is setup
    tail -f /tmp/serve.log
@@ -49,9 +47,7 @@ Before running these examples, ensure you have:
 
 Current supported & tested models:
 
-1. FLUX2 for image generation (t2i)
-2. WAN T2V/I2V for video generation (t2v, ti2v, delete_video)
-3. LTX2 for video generation with audio (t2v, delete_video)
+1. WAN T2V/I2V for video generation (t2v, ti2v, delete_video)
 
 ### 1. Synchronous Image Generation (`sync_t2i.py`)
 
@@ -232,7 +228,7 @@ You can customize these by:
 ## Common Parameters
 
 ### Image Generation
-- `model`: Model identifier (e.g., "flux2")
+- `model`: Model identifier (e.g., "wan")
 - `prompt`: Text description
 - `n`: Number of images to generate
 - `size`: Image dimensions (e.g., "512x512", "1024x1024")

@@ -1,6 +1,6 @@
 # Visual Generation Examples
 
-Quick reference for running visual generation models (WAN, FLUX2, LTX2).
+Quick reference for running visual generation models (WAN).
 
 ## Prerequisites
 
@@ -116,19 +116,19 @@ GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 
 ## Common Arguments
 
-| Argument | WAN | FLUX2 | LTX2 | Default | Description |
-|----------|-----|-------|------|---------|-------------|
-| `--height` | ✓ | ✓ | ✓ | 720 | Output height |
-| `--width` | ✓ | ✓ | ✓ | 1280 | Output width |
-| `--num_frames` | ✓ | - | ✓ | 81 | Number of frames |
-| `--steps` | ✓ | ✓ | ✓ | 50 | Denoising steps |
-| `--guidance_scale` | ✓ | ✓ | ✓ | 5.0 | CFG guidance strength |
-| `--seed` | ✓ | ✓ | ✓ | 42 | Random seed |
-| `--enable_teacache` | ✓ | ✓ | - | False | Cache optimization |
-| `--attention_backend` | ✓ | ✓ | - | VANILLA | VANILLA or TRTLLM |
-| `--cfg_size` | ✓ | - | ✓ | 1 | CFG parallelism |
-| `--ulysses_size` | ✓ | - | - | 1 | Sequence parallelism |
-| `--linear_type` | ✓ | ✓ | ✓ | default | Quantization type |
+| Argument | WAN | Default | Description |
+|----------|-----|---------|-------------|
+| `--height` | ✓ | 720 | Output height |
+| `--width` | ✓ | 1280 | Output width |
+| `--num_frames` | ✓ | 81 | Number of frames |
+| `--steps` | ✓ | 50 | Denoising steps |
+| `--guidance_scale` | ✓ | 5.0 | CFG guidance strength |
+| `--seed` | ✓ | 42 | Random seed |
+| `--enable_teacache` | ✓ | False | Cache optimization |
+| `--attention_backend` | ✓ | VANILLA | VANILLA or TRTLLM |
+| `--cfg_size` | ✓ | 1 | CFG parallelism |
+| `--ulysses_size` | ✓ | 1 | Sequence parallelism |
+| `--linear_type` | ✓ | default | Quantization type |
 
 ## Troubleshooting
 
@@ -155,8 +155,6 @@ GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 ## Output Formats
 
 - **WAN**: `.mp4` (video), `.gif` (animated), `.png` (single frame)
-- **FLUX2**: `.png`, `.jpg`
-- **LTX2**: `.mp4` (with audio), `.gif` (video only), `.png` (single frame)
 
 ## Baseline Validation
 

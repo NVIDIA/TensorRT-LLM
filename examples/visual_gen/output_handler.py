@@ -79,9 +79,9 @@ class OutputHandler:
     """Handle saving of generated outputs in various formats.
 
     Supports MediaOutput from all models:
-    - Image models (FLUX2): MediaOutput(image=torch.Tensor)
     - Video models (WAN): MediaOutput(video=torch.Tensor)
-    - Video+Audio models (LTX2): MediaOutput(video=torch.Tensor, audio=torch.Tensor)
+    - Image models: MediaOutput(image=torch.Tensor)
+    - Video+Audio models: MediaOutput(video=torch.Tensor, audio=torch.Tensor)
 
     Supported output formats:
     - .png: Save single image or middle frame
@@ -187,7 +187,7 @@ class OutputHandler:
 
         except ImportError:
             logger.warning(
-                "diffusers.pipelines.ltx2.export_utils not available. "
+                "diffusers export_utils (encode_video) not available. "
                 "Falling back to saving middle frame as PNG."
             )
             png_path = output_path.replace(".mp4", ".png")
