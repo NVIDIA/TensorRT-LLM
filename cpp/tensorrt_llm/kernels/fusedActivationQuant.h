@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,38 +13,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #pragma once
+
 #include "tensorrt_llm/common/config.h"
 #include <cstdint>
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
 
-struct WarpSpecializedCounters
-{
-    uint32_t tile_ctr;
-    uint32_t cta_completion_ctr;
-};
-
-template <typename Param>
-struct WarpSpecializedParam : public Param
-{
-    WarpSpecializedCounters* counters;
-};
-
-enum class SCALE_TYPE
-{
-    NONE,
-    SCALAR,
-    VECTOR,
-    SIZE
-};
-
 template <typename T>
-void invokeWSLayerNorm(WarpSpecializedParam<T> param, bool use_rms_norm, int ctas, bool output_hp_norm = false);
+void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
+    int m, int n, int sfVecSize, cudaStream_t stream);
 
 } // namespace kernels
 

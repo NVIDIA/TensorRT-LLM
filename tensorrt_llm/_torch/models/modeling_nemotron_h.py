@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import re
-from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -23,6 +22,7 @@ from transformers import AutoConfig, PretrainedConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.utils import ActivationType, relu2
+from tensorrt_llm.logger import logger
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce
@@ -37,7 +37,7 @@ from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType
+from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
@@ -121,7 +121,7 @@ class NemotronHMOE(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: int,
-        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
     ):
         super().__init__()
 
@@ -242,13 +242,20 @@ class NemotronHMOE(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor
+        | tuple[torch.Tensor | Fp4QuantizedTensor, torch.Tensor],
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
-        assert hidden_states.shape[-1] == self.hidden_dim
-        orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, self.hidden_dim)
+
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_hp = hidden_states
+        else:
+            hidden_states_hp = hidden_states
+
+        assert hidden_states_hp.shape[-1] == self.hidden_dim
+        orig_shape = hidden_states_hp.shape
+        hidden_states_hp_2d = hidden_states_hp.view(-1, self.hidden_dim)
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         def _compute_shared_output():
@@ -259,7 +266,8 @@ class NemotronHMOE(nn.Module):
             return shared_expert_output
 
         def _compute_routed_output():
-            router_logits = self.gate(hidden_states)
+            # Gate uses high precision input for accurate routing decisions.
+            router_logits = self.gate(hidden_states_hp_2d)
 
             routed_hidden_states = hidden_states
             if self.use_latent_moe:
@@ -301,7 +309,7 @@ class NemotronHLayer(DecoderLayer):
         # - -> MLPLayer
         # * -> TransformerLayer
         layer_type: str,
-        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
     ):
         super().__init__()
 
@@ -310,10 +318,31 @@ class NemotronHLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
+        self.is_nvfp4 = (model_config.quant_config is not None
+                         and model_config.quant_config.quant_mode is not None
+                         and model_config.quant_config.quant_mode.has_nvfp4())
+        # The fused RMSNorm+NVFP4 CUDA kernel requires hidden_size to be
+        # a supported tile size. Non-power-of-2 hidden sizes within tile
+        # ranges may cause kernel hangs. Disable fused NVFP4 for such cases.
+        # Supported tile sizes: 2048, 4096, 8192, 16384
+        _SUPPORTED_NVFP4_HIDDEN_SIZES = {2048, 4096, 8192, 16384}
+        if self.is_nvfp4 and config.hidden_size not in _SUPPORTED_NVFP4_HIDDEN_SIZES:
+            logger.warning_once(
+                f"Layer {layer_idx}: Disabling fused NVFP4 RMSNorm for hidden_size={config.hidden_size}. "
+                f"Supported sizes: {_SUPPORTED_NVFP4_HIDDEN_SIZES}. Using non-fused path.",
+                key=f"disable_nvfp4_rmsnorm_with_{config.hidden_size}")
+            self.is_nvfp4 = False
+
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
+            # Enable fused NVFP4 quantization if possible.
+            # It might be overridden in `_try_attach_nvfp4_scale` function.
+            quantize_type="nvfp4" if self.is_nvfp4 else None,
+            # Enable high precision output for MoE layer (only with NVFP4).
+            # It might be overridden in `_try_attach_nvfp4_scale` function.
+            return_hp_output=layer_type == "E" and self.is_nvfp4,
         )
 
         if layer_type == "M":
@@ -343,29 +372,71 @@ class NemotronHLayer(DecoderLayer):
         else:
             raise ValueError(f"{layer_type} is not supported")
 
+    def post_load_weights(self):
+        """Post-process after loading weights."""
+        if self.norm.is_nvfp4 and not hasattr(self.norm, 'nvfp4_scale'):
+            self._try_attach_nvfp4_scale()
+
+    def _try_attach_nvfp4_scale(self):
+        """Attach input_scale from mixer's first linear to norm for fused RMSNorm+Quant."""
+        # Normal handling for Mamba, MLP, and Attention layers.
+        first_linear_attr = {
+            'M': 'in_proj',
+            '-': 'up_proj',
+            '*': 'qkv_proj'
+        }.get(self.layer_type)
+        if first_linear_attr:
+            first_linear = getattr(self.mixer, first_linear_attr, None)
+            if first_linear and hasattr(first_linear, 'input_scale'):
+                self.norm.nvfp4_scale = first_linear.input_scale
+                return
+
+        # Special handling for MoE layer: fetch shared_expert.up_proj.input_scale
+        # as representation of the input scale.
+        if self.layer_type == 'E':
+            if (hasattr(self.mixer, 'shared_experts')
+                    and self.mixer.shared_experts is not None
+                    and hasattr(self.mixer.shared_experts, 'up_proj')
+                    and hasattr(self.mixer.shared_experts.up_proj,
+                                'input_scale') and
+                    self.mixer.shared_experts.up_proj.input_scale is not None):
+                self.norm.nvfp4_scale = self.mixer.shared_experts.up_proj.input_scale
+                # Enable high precision output for MoE layer.
+                self.norm.return_hp_output = True
+                return
+
+        self.norm.is_nvfp4 = False
+        self.norm.return_hp_output = False
+
     def forward(
         self,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        spec_metadata: Optional[SpecMetadata] = None,
+        residual: torch.Tensor | None = None,
+        spec_metadata: SpecMetadata | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = torch.zeros_like(hidden_states)
 
-        residual = hidden_states
-
-        hidden_states = self.norm(hidden_states)
+        if self.norm.return_hp_output:
+            hidden_states, residual, high_precision_normed_output = self.norm(
+                hidden_states, residual)
+            hidden_states = (hidden_states, high_precision_normed_output)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
         hidden_states = self.mixer(hidden_states,
                                    attn_metadata,
                                    spec_metadata=spec_metadata,
                                    **kwargs)
-        hidden_states = torch.add(hidden_states, residual)
+
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
-                                                      hidden_states, None)
+                                                      hidden_states, residual)
 
-        return hidden_states
+        return hidden_states, residual
 
 
 class NemotronHModel(DecoderModel):
@@ -426,10 +497,10 @@ class NemotronHModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.IntTensor] = None,
-        position_ids: Optional[torch.IntTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
+        input_ids: torch.IntTensor | None = None,
+        position_ids: torch.IntTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        spec_metadata: SpecMetadata | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -443,16 +514,15 @@ class NemotronHModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-
+        residual = torch.zeros_like(hidden_states)
         for layer in self.layers[:self.num_hidden_layers]:
-            hidden_states = layer(position_ids,
-                                  hidden_states,
-                                  attn_metadata,
-                                  spec_metadata=spec_metadata,
-                                  mamba_metadata=mamba_metadata)
-
-        hidden_states = self.norm_f(hidden_states)
-
+            hidden_states, residual = layer(position_ids,
+                                            hidden_states,
+                                            residual=residual,
+                                            attn_metadata=attn_metadata,
+                                            spec_metadata=spec_metadata,
+                                            mamba_metadata=mamba_metadata)
+        hidden_states, _ = self.norm_f(hidden_states, residual)
         return hidden_states
 
 
@@ -517,7 +587,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             self.epilogue.extend(self.draft_model.mtp_layers)
             self.epilogue.append(self.spec_worker)
 
-    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
 
@@ -528,7 +598,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         self,
         model_config: ModelConfig[NemotronHConfig],
         layer_idx: int,
-        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         has_start_projections: bool,
         has_end_norm: bool,
         layer_type: str,
@@ -625,7 +695,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
-        attn_metadata: Optional[AttentionMetadata] = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
 
         if self.has_start_projections:
@@ -672,7 +742,7 @@ class NemotronHMTP(nn.Module):
     def __init__(self,
                  model_config: ModelConfig[NemotronHConfig],
                  layer_idx: int,
-                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+                 aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
                  is_separate_draft_engine: bool = False,
                  prefix: str = ""):
         super().__init__()
@@ -744,8 +814,8 @@ class NemotronHMTP(nn.Module):
         hidden_states: torch.Tensor,
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
+        all_rank_num_tokens: list[int] | None = None,
+        spec_metadata: SpecMetadata | None = None,
         **kwargs,
     ) -> torch.Tensor:
         inputs_embeds = embed_tokens(input_ids)
