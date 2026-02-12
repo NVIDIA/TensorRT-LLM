@@ -87,6 +87,10 @@ class _TrtllmPlanner:
         # thop-specific host metadata NOT available from SequenceInfo
         self.host_request_types: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         self.host_total_kv_lens: Optional[torch.Tensor] = None  # [2] int64 pinned
+        # thop variant of input_pos_host and seq_len_host
+        # keeping a separate copy here since we sometimes have to overwrite the original values
+        self.host_past_kv_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
+        self.host_context_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
         self.block_offsets: Optional[torch.Tensor] = None
@@ -114,17 +118,26 @@ class _TrtllmPlanner:
         self.block_offsets = torch.zeros(
             1, max_batch, 2, max_blocks_per_seq, dtype=torch.int32, device=device
         )
+        self.host_past_kv_lengths = torch.zeros(
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self.host_context_lengths = torch.zeros(
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+        )
 
     def plan(
         self,
         num_prefill: int,
         num_decode: int,
-        multiplier: int,
+        max_context_length: int,
+        block_offset_multiplier: int,
         seq_len_with_cache_host: torch.Tensor,
         cu_num_pages_host: torch.Tensor,
         cache_loc: torch.Tensor,
         page_seq_indices: torch.Tensor,
         page_in_seq: torch.Tensor,
+        input_pos_host: torch.Tensor,
+        seq_len_host: torch.Tensor,
     ) -> None:
         """Per-forward host metadata: fills host_request_types, block_offsets, host_total_kv_lens.
 
@@ -133,31 +146,32 @@ class _TrtllmPlanner:
         num_seq = num_prefill + num_decode
 
         # host_request_types: 0 = prefill (context), 1 = decode (generation)
-        if num_prefill > 0:
-            self.host_request_types[:num_prefill].fill_(0)
-        if num_decode > 0:
-            self.host_request_types[num_prefill:num_seq].fill_(1)
+        self.host_request_types[:num_prefill].fill_(0)
+        self.host_request_types[num_prefill:num_seq].fill_(1)
 
         # Compute block_offsets for thop.attention using pre-computed page indices.
-        # Zero the ENTIRE block_offsets buffer to clear stale entries from previous
-        # iterations.  During CUDA graph replay, the captured kernel reads block_offsets
-        # for the full captured batch size (e.g., 32), not just the current num_seq.
-        # Any stale entries beyond the current batch could point to freed/invalid pool
-        # locations, causing illegal memory accesses.
         block_offsets = self.block_offsets
-        block_offsets.zero_()
         total_pages = int(cu_num_pages_host[num_seq])
-        if total_pages > 0:
-            base_offsets = cache_loc[:total_pages] * multiplier
-            seq_idx = page_seq_indices[:total_pages]
-            pg_idx = page_in_seq[:total_pages]
-            block_offsets[0, seq_idx, 0, pg_idx] = base_offsets  # K
-            block_offsets[0, seq_idx, 1, pg_idx] = base_offsets + 1  # V
+        base_offsets = cache_loc[:total_pages] * block_offset_multiplier
+        seq_idx = page_seq_indices[:total_pages]
+        pg_idx = page_in_seq[:total_pages]
+        block_offsets[0, seq_idx, 0, pg_idx] = base_offsets  # K
+        block_offsets[0, seq_idx, 1, pg_idx] = base_offsets + 1  # V
 
         # host_total_kv_lens: [context_total_kv, gen_total_kv]
-        slwc = seq_len_with_cache_host[:num_seq]
-        self.host_total_kv_lens[0] = int(slwc[:num_prefill].sum()) if num_prefill > 0 else 0
-        self.host_total_kv_lens[1] = int(slwc[num_prefill:num_seq].sum()) if num_decode > 0 else 0
+        is_capturing = torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up()
+        if is_capturing:
+            # CUDA graph capture: set host tensors to MAX values so the kernel captures
+            # the worst-case execution pattern.
+            self.host_total_kv_lens[0] = max_context_length * num_prefill
+            self.host_total_kv_lens[1] = max_context_length * num_decode
+            self.host_past_kv_lengths[:num_seq].fill_(max_context_length)
+            self.host_context_lengths[:num_seq].fill_(max_context_length)
+        else:
+            self.host_total_kv_lens[0] = seq_len_with_cache_host[:num_prefill].sum()
+            self.host_total_kv_lens[1] = seq_len_with_cache_host[num_prefill:num_seq].sum()
+            self.host_past_kv_lengths[:num_seq] = input_pos_host[:num_seq]
+            self.host_context_lengths[:num_seq] = seq_len_host[:num_seq]
 
     def get_pool_pointers_for_layer(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Return a per-layer ``host_pool_pointers`` tensor for this kv_cache view.
@@ -195,6 +209,8 @@ def prepare_trtllm_metadata_host(
     cache_loc: torch.Tensor,
     page_seq_indices: torch.Tensor,
     page_in_seq: torch.Tensor,
+    input_pos_host: torch.Tensor,
+    seq_len_host: torch.Tensor,
 ) -> None:
     """Fill thop-specific host metadata and compute block_offsets.
 
@@ -212,23 +228,26 @@ def prepare_trtllm_metadata_host(
     num_prefill, _, num_decode = batch_info_host.tolist()
 
     # Read all max-size constants from max_seq_info_host (set at cache init time)
-    multiplier = int(max_seq_info_host[2])
-    max_blocks_per_seq = int(max_seq_info_host[1])
-    max_batch = int(max_seq_info_host[3])
+    max_context_length, max_blocks_per_seq, block_offset_multiplier, max_batch_size = (
+        max_seq_info_host.tolist()
+    )
 
     # One-time allocation of all persistent buffers (lazy, guards against double-init)
-    _GlobalTrtllmPlanner.reset(cache_loc.device, max_batch, max_blocks_per_seq)
+    _GlobalTrtllmPlanner.reset(cache_loc.device, max_batch_size, max_blocks_per_seq)
 
     # Per-forward: fill host_request_types, block_offsets, host_total_kv_lens
     _GlobalTrtllmPlanner.plan(
         num_prefill=num_prefill,
         num_decode=num_decode,
-        multiplier=multiplier,
+        max_context_length=max_context_length,
+        block_offset_multiplier=block_offset_multiplier,
         seq_len_with_cache_host=seq_len_with_cache_host,
         cu_num_pages_host=cu_num_pages_host,
         cache_loc=cache_loc,
         page_seq_indices=page_seq_indices,
         page_in_seq=page_in_seq,
+        input_pos_host=input_pos_host,
+        seq_len_host=seq_len_host,
     )
 
 
@@ -322,23 +341,12 @@ def trtllm_mha_with_cache(
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
     context_lengths = seq_len[:num_seq]  # device
-    host_past_kv_lengths = input_pos_host[:num_seq]  # host (pinned)
-    host_context_lengths = seq_len_host[:num_seq]  # host (pinned)
+    host_past_kv_lengths = _GlobalTrtllmPlanner.host_past_kv_lengths[:num_seq]  # host (pinned)
+    host_context_lengths = _GlobalTrtllmPlanner.host_context_lengths[:num_seq]  # host (pinned)
 
     # thop-specific metadata from _GlobalTrtllmPlanner
     host_request_types = _GlobalTrtllmPlanner.host_request_types[:num_seq]
     host_total_kv_lens = _GlobalTrtllmPlanner.host_total_kv_lens
-
-    # CUDA graph capture: set host tensors to MAX values so the kernel captures
-    # the worst-case execution pattern.  During replay the host-prepare function
-    # updates these persistent tensors with actual values before the graph runs.
-    is_capturing = torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up()
-    if is_capturing:
-        host_past_kv_lengths[:num_seq].fill_(max_context_length)
-        host_context_lengths[:num_seq].fill_(max_context_length)
-        host_request_types[:num_seq].fill_(1)  # all decode
-        host_total_kv_lens[0] = 0
-        host_total_kv_lens[1] = max_context_length * num_seq
 
     # Block offsets from host_prepare
     kv_cache_block_offsets = _GlobalTrtllmPlanner.block_offsets
