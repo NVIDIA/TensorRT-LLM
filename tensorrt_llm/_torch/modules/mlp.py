@@ -8,23 +8,25 @@ from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..utils import Fp4QuantizedTensor, relu2
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 class MLP(nn.Module):
 
-    def __init__(self,
-                 *,
-                 hidden_size: int,
-                 intermediate_size: int,
-                 bias: bool,
-                 activation: Callable[[torch.Tensor], torch.Tensor] = None,
-                 dtype: Optional[torch.dtype] = None,
-                 config: Optional[ModelConfig] = None,
-                 layer_idx: Optional[int] = None,
-                 reduce_output: bool = True,
-                 overridden_tp_size: Optional[int] = None):
-
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        bias: bool,
+        activation: Callable[[torch.Tensor], torch.Tensor] = None,
+        dtype: Optional[torch.dtype] = None,
+        config: Optional[ModelConfig] = None,
+        layer_idx: Optional[int] = None,
+        reduce_output: bool = True,
+        overridden_tp_size: Optional[int] = None,
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -81,7 +83,22 @@ class MLP(nn.Module):
             lora=self.down_lora,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            reduce_output=reduce_output)
+            reduce_output=reduce_output,
+        )
+
+        self._use_fused_relu2_quant = False
+
+    def create_weights(self):
+        self.up_proj.create_weights()
+        self.down_proj.create_weights()
+
+        has_nvfp4 = hasattr(self.down_proj,
+                            'has_nvfp4') and self.down_proj.has_nvfp4
+        has_kernel = hasattr(torch.ops.trtllm, 'fused_relu2_quantize')
+        has_scale = hasattr(self.down_proj, 'input_scale')
+        is_relu2 = self.activation is relu2
+
+        self._use_fused_relu2_quant = has_nvfp4 and has_kernel and has_scale and is_relu2
 
     def forward(
         self,
@@ -92,10 +109,33 @@ class MLP(nn.Module):
             return self.forward_lora(x, lora_params=lora_params)
 
         x_up = self.up_proj(x)
-        x_act = self.activation(x_up)
+
+        if self._use_fused_relu2_quant:
+            x_act = self._fused_relu2_quant(x_up)
+        else:
+            x_act = self.activation(x_up)
+
         x_down = self.down_proj(x_act)
 
         return x_down
+
+    def _fused_relu2_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        x_flat = x.view(-1, x.shape[-1])
+
+        if not x_flat.is_contiguous():
+            x_flat = x_flat.contiguous()
+
+        if x_flat.dtype not in (torch.float16, torch.bfloat16):
+            x_flat = x_flat.to(torch.bfloat16)
+
+        fp4_tensor, sf_tensor = torch.ops.trtllm.fused_relu2_quantize(
+            x_flat, self.down_proj.input_scale, 16)
+
+        return Fp4QuantizedTensor(
+            fp4_tensor=fp4_tensor,
+            scaling_factor=sf_tensor,
+            is_sf_swizzled=True,
+        )
 
     def forward_lora(
         self,

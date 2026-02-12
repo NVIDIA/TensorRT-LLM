@@ -43,6 +43,8 @@ struct Causal_conv1d_fwd_kernel_traits
     static_assert(kWidth <= kNElts);
     static constexpr bool kIsVecLoad = kIsVecLoad_;
     using vec_t = typename BytesToType<kNBytes * kNElts>::Type;
+    static_assert(kNThreads_ % 32 == 0, "kNThreads must be a multiple of 32 for warp shuffle");
+    static_assert(sizeof(vec_t) == 16, "vec_t must be 16 bytes for warp shuffle optimization");
     using BlockLoadT = cub::BlockLoad<input_t, kNThreads, kNElts, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
     using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, 1, cub::BLOCK_LOAD_DIRECT>;
     using BlockStoreT = cub::BlockStore<input_t, kNThreads, kNElts, cub::BLOCK_STORE_WARP_TRANSPOSE>;
@@ -123,7 +125,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
 #pragma unroll
     for (int i = 0; i < kWidth; ++i)
     {
-        weight_vals[i] = float(weight[i * params.weight_width_stride]);
+        weight_vals[i] = float(__ldg(&weight[i * params.weight_width_stride]));
     }
 
     constexpr int kChunkSize = kNThreads * kNElts;
@@ -144,20 +146,41 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
                 x, *reinterpret_cast<input_t(*)[kNElts]>(&x_vals_load[kNElts]), seqlen - chunk * kChunkSize);
         }
         x += kChunkSize;
+
+        int const lane_id = tidx & 31;
+        vec_t high_val = reinterpret_cast<vec_t*>(x_vals_load)[1];
+
         __syncthreads();
         // Thread kNThreads - 1 don't write yet, so that thread 0 can read
         // the last elements of the previous chunk.
         if (tidx < kNThreads - 1)
         {
-            smem_exchange[tidx] = reinterpret_cast<vec_t*>(x_vals_load)[1];
+            smem_exchange[tidx] = high_val;
         }
         __syncthreads();
-        reinterpret_cast<vec_t*>(x_vals_load)[0] = smem_exchange[tidx > 0 ? tidx - 1 : kNThreads - 1];
+
+        // Get neighbor data: use warp shuffle for most threads, shared memory for warp boundaries
+        vec_t neighbor;
+        uint32_t* high_val_p = reinterpret_cast<uint32_t*>(&high_val);
+        uint32_t* nbr_p = reinterpret_cast<uint32_t*>(&neighbor);
+        nbr_p[0] = __shfl_up_sync(0xFFFFFFFF, high_val_p[0], 1);
+        nbr_p[1] = __shfl_up_sync(0xFFFFFFFF, high_val_p[1], 1);
+        nbr_p[2] = __shfl_up_sync(0xFFFFFFFF, high_val_p[2], 1);
+        nbr_p[3] = __shfl_up_sync(0xFFFFFFFF, high_val_p[3], 1);
+
+        // Lane 0 must use shared memory to handle the cross-warp boundary.
+        // thread 0 uses the last element of the previous chunk.
+        if (lane_id == 0)
+        {
+            neighbor = smem_exchange[tidx > 0 ? tidx - 1 : kNThreads - 1];
+        }
+        reinterpret_cast<vec_t*>(x_vals_load)[0] = neighbor;
+
         __syncthreads();
         // Now thread kNThreads - 1 can write the last elements of the current chunk.
         if (tidx == kNThreads - 1)
         {
-            smem_exchange[tidx] = reinterpret_cast<vec_t*>(x_vals_load)[1];
+            smem_exchange[tidx] = high_val;
         }
 
         float x_vals[2 * kNElts];
@@ -169,22 +192,33 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
 
         float out_vals[kNElts];
 #pragma unroll
-        for (int i = 0; i < kNElts; ++i)
+        // Process 2 outputs at a time for better ILP (instruction level parallelism).
+        for (int i = 0; i < kNElts; i += 2)
         {
-            out_vals[i] = bias_val;
+            float acc0 = bias_val;
+            float acc1 = bias_val;
 #pragma unroll
             for (int w = 0; w < kWidth; ++w)
             {
-                out_vals[i] += weight_vals[w] * x_vals[kNElts + i - (kWidth - w - 1)];
+                float wt = weight_vals[w];
+                acc0 = __fmaf_rn(wt, x_vals[kNElts + i - (kWidth - w - 1)], acc0);
+                acc1 = __fmaf_rn(wt, x_vals[kNElts + i + 1 - (kWidth - w - 1)], acc1);
             }
+            out_vals[i] = acc0;
+            out_vals[i + 1] = acc1;
         }
 
         if (params.silu_activation)
         {
 #pragma unroll
-            for (int i = 0; i < kNElts; ++i)
+            for (int i = 0; i < kNElts; i += 2)
             {
-                out_vals[i] = out_vals[i] / (1 + expf(-out_vals[i]));
+                // SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+                // Using fast math: __expf and __frcp_rn
+                float v0 = out_vals[i];
+                float v1 = out_vals[i + 1];
+                out_vals[i] = v0 * __frcp_rn(1.0f + __expf(-v0));
+                out_vals[i + 1] = v1 * __frcp_rn(1.0f + __expf(-v1));
             }
         }
 

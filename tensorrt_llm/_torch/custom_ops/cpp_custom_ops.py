@@ -1003,7 +1003,9 @@ def _register_fake():
         sf_scale: Optional[torch.Tensor],
         use_rms_norm: bool = True,
         eps: float = 1e-5,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        output_hp_norm: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+               Optional[torch.Tensor]]:
         m, n = input.shape
         # normed_output_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
         normed_output_fp4 = input.new_empty((m, n // 8), dtype=torch.int32)
@@ -1013,4 +1015,22 @@ def _register_fake():
         sf_vec_size = 16
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
-        return normed_output_fp4, output, sf_out
+        # high_precision_normed_output: [M, N] optional, only when output_hp_norm=True
+        hp_output = input.new_empty(
+            (m, n), dtype=input.dtype) if output_hp_norm else None
+        return normed_output_fp4, output, sf_out, hp_output
+
+    @torch.library.register_fake("trtllm::fused_relu2_quantize")
+    def _(
+        input: torch.Tensor,
+        sf_scale: torch.Tensor,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # input: 2D tensor [M, N] (bf16 or fp16)
+        # output_fp4: [M, N/2] (packed FP4 values, 2 values per byte)
+        # output_sf: swizzled scale factors
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf
