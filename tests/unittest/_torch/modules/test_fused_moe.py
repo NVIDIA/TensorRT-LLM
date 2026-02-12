@@ -1063,6 +1063,8 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     NUM_EXPERTS = num_experts
     TOP_K = 6
 
+    os.environ["TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM"] = "1"
+
     routing_method = RoutingMethodCls(top_k=TOP_K)
 
     mapping = mapping or Mapping()
