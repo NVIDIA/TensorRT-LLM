@@ -433,8 +433,17 @@ def launchReleaseCheck(pipeline, globalVars)
         // Post-merge CI runs on all files; pre-merge CI runs only on changed files.
         def precommitArgs = "-a"
         if (!(env.JOB_NAME ==~ /.*PostMerge.*/ || env.alternativeTRT)) {
-            def targetBranch = env.gitlabTargetBranch ?: "globalVars[TARGET_BRANCH]"
-            precommitArgs = "--from-ref origin/${targetBranch} --to-ref HEAD"
+            // Use GitLab/GitHub API to get the exact list of changed files in this MR.
+            // This avoids git history depth issues with shallow clones.
+            def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+            if (changedFileList && !changedFileList.isEmpty()) {
+                def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
+                writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
+                precommitArgs = "--files-from ${changedFilesPath}"
+                echo "Pre-commit will check ${changedFileList.unique().size()} changed file(s)"
+            } else {
+                echo "Could not determine changed files, falling back to all files"
+            }
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py ${precommitArgs} || (git restore . && false)")
 

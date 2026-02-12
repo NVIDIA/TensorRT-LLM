@@ -41,8 +41,8 @@ def run_precommit_with_timing(precommit_args):
 
     Args:
         precommit_args: Arguments to pass to `pre-commit run`, e.g.
-            "-a" for all files, or
-            "--from-ref origin/main --to-ref HEAD" for changed files.
+            "--all-files" for all files, or
+            "--files file1 file2" for specific files.
     """
 
     print("Running pre-commit checks with performance monitoring...")
@@ -169,7 +169,7 @@ def main():
     # Parse command line arguments
     # Usage:
     #   All files:      python release_check.py -a
-    #   Changed files:  python release_check.py --from-ref origin/main --to-ref HEAD
+    #   Changed files:  python release_check.py --files-from changed_files.txt
     parser = argparse.ArgumentParser(description="Release Check")
     parser.add_argument(
         "-a",
@@ -178,28 +178,36 @@ def main():
         help="Run pre-commit on all files",
     )
     parser.add_argument(
-        "--from-ref",
+        "--files-from",
         default=None,
-        help="Start ref for changed file detection (e.g. origin/main)",
-    )
-    parser.add_argument(
-        "--to-ref",
-        default=None,
-        help="End ref for changed file detection (e.g. HEAD)",
+        help="Path to a file containing the list of changed files (one per line)",
     )
     args = parser.parse_args()
 
     # Build pre-commit arguments
-    if args.all_files:
+    if args.files_from:
+        with open(args.files_from) as f:
+            changed_files = [
+                line.strip() for line in f if line.strip()
+            ]
+        if changed_files:
+            files_arg = " ".join(f'"{f}"' for f in changed_files)
+            precommit_args = f"--files {files_arg}"
+            print(f"=== Running pre-commit on {len(changed_files)} changed file(s) ===")
+            for cf in changed_files[:20]:
+                print(f"  {cf}")
+            if len(changed_files) > 20:
+                print(f"  ... and {len(changed_files) - 20} more")
+        else:
+            print("=== No changed files found, skipping pre-commit ===")
+            return
+    elif args.all_files:
         precommit_args = "--all-files"
         print("=== Running pre-commit on ALL files ===")
-    elif args.from_ref and args.to_ref:
-        precommit_args = f"--from-ref {args.from_ref} --to-ref {args.to_ref}"
-        print(f"=== Running pre-commit on changed files ({args.from_ref}..{args.to_ref}) ===")
     else:
         # Default: all files (backward compatible)
         precommit_args = "--all-files"
-        print("=== No ref range specified, running pre-commit on ALL files ===")
+        print("=== No arguments specified, running pre-commit on ALL files ===")
 
     # Install pre-commit and bandit from requirements-dev.txt
     with open("requirements-dev.txt") as f:
