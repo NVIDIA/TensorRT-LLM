@@ -298,7 +298,9 @@ class OpenAIServer:
     def _check_health(self) -> bool:
         if isinstance(self.generator, LLM):
             return self.generator._check_health()
-
+        # llmapi.LLM (e.g. PyTorch backend) is not isinstance(_tensorrt_engine.LLM)
+        if hasattr(self.generator, '_check_health'):
+            return self.generator._check_health()
         return True
 
     def register_routes(self):

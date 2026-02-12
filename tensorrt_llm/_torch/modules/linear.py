@@ -1234,10 +1234,13 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
-        # GEMM ops require 2D matrices
-        original_shape = input.shape
-        if input.dim() > 2:
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
+        # GEMM requires 2D. Only plain tensors support for now, skip for
+        # tuple and Fp4QuantizedTensor.
+        original_shape = None
+        if not isinstance(input,
+                          (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
+            original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
 
         act_fp4, act_sf = self._input_prepare(module, input)
@@ -1257,8 +1260,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
 
-        # Reshape output back to original shape (with out_features as last dim)
-        if len(original_shape) > 2:
+        if original_shape is not None:
             output = output.reshape(*original_shape[:-1], output.shape[-1])
 
         if bias is not None:
