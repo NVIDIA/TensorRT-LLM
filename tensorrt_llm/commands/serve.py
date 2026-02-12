@@ -105,6 +105,7 @@ def get_llm_args(
         moe_expert_parallel_size: Optional[int] = None,
         gpus_per_node: Optional[int] = None,
         free_gpu_memory_fraction: float = 0.9,
+        kv_cache_dtype: str = "auto",
         num_postprocess_workers: int = 0,
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
@@ -123,7 +124,8 @@ def get_llm_args(
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction, )
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        dtype=kv_cache_dtype)
 
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
@@ -506,6 +508,13 @@ class ChoiceWithAlias(click.Choice):
               help=help_info_with_stability_tag(
                   "Free GPU memory fraction reserved for KV Cache, "
                   "after allocating model weights and buffers.", "beta"))
+@click.option("--kv_cache_dtype",
+              type=click.Choice(("auto", "fp8", "nvfp4")),
+              default="auto",
+              help=help_info_with_stability_tag(
+                  "KV cache quantization dtype for PyTorch backend. "
+                  "'auto' uses checkpoint/model metadata; explicit values force override.",
+                  "beta"))
 @click.option("--num_postprocess_workers",
               type=int,
               default=0,
@@ -607,7 +616,8 @@ def serve(
         tensor_parallel_size: int, pipeline_parallel_size: int,
         context_parallel_size: int, moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
-        free_gpu_memory_fraction: float, num_postprocess_workers: int,
+        free_gpu_memory_fraction: float, kv_cache_dtype: str,
+        num_postprocess_workers: int,
         trust_remote_code: bool, revision: Optional[str],
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         tool_parser: Optional[str], metadata_server_config_file: Optional[str],
@@ -646,6 +656,7 @@ def serve(
         moe_cluster_parallel_size=moe_cluster_parallel_size,
         gpus_per_node=gpus_per_node,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
+        kv_cache_dtype=kv_cache_dtype,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
         revision=revision,
