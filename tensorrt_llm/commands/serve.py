@@ -765,9 +765,8 @@ def serve(
         else:
             # Default: launch OpenAI HTTP server
             launch_server(host, port, llm_args, tool_parser, chat_template,
-                        metadata_server_cfg, server_role, disagg_cluster_config,
-                        multimodal_server_config)
-
+                          metadata_server_cfg, server_role,
+                          disagg_cluster_config, multimodal_server_config)
 
     def _serve_visual_gen():
         visual_gen_config = {

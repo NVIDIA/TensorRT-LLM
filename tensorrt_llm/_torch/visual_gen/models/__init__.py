@@ -19,7 +19,7 @@ Example structure:
 
 from ..pipeline import BasePipeline
 from ..pipeline_registry import AutoPipeline, register_pipeline
-from .wan import WanPipeline, WanImageToVideoPipeline
+from .wan import WanImageToVideoPipeline, WanPipeline
 
 __all__ = [
     "AutoPipeline",
