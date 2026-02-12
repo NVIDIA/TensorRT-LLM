@@ -34,7 +34,10 @@ from tensorrt_llm._torch.autotuner import autotune
 @pytest.mark.parametrize("n", [2560])
 @pytest.mark.parametrize("max_tokens_per_group", [10, 50, 100, 128, 256, 512, 1000, 1024])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_cute_dsl_fp8_block_scale_grouped_gemm(dtype, num_experts, k, n, max_tokens_per_group):
+@pytest.mark.parametrize("use_tvm_ffi", [True, False])
+def test_cute_dsl_fp8_block_scale_grouped_gemm(
+    dtype, use_tvm_ffi, num_experts, k, n, max_tokens_per_group
+):
     random.seed(0)
     torch.random.manual_seed(0)
 
@@ -66,12 +69,6 @@ def test_cute_dsl_fp8_block_scale_grouped_gemm(dtype, num_experts, k, n, max_tok
         b_fp8[i, :, :] = cur_b
         b_scale[i, :, :] = cur_b_scale
 
-    print(f"group_offset: {group_offset.shape}")
-    print(f"a_fp8: {a_fp8.shape}")
-    print(f"b_fp8: {b_fp8.shape}")
-    print(f"a_scale: {a_scale.shape}")
-    print(f"b_scale: {b_scale.shape}")
-
     with autotune():
         output = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
             input=a_fp8,
@@ -79,6 +76,7 @@ def test_cute_dsl_fp8_block_scale_grouped_gemm(dtype, num_experts, k, n, max_tok
             input_scale=a_scale,
             weight_scale=b_scale,
             group_offset=group_offset,
+            use_tvm_ffi=use_tvm_ffi,
         )
     output = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
         input=a_fp8,
@@ -86,6 +84,7 @@ def test_cute_dsl_fp8_block_scale_grouped_gemm(dtype, num_experts, k, n, max_tok
         input_scale=a_scale,
         weight_scale=b_scale,
         group_offset=group_offset,
+        use_tvm_ffi=use_tvm_ffi,
     )
 
     diff = calc_diff(output, output_expected)
