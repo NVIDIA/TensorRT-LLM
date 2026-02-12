@@ -101,9 +101,9 @@ class WanImageEmbedding(nn.Module):
     ):
         super().__init__()
         dtype = model_config.torch_dtype if model_config else None
-
+        # LayerNorm weights in fp32 (matches internal float32 normalization; avoids bf16/fp32 mismatch).
         self.norm1 = LayerNorm(
-            hidden_size=in_features, eps=1e-6, dtype=dtype, has_weights=True, has_bias=True
+            hidden_size=in_features, eps=1e-6, dtype=torch.float32, has_weights=True, has_bias=True
         )
 
         # Match HF FeedForward structure: Linear(in, in) → GELU → Linear(in, out)
@@ -137,7 +137,7 @@ class WanImageEmbedding(nn.Module):
         )
 
         self.norm2 = LayerNorm(
-            hidden_size=out_features, eps=1e-6, dtype=dtype, has_weights=True, has_bias=True
+            hidden_size=out_features, eps=1e-6, dtype=torch.float32, has_weights=True, has_bias=True
         )
 
         if pos_embed_seq_len is not None:
@@ -256,8 +256,9 @@ class WanBlock(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
+        # LayerNorm weights in fp32 (matches internal float32 normalization; avoids bf16/fp32 mismatch).
         self.norm1 = LayerNorm(
-            hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=False, has_bias=False
+            hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
         # Self-attention with fused QKV
@@ -285,10 +286,10 @@ class WanBlock(nn.Module):
         )
 
         self.norm2 = LayerNorm(
-            hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True, has_bias=True
+            hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=True, has_bias=True
         )
         self.norm3 = LayerNorm(
-            hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=False, has_bias=False
+            hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
         self.ffn = MLP(
@@ -521,8 +522,13 @@ class WanTransformer3DModel(nn.Module):
 
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, max_seq_len=1024)
 
+        # LayerNorm weights in fp32 (matches internal float32 normalization; avoids bf16/fp32 mismatch).
         self.norm_out = LayerNorm(
-            hidden_size=hidden_size, eps=1e-6, dtype=dtype, has_weights=False, has_bias=False
+            hidden_size=hidden_size,
+            eps=1e-6,
+            dtype=torch.float32,
+            has_weights=False,
+            has_bias=False,
         )
 
         self.proj_out = Linear(
