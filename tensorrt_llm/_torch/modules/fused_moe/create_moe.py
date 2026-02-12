@@ -1,8 +1,8 @@
-import os
 from typing import Dict, Optional, Type
 
 import torch
 
+from tensorrt_llm import envs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -346,8 +346,7 @@ def create_moe(
 
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
-    enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
-                                             "1") == "1"
+    enable_configurable_moe = envs.get_env("ENABLE_CONFIGURABLE_MOE")
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                        CutlassFusedMoE):

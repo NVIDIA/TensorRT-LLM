@@ -1,4 +1,3 @@
-import os
 from typing import Dict, Optional
 
 import torch
@@ -7,6 +6,7 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from transformers import GptOssConfig
 
+from tensorrt_llm import envs
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
@@ -193,7 +193,7 @@ class MLPBlock(torch.nn.Module):
         self.experts = create_moe(**moe_params)
 
         # Perfect router caching - precompute common logits if enabled
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
+        if envs.get_env('ENABLE_PERFECT_ROUTER'):
             precompute_common_perfect_router_logits(
                 num_experts=pretrained_config.num_local_experts,
                 experts_per_token=pretrained_config.num_experts_per_tok,
@@ -260,7 +260,7 @@ class MLPBlock(torch.nn.Module):
 
         g = self.compute_gate_output(t, lora_params=lora_params)
         # Use ideal load balanced logits if enabled, otherwise use gate output
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
+        if envs.get_env('ENABLE_PERFECT_ROUTER'):
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
             # Only use this for testing load balancing strategies, not for actual inference
             num_tokens, num_experts = g.shape
@@ -296,7 +296,7 @@ class MLPBlock(torch.nn.Module):
 
         g = self.compute_gate_output(t, lora_params=lora_params)
         # Use ideal load balanced logits if enabled, otherwise use gate output
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
+        if envs.get_env('ENABLE_PERFECT_ROUTER'):
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
             # Only use this for testing load balancing strategies, not for actual inference
             # The gate is still computed to maintain realistic performance measurement

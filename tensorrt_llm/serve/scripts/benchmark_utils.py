@@ -5,11 +5,12 @@
 import argparse
 import json
 import math
-import os
 from typing import Any, Optional
 
 import requests
 from tqdm.asyncio import tqdm
+
+from tensorrt_llm import envs
 
 
 def convert_to_pytorch_benchmark_format(args: argparse.Namespace,
@@ -21,7 +22,7 @@ def convert_to_pytorch_benchmark_format(args: argparse.Namespace,
     https://github.com/pytorch/pytorch/wiki/How-to-integrate-with-PyTorch-OSS-benchmark-database
     """
     records = []
-    if not os.environ.get("SAVE_TO_PYTORCH_BENCHMARK_FORMAT", False):
+    if not envs.get_env("SAVE_TO_PYTORCH_BENCHMARK_FORMAT"):
         return records
 
     for name, benchmark_values in metrics.items():

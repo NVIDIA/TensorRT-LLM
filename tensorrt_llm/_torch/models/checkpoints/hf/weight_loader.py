@@ -9,6 +9,7 @@ import safetensors
 import torch
 import tqdm
 
+from tensorrt_llm import envs
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.modeling_utils import (
@@ -43,7 +44,7 @@ class HfWeightLoader(BaseWeightLoader):
             prefetch_size = sum(os.path.getsize(file) for file in weight_files)
             # If the layer number is overridden, it indicates that only a subset of layers are loaded.
             # Prefetching all layers is unnecessary.
-            num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
+            num_layers = envs.get_env("TLLM_OVERRIDE_LAYER_NUM")
             enable_prefetch = prefetch_size < psutil.virtual_memory(
             ).available * 0.9 and num_layers == 0
             if enable_prefetch:

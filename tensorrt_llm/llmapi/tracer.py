@@ -1,9 +1,9 @@
 __all__ = ["enable_llm_tracer", "VizTracer", "log_sparse", "get_tracer"]
 
-import os
 from functools import wraps
 from typing import Callable, Optional
 
+from tensorrt_llm import envs
 from tensorrt_llm.logger import logger
 
 _enable_llm_tracer_ = None
@@ -14,7 +14,7 @@ def enable_llm_tracer() -> bool:
     global _enable_llm_tracer_
     if _enable_llm_tracer_ is not None:
         return _enable_llm_tracer_
-    _enable_llm_tracer_ = os.environ.get("TLLM_LLM_ENABLE_TRACER", "0") == "1"
+    _enable_llm_tracer_ = envs.get_env("TLLM_LLM_ENABLE_TRACER")
     return _enable_llm_tracer_
 
 

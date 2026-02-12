@@ -1,10 +1,10 @@
-import os
 from typing import Dict, List, Optional, Type
 
 import torch
 from torch import nn
 from transformers import Qwen3MoeConfig
 
+from tensorrt_llm import envs
 from tensorrt_llm._ipc_utils import can_access_peer
 
 from ..attention_backend import AttentionMetadata
@@ -200,8 +200,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.is_p2p_supported = can_access_peer(model_config.mapping)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not envs.get_env(
+            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED")
         self.enable_fusion &= not self.enable_attention_dp
 
         has_tp = self.mapping.has_tp()

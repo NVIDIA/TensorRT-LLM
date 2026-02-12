@@ -1,7 +1,6 @@
 import contextlib
 import functools
 import itertools
-import os
 import unittest.mock
 import weakref
 from enum import IntEnum
@@ -11,6 +10,7 @@ import torch
 
 import tensorrt_llm._torch.model_config
 import tensorrt_llm.bindings
+from tensorrt_llm import envs
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -97,7 +97,7 @@ def get_balanced_selection_impl_random(
 
 
 def get_balanced_selection_no_cache(*args, **kwargs):
-    if os.environ.get("TRTLLM_LAYERWISE_BENCHMARK_BALANCED_IMPL", "DEFAULT") == "RANDOM":
+    if envs.get_env("TRTLLM_LAYERWISE_BENCHMARK_BALANCED_IMPL") == "RANDOM":
         return get_balanced_selection_impl_random(*args, **kwargs)
     else:
         return get_balanced_selection_impl_default(*args, **kwargs)

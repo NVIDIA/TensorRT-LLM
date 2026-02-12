@@ -27,7 +27,6 @@
 
 import copy
 import math
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -38,6 +37,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm import envs
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
@@ -1002,7 +1002,7 @@ class Deepseekv3MoE(nn.Module):
         self.dtype = dtype
 
         # Perfect router caching - precompute common logits if enabled.
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
+        if envs.get_env('ENABLE_PERFECT_ROUTER'):
             precompute_common_perfect_router_logits(
                 num_experts=num_experts,
                 experts_per_token=top_k,
@@ -1086,7 +1086,7 @@ class Deepseekv3MoE(nn.Module):
         router_logits = self.gate(hidden_states)
 
         # Use ideal load balanced logits if enabled, otherwise use gate output.
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
+        if envs.get_env('ENABLE_PERFECT_ROUTER'):
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing.
             # Only use this for testing load balancing strategies, not for actual inference.
             # The gate is still computed to maintain realistic performance measurement.
@@ -1219,8 +1219,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not envs.get_env(
+            "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED")
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode

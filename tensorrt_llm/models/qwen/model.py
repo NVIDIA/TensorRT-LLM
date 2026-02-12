@@ -14,11 +14,12 @@
 # limitations under the License.
 
 import copy
-import os
 from typing import Optional, Union
 
 import torch
 from tqdm import tqdm
+
+from tensorrt_llm import envs
 
 from ..._utils import pad_vocab_size
 from ...functional import LayerNormType, Tensor, recv, send
@@ -327,7 +328,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                               quant_config=quant_config,
                                               **kwargs)
 
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             arg_dict = {"use_autoawq": True} if use_autoawq else {}
             custom_dict = {}
 

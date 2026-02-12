@@ -1,11 +1,11 @@
 # Adapted from
 # https://github.com/deepseek-ai/DeepEP/blob/aae9fa9a6dd0fec2a723fbb85ec4b22460fab670/README.md
-import os
 import weakref
 from typing import List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm import envs
 from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.mapping import Mapping
 
@@ -120,8 +120,8 @@ class VariableLengthLowLatencyBuffer:
         num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
             num_max_dispatch_tokens_per_rank, hidden_size, world_size,
             num_experts)
-        allow_nvlink_for_low_latency_mode = (os.environ.get(
-            "TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE", "0") == "0")
+        allow_nvlink_for_low_latency_mode = not envs.get_env(
+            "TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE")
 
         assert self.num_experts is None or self.num_experts == num_experts
         # Allocate a buffer if not existed or not enough buffer size

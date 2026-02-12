@@ -1,6 +1,5 @@
 import contextlib
 import json
-import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +10,7 @@ import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
-from tensorrt_llm import logger
+from tensorrt_llm import envs, logger
 from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
                                                          load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
@@ -473,7 +472,7 @@ class ModelConfig(Generic[TConfig]):
 
     @staticmethod
     def override_quant_algo():
-        new_algo = os.environ.get("OVERRIDE_QUANT_ALGO", None)
+        new_algo = envs.get_env("OVERRIDE_QUANT_ALGO")
         supported_algos = {
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,

@@ -1,5 +1,4 @@
 import contextlib
-import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -8,6 +7,7 @@ from typing import Dict, List
 import torch
 from torch.nn import functional as F
 
+from tensorrt_llm import envs
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  torch_dtype_to_str)
 from tensorrt_llm.mapping import Mapping
@@ -358,11 +358,10 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     lm_head_tp_size_raw = 256 // token_count
     # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
     lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
-    lm_head_tp_size = int(
-        os.getenv(
-            'LM_HEAD_TP_SIZE',
-            nearest_in_buckets(lm_head_tp_size_raw,
-                               [1, lm_head_tp_size_upper_bound])))
+    lm_head_tp_size = envs.get_env("LM_HEAD_TP_SIZE")
+    if lm_head_tp_size is None:
+        lm_head_tp_size = nearest_in_buckets(lm_head_tp_size_raw,
+                                             [1, lm_head_tp_size_upper_bound])
     assert mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 

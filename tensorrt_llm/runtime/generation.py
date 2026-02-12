@@ -15,7 +15,6 @@
 
 import copy
 import math
-import os
 import platform
 from collections import Counter
 from dataclasses import dataclass, field
@@ -24,6 +23,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Union
 
 import numpy as np
+
+from tensorrt_llm import envs
 
 # isort: off
 import torch
@@ -56,7 +57,7 @@ from .session import _scoped_stream
 
 # When variable is set, this will disable torch.cuda.set_device(...) calls
 # Useful in situations where device is already assigned by another library, i.e., megatron.
-DISABLE_TORCH_DEVICE_SET = os.environ.get("DISABLE_TORCH_DEVICE_SET", False)
+DISABLE_TORCH_DEVICE_SET = envs.get_env("DISABLE_TORCH_DEVICE_SET")
 
 
 def decode_words_list(word_dict: List[List[str]],

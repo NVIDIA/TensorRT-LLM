@@ -1,7 +1,6 @@
 import dataclasses
 import datetime
 import functools
-import os
 import threading
 import time
 import traceback
@@ -12,6 +11,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm import envs
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
@@ -86,7 +86,7 @@ class PPCommTag(IntEnum):
 
 @functools.cache
 def _load_iteration_indexes(env_var: str):
-    spans = os.environ.get(env_var, None)
+    spans = envs.get_env(env_var)
     starts, stops = [], []
 
     if spans:
@@ -381,8 +381,8 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
-        self.benchmark_req_queues_size = int(
-            os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
+        self.benchmark_req_queues_size = envs.get_env(
+            "TLLM_BENCHMARK_REQ_QUEUES_SIZE")
 
         # list of requests in each PP micro batch
         self.num_micro_batches = max(self.dist.pp_size,
@@ -394,10 +394,10 @@ class PyExecutor:
         self.send_schedule_handles = [None] * self.num_micro_batches
         self.send_expected_batch_num_handles = [None] * self.num_micro_batches
         self.unhandled_batch_counter = 0
-        self.pp_scheduler_max_retry_count = int(
-            os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
-        self.pp_multi_stream_sample = os.environ.get(
-            "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
+        self.pp_scheduler_max_retry_count = envs.get_env(
+            "TLLM_PP_SCHEDULER_MAX_RETRY_COUNT")
+        self.pp_multi_stream_sample = envs.get_env(
+            "TRTLLM_PP_MULTI_STREAM_SAMPLE")
         self.sample_stream = torch.cuda.Stream()
         self.finish_sample_event = torch.cuda.Event()
         if (self.dist.pp_size > 1 and self.pp_multi_stream_sample
@@ -501,8 +501,8 @@ class PyExecutor:
             # If false, the executor loop can only broadcast and handle each sample state in a pre-defined iteration.
             # It is only for debugging purposes.
             # Some tests can disable it to get a deterministic behavior.
-            self.pp_async_broadcast_sample_state = os.environ.get(
-                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "1") == "1"
+            self.pp_async_broadcast_sample_state = envs.get_env(
+                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE")
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
@@ -785,9 +785,8 @@ class PyExecutor:
         end_event_2 = torch.cuda.Event(enable_timing=True)
         prev_device_step_time = None
 
-        torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
-        profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
-                                            None)
+        torch_trace_path = envs.get_env(PROFILE_TRACE_ENV_VAR_NAME)
+        profile_start_stop = envs.get_env(PROFILE_START_STOP_ENV_VAR_NAME)
         enable_torch_trace = bool(torch_trace_path and profile_start_stop)
         if torch_trace_path and profile_start_stop is None:
             logger.warning(
@@ -2685,12 +2684,12 @@ class PyExecutor:
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
         # For gen-only benchmarking, mark new gen request as transmission complete right away
-        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+        if envs.get_env("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"):
             for req in new_gen_reqs:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
-        if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
+        if envs.get_env("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"):
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
         else:

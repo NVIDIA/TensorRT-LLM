@@ -12,6 +12,7 @@ from ray.util.placement_group import (PlacementGroupSchedulingStrategy,
                                       get_current_placement_group,
                                       placement_group)
 
+from tensorrt_llm import envs
 from tensorrt_llm._ray_utils import unwrap_ray_errors
 from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.logger import logger
@@ -59,7 +60,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         }
 
         try:
-            if os.environ.get("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0") != "1":
+            if not envs.get_env("TLLM_RAY_FORCE_LOCAL_CLUSTER"):
                 try:
                     ray.init(address="auto", **ray_init_args)
                     logger.info(f"Attached to an existing Ray cluster.")
@@ -114,7 +115,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
-        num_gpus = float(os.getenv("TRTLLM_RAY_PER_WORKER_GPUS", "1.0"))
+        num_gpus = envs.get_env("TRTLLM_RAY_PER_WORKER_GPUS")
         if placement_config and placement_config.per_worker_gpu_share is not None:
             num_gpus = placement_config.per_worker_gpu_share
 
@@ -451,7 +452,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         if placement_config and placement_config.placement_groups is not None:
             return _get_from_placement_config(placement_config)
         # path 1
-        if bundle_indices := os.getenv("TRTLLM_RAY_BUNDLE_INDICES", None):
+        if bundle_indices := envs.get_env("TRTLLM_RAY_BUNDLE_INDICES"):
             return _get_from_env(bundle_indices)
         # path 2
         return _get_default(tp_size)

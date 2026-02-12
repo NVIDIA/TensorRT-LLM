@@ -1,6 +1,5 @@
 import asyncio
 import concurrent.futures
-import os
 import sys
 import threading
 import traceback
@@ -10,6 +9,7 @@ from typing import Any, Callable, List, NamedTuple, Optional
 
 from strenum import StrEnum
 
+from tensorrt_llm import envs
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
@@ -31,18 +31,18 @@ class LlmLauncherEnvs(StrEnum):
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     ''' Get the IPC address for the spawn proxy process dynamically. '''
-    return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
+    return envs.get_env(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
 
 
 def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
     ''' Get the HMAC key for the spawn proxy process dynamically. '''
-    if key := os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"):
+    if key := envs.get_env("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"):
         return bytes.fromhex(key)
 
 
 def get_spawn_proxy_process_env() -> bool:
     ''' Get the environment variable for the spawn proxy process dynamically. '''
-    return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS) == "1"
+    return envs.get_env(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS)
 
 
 def create_mpi_comm_session(

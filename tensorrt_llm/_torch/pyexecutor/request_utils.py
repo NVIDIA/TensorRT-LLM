@@ -1,7 +1,6 @@
 """Utility functions for request processing."""
 
 import heapq
-import os
 from collections import namedtuple
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -10,6 +9,7 @@ if TYPE_CHECKING:
 
 import torch
 
+from tensorrt_llm import envs
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.mapping import CpType
 
@@ -694,7 +694,7 @@ class RequestBroadcaster:
         # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
         pp_send_func = (
             self.dist.isend_object
-            if os.environ.get("TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1"
+            if envs.get_env(envs.TRTLLM_PP_REQ_SEND_ASYNC)
             else self.dist.send_object
         )
 

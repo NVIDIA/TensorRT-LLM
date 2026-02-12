@@ -18,6 +18,8 @@ from typing import Optional
 
 import safetensors
 
+from tensorrt_llm import envs
+
 from ..._utils import numpy_to_torch
 from ...functional import ACT2FN, Tensor, concat, shape, slice
 from ...layers import Linear
@@ -103,7 +105,7 @@ class LlavaNextVisionWrapper(PretrainedModel):
                           **kwargs):
         ''' Create a LlavaNextVisionWrapper object from give parameters
         '''
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is not None:
+        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is not None:
             logger.error(
                 "Please enable unified converter to convert llava-next checkpoints."
             )

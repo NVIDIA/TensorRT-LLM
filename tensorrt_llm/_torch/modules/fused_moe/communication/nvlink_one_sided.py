@@ -24,11 +24,11 @@ This module implements the NVLINK one-sided comm AllToAll throughput communicati
 NVLINK One-Sided supports post-quant dispatch.
 """
 
-import os
 from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm import envs
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
@@ -199,9 +199,9 @@ class NVLinkOneSided(Communication):
                 dtype,
                 eplb_stats_num_experts=self.eplb_stats_num_experts,
             )
-        workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
+        workspace_mb_env = envs.get_env("TRTLLM_MOE_A2A_WORKSPACE_MB")
         if workspace_mb_env:
-            self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
+            self.workspace_size_per_rank = workspace_mb_env * 1024 * 1024
             msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env})."
             if auto_workspace_size is not None:
                 msg += f"Automatically calculated workspace size is {auto_workspace_size} bytes."

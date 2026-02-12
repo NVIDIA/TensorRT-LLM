@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import enum
 import math
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -13,6 +12,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm import envs
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -751,7 +751,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         self.rescale_fused_weights(module)
 
         # Handle kv_scales for NVFP4 KV cache
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
+        if envs.get_env("TRTLLM_LOAD_KV_SCALES"):
             k_scales = getattr(module, "tmp_k_scales", [])
             v_scales = getattr(module, "tmp_v_scales", [])
             if k_scales:
@@ -1360,7 +1360,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Load k and v scales, used for NVFP4 KV cache
         k_scale, v_scale = self.load_kv_scales(weights)
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
+        if envs.get_env("TRTLLM_LOAD_KV_SCALES"):
             if len(k_scale) != 0:
                 assert len(v_scale) != 0
                 copy_weight(
@@ -2430,8 +2430,8 @@ class Linear(nn.Module):
         )
 
         device_supported = get_sm_version() >= 100
-        enable_gemm_allreduce_fusion_env = (os.environ.get(
-            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
+        enable_gemm_allreduce_fusion_env = (
+            envs.get_env("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED"))
 
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,

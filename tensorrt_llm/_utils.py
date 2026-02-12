@@ -45,6 +45,7 @@ import torch
 import tensorrt as trt
 # isort: on
 
+from tensorrt_llm import envs
 from tensorrt_llm.bindings import DataType, GptJsonConfig, LayerType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
@@ -551,7 +552,7 @@ def torch_comm():
 
 def mpi_disabled() -> bool:
     """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
-    return os.environ.get("TLLM_DISABLE_MPI") == "1"
+    return envs.get_env("TLLM_DISABLE_MPI")
 
 
 def mpi_rank():
@@ -788,7 +789,7 @@ def print_all_stacks():
 
 
 def is_trace_enabled(env_var: str):
-    value = os.environ.get(env_var, "-1")
+    value = envs.get_env(env_var, "-1")
     if value == "ALL":
         return True
     if value == "-1":
@@ -956,8 +957,8 @@ def nvtx_range_debug(msg: str,
         contextmanager: A context manager that either marks the NVTX range if enabled,
                         or a null context manager that does nothing if disabled.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if envs.get_env("TLLM_LLMAPI_ENABLE_NVTX") or envs.get_env(
+            "TLLM_NVTX_DEBUG"):
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
         return _null_context_manager()
@@ -970,8 +971,8 @@ def nvtx_mark_debug(msg: str,
     """
     Creates an NVTX marker for debugging purposes.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if envs.get_env("TLLM_LLMAPI_ENABLE_NVTX") or envs.get_env(
+            "TLLM_NVTX_DEBUG"):
         nvtx_mark(msg, color=color, domain=domain, category=category)
 
 
@@ -1375,7 +1376,7 @@ def _setup_gc_nvtx_profiling() -> Optional[_GCNvtxHandle]:
     if _gc_watcher_handle is not None:
         return _gc_watcher_handle
 
-    enabled = os.environ.get(PROFILE_RECORD_GC_ENV_VAR_NAME, None)
+    enabled = envs.get_env(PROFILE_RECORD_GC_ENV_VAR_NAME)
     if not enabled:
         return None
 

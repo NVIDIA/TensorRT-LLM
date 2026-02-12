@@ -1,9 +1,8 @@
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional
 
-from tensorrt_llm import logger
+from tensorrt_llm import envs, logger
 
 
 # We deliberately use a non-enum data structure here. This choice ensures that
@@ -84,13 +83,15 @@ class BaseTransferAgent(ABC):
 
 
 def _force_py_nixl_kv_transfer() -> bool:
-    env_value = os.getenv("TRTLLM_USE_PY_NIXL_KVCACHE", "0")
-    if env_value not in {"0", "1"}:
+    try:
+        env_value = envs.get_env("TRTLLM_USE_PY_NIXL_KVCACHE")
+    except ValueError:
         logger.warning(
-            f"Invalid value for TRTLLM_USE_PY_NIXL_KVCACHE: {env_value}. Expected '0' or '1'. Defaulting to '0'."
+            "Invalid value for TRTLLM_USE_PY_NIXL_KVCACHE. "
+            "Expected one of 1/0/true/false/on/off. Defaulting to 0."
         )
         return False
-    if env_value == "1":
+    if env_value:
         logger.info("Forcing use of pure Python NIXL KV Transfer Agent implementation.")
         return True
     return False

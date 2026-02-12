@@ -15,7 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Dict, List, Optional
 
 import torch
@@ -25,6 +24,7 @@ import triton.language as tl
 from torch import nn
 from transformers import Qwen3NextConfig
 
+from tensorrt_llm import envs
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
@@ -877,8 +877,8 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
 
         self.fusion_config = EagerFusionConfig()
         ### TODO: enable eager_fusion by default
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "1") == "0"
+        self.enable_fusion = not envs.get_env(
+            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "1")
         self.enable_fusion &= not self.enable_attention_dp
 
         # has_tp = self.mapping.has_tp()
@@ -1036,8 +1036,8 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not envs.get_env(
+            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED")
         self.enable_fusion &= not self.enable_attention_dp
 
         # has_tp = self.mapping.has_tp()

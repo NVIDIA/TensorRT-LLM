@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import psutil
 import torch
 
+from tensorrt_llm import envs
 from tensorrt_llm.logger import logger
 
 from .._torch.pyexecutor.llm_request import LlmResponse
@@ -142,7 +143,7 @@ class BaseWorker(GenerationExecutor):
         all_cpus = list(range(psutil.cpu_count()))
 
         constrained_affinity = (cpu_affinity != all_cpus)
-        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+        numa_aware_affinity = envs.get_env("TLLM_NUMA_AWARE_WORKER_AFFINITY")
 
         # If affinity is constrained but the user hasn't explicitly
         # requested NUMA-aware affinity, remove the constraints.

@@ -1,4 +1,3 @@
-import os
 from abc import ABC, abstractmethod
 
 import llguidance
@@ -6,6 +5,7 @@ import llguidance.torch
 import torch
 import xgrammar
 
+from tensorrt_llm import envs
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
 from ...bindings.executor import GuidedDecodingParams
@@ -82,7 +82,7 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
             add_prefix_space=add_prefix_space)
 
         # Default cache limit is 1GB.
-        cache_limit_gb = float(os.getenv("XGRAMMAR_CACHE_LIMIT_GB", "1"))
+        cache_limit_gb = envs.get_env("XGRAMMAR_CACHE_LIMIT_GB")
         cache_limit_bytes = int(cache_limit_gb * 1024 * 1024 * 1024)
         self._xgrammar_compiler = xgrammar.GrammarCompiler(
             tokenizer_info,

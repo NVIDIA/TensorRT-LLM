@@ -12,6 +12,7 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
+from tensorrt_llm import envs
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_mark, nvtx_range_debug
@@ -71,8 +72,7 @@ class ZeroMqQueue:
 
         # Thread safety debugging
         self._zmq_thread_id = None
-        self._zmq_debug_enabled = os.environ.get('TLLM_LLMAPI_ZMQ_DEBUG',
-                                                 '0') != '0'
+        self._zmq_debug_enabled = envs.get_env('TLLM_LLMAPI_ZMQ_DEBUG')
 
         # Check HMAC key condition
         if self.use_hmac_encryption and not self.is_server and self.hmac_key is None:

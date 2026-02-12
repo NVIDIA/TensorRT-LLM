@@ -1,7 +1,6 @@
 import ctypes
 import gc
 import mmap
-import os
 import threading
 from contextlib import nullcontext
 from multiprocessing import resource_tracker, shared_memory
@@ -13,6 +12,7 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.runtime as _tbr
+from tensorrt_llm import envs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -867,8 +867,8 @@ class MoeLoadBalancer:
                                                        layer_updates_per_iter)
         self._previous_balancer = None
         self.single_layer_load_balancers = []
-        self.shared_memory_base_name = shared_memory_base_name or os.getenv(
-            'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
+        self.shared_memory_base_name = shared_memory_base_name or envs.get_env(
+            'TRTLLM_EPLB_SHM_NAME')
         self._setup_mpi_comm()
         self.is_shutdown = False
 

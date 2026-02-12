@@ -5,6 +5,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm import envs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
@@ -970,7 +971,7 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
+    use_python_scheduler = envs.get_env("TLLM_USE_PYTHON_SCHEDULER")
     if use_python_scheduler and not isinstance(kv_cache_manager,
                                                KVCacheManagerV2):
         scheduler = SimpleUnifiedScheduler(

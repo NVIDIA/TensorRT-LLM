@@ -30,6 +30,8 @@ import tensorrt as trt
 
 # isort: on
 
+from tensorrt_llm import envs
+
 if TYPE_CHECKING:
     from .network import Network
 else:
@@ -54,7 +56,7 @@ def _init(log_level: object = None) -> None:
     if log_level is not None:
         logger.set_level(log_level)
 
-    if os.getenv("TRT_LLM_NO_LIB_INIT", "0") == "1":
+    if envs.get_env("TRT_LLM_NO_LIB_INIT"):
         logger.info("Skipping TensorRT LLM init.")
         return
 
@@ -91,7 +93,7 @@ def _init(log_level: object = None) -> None:
             logger.error(f"Printing stacks {counter} times")
             print_all_stacks()
 
-    print_stacks_period = int(os.getenv("TRTLLM_PRINT_STACKS_PERIOD", "-1"))
+    print_stacks_period = envs.get_env("TRTLLM_PRINT_STACKS_PERIOD")
     if print_stacks_period > 0:
         print_stacks_thread = threading.Thread(target=_print_stacks, daemon=True)
         print_stacks_thread.start()

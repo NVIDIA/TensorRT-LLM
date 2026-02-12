@@ -1,10 +1,11 @@
-import os
 import shutil
 from pathlib import Path
 from typing import TextIO
 
 import torch.nn as nn
 from torch.fx import GraphModule
+
+from tensorrt_llm import envs
 
 from ....logger import Singleton
 from .logger import ADLogger
@@ -95,7 +96,7 @@ class GraphWriter(metaclass=Singleton):
     DUMP_GRAPHS_ENV = "AD_DUMP_GRAPHS_DIR"
 
     def __init__(self):
-        self._dump_dir = os.environ.get(self.DUMP_GRAPHS_ENV)
+        self._dump_dir = envs.get_env(self.DUMP_GRAPHS_ENV)
         self._logger = ADLogger()
         self._transform_counter = 0
         self._dump_dir_initialized = False

@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -29,6 +28,8 @@ from triton_kernels.numerics import InFlexData
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
+
+from tensorrt_llm import envs
 
 from ...model_config import ModelConfig
 from ..linear import TensorParallelMode, load_weight_shard
@@ -641,7 +642,7 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[2] == w_scale_shape[2]
     w = maybe_update_stride(w)
     #num_warps = 4 if batch <= 512 else 8
-    num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
+    num_warps = envs.get_env("TRITON_MOE_MXFP4_NUM_WARPS")
     assert num_warps in [4, 8], \
         f"TRITON_MOE_MXFP4_NUM_WARPS should be 4 or 8, got {num_warps}"
     value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(

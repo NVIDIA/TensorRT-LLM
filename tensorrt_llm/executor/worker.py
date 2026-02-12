@@ -9,6 +9,7 @@ from typing import List, Optional, Union
 
 import zmq
 
+from tensorrt_llm import envs
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
@@ -163,8 +164,7 @@ def worker_main(
             logger.error(f"Printing stacks {counter} times")
             print_all_stacks()
 
-    print_stacks_period = int(
-        os.getenv("TRTLLM_WORKER_PRINT_STACKS_PERIOD", "-1"))
+    print_stacks_period = envs.get_env("TRTLLM_WORKER_PRINT_STACKS_PERIOD")
     if print_stacks_period > 0:
         print_stacks_thread = threading.Thread(target=_print_stacks,
                                                daemon=True)
@@ -301,7 +301,7 @@ def worker_main(
         return
 
     # Optionally disable GC (default: not disabled)
-    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
+    if envs.get_env("TRTLLM_WORKER_DISABLE_GC"):
         gc.disable()
 
     with worker:

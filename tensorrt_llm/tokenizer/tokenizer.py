@@ -1,17 +1,16 @@
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 
+from tensorrt_llm import envs
 from .._utils import nvtx_range_debug
 from ..logger import logger
 
-TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
-    "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
-TLLM_STREAM_INTERVAL_THRESHOLD = int(
-    os.environ.get("TLLM_STREAM_INTERVAL_THRESHOLD", "24"))
+TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = envs.get_env(
+    "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND")
+TLLM_STREAM_INTERVAL_THRESHOLD = envs.get_env("TLLM_STREAM_INTERVAL_THRESHOLD")
 try:
     from tokenizers.decoders import DecodeStream  # noqa
 except ImportError:

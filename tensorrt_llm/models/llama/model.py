@@ -12,10 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 from typing import Optional, Union
 
 import transformers
+
+from tensorrt_llm import envs
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
@@ -438,9 +439,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
         quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)
         use_autoawq = kwargs.pop('use_autoawq', None)
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER"
-                          ) is not None and not isinstance(
-                              hf_model_or_dir, transformers.PreTrainedModel):
+        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER"
+                        ) is not None and not isinstance(
+                            hf_model_or_dir, transformers.PreTrainedModel):
             if "vila" in hf_model_or_dir or "llava" in hf_model_or_dir:
                 hf_model_or_dir = load_hf_llama(hf_model_or_dir,
                                                 load_model_on_cpu)
@@ -468,7 +469,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                **kwargs)
         if config.remove_duplicated_kv_heads:
             config.num_key_value_heads = config.num_key_value_heads // 2
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {}
             model_name = hf_model.config.model_type if use_preloading else hf_model_or_dir
             if "llava" in model_name:

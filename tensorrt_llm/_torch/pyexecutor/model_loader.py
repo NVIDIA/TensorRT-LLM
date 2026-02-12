@@ -1,11 +1,11 @@
 import copy
 import inspect
-import os
 import traceback
 from typing import Callable, Optional, Tuple
 
 import torch
 
+from tensorrt_llm import envs
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
@@ -388,8 +388,7 @@ class ModelLoader:
 
         # Allow overriding the number of layers via environment variable
         # Note: This is kept for backward compatibility, but model_kwargs is preferred
-        num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",
-                                                 "0"))
+        num_layers_override = envs.get_env("TLLM_OVERRIDE_LAYER_NUM")
         if num_layers_override > 0:
             logger.warning(
                 f"TLLM_OVERRIDE_LAYER_NUM is deprecated. Use model_kwargs instead: "

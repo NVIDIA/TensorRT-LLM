@@ -1,6 +1,5 @@
 import asyncio
 import inspect
-import os
 import threading
 import time
 import traceback
@@ -8,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 import zmq
+
+from tensorrt_llm import envs
 
 from ...llmapi.utils import logger_debug
 from ...logger import logger
@@ -98,7 +99,7 @@ class RPCServer:
         self._address = address
 
         # Check if PAIR mode is enabled via environment variable
-        use_pair_mode = os.environ.get('TLLM_LLMAPI_ZMQ_PAIR', '0') != '0'
+        use_pair_mode = envs.get_env('TLLM_LLMAPI_ZMQ_PAIR')
         socket_type = zmq.PAIR if use_pair_mode else zmq.ROUTER
 
         if use_pair_mode:

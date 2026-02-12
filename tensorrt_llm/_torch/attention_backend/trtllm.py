@@ -1,10 +1,11 @@
 import math
-import os
 import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+
+from tensorrt_llm import envs
 
 if TYPE_CHECKING:
     from ..speculative.utils import SpecDecodingTensor
@@ -29,8 +30,8 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
 from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable.
-_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
+_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = envs.get_env(
+    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION")
 
 
 @dataclass(kw_only=True, init=False)
@@ -164,8 +165,8 @@ class TrtllmAttentionWrapper:
                                              dtype=torch.uint32,
                                              device='cuda')
         # Default disabled, but allow manual enabling through `TRTLLM_PRINT_SKIP_SOFTMAX_STAT=1`
-        self.print_skip_softmax_stat = os.environ.get(
-            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
+        self.print_skip_softmax_stat = envs.get_env(
+            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT")
 
     def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
         quant_config = quant_config or QuantConfig()
@@ -1710,8 +1711,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return False
 
         # Default enabled, but allow manual disabling through `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0`
-        if not os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT",
-                              "1") == "1":
+        if not envs.get_env("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT"):
             return False
 
         use_paged_context_fmha = (

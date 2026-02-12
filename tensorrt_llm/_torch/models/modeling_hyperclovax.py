@@ -1,6 +1,5 @@
 import copy
 import math
-import os
 from functools import partial
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -13,6 +12,7 @@ from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
 from transformers.models.auto import CONFIG_MAPPING
 
+from tensorrt_llm import envs
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -30,7 +30,7 @@ from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import register_auto_model
 
-DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
+DISAGG = envs.get_env('TLLM_MULTIMODAL_DISAGGREGATED')
 
 
 def select_best_resolution(original_size: tuple,

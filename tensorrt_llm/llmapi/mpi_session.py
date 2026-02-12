@@ -12,6 +12,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
 
+from tensorrt_llm import envs
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -560,7 +561,7 @@ def get_mpi_world_size() -> int:
 
     # If the proxy process is spawned, the MPI-related env will be cleaned in the proxy process, thus we made another env for the mpi_world_size
     if get_spawn_proxy_process_env():
-        return int(os.getenv("tllm_mpi_size") or 1)
+        return envs.get_env("tllm_mpi_size")
     else:
         return mpi_world_size()
 

@@ -1,7 +1,6 @@
 import copy
 import enum
 import math
-import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
@@ -13,6 +12,7 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm import envs
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
@@ -1333,10 +1333,10 @@ class KVCacheManager(BaseResourceManager):
         logger.info(
             f"Secondary pool memory bytes: {self._secondary_pool_memory_bytes}")
 
-        if os.getenv("TRTLLM_WINDOW_SIZE_SHARES") is not None:
+        if envs.get_env("TRTLLM_WINDOW_SIZE_SHARES") is not None:
             logger.info("Environment variable TRTLLM_WINDOW_SIZE_SHARES is set")
-            window_size_shares = os.getenv("TRTLLM_WINDOW_SIZE_SHARES").split(
-                ",")
+            window_size_shares = envs.get_env(
+                "TRTLLM_WINDOW_SIZE_SHARES").split(",")
             window_size_shares = [float(share) for share in window_size_shares]
             assert len(window_size_shares) == len(
                 window_size_to_layers

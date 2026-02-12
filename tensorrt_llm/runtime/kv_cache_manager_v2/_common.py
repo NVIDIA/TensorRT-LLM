@@ -14,11 +14,12 @@
 # limitations under the License.
 
 import enum
-import os
 from dataclasses import dataclass
 from typing import Final, NewType
 
-NDEBUG: Final[int] = int(os.environ.get("TLLM_KV_CACHE_MANAGER_V2_DEBUG", "0")) == 0
+from tensorrt_llm import envs
+
+NDEBUG: Final[int] = envs.get_env("TLLM_KV_CACHE_MANAGER_V2_DEBUG")
 
 
 class PageStatus(enum.IntEnum):

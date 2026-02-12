@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm import envs
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
@@ -54,7 +54,7 @@ def use_cpp_mamba_cache_manager() -> bool:
     Returns True if TRTLLM_USE_CPP_MAMBA='1' is set, False otherwise.
     By default, PythonMambaCacheManager is used.
     """
-    return os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    return envs.get_env('TRTLLM_USE_CPP_MAMBA')
 
 
 class CppMambaCacheManager(BaseResourceManager):

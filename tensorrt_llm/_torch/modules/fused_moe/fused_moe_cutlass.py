@@ -1,10 +1,10 @@
 import inspect
-import os
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm import envs
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._utils import get_sm_version
@@ -400,7 +400,7 @@ class CutlassFusedMoE(MoE):
         if not MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.NotEnabled
 
-        all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
+        all2all_method_type = envs.get_env("TRTLLM_FORCE_ALLTOALL_METHOD")
         if all2all_method_type is not None:
             if AlltoallMethodType[all2all_method_type] in [
                     AlltoallMethodType.DeepEP,

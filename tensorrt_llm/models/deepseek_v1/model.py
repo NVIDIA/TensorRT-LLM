@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Optional
+
+from tensorrt_llm import envs
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, non_gated_version, recv, send
@@ -227,7 +228,7 @@ class DeepseekForCausalLM(DecoderModelForCausalLM):
                                                                mapping=mapping,
                                                                **kwargs)
         deepseek = cls.from_config(pretrained_config)
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if envs.get_env("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
 
             custom_dict = {}
 

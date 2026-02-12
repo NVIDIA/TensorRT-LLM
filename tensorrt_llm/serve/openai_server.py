@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import asyncio
-import os
 import re
 import signal
 import socket
@@ -20,6 +19,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
+from tensorrt_llm import envs
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
 # yapf: disable
@@ -121,7 +121,9 @@ class OpenAIServer:
             self.model_config = None
 
         # Enable response storage for Responses API
-        self.enable_store = (len(os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "")) < 1) and not self.postproc_worker_enabled
+        self.enable_store = (
+            len(envs.get_env("TRTLLM_RESPONSES_API_DISABLE_STORE")) < 1
+        ) and not self.postproc_worker_enabled
 
         self.conversation_store = ConversationHistoryStore()
 
@@ -148,7 +150,7 @@ class OpenAIServer:
 
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
-        disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
+        disable_harmony = envs.get_env("DISABLE_HARMONY_ADAPTER")
         if disable_harmony:
             self.use_harmony = False
         else:
@@ -822,7 +824,7 @@ class OpenAIServer:
                 gather_generation_logits=self.llm.args.gather_generation_logits,
                 backend=self.llm.args.backend)
             # TODO: better way to enable metrics
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+            if len(envs.get_env("TRTLLM_KVCACHE_TIME_OUTPUT_PATH")) > 0:
                 sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             for idx, prompt in enumerate(prompts):

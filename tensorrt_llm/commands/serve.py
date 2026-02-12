@@ -16,7 +16,7 @@ from strenum import StrEnum
 from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm import MultimodalEncoder
+from tensorrt_llm import MultimodalEncoder, envs
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
@@ -227,7 +227,7 @@ def launch_server(
                               chat_template=chat_template)
 
         # Optionally disable GC (default: not disabled)
-        if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+        if envs.get_env("TRTLLM_SERVER_DISABLE_GC"):
             gc.disable()
 
         asyncio.run(server(host, port, sockets=[s]))
@@ -867,7 +867,7 @@ def disaggregated(
         #   increment, and observed that `count0` (obtained by `gc.get_count()`)
         #   increases by fewer than 1,000 after every 200,000 requests, while the
         #   maximum value of `count0` exceeded 3,000,000 during the test.
-        if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        if envs.get_env("TRTLLM_DISAGG_SERVER_DISABLE_GC"):
             gc.disable()
 
         asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
@@ -901,8 +901,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
 
     from tensorrt_llm._utils import mpi_rank
-    if os.environ.get(DisaggLauncherEnvs.
-                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
+    if not envs.get_env("TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"):
         set_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to war an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
@@ -913,11 +912,12 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     disagg_cfg = parse_disagg_config_file(config_file)
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
-    if os.environ.get(DisaggLauncherEnvs.
-                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) == "1":
-        instance_idx = os.environ.get(
-            DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
-        server_cfg = disagg_cfg.server_configs[int(instance_idx)]
+    if envs.get_env("TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"):
+        instance_idx = envs.get_env("TLLM_DISAGG_INSTANCE_IDX")
+        assert instance_idx is not None, (
+            f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
+        )
+        server_cfg = disagg_cfg.server_configs[instance_idx]
 
         llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
         llm_args = update_llm_args_with_extra_dict(llm_args,
@@ -966,10 +966,10 @@ class DisaggLauncherEnvs(StrEnum):
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     # Launching the server
-    instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
+    instance_idx = envs.get_env("TLLM_DISAGG_INSTANCE_IDX")
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
     disagg_config = parse_disagg_config_file(disagg_config_file)
-    server_cfg = disagg_config.server_configs[int(instance_idx)]
+    server_cfg = disagg_config.server_configs[instance_idx]
 
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
