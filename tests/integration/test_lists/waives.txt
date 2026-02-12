@@ -1,4 +1,4 @@
-examples/test_openai.py::test_llm_openai_triton_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654) # prevent reuse
+examples/test_openai.py::test_llm_openai_triton_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654)
 examples/test_openai.py::test_llm_openai_triton_plugingen_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654)
 full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
 full:GH200/examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-full_prec] SKIP (arm is not supported)
