@@ -189,7 +189,7 @@ class OpenAIServer:
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        self.media_storage_path = Path(os.getenv("TRTLLM_MEDIA_STORAGE_PATH", "/tmp/trtllm_generated"))
+        self.media_storage_path = Path(os.getenv("TRTLLM_MEDIA_STORAGE_PATH", "/tmp/trtllm_generated"))  # nosec B108
         self.media_storage_path.mkdir(exist_ok=True, parents= True)
         self.video_gen_tasks = {}
 
