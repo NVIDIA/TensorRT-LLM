@@ -9,7 +9,6 @@ to PyExecutor, including:
 - expected_num_active_requests tracking
 """
 
-from collections import deque
 from unittest.mock import Mock
 
 import pytest
@@ -18,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 
 
 class MockPyExecutor:
@@ -35,7 +35,7 @@ class MockPyExecutor:
         self.is_shutdown = False
         self.expected_num_active_requests = 0
         self.new_active_requests_queue_latency_ms = 0.0
-        self.waiting_queue = deque()
+        self.waiting_queue = FCFSWaitingQueue()
 
     def _handle_special_queue_items(self, new_requests):
         """Handle special signals.
@@ -62,13 +62,11 @@ class MockPyExecutor:
     def update_waiting_queue(self):
         """Update waiting queue to remove canceled requests.
 
-        This method mirrors PyExecutor.update_waiting_queue.
+        This method mirrors PyExecutor._handle_canceled_requests.
         """
         if self.canceled_req_ids:
             canceled_set = set(self.canceled_req_ids)
-            self.waiting_queue = deque(
-                item for item in self.waiting_queue if item.id not in canceled_set
-            )
+            self.waiting_queue.remove_by_ids(canceled_set)
 
     def clear_canceled_req_ids(self):
         """Clear the list of canceled request IDs."""

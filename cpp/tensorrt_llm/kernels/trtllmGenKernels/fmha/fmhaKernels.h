@@ -925,12 +925,11 @@ public:
 
     static TllmFmhaKernelFactory& Get()
     {
-        int deviceId;
-        cudaGetDevice(&deviceId);
         static std::unique_ptr<TllmFmhaKernelFactory> sFactory[32] = {nullptr};
+        int const deviceId = tensorrt_llm::common::getDevice();
+        TLLM_CHECK_WITH_INFO(deviceId < 32, "Invalid deviceId %d (must be < 32)", deviceId);
         if (sFactory[deviceId] == nullptr)
         {
-            TLLM_CHECK_WITH_INFO(deviceId < 32, "Invalid deviceId %d", deviceId);
             sFactory[deviceId] = std::make_unique<TllmFmhaKernelFactory>(TllmFmhaKernelFactory());
         }
         return *(sFactory[deviceId]);
