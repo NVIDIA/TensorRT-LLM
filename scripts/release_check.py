@@ -36,20 +36,17 @@ def run_cmd(cmd):
     return result
 
 
-def run_precommit_with_timing(precommit_args):
+def run_precommit_with_timing(cmd):
     """Run pre-commit with timing information for each hook.
 
     Args:
-        precommit_args: Arguments to pass to `pre-commit run`, e.g.
-            "--all-files" for all files, or
-            "--files file1 file2" for specific files.
+        cmd: Command as a list of arguments (passed directly to Popen
+             without shell=True, avoiding ARG_MAX limits).
     """
 
     print("Running pre-commit checks with performance monitoring...")
     print("=" * 80)
-
-    cmd = f"pre-commit run {precommit_args} --show-diff-on-failure --verbose"
-    print(f"Command: {cmd}")
+    print(f"Command: {' '.join(cmd[:10])}{'...' if len(cmd) > 10 else ''}")
 
     # Track hook execution times
     # Since hooks run sequentially, we can estimate each hook's duration
@@ -62,9 +59,8 @@ def run_precommit_with_timing(precommit_args):
     # or "isort....................................................................Failed"
     hook_result_pattern = re.compile(r'^([^\.]+)\.+(\w+)$')
 
-    # Use Popen to capture real-time output
+    # Use Popen with shell=False to pass args directly (no ARG_MAX issue)
     process = sp.Popen(cmd,
-                       shell=True,
                        stdout=sp.PIPE,
                        stderr=sp.STDOUT,
                        text=True,
@@ -185,13 +181,13 @@ def main():
     )
     args = parser.parse_args()
 
-    # Build pre-commit arguments
+    # Build pre-commit command as a list to avoid ARG_MAX limits with many files.
+    base_cmd = ["pre-commit", "run", "--show-diff-on-failure", "--verbose"]
     if args.files_from:
         with open(args.files_from) as f:
             changed_files = [line.strip() for line in f if line.strip()]
         if changed_files:
-            files_arg = " ".join(f'"{f}"' for f in changed_files)
-            precommit_args = f"--files {files_arg}"
+            precommit_cmd = base_cmd + ["--files"] + changed_files
             print(
                 f"=== Running pre-commit on {len(changed_files)} changed file(s) ==="
             )
@@ -203,11 +199,11 @@ def main():
             print("=== No changed files found, skipping pre-commit ===")
             return
     elif args.all_files:
-        precommit_args = "--all-files"
+        precommit_cmd = base_cmd + ["--all-files"]
         print("=== Running pre-commit on ALL files ===")
     else:
         # Default: all files (backward compatible)
-        precommit_args = "--all-files"
+        precommit_cmd = base_cmd + ["--all-files"]
         print("=== No arguments specified, running pre-commit on ALL files ===")
 
     # Install pre-commit and bandit from requirements-dev.txt
@@ -224,7 +220,7 @@ def main():
 
     # Run pre-commit with performance monitoring
     try:
-        run_precommit_with_timing(precommit_args)
+        run_precommit_with_timing(precommit_cmd)
     except SystemExit:
         handle_check_failure("pre-commit checks failed")
 
