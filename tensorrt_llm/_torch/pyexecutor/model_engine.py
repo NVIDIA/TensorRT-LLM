@@ -378,6 +378,20 @@ class PyTorchModelEngine(ModelEngine):
         self.position_ids_cuda = torch.empty((self.max_num_tokens, ),
                                              dtype=torch.int,
                                              device='cuda')
+
+        # Pre-allocated pinned host buffers to avoid per-iteration mlock() syscalls
+        self.input_ids_host = torch.empty((self.max_num_tokens, ),
+                                          dtype=torch.int,
+                                          pin_memory=True)
+        self.position_ids_host = torch.empty((self.max_num_tokens, ),
+                                             dtype=torch.int,
+                                             pin_memory=True)
+        self.previous_batch_indices_host = torch.empty((self.max_num_tokens, ),
+                                                       dtype=torch.int,
+                                                       pin_memory=True)
+        self.seq_lens_host = torch.empty((self.batch_size, ),
+                                         dtype=torch.int,
+                                         pin_memory=True)
         if self.use_mrope:
             self.mrope_position_ids_cuda = torch.empty(
                 (3, 1, self.max_num_tokens), dtype=torch.int, device='cuda')
@@ -2457,12 +2471,13 @@ class PyTorchModelEngine(ModelEngine):
         previous_batch_len = len(previous_batch_indices)
 
         def previous_seq_slots_device():
-            previous_batch_indices_host = torch.tensor(previous_batch_indices,
-                                                       dtype=torch.int,
-                                                       pin_memory=True)
+            self.previous_batch_indices_host[:previous_batch_len].copy_(
+                torch.as_tensor(previous_batch_indices, dtype=torch.int))
             previous_slots = self.previous_batch_indices_cuda[:
                                                               previous_batch_len]
-            previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
+            previous_slots.copy_(
+                self.previous_batch_indices_host[:previous_batch_len],
+                non_blocking=True)
             return previous_slots
 
         num_tokens = len(input_ids)
@@ -2473,10 +2488,10 @@ class PyTorchModelEngine(ModelEngine):
         )
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
-            input_ids = torch.tensor(input_ids,
-                                     dtype=torch.int,
-                                     pin_memory=True)
-            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            self.input_ids_host[:num_tokens].copy_(
+                torch.as_tensor(input_ids, dtype=torch.int))
+            self.input_ids_cuda[:num_tokens].copy_(
+                self.input_ids_host[:num_tokens], non_blocking=True)
 
             # Update input_ids_cuda with new tokens from new_tensors_device (draft model only)
             if self.is_draft_model and num_accepted_tokens_device is not None:
@@ -2682,11 +2697,10 @@ class PyTorchModelEngine(ModelEngine):
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
         else:
-            position_ids = torch.tensor(position_ids,
-                                        dtype=torch.int,
-                                        pin_memory=True)
-            self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
-                                                            non_blocking=True)
+            self.position_ids_host[:total_num_tokens].copy_(
+                torch.as_tensor(position_ids, dtype=torch.int))
+            self.position_ids_cuda[:total_num_tokens].copy_(
+                self.position_ids_host[:total_num_tokens], non_blocking=True)
             final_position_ids = self.position_ids_cuda[:
                                                         total_num_tokens].unsqueeze(
                                                             0)
@@ -2733,11 +2747,12 @@ class PyTorchModelEngine(ModelEngine):
         if not attn_metadata.is_cuda_graph:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
             # to draft sequences too. This means that all draft sequences must be padded.
-            attn_metadata.seq_lens = torch.tensor(
-                sequence_lengths,
-                dtype=torch.int,
-                pin_memory=True,
-            )
+            num_seqs = len(sequence_lengths)
+            self.seq_lens_host[:num_seqs].copy_(
+                torch.as_tensor(sequence_lengths, dtype=torch.int))
+            # Clone to avoid aliasing the persistent pinned buffer, as
+            # downstream attention backends may modify seq_lens in-place.
+            attn_metadata.seq_lens = self.seq_lens_host[:num_seqs].clone()
 
         num_generation_requests = len(gen_request_seq_slots)
         # Cache indirection is only used for beam search on generation requests

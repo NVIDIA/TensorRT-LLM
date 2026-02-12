@@ -3482,6 +3482,33 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
 
         self._async_worker_init(enable_async_worker)
 
+        # Cache for pre-allocated pinned host buffers used by _copy_to_host.
+        # Keyed by source tensor data_ptr to avoid per-iteration pinned memory
+        # allocation. Decoder state tensors persist across iterations so their
+        # data_ptr values are stable.
+        self._host_buffer_cache: dict[int, torch.Tensor] = {}
+
+    def _copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
+        """Override to reuse pre-allocated pinned host buffers."""
+        cache_key = src.data_ptr()
+        dest = self._host_buffer_cache.get(cache_key)
+        if dest is None or dest.shape != src.shape or dest.dtype != src.dtype:
+            dest = torch.empty_like(src, device="cpu", pin_memory=True)
+            self._host_buffer_cache[cache_key] = dest
+
+        if self._async_worker_active():
+            src_snapshot = src.clone()
+            copy_ready = torch.cuda.Event()
+            copy_ready.record()
+            assert self._async_worker is not None
+            result = self._async_worker.submit(
+                self._async_copy_to_host, copy_ready, dest, src_snapshot
+            )
+            self._async_worker_futures.append(result)
+        else:
+            dest.copy_(src, non_blocking=True)
+        return dest
+
     def _initialize_store(self):
         torch_stream = torch.cuda.current_stream().cuda_stream
         cuda_stream = CudaStream(torch_stream)
@@ -3702,16 +3729,16 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
     def update_requests_single_beam_single_step(self, state: SampleStateTRTLLM):
         """Specialization of update_requests for single beam and single step"""
         assert state.host is not None
-        sequence_lengths_host_data = state.host.sequence_lengths.flatten().tolist()
-        finish_reasons = state.host.finish_reasons.flatten().tolist()
+        sequence_lengths_host_data = state.host.sequence_lengths.flatten().numpy()
+        finish_reasons = state.host.finish_reasons.flatten().numpy()
 
-        reqs = [
-            r for r in state.scheduled_requests.context_requests if not r.is_context_init_state
-        ] + [
-            r
-            for r in state.scheduled_requests.generation_requests
-            if not r.is_generation_complete_state
-        ]
+        ctx_reqs = state.scheduled_requests.context_requests
+        gen_reqs = state.scheduled_requests.generation_requests
+        if ctx_reqs:
+            reqs = [r for r in ctx_reqs if not r.is_context_init_state]
+            reqs.extend(r for r in gen_reqs if not r.is_generation_complete_state)
+        else:
+            reqs = [r for r in gen_reqs if not r.is_generation_complete_state]
 
         # NB: To ensure good performance, we must
         #  1. Avoid accessing torch.Tensor object inside the for-each-request loops
@@ -3733,12 +3760,12 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
                 seq_slots_need_log_probs.append(request.py_seq_slot)
 
         # [maxTokensPerStep, batchSize, maxBeamWidth]
-        new_tokens = state.host.new_tokens[0, seq_slots, 0].tolist()
+        new_tokens = state.host.new_tokens[0, seq_slots, 0].numpy()
         add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
 
         # Log probs
         assert state.host is not None
-        if state.host.log_probs is not None:
+        if state.host.log_probs is not None and seq_slots_need_log_probs:
             # [batchSize, maxBeamWidth]
             seq_last_idx = state.host.sequence_lengths[seq_slots_need_log_probs, 0] - 1
             # [batchSize, maxBeamWidth, maxSequenceLength]
@@ -3791,13 +3818,13 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         log_probs_host = state.host.log_probs.tolist() if state.host.log_probs is not None else None
         finalize_events = state.finalize_events
 
-        reqs = [
-            r for r in state.scheduled_requests.context_requests if not r.is_context_init_state
-        ] + [
-            r
-            for r in state.scheduled_requests.generation_requests
-            if not r.is_generation_complete_state
-        ]
+        ctx_reqs = state.scheduled_requests.context_requests
+        gen_reqs = state.scheduled_requests.generation_requests
+        if ctx_reqs:
+            reqs = [r for r in ctx_reqs if not r.is_context_init_state]
+            reqs.extend(r for r in gen_reqs if not r.is_generation_complete_state)
+        else:
+            reqs = [r for r in gen_reqs if not r.is_generation_complete_state]
 
         for request in reqs:
             seq_slot = request.py_seq_slot

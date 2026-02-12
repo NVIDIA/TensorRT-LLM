@@ -313,6 +313,10 @@ class PyExecutor:
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.virtual_memory_pools = virtual_memory_pools
 
+        # Pre-allocated stateless handlers to avoid per-iteration object creation
+        self._handle_logits = HandleLogits()
+        self._handle_additional_outputs = HandleAdditionalOutputs()
+
         # enqueue and _fetch_new_requests used data
         self.active = True
         self.max_beam_width = max_beam_width
@@ -2815,20 +2819,6 @@ class PyExecutor:
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
-        @nvtx_range(
-            f"[Executor] _forward_step {self.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
-        )
-        def forward(scheduled_requests, resource_manager, new_tensors_device,
-                    gather_context_logits, cache_indirection_buffer,
-                    num_accepted_tokens_device):
-            return self.model_engine.forward(
-                scheduled_requests,
-                resource_manager,
-                new_tensors_device,
-                gather_context_logits=gather_context_logits,
-                cache_indirection_buffer=cache_indirection_buffer,
-                num_accepted_tokens_device=num_accepted_tokens_device)
-
         try:
             gather_context_logits = any(
                 a.py_return_context_logits
@@ -2838,11 +2828,16 @@ class PyExecutor:
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations.
             self.execution_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.execution_stream):
-                outputs = forward(scheduled_requests, self.resource_manager,
-                                  new_tensors_device, gather_context_logits,
-                                  cache_indirection_buffer,
-                                  num_accepted_tokens_device)
+            with torch.cuda.stream(self.execution_stream), nvtx_range(
+                    f"[Executor] _forward_step {self.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            ):
+                outputs = self.model_engine.forward(
+                    scheduled_requests,
+                    self.resource_manager,
+                    new_tensors_device,
+                    gather_context_logits=gather_context_logits,
+                    cache_indirection_buffer=cache_indirection_buffer,
+                    num_accepted_tokens_device=num_accepted_tokens_device)
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
@@ -2933,16 +2928,16 @@ class PyExecutor:
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
 
-                HandleLogits()(scheduled_batch.context_requests,
-                               scheduled_batch.generation_requests,
-                               batch_outputs["logits"], beam_width,
-                               num_context_logits_prefix_sum,
-                               self.sampler.is_generation_model())
+                self._handle_logits(scheduled_batch.context_requests,
+                                    scheduled_batch.generation_requests,
+                                    batch_outputs["logits"], beam_width,
+                                    num_context_logits_prefix_sum,
+                                    self.sampler.is_generation_model())
 
-                HandleAdditionalOutputs()(scheduled_batch.context_requests,
-                                          scheduled_batch.generation_requests,
-                                          batch_outputs, beam_width,
-                                          num_context_tokens)
+                self._handle_additional_outputs(
+                    scheduled_batch.context_requests,
+                    scheduled_batch.generation_requests, batch_outputs,
+                    beam_width, num_context_tokens)
 
                 return self.sampler.sample_async(scheduled_batch, batch_outputs,
                                                  num_context_logits_prefix_sum)
@@ -3195,8 +3190,7 @@ class PyExecutor:
             else:
                 new_active_requests.append(request)
 
-        self.active_requests.clear()
-        self.active_requests.extend(new_active_requests)
+        self.active_requests = new_active_requests
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
