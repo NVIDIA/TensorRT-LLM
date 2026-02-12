@@ -253,7 +253,14 @@ void initBindings(nb::module_& m)
             cudaMemcpyAsync(gpuDst, hostSrc, stateSize, cudaMemcpyHostToDevice, stream);
         },
         nb::arg("host_state"), nb::arg("gpu_slots"), nb::arg("slot_index"), nb::arg("max_seq_len"),
-        "Copy a host-built suffix automaton state to a GPU slot (async)");
+        "Copy a host-built suffix automaton state to a GPU slot (async).\n\n"
+        "WARNING: This function is SINGLE-USE per host_state tensor. It mutates host_state\n"
+        "in-place via relocateAutomaton(), which rebases internal pointers from the host\n"
+        "address to the GPU destination address. After this call, the host tensor's internal\n"
+        "pointer graph is relative to the GPU destination, making it corrupted for any\n"
+        "subsequent use (e.g., copying to a different slot). If you need to copy the same\n"
+        "automaton state to multiple GPU slots, you must call build_automaton_host() to\n"
+        "create a fresh host state for each destination slot.");
 
     // Clear a suffix automaton state at a GPU slot (reset for reuse)
     m.def(

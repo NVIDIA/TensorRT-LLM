@@ -127,6 +127,7 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         # GPU output buffers
         self._workspace_allocated = False
+        self._allocated_max_draft_len: int = 0  # Track allocated draft length
         self._gpu_match_len: Optional[torch.Tensor] = None
         self._gpu_draft_tokens: Optional[torch.Tensor] = None
         self._gpu_batch_indices: Optional[torch.Tensor] = None
@@ -135,8 +136,16 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._initialized_requests: Set[int] = set()
 
     def _ensure_workspace(self, max_draft_len: int):
-        """Ensure GPU workspace is allocated."""
+        """Ensure GPU workspace is allocated with sufficient capacity.
+
+        Args:
+            max_draft_len: Required maximum draft length for output buffers.
+
+        Raises:
+            ValueError: If called with max_draft_len larger than previously allocated.
+        """
         if not self._workspace_allocated:
+            # First allocation - create all buffers
             self._gpu_match_len = torch.zeros(
                 (self.max_num_requests,), dtype=torch.int32, device="cuda"
             )
@@ -150,7 +159,18 @@ class SuffixAutomatonManager(BaseResourceManager):
             # Allocate GPU workspace for SA states with dynamic size
             self._gpu_slots = _sa_native.allocate_workspace(self.max_num_requests, self.max_seq_len)
 
+            self._allocated_max_draft_len = max_draft_len
             self._workspace_allocated = True
+        elif max_draft_len > self._allocated_max_draft_len:
+            # Subsequent call with larger draft length - need to re-allocate draft tokens buffer
+            logger.warning(
+                f"SuffixAutomatonManager: Re-allocating _gpu_draft_tokens buffer "
+                f"(old max_draft_len={self._allocated_max_draft_len}, new={max_draft_len})"
+            )
+            self._gpu_draft_tokens = torch.zeros(
+                (self.max_num_requests, max_draft_len), dtype=torch.int32, device="cuda"
+            )
+            self._allocated_max_draft_len = max_draft_len
 
     # --- Core SA operations ---
 
@@ -224,9 +244,18 @@ class SuffixAutomatonManager(BaseResourceManager):
                     )
             self._pending_copies.clear()
 
-        # Prepare batch indices
+        # Validate request_ids and prepare batch indices
+        # Do not use a default fallback - unknown request IDs would corrupt slot 0's state
+        unknown_rids = [rid for rid in request_ids if rid not in self._request_to_slot]
+        if unknown_rids:
+            raise KeyError(
+                f"SuffixAutomatonManager.prepare(): Unknown request IDs {unknown_rids}. "
+                f"All request IDs must be added via add_request() before calling prepare(). "
+                f"Known request IDs: {list(self._request_to_slot.keys())}"
+            )
+
         batch_indices = torch.tensor(
-            [self._request_to_slot.get(rid, 0) for rid in request_ids],
+            [self._request_to_slot[rid] for rid in request_ids],
             dtype=torch.int32,
             pin_memory=True,
         )
@@ -385,6 +414,7 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._gpu_draft_tokens = None
         self._gpu_batch_indices = None
         self._workspace_allocated = False
+        self._allocated_max_draft_len = 0
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests

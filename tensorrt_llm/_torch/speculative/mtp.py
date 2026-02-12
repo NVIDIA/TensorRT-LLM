@@ -385,6 +385,10 @@ class MTPWorker(SpecWorkerBase):
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
+        # Initialize SA spec attributes
+        self.sa_match_len = None
+        self.sa_draft_tokens = None
+        self.sa_spec_index = 0
 
     @property
     def max_draft_len(self) -> int:
@@ -1219,8 +1223,10 @@ class MTPWorker(SpecWorkerBase):
             draft_tokens = self._draft_sampler_greedy(logits)
 
         # select between MTP draft tokens and SA draft tokens
-        if self.spec_config.use_sa_spec and (num_gens :=
-                                             self.sa_match_len.shape[0]) > 0:
+        # Check sa_match_len is not None to handle case where use_sa_spec is True
+        # but sa_manager was None during sample_and_accept_draft_tokens
+        if self.spec_config.use_sa_spec and self.sa_match_len is not None and (
+                num_gens := self.sa_match_len.shape[0]) > 0:
             num_contexts = draft_tokens.shape[0] - num_gens
 
             draft_tokens[num_contexts:] = torch.where(

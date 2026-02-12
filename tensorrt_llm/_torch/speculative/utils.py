@@ -23,12 +23,14 @@ def get_spec_metadata(spec_config,
                       max_num_requests,
                       max_num_tokens,
                       spec_resource_manager=None,
-                      is_draft_model=False):
+                      is_draft_model=False,
+                      max_seq_len=262144):
     if spec_config.spec_dec_mode.is_mtp_one_model():
         # Create SA manager for MTP+SA if enabled
         sa_manager = None
         if getattr(spec_config, 'use_sa_spec', False):
-            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests)
+            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+                                                max_seq_len)
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,

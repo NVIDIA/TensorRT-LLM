@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,5 +25,9 @@
 #define SA_CUDA_CALLABLE __host__ __device__ __forceinline__
 #else
 #define SA_CUDA_CALLABLE
+// Provide a placeholder type for cudaStream_t when not compiling with CUDA.
+// Only define if not already defined to avoid conflicts with cuda_runtime_api.h.
+#if !defined(cudaStream_t)
 #define cudaStream_t int
+#endif
 #endif // __CUDACC__

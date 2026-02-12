@@ -1248,7 +1248,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager,
-                is_draft_model=self.is_draft_model)
+                is_draft_model=self.is_draft_model,
+                max_seq_len=self.max_seq_len)
 
         if self.spec_metadata is not None:
             return self.spec_metadata
@@ -1258,7 +1259,8 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size,
             max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
-            is_draft_model=self.is_draft_model)
+            is_draft_model=self.is_draft_model,
+            max_seq_len=self.max_seq_len)
         return self.spec_metadata
 
     def __del__(self) -> None:

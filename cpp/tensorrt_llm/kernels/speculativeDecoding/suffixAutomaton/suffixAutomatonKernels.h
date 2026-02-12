@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -171,7 +171,20 @@ void initAutomaton(void* memory, size_t maxSeqLen);
 void buildAutomatonFromTokens(SuffixAutomaton* sa, int const* tokens, int numTokens);
 
 //! \brief Relocate a SuffixAutomaton's internal pointers for GPU copy
-//! \param sa Pointer to the SuffixAutomaton
+//!
+//! WARNING: This function MUTATES the SuffixAutomaton in-place, making it SINGLE-USE.
+//! It rebases internal pointers from oldBase to newBase directly in the host buffer.
+//! After this call, the host buffer's internal pointer graph is relative to newBase
+//! (the GPU destination), so the host buffer is effectively corrupted for any subsequent
+//! use (e.g., copying to a different GPU slot). If a caller invokes this twice with
+//! the same host buffer but a different newBase, the second operation will produce
+//! incorrectly relocated pointers.
+//!
+//! To copy the same automaton state to multiple GPU slots, callers must rebuild the
+//! automaton from scratch via initAutomaton() + buildAutomatonFromTokens() for each
+//! destination.
+//!
+//! \param sa Pointer to the SuffixAutomaton (mutated in-place)
 //! \param oldBase The current base address (host address)
 //! \param newBase The target base address (GPU address)
 void relocateAutomaton(SuffixAutomaton* sa, void* oldBase, void* newBase);

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +52,8 @@ __global__ void suffixAutomatonExtendKernel(int batchSize, int draftLength, int 
     SuffixAutomaton* slot = reinterpret_cast<SuffixAutomaton*>(slotMemory);
 
     int numNewTokens = acceptedLensIn[i];
+    // Bounds check: numNewTokens must be in valid range to prevent out-of-bounds access
+    assert(numNewTokens >= 0 && numNewTokens <= draftLength + 1);
 
     // Extend the automaton with accepted tokens
     for (int j = 0; j < numNewTokens; j++)
@@ -115,6 +117,8 @@ __global__ void suffixAutomatonExtendNgramKernel(int batchSize, int draftLength,
     SuffixAutomaton* slot = reinterpret_cast<SuffixAutomaton*>(slotMemory);
 
     int numNewTokens = acceptedLensIn[i];
+    // Bounds check: numNewTokens must be in valid range to prevent out-of-bounds access
+    assert(numNewTokens >= 0 && numNewTokens <= draftLength + 1);
 
     // Extend the automaton with accepted tokens
     for (int j = 0; j < numNewTokens; j++)
