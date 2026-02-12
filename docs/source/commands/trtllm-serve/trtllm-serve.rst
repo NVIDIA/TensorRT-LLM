@@ -215,11 +215,14 @@ model.
 Visual Generation Serving
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``trtllm-serve`` supports diffusion-based visual generation models (FLUX.2, Wan2.1, LTX-2) for image and video generation. When a diffusion model directory is provided (detected by the presence of ``model_index.json``), the server automatically launches in visual generation mode with dedicated endpoints.
+``trtllm-serve`` supports diffusion-based visual generation models (Wan2.1, Wan2.2) for image and video generation. When a diffusion model directory is provided (detected by the presence of ``model_index.json``), the server automatically launches in visual generation mode with dedicated endpoints.
+
+.. note::
+   This is the initial release of TensorRT-LLM VisualGen. APIs, supported models, and optimization options are actively evolving and may change in future releases.
 
 .. code-block:: bash
 
-   trtllm-serve /path/to/Wan2.1-T2V-1.3B-Diffusers \
+   trtllm-serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
        --extra_visual_gen_options config.yml
 
 The ``--extra_visual_gen_options`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/generations``, and video management APIs.

@@ -16,7 +16,7 @@
 
 Visual generation models based on diffusion transformers (DiT) have become the standard for high-quality image and video synthesis. These models iteratively denoise latent representations through a learned transformer backbone, then decode the final latents with a VAE to produce pixels. As model sizes and output resolutions grow, efficient inference becomes critical — demanding multi-GPU parallelism, weight quantization, and runtime caching to achieve practical throughput and latency.
 
-TensorRT-LLM's **VisualGen** module provides a unified inference stack for diffusion models. Key capabilities include (subject to change as the feature matures):
+TensorRT-LLM **VisualGen** module provides a unified inference stack for diffusion models. Key capabilities include (subject to change as the feature matures):
 
 - A shared pipeline abstraction for diffusion model families, covering the denoising loop, guidance strategies, and component loading.
 - Pluggable attention backends.
@@ -29,6 +29,14 @@ TensorRT-LLM's **VisualGen** module provides a unified inference stack for diffu
 
 ## Quick Start
 
+### Prerequisites
+
+```bash
+pip install -r requirements-dev.txt
+pip install git+https://github.com/huggingface/diffusers.git
+pip install av
+```
+
 ### Python API
 
 The example scripts under `examples/visual_gen/` demonstrate direct Python usage. For Wan2.1 text-to-video generation:
@@ -37,7 +45,7 @@ The example scripts under `examples/visual_gen/` demonstrate direct Python usage
 cd examples/visual_gen
 
 python visual_gen_wan_t2v.py \
-    --model_path /path/to/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \  # or a local path
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --output_path output.mp4
@@ -66,7 +74,7 @@ parallel:
 **2. Launch the server:**
 
 ```bash
-trtllm-serve /path/to/Wan2.1-T2V-1.3B-Diffusers \
+trtllm-serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers \  # or a local path
     --extra_visual_gen_options wan_config.yml
 ```
 
@@ -118,7 +126,7 @@ TensorRT-LLM VisualGen supports both **dynamic quantization** (on-the-fly at wei
 
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path /path/to/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \  # or a local path
     --prompt "A cute cat playing piano" \
     --linear_type trtllm-fp8-per-tensor \
     --output_path output_fp8.mp4
