@@ -65,6 +65,9 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
             max_draft_len=max_draft_len,
             max_matching_ngram_size=2,
             draft_len_schedule=schedule,
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=False,
         )
     else:
         spec_config = DraftTargetDecodingConfig(
@@ -108,6 +111,9 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
             max_draft_len=max_draft_len,
             max_matching_ngram_size=2,
             draft_len_schedule=None,  # No schedule - fixed draft length
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=False,
         )
     else:
         spec_config_fixed = DraftTargetDecodingConfig(
