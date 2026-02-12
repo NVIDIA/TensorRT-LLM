@@ -2043,13 +2043,31 @@ class KVCacheManagerV2(BaseResourceManager):
                     self.free_resources(req)
                     return None
                 kv_cache.stop_committing()
-                new_capacity = token_num + self.num_extra_kv_tokens +
-                                num_extra_decoding_steps
-                success = kv_cache.resize(new_capacity)
+                dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
+                success = kv_cache.resize(dummy_capacity)
                 if not success:
                     raise ValueError(
-                        f"Failed to resize capacity of KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
+                        f"Failed to resize capacity of KV cache for request {req.py_request_id} to {dummy_capacity} tokens for dummy request"
                     )
+                draft_kv_cache = None
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
+                        req.py_request_id, req.lora_task_id, input_tokens)
+                    success = draft_kv_cache.resume(
+                        torch.cuda.current_stream().cuda_stream)
+                    if not success:
+                        for r in requests:
+                            self.free_resources(r)
+                            draft_kv_cache.free_resources(r)
+                        self.free_resources(req)
+                        draft_kv_cache.free_resources(req)
+                        return None
+                    draft_kv_cache.stop_committing()
+                    success = draft_kv_cache.resize(dummy_capacity)
+                    if not success:
+                        raise ValueError(
+                            f"Failed to resize capacity of draft KV cache for request {req.py_request_id} to {dummy_capacity} tokens for dummy request"
+                        )
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -2057,12 +2075,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    success = kv_cache.resize(kv_cache.capacity + max_num_draft_tokens +
-                                    1)
+                    new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
+                    success = kv_cache.resize(new_capacity)
                     if not success:
                         raise ValueError(
-                            f"Failed to resize capacity of KV cache for request {req.py_request_id} to {kv_cache.capacity + max_num_draft_tokens + 1} tokens for dummy request"
+                            f"Failed to resize capacity of KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
                         )
+                    if draft_kv_cache is not None:
+                        success = draft_kv_cache.resize(new_capacity)
+                        if not success:
+                            raise ValueError(
+                                f"Failed to resize capacity of draft KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
+                            )
 
             # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
             if use_mrope:

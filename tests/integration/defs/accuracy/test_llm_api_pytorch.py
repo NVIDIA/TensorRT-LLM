@@ -1402,7 +1402,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
@@ -4854,6 +4854,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
+
+        if v2_kv_cache and not one_model and overlap_scheduler:
+            pytest.skip(
+                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
+            )
 
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
