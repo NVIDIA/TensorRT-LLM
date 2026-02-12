@@ -90,12 +90,6 @@ from helpers import (get_input_tensor_by_name, get_output_config_from_request,
 # Root cause: CUDA is not fork-safe. Importing tensorrt_llm imports torch, which initializes
 # CUDA and opens file descriptors to /dev/nvidia* devices. MPI_Comm_spawn (used by mpi4py)
 # inherits these FDs, causing child processes to ignore CUDA_VISIBLE_DEVICES.
-# Solution: Set CUDA_VISIBLE_DEVICES BEFORE importing tensorrt_llm, so CUDA only opens FDs
-# to the assigned GPUs, and children inherit the correct restricted state.
-# See: https://stackoverflow.com/questions/22950047/cuda-initialization-error-after-fork
-LLM = None
-SamplingParams = None
-RequestOutput = None
 
 
 @dataclass
@@ -103,7 +97,7 @@ class RequestData:
     triton_req_id: int
     triton_user_id: str
     triton_request: Any
-    response_iterator: RequestOutput
+    response_iterator: Any  # tensorrt_llm.llmapi.RequestOutput (deferred import)
 
 
 def get_model_config(filename, include_keys=None, exclude_keys=None):
@@ -237,16 +231,12 @@ class TritonPythonModel:
 
             # Set CUDA_VISIBLE_DEVICES BEFORE importing tensorrt_llm (see module-level comment)
             os.environ["CUDA_VISIBLE_DEVICES"] = self._gpu_ids
-            os.environ["TRTLLM_VISIBLE_DEVICES"] = self._gpu_ids
 
             self.logger.log_info(
                 f"[trtllm] Instance {self._instance_idx}: gpu_ids={self._gpu_ids}, instance_count={instance_count}"
             )
 
         # Import tensorrt_llm AFTER setting CUDA_VISIBLE_DEVICES
-        global LLM, SamplingParams, RequestOutput
-        from tensorrt_llm import LLM, SamplingParams
-        from tensorrt_llm.llmapi.llm import RequestOutput
         from tensorrt_llm.llmapi.llm_utils import \
             update_llm_args_with_extra_dict
 
@@ -267,13 +257,12 @@ class TritonPythonModel:
                                  exclude_keys=["triton_config"]),
             )
 
-            # For multi-instance mode, set TRTLLM_VISIBLE_DEVICES to specify GPU assignment
-            # This will be automatically passed to MPI workers and converted to CUDA_VISIBLE_DEVICES
+            # For multi-instance mode, set gpus_per_node to match the assigned GPUs
             if self._use_multi_instance:
                 self.llm_engine_args["gpus_per_node"] = len(self._gpu_id_list)
 
             self.logger.log_info(
-                f"[trtllm] Starting trtllm engine with args: {self.llm_engine_args}"
+                f"[trtllm] rank{global_mpi_rank()} is starting trtllm engine with args: {self.llm_engine_args}"
             )
 
             triton_config = get_model_config(
@@ -356,6 +345,8 @@ class TritonPythonModel:
 
         @asynccontextmanager
         async def async_llm_wrapper():
+            from tensorrt_llm import LLM
+
             # Create LLM in a thread to avoid blocking
             loop = asyncio.get_running_loop()
             try:
@@ -520,6 +511,8 @@ class TritonPythonModel:
         triton_req_id = str(randint(0, sys.maxsize))
 
         try:
+            from tensorrt_llm import SamplingParams
+
             # TODO: [JIRA-4496] Implement when request contains batched prompts
             (prompt, sampling_params, streaming,
              output_config) = self._convert_request(request)
