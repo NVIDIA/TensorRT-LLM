@@ -38,6 +38,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
 
 from .....llmapi.llm_args import KvCacheConfig
+from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
@@ -66,16 +67,23 @@ class _TrtllmPlanner:
     - ``reset()``: one-time allocation of ALL persistent buffers.
     - ``plan()``: per-forward host metadata (host_request_types, block_offsets, host_total_kv_lens).
 
-    Additionally, ``update_pool_pointer()`` is called from the device-side custom op to track
-    the kv_cache data pointer across replays.
+    Pool pointer management:
+    Each attention layer needs its own ``host_pool_pointers`` tensor so that CUDA graph
+    replay reads the correct (layer-specific) pool base from a stable tensor address.
+    Tensors are created lazily on first access per layer and never re-allocated.
     """
 
     def __init__(self):
         self.workspace: Optional[torch.Tensor] = None
-        # Pool pointers (derived lazily from kv_cache.data_ptr())
-        self.host_pool_pointers: Optional[torch.Tensor] = None  # [1, 2] int64 pinned
-        self.host_pool_mapping: Optional[torch.Tensor] = None  # [1, 2] int32 pinned (always zeros)
-        self._cached_kv_data_ptr: int = 0  # track kv_cache ptr for change detection
+        # Per-layer pool pointer tensors, keyed by kv_cache.data_ptr().
+        # Each is [1, 2] int64 pinned, created lazily on first access per layer.
+        # This ensures each layer's attention kernel in a CUDA graph is captured
+        # with its own stable tensor address, avoiding the issue where a shared
+        # tensor would hold only the last-set layer's pointer during graph replay.
+        self._per_layer_pool_ptrs: dict = {}
+        # pool_mapping: fixed [1, 2] all zeros since we always pass layer_idx=0
+        # and pool_pointers already encodes the layer offset via kv_cache.data_ptr()
+        self.host_pool_mapping: Optional[torch.Tensor] = None  # [1, 2] int32 pinned
         # thop-specific host metadata NOT available from SequenceInfo
         self.host_request_types: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         self.host_total_kv_lens: Optional[torch.Tensor] = None  # [2] int64 pinned
@@ -98,11 +106,6 @@ class _TrtllmPlanner:
         # Workspace: pre-allocate a modest initial buffer (like flashinfer's 320MB).
         # thop.attention auto-resizes via resize_() if more space is needed during warm-up.
         self.workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-        self.host_pool_pointers = torch.zeros(
-            1, 2, dtype=torch.int64, device="cpu", pin_memory=True
-        )
-        # pool_mapping: fixed [1, 2] all zeros since we always pass layer_idx=0
-        # and pool_pointers already encodes the layer offset via kv_cache.data_ptr()
         self.host_pool_mapping = torch.zeros(1, 2, dtype=torch.int32, device="cpu", pin_memory=True)
         self.host_total_kv_lens = torch.zeros(2, dtype=torch.int64, device="cpu", pin_memory=True)
         self.host_request_types = torch.zeros(
@@ -136,33 +139,44 @@ class _TrtllmPlanner:
             self.host_request_types[num_prefill:num_seq].fill_(1)
 
         # Compute block_offsets for thop.attention using pre-computed page indices.
+        # Zero the ENTIRE block_offsets buffer to clear stale entries from previous
+        # iterations.  During CUDA graph replay, the captured kernel reads block_offsets
+        # for the full captured batch size (e.g., 32), not just the current num_seq.
+        # Any stale entries beyond the current batch could point to freed/invalid pool
+        # locations, causing illegal memory accesses.
         block_offsets = self.block_offsets
+        block_offsets.zero_()
         total_pages = int(cu_num_pages_host[num_seq])
-        base_offsets = cache_loc[:total_pages] * multiplier
-        seq_idx = page_seq_indices[:total_pages]
-        pg_idx = page_in_seq[:total_pages]
-        block_offsets[0, seq_idx, 0, pg_idx] = base_offsets  # K
-        block_offsets[0, seq_idx, 1, pg_idx] = base_offsets + 1  # V
+        if total_pages > 0:
+            base_offsets = cache_loc[:total_pages] * multiplier
+            seq_idx = page_seq_indices[:total_pages]
+            pg_idx = page_in_seq[:total_pages]
+            block_offsets[0, seq_idx, 0, pg_idx] = base_offsets  # K
+            block_offsets[0, seq_idx, 1, pg_idx] = base_offsets + 1  # V
 
         # host_total_kv_lens: [context_total_kv, gen_total_kv]
         slwc = seq_len_with_cache_host[:num_seq]
         self.host_total_kv_lens[0] = int(slwc[:num_prefill].sum()) if num_prefill > 0 else 0
         self.host_total_kv_lens[1] = int(slwc[num_prefill:num_seq].sum()) if num_decode > 0 else 0
 
-    def update_pool_pointer(self, kv_cache: torch.Tensor) -> None:
-        """Update pool pointer from kv_cache tensor if data_ptr changed.
+    def get_pool_pointers_for_layer(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Return a per-layer ``host_pool_pointers`` tensor for this kv_cache view.
 
-        Sets pool_pointers[0, 0] to kv_cache.data_ptr() so the kernel reads/writes
-        directly into the layer-specific strided view. pool_mapping stays all zeros
-        since the layer offset is already encoded in the pointer.
+        Each attention layer receives a different ``kv_cache`` tensor (a strided view
+        into the pool).  We create one pinned [1, 2] int64 tensor per unique
+        ``data_ptr`` and cache it forever.  This guarantees that each layer's
+        ``thop.attention`` call in a CUDA graph is captured with a *stable, distinct*
+        tensor address, so graph replay reads the correct pool base for every layer.
         """
-        current_ptr = kv_cache.data_ptr()
-        if current_ptr == self._cached_kv_data_ptr:
-            return
+        ptr = kv_cache.data_ptr()
+        t = self._per_layer_pool_ptrs.get(ptr)
+        if t is not None:
+            return t
 
-        self._cached_kv_data_ptr = current_ptr
-        self.host_pool_pointers[0, 0] = current_ptr
-        self.host_pool_pointers[0, 1] = 0
+        t = torch.zeros(1, 2, dtype=torch.int64, device="cpu", pin_memory=True)
+        t[0, 0] = ptr
+        self._per_layer_pool_ptrs[ptr] = t
+        return t
 
 
 _GlobalTrtllmPlanner = _TrtllmPlanner()
@@ -277,8 +291,8 @@ def trtllm_mha_with_cache(
         else max_context_length
     )
 
-    # Update pool pointer (only planner interaction needed; reset/plan done by host_prepare)
-    _GlobalTrtllmPlanner.update_pool_pointer(kv_cache)
+    # Get per-layer pool pointer tensor (stable address for CUDA graph replay)
+    host_kv_cache_pool_pointers = _GlobalTrtllmPlanner.get_pool_pointers_for_layer(kv_cache)
 
     # FP8 KV cache: lazily create scale tensors from float constants on first use
     if kv_cache.dtype == torch.float8_e4m3fn:
@@ -315,11 +329,21 @@ def trtllm_mha_with_cache(
     host_request_types = _GlobalTrtllmPlanner.host_request_types[:num_seq]
     host_total_kv_lens = _GlobalTrtllmPlanner.host_total_kv_lens
 
+    # CUDA graph capture: set host tensors to MAX values so the kernel captures
+    # the worst-case execution pattern.  During replay the host-prepare function
+    # updates these persistent tensors with actual values before the graph runs.
+    is_capturing = torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up()
+    if is_capturing:
+        host_past_kv_lengths[:num_seq].fill_(max_context_length)
+        host_context_lengths[:num_seq].fill_(max_context_length)
+        host_request_types[:num_seq].fill_(1)  # all decode
+        host_total_kv_lens[0] = 0
+        host_total_kv_lens[1] = max_context_length * num_seq
+
     # Block offsets from host_prepare
     kv_cache_block_offsets = _GlobalTrtllmPlanner.block_offsets
 
-    # Pool pointers from kv_cache.data_ptr()
-    host_kv_cache_pool_pointers = _GlobalTrtllmPlanner.host_pool_pointers
+    # Pool mapping (shared, always zeros since layer offset is in pool_pointers)
     host_kv_cache_pool_mapping = _GlobalTrtllmPlanner.host_pool_mapping
 
     # Pack parameters for thop.attention
