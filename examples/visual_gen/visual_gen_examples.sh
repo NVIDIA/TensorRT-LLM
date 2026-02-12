@@ -12,17 +12,19 @@
 # - 8 GPUs: + Large-scale high-resolution examples
 #
 # Usage:
-#   export PROJECT_ROOT=/path/to/tekit
-#   export MODEL_ROOT=/path/to/models
-#   ./visual_gen_examples.sh
+#   export MODEL_ROOT=/path/to/models   # required
+#   # Optional: PROJECT_ROOT auto-detected when run from examples/visual_gen
+#   cd examples/visual_gen && ./visual_gen_examples.sh
 #
 # Or inline:
-#   PROJECT_ROOT=/workspace/gitlab/tekit-b200 MODEL_ROOT=/llm-models ./visual_gen_examples.sh
+#   MODEL_ROOT=/llm-models ./visual_gen_examples.sh
 
 set -e  # Exit on error
 
 # Environment variables with defaults
-PROJECT_ROOT=${PROJECT_ROOT:-"/workspace/gitlab/tekit-b200"}
+# PROJECT_ROOT: auto-detect repo root when run from examples/visual_gen
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT=${PROJECT_ROOT:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
 MODEL_ROOT=${MODEL_ROOT:-"/llm-models"}
 
 # Log configuration
@@ -225,7 +227,7 @@ python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_wan_i2v.py \
     --linear_type trtllm-fp8-blockwise \
     --attention_backend TRTLLM \
     --enable_teacache \
-    --teacache_thres 0.2 \
+    --teacache_thresh 0.2 \
     --guidance_scale 6.0 \
     --guidance_scale_2 5.0 \
     --boundary_ratio 0.85

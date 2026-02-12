@@ -726,6 +726,26 @@ def cleanup_gpu_memory():
         torch.cuda.empty_cache()
 
 
+def _is_fp32_layernorm_param(param_name: str) -> bool:
+    """True if param is a LayerNorm weight/bias we keep in float32. Only LayerNorm (norm1/norm2/norm3/norm_out)."""
+    if not param_name.endswith((".weight", ".bias")):
+        return False
+    # blocks.<n>.norm1, norm2, norm3 (LayerNorm only; attn norm_q/norm_k are RMSNorm)
+    if ".norm" in param_name and "blocks." in param_name:
+        parts = param_name.split(".")
+        for p in parts:
+            if p in ("norm1", "norm2", "norm3"):
+                return True
+        return False
+    # top-level norm_out (LayerNorm)
+    if param_name == "norm_out.weight" or param_name == "norm_out.bias":
+        return True
+    # condition_embedder.norm1, norm2 (LayerNorm)
+    if param_name.startswith("condition_embedder.") and ".norm" in param_name:
+        return True
+    return False
+
+
 class TestWanPipeline:
     """Pipeline tests for Wan pipeline loading with PipelineLoader.
 
@@ -769,6 +789,11 @@ class TestWanPipeline:
                 )
                 if param.dtype == torch.float32:
                     f32_scale_count += 1
+            elif _is_fp32_layernorm_param(name):
+                # LayerNorm (norm1/norm2/norm3/norm_out) use float32; RMSNorm (norm_q, norm_k, etc.) stay bf16
+                assert param.dtype == torch.float32, (
+                    f"LayerNorm param {name} expected float32 but got {param.dtype}"
+                )
             else:
                 # Non-scale parameters should be bfloat16
                 assert param.dtype == torch.bfloat16, (

@@ -5,8 +5,8 @@ Quick reference for running visual generation models (WAN).
 ## Prerequisites
 
 ```bash
-# Install dependencies
-pip install -r ${PROJECT_ROOT}/requirements-dev.txt
+# Install dependencies (from repository root)
+pip install -r requirements-dev.txt
 pip install git+https://github.com/huggingface/diffusers.git
 pip install av
 ```
@@ -14,9 +14,9 @@ pip install av
 ## Quick Start
 
 ```bash
-# Set environment variables
-export PROJECT_ROOT=/workspace/gitlab/tekit-b200
+# Set MODEL_ROOT to your model directory (required for examples)
 export MODEL_ROOT=/llm-models
+# Optional: PROJECT_ROOT defaults to repo root when run from examples/visual_gen
 
 # Run all examples (auto-detects GPUs)
 cd examples/visual_gen
@@ -28,7 +28,7 @@ cd examples/visual_gen
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROJECT_ROOT` | `/workspace/gitlab/tekit-b200` | Path to tekit repository |
+| `PROJECT_ROOT` | Auto-detected | Path to repository root (set when running from `examples/visual_gen`) |
 | `MODEL_ROOT` | `/llm-models` | Path to model directory |
 | `TLLM_LOG_LEVEL` | `INFO` | Logging level |
 
@@ -125,6 +125,7 @@ GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 | `--guidance_scale` | ✓ | 5.0 | CFG guidance strength |
 | `--seed` | ✓ | 42 | Random seed |
 | `--enable_teacache` | ✓ | False | Cache optimization |
+| `--teacache_thresh` | ✓ | 0.2 | TeaCache similarity threshold |
 | `--attention_backend` | ✓ | VANILLA | VANILLA or TRTLLM |
 | `--cfg_size` | ✓ | 1 | CFG parallelism |
 | `--ulysses_size` | ✓ | 1 | Sequence parallelism |
