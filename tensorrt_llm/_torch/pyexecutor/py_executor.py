@@ -55,8 +55,9 @@ from .hang_detector import HangDetector
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, PerfTimingInfo, get_draft_token_length)
+                          LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
+from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests,
                             schedule_attention_dp_requests)
@@ -328,7 +329,8 @@ class PyExecutor:
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.stream_interval = self.llm_args.stream_interval
-        self.return_perf_metrics = self.llm_args.return_perf_metrics
+        self.perf_manager = PerfMetricsManager(
+            enabled=self.llm_args.return_perf_metrics)
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -564,151 +566,7 @@ class PyExecutor:
         if self.async_transfer_manager.end_transfer(request):
             self._terminate_request(request)
 
-    # ========== Performance Metrics Helper Methods ==========
-
-    def _create_perf_timing_events(self):
-        """Get GPU timing events for performance measurement.
-
-        Uses ping-pong pattern (two sets of events, alternating per iteration)
-        to avoid creating new events every step. Each set persists until the
-        next same-parity iteration, which is safe because _compute_batch_gpu_times
-        reads the previous iteration's events before they're reused.
-
-        Returns:
-            Tuple of (gpu_forward_start, gpu_forward_end, gpu_sample_end)
-            or (None, None, None) if metrics are disabled.
-        """
-        if not self.return_perf_metrics:
-            return None, None, None
-        if not hasattr(self, '_perf_events'):
-            self._perf_events = [
-                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3)),
-                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3)),
-            ]
-            self._perf_event_idx = 0
-        events = self._perf_events[self._perf_event_idx % 2]
-        self._perf_event_idx += 1
-        return events
-
-    def _save_timing_to_requests(self, requests, gpu_forward_start,
-                                 gpu_forward_end, gpu_sample_end,
-                                 forward_start_time, forward_end_time,
-                                 sample_start_time, sample_end_time):
-        """Save current iteration's timing info to all requests in the batch."""
-        for req in requests:
-            # Lazily create PerfTimingInfo only when perf metrics are enabled
-            if req.py_perf_timing is None:
-                req.py_perf_timing = PerfTimingInfo()
-            req.py_perf_timing.gpu_forward_start_event = gpu_forward_start
-            req.py_perf_timing.gpu_forward_end_event = gpu_forward_end
-            req.py_perf_timing.gpu_sample_end_event = gpu_sample_end
-            req.py_perf_timing.forward_start_time = forward_start_time
-            req.py_perf_timing.forward_end_time = forward_end_time
-            req.py_perf_timing.sample_start_time = sample_start_time
-            req.py_perf_timing.sample_end_time = sample_end_time
-
-    def _compute_batch_gpu_times(self, requests):
-        """Compute GPU times once per batch for the last ctx chunk or gen step.
-
-        Reads events from perf fields, computes elapsed_time once per batch,
-        and fills in gpu_forward_time/gpu_sample_time for the last entry in
-        either ctx_chunk_metrics or step_metrics.
-        For ctx chunks, also accumulates ctx_gpu_forward_time across all chunks.
-        """
-        if not self.return_perf_metrics:
-            return
-        batch_gpu_forward_time = None
-        batch_gpu_sample_time = None
-        for req in requests:
-            perf = req.py_perf_timing
-            if perf is None or perf.gpu_forward_start_event is None:
-                continue
-
-            # Find the last metric entry with gpu_forward_time == 0
-            # Check ctx_chunk_metrics first, then step_metrics
-            target = None
-            is_ctx = False
-            if perf.ctx_chunk_metrics and perf.ctx_chunk_metrics[-1].get(
-                    'gpu_forward_time', 0) == 0:
-                target = perf.ctx_chunk_metrics[-1]
-                is_ctx = True
-            elif perf.step_metrics and perf.step_metrics[-1].get(
-                    'gpu_forward_time', 0) == 0:
-                target = perf.step_metrics[-1]
-            if target is None:
-                continue
-
-            # Compute once per batch, reuse for all requests
-            if batch_gpu_forward_time is None:
-                batch_gpu_forward_time = perf.gpu_forward_start_event.elapsed_time(
-                    perf.gpu_forward_end_event)
-                batch_gpu_sample_time = perf.gpu_forward_end_event.elapsed_time(
-                    perf.gpu_sample_end_event
-                ) if perf.gpu_sample_end_event else 0.0
-
-            target['gpu_forward_time'] = batch_gpu_forward_time
-            target['gpu_sample_time'] = batch_gpu_sample_time
-
-            # Accumulate total context GPU times across chunks
-            if is_ctx:
-                if perf.ctx_gpu_forward_time is None:
-                    perf.ctx_gpu_forward_time = 0.0
-                    perf.ctx_gpu_sample_time = 0.0
-                perf.ctx_gpu_forward_time += batch_gpu_forward_time
-                perf.ctx_gpu_sample_time += batch_gpu_sample_time
-
-    def _append_step_metrics(self, request, batch_token_time=None):
-        """Append per-iteration metrics for a request (ctx chunk or gen step).
-
-        For context phase (py_decoding_iter < 1): saves to ctx_chunk_metrics.
-        For generation phase (py_decoding_iter >= 1): saves to step_metrics.
-        """
-        perf = request.py_perf_timing
-        if not self.return_perf_metrics or perf is None or perf.forward_start_time is None:
-            return
-
-        # Determine ctx vs gen:
-        # - py_decoding_iter == 0: intermediate chunk (sampler skipped)
-        # - py_decoding_iter == 1 and not yet marked complete: last/only chunk
-        # - Gen-only requests (disagg gen server) are never ctx
-        is_ctx = (not request.is_generation_only_request()
-                  and not perf.ctx_chunks_complete
-                  and request.py_decoding_iter <= 1)
-
-        # Skip if timing hasn't changed (request not scheduled this iteration)
-        # Skip if timing hasn't changed (request not scheduled this iteration)
-        for metrics_list in (perf.step_metrics, perf.ctx_chunk_metrics):
-            if metrics_list and metrics_list[-1][
-                    'forward_start_time'] == perf.forward_start_time:
-                return
-
-        # Common fields for both ctx chunk and gen step
-        metric = {
-            'forward_start_time': perf.forward_start_time,
-            'forward_end_time': perf.forward_end_time,
-            'sample_start_time': perf.sample_start_time,
-            'sample_end_time': perf.sample_end_time,
-            'gpu_forward_time': 0,
-            'gpu_sample_time': 0,
-        }
-
-        step_token_time = batch_token_time or get_steady_clock_now_in_seconds()
-        metric['token_time'] = step_token_time
-
-        if is_ctx:
-            if request.py_decoding_iter >= 1:
-                # Last ctx chunk: update perf metrics (sets first_token_time)
-                request.update_perf_metrics(self.iter_counter)
-            # Mark complete when context is done (remaining == 0 after move_to_next_chunk)
-            if request.context_remaining_length == 0:
-                perf.ctx_chunks_complete = True
-            perf.ctx_chunk_metrics.append(metric)
-        else:
-            request.update_perf_metrics(self.iter_counter)
-            metric['iter'] = request.py_decoding_iter
-            perf.step_metrics.append(metric)
-
-    # ========== End Performance Metrics Helper Methods ==========
+    # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
     def _event_loop_wrapper(self):
         try:
@@ -1924,39 +1782,28 @@ class PyExecutor:
                                 self.guided_decoder.rollback_draft_tokens()
 
                     # GPU and CPU timing for perf metrics
-                    gpu_forward_start, gpu_forward_end, gpu_sample_end = self._create_perf_timing_events(
+                    gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
-                    if gpu_forward_start is not None:
-                        gpu_forward_start.record()
-                    forward_start_time = get_steady_clock_now_in_seconds(
-                    ) if self.return_perf_metrics else None
 
-                    batch_outputs = self._forward_step(scheduled_batch)
-
-                    if gpu_forward_end is not None:
-                        gpu_forward_end.record()
-                    forward_end_time = get_steady_clock_now_in_seconds(
-                    ) if self.return_perf_metrics else None
+                    with self.perf_manager.record_perf_events(
+                            gpu_forward_start, gpu_forward_end) as fwd_timing:
+                        batch_outputs = self._forward_step(scheduled_batch)
 
                     guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
                         guided_decoder_failed_requests = self.guided_decoder.execute(
                             batch_outputs['logits'])
 
-                    sample_start_time = get_steady_clock_now_in_seconds(
-                    ) if self.return_perf_metrics else None
+                    with self.perf_manager.record_perf_events(
+                            None, gpu_sample_end) as sample_timing:
+                        sample_state = self._sample_async(
+                            scheduled_batch, batch_outputs)
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
-
-                    if gpu_sample_end is not None:
-                        gpu_sample_end.record()
-                    sample_end_time = get_steady_clock_now_in_seconds(
-                    ) if self.return_perf_metrics else None
-                    self._save_timing_to_requests(
+                    self.perf_manager.save_timing_to_requests(
                         scheduled_batch.all_requests(), gpu_forward_start,
-                        gpu_forward_end, gpu_sample_end, forward_start_time,
-                        forward_end_time, sample_start_time, sample_end_time)
+                        gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
+                        fwd_timing.end_time, sample_timing.start_time,
+                        sample_timing.end_time)
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
@@ -1985,7 +1832,7 @@ class PyExecutor:
                     finished_requests = self._handle_responses()
                     # Compute GPU times after _handle_responses creates metric entries
                     # (safe in non-overlap mode: no next iteration to overwrite events)
-                    self._compute_batch_gpu_times(
+                    self.perf_manager.compute_batch_gpu_times(
                         scheduled_batch.all_requests())
                     attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                             None)
@@ -2217,26 +2064,19 @@ class PyExecutor:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
                     # GPU timing for perf metrics
-                    gpu_forward_start, gpu_forward_end, gpu_sample_end = self._create_perf_timing_events(
+                    gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
-                    if gpu_forward_start is not None:
-                        gpu_forward_start.record()
-                    forward_start_time = get_steady_clock_now_in_seconds(
-                    ) if self.return_perf_metrics else None
 
-                    batch_outputs = self._forward_step(
-                        scheduled_batch, previous_tensors_device,
-                        num_accepted_tokens_device)
-
-                    if gpu_forward_end is not None:
-                        gpu_forward_end.record()
-                    forward_end_time = get_steady_clock_now_in_seconds(
-                    ) if self.return_perf_metrics else None
+                    with self.perf_manager.record_perf_events(
+                            gpu_forward_start, gpu_forward_end) as fwd_timing:
+                        batch_outputs = self._forward_step(
+                            scheduled_batch, previous_tensors_device,
+                            num_accepted_tokens_device)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
 
-                    self._compute_batch_gpu_times(
+                    self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.all_requests)
 
                     self._send_kv_async(self.previous_batch.all_requests)
@@ -2248,28 +2088,22 @@ class PyExecutor:
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
-                    # Record sample start time (after processing previous batch)
-                    sample_start_time = get_steady_clock_now_in_seconds(
-                    ) if self.return_perf_metrics else None
-
                     guided_decoder_failed_requests = None
-                    if self.guided_decoder is not None:
-                        self.guided_decoder.add_batch(scheduled_batch)
-                        guided_decoder_failed_requests = self.guided_decoder.execute(
-                            batch_outputs['logits'])
+                    with self.perf_manager.record_perf_events(
+                            None, gpu_sample_end) as sample_timing:
+                        if self.guided_decoder is not None:
+                            self.guided_decoder.add_batch(scheduled_batch)
+                            guided_decoder_failed_requests = self.guided_decoder.execute(
+                                batch_outputs['logits'])
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
+                        sample_state = self._sample_async(
+                            scheduled_batch, batch_outputs)
 
-                    # Record sample timing and save to requests
-                    if gpu_sample_end is not None:
-                        gpu_sample_end.record()
-                    sample_end_time = get_steady_clock_now_in_seconds(
-                    ) if self.return_perf_metrics else None
-                    self._save_timing_to_requests(
+                    self.perf_manager.save_timing_to_requests(
                         scheduled_batch.all_requests(), gpu_forward_start,
-                        gpu_forward_end, gpu_sample_end, forward_start_time,
-                        forward_end_time, sample_start_time, sample_end_time)
+                        gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
+                        fwd_timing.end_time, sample_timing.start_time,
+                        sample_timing.end_time)
                     assert sample_state is not None, "Sampling failed"
 
                     self._handle_guided_decoder_errors(
@@ -3343,8 +3177,7 @@ class PyExecutor:
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
 
-        batch_token_time = get_steady_clock_now_in_seconds(
-        ) if self.return_perf_metrics else None
+        batch_token_time = self.perf_manager.get_timestamp()
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -3369,8 +3202,10 @@ class PyExecutor:
                 if request.is_disagg_generation_transmission_in_progress or (
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
-                    self._append_step_metrics(request,
-                                              batch_token_time=batch_token_time)
+                    self.perf_manager.append_step_metrics(
+                        request,
+                        self.iter_counter,
+                        batch_token_time=batch_token_time)
                     new_active_requests.append(request)
                     continue
 
@@ -3378,8 +3213,8 @@ class PyExecutor:
                 request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
-            self._append_step_metrics(request,
-                                      batch_token_time=batch_token_time)
+            self.perf_manager.append_step_metrics(
+                request, self.iter_counter, batch_token_time=batch_token_time)
 
             request_done = False
             if request.py_decoding_iter == 1 or request.is_finished or \

@@ -183,7 +183,7 @@ Client receives first token
 4. **Context Postprocessing** (`ctx_postprocessing`)
    - **Time Period**: `first_token_time` → `server_first_token_time`
    - **Description**: Detokenize + IPC from executor to OpenAI server
-   - **Includes**: Token-to-text conversion, inter-process communication to OpenAI server
+   - **Includes**: Token-to-text conversion, inter-process communication to OpenAI server, and metric extraction (`_extract_metrics`: perf metric collection, lock acquisition, and metric storage). 
    - **Display**: In non-disagg mode, shown as semi-transparent overlay on CPU timeline. In disagg mode with chunk data, extends from `sample_end_time` to include executor-side postprocessing (GPU sync, KV cache send, response creation)
 
 ### Per-Chunk Metrics (Context/Prefill Phase)

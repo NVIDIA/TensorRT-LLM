@@ -599,7 +599,9 @@ class OpenAIServer:
             }
             if raw_request:
                 item["server_arrival_time"] = getattr(raw_request.state, "server_arrival_time", None)
-                item["server_first_token_time"] = getattr(raw_request.state, "server_first_token_time", None)
+                if not getattr(raw_request.state, "server_first_token_time", None):
+                    raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                item["server_first_token_time"] = raw_request.state.server_first_token_time
             if output.disaggregated_params:
                 item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
             # Extract time_breakdown_metrics for per-step timing analysis
@@ -622,7 +624,6 @@ class OpenAIServer:
             raise ValueError(f"disaggregated_params is not set in the response for request"
                              f" {disaggregated_params.disagg_request_id}")
 
-        raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
         await self._extract_metrics(promise, raw_request)
         return chat_response
 
@@ -898,7 +899,6 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
             await self._extract_metrics(response, raw_request)
             return pp_result
 
