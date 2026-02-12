@@ -1,0 +1,1260 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Accelerating Long-Context Inference with Skip Softmax Attention &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=aaf6cd4a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=1ae7504c"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc3';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html" />
+    <link rel="prev" title="Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc3" />
+
+
+  </head>
+
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Accelerating Long-Context Inference with Skip Softmax Attention</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="accelerating-long-context-inference-with-skip-softmax-attention">
+<h1>Accelerating Long-Context Inference with Skip Softmax Attention<a class="headerlink" href="#accelerating-long-context-inference-with-skip-softmax-attention" title="Link to this heading">#</a></h1>
+<p>As context lengths grow from thousands to hundreds of thousands of tokens, attention computation becomes a major bottleneck in long-context LLM inference. TensorRT-LLM provides a <a class="reference internal" href="../../features/sparse-attention.html#framework-level-sparse-attention"><span class="std std-ref">sparse attention framework</span></a> that supports techniques like KV cache compression and sparse pattern prediction, featured in <a class="reference external" href="https://arxiv.org/pdf/2502.14051">RocketKV</a> and <a class="reference external" href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf">DSA</a>. However, these require framework-level support—additional token selection steps, auxiliary data structures, and kernel modifications are required, compared to the vanilla attention architecture. This complexity introduces <strong>runtime overhead</strong> that can offset performance gains, particularly when context lengths are not long enough to amortize the extra work.</p>
+<p>In this blog, we introduce <strong>Skip Softmax Attention</strong>, a drop-in sparse attention technique that is designed to accelerate the existing pretrained models that use standard attention mechanisms like MHA, GQA, or MLA. Skip Softmax Attention based on top of the Flash Attention algorithm and only requires modifying the existing <strong>attention kernels</strong>. Due to this simplicity, the end-to-end performance gain is more predictable. In addition, it is only an approximation method of the attention kernel computation, making it compatible with nearly all the other features, such as FP8 attention, KV cache reuse, chunked prefill etc.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#accelerating-long-context-inference-with-skip-softmax-attention">Accelerating Long-Context Inference with Skip Softmax Attention</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#method-overview">Method Overview</a></p></li>
+<li><p><a class="reference internal" href="#example-usage">Example Usage</a></p></li>
+<li><p><a class="reference internal" href="#accuracy-evaluation">Accuracy Evaluation</a></p></li>
+<li><p><a class="reference internal" href="#performance-benchmark">Performance Benchmark</a></p>
+<ul>
+<li><p><a class="reference internal" href="#kernel-performance">Kernel Performance</a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-performance">End-to-end Performance</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#reproduction">Reproduction</a></p>
+<ul>
+<li><p><a class="reference internal" href="#accuracy-evaluation-longbench-v1-v2">Accuracy evaluation (LongBench V1/V2)</a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-performance-ttft-tpot">End-to-end performance (TTFT/TPOT)</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#conclusion">Conclusion</a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="method-overview">
+<h2>Method Overview<a class="headerlink" href="#method-overview" title="Link to this heading">#</a></h2>
+<p>The idea of Skip Softmax Attention is to compare the local maximum <span class="math notranslate nohighlight">\(\tilde{m}_i^{(j)}\)</span> of <span class="math notranslate nohighlight">\(Q \cdot K^T\)</span> with the running global maximum <span class="math notranslate nohighlight">\(m_i^{(j)}\)</span>, and skip the softmax (exp) and BMM2 calculation for blocks that are below a certain threshold <span class="math notranslate nohighlight">\(\lambda\)</span>:</p>
+<div class="math notranslate nohighlight">
+\[\tilde{m}_i^{(j)} - m_i^{(j)} &lt; \lambda\]</div>
+<p>In this way, we can indirectly control the sparsity via the threshold. The threshold is set to be inversely proportional to the context length, i.e., the longer the context, the smaller the threshold is needed to achieve the same sparsity.</p>
+<p>The method is fully dynamic, and can be applied to both the prefilling and decoding. The algorithm of Skip Softmax Attention is described in the paper <a class="reference external" href="https://arxiv.org/pdf/2512.12087">BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding</a>. We have also published a <a class="reference external" href="https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/">Developer Blog</a> for explanation. Please refer to these resources for in-depth dive into the algorithm details. We will focus on the application of Skip Softmax Attention in TensorRT-LLM to accelerate long-context inference.</p>
+<p align="center">
+  <img src="../media/tech_blog16_blasst.jpg" alt="BLASST Illustration" style="width: 50%; min-width: 300px; display: block; margin: auto;" />
+</p>
+</section>
+<section id="example-usage">
+<h2>Example Usage<a class="headerlink" href="#example-usage" title="Link to this heading">#</a></h2>
+<p>Enabling Skip Softmax Attention is pretty simple: we only need to configure the <code class="docutils literal notranslate"><span class="pre">SkipSoftmaxAttentionConfig</span></code> and pass it to the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> API:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">SkipSoftmaxAttentionConfig</span>
+
+<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span><span class="n">threshold_scale_factor</span><span class="o">=</span><span class="mf">1000.0</span><span class="p">)</span>
+
+<span class="c1"># Additionally, the threshold_scale_factor for prefill and decode could be separately configured.</span>
+<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span><span class="n">threshold_scale_factor</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;prefill&quot;</span><span class="p">:</span> <span class="mf">1000.0</span><span class="p">,</span> <span class="s2">&quot;decode&quot;</span><span class="p">:</span> <span class="mf">500.0</span><span class="p">})</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+   <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen/Qwen3-30B-A3B-Instruct-2507&quot;</span><span class="p">,</span>
+   <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">sparse_attention_config</span><span class="p">,</span>
+   <span class="c1"># Other LLM arguments...</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>The configuration could also be specified through the extra LLM API options YAML file. An example to launch an OpenAI-compatible endpoint is shown below:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span>&gt;extra_llm_api_options.yaml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="s">sparse_attention_config:</span>
+<span class="s">    algorithm: skip_softmax</span>
+<span class="s">    threshold_scale_factor: 1000.0</span>
+<span class="s">EOF</span>
+
+<span class="c1"># Additionally, the threshold_scale_factor for prefill and decode could be separately configured.</span>
+cat<span class="w"> </span>&gt;extra_llm_api_options.yaml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="s">sparse_attention_config:</span>
+<span class="s">    algorithm: skip_softmax</span>
+<span class="s">    threshold_scale_factor:</span>
+<span class="s">        prefill: 1000.0</span>
+<span class="s">        decode: 500.0</span>
+<span class="s">EOF</span>
+
+trtllm-serve<span class="w"> </span>Qwen/Qwen3-30B-A3B-Instruct-2507<span class="w"> </span>--extra_llm_api_options<span class="w"> </span>extra_llm_api_options.yaml
+</pre></div>
+</div>
+<p>The actual threshold value equals the <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> divided by the context length. <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA Model Optimizer</a> will support the calibration to automatically determine the required value given the target sparsity. We will use <code class="docutils literal notranslate"><span class="pre">Qwen3-30B-A3B-Instruct-2507</span></code> as the example model for testing, and the calibrated threshold scale factors are listed below:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Target Sparsity</p></th>
+<th class="head text-center"><p>Threshold Scale Factor (Prefill)</p></th>
+<th class="head text-center"><p>Threshold Scale Factor (Decode)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>0.0</p></td>
+<td class="text-center"><p>0.0</p></td>
+<td class="text-center"><p>0.0</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.1</p></td>
+<td class="text-center"><p>18.76</p></td>
+<td class="text-center"><p>0.32</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.2</p></td>
+<td class="text-center"><p>44.37</p></td>
+<td class="text-center"><p>0.86</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.3</p></td>
+<td class="text-center"><p>104.97</p></td>
+<td class="text-center"><p>2.30</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.4</p></td>
+<td class="text-center"><p>248.40</p></td>
+<td class="text-center"><p>6.17</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.5</p></td>
+<td class="text-center"><p>587.18</p></td>
+<td class="text-center"><p>16.52</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.6</p></td>
+<td class="text-center"><p>1390.63</p></td>
+<td class="text-center"><p>44.26</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.7</p></td>
+<td class="text-center"><p>3293.04</p></td>
+<td class="text-center"><p>118.62</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.8</p></td>
+<td class="text-center"><p>7799.91</p></td>
+<td class="text-center"><p>317.99</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.9</p></td>
+<td class="text-center"><p>18471.56</p></td>
+<td class="text-center"><p>852.20</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="accuracy-evaluation">
+<h2>Accuracy Evaluation<a class="headerlink" href="#accuracy-evaluation" title="Link to this heading">#</a></h2>
+<p>We evaluate the accuracy of Skip Softmax Attention using LongBench V1 and V2. LongBench V1 is a comprehensive benchmark for medium-to-long context understanding, with average sequence length of 10k tokens. LongBench V2 is a harder benchmark that contains longer sequences, and we pick its <code class="docutils literal notranslate"><span class="pre">medium</span></code> subset and truncate the prompt length to 256k due to the limit of the native context window of the model. The average sequence length of LongBench V2 is 130k tokens.</p>
+<p>The evaluation results (on H200) are summarized in the table below:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Target Sparsity</p></th>
+<th class="head text-center"><p>LongBench V1 Overall Accuracy</p></th>
+<th class="head text-center"><p>LongBench V2 Overall Accuracy</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>0.0</p></td>
+<td class="text-center"><p>47.79</p></td>
+<td class="text-center"><p>35.81</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.1</p></td>
+<td class="text-center"><p>47.92</p></td>
+<td class="text-center"><p>40.00</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.2</p></td>
+<td class="text-center"><p>47.80</p></td>
+<td class="text-center"><p>38.14</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.3</p></td>
+<td class="text-center"><p>47.84</p></td>
+<td class="text-center"><p>38.60</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.4</p></td>
+<td class="text-center"><p>47.84</p></td>
+<td class="text-center"><p>39.53</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.5</p></td>
+<td class="text-center"><p>46.87</p></td>
+<td class="text-center"><p>37.67</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.6</p></td>
+<td class="text-center"><p>46.45</p></td>
+<td class="text-center"><p>36.28</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.7</p></td>
+<td class="text-center"><p>45.56</p></td>
+<td class="text-center"><p>34.88</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.8</p></td>
+<td class="text-center"><p>43.38</p></td>
+<td class="text-center"><p>36.74</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.9</p></td>
+<td class="text-center"><p>39.84</p></td>
+<td class="text-center"><p>39.07</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Note that the number of samples in LongBench V2 is very small (~200), so the result is subject to large variance. You will see non-monotonic relationship between sparsity and accuracy. We recommend to look at LongBench V1 (~5000 samples) for inspecting the accuracy loss trend.</p>
+</section>
+<section id="performance-benchmark">
+<h2>Performance Benchmark<a class="headerlink" href="#performance-benchmark" title="Link to this heading">#</a></h2>
+<p>Skip Softmax Attention is supported on both Hopper and Blackwell GPUs and builds on top of the SoTA performance of the TensorRT-LLM’s attention kernels. Hopper prefilling is implemented in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/fmha_v2">fmha_v2</a>, Hopper decoding is implemented in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa">XQA</a>, and Blackwell is implemented in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels">trtllm-gen</a>.</p>
+<section id="kernel-performance">
+<h3>Kernel Performance<a class="headerlink" href="#kernel-performance" title="Link to this heading">#</a></h3>
+<p>We provide the performance data of the attention kernels under different achieved sparsity by specifying the threshold. The micro-benchmarking is performed under these configs: q_heads=64, kv_heads=4, head_dim=128, seqlen=16k/64k. Both BF16 and FP8 attention are supported. For prefilling, batch size is set to 1; for decoding, batch size is 64.</p>
+<p>As a reference, the baseline performance data <strong>without</strong> Skip Softmax Attention are listed below (you can fill in the numbers).</p>
+<p><strong>Prefill Baseline (we report compute performance in TFLOP/s):</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>GPU</p></th>
+<th class="head text-center"><p>Seqlen</p></th>
+<th class="head text-center"><p>Precision</p></th>
+<th class="head text-right"><p>TFLOP/s</p></th>
+<th class="head text-right"><p>Duration µs</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>H200</p></td>
+<td class="text-center"><p>16k</p></td>
+<td class="text-center"><p>BF16</p></td>
+<td class="text-right"><p>594.05</p></td>
+<td class="text-right"><p>7403</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>H200</p></td>
+<td class="text-center"><p>16k</p></td>
+<td class="text-center"><p>FP8</p></td>
+<td class="text-right"><p>852.81</p></td>
+<td class="text-right"><p>5157</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>H200</p></td>
+<td class="text-center"><p>64k</p></td>
+<td class="text-center"><p>BF16</p></td>
+<td class="text-right"><p>610.30</p></td>
+<td class="text-right"><p>115301</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>H200</p></td>
+<td class="text-center"><p>64k</p></td>
+<td class="text-center"><p>FP8</p></td>
+<td class="text-right"><p>873.60</p></td>
+<td class="text-right"><p>80550</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>B200</p></td>
+<td class="text-center"><p>16k</p></td>
+<td class="text-center"><p>BF16</p></td>
+<td class="text-right"><p>1029.13</p></td>
+<td class="text-right"><p>4273</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>B200</p></td>
+<td class="text-center"><p>16k</p></td>
+<td class="text-center"><p>FP8</p></td>
+<td class="text-right"><p>1523.57</p></td>
+<td class="text-right"><p>2886</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>B200</p></td>
+<td class="text-center"><p>64k</p></td>
+<td class="text-center"><p>BF16</p></td>
+<td class="text-right"><p>1038.26</p></td>
+<td class="text-right"><p>67775</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>B200</p></td>
+<td class="text-center"><p>64k</p></td>
+<td class="text-center"><p>FP8</p></td>
+<td class="text-right"><p>1621.41</p></td>
+<td class="text-right"><p>43399</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Decode Baseline (we report memory bandwidth in TB/s):</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>GPU</p></th>
+<th class="head text-center"><p>Seqlen</p></th>
+<th class="head text-center"><p>Precision</p></th>
+<th class="head text-right"><p>TB/s</p></th>
+<th class="head text-right"><p>Duration µs</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>H200</p></td>
+<td class="text-center"><p>16k</p></td>
+<td class="text-center"><p>BF16</p></td>
+<td class="text-right"><p>4.31</p></td>
+<td class="text-right"><p>498</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>H200</p></td>
+<td class="text-center"><p>16k</p></td>
+<td class="text-center"><p>FP8</p></td>
+<td class="text-right"><p>4.03</p></td>
+<td class="text-right"><p>266</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>H200</p></td>
+<td class="text-center"><p>64k</p></td>
+<td class="text-center"><p>BF16</p></td>
+<td class="text-right"><p>4.37</p></td>
+<td class="text-right"><p>1962</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>H200</p></td>
+<td class="text-center"><p>64k</p></td>
+<td class="text-center"><p>FP8</p></td>
+<td class="text-right"><p>4.10</p></td>
+<td class="text-right"><p>1045</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>B200</p></td>
+<td class="text-center"><p>16k</p></td>
+<td class="text-center"><p>BF16</p></td>
+<td class="text-right"><p>7.08</p></td>
+<td class="text-right"><p>303</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>B200</p></td>
+<td class="text-center"><p>16k</p></td>
+<td class="text-center"><p>FP8</p></td>
+<td class="text-right"><p>5.46</p></td>
+<td class="text-right"><p>196</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>B200</p></td>
+<td class="text-center"><p>64k</p></td>
+<td class="text-center"><p>BF16</p></td>
+<td class="text-right"><p>7.10</p></td>
+<td class="text-right"><p>1209</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>B200</p></td>
+<td class="text-center"><p>64k</p></td>
+<td class="text-center"><p>FP8</p></td>
+<td class="text-right"><p>5.68</p></td>
+<td class="text-right"><p>755</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The following figures plot <strong>speedup vs. achieved sparsity</strong>, on top of the baseline performance:</p>
+<table style="width: 100%; border: 0;">
+  <tr>
+    <td style="width: 50%; padding: 0 8px; vertical-align: top;">
+      <p align="center"><b>Hopper (H200)</b></p>
+      <p align="center"><b>Prefill</b></p>
+      <img src="../media/tech_blog16_hopper_prefill.png" alt="Hopper prefill kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <p align="center"><b>Decode</b></p>
+      <img src="../media/tech_blog16_hopper_decode.png" alt="Hopper decode kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+    </td>
+    <td style="width: 50%; padding: 0 8px; vertical-align: top;">
+      <p align="center"><b>Blackwell (B200)</b></p>
+      <p align="center"><b>Prefill</b></p>
+      <img src="../media/tech_blog16_blackwell_prefill.png" alt="Blackwell prefill kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <p align="center"><b>Decode</b></p>
+      <img src="../media/tech_blog16_blackwell_decode.png" alt="Blackwell decode kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+    </td>
+  </tr>
+</table>
+<p>Skip Softmax Attention could further boost the performance of FP8 attention, though the gain is less significant compared to BF16.</p>
+</section>
+<section id="end-to-end-performance">
+<h3>End-to-end Performance<a class="headerlink" href="#end-to-end-performance" title="Link to this heading">#</a></h3>
+<p>We benchmark the end-to-end performance to demonstrate the benefit of Skip Softmax Attention. Due to the quadratic complexity of the attention, the TTFT in long-context scenarios is often a severe blocker for real-world usage. Skip Softmax Attention can significantly reduce the TTFT by accelerating the prefilling kernel, and the TPOT can also be reduced if the context length is long enough. The experiemnt is conducted on a single H200 or B200 GPU, using the exact same dataset as the accuracy evaluation.</p>
+<p><strong>LongBench V1, avg ISL=10k, OSL=6:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Target Sparsity</p></th>
+<th class="head text-right"><p>TTFT/ms (H200)</p></th>
+<th class="head text-right"><p>TPOT/ms (H200)</p></th>
+<th class="head text-right"><p>TTFT/ms (B200)</p></th>
+<th class="head text-right"><p>TPOT/ms (B200)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>0.0</p></td>
+<td class="text-right"><p>9419.61</p></td>
+<td class="text-right"><p>1731.80</p></td>
+<td class="text-right"><p>4854.55</p></td>
+<td class="text-right"><p>928.45</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.1</p></td>
+<td class="text-right"><p>9519.40</p></td>
+<td class="text-right"><p>1746.73</p></td>
+<td class="text-right"><p>4758.06</p></td>
+<td class="text-right"><p>909.08</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.2</p></td>
+<td class="text-right"><p>9417.36</p></td>
+<td class="text-right"><p>1729.74</p></td>
+<td class="text-right"><p>4794.23</p></td>
+<td class="text-right"><p>916.64</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.3</p></td>
+<td class="text-right"><p>9304.48</p></td>
+<td class="text-right"><p>1711.27</p></td>
+<td class="text-right"><p>4770.26</p></td>
+<td class="text-right"><p>913.51</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.4</p></td>
+<td class="text-right"><p>9139.85</p></td>
+<td class="text-right"><p>1684.78</p></td>
+<td class="text-right"><p>4672.09</p></td>
+<td class="text-right"><p>896.25</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.5</p></td>
+<td class="text-right"><p>8847.43</p></td>
+<td class="text-right"><p>1633.08</p></td>
+<td class="text-right"><p>4548.07</p></td>
+<td class="text-right"><p>873.80</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.6</p></td>
+<td class="text-right"><p>8437.45</p></td>
+<td class="text-right"><p>1560.64</p></td>
+<td class="text-right"><p>4459.08</p></td>
+<td class="text-right"><p>858.60</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.7</p></td>
+<td class="text-right"><p>8134.72</p></td>
+<td class="text-right"><p>1508.60</p></td>
+<td class="text-right"><p>4385.12</p></td>
+<td class="text-right"><p>846.64</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.8</p></td>
+<td class="text-right"><p>8107.73</p></td>
+<td class="text-right"><p>1507.82</p></td>
+<td class="text-right"><p>4348.80</p></td>
+<td class="text-right"><p>831.88</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.9</p></td>
+<td class="text-right"><p>8130.39</p></td>
+<td class="text-right"><p>1516.16</p></td>
+<td class="text-right"><p>4150.44</p></td>
+<td class="text-right"><p>798.93</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>LongBench V1 results are reported with concurrency 64. Due to the nature of in-flight batching, the decoding requests might be piggybacked with the prefilling requests, so the TPOT is relatively high.</p>
+<p><strong>LongBench V2, avg ISL=130k, OSL=200:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Target Sparsity</p></th>
+<th class="head text-right"><p>TTFT/ms (H200)</p></th>
+<th class="head text-right"><p>TPOT/ms (H200)</p></th>
+<th class="head text-right"><p>TTFT/ms (B200)</p></th>
+<th class="head text-right"><p>TPOT/ms (B200)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>0.0</p></td>
+<td class="text-right"><p>16486.70</p></td>
+<td class="text-right"><p>9.34</p></td>
+<td class="text-right"><p>6990.59</p></td>
+<td class="text-right"><p>6.30</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.1</p></td>
+<td class="text-right"><p>16487.54</p></td>
+<td class="text-right"><p>8.61</p></td>
+<td class="text-right"><p>7024.50</p></td>
+<td class="text-right"><p>6.30</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.2</p></td>
+<td class="text-right"><p>16169.69</p></td>
+<td class="text-right"><p>8.61</p></td>
+<td class="text-right"><p>6687.21</p></td>
+<td class="text-right"><p>6.34</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.3</p></td>
+<td class="text-right"><p>15750.17</p></td>
+<td class="text-right"><p>8.46</p></td>
+<td class="text-right"><p>6616.12</p></td>
+<td class="text-right"><p>6.33</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.4</p></td>
+<td class="text-right"><p>15288.68</p></td>
+<td class="text-right"><p>8.61</p></td>
+<td class="text-right"><p>6432.32</p></td>
+<td class="text-right"><p>6.27</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.5</p></td>
+<td class="text-right"><p>14554.04</p></td>
+<td class="text-right"><p>8.45</p></td>
+<td class="text-right"><p>6193.92</p></td>
+<td class="text-right"><p>6.29</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.6</p></td>
+<td class="text-right"><p>14323.08</p></td>
+<td class="text-right"><p>8.44</p></td>
+<td class="text-right"><p>5966.53</p></td>
+<td class="text-right"><p>6.32</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.7</p></td>
+<td class="text-right"><p>13871.32</p></td>
+<td class="text-right"><p>8.42</p></td>
+<td class="text-right"><p>5769.19</p></td>
+<td class="text-right"><p>6.31</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>0.8</p></td>
+<td class="text-right"><p>12922.99</p></td>
+<td class="text-right"><p>8.58</p></td>
+<td class="text-right"><p>5605.66</p></td>
+<td class="text-right"><p>6.23</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>0.9</p></td>
+<td class="text-right"><p>12507.95</p></td>
+<td class="text-right"><p>8.58</p></td>
+<td class="text-right"><p>5276.67</p></td>
+<td class="text-right"><p>6.29</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Due to the extremely long context length, we only run LongBench V2 with concurrency 1. In this scenario, the prefilling/decoding is better separated and we can observe how is TTFT/TPOT affected by the sparsity. Note that the speedup for decoding is less pronounced under small batch size. Small batch size and small number of heads (with TP) are more close to real-world usage for long-context serving due to the limit of SLO, and we are actively optimizing the decoding performance under such scenarios.</p>
+</section>
+</section>
+<section id="reproduction">
+<h2>Reproduction<a class="headerlink" href="#reproduction" title="Link to this heading">#</a></h2>
+<p>We provide the commands to reproduce the results in the previous context, as a showcase of how to evaluate the accuracy and benchmark the performance for Skip Softmax Attention.</p>
+<section id="accuracy-evaluation-longbench-v1-v2">
+<h3>Accuracy evaluation (LongBench V1/V2)<a class="headerlink" href="#accuracy-evaluation-longbench-v1-v2" title="Link to this heading">#</a></h3>
+<p>Both LongBench V1 and V2 are integrated into the TensorRT-LLM accuracy test suite, <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code>. Here are the example scripts to run the accuracy evaluation:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Dump the extra LLM API options YAML file.</span>
+cat<span class="w"> </span>&gt;extra_llm_api_options.yaml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="s">kv_cache_config:</span>
+<span class="s">    free_gpu_memory_fraction: 0.8</span>
+<span class="s">sparse_attention_config:</span>
+<span class="s">    algorithm: skip_softmax</span>
+<span class="s">    threshold_scale_factor:</span>
+<span class="s">        prefill: ${thr_prefill}</span>
+<span class="s">        decode: ${thr_decode}</span>
+<span class="s">EOF</span>
+</pre></div>
+</div>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Evaluate LongBench V1.</span>
+trtllm-eval<span class="w"> </span>--model<span class="w"> </span>Qwen/Qwen3-30B-A3B-Instruct-2507<span class="w"> </span><span class="se">\</span>
+<span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">100000</span><span class="w"> </span><span class="se">\</span>
+<span class="w"> </span>--extra_llm_api_options<span class="w"> </span>extra_llm_api_options.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w"> </span>longbench_v1<span class="w"> </span><span class="se">\</span>
+<span class="w"> </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">OUTPUT_DIR</span><span class="si">}</span><span class="w">  </span><span class="c1"># Dump dataset for perf benching</span>
+</pre></div>
+</div>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Evaluate LongBench V2.</span>
+trtllm-eval<span class="w"> </span>--model<span class="w"> </span>Qwen/Qwen3-30B-A3B-Instruct-2507<span class="w"> </span><span class="se">\</span>
+--max_batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">262144</span><span class="w"> </span><span class="se">\</span>
+--extra_llm_api_options<span class="w"> </span>extra_llm_api_options.yaml<span class="w"> </span><span class="se">\</span>
+longbench_v2<span class="w"> </span><span class="se">\</span>
+--length<span class="w"> </span>medium<span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># Medium subset of LongBench V2</span>
+--max_input_length<span class="w"> </span><span class="m">256000</span><span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># Truncate the prompt length to 256k</span>
+--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">OUTPUT_DIR</span><span class="si">}</span><span class="w">  </span><span class="c1"># Dump dataset for perf benching</span>
+</pre></div>
+</div>
+</section>
+<section id="end-to-end-performance-ttft-tpot">
+<h3>End-to-end performance (TTFT/TPOT)<a class="headerlink" href="#end-to-end-performance-ttft-tpot" title="Link to this heading">#</a></h3>
+<p>The option <code class="docutils literal notranslate"><span class="pre">--output_dir</span></code> in <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code> will dump the dataset in the format required by <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> as <code class="docutils literal notranslate"><span class="pre">dumped_ids.json</span></code>. After getting the data, we can perform end-to-end benchmarking:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Benchmark on LongBench V1.</span>
+trtllm-bench<span class="w"> </span>--model<span class="w"> </span>Qwen/Qwen3-30B-A3B-Instruct-2507<span class="w"> </span><span class="se">\</span>
+throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="si">${</span><span class="nv">OUTPUT_DIR</span><span class="si">}</span>/dumped_ids.json<span class="w"> </span><span class="se">\</span>
+--concurrency<span class="w"> </span><span class="m">64</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">100000</span><span class="w"> </span><span class="se">\</span>
+--extra_llm_api_options<span class="w"> </span>extra_llm_api_options.yaml<span class="w"> </span><span class="se">\</span>
+--warmup<span class="w"> </span><span class="m">0</span><span class="w"> </span>--streaming<span class="w"> </span><span class="se">\</span>
+--report_json<span class="w"> </span><span class="si">${</span><span class="nv">OUTPUT_DIR</span><span class="si">}</span>/report.json
+</pre></div>
+</div>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Benchmark on LongBench V2.</span>
+trtllm-bench<span class="w"> </span>--model<span class="w"> </span>Qwen/Qwen3-30B-A3B-Instruct-2507<span class="w"> </span><span class="se">\</span>
+throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="si">${</span><span class="nv">OUTPUT_DIR</span><span class="si">}</span>/dumped_ids.json<span class="w"> </span><span class="se">\</span>
+--concurrency<span class="w"> </span><span class="m">1</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">262144</span><span class="w"> </span><span class="se">\</span>
+--extra_llm_api_options<span class="w"> </span>extra_llm_api_options.yaml<span class="w"> </span><span class="se">\</span>
+--warmup<span class="w"> </span><span class="m">0</span><span class="w"> </span>--streaming<span class="w"> </span><span class="se">\</span>
+--report_json<span class="w"> </span><span class="si">${</span><span class="nv">OUTPUT_DIR</span><span class="si">}</span>/report.json
+</pre></div>
+</div>
+</section>
+</section>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
+<p>Skip Softmax Attention is a kernel-based solution for accelerating the attention. Due to the design that BMM1 (<span class="math notranslate nohighlight">\(Q \cdot K^T\)</span>) in the attention kernel is not skipped, the performance gain is capped to 1.8x at kernel level. Nevertheless, it excels at achieving high sparsity with minimal accuracy degradation, and is especially effective in the medium-to-long context scenarios where previous methods like MInference cannot well handle, because the introduced runtime overhead may not pay off the speedup of the attention kernel. The drop-in nature of Skip Softmax Attention makes it a flexible, easy-to-use method for accelerating long-context inference. The Skip Softmax Attention kernels will also be available in FlashInfer for adoptions by the open-source community.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#method-overview">Method Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#example-usage">Example Usage</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#accuracy-evaluation">Accuracy Evaluation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-benchmark">Performance Benchmark</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-performance">Kernel Performance</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-performance">End-to-end Performance</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reproduction">Reproduction</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#accuracy-evaluation-longbench-v1-v2">Accuracy evaluation (LongBench V1/V2)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-performance-ttft-tpot">End-to-end performance (TTFT/TPOT)</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on February 08, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b464c75">b464c75</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

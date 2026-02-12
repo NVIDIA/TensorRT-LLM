@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Example Run Script &#8212; TensorRT LLM</title>
+    <title>Export ONNX for EdgeLLM &#8212; TensorRT LLM</title>
   
   
   
@@ -59,11 +59,11 @@
     <script src="../../../_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'torch/auto_deploy/advanced/example_run';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'features/auto_deploy/advanced/export_onnx';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc2" />
+  <meta name="docsearch:version" content="1.3.0rc3" />
 
 
   </head>
@@ -222,6 +222,10 @@
     </div>
   
 
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
   
 </div>
 
@@ -403,27 +407,28 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sparse-attention.html">Sparse Attention</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -443,6 +448,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -500,7 +506,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Example Run Script</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Export ONNX for EdgeLLM</span></li>
   </ul>
 </nav>
 </div>
@@ -517,85 +523,139 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="example-run-script">
-<h1>Example Run Script<a class="headerlink" href="#example-run-script" title="Link to this heading">#</a></h1>
-<p>To build and run AutoDeploy example, use the <code class="docutils literal notranslate"><span class="pre">examples/auto_deploy/build_and_run_ad.py</span></code> script:</p>
+  <section class="tex2jax_ignore mathjax_ignore" id="export-onnx-for-edgellm">
+<h1>Export ONNX for EdgeLLM<a class="headerlink" href="#export-onnx-for-edgellm" title="Link to this heading">#</a></h1>
+<p>AutoDeploy provides a mode to export PyTorch/HuggingFace models to ONNX format specifically designed for EdgeLLM deployment. This mode performs graph transformations to fuse RoPE (Rotary Position Embedding) and attention operations into a single <code class="docutils literal notranslate"><span class="pre">AttentionPlugin</span></code> operation, then exports the optimized graph to ONNX.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">export_edgellm_onnx</span></code> mode differs from the standard AutoDeploy workflow in two key ways:</p>
+<ol class="arabic simple">
+<li><p><strong>Operation Fusion</strong>: Fuses <code class="docutils literal notranslate"><span class="pre">torch_rope_with_explicit_cos_sin</span></code> and <code class="docutils literal notranslate"><span class="pre">torch_cached_attention_with_cache</span></code> into a single <code class="docutils literal notranslate"><span class="pre">AttentionPlugin</span></code> operation</p></li>
+<li><p><strong>ONNX Export</strong>: Outputs an ONNX model file instead of a TensorRT Engine</p></li>
+</ol>
+</section>
+<section id="quick-start">
+<h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h2>
+<p>Use the <code class="docutils literal notranslate"><span class="pre">onnx_export_llm.py</span></code> script to export a model:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/auto_deploy
-python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span>--model<span class="w"> </span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span>
+python<span class="w"> </span>onnx_export_llm.py<span class="w"> </span>--model<span class="w"> </span><span class="s2">&quot;deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B&quot;</span>
 </pre></div>
 </div>
-<p>You can configure your experiment with various options. Use the <code class="docutils literal notranslate"><span class="pre">-h/--help</span></code> flag to see available options:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span>--help
-</pre></div>
-</div>
-<p>The following is a non-exhaustive list of common configuration options:</p>
+<p>This will export the model to ONNX format in the current directory.</p>
+</section>
+<section id="command-line-options">
+<h2>Command Line Options<a class="headerlink" href="#command-line-options" title="Link to this heading">#</a></h2>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
-<tr class="row-odd"><th class="head"><p>Configuration Key</p></th>
+<tr class="row-odd"><th class="head"><p>Option</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
 <th class="head"><p>Description</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--model</span></code></p></td>
-<td><p>The HF model card or path to a HF checkpoint folder</p></td>
+<td><p>str</p></td>
+<td><p>Required</p></td>
+<td><p>HuggingFace model name or path to a local checkpoint</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--args.model-factory</span></code></p></td>
-<td><p>Choose model factory implementation (<code class="docutils literal notranslate"><span class="pre">&quot;AutoModelForCausalLM&quot;</span></code>, …)</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--device</span></code></p></td>
+<td><p>str</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cpu</span></code></p></td>
+<td><p>Device to use for export (<code class="docutils literal notranslate"><span class="pre">cpu</span></code> or <code class="docutils literal notranslate"><span class="pre">cuda</span></code>)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--args.skip-loading-weights</span></code></p></td>
-<td><p>Only load the architecture, not the weights</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--args.model-kwargs</span></code></p></td>
-<td><p>Extra kwargs that are being passed to the model initializer in the model factory</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--args.tokenizer-kwargs</span></code></p></td>
-<td><p>Extra kwargs that are being passed to the tokenizer initializer in the model factory</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--args.world-size</span></code></p></td>
-<td><p>The number of GPUs used for auto-sharding the model</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--args.runtime</span></code></p></td>
-<td><p>Specifies which type of Engine to use during runtime (<code class="docutils literal notranslate"><span class="pre">&quot;demollm&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;trtllm&quot;</span></code>)</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--args.compile-backend</span></code></p></td>
-<td><p>Specifies how to compile the graph at the end</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--args.attn-backend</span></code></p></td>
-<td><p>Specifies kernel implementation for attention</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--args.mla-backend</span></code></p></td>
-<td><p>Specifies implementation for multi-head latent attention</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--args.max-seq-len</span></code></p></td>
-<td><p>Maximum sequence length for inference/cache</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--args.max-batch-size</span></code></p></td>
-<td><p>Maximum dimension for statically allocated KV cache</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--args.attn-page-size</span></code></p></td>
-<td><p>Page size for attention</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--prompt.batch-size</span></code></p></td>
-<td><p>Number of queries to generate</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--benchmark.enabled</span></code></p></td>
-<td><p>Whether to run the built-in benchmark (true/false)</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--output_dir</span></code></p></td>
+<td><p>str</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">.</span></code></p></td>
+<td><p>Directory to save the exported ONNX model</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>For default values and additional configuration options, refer to the <code class="docutils literal notranslate"><span class="pre">ExperimentConfig</span></code> class in <code class="docutils literal notranslate"><span class="pre">examples/auto_deploy/build_and_run_ad.py</span></code> file.</p>
-<p>The following is a more complete example of using the script:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/auto_deploy
-python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
---model<span class="w"> </span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="w"> </span><span class="se">\</span>
---args.world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
---args.runtime<span class="w"> </span><span class="s2">&quot;demollm&quot;</span><span class="w"> </span><span class="se">\</span>
---args.compile-backend<span class="w"> </span><span class="s2">&quot;torch-compile&quot;</span><span class="w"> </span><span class="se">\</span>
---args.attn-backend<span class="w"> </span><span class="s2">&quot;flashinfer&quot;</span><span class="w"> </span><span class="se">\</span>
---benchmark.enabled<span class="w"> </span>True
+</section>
+<section id="examples">
+<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h2>
+<section id="basic-export">
+<h3>Basic Export<a class="headerlink" href="#basic-export" title="Link to this heading">#</a></h3>
+<p>Export a DeepSeek model with default settings:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>onnx_export_llm.py<span class="w"> </span>--model<span class="w"> </span><span class="s2">&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;</span>
 </pre></div>
 </div>
+</section>
+<section id="custom-output-location">
+<h3>Custom Output Location<a class="headerlink" href="#custom-output-location" title="Link to this heading">#</a></h3>
+<p>Export to a specific directory with a custom filename:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>onnx_export_llm.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span><span class="s2">&quot;deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="s2">&quot;./exported_models&quot;</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="output-files">
+<h2>Output Files<a class="headerlink" href="#output-files" title="Link to this heading">#</a></h2>
+<p>The export process generates the following files in the output directory:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model.onnx</span></code></p></td>
+<td><p>The exported ONNX model with fused attention operations</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">config.json</span></code></p></td>
+<td><p>Model configuration (architecture, hidden size, etc.)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code></p></td>
+<td><p>Tokenizer vocabulary and configuration</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tokenizer_config.json</span></code></p></td>
+<td><p>Tokenizer settings</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">special_tokens_map.json</span></code></p></td>
+<td><p>Special token mappings</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">processed_chat_template.json</span></code></p></td>
+<td><p>Processed chat template for inference</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="programmatic-usage">
+<h2>Programmatic Usage<a class="headerlink" href="#programmatic-usage" title="Link to this heading">#</a></h2>
+<p>You can also use the ONNX export functionality programmatically:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.auto_deploy</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">AutoDeployConfig</span>
+
+<span class="c1"># Create AutoDeploy config with export_edgellm_onnx mode</span>
+<span class="n">ad_config</span> <span class="o">=</span> <span class="n">AutoDeployConfig</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;</span><span class="p">,</span>
+    <span class="n">mode</span><span class="o">=</span><span class="s2">&quot;export_edgellm_onnx&quot;</span><span class="p">,</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">max_seq_len</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+    <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="c1"># Configure attention backend</span>
+<span class="n">ad_config</span><span class="o">.</span><span class="n">attn_backend</span> <span class="o">=</span> <span class="s2">&quot;torch&quot;</span>
+
+<span class="c1"># Optionally customize output location</span>
+<span class="n">ad_config</span><span class="o">.</span><span class="n">transforms</span><span class="p">[</span><span class="s2">&quot;export_to_onnx&quot;</span><span class="p">][</span><span class="s2">&quot;output_dir&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;./my_output&quot;</span>
+
+<span class="c1"># Run the export</span>
+<span class="n">LLM</span><span class="p">(</span><span class="o">**</span><span class="n">ad_config</span><span class="o">.</span><span class="n">to_llm_kwargs</span><span class="p">())</span>
+</pre></div>
+</div>
+</section>
+<section id="notes">
+<h2>Notes<a class="headerlink" href="#notes" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Device Selection</strong>: Using <code class="docutils literal notranslate"><span class="pre">cpu</span></code> for the <code class="docutils literal notranslate"><span class="pre">--device</span></code> option is recommended to reduce GPU memory footprint during export.</p></li>
+<li><p><strong>Custom Operations</strong>: The exported ONNX model contains custom operations (e.g., <code class="docutils literal notranslate"><span class="pre">AttentionPlugin</span></code>) in the <code class="docutils literal notranslate"><span class="pre">trt</span></code> domain that require corresponding implementations in the target inference runtime.</p></li>
+</ul>
+</section>
 </section>
 
 
@@ -615,9 +675,35 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
             
             
 
-<div class="bd-sidebar-secondary"></div>
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start">Quick Start</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#command-line-options">Command Line Options</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#basic-export">Basic Export</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#custom-output-location">Custom Output Location</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#output-files">Output Files</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#programmatic-usage">Programmatic Usage</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
               
             
 
@@ -705,9 +791,9 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 30, 2026.</p>
+  <p>Last updated on February 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/f42a6cb">f42a6cb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b464c75">b464c75</a>.</p>
   
 </div></div>
       
