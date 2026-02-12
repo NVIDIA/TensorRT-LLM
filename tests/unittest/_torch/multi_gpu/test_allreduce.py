@@ -716,8 +716,8 @@ def run_minimax_allreduce_rms_op(input: torch.Tensor, tensor_parallel_size: int,
                           -1).to(torch.float32)
     rms_weights = rms_weights.reshape(tensor_parallel_size,
                                       -1).to(torch.float32)
-    rank_input = input[:, tensor_parallel_rank, :]
-    rank_rms_weights = rms_weights[tensor_parallel_rank, :]
+    rank_input = input[:, tensor_parallel_rank, :].contiguous()
+    rank_rms_weights = rms_weights[tensor_parallel_rank, :].contiguous()
     # firstly, calculate the reference output for each rank
     ref_output = rms_norm(input, rms_weights, eps)
     ref_output = ref_output.reshape(total_tokens, tensor_parallel_size,
@@ -732,9 +732,9 @@ def run_minimax_allreduce_rms_op(input: torch.Tensor, tensor_parallel_size: int,
     ))
     minimax_output = minimax_allreduce_rms(
         input=rank_input,
-        rms_weights=rank_rms_weights,
+        rms_weights=rank_rms_weights.to(torch.bfloat16),
         eps=eps,
-    )
+    ).to(origin_dtype)
 
     # finally, verify the results
     torch.testing.assert_close(minimax_output, ref_output, rtol=0.2, atol=0.2)
@@ -763,7 +763,7 @@ def test_minimax_allreduce_rms(mpi_pool_executor):
     torch.manual_seed(42)
 
     seq_len = 16
-    hidden_size = 7168
+    hidden_size = 6144
     dtype = torch.bfloat16
     tensor_parallel_size = mpi_pool_executor.num_workers
 

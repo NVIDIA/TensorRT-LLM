@@ -164,7 +164,7 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
     {
         alignas(16) float vals[4];
         float sum_variance = 0.F;
-        *reinterpret_cast<float4*>(vals) = reinterpret_cast<float4*>(params.allreduce_in)[access_id];
+        *reinterpret_cast<float4*>(vals) = reinterpret_cast<float4*>(params.allreduce_in)[idx];
 #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
@@ -224,11 +224,12 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
 #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
-            vals[i] = vals[i] * rsqrtf(sum_variance + params.rms_eps) * static_cast<float>(norm_weight[i]);
+            vals[i] = vals[i] * rsqrtf((sum_variance / static_cast<float>(params.hidden_dim) / NRanks) + params.rms_eps)
+                * static_cast<float>(norm_weight[i]);
         }
 
         // step 4: store the rms norm
-        reinterpret_cast<float4*>(params.rms_norm_out)[access_id] = *reinterpret_cast<float4*>(vals);
+        reinterpret_cast<float4*>(params.rms_norm_out)[idx] = *reinterpret_cast<float4*>(vals);
     }
     for (int idx = access_id; idx < clear_access; idx += access_stride)
     {

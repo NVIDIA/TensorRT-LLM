@@ -24,7 +24,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import AllReduce
+from ..distributed import AllReduce, MiniMaxAllReduceRMS
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -130,6 +130,8 @@ class MiniMaxRMSNorm(nn.Module):
         self.dtype = dtype
         self.all_reduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.NCCL)
 
+        self.minimax_all_reduce_rms = MiniMaxAllReduceRMS(mapping=self.mapping)
+
     # TODO: add load weights method
     def load_weights(self, weights: Dict):
         assert len(weights) == 1
@@ -151,15 +153,7 @@ class MiniMaxRMSNorm(nn.Module):
         """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        rms_norm_out = torch.ops.trtllm.minimax_allreduce_rms(
-            hidden_states,
-            self.weight,
-            self.workspace,
-            self.mapping.tp_rank,
-            self.mapping.tp_size,
-            self.eps,
-            False,
-        )
+        rms_norm_out = self.minimax_all_reduce_rms(hidden_states, self.weight, self.eps)
         return rms_norm_out.to(input_dtype)
 
 
