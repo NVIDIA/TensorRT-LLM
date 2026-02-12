@@ -457,8 +457,7 @@ class PyTorchModelEngine(ModelEngine):
         # This way it can also be used for CUDA graphs.
         if self.use_beam_search:
             self.cache_indirection_attention = torch.zeros(
-                (self.batch_size, self.max_beam_width, self.max_seq_len +
-                 (0 if self._disable_overlap_scheduler else 1)),
+                (self.batch_size, self.max_beam_width, self.max_seq_len),
                 device="cuda",
                 dtype=torch.int32)
         else:
