@@ -53,7 +53,6 @@ target_link_libraries(
          ${TORCH_LIBRARIES}
          torch_python
          ${CUDA_DRV_LIB}
-         ${CUDA_NVML_LIB}
          th_common
          pg_utils)
 target_compile_definitions(

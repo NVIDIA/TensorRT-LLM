@@ -23,7 +23,7 @@
 #include <nvshmem/nvshmemx.h>
 #endif
 #if ENABLE_MULTI_DEVICE
-#include <nvml.h>
+#include "tensorrt_llm/common/nvmlWrapper.h"
 #endif
 #include <unistd.h>
 
@@ -46,7 +46,8 @@
         nvmlReturn_t retval = cmd;                                                                                     \
         if (retval != NVML_SUCCESS)                                                                                    \
         {                                                                                                              \
-            printf("Failed: NVML error %s:%d '%s'\n", __FILE__, __LINE__, nvmlErrorString(retval));                    \
+            printf("Failed: NVML error %s:%d '%s'\n", __FILE__, __LINE__,                                              \
+                tensorrt_llm::common::NVMLWrapper::getInstance()->nvmlErrorString(retval));                            \
             exit(EXIT_FAILURE);                                                                                        \
         }                                                                                                              \
     } while (0)
@@ -329,18 +330,41 @@ private:
             return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
         }
 
+        auto nvml = tensorrt_llm::common::NVMLWrapper::getInstance();
+        tensorrt_llm::common::NvmlManager nvmlManager;
+
         nvmlDevice_t nvml_device;
-        nvmlGpuFabricInfo_t fabric_info;
-        NVMLCHECK(nvmlInit_v2());
-        NVMLCHECK(nvmlDeviceGetHandleByIndex(device_id, &nvml_device));
-        NVMLCHECK(nvmlDeviceGetGpuFabricInfo(nvml_device, &fabric_info));
-        NVMLCHECK(nvmlShutdown());
+        NVMLCHECK(nvml->nvmlDeviceGetHandleByIndex(device_id, &nvml_device));
+
+        nvmlGpuFabricState_t fabric_state;
+        nvmlReturn_t fabric_status;
+        if (nvml->hasGpuFabricInfoV())
+        {
+            nvmlGpuFabricInfoV_t fabric_info_v;
+            memset(&fabric_info_v, 0, sizeof(fabric_info_v));
+            fabric_info_v.version = nvmlGpuFabricInfo_v2;
+            NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfoV(nvml_device, &fabric_info_v));
+            fabric_state = fabric_info_v.state;
+            fabric_status = fabric_info_v.status;
+        }
+        else if (nvml->hasGpuFabricInfo())
+        {
+            nvmlGpuFabricInfo_t fabric_info;
+            NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfo(nvml_device, &fabric_info));
+            fabric_state = fabric_info.state;
+            fabric_status = fabric_info.status;
+        }
+        else
+        {
+            TLLM_LOG_TRACE("checking fabric support... NVML fabric info APIs not available.");
+            return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        }
 
         // Check if the fabric is fully initialized.
-        if (fabric_info.state != NVML_GPU_FABRIC_STATE_COMPLETED || fabric_info.status != NVML_SUCCESS)
+        if (fabric_state != NVML_GPU_FABRIC_STATE_COMPLETED || fabric_status != NVML_SUCCESS)
         {
-            TLLM_LOG_TRACE("checking fabric support... fabric state is NOT COMPLETE: state=%u status=%u.",
-                fabric_info.state, fabric_info.status);
+            TLLM_LOG_TRACE("checking fabric support... fabric state is NOT COMPLETE: state=%u status=%u.", fabric_state,
+                fabric_status);
             return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
         }
 
@@ -381,8 +405,7 @@ private:
             return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
         }
 
-        TLLM_LOG_TRACE("fabric status: state=%u status=%u clique=%u", device_id, fabric_info.state, fabric_info.status,
-            fabric_info.cliqueId);
+        TLLM_LOG_TRACE("fabric status: state=%u status=%u", device_id, fabric_state, fabric_status);
 
         CUCHECK(cuMemRelease(handle));
         // If we get here, fabric handles are supported.

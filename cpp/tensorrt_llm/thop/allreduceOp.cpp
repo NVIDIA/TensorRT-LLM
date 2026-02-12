@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/common/ncclUtils.h"
+#include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -85,19 +86,8 @@ struct overloaded : Ts...
 template <class... Ts>
 overloaded(Ts...) -> overloaded<Ts...>;
 
-class NvmlManager
-{
-public:
-    NvmlManager()
-    {
-        NVML_CHECK_THROW(nvmlInit());
-    }
-
-    ~NvmlManager()
-    {
-        NVML_CHECK(nvmlShutdown());
-    }
-};
+using tensorrt_llm::common::NvmlManager;
+using tensorrt_llm::common::NVMLWrapper;
 
 std::set<int> getLocalGroup(std::set<int> const& group)
 {
@@ -965,7 +955,7 @@ private:
         MNNVLFabricInfo info;
 
 #if ENABLE_MULTI_DEVICE
-        // 1. Check CUDA driver version (needs >= 12.0.10)
+        // Check CUDA driver version (needs >= 12.0.10)
         int cudaDriverVersion = -1;
         TLLM_CUDA_CHECK(cudaDriverGetVersion(&cudaDriverVersion));
         if (cudaDriverVersion < 12010)
@@ -974,7 +964,7 @@ private:
             return info;
         }
 
-        // 2. Check multicast support
+        // Check multicast support
         CUdevice cuDevice;
         TLLM_CU_CHECK(cuDeviceGet(&cuDevice, deviceId));
         auto cudaDriver = tensorrt_llm::common::CUDADriverWrapper::getInstance();
@@ -988,7 +978,7 @@ private:
             return info;
         }
 
-        // 3. Check fabric handle support
+        // Check fabric handle support
         int fabricHandleSupported = 0;
         TLLM_CU_CHECK(cudaDriver->cuDeviceGetAttribute(
             &fabricHandleSupported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice));
@@ -998,9 +988,10 @@ private:
             return info;
         }
 
-        // 4. Check NVML GPU Fabric Info using versioned API
+        // Check NVML GPU Fabric Info using versioned API (runtime dispatch)
+        auto nvml = NVMLWrapper::getInstance();
         nvmlDevice_t nvmlDevice;
-        nvmlReturn_t nvmlResult = nvmlDeviceGetHandleByIndex(deviceId, &nvmlDevice);
+        nvmlReturn_t nvmlResult = nvml->nvmlDeviceGetHandleByIndex(deviceId, &nvmlDevice);
         if (nvmlResult != NVML_SUCCESS)
         {
             TLLM_LOG_DEBUG("MNNVL check: Failed to get NVML device handle for device %d - error=%d", deviceId,
@@ -1008,24 +999,48 @@ private:
             return info;
         }
 
-        nvmlGpuFabricInfoV_t fabricInfoV;
-        std::memset(&fabricInfoV, 0, sizeof(fabricInfoV));
-        fabricInfoV.version = NVML_STRUCT_VERSION(GpuFabricInfo, 3);
-        nvmlResult = nvmlDeviceGetGpuFabricInfoV(nvmlDevice, &fabricInfoV);
+        nvmlGpuFabricState_t fabricState;
+        nvmlReturn_t fabricStatus;
+        unsigned char fabricClusterUuid[NVML_GPU_FABRIC_UUID_LEN];
+        unsigned int fabricCliqueId;
+        if (nvml->hasGpuFabricInfoV())
+        {
+            nvmlGpuFabricInfoV_t fabricInfoV;
+            std::memset(&fabricInfoV, 0, sizeof(fabricInfoV));
+            fabricInfoV.version = nvmlGpuFabricInfo_v2;
+            nvmlResult = nvml->nvmlDeviceGetGpuFabricInfoV(nvmlDevice, &fabricInfoV);
+            fabricState = fabricInfoV.state;
+            fabricStatus = fabricInfoV.status;
+            std::memcpy(fabricClusterUuid, fabricInfoV.clusterUuid, NVML_GPU_FABRIC_UUID_LEN);
+            fabricCliqueId = fabricInfoV.cliqueId;
+        }
+        else if (nvml->hasGpuFabricInfo())
+        {
+            nvmlGpuFabricInfo_t fabricInfoLegacy;
+            nvmlResult = nvml->nvmlDeviceGetGpuFabricInfo(nvmlDevice, &fabricInfoLegacy);
+            fabricState = fabricInfoLegacy.state;
+            fabricStatus = fabricInfoLegacy.status;
+            std::memcpy(fabricClusterUuid, fabricInfoLegacy.clusterUuid, NVML_GPU_FABRIC_UUID_LEN);
+            fabricCliqueId = fabricInfoLegacy.cliqueId;
+        }
+        else
+        {
+            TLLM_LOG_DEBUG("MNNVL check: Neither nvmlDeviceGetGpuFabricInfoV nor nvmlDeviceGetGpuFabricInfo available");
+            return info;
+        }
         if (nvmlResult != NVML_SUCCESS)
         {
             TLLM_LOG_DEBUG(
-                "MNNVL check: nvmlDeviceGetGpuFabricInfoV failed for device %d - error=%d (not supported or "
+                "MNNVL check: nvmlDeviceGetGpuFabricInfo failed for device %d - error=%d (not supported or "
                 "no fabric manager)",
                 deviceId, static_cast<int>(nvmlResult));
             return info;
         }
 
         // Check if fabric is fully initialized
-        if (fabricInfoV.state != NVML_GPU_FABRIC_STATE_COMPLETED || fabricInfoV.status != NVML_SUCCESS)
+        if (fabricState != NVML_GPU_FABRIC_STATE_COMPLETED || fabricStatus != NVML_SUCCESS)
         {
-            TLLM_LOG_DEBUG(
-                "MNNVL check: Fabric state not complete - state=%u status=%u", fabricInfoV.state, fabricInfoV.status);
+            TLLM_LOG_DEBUG("MNNVL check: Fabric state not complete - state=%u status=%u", fabricState, fabricStatus);
             return info;
         }
 
@@ -1034,7 +1049,7 @@ private:
         bool clusterUuidValid = false;
         for (int i = 0; i < NVML_GPU_FABRIC_UUID_LEN; ++i)
         {
-            if (fabricInfoV.clusterUuid[i] != 0)
+            if (fabricClusterUuid[i] != 0)
             {
                 clusterUuidValid = true;
                 break;
@@ -1047,7 +1062,7 @@ private:
             return info;
         }
 
-        // 5. Check NVLink links are active (similar to Python support_nvlink(True))
+        // Check NVLink links are active (similar to Python support_nvlink(True))
         unsigned int activeLinks = 0;
         unsigned int availableLinks = 0;
 
@@ -1055,12 +1070,12 @@ private:
         {
             unsigned int capP2p = 0;
             nvmlReturn_t capResult
-                = nvmlDeviceGetNvLinkCapability(nvmlDevice, link, NVML_NVLINK_CAP_P2P_SUPPORTED, &capP2p);
+                = nvml->nvmlDeviceGetNvLinkCapability(nvmlDevice, link, NVML_NVLINK_CAP_P2P_SUPPORTED, &capP2p);
             if (capResult == NVML_SUCCESS && capP2p)
             {
                 availableLinks++;
                 nvmlEnableState_t linkState;
-                if (nvmlDeviceGetNvLinkState(nvmlDevice, link, &linkState) == NVML_SUCCESS
+                if (nvml->nvmlDeviceGetNvLinkState(nvmlDevice, link, &linkState) == NVML_SUCCESS
                     && linkState == NVML_FEATURE_ENABLED)
                 {
                     activeLinks++;
@@ -1077,12 +1092,12 @@ private:
         }
 
         // Device supports MNNVL - copy fabric info
-        std::memcpy(info.clusterUuid, fabricInfoV.clusterUuid, NVML_GPU_FABRIC_UUID_LEN);
-        info.cliqueId = fabricInfoV.cliqueId;
+        std::memcpy(info.clusterUuid, fabricClusterUuid, NVML_GPU_FABRIC_UUID_LEN);
+        info.cliqueId = fabricCliqueId;
         info.isValid = true;
 
         TLLM_LOG_INFO("MNNVL check: Device %d supports MNNVL (clusterUuid=%s, cliqueId=%u)", deviceId,
-            info.getClusterUuidString().c_str(), fabricInfoV.cliqueId);
+            info.getClusterUuidString().c_str(), fabricCliqueId);
 #endif
         return info;
     }
@@ -1104,6 +1119,7 @@ private:
         bool is_inter_node = (mGroup.size() != local_group.size());
 
         NvmlManager nvml_manager;
+        auto const& nvml = nvml_manager.sharedWrapper();
         mIsP2PSupported = true;
         mIsNVLINKSupported = true;
         mIsMNNVLSupported = false;
@@ -1134,26 +1150,27 @@ private:
                     }
 
                     nvmlDevice_t first_device;
-                    NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(first_device_id, &first_device));
+                    NVML_CHECK_THROW(nvml->nvmlDeviceGetHandleByIndex(first_device_id, &first_device));
 
                     bool is_NVLINK = false;
 
                     for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; link++)
                     {
                         nvmlPciInfo_t remote_pci_info;
-                        if (nvmlDeviceGetNvLinkRemotePciInfo_v2(first_device, link, &remote_pci_info) != NVML_SUCCESS)
+                        if (nvml->nvmlDeviceGetNvLinkRemotePciInfo(first_device, link, &remote_pci_info)
+                            != NVML_SUCCESS)
                         {
                             continue;
                         }
 
                         nvmlDevice_t remote_device;
-                        auto const result = nvmlDeviceGetHandleByPciBusId_v2(remote_pci_info.busId, &remote_device);
+                        auto const result = nvml->nvmlDeviceGetHandleByPciBusId(remote_pci_info.busId, &remote_device);
 
                         if (result == NVML_SUCCESS)
                         {
                             // Two GPUs are connected directly through nvlink
                             unsigned int remote_device_id;
-                            NVML_CHECK_THROW(nvmlDeviceGetIndex(remote_device, &remote_device_id));
+                            NVML_CHECK_THROW(nvml->nvmlDeviceGetIndex(remote_device, &remote_device_id));
 
                             if (remote_device_id == static_cast<unsigned int>(second_device_id))
                             {
@@ -1167,12 +1184,12 @@ private:
                             // determine whether nvlink is supported by whether two GPUs are connected to the same
                             // nvswitch.
                             nvmlDevice_t second_device;
-                            NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(second_device_id, &second_device));
+                            NVML_CHECK_THROW(nvml->nvmlDeviceGetHandleByIndex(second_device_id, &second_device));
 
                             for (unsigned int second_link = 0; second_link < NVML_NVLINK_MAX_LINKS; second_link++)
                             {
                                 nvmlPciInfo_t second_remote_pci_info;
-                                if (nvmlDeviceGetNvLinkRemotePciInfo_v2(
+                                if (nvml->nvmlDeviceGetNvLinkRemotePciInfo(
                                         second_device, second_link, &second_remote_pci_info)
                                     != NVML_SUCCESS)
                                 {
