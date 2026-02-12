@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,10 +48,6 @@ namespace tensorrt_llm::executor
 {
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
-// Mmkey is used in KVCacheBlock when multimodal data presents in a block.
-// Type alias for hash array + start offset at per-block granularity.
-// This differs from the per-request level multimodal hash in MultimodalInput.
-using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
 
 /// @brief Version of TRT-LLM
 char const* version() noexcept;
@@ -301,11 +297,13 @@ class MultimodalInput
 {
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
-        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths);
+        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
+    [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
 
 private:
     friend class Serialization;
@@ -315,6 +313,9 @@ private:
     std::vector<SizeType32> mMultimodalPositions;
     /// @brief The multimodal lengths
     std::vector<SizeType32> mMultimodalLengths;
+    /// @brief Optional user-provided UUIDs for multimodal items.
+    /// When provided, these are returned in KV cache events instead of content hashes.
+    std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
 };
 
 /// @brief Configuration for mrope

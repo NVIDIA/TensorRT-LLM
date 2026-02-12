@@ -664,10 +664,18 @@ def create_input_processor_with_hash(
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
         Process the multinmodal hashing for media tokens if possible.
+
+        Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
+        When a UUID is provided for a multimodal item, it will be used as the
+        cache identifier and returned in KV cache events instead of the content hash.
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
-        mm_hashes = apply_mm_hashes(mm_data, hash_lib)
+
+        # Extract optional UUIDs (can be None, or dict with same structure as mm_data)
+        mm_uuids = inputs.get('multi_modal_uuids', None)
+
+        mm_hashes, mm_uuid_list = apply_mm_hashes(mm_data, mm_uuids, hash_lib)
         prompt_token_ids, extra_processed_inputs = input_processor(
             inputs, sampling_params)
 
@@ -698,15 +706,15 @@ def create_input_processor_with_hash(
             extra_processed_inputs["multimodal_data"][
                 "special_token_offsets"] = start_special_token_positions
         # flatten the hashes from dict to a single list
-        mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
-        validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
+        mm_hashes_flat = [h for hashes in mm_hashes.values() for h in hashes]
+        validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
                            num_mm_tokens)
-        mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
+        mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
                            ]  # nested list w/ multiple int32 per hash
 
         extra_processed_inputs[
             "multimodal_input"] = MultimodalInput.from_components(
-                mm_hashes_int32, start_positions, num_mm_tokens)
+                mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list)
         return prompt_token_ids, extra_processed_inputs
 
     def input_processor_wrapper(

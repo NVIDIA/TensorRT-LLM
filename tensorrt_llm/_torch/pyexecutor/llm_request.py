@@ -846,10 +846,12 @@ def executor_request_to_llm_request(
     multimodal_hashes = None
     multimodal_positions = None
     multimodal_lengths = None
+    multimodal_uuids = None
     if executor_request.multimodal_input is not None:
         multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
         multimodal_positions = executor_request.multimodal_input.multimodal_positions
         multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
+        multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
@@ -879,6 +881,7 @@ def executor_request_to_llm_request(
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
+        multimodal_uuids=multimodal_uuids,
         multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
