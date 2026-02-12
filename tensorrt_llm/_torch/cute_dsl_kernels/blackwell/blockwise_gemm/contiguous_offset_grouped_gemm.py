@@ -2672,7 +2672,7 @@ class Sm100BlockwiseContiguousGroupedGemmKernel:
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
-        group_offset_ptr: cute.Pointer,
+        group_offset_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -2692,7 +2692,7 @@ class Sm100BlockwiseContiguousGroupedGemmKernel:
             a_sf_ptr (cute.Pointer): Pointer for the scale factor tensor for A.
             b_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for B.
             c_ptr (cute.Pointer): Pointer to the C tensor.
-            group_offset_ptr (cute.Pointer): Tensor for group offset.
+            group_offset_tensor (cute.Tensor): Tensor for group offset. Used for tvm ffi stream detection.
             max_active_clusters (cutlass.Constexpr): Maximum number of active
                 clusters.
             current_stream (cuda.CUstream): CUDA stream for the operation.
@@ -2733,13 +2733,6 @@ class Sm100BlockwiseContiguousGroupedGemmKernel:
             layout=cute.make_ordered_layout(
                 (sf_n, sf_k, group_size),
                 order=(1, 0, 2),
-            ),
-        )
-        group_offset_tensor = cute.make_tensor(
-            group_offset_ptr,
-            layout=cute.make_ordered_layout(
-                (group_size + 1),
-                order=(0),
             ),
         )
 

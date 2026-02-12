@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -310,7 +311,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-        use_cute_dsl_fp8 (bool): Whether to use CuteDSL FP8 blockwise gemm.
     """
 
     def __init__(
@@ -331,7 +331,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
-        use_cute_dsl_fp8: bool = False,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -358,7 +357,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
-        self.use_cute_dsl_fp8 = use_cute_dsl_fp8
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled
@@ -605,7 +603,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             use_fp8_block_scaling=True,
         )
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        if is_sm_100f() and self.use_cute_dsl_fp8:
+        use_cute_dsl = os.environ.get(
+            "TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM", "0") == "1"
+        if is_sm_100f() and use_cute_dsl:
             x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
                 input=x,
                 weight=self.w3_w1_weight.view(weight_dtype),
@@ -623,7 +623,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             )
         x = swiglu_fused_moe(x)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        if is_sm_100f() and self.use_cute_dsl_fp8:
+        if is_sm_100f() and use_cute_dsl:
             x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
                 input=x,
                 weight=self.w2_weight.view(weight_dtype),

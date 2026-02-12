@@ -2819,8 +2819,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # [m, k]
             m, k = inputs[0].shape[0], inputs[0].shape[1]
             # [group_size, n, k]
-            group_size, n, k = inputs[1].shape[0], inputs[1].shape[1], inputs[
-                1].shape[2]
+            group_size, n = inputs[1].shape[0], inputs[1].shape[1]
             batch_size = 1
             # m,k
             a_major = "k"
@@ -2895,49 +2894,49 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     (1, 1),
                 ]
 
-            a, b, a_sf, b_sf, group_offset = inputs
-            m, k, n = a.shape[0], a.shape[1], b.shape[1]
-            group_size = b.shape[0]
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, group_offset_tensor = inputs
+            m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[1]
+            group_size = b_tensor.shape[0]
             sf_m = m
             sf_n = ceil_div(n, 128)
             sf_k = ceil_div(k, 128)
-            c = torch.empty(*(m, n), dtype=torch.bfloat16, device=a.device)
+            c_tensor = torch.empty(*(m, n),
+                                   dtype=torch.bfloat16,
+                                   device=a_tensor.device)
 
-            a_ptr = make_ptr(
-                cutlass.Float8E4M3FN,
-                a.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            b_ptr = make_ptr(
-                cutlass.Float8E4M3FN,
-                b.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            c_ptr = make_ptr(
-                cutlass.BFloat16,
-                c.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            a_sf_ptr = make_ptr(
-                cutlass.Float32,
-                a_sf.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            b_sf_ptr = make_ptr(
-                cutlass.Float32,
-                b_sf.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            group_offset_ptr = make_ptr(
-                cutlass.Int32,
-                group_offset.data_ptr(),
-                cute.AddressSpace.gmem,
-            )
+            if not self.use_tvm_ffi:
+                a_ptr = make_ptr(
+                    cutlass.Float8E4M3FN,
+                    a_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_ptr = make_ptr(
+                    cutlass.Float8E4M3FN,
+                    b_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                c_ptr = make_ptr(
+                    cutlass.BFloat16,
+                    c_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                a_sf_ptr = make_ptr(
+                    cutlass.Float32,
+                    a_sf_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_sf_ptr = make_ptr(
+                    cutlass.Float32,
+                    b_sf_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                group_offset_cute_tensor = cute.runtime.from_dlpack(
+                    group_offset_tensor).mark_layout_dynamic(leading_dim=0)
 
             # get stream
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -2946,8 +2945,46 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_2cta_instrs,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                self.use_tvm_ffi,
             )
             if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        a_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        b_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    c_ptr = make_ptr(
+                        cutlass.BFloat16,
+                        c_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    a_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        a_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        b_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    group_offset_cute_tensor = cute.runtime.from_dlpack(
+                        group_offset_tensor).mark_layout_dynamic(leading_dim=0)
+                    # make faked stream for TVM FFI
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
                 gemm = self.__class__.kernel_class(
                     cutlass.Float32,  # acc_dtype,
                     use_2cta_instrs=use_2cta_instrs,
@@ -2974,33 +3011,53 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_sf_ptr,
                     b_sf_ptr,
                     c_ptr,
-                    group_offset_ptr,
+                    group_offset_cute_tensor,
                     max_active_clusters,
                     stream,
+                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
             # launch gemm kernel
-            compiled_gemm(
-                m,
-                n,
-                k,
-                sf_m,
-                sf_n,
-                sf_k,
-                1,  # batch
-                group_size,
-                a_ptr,
-                b_ptr,
-                a_sf_ptr,
-                b_sf_ptr,
-                c_ptr,
-                group_offset_ptr,
-                stream=stream,
-            )
-            return c
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    1,  # batch
+                    group_size,
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    a_sf_tensor.data_ptr(),
+                    b_sf_tensor.data_ptr(),
+                    c_tensor.data_ptr(),
+                    group_offset_tensor,
+                )
+            else:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    1,  # batch
+                    group_size,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    group_offset_cute_tensor,
+                    stream=stream,
+                )
+            return c_tensor
 
     # a/b: fp8, scale: fp32, out: bf16
     @torch.library.custom_op(
