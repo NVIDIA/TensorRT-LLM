@@ -1141,3 +1141,31 @@ class TestPyTorchBackendModelDefaults:
             assert modified_args.max_batch_size == 42
             assert modified_args.enable_chunked_prefill == True
             assert modified_args.kv_cache_config.enable_block_reuse == False
+
+    @pytest.mark.part0
+    def test_empty_nested_config_preserves_defaults(self):
+        """Passing an empty nested config (e.g. KvCacheConfig()) should not
+        block model defaults from applying to that config's sub-fields.
+
+        This covers the pattern used by tests that conditionally build a
+        KvCacheConfig: ``kv_cache_config=KvCacheConfig(...) if cond else
+        KvCacheConfig()``.  The else-branch must not shadow model defaults
+        like ``enable_block_reuse=False``.
+        """
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                kv_cache_config=KvCacheConfig(),
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            # Model defaults set enable_block_reuse=False and
+            # free_gpu_memory_fraction=0.75.  An empty KvCacheConfig()
+            # should not prevent these from being applied.
+            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
