@@ -313,6 +313,11 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+        # WAR for https://nvbugs/5807902
+        # Disable separate draft KV cache in disaggregated mode
+        if cache_transceiver_config is not None or kv_connector_config is not None:
+            spec_config._allow_separate_draft_kv_cache = False
+
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
@@ -431,10 +436,8 @@ def create_py_executor(
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
-    if not llm_args.disable_overlap_scheduler:
-        model_engine_max_seq_len = model_engine.max_seq_len + 1
-        if spec_config is not None:
-            model_engine_max_seq_len += spec_config.max_total_draft_tokens
+    if not llm_args.disable_overlap_scheduler and spec_config is not None:
+        model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
@@ -623,6 +626,10 @@ def create_py_executor(
 
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
+
+        # Get draft config for one-engine speculative decoding if available
+        draft_config = getattr(model_engine.model, 'draft_config', None)
+
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
@@ -640,6 +647,7 @@ def create_py_executor(
             profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
+            draft_config=draft_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with allocation_scope(

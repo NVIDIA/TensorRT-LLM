@@ -16,6 +16,7 @@
 
 #include "fused_multihead_attention_v2.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <cmath>
@@ -152,10 +153,9 @@ TFusedMHAKernelList const* TFusedMHAKernelFactory<TFusedMHAKernelList>::getXMMAK
 template <typename TFusedMHAKernelList>
 TFusedMHAKernelFactory<TFusedMHAKernelList>& TFusedMHAKernelFactory<TFusedMHAKernelList>::Get()
 {
-    int device_id;
-    cudaGetDevice(&device_id);
     static std::unique_ptr<TFusedMHAKernelFactory<TFusedMHAKernelList>> s_factory[32] = {nullptr};
-    TLLM_CHECK(device_id <= 32);
+    int const device_id = tensorrt_llm::common::getDevice();
+    TLLM_CHECK_WITH_INFO(device_id < 32, "Invalid device_id %d (must be < 32)", device_id);
     if (s_factory[device_id] == nullptr)
     {
         s_factory[device_id] = std::make_unique<TFusedMHAKernelFactory<TFusedMHAKernelList>>(

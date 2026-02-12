@@ -48,3 +48,21 @@ llm_spark_perf:
   - perf/test_perf.py::test_perf[gemma_3_12b_it-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[gemma_3_12b_it_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[gemma_3_12b_it_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
+# ===============================================================================
+# 2: Multi-GPU (2 GPUs) Spark perf cases with multinode support
+# ===============================================================================
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+  tests:
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[deepseek_r1_distill_llama_70b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2]
+   # Qwen3-235B-A22B-FP4 with Eagle3 speculative decoding
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4_eagle3-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2]

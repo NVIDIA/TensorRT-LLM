@@ -128,6 +128,7 @@ MODEL_PATH_DICT = {
     "qwen3_32b_fp4": "Qwen3/nvidia-Qwen3-32B-NVFP4",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+    "qwen3_235b_a22b_fp4_eagle3": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
     "qwen2_5_vl_7b_instruct": "Qwen2.5-VL-7B-Instruct",
     "qwen2_5_vl_7b_instruct_fp8": "multimodals/Qwen2.5-VL-7B-Instruct-FP8",
     "qwen2_5_vl_7b_instruct_fp4": "multimodals/Qwen2.5-VL-7B-Instruct-FP4",
@@ -1508,14 +1509,32 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         # Construct MPI command.
         mpi_cmd = []
-        if num_gpus > 1 and num_gpus <= 8 and not self._config.runtime == "bench":
-            if cpu_socket_count_gt_1():
-                mpi_cmd = [
-                    "mpirun", "--map-by", "socket", "-n", f"{num_gpus}",
-                    "--allow-run-as-root"
-                ]
-            else:
-                mpi_cmd = ["mpirun", "-n", f"{num_gpus}", "--allow-run-as-root"]
+        if num_gpus > 1 and num_gpus <= 8:
+            # For bench runtime: optionally use mpirun to propagate environment variables.
+            # Set TRTLLM_BENCH_USE_MPIRUN=1 to enable (needed for newer GPUs like GB10
+            # where Triton's bundled ptxas doesn't support the architecture).
+            if self._config.runtime == "bench" and os.getenv(
+                    "TRTLLM_BENCH_USE_MPIRUN"):
+                mpi_cmd = ["mpirun", "-n", f"{num_gpus}"]
+
+                # Pass environment variables that are set
+                for var in ["CPATH", "TRITON_PTXAS_PATH", "TRTLLM_LOG_LEVEL"]:
+                    if os.getenv(var):
+                        mpi_cmd.extend(["-x", var])
+
+                mpi_cmd.append("trtllm-llmapi-launch")
+            elif self._config.runtime != "bench":
+                # Non-bench runtimes (original behavior)
+                if cpu_socket_count_gt_1():
+                    mpi_cmd = [
+                        "mpirun", "--map-by", "socket", "-n", f"{num_gpus}",
+                        "--allow-run-as-root"
+                    ]
+                else:
+                    mpi_cmd = [
+                        "mpirun", "-n", f"{num_gpus}", "--allow-run-as-root"
+                    ]
+
         if self._build_script == "trtllm-bench":
             return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
                                            mpi_cmd, is_python)
