@@ -369,6 +369,29 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-relax")
 endif()
 
+# ==== BOLT Compatible Flags ====
+# These flags enable LLVM BOLT binary compatible:
+# -fno-reorder-blocks-and-partition: Prevents compiler from splitting hot/cold
+# blocks -fno-plt: Removes PLT stubs for additional performance
+# -Wl,--emit-relocs (or -Wl,-q): Preserves relocation info for BOLT Note:
+# Binaries should NOT be stripped for BOLT to work Usage: cmake
+# -DENABLE_BOLT_COMPATIBLE=ON ...
+option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
+if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
+  message(STATUS "BOLT compatible flags enabled")
+  # Compiler flags for C/C++
+  add_compile_options(-fno-reorder-blocks-and-partition -fno-plt)
+  # Linker flags - applies to shared, module, and executable targets
+  add_link_options(-Wl,--emit-relocs)
+  # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
+  set(CMAKE_STRIP
+      ""
+      CACHE STRING "Disabled for BOLT compatibility" FORCE)
+  message(STATUS "BOLT: Disabled CMAKE_STRIP to prevent binary stripping")
+endif()
+# Note: For nanobind modules, use NOSTRIP option in nanobind_add_module()
+# ==== End BOLT Compatible Flags ====
+
 # Disable deprecated declarations warnings
 if(NOT WIN32)
   set(CMAKE_CXX_FLAGS "-Wno-deprecated-declarations ${CMAKE_CXX_FLAGS}")

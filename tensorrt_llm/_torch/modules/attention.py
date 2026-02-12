@@ -336,13 +336,14 @@ class Attention(nn.Module):
                              key="sparse_attention_config")
 
             if config.sparse_attention_config.algorithm == "rocket":
-                logger.warning("disable rope_fusion for RocketKV.")
+                logger.warning_once("disable rope_fusion for RocketKV.",
+                                    key="disable_rope_fusion_for_rocketkv")
                 self.rope_fusion = False
 
         if self.rope_fusion and not attn_cls.support_fused_rope():
-            logger.warning(
-                "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion."
-            )
+            logger.warning_once(
+                "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion.",
+                key="disable_rope_fusion_for_non_supported_backend")
             self.rope_fusion = False
         # If rope_fusion is not specified, enable if the attention backend supports it.
         if self.rope_fusion is None:
@@ -824,8 +825,9 @@ class MLA(nn.Module):
         # tensor parallel
         config = config or ModelConfig()
         if mapping_with_cp is not None:
-            logger.warning(
-                "[MLA::__init__] Overriding mapping with CP detected.")
+            logger.warning_once(
+                "[MLA::__init__] Overriding mapping with CP detected.",
+                key="mla_init_mapping_with_cp")
             self.mapping = mapping_with_cp
         else:
             self.mapping = config.mapping

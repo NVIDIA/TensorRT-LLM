@@ -22,7 +22,6 @@ from transformers import AutoConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.utils import ActivationType, relu2
 
 from ..attention_backend import AttentionMetadata
@@ -424,8 +423,6 @@ class NemotronHModel(DecoderModel):
             dtype=config.torch_dtype,
         )
 
-        self.mamba_metadata: Optional[Mamba2Metadata] = None
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -440,11 +437,7 @@ class NemotronHModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        if self.mamba_metadata is None or self.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            self.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests,
-                chunk_size=self.model_config.pretrained_config.chunk_size)
-        self.mamba_metadata.prepare(attn_metadata)
+        mamba_metadata = attn_metadata.mamba_metadata
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -456,7 +449,7 @@ class NemotronHModel(DecoderModel):
                                   hidden_states,
                                   attn_metadata,
                                   spec_metadata=spec_metadata,
-                                  mamba_metadata=self.mamba_metadata)
+                                  mamba_metadata=mamba_metadata)
 
         hidden_states = self.norm_f(hidden_states)
 
@@ -665,11 +658,10 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         )
 
         if self.has_end_norm:
-            if residual is not None:
-                hidden_states = hidden_states + residual
-                residual = None
-
-            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states, residual = self.final_layernorm(
+                hidden_states, residual)
+            # The last step, so don't forward the residual.
+            residual = None
 
         return hidden_states, residual
 
@@ -697,9 +689,7 @@ class NemotronHMTP(nn.Module):
         # Build pattern-based layers
         self.layers = nn.ModuleDict()
 
-        for i in range(self.pattern_len):
-            step_rel_idx = i % self.pattern_len
-
+        for step_rel_idx in range(self.pattern_len):
             char = self.pattern_str[step_rel_idx]
 
             is_start_of_step = step_rel_idx == 0
@@ -717,7 +707,7 @@ class NemotronHMTP(nn.Module):
                 skip_create_weights_in_init,
             )
 
-            self.layers[str(i)] = NemotronHMTPDecoderLayer(
+            self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
                 model_config=sublayer_model_config,
                 layer_idx=self.layer_idx,
                 aux_stream_dict=aux_stream_dict,

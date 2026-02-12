@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
+from mpi4py.util import pkl5
 
 from .._utils import global_mpi_rank, global_mpi_size
 
@@ -327,7 +328,7 @@ def split_world_comm(
         f"global_rank: {global_rank}, instance_idx: {instance_idx}, sub_rank: {sub_rank}, is_leader: {is_leader}"
     )
 
-    return is_leader, instance_idx, sub_comm
+    return is_leader, instance_idx, pkl5.Intracomm(sub_comm)
 
 
 def parse_metadata_server_config_file(

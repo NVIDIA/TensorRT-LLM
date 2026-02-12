@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime
 import gc
 import json
@@ -57,7 +58,8 @@ from llmapi.lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request)
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu
+from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu, altered_env
+
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
@@ -2171,11 +2173,16 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         llm_args_extra["fast_build"] = True
         LLM_CLASS = LLM
 
-    with LLM_CLASS(model=llama_model_path,
-                   kv_cache_config=global_kvcache_config,
-                   tensor_parallel_size=tp_size,
-                   pipeline_parallel_size=pp_size,
-                   **llm_args_extra) as llm:
+    # Since we need to check pp's internal states, we disable the async broadcast
+    # to get a deterministic behavior.
+    env_ctx = altered_env(TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE="0") \
+        if pp_size > 1 else contextlib.nullcontext()
+
+    with env_ctx, LLM_CLASS(model=llama_model_path,
+                            kv_cache_config=global_kvcache_config,
+                            tensor_parallel_size=tp_size,
+                            pipeline_parallel_size=pp_size,
+                            **llm_args_extra) as llm:
 
         max_tokens = 5
         sampling_params = SamplingParams(max_tokens=max_tokens,

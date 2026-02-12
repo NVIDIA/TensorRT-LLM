@@ -31,6 +31,8 @@
 /CONTAINER_SOURCE.md @NVIDIA/trt-llm-doc-owners
 /CONTRIBUTING.md @NVIDIA/trt-llm-doc-owners
 /README.md @NVIDIA/trt-llm-doc-owners
+/CLAUDE.md @NVIDIA/trt-llm-doc-owners
+/AGENTS.md @NVIDIA/trt-llm-doc-owners
 
 ## Examples
 /examples @NVIDIA/trt-llm-doc-owners
@@ -154,6 +156,8 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ## TensorRT-LLM LLM API
 /tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
+/tensorrt_llm/serve @NVIDIA/trt-llm-llmapi-devs
+/tensorrt_llm/commands @NVIDIA/trt-llm-llmapi-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners

@@ -21,6 +21,8 @@ from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -204,15 +206,24 @@ class Mamba2Mixer(nn.Module):
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
-        state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-        )[:num_prefills + num_decodes]
+        if use_cpp_mamba_cache_manager():
+            state_indices = mamba_metadata.state_indices[:num_prefills +
+                                                         num_decodes]
+            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
+                self.layer_idx)
+            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
+                self.layer_idx)
+            layer_cache = None  # Not used in C++ path
+        else:
+            state_indices = attn_metadata.kv_cache_manager.get_state_indices(
+            )[:num_prefills + num_decodes]
+            layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
+                self.layer_idx)
+            conv_states = layer_cache.conv
+            ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
-        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
-            self.layer_idx)
-        conv_states = layer_cache.conv
-        ssm_states = layer_cache.temporal
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
@@ -310,6 +321,9 @@ class Mamba2Mixer(nn.Module):
             is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
             ) and spec_metadata is not None
             if is_target_verify:
+                # Speculative decoding only supported with Python path
+                assert layer_cache is not None, \
+                    "Speculative decoding requires Python MambaCacheManager"
                 # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window

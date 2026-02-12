@@ -234,6 +234,29 @@ def get_model_yaml_config(model_label: str,
                 'enable_chunked_prefill': False,
             }
         },
+        # Qwen3-235B-A22B-FP4 with Eagle3 speculative decoding
+        {
+            'patterns': [
+                'qwen3_235b_a22b_fp4_eagle3-bench-pytorch',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'enable_autotuner': False,
+                'enable_chunked_prefill': False,
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3",
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
         # Llama-v3.3 models with fp8 quantization
         {
             'patterns': [
