@@ -118,7 +118,7 @@ class CppMambaCacheManager(BaseResourceManager):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # For Mamba cache manager, we always need one slot per request.
         return 1
-    
+
     def is_speculative(self) -> bool:
         # C++ MambaCacheManager does not support speculative decoding
         return False
