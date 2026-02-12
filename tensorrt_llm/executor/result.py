@@ -170,7 +170,7 @@ class GenerationResultBase:
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
-        self.disaggregated_params = None
+        self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
@@ -196,7 +196,6 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
-        self._mm_embedding_handle: Optional[Dict[str, Any]] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -234,9 +233,9 @@ class GenerationResultBase:
         return self._context_logits
 
     @property
-    # TODO: Keep this property only for backward compatibility. In the future, access multimodal embedding handles from disaggregated_params instead.
-    def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
-        return self._mm_embedding_handle
+    def disaggregated_params(self) -> Optional[DisaggregatedParams]:
+        """Returns the disaggregated params."""
+        return self._disaggregated_params
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -420,7 +419,7 @@ class GenerationResultBase:
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and
                 # `mrope_position_deltas_handle`. However, explicitly set
                 # `multimodal_embedding_handles=None` since they should no longer be needed.
-                self.disaggregated_params = dataclasses.replace(
+                self._disaggregated_params = dataclasses.replace(
                     existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
                     first_gen_tokens=context_phase_params.first_gen_tokens,
@@ -447,19 +446,16 @@ class GenerationResultBase:
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
-            if hasattr(response_result, 'mm_embedding_handle'
-                       ) and response_result.mm_embedding_handle is not None:
-                self._mm_embedding_handle = response_result.mm_embedding_handle
-                if self.disaggregated_params is not None:
-                    self.disaggregated_params.multimodal_embedding_handles = [
-                        response_result.mm_embedding_handle
-                    ],
-                    self.disaggregated_params.multimodal_hashes = self._multimodal_hashes
+            if hasattr(response_result, "mm_embedding_handles"
+                       ) and response_result.mm_embedding_handles is not None:
+                # mm_embedding_handles is a list of handles (one per multimodal item).
+                mm_embedding_handles = response_result.mm_embedding_handles
+                if self._disaggregated_params is not None:
+                    self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
+                    self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
                 else:
-                    self.disaggregated_params = DisaggregatedParams(
-                        multimodal_embedding_handles=[
-                            response_result.mm_embedding_handle
-                        ],
+                    self._disaggregated_params = DisaggregatedParams(
+                        multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes)
 
             # Handle mrope handles for both:
@@ -468,9 +464,9 @@ class GenerationResultBase:
             #    were already computed in encode phase, but mrope still needs forwarding)
             if (getattr(response_result, "mrope_position_ids_handle", None)
                     is not None and self.disaggregated_params is not None):
-                self.disaggregated_params.mrope_position_ids_handle = (
+                self._disaggregated_params.mrope_position_ids_handle = (
                     response_result.mrope_position_ids_handle)
-                self.disaggregated_params.mrope_position_deltas_handle = (
+                self._disaggregated_params.mrope_position_deltas_handle = (
                     response_result.mrope_position_deltas_handle)
 
             # Processing background errors here ASAF during generation.
@@ -716,7 +712,7 @@ class GenerationResult(GenerationResultBase):
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
-        self.disaggregated_params = disaggregated_params
+        self._disaggregated_params = disaggregated_params
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers
@@ -837,7 +833,7 @@ class GenerationResult(GenerationResultBase):
             'outputs',
             'finished',
             "context_logits",
-            "mm_embedding_handle",
+            "disaggregated_params",
         ]
 
     def __repr__(self) -> str:
