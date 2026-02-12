@@ -43,6 +43,7 @@ namespace torch_ext
 // gamma: [N] - RMSNorm weight (fp16/bf16)
 // sf_scale: [1] - optional scale factor for FP4 quantization (float)
 // use_rms_norm: bool - if true use RMSNorm, else use LayerNorm
+// eps: float - layernorm epsilon
 // output_hp_norm: bool - if true, also output high precision normalized values (same dtype as input) for MoE gate.
 // Returns:
 //   normed_output: [M, N/8] - FP4 quantized normalized output (uint32_t, packed)
