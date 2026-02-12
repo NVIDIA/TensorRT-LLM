@@ -67,7 +67,14 @@ if(NIXL_ENABLED OR MOONCAKE_ENABLED)
   set(AGENT_BINDING_SOURCES "")
   list(APPEND AGENT_BINDING_SOURCES agentBindings.cpp)
 
-  nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET} ${AGENT_BINDING_SOURCES})
+  # NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
+  if(ENABLE_BOLT_COMPATIBLE)
+    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET} NOSTRIP
+                        ${AGENT_BINDING_SOURCES})
+  else()
+    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET}
+                        ${AGENT_BINDING_SOURCES})
+  endif()
   message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
 
   target_compile_options(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE -Wno-error)
