@@ -18,7 +18,8 @@ from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
+from utils.util import (check_accuracy, getSMVersion, isSM100Family,
+                        skip_blackwell, skip_blackwell_geforce,
                         skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
                         skip_pre_blackwell, skip_pre_hopper)
 
@@ -70,6 +71,19 @@ def moe_trtllm_debug_msg(enable=False):
             "TLLM_BATCHED_GEMM_PRINT_NAME"] = TLLM_BATCHED_GEMM_PRINT_NAME
         os.environ[
             "TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = TLLM_BATCHED_GEMM_PRINT_CONFIGS
+
+
+@contextmanager
+def cute_dsl_fp8_block_scales():
+    TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM = os.environ.get(
+        "TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM", "0")
+    # enable
+    os.environ["TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM"] = "1"
+    try:
+        yield
+    finally:
+        os.environ[
+            "TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM"] = TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM
 
 
 def round_up(x, alignment):
@@ -1038,7 +1052,10 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
-@skip_pre_blackwell
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
@@ -1062,8 +1079,6 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     INTERMEDIATE_SIZE = 1536
     NUM_EXPERTS = num_experts
     TOP_K = 6
-
-    os.environ["TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM"] = "1"
 
     routing_method = RoutingMethodCls(top_k=TOP_K)
 
@@ -1138,19 +1153,6 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
-    fused_moe = CuteDslFusedMoE(
-        num_experts=NUM_EXPERTS,
-        routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
-        reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
-        weight_loading_mode=WeightLoadingMode,
-    )
-    fused_moe.cuda()
-    fused_moe.load_weights([weights])
-
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
@@ -1164,9 +1166,24 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
 
-    with torch.inference_mode():
-        output = fused_moe.forward(x, router_logits)
-        ref_output = ref_fused_moe.forward(x, router_logits)
+    with cute_dsl_fp8_block_scales():
+        fused_moe = CuteDslFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ModelConfig(quant_config=quant_config,
+                                     mapping=mapping),
+            weight_loading_mode=WeightLoadingMode,
+        )
+        fused_moe.cuda()
+        fused_moe.load_weights([weights])
+
+        with torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+            ref_output = ref_fused_moe.forward(x, router_logits)
 
     # compare
     torch.cuda.synchronize()

@@ -2802,6 +2802,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def __init__(self, use_tvm_ffi: bool = True):
             super().__init__()
+            if (sm_version := get_sm_version()) not in (100, 103):
+                raise ValueError(
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 and SM 103 only, but got SM {sm_version}"
+                )
             self.use_tvm_ffi = use_tvm_ffi
 
         def get_valid_tactics(
@@ -2816,10 +2820,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"CuteDSL FP8 Group Gemm only supports SM 100 family. Skipping all tactics."
                 )
                 return []
-            # [m, k]
-            m, k = inputs[0].shape[0], inputs[0].shape[1]
-            # [group_size, n, k]
-            group_size, n = inputs[1].shape[0], inputs[1].shape[1]
+            m, k, n = inputs[0].shape[0], inputs[0].shape[1], inputs[1].shape[1]
             batch_size = 1
             # m,k
             a_major = "k"
@@ -3076,6 +3077,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tuner = AutoTuner.get()
         runner = CuteDSLFp8BlackwellGroupedGemmRunner(use_tvm_ffi=use_tvm_ffi)
 
+        if group_offset.dtype != torch.int32:
+            group_offset = group_offset.to(torch.int32)
+
         inputs = [input, weight, input_scale, weight_scale, group_offset]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_fp8_blockwise_grouped_gemm_blackwell::gemm",
@@ -3095,6 +3099,5 @@ if IS_CUTLASS_DSL_AVAILABLE:
         group_offset: torch.Tensor,
         use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
-        m, k = input.shape[0], input.shape[1]
-        num_group, n, k = weight.shape[0], weight.shape[1], weight.shape[2]
+        m, n = input.shape[0], weight.shape[0]
         return input.new_empty((m, n), dtype=torch.bfloat16)
