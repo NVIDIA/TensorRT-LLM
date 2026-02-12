@@ -1950,8 +1950,23 @@ class KVCacheManagerV2(BaseResourceManager):
                     self.free_resources(req)
                     return None
                 kv_cache.stop_committing()
-                kv_cache.resize(token_num + self.num_extra_kv_tokens +
-                                num_extra_decoding_steps)
+                dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
+                kv_cache.resize(dummy_capacity)
+                draft_kv_cache = None
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
+                        req.py_request_id, req.lora_task_id, input_tokens)
+                    success = draft_kv_cache.resume(
+                        torch.cuda.current_stream().cuda_stream)
+                    if not success:
+                        for r in requests:
+                            self.free_resources(r)
+                            draft_kv_cache.free_resources(r)
+                        self.free_resources(req)
+                        draft_kv_cache.free_resources(req)
+                        return None
+                    draft_kv_cache.stop_committing()
+                    draft_kv_cache.resize(dummy_capacity)
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -1959,8 +1974,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    kv_cache.resize(kv_cache.capacity + max_num_draft_tokens +
-                                    1)
+                    new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
+                    kv_cache.resize(new_capacity)
+                    if draft_kv_cache is not None:
+                        draft_kv_cache.resize(new_capacity)
 
             # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
             if use_mrope:
@@ -2185,33 +2202,36 @@ class KVCacheManagerV2(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
-        if not self.is_draft:
-            _update_kv_cache_draft_token_location(self, scheduled_batch,
-                                                  attn_metadata,
-                                                  kv_cache_dtype_byte_size)
-        for req in scheduled_batch.context_requests:
-            if req.py_request_id not in self.kv_cache_map:
-                continue
-            kv_cache = self.kv_cache_map[req.py_request_id]
-            if self.enable_block_reuse and not req.is_dummy_request:
-                if req.context_current_position > kv_cache.num_committed_tokens:
-                    kv_cache.commit(
-                        req.get_tokens(DEFAULT_BEAM_INDEX)
-                        [kv_cache.num_committed_tokens:req.
-                         context_current_position])
-                kv_cache.stop_committing()
-            else:
-                kv_cache.resize(None, req.context_current_position)
+        self._stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._stream):
+            if not self.is_draft:
+                _update_kv_cache_draft_token_location(self, scheduled_batch,
+                                                      attn_metadata,
+                                                      kv_cache_dtype_byte_size)
+            for req in scheduled_batch.context_requests:
+                if req.py_request_id not in self.kv_cache_map:
+                    continue
+                kv_cache = self.kv_cache_map[req.py_request_id]
+                if self.enable_block_reuse and not req.is_dummy_request:
+                    if req.context_current_position > kv_cache.num_committed_tokens:
+                        kv_cache.commit(
+                            req.get_tokens(DEFAULT_BEAM_INDEX)
+                            [kv_cache.num_committed_tokens:req.
+                             context_current_position])
+                    kv_cache.stop_committing()
+                else:
+                    kv_cache.resize(None, req.context_current_position)
 
-        for req in scheduled_batch.generation_requests:
-            if req.py_request_id not in self.kv_cache_map:
-                continue
-            kv_cache = self.kv_cache_map[req.py_request_id]
-            new_capacity = None if req.state in (
-                LlmRequestState.GENERATION_COMPLETE,
-                LlmRequestState.CONTEXT_INIT
-            ) else kv_cache.capacity - req.py_rewind_len
-            kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
+            for req in scheduled_batch.generation_requests:
+                if req.py_request_id not in self.kv_cache_map:
+                    continue
+                kv_cache = self.kv_cache_map[req.py_request_id]
+                new_capacity = None if req.state in (
+                    LlmRequestState.GENERATION_COMPLETE,
+                    LlmRequestState.CONTEXT_INIT
+                ) else kv_cache.capacity - req.py_rewind_len
+                kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
+        torch.cuda.current_stream().wait_stream(self._stream)
 
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
