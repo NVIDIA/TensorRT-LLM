@@ -2,6 +2,7 @@ import base64
 from typing import Optional
 
 import torch
+import inspect
 
 from tensorrt_llm import serialization
 from tensorrt_llm._ray_utils import control_action_decorator
@@ -31,7 +32,7 @@ class WorkerExtension:
 
         >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
     """
-    @control_action_decorator
+    
     def supports_partial_loading(self) -> bool:
         """Check if the model supports partial weight loading."""
         try:
@@ -122,12 +123,10 @@ class WorkerExtension:
                 logger.info(f"weights key size: {len(weights.keys())}")
                 model = self.engine.model_engine.model
                 load_weights_args = inspect.getfullargspec(model.load_weights).args
-                supports_partial_loading = "allow_partial_loading" in load_weights_args
 
-                if supports_partial_loading:
-                    self.engine.model_engine.model_loader.reload(model, weights, allow_partial_loading=True)
-                else:
-                    self.engine.model_engine.model_loader.reload(model, weights, allow_partial_loading=False)
+                self.engine.model_engine.model_loader.reload(
+                    model, weights, allow_partial_loading=self.supports_partial_loading()
+                )
             else:
                 logger.info("Finalize update weights")
                 for module in self.engine.model_engine.model.modules():
