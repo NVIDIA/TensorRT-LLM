@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from typing import List, Mapping, Optional, Tuple, Union
 
@@ -7,6 +8,7 @@ import triton  # type: ignore[import]
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -1677,6 +1679,19 @@ class AllReduceRunner(TunableRunner):
         self.eps = eps
         self.trigger_completion_at_end = trigger_completion_at_end
 
+        # Get extra attributes for Ray path
+        extra_attrs = get_model_extra_attrs()
+        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if extra_attrs[
+            'disable_mpi'] else torch.ops.trtllm.allreduce
+        self.extra_args = {}
+        if extra_attrs['disable_mpi']:
+            assert extra_attrs[
+                'mapping'].tp_group_pg is not None, "TP ProcessGroup not initialised"
+            self.extra_args = {
+                "rank": torch.distributed.get_rank(),
+                "pg": extra_attrs['mapping'].tp_group_pg.boxed(),
+            }
+
     def unique_id(self):
         return (
             self.tp_size,
@@ -1720,18 +1735,19 @@ class AllReduceRunner(TunableRunner):
         if tactic == -1:
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
-        return torch.ops.trtllm.allreduce(
-            input,
-            residual,
-            norm_weight,
-            scale,
-            bias,
-            workspace,
-            self.group,
-            tactic,
-            self.op,
-            self.eps,
-            self.trigger_completion_at_end,
+        return self.all_reduce_op(
+            input=input,
+            residual=residual,
+            norm_weight=norm_weight,
+            scale=scale,
+            bias=bias,
+            workspace=workspace,
+            group=self.group,
+            strategy=tactic,
+            op=self.op,
+            eps=self.eps,
+            trigger_completion_at_end=self.trigger_completion_at_end,
+            **self.extra_args,
         )
 
 
@@ -1760,12 +1776,20 @@ def tunable_allreduce(
         trigger_completion_at_end,
     )
 
-    _, best_tactic = tuner.choose_one(
-        "trtllm::tunable_allreduce::allreduce",
-        [allreduce_runner],
-        AllReduceRunner.tuning_config,
-        [input, residual, norm_weight, scale, bias, workspace],
-    )
+    # In case that AutoTuner brings potential perf regression
+    # TODO: Remove this if no perf regression is observed.
+    disable_allreduce_autotune = os.environ.get(
+        "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
+
+    if strategy == AllReduceStrategy.AUTO.value and not disable_allreduce_autotune:
+        _, best_tactic = tuner.choose_one(
+            "trtllm::tunable_allreduce::allreduce",
+            [allreduce_runner],
+            AllReduceRunner.tuning_config,
+            [input, residual, norm_weight, scale, bias, workspace],
+        )
+    else:
+        best_tactic = strategy
 
     return allreduce_runner(
         [input, residual, norm_weight, scale, bias, workspace],
