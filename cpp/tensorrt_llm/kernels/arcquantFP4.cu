@@ -95,18 +95,6 @@ inline __device__ float4 e2m1_to_float(uint16_t const& packed_e2m1)
 #endif
 }
 
-template <typename T, typename U, int Size = sizeof(U) / sizeof(T)>
-__forceinline__ __device__ float local_abs_max(U* vec, float maxv)
-{
-    T* view = reinterpret_cast<T*>(vec);
-#pragma unroll 4
-    for (int i = 0; i < Size; ++i)
-    {
-        maxv = max((float) maxv, (float) abs((float) view[i]));
-    }
-    return maxv;
-}
-
 __forceinline__ __device__ int64_t get_sf_offset(int row_id, int pos, int K)
 {
     int64_t sf_offset = 0;
@@ -185,14 +173,11 @@ __global__ void quantize_reorder_nvfp4_kernel(
         input_frag[i] = __float2bfloat16_rn((float) input_smem[reorder_index[offset]] * global_scale);
     }
     // Reduce to get max
-    // Each ty should get its max value
-    float4* input_frag_float4 = reinterpret_cast<float4*>(input_frag);
-    constexpr int float4_per_thread = elements_per_thread * sizeof(__nv_bfloat16) / sizeof(float4);
     float maxv = 0, scale = 1.0, r_scale = 1.0;
 #pragma unroll
-    for (int i = 0; i < float4_per_thread; ++i)
+    for (int i = 0; i < elements_per_thread; ++i)
     {
-        maxv = local_abs_max<__nv_bfloat16, float4>(input_frag_float4 + i, maxv);
+        maxv = cuda_max(maxv, __bfloat162float(cuda_abs(input_frag[i])));
     }
     // Q quantize
     scale = cuda_max(maxv / FP4_MAX, SCALE_EPS);
@@ -205,7 +190,6 @@ __global__ void quantize_reorder_nvfp4_kernel(
     r_scale = reciprocal_approximate_ftz(qdq_scale);
     // Quantize each thread's value using PTX hardware instructions
     // Each iteration processes 4 elements using vectorized PTX operations
-    PackFp4* output_frag_fp4 = reinterpret_cast<PackFp4*>(output_frag);
 #pragma unroll 4
     for (int i = 0; i < elements_per_thread; i += 4)
     {
@@ -220,16 +204,6 @@ __global__ void quantize_reorder_nvfp4_kernel(
         // Uses cvt.rn.satfinite.e2m1x2.f32 which bypasses ALU pipeline
         uint16_t packed_e2m1 = fp32_vec4_to_e2m1(scaled_inputs);
 
-        // Unpack e2m1 values and dequantize for residual computation
-        uint8_t byte0 = packed_e2m1 & 0xFF;
-        uint8_t byte1 = (packed_e2m1 >> 8) & 0xFF;
-
-        // Extract e2m1 values (4 bits each)
-        uint8_t e2m1_0 = byte0 & 0xF;
-        uint8_t e2m1_1 = (byte0 >> 4) & 0xF;
-        uint8_t e2m1_2 = byte1 & 0xF;
-        uint8_t e2m1_3 = (byte1 >> 4) & 0xF;
-
         // Dequantize e2m1 to float and compute residuals using PTX instructions
         float4 e2m1_float = e2m1_to_float(packed_e2m1);
         input_frag[i + 0] = __float2bfloat16_rn((float) input_frag[i + 0] - e2m1_float.x * qdq_scale);
@@ -238,10 +212,7 @@ __global__ void quantize_reorder_nvfp4_kernel(
         input_frag[i + 3] = __float2bfloat16_rn((float) input_frag[i + 3] - e2m1_float.w * qdq_scale);
 
         // Store packed e2m1 values to PackFp4 struct
-        output_frag_fp4[i / 2 + 0].low = e2m1_0;
-        output_frag_fp4[i / 2 + 0].high = e2m1_1;
-        output_frag_fp4[i / 2 + 1].low = e2m1_2;
-        output_frag_fp4[i / 2 + 1].high = e2m1_3;
+        reinterpret_cast<uint16_t*>(output_frag)[i / 4] = packed_e2m1;
     }
     int const ke_thread_count = GROUP_NUM(KE);
     int const kq_thread_count = bdx - ke_thread_count;
@@ -251,9 +222,9 @@ __global__ void quantize_reorder_nvfp4_kernel(
         {
             maxv = 0;
 #pragma unroll
-            for (int i = 0; i < float4_per_thread; ++i)
+            for (int i = 0; i < elements_per_thread; ++i)
             {
-                maxv = local_abs_max<__nv_bfloat16, float4>(input_frag_float4 + i, maxv);
+                maxv = cuda_max(maxv, __bfloat162float(cuda_abs(input_frag[i])));
             }
             scale = cuda_max(maxv / FP4_MAX, SCALE_EPS);
             // logical_coord1 = make_coord(make_coord(0, (pos + 1) % 4), (pos + 1) / 4);
@@ -262,7 +233,6 @@ __global__ void quantize_reorder_nvfp4_kernel(
             __nv_fp8_e4m3 scale_ue4m3_res = (__nv_fp8_e4m3) scale;
             q_scale_tensor[sf_offset] = scale_ue4m3_res;
             r_scale = reciprocal_approximate_ftz((float) scale_ue4m3_res);
-            int q_offset = elements_per_thread / 2;
 #pragma unroll 4
             for (int i = 0; i < elements_per_thread; i += 4)
             {
@@ -275,35 +245,18 @@ __global__ void quantize_reorder_nvfp4_kernel(
 
                 // PTX-based quantization of residuals
                 uint16_t packed_e2m1 = fp32_vec4_to_e2m1(scaled_inputs);
-
-                // Unpack e2m1 values and store to PackFp4 struct
-                uint8_t byte0 = packed_e2m1 & 0xFF;
-                uint8_t byte1 = (packed_e2m1 >> 8) & 0xFF;
-
-                uint8_t e2m1_0 = byte0 & 0xF;
-                uint8_t e2m1_1 = (byte0 >> 4) & 0xF;
-                uint8_t e2m1_2 = byte1 & 0xF;
-                uint8_t e2m1_3 = (byte1 >> 4) & 0xF;
-
-                output_frag_fp4[i / 2 + q_offset + 0].low = e2m1_0;
-                output_frag_fp4[i / 2 + q_offset + 0].high = e2m1_1;
-                output_frag_fp4[i / 2 + q_offset + 1].low = e2m1_2;
-                output_frag_fp4[i / 2 + q_offset + 1].high = e2m1_3;
+                reinterpret_cast<uint16_t*>(output_frag)[(i + elements_per_thread) / 4] = packed_e2m1;
             }
         }
         else if constexpr (arcquant_type == ArcQuantType::WEIGHT)
         {
             sf_offset = get_sf_offset(row_id, pos + 1, K);
             q_scale_tensor[sf_offset] = scale_ue4m3;
-
-            int q_offset = elements_per_thread / 2;
 #pragma unroll 4
             for (int i = 0; i < elements_per_thread; i += 4)
             {
-                output_frag_fp4[i / 2 + q_offset + 0].low = output_frag_fp4[i / 2 + 0].low;
-                output_frag_fp4[i / 2 + q_offset + 0].high = output_frag_fp4[i / 2 + 0].high;
-                output_frag_fp4[i / 2 + q_offset + 1].low = output_frag_fp4[i / 2 + 1].low;
-                output_frag_fp4[i / 2 + q_offset + 1].high = output_frag_fp4[i / 2 + 1].high;
+                reinterpret_cast<uint16_t*>(output_frag)[(i + elements_per_thread) / 4]
+                    = reinterpret_cast<uint16_t*>(output_frag)[i / 4];
             }
         }
 
