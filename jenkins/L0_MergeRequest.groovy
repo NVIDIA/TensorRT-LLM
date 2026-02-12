@@ -439,7 +439,8 @@ def launchReleaseCheck(pipeline, globalVars)
             if (changedFileList && !changedFileList.isEmpty()) {
                 def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
                 writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
-                precommitArgs = "--files-from ${changedFilesPath}"
+                // Script runs after "cd ${LLM_ROOT}", so use relative path
+                precommitArgs = "--files-from changed_files.txt"
                 echo "Pre-commit will check ${changedFileList.unique().size()} changed file(s)"
             } else {
                 echo "Could not determine changed files, falling back to all files"

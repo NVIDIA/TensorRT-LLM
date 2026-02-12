@@ -180,20 +180,21 @@ def main():
     parser.add_argument(
         "--files-from",
         default=None,
-        help="Path to a file containing the list of changed files (one per line)",
+        help=
+        "Path to a file containing the list of changed files (one per line)",
     )
     args = parser.parse_args()
 
     # Build pre-commit arguments
     if args.files_from:
         with open(args.files_from) as f:
-            changed_files = [
-                line.strip() for line in f if line.strip()
-            ]
+            changed_files = [line.strip() for line in f if line.strip()]
         if changed_files:
             files_arg = " ".join(f'"{f}"' for f in changed_files)
             precommit_args = f"--files {files_arg}"
-            print(f"=== Running pre-commit on {len(changed_files)} changed file(s) ===")
+            print(
+                f"=== Running pre-commit on {len(changed_files)} changed file(s) ==="
+            )
             for cf in changed_files[:20]:
                 print(f"  {cf}")
             if len(changed_files) > 20:
