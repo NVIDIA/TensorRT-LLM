@@ -675,11 +675,9 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
                                     self.batch_size * (self.max_seq_len - 1))
-        curr_max_num_tokens = min(
-            kv_cache_manager.get_num_available_tokens(
-                token_num_upper_bound=token_num_upper_bound,
-                max_num_draft_tokens=self.original_max_draft_len),
-            token_num_upper_bound)
+        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num_upper_bound,
+            max_num_draft_tokens=self.original_max_draft_len)
         max_batch_size = min(
             self.batch_size,
             curr_max_num_tokens // (1 + self.runtime_draft_len))
@@ -730,11 +728,9 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
                                     self.batch_size * (self.max_seq_len - 1))
-        curr_max_num_tokens = min(
-            kv_cache_manager.get_num_available_tokens(
-                token_num_upper_bound=token_num_upper_bound,
-                max_num_draft_tokens=self.original_max_draft_len),
-            token_num_upper_bound)
+        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num_upper_bound,
+            max_num_draft_tokens=self.original_max_draft_len)
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         with self.no_cuda_graph(), autotune(cache_path=cache_path):
