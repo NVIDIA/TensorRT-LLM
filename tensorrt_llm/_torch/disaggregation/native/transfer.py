@@ -231,15 +231,26 @@ class AuxSendTask:
             ratio = self_tp_size_per_dp_group // peer_tp_size_per_dp_group
             should_send_in_tp = self_tp_rank_in_dp_group % ratio == 0
 
-        should_send_in_pp = False
-        self_pp_size = self_ri.pp_size
-        peer_pp_size = peer_rank_info.pp_size
-        # FIXME:  if pp_layer_num // pp_size !=0, how to handle it?
-        if self_pp_size <= peer_pp_size:
-            should_send_in_pp = True
-        else:
-            ratio = self_pp_size // peer_pp_size
-            should_send_in_pp = self_ri.pp_rank % ratio == 0
+        # Compute peer pp_rank's global layer range from layer_num_per_pp
+        self_layer_num_per_pp = self_ri.layer_num_per_pp
+        peer_layer_num_per_pp = peer_rank_info.layer_num_per_pp
+        peer_start_layer = sum(peer_layer_num_per_pp[: peer_rank_info.pp_rank])
+        peer_end_layer = peer_start_layer + peer_layer_num_per_pp[peer_rank_info.pp_rank]
+
+        # Find the first self pp_rank whose global layers overlap with peer's pp_rank.
+        # All tp/pp ranks have the same aux data, so we only select one self pp_rank
+        # to send to the peer; pick the first overlapping one to avoid duplication.
+        first_matching_self_pp_rank = None
+        self_layer_offset = 0
+        for p in range(self_ri.pp_size):
+            self_start = self_layer_offset
+            self_end = self_start + self_layer_num_per_pp[p]
+            if self_start < peer_end_layer and self_end > peer_start_layer:
+                first_matching_self_pp_rank = p
+                break
+            self_layer_offset += self_layer_num_per_pp[p]
+
+        should_send_in_pp = first_matching_self_pp_rank == self_ri.pp_rank
         return should_send_in_tp and should_send_in_pp
 
     def print_perf_info(self, peer_rank: int):
@@ -532,7 +543,7 @@ class Sender:
         """
         device_id = self._device_id
         torch.cuda.set_device(device_id)
-        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        CUASSERT(cudart.cudaSetDevice(device_id))
 
         task_queue = self._send_task_queues[thread_idx]
         while True:
