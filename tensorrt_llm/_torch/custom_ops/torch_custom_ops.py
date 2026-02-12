@@ -1,5 +1,6 @@
+import threading
 from functools import lru_cache
-from typing import List, Mapping, Optional, Tuple, Union
+from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]
@@ -1655,6 +1656,8 @@ def _(
 
 
 class AllReduceRunner(TunableRunner):
+    _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
+    _prealloc_done: ClassVar[set] = set()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -1682,6 +1685,42 @@ class AllReduceRunner(TunableRunner):
             self.tp_size,
             self.op,
         )
+
+    @classmethod
+    def _maybe_preallocate_buffers(cls,
+                                   input_tensor: torch.Tensor,
+                                   group: List[int],
+                                   do_preparation: bool = False) -> None:
+        if not do_preparation:
+            return
+        if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
+            return
+        if input_tensor.numel() == 0 or input_tensor.size(0) == 0:
+            return
+        if hasattr(torch.cuda, "is_current_stream_capturing"):
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except (RuntimeError, AssertionError):
+                # If capture status can't be queried, avoid prealloc to be safe.
+                return
+
+        num_tokens = int(input_tensor.size(0))
+        if num_tokens <= 0:
+            return
+        group_key = tuple(group)
+        cache_key = (group_key, num_tokens)
+        with cls._prealloc_lock:
+            if cache_key in cls._prealloc_done:
+                return
+            cls._prealloc_done.add(cache_key)
+
+        logger.debug(
+            "[tunable_allreduce] Pre-allocating NCCL window buffers: "
+            "tokens=%d group=%s", num_tokens, list(group))
+        prealloc_input = input_tensor
+        torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
+                                                        2)
 
     def get_valid_tactics(
         self,
@@ -1715,8 +1754,19 @@ class AllReduceRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
         input, residual, norm_weight, scale, bias, workspace = inputs
+        if do_preparation:
+            valid_tactics = self.get_valid_tactics(inputs,
+                                                   OptimizationProfile(),
+                                                   **kwargs)
+            if AllReduceStrategy.NCCL_SYMMETRIC.value in valid_tactics:
+                self._maybe_preallocate_buffers(input,
+                                                self.group,
+                                                do_preparation=True)
+            return input
         if tactic == -1:
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
@@ -1733,6 +1783,15 @@ class AllReduceRunner(TunableRunner):
             self.eps,
             self.trigger_completion_at_end,
         )
+
+
+@torch.library.register_fake("trtllm::preallocate_nccl_window_buffer")
+def _(
+    input: torch.Tensor,
+    group: List[int],
+    count: int,
+) -> None:
+    return None
 
 
 @torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
