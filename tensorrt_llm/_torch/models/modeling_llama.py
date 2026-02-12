@@ -349,11 +349,19 @@ class Llama4MoE(nn.Module):
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
-        final_hidden_states = shared_output + routed_output
         if not self.enable_attention_dp and self.mapping.has_tp():
+            window = self.all_reduce.get_nccl_window_for_shape(
+                shared_output.shape,
+                all_reduce_params=final_all_reduce_params,
+                like_tensor=shared_output,
+            )
+            final_hidden_states = torch.add(shared_output,
+                                            routed_output,
+                                            out=window)
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
-
+        else:
+            final_hidden_states = shared_output + routed_output
         return final_hidden_states
 
 
