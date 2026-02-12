@@ -19,7 +19,6 @@ import torch
 
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 
-from ...utils.cuda_graph import cuda_graph_state
 from ..attention_interface import AttentionRegistry, MHACallable
 from .mamba_backend_common import (
     BaseBackendSSM,
@@ -65,14 +64,7 @@ def _triton_cached_ssm(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-
-    # Get batch dimensions from shared state if available (for CUDA graph replay)
-    shared_batch_info = cuda_graph_state.get_batch_info()
-    if shared_batch_info is not None:
-        num_prefill, num_prefill_tokens, num_decode = shared_batch_info
-    else:
-        num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
     preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]

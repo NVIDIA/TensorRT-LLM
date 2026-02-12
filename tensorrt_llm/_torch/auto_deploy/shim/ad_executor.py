@@ -764,7 +764,7 @@ class ADEngine(ModelEngine):
         gather_required = len(context_requests) > 0 and not gather_context_logits
         logits_gather_info = [len(logits_gather_indices), int(gather_required)]
 
-        # update the sequence info object now
+        # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
             position_ids=position_ids,
@@ -782,13 +782,9 @@ class ADEngine(ModelEngine):
             logits_gather_info=logits_gather_info,
             _gather_idx=None if new_tokens is None else flat_gather_indices,
             _mask_scatter_indices=None if new_tokens is None else mask_scatter_indices,
+            _ungathered_input_ids=new_tokens.flatten() if new_tokens is not None else None,
             **extra_args,
         )
-        # scatter the new tokens into the input_ids tensor if provided
-        if new_tokens is not None:
-            self.cache_seq_interface.info.rescatter_input_ids(new_tokens.flatten())
-
-        self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
 
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager

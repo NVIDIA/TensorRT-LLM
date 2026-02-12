@@ -27,12 +27,6 @@ from ..distributed.common import is_initialized as is_distributed_initialized
 from ..utils.cuda_mem_tracker import bytes_to, get_mem_info
 from ..utils.logger import ad_logger
 
-# Import trtllm_attention config to configure it when pool info is available
-try:
-    from ..custom_ops.trtllm_attention import _trtllm_config as trtllm_attn_config
-except ImportError:
-    trtllm_attn_config = None
-
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 DataType = tensorrt_llm.bindings.DataType
 
@@ -459,16 +453,28 @@ class CachedSequenceInterface:
 
         return manager, num_managed_mamba_layers
 
-    def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> None:
+    def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> int:
         """Retrieve and assign buffer views for managed KV paged resources.
 
         Args:
             kv_managed: Dict of KV resources managed by the cache manager.
+
+        Returns:
+            block_offset_multiplier derived from the first KV cache view's strides.
         """
+        block_offset_multiplier = 0
         for idx, (name, h) in enumerate(kv_managed.items()):
             view = self._kv_cache_manager.get_buffers(idx, kv_layout=h.kv_layout)
             assert view[0].is_contiguous(), f"Non-contiguous kv cache resource for {name}"
             self._caches[name] = view
+
+            # Compute block_offset_multiplier from the first layer's kv_cache strides.
+            # This is stride(0)/stride(1) which equals kv_factor for per-layer views
+            # or num_layers*kv_factor for interleaved pools.
+            if idx == 0:
+                block_offset_multiplier = view.stride(0) // view.stride(1)
+
+        return block_offset_multiplier
 
     def _allocate_unmanaged_resources(self) -> None:
         """Allocate resources not managed by cache managers.
@@ -526,37 +532,32 @@ class CachedSequenceInterface:
             # No typed state resources - use pure KVCacheManager
             self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
 
-        # 4. Store tuned config and ensure capacity
+        # 4. Store tuned config
         self._kv_cache_config_tuned = kv_cache_config
-        self.info.estimate_cache_loc_capacity(self._kv_cache_manager.blocks_in_primary_pool)
 
-        # 5. Assign KV views
-        self._assign_kv_cache_views(kv_managed)
+        # 5. Assign KV views (compute block_offset_multiplier from first view's strides)
+        block_offset_multiplier = self._assign_kv_cache_views(kv_managed)
 
-        # 5b. Configure trtllm_attention global state with pool info
-        if trtllm_attn_config is not None:
-            trtllm_attn_config.configure(self.info)
-            # Pass KV cache pool pointers if available
-            if hasattr(self._kv_cache_manager, "kv_cache_pool_pointers"):
-                trtllm_attn_config.set_kv_cache_pool_info(
-                    pool_pointers=self._kv_cache_manager.kv_cache_pool_pointers,
-                    pool_mapping=self._kv_cache_manager.kv_cache_pool_mapping,
-                )
+        # 6. Update cache information (resize cache_loc, set max_seq_info with all max sizes)
+        self.info.update_cache_information(
+            num_blocks=self._kv_cache_manager.blocks_in_primary_pool,
+            block_offset_multiplier=block_offset_multiplier,
+        )
 
-        # 6. Allocate remaining unmanaged resources
+        # 7. Allocate remaining unmanaged resources
         self._allocate_unmanaged_resources()
 
-        # 7. Patch shutdown
+        # 8. Patch shutdown
         self._kv_cache_manager.shutdown = with_pre_callback(
             self._kv_cache_manager.shutdown,
             self._clear_caches,
         )
 
-        # 8. Compute final token count and cache statistics
+        # 9. Compute final token count and cache statistics
         max_resource_count = self._kv_cache_manager.get_max_resource_count()
         max_tokens_final = max_resource_count * self._kv_cache_manager.tokens_per_block
 
-        # 9. Collect statistics of different types of resources
+        # 10. Collect statistics of different types of resources
         num_state_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, StateResourceHandler)
         )
@@ -691,15 +692,6 @@ class CachedSequenceInterface:
         # Create new cache manager with optimal capacity
         cache_stats = self._create_kv_cache_manager(max_tokens=max_tokens_optimal)
         max_tokens_final = cache_stats["max_tokens"]
-
-        # Update trtllm pool pointers after resize (pool address may change)
-        if trtllm_attn_config is not None and hasattr(
-            self._kv_cache_manager, "kv_cache_pool_pointers"
-        ):
-            trtllm_attn_config.set_kv_cache_pool_info(
-                pool_pointers=self._kv_cache_manager.kv_cache_pool_pointers,
-                pool_mapping=self._kv_cache_manager.kv_cache_pool_mapping,
-            )
 
         # Log resulting memory information
         total_cache_bytes = mem_for_paged_optimal + non_paged_bytes_total
