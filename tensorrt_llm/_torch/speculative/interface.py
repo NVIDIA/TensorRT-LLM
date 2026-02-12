@@ -646,7 +646,6 @@ class SpecWorkerBase(nn.Module, ABC):
         # Switch to draft KV cache manager and its block offsets
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
         attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-        # After zero-copy API, host buffer is inside the manager
         attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
 
         try:

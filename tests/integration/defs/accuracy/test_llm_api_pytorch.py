@@ -4862,7 +4862,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
-                              cuda_graph_config=None)
+                              cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto",
                                         use_kv_cache_manager_v2=v2_kv_cache)

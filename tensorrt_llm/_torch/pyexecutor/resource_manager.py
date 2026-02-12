@@ -1937,9 +1937,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
                         success = kv_cache.resume()
                         assert success
-                        new_capacity = req.prompt_len +
-                                        self.num_extra_kv_tokens +
-                                        get_draft_token_length(req)
+                        new_capacity = req.prompt_len + self.num_extra_kv_tokens + get_draft_token_length(
+                            req)
                         success = kv_cache.resize(new_capacity)
                         if not success:
                             raise ValueError(
@@ -1952,7 +1951,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
             for req in generation_batch:
                 kv_cache = self.kv_cache_map[req.py_request_id]
-                new_capacity = kv_cache.capacity + 1 + get_draft_token_length(req)
+                new_capacity = kv_cache.capacity + 1 + get_draft_token_length(
+                    req)
                 success = kv_cache.resize(new_capacity)
                 if not success:
                     raise ValueError(

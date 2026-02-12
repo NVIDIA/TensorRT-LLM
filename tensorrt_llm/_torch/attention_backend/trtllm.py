@@ -913,7 +913,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            # After zero-copy API, reference the manager's pinned host buffer
             self.host_kv_cache_block_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
