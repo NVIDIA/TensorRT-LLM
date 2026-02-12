@@ -47,18 +47,15 @@ def create_nemotron_h_llm(model_folder,
     if load_format is not None:
         kwargs["load_format"] = load_format
 
-    # Only override SSM cache dtype if different from default
-    # This tests if model-specific defaults application path
-    if mamba_ssm_cache_dtype is not None and mamba_ssm_cache_dtype != "auto":
-        kwargs["kv_cache_config"] = KvCacheConfig(
-            mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
-
     return LLM(
         model=model_dir,
         tensor_parallel_size=1,
         max_batch_size=max_batch_size,
         cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
         disable_overlap_scheduler=disable_overlap_scheduler,
+        kv_cache_config=KvCacheConfig(
+            mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
+        if mamba_ssm_cache_dtype is not None else None,
         sampler_type="TRTLLMSampler",
         enable_chunked_prefill=enable_chunked_prefill,
         **kwargs,
