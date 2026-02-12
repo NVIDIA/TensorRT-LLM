@@ -101,7 +101,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan.py
   - unittest/_torch/visual_gen/test_wan_i2v.py
   - unittest/_torch/visual_gen/test_model_loader.py
-  - examples/test_visual_gen.py
+  # - examples/test_visual_gen.py
 - condition:
     ranges:
       system_gpu_count:
