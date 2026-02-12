@@ -264,9 +264,10 @@ class Deepseekv3RoutingImpl:
                         "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
                     )
                 self.is_fused = False
-        elif (num_experts > 512 or (self.top_k > 8 and self.top_k != 22)
-              or (self.topk_group == 1 and self.top_k != 22)):
-            # We have special implementation for n_group == 1, top_k == 22 and num_experts == 512 for Nemotron Super v3.
+        elif (num_experts > 512 or (self.top_k > 8 and self.top_k != 22)):
+            # The fused CUDA kernel supports:
+            #   - n_group == 1 with top_k <= 8 and num_experts <= 512
+            #   - n_group == 1 with top_k == 22 and num_experts == 512 (Nemotron Super v3)
             if self.is_fused:
                 warnings.warn(
                     "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
