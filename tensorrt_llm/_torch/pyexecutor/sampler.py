@@ -326,7 +326,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
                     f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
                 )
 
-            request.py_result.append_mm_embeddings(mm_embedding)
+            request.py_result.append_mm_embeddings(mm_embedding, request.multimodal_lengths)
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
@@ -1047,7 +1047,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.CACHE_INDIRECTION_SHAPE = (
             self.max_num_sequences,
             self.max_beam_width,
-            self.max_seq_len + (0 if args.disable_overlap_scheduler else 1),
+            self.max_seq_len,
         )
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)

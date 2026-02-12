@@ -360,7 +360,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
-            mm_handles: List of multimodal embedding handles. Currently only a single handle is supported.
+            mm_handles: List of multimodal embedding handles.
 
         Returns:
             Tuple[List[int], List[int], List[int]]:
@@ -376,19 +376,16 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         if not isinstance(mm_handles, list):
             raise TypeError("mm_handles must be a list")
 
-        if len(mm_handles) > 1:
-            # TODO: only support single multimodal item within a request for now
-            raise NotImplementedError("Only one mm_handle is supported for Qwen3 VL for now")
-
-        hidden_size = mm_handles[0]["tensor_size"][1]
         num_deepstack_levels = len(self.config.vision_config.deepstack_visual_indexes)
         # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
         # feature maps from deepstack layers.
         expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
-        if hidden_size != expected_size:
-            raise RuntimeError(
-                f"Expected multimodal embedding to have hidden size {expected_size}, got {hidden_size}."
-            )
+        for i, mm_handle in enumerate(mm_handles):
+            hidden_size = mm_handle["tensor_size"][1]
+            if hidden_size != expected_size:
+                raise RuntimeError(
+                    f"Expected multimodal embedding {i} to have hidden size {expected_size}, got {hidden_size}."
+                )
 
         input_ids = self.tokenizer(text_prompt, return_tensors="pt").input_ids[0]
 
