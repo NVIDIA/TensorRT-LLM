@@ -122,7 +122,6 @@ class WorkerExtension:
 
                 logger.info(f"weights key size: {len(weights.keys())}")
                 model = self.engine.model_engine.model
-                load_weights_args = inspect.getfullargspec(model.load_weights).args
 
                 self.engine.model_engine.model_loader.reload(
                     model, weights, allow_partial_loading=self.supports_partial_loading()
