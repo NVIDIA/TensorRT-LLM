@@ -11,12 +11,13 @@ from tensorrt_llm._torch.models.modeling_utils import \
 from tensorrt_llm._utils import (confidential_compute_enabled,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
-                                          EagleDecodingConfig, KvCacheConfig,
-                                          MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SchedulerConfig,
-                                          SparseAttentionConfig,
-                                          SpeculativeConfig, TorchLlmArgs)
+
+# isort: off
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig, EagleDecodingConfig, KvCacheConfig,
+    MTPDecodingConfig, PeftCacheConfig, SamplerType, SchedulerConfig,
+    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+# isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -1006,6 +1007,9 @@ def create_py_executor_instance(
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
         cache_transceiver_config)
+    waiting_queue_policy = (scheduler_config.waiting_queue_policy
+                            if scheduler_config is not None else
+                            WaitingQueuePolicy.FCFS)
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -1029,7 +1033,8 @@ def create_py_executor_instance(
         max_seq_len=max_seq_len,
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
-        execution_stream=execution_stream)
+        execution_stream=execution_stream,
+        waiting_queue_policy=waiting_queue_policy)
 
 
 def create_torch_sampler_args(
