@@ -109,18 +109,20 @@ def fla_cached_gated_delta_rule(
         del y_prefill, initial_states, final_state
 
     if num_decode > 0:
+        cu_seqlen_decode = torch.arange(0, num_decode + 1, device=q.device, dtype=torch.long)
         y_decode = fused_recurrent_gated_delta_rule_update_fwd(
-            q=q_flat[num_prefill_tokens:, None],
-            k=k_flat[num_prefill_tokens:, None],
-            v=v_flat[num_prefill_tokens:, None],
-            g=g_flat[num_prefill_tokens:, None],
-            beta=beta_flat[num_prefill_tokens:, None],
+            q=q_flat[None, num_prefill_tokens:].contiguous(),
+            k=k_flat[None, num_prefill_tokens:].contiguous(),
+            v=v_flat[None, num_prefill_tokens:].contiguous(),
+            g=g_flat[None, num_prefill_tokens:].contiguous(),
+            beta=beta_flat[None, num_prefill_tokens:].contiguous(),
             scale=scale,
             initial_state_source=delta_cache,
-            initial_state_indices=slot_idx[num_prefill:],
+            initial_state_indices=slot_idx[num_prefill:].contiguous(),
+            cu_seqlens=cu_seqlen_decode,
         )
 
-        y_flat[num_prefill_tokens:, None] = y_decode.to(y_flat.dtype)
+        y_flat[None, num_prefill_tokens:] = y_decode.to(y_flat.dtype)
 
         del y_decode
 
