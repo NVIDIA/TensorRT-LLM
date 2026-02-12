@@ -1002,10 +1002,13 @@ class KVCacheManager(BaseResourceManager):
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
 
     def get_num_available_tokens(self,
+                                 token_num_upper_bound: int,
                                  max_num_draft_tokens: int = 0,
                                  **kwargs) -> int:
-        return (self.get_num_free_blocks() * self.tokens_per_block -
-                self.num_extra_kv_tokens - max_num_draft_tokens)
+        return min(
+            token_num_upper_bound,
+            self.get_num_free_blocks() * self.tokens_per_block -
+            self.num_extra_kv_tokens - max_num_draft_tokens)
 
     def get_buffers(self,
                     layer_idx: int,
