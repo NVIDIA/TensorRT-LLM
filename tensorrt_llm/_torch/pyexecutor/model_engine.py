@@ -457,8 +457,7 @@ class PyTorchModelEngine(ModelEngine):
         # This way it can also be used for CUDA graphs.
         if self.use_beam_search:
             self.cache_indirection_attention = torch.zeros(
-                (self.batch_size, self.max_beam_width, self.max_seq_len +
-                 (0 if self._disable_overlap_scheduler else 1)),
+                (self.batch_size, self.max_beam_width, self.max_seq_len),
                 device="cuda",
                 dtype=torch.int32)
         else:
@@ -2777,6 +2776,8 @@ class PyTorchModelEngine(ModelEngine):
             num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
+        if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
+            attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
         attn_metadata.prepare()
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(

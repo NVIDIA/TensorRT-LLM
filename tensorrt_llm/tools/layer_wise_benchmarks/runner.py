@@ -884,7 +884,7 @@ class Runner:
         else:
             raise NotImplementedError("Unsupported config")
         kv_cache_manager.add_dummy_requests(
-            list(range(max_batch_size)), [max_seq_len] * max_batch_size
+            list(range(max_batch_size)), token_nums=[max_seq_len] * max_batch_size
         )
         return kv_cache_manager
 
