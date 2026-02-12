@@ -779,6 +779,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "Eagle3": Eagle3DecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
+            "SA": SADecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
             "SaveState": SaveHiddenStatesDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
@@ -1105,65 +1106,50 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 class NGramDecodingConfig(DecodingBaseConfig):
     """
-    Configuration for NGram drafter speculative decoding using suffix automaton.
+    Configuration for NGram speculative decoding (two-model design).
 
-    The ngram drafter uses a suffix automaton (SA) to efficiently find matching
-    patterns in previously generated tokens to predict future tokens. This provides
-    CUDA graph compatible pattern matching with O(L) lookup complexity.
+    Uses a Python pool-based drafter that matches n-gram patterns in previously
+    generated tokens to predict draft tokens. Draft tokens are produced by
+    NGramDrafter in a separate step; the target model then verifies them.
 
     Arguments:
         max_draft_len: int
-            The maximum number of draft tokens to generate.
+            The maximum number of draft tokens to generate per step.
 
         max_matching_ngram_size: int
-            The ngram size for pattern matching:
-            - Positive value (e.g., 3): Fixed-size ngram matching. Tries to match
-              ngrams of size N, N-1, ..., 1 until a match is found.
-            - -1: Use suffix automaton for longest possible match (most flexible).
-            - 0: Invalid, will raise an error.
+            Maximum n-gram size for pattern matching. Must be > 0.
 
-    Deprecated Options (will raise error if set to non-default):
-        is_keep_all: No longer supported. SA returns a single match.
-        is_use_oldest: No longer supported. SA returns the match stored in its state.
-        is_public_pool: No longer supported. SA maintains per-request state.
+        max_total_draft_tokens: int
+            Maximum total draft tokens (linear tree: equals max_draft_len).
+
+        is_keep_all: bool
+            If True, keep all candidate pattern-match pairs; if False, only one
+            match per pattern (longest wins when updating).
+
+        is_use_oldest: bool
+            If True, use the oldest match when a pattern is hit; if False, use
+            the newest match.
+
+        is_public_pool: bool
+            If True, use a single shared pool for all requests; if False, each
+            request has its own pool.
     """
-    max_matching_ngram_size: int = 0
+    max_matching_ngram_size: int = 1
 
-    # Deprecated options - will raise error if set to non-default values
-    is_keep_all: bool = False
-    is_use_oldest: bool = False
-    is_public_pool: bool = False
+    is_keep_all: bool = True
+    is_use_oldest: bool = True
+    is_public_pool: bool = True
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.max_total_draft_tokens = self.max_draft_len  # Current NGram only support linear tree
+        self.max_total_draft_tokens = self.max_draft_len  # NGram only supports linear tree
 
     @model_validator(mode='after')
     def validate_ngram_config(self) -> 'NGramDecodingConfig':
-        """Validate NGram configuration and reject deprecated options."""
-        # Reject deprecated options
-        if self.is_public_pool:
-            raise ValueError(
-                "is_public_pool=True is not supported. NGram now uses suffix automaton "
-                "which maintains per-request state. Remove this option from your config."
-            )
-        if self.is_keep_all:
-            raise ValueError(
-                "is_keep_all=True is not supported. NGram now uses suffix automaton "
-                "which returns a single match. Remove this option from your config."
-            )
-        if self.is_use_oldest:
-            raise ValueError(
-                "is_use_oldest=True is not supported. NGram now uses suffix automaton "
-                "which returns the match stored in the SA state. Remove this option from your config."
-            )
-
-        # Validate ngram size
+        """Validate NGram configuration."""
         if self.max_matching_ngram_size == 0:
             raise ValueError(
-                "max_matching_ngram_size must be > 0 (fixed-size ngram) or -1 (longest match). "
-                "Got 0 which is invalid.")
-
+                "max_matching_ngram_size must be > 0 for NGram. Got 0.")
         return self
 
     @classmethod
@@ -1171,6 +1157,47 @@ class NGramDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "NGram"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
+class SADecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
+
+    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside
+    the target model forward; supports CUDA graph and overlap scheduler.
+
+    Arguments:
+        max_draft_len: int
+            The maximum number of draft tokens per step.
+
+        max_matching_ngram_size: int
+            - Positive value (e.g., 3): Fixed-size ngram matching.
+            - -1: Longest possible match via suffix automaton.
+            - 0: Invalid.
+    """
+    max_matching_ngram_size: int = -1
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # SA only supports linear tree
+
+    @model_validator(mode='after')
+    def validate_sa_config(self) -> 'SADecodingConfig':
+        """Validate SA configuration."""
+        if self.max_matching_ngram_size == 0:
+            raise ValueError(
+                "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
+                "Got 0.")
+        return self
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "SA"
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -1708,6 +1735,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MedusaDecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
+    SADecodingConfig,
     UserProvidedDecodingConfig,
     SaveHiddenStatesDecodingConfig,
     AutoDecodingConfig,
@@ -3202,7 +3230,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
-                # max_matching_ngram_size: >0 for fixed-size ngram, -1 for longest match mode
+                assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
+            elif isinstance(self.speculative_config, SADecodingConfig):
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size != 0
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0

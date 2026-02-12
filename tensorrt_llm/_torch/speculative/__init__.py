@@ -3,7 +3,8 @@ from .eagle3 import Eagle3SpecMetadata
 from .interface import (SpecMetadata, SpecWorkerBase,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPEagleWorker, MTPSampler, MTPSpecMetadata, MTPWorker
-from .ngram_worker import NGramSampler, NGramSpecMetadata, NGramWorker
+from .ngram import NGramDrafter, NGramPoolManager
+from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import SaveHiddenStatesDrafter
 from .spec_sampler_base import (SampleStateSpec, SampleStateTensorsSpec,
                                 SpecSamplerBase)
@@ -20,9 +21,11 @@ __all__ = [
     "MTPSampler",
     "MTPSpecMetadata",
     "MTPWorker",
-    "NGramSampler",
-    "NGramSpecMetadata",
-    "NGramWorker",
+    "NGramDrafter",
+    "NGramPoolManager",
+    "SASampler",
+    "SASpecMetadata",
+    "SAWorker",
     "SuffixAutomatonManager",
     "SampleStateSpec",
     "SampleStateTensorsSpec",

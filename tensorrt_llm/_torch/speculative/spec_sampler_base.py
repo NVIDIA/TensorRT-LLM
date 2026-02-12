@@ -15,7 +15,7 @@
 """
 Base class for speculative decoding samplers.
 
-This module provides a common base class for MTPSampler, NGramSampler, and
+This module provides a common base class for MTPSampler, SASampler, and
 Eagle3OneModelSampler.
 """
 

@@ -936,8 +936,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
-            # Only create draft_model for modes MTP, Eagle3
-            if not spec_config.spec_dec_mode.is_ngram():
+            # Only create draft_model for modes MTP, Eagle3 (not SA)
+            if not spec_config.spec_dec_mode.is_sa():
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \

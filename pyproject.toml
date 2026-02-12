@@ -1074,6 +1074,7 @@ exclude = [
     "tests/unittest/_torch/speculative/test_kv_cache_reuse.py",
     "tests/unittest/_torch/speculative/test_mtp.py",
     "tests/unittest/_torch/speculative/test_ngram.py",
+    "tests/unittest/_torch/speculative/test_sa.py",
     "tests/unittest/_torch/speculative/test_save_state.py",
     "tests/unittest/_torch/speculative/test_spec_gate.py",
     "tests/unittest/_torch/speculative/test_torch_rejection_sampling.py",

@@ -14,9 +14,7 @@ from .drafter import Drafter
 
 class NGramPoolManager(BaseResourceManager):
     """
-    DEPRECATED: This class is kept for backward compatibility with user-provided drafter mode.
-    For new code, use NGramResourceManager directly for NGram speculative decoding.
-
+    Pool-based resource manager for NGram speculative decoding (two-model design).
 
     For example, one of the existed pairs could be: ["I","love"] -> [["apple", "because", "it", "is"], ["banana", "and"]].
 
