@@ -14,6 +14,7 @@ from tensorrt_llm.logger import logger
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
+from ..cute_dsl_kernels import argmax
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import (BaseResourceManager,
                                            ResourceManagerType)
@@ -551,8 +552,7 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_tokens: [num_tokens] - Sampled draft token ids (int32)
         """
         if logits.dtype == torch.float32:
-            from ..cute_dsl_kernels.argmax import argmax as cutedsl_argmax
-            draft_tokens = cutedsl_argmax(logits)[:, 1].long()
+            draft_tokens = argmax.argmax(logits)[:, 1].long()
         else:
             draft_tokens = torch.argmax(logits, dim=-1)
 
@@ -706,8 +706,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=self.offset)
         else:
             if logits.dtype == torch.float32:
-                from ..cute_dsl_kernels.argmax import argmax as cutedsl_argmax
-                sampled_tokens = cutedsl_argmax(logits)[:, 1].long()
+                sampled_tokens = argmax.argmax(logits)[:, 1].long()
             else:
                 sampled_tokens = torch.argmax(logits, dim=-1)
 
