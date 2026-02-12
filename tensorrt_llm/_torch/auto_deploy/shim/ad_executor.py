@@ -765,12 +765,24 @@ class ADEngine(ModelEngine):
         gather_required = len(context_requests) > 0 and not gather_context_logits
         logits_gather_info = [len(logits_gather_indices), int(gather_required)]
 
+        # Compute batch_info explicitly based on actual request ordering rather than
+        # relying on the seq_len > 1 heuristic in nest_sequences. With chunked prefill,
+        # a context request may have context_chunk_size=1, giving seq_len=1. The heuristic
+        # would misclassify it as decode, causing host_request_types to be inconsistent
+        # with the actual request ordering (context + extend first, then generation).
+        # This mismatch leads to incorrect token splitting in thop.attention.
+        num_prefill_seqs = num_ctx_requests + len(extend_requests)
+        num_prefill_tokens = sum(seq_len[:num_prefill_seqs])
+        num_decode_seqs = len(generation_requests)
+        batch_info = [num_prefill_seqs, num_prefill_tokens, num_decode_seqs]
+
         # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
             position_ids=position_ids,
             seq_len=seq_len,
             input_pos=input_pos,
+            batch_info=batch_info,
             cu_seqlen=cu_seqlen,
             cache_loc=cache_loc,
             pages_per_seq=pages_per_seq,
