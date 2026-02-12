@@ -246,7 +246,7 @@ class PyResult:
                                list[float] | None] | None = None
         log_probs_list: list[tuple[list[TokenLogprobs], list[float]
                                    | None]] = field(default_factory=list)
-        mm_embeddings: dict[str, Any] | None = None
+        mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
         mrope_position_deltas: dict[str, Any] | None = None
         additional_context_outputs_list: list[tuple[str, torch.Tensor]] = field(
@@ -289,7 +289,7 @@ class PyResult:
             use_chunked_generation_logits=use_chunked_generation_logits,
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
-        self._mm_embeddings = None
+        self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
         self._mrope_position_ids = None
         self._mrope_position_deltas = None
         self._additional_context_outputs = {
@@ -362,9 +362,22 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
             self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
-        self._mm_embeddings = SharedTensorContainer.from_tensor(
-            mm_embeddings).dump_to_dict()
+    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
+                             multimodal_lengths: List[int]):
+        """Split concatenated embeddings by multimodal_lengths and create handles for each.
+
+        Args:
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape [total_tokens, hidden_dim]
+            multimodal_lengths: List of token lengths for each multimodal item
+        """
+        # Split the concatenated tensor by lengths to get per-item embeddings
+        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+
+        # Create a SharedTensorContainer handle for each split
+        self._mm_embeddings = [
+            SharedTensorContainer.from_tensor(emb).dump_to_dict()
+            for emb in split_embeddings
+        ]
         self.diff.mm_embeddings = self._mm_embeddings
 
     def set_mrope_position(
@@ -441,7 +454,8 @@ class PyResult:
         return self._log_probs and self._log_probs.cum_log_probs
 
     @property
-    def mm_embedding_handle(self) -> Dict[str, Any] | None:
+    def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:
+        """Returns a list of SharedTensorContainer handles, one per multimodal item."""
         return self._mm_embeddings
 
     @property
@@ -485,7 +499,7 @@ class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handle', 'additional_context_outputs',
+         'mm_embedding_handles', 'additional_context_outputs',
          'additional_generation_outputs', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
 

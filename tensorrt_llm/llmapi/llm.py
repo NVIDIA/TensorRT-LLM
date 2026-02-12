@@ -60,7 +60,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
-        mm_embedding_handle (Dict[str, Any], optional): The multimodal embedding handle of the request.
+        disaggregated_params (DisaggregatedParams, optional): Parameters for disaggregated serving, including multimodal embedding handles.
         finished (bool): Whether the whole request is finished.
     """
 
@@ -94,7 +94,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
             "prompt_token_ids",
             "outputs",
             "finished",
-            "mm_embedding_handle",
+            "disaggregated_params",
         ]
 
 

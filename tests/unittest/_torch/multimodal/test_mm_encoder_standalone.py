@@ -2,7 +2,6 @@ import copy
 import json
 import os
 import time
-from itertools import product
 from pathlib import Path
 from typing import Generator
 
@@ -193,8 +192,12 @@ def llms(model_dir: Path,
     """Get LLM for prefill and, if disagg, separate LLM for decode."""
     free_gpu_memory_fraction = 0.2
     disable_overlap_scheduler = pd_disagg
+    # NOTE: if the number of tokens that need to pass from P -> D exceeds `max_tokens_in_buffer`,
+    # one may see the following error:
+    # >>> tensorrt_llm.executor.utils.RequestError: Error in kv cache transfer for generation
+    #     requests.
     cache_transceiver_cfg = CacheTransceiverConfig(
-        backend="DEFAULT") if pd_disagg else None
+        backend="DEFAULT", max_tokens_in_buffer=10240) if pd_disagg else None
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=False,  # Disable for output 1:1 matching check
         free_gpu_memory_fraction=free_gpu_memory_fraction,
@@ -290,14 +293,13 @@ def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
         assert x[key] != y[key]
 
 
-# TODO: Add multi-image in single chat test
 @pytest.mark.threadleak(enabled=False)
-def test_single_image_chat(
+def test_single_request_chat_multiple_images(
     pd_disagg: bool,
     model_dir: Path,
     llms: tuple[LLM, LLM | None],
 ):
-    """Test processing single image using encoder (pass mm_embeddings) + LLM API.
+    """Test processing a single request with multiple images.
 
     This test verifies that encoder (pass mm_embeddings) + LLM API produces identical
     results to standard llm generation (pass raw image) by comparing outputs.
@@ -309,8 +311,8 @@ def test_single_image_chat(
     max_batch_size = 1
 
     # Test data - OpenAI chat completion format
-    prompts = ["Describe the natural environment in the image."]
-    media = [example_images[0]]
+    prompts = ["Compare these 2 images."]
+    media = [example_images[0], example_images[1]]
 
     # Sampling configuration
     sampling_params = SamplingParams(max_tokens=max_tokens)
@@ -461,8 +463,14 @@ def test_pd_disagg_with_image_input(
                 f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
 
 
-@pytest.mark.parametrize("use_mm_embeddings,pass_embeddings_through_loader",
-                         product([False, True], [False, True]))
+# Explicit combinations instead of product([False, True], [False, True]) to avoid
+# having to call `pytest.skip` within the test code itself. This saves on CI time, since `llms`
+# take a long time to instantiate.
+@pytest.mark.parametrize("use_mm_embeddings,pass_embeddings_through_loader", [
+    (False, False),
+    (True, False),
+    (True, True),
+])
 @pytest.mark.threadleak(enabled=False)
 def test_multi_request_batch_chat(
     model_dir: Path,
@@ -490,6 +498,7 @@ def test_multi_request_batch_chat(
     if llm_decode is not None:
         pytest.skip("Disagg support not implemented in test case")
 
+    # Guard against accidental reintroduction of invalid parameter combinations.
     if pass_embeddings_through_loader and not use_mm_embeddings:
         pytest.skip("Redundant test configuration")
 
@@ -522,10 +531,18 @@ def test_multi_request_batch_chat(
         encoder_outputs = encoder.generate(inputs)
         if use_mm_embeddings:
             for input, encoder_output in zip(inputs, encoder_outputs):
-                mm_embed_handle = encoder_output.mm_embedding_handle
-                assert mm_embed_handle is not None
-                mm_embed = SharedTensorContainer.from_dict(
-                    mm_embed_handle).get_local_view()
+                disagg_params = encoder_output.disaggregated_params
+                assert disagg_params is not None
+                mm_embed_handles = disagg_params.multimodal_embedding_handles
+                assert mm_embed_handles is not None
+                # `mm_embed_handles` is list of handles (one per multimodal item).
+                # Reconstruct and concatenate all embeddings for this request.
+                mm_embeds = [
+                    SharedTensorContainer.from_dict(handle).get_local_view()
+                    for handle in mm_embed_handles
+                ]
+                mm_embed = torch.cat(
+                    mm_embeds, dim=0) if len(mm_embeds) > 1 else mm_embeds[0]
                 input["multi_modal_embeddings"] = {"image": mm_embed}
 
             if pass_embeddings_through_loader:
