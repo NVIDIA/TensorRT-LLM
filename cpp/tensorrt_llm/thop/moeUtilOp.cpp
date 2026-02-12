@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -131,7 +131,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
     int64_t num_moe_inputs = static_cast<int64_t>(experts_per_token * num_rows);
     TORCH_CHECK(num_moe_inputs <= std::numeric_limits<int32_t>::max(),
-        "num_moe_inputs exceeds int32 range (because we use int32 for expert_first_token_offset_tensor output). "
+        "num_moe_inputs shall not exceed int32 range, as we use int32 for cute dsl expert_first_token_offset_tensor. "
         "num_moe_inputs = ",
         num_moe_inputs);
 
@@ -230,7 +230,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             "Invalid dtype, only supports input tensor with float32, float16 and bfloat16 dtype");
         break;
     }
-    expert_first_token_offset_tensor = expert_first_token_offset_tensor.to(torch::kInt32);
     return std::make_tuple(permuted_row_to_unpermuted_row_tensor, permuted_token_selected_experts_tensor,
         permuted_data_tensor, expert_first_token_offset_tensor, permuted_token_final_scales_tensor,
         unpermuted_row_to_permuted_row_tensor);
