@@ -2092,6 +2092,7 @@ class PyExecutor:
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
                         if self.guided_decoder is not None:
+                            # add_batch must be called again to have updated new tokens.
                             self.guided_decoder.add_batch(scheduled_batch)
                             guided_decoder_failed_requests = self.guided_decoder.execute(
                                 batch_outputs['logits'])
@@ -2106,6 +2107,9 @@ class PyExecutor:
                         sample_timing.end_time)
                     assert sample_state is not None, "Sampling failed"
 
+                    # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                    # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                    # causing _sample_async to fail when accessing context_chunk_size property.
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
                     self._update_request_states(scheduled_batch)
