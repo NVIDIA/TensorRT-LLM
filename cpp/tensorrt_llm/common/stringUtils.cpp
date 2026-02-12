@@ -29,10 +29,10 @@ TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
-void fmtstr_(char const*    format,fmtstr_allocator alloc,void*       target, va_list   args)
+void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args)
 {
-    va_list     args0;
-    va_copy(args0,  args);
+    va_list args0;
+    va_copy(args0, args);
 
     size_t constexpr init_size = 2048;
     char fixed_buffer[init_size];
