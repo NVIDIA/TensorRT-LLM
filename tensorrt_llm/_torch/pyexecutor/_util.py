@@ -104,7 +104,9 @@ class KvCacheCreator:
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
         self._execution_stream = execution_stream
-        if self._kv_cache_manager_cls == KVCacheManager and kv_cache_config.use_kv_cache_manager_v2:
+        if self._kv_cache_manager_cls == KVCacheManager and kv_cache_config.use_kv_cache_manager_v2 and (
+                max_beam_width is None
+                or max_beam_width <= 1) and kv_connector_manager is None:
             self._kv_cache_manager_cls = KVCacheManagerV2
         self._draft_config = draft_config
 
