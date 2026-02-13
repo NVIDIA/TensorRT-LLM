@@ -20,18 +20,21 @@ template <>
 struct ElemsPerAccess<half>
 {
     static constexpr int value = 8;
+    using norm_weight_type = common::__nv_bfloat168;
 };
 
 template <>
 struct ElemsPerAccess<nv_bfloat16>
 {
     static constexpr int value = 8;
+    using norm_weight_type = common::__nv_bfloat168;
 };
 
 template <>
 struct ElemsPerAccess<float>
 {
     static constexpr int value = 4;
+    using norm_weight_type = common::__nv_bfloat164;
 };
 
 template <typename DType>

@@ -134,8 +134,8 @@ public:
 step 1: reduce from single rank to get the variance sum (reduce(input^2, dim=-1))
 step 2: reduce from all ranks to get the variance sum (all_reduce(variance_sum))
 step 3: calculate the rms norm (input * rsqrt(variance + eps))
-in this case, max hidden_dim is 6144, for each token, we only need 6144 / 4 / tp_size = (1536 / tp_size) threads
-so we can assume cluster size is 1 (tp_size >= 2)
+in this case, max hidden_dim is 6144 (float data), for each token, we only need 6144 / 4 / tp_size = (1536 / tp_size)
+threads so we can assume cluster size is 1 (tp_size >= 2)
  */
 template <typename DType, int NRanks, bool TriggerCompletionAtEnd = true>
 __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMaxReduceRMSParams params)
@@ -162,25 +162,24 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
     int clear_access = comm.clear_size / kElemsPerAccess<DType>;
     for (int idx = access_id; idx < tot_access; idx += access_stride, token_id += token_stride)
     {
-        alignas(16) float vals[4];
+        alignas(16) DType vals[kElemsPerAccess<DType>];
+        // we use float to load and store variance sum
         float sum_variance = 0.F;
         *reinterpret_cast<float4*>(vals) = reinterpret_cast<float4*>(params.allreduce_in)[idx];
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < kElemsPerAccess<DType>; ++i)
         {
-            if (is_neg_zero(vals[i]))
-            {
-                vals[i] = 0.F;
-            }
-            sum_variance += vals[i] * vals[i];
+            sum_variance += static_cast<float>(vals[i]) * static_cast<float>(vals[i]);
         }
         // step 1: reduce from single rank to get the variance sum
         tensorrt_llm::common::blockReduceSumV2<float, 1>(&sum_variance);
-
+        if (is_neg_zero(sum_variance))
+        {
+            sum_variance = 0.F;
+        }
         // step 2: reduce from all ranks to get the variance sum
         // be careful, we only use float to load and store variance sum
         // but we use float4 to load input tensor
-        // constexpr int StrideGap = kElemsPerAccess<float>;
         // Push data to other ranks
         // we only need the first thread to push data to other ranks
         if (threadIdx.x == 0)
@@ -217,15 +216,16 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
 
         // load norm weight
         // TODO: correct the access_id_in_token
-        __nv_bfloat16 norm_weight[4];
-        *reinterpret_cast<__nv_bfloat164*>(norm_weight)
-            = reinterpret_cast<__nv_bfloat164*>(params.rms_gamma)[access_id_in_token];
+        __nv_bfloat16 norm_weight[kElemsPerAccess<DType>];
+        *reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type*>(norm_weight)
+            = reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type*>(params.rms_gamma)[access_id_in_token];
 
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < kElemsPerAccess<DType>; ++i)
         {
-            vals[i] = vals[i] * rsqrtf((sum_variance / static_cast<float>(params.hidden_dim) / NRanks) + params.rms_eps)
-                * static_cast<float>(norm_weight[i]);
+            vals[i] = static_cast<DType>(static_cast<float>(vals[i])
+                * rsqrtf((sum_variance / static_cast<float>(params.hidden_dim) / NRanks) + params.rms_eps)
+                * static_cast<float>(norm_weight[i]));
         }
 
         // step 4: store the rms norm

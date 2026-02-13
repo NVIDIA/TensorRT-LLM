@@ -731,11 +731,10 @@ def run_minimax_allreduce_rms_op(input: torch.Tensor, tensor_parallel_size: int,
         rank=tensor_parallel_rank,
     ))
     minimax_output = minimax_allreduce_rms(
-        input=rank_input,
+        input=rank_input.to(torch.bfloat16),
         rms_weights=rank_rms_weights.to(torch.bfloat16),
         eps=eps,
-    ).to(origin_dtype)
-
+    )
     # finally, verify the results
     torch.testing.assert_close(minimax_output, ref_output, rtol=0.2, atol=0.2)
 
