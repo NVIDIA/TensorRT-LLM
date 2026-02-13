@@ -125,25 +125,20 @@ class TestExtendNgram:
         config = SAConfig(max_seq_len=1024, max_slots=16)
         manager = SuffixAutomatonManager(config, max_num_requests=16)
 
-        # Add request with repeating pattern
-        # [0, 2, 3, 4, 10, 1, 2, 3, 4, 5, 1, 2, 3] - pattern [1, 2, 3] appears twice
-        # Pattern [1, 2, 3, 4] appears at positions 5-8
-        context_tokens = [0, 2, 3, 4, 10, 1, 2, 3, 4, 5, 1, 2, 3]
+        # Case 1: context_tokens=[0,1,2,1,2], extend with token 1
+        # New sequence: [0, 1, 2, 1, 2, 1]
+        # Longest suffix match in context: [1, 2, 1] at positions 1-3 → match_len=3
+        # Continuation after match: token at position 4 is 2 → draft starts with [2, ...]
+        context_tokens = [0, 1, 2, 1, 2]
         manager.add_request(0, context_tokens)
 
-        # Prepare
         request_ids = [0]
         max_draft_len = 4
         manager.prepare(request_ids, max_draft_len)
 
-        # Extend with token 4 - this continues the pattern!
-        # New sequence: [0, 2, 3, 4, 10, 1, 2, 3, 4, 5, 1, 2, 3, 4]
-        # Suffix [1, 2, 3, 4] matches at position 5-8
-        # Continuation starts at position 9, draft tokens are [5, 1, 2, 3]
-        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        accepted_tokens = torch.tensor([[1, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
         num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
-        # Use longest match mode
         match_len, draft_tokens = manager.extend_ngram(
             request_ids,
             accepted_tokens,
@@ -154,15 +149,115 @@ class TestExtendNgram:
 
         print(f"extend_ngram (longest): match_len={match_len}, draft_tokens={draft_tokens}")
 
-        # Verify results
         match_len_val = match_len[0].item()
         assert match_len_val >= 1, f"Expected match, got match_len={match_len_val}"
-        # The longest match should be [1, 2, 3, 4] (length 4)
-        assert match_len_val == 4, f"Expected longest match of 4, got {match_len_val}"
-
-        # Draft tokens should be [5, 1, 2, 3] (tokens after the match at pos 5-8)
+        # Longest match is [1, 2, 1] (length 3)
+        assert match_len_val == 3, f"Expected longest match of 3, got {match_len_val}"
+        # Draft tokens: continuation after match at 1-3 is token 2 at index 4
         draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
-        assert draft_list == [5, 1, 2, 3], f"Expected [5, 1, 2, 3], got {draft_list}"
+        assert draft_list[0] == 2, f"Expected first draft token 2, got {draft_list}"
+
+        manager.shutdown()
+
+        # Case 2: context_tokens=[0, 1, 2, 3, 1, 2, 4, 1], extend with token 2
+        # New sequence: [0, 1, 2, 3, 1, 2, 4, 1, 2]
+        # Longest suffix match in context: [1, 2] at positions 1-2 or 4-5 → match_len=2
+        # Kernel uses leftmost match (1-2): continuation is token at position 3 → draft [3, 1, 2, 4]
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+        context_tokens = [0, 1, 2, 3, 1, 2, 4, 1]
+        manager.add_request(0, context_tokens)
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[2, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_ngram(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,  # Longest match
+        )
+
+        print(f"extend_ngram (longest) case 2: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        match_len_val = match_len[0].item()
+        assert match_len_val >= 1, f"Expected match, got match_len={match_len_val}"
+        assert match_len_val == 2, f"Expected longest match of 2, got {match_len_val}"
+        draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_list == [3, 1, 2, 4], f"Expected draft [3, 1, 2, 4], got {draft_list}"
+
+        manager.shutdown()
+
+        # Case 3: context_tokens=[1, 1, 1, 1], extend with token 1
+        # New sequence: [1, 1, 1, 1, 1]
+        # Longest suffix match in context: [1, 1, 1, 1] at positions 0-3 → match_len=4
+        # Only one draft token (kernel yields token at position after match; rest zero-padded)
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+        context_tokens = [1, 1, 1, 1]
+        manager.add_request(0, context_tokens)
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[1, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_ngram(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,  # Longest match
+        )
+
+        print(f"extend_ngram (longest) case 3: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        match_len_val = match_len[0].item()
+        assert match_len_val >= 1, f"Expected match, got match_len={match_len_val}"
+        assert match_len_val == 4, f"Expected longest match of 4, got {match_len_val}"
+        draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_list == [1, 0, 0, 0], f"Expected draft [1, 0, 0, 0], got {draft_list}"
+
+        manager.shutdown()
+
+        # Case 4: context_tokens=[0, 1, 2, 3], extend with token 2
+        # New sequence: [0, 1, 2, 3, 2]
+        # Longest suffix match in context: [2] at position 2 → match_len=1
+        # Continuation after match: tokens at 3 and from extended seq → draft [3, 2, 0, 0]
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+        context_tokens = [0, 1, 2, 3]
+        manager.add_request(0, context_tokens)
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[2, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_ngram(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,  # Longest match
+        )
+
+        print(f"extend_ngram (longest) case 4: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        match_len_val = match_len[0].item()
+        assert match_len_val >= 1, f"Expected match, got match_len={match_len_val}"
+        assert match_len_val == 1, f"Expected longest match of 1, got {match_len_val}"
+        draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_list == [3, 2, 0, 0], f"Expected draft [3, 2, 0, 0], got {draft_list}"
 
         manager.shutdown()
 
@@ -171,24 +266,20 @@ class TestExtendNgram:
         config = SAConfig(max_seq_len=1024, max_slots=16)
         manager = SuffixAutomatonManager(config, max_num_requests=16)
 
-        # Add request with repeating pattern
-        # [0, 2, 3, 4, 10, 1, 2, 3, 4, 5, 1, 2, 3]
-        # Pattern [2, 3, 4] appears at positions 1-3 and 6-8
-        context_tokens = [0, 2, 3, 4, 10, 1, 2, 3, 4, 5, 1, 2, 3]
+        # Case 1: context_tokens=[0, 1, 2, 3, 1, 2], extend with token 3
+        # New sequence: [0, 1, 2, 3, 1, 2, 3]
+        # With max_ngram_size=3: try 3-gram [1, 2, 3] → matches at positions 1-3 (leftmost)
+        # match_len=3, continuation → draft [1, 2, 3, 0]
+        context_tokens = [0, 1, 2, 3, 1, 2]
         manager.add_request(0, context_tokens)
 
-        # Prepare
         request_ids = [0]
         max_draft_len = 4
         manager.prepare(request_ids, max_draft_len)
 
-        # Extend with token 4 - continues the pattern
-        # New sequence: [0, 2, 3, 4, 10, 1, 2, 3, 4, 5, 1, 2, 3, 4]
-        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        accepted_tokens = torch.tensor([[3, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
         num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
-        # Use fixed-size ngram mode (max_ngram_size=3 means try 3, 2, 1)
-        # Should find 3-gram [2, 3, 4] matching at position 1-3 (leftmost match)
         match_len, draft_tokens = manager.extend_ngram(
             request_ids,
             accepted_tokens,
@@ -197,49 +288,181 @@ class TestExtendNgram:
             max_ngram_size=3,  # Try 3-gram, 2-gram, 1-gram
         )
 
-        print(f"extend_ngram (fixed 3): match_len={match_len}, draft_tokens={draft_tokens}")
+        print(f"extend_ngram (fixed) case 1: match_len={match_len}, draft_tokens={draft_tokens}")
 
-        # Verify results
         match_len_val = match_len[0].item()
         assert match_len_val >= 1, f"Expected match, got match_len={match_len_val}"
-        # With max_ngram_size=3, should find 3-gram match
         assert match_len_val == 3, f"Expected 3-gram match, got {match_len_val}"
-
-        # Draft tokens after 3-gram [2, 3, 4] at pos 1-3 are [10, 1, 2, 3]
-        # (leftmost match returns tokens starting at position 4)
         draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
-        assert draft_list == [10, 1, 2, 3], f"Expected [10, 1, 2, 3], got {draft_list}"
+        assert draft_list == [1, 2, 3, 0], f"Expected draft [1, 2, 3, 0], got {draft_list}"
 
         manager.shutdown()
 
-    def test_extend_ngram_no_match(self):
-        """Test extend_ngram when no match exists."""
+        # Case 2: context_tokens=[0, 1, 2, 3, 1, 2, 4, 1], extend with token 2
+        # New sequence: [0, 1, 2, 3, 1, 2, 4, 1, 2]
+        # With max_ngram_size=3: 3-gram [4, 1, 2] not in context; 2-gram [1, 2] matches at 1-2 (leftmost)
+        # match_len=2, continuation → draft [3, 1, 2, 4]
         config = SAConfig(max_seq_len=1024, max_slots=16)
         manager = SuffixAutomatonManager(config, max_num_requests=16)
-
-        # Add request with repeating pattern
-        context_tokens = [1, 2, 3, 4, 5, 1, 2, 3]
+        context_tokens = [0, 1, 2, 3, 1, 2, 4, 1]
         manager.add_request(0, context_tokens)
 
-        # Prepare
         request_ids = [0]
         max_draft_len = 4
         manager.prepare(request_ids, max_draft_len)
 
-        # Extend with unique token 99 - no pattern will match
-        # New sequence: [1, 2, 3, 4, 5, 1, 2, 3, 99]
-        accepted_tokens = torch.tensor([[99, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        accepted_tokens = torch.tensor([[2, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
         num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         match_len, draft_tokens = manager.extend_ngram(
-            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len, max_ngram_size=-1
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=3,  # Try 3-gram, 2-gram, 1-gram
+        )
+
+        print(f"extend_ngram (fixed) case 2: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        match_len_val = match_len[0].item()
+        assert match_len_val >= 1, f"Expected match, got match_len={match_len_val}"
+        assert match_len_val == 2, f"Expected 2-gram match, got {match_len_val}"
+        draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_list == [3, 1, 2, 4], f"Expected draft [3, 1, 2, 4], got {draft_list}"
+
+        manager.shutdown()
+
+        # Case 3: context_tokens=[0, 2, 3, 4, 5, 1, 2, 3, 4, 6, 1, 2, 3], extend with token 4
+        # New sequence: [0, 2, 3, 4, 5, 1, 2, 3, 4, 6, 1, 2, 3, 4]
+        # With max_ngram_size=3: 3-gram [2, 3, 4] matches at positions 1-3 (leftmost)
+        # match_len=3, continuation after 1-3 → draft [5, 1, 2, 3]
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+        context_tokens = [0, 2, 3, 4, 5, 1, 2, 3, 4, 6, 1, 2, 3]
+        manager.add_request(0, context_tokens)
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_ngram(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=3,  # Try 3-gram, 2-gram, 1-gram
+        )
+
+        print(f"extend_ngram (fixed) case 3: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        match_len_val = match_len[0].item()
+        assert match_len_val >= 1, f"Expected match, got match_len={match_len_val}"
+        assert match_len_val == 3, f"Expected 3-gram match, got {match_len_val}"
+        draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_list == [5, 1, 2, 3], f"Expected draft [5, 1, 2, 3], got {draft_list}"
+
+        manager.shutdown()
+
+        # Case 4: context_tokens=[1, 2, 1, 2], extend with token 1
+        # New sequence: [1, 2, 1, 2, 1]
+        # With max_ngram_size=3: 3-gram [2, 1, 2] matches at positions 1-3 (leftmost)
+        # match_len=3; continuation from match start when no token after match → draft [2, 1, 0, 0]
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+        context_tokens = [1, 2, 1, 2]
+        manager.add_request(0, context_tokens)
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[1, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_ngram(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=3,  # Try 3-gram, 2-gram, 1-gram
+        )
+
+        print(f"extend_ngram (fixed) case 4: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        match_len_val = match_len[0].item()
+        assert match_len_val >= 1, f"Expected match, got match_len={match_len_val}"
+        assert match_len_val == 3, f"Expected 3-gram match, got {match_len_val}"
+        draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_list == [2, 1, 0, 0], f"Expected draft [2, 1, 0, 0], got {draft_list}"
+
+        manager.shutdown()
+
+    def test_extend_ngram_no_match(self):
+        """Test extend_ngram when no match exists (moved from longest_match case 5)."""
+        # context_tokens=[0, 1, 2, 3], extend with token 4
+        # New sequence: [0, 1, 2, 3, 4]
+        # Token 4 not in context → no suffix match, match_len=0, draft is zero-padded
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+        context_tokens = [0, 1, 2, 3]
+        manager.add_request(0, context_tokens)
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_ngram(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,  # Longest match
         )
 
         print(f"extend_ngram (no match): match_len={match_len}, draft_tokens={draft_tokens}")
 
-        # Verify no match found
         match_len_val = match_len[0].item()
-        assert match_len_val == 0, f"Expected no match, got match_len={match_len_val}"
+        assert match_len_val == 0, f"Expected no match (0), got {match_len_val}"
+        draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_list == [0, 0, 0, 0], f"Expected draft [0, 0, 0, 0], got {draft_list}"
+
+        manager.shutdown()
+
+        # Same no-match scenario with max_ngram_size=3: context [0, 1, 2, 3], extend token 4
+        config = SAConfig(max_seq_len=1024, max_slots=16)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+        context_tokens = [0, 1, 2, 3]
+        manager.add_request(0, context_tokens)
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_ngram(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=3,
+        )
+
+        print(
+            f"extend_ngram (no match, max_ngram_size=3): match_len={match_len}, draft_tokens={draft_tokens}"
+        )
+
+        match_len_val = match_len[0].item()
+        assert match_len_val == 0, f"Expected no match (0), got {match_len_val}"
+        draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_list == [0, 0, 0, 0], f"Expected draft [0, 0, 0, 0], got {draft_list}"
 
         manager.shutdown()
 
