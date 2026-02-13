@@ -494,7 +494,7 @@ class OpenAIServer:
                     self.perf_metrics.append(item)
 
     async def _create_chat_response(self,
-            promise: RequestOutput, postproc_params: PostprocParams, raw_request: Request, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
+            promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
         await promise.aresult()
         if self.postproc_worker_enabled:
             chat_response = promise.outputs[0]._postprocess_result
@@ -971,7 +971,7 @@ class OpenAIServer:
                     media_type="text/event-stream"
                 )
             else:
-                response = await self._create_chat_response(promise, postproc_params, raw_request, disaggregated_params)
+                response = await self._create_chat_response(promise, postproc_params, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
         except Exception as e:
