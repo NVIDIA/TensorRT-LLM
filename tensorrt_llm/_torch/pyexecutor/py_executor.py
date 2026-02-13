@@ -613,6 +613,7 @@ class PyExecutor:
             # Start the sampler's async worker, if it is enabled
             if (isinstance(self.sampler, AsyncWorkerMixin)
                     and self.sampler.async_worker_enabled()):
+                logger.info(f"Starting the async worker for sampler D2H copies")
                 self.sampler.async_worker_start()
 
     def _set_global_steady_clock_offset(self):
