@@ -151,10 +151,10 @@ class MiniMaxRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         hidden_states = self.weight * hidden_states.to(input_dtype)
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
+        # input_dtype = hidden_states.dtype
+        # hidden_states = hidden_states.to(torch.float32)
         rms_norm_out = self.minimax_all_reduce_rms(hidden_states, self.weight, self.eps)
-        return rms_norm_out.to(input_dtype)
+        return rms_norm_out
 
 
 # It's a little bit tricky to implement special qk norm
