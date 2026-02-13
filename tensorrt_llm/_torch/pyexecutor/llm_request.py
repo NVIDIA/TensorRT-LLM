@@ -1,14 +1,10 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm.bindings
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.sampler import Strategy
-
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
@@ -246,7 +242,7 @@ class PyResult:
                                list[float] | None] | None = None
         log_probs_list: list[tuple[list[TokenLogprobs], list[float]
                                    | None]] = field(default_factory=list)
-        mm_embeddings: dict[str, Any] | None = None
+        mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
         mrope_position_deltas: dict[str, Any] | None = None
         additional_context_outputs_list: list[tuple[str, torch.Tensor]] = field(
@@ -289,7 +285,7 @@ class PyResult:
             use_chunked_generation_logits=use_chunked_generation_logits,
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
-        self._mm_embeddings = None
+        self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
         self._mrope_position_ids = None
         self._mrope_position_deltas = None
         self._additional_context_outputs = {
@@ -362,9 +358,22 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
             self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
-        self._mm_embeddings = SharedTensorContainer.from_tensor(
-            mm_embeddings).dump_to_dict()
+    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
+                             multimodal_lengths: List[int]):
+        """Split concatenated embeddings by multimodal_lengths and create handles for each.
+
+        Args:
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape [total_tokens, hidden_dim]
+            multimodal_lengths: List of token lengths for each multimodal item
+        """
+        # Split the concatenated tensor by lengths to get per-item embeddings
+        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+
+        # Create a SharedTensorContainer handle for each split
+        self._mm_embeddings = [
+            SharedTensorContainer.from_tensor(emb).dump_to_dict()
+            for emb in split_embeddings
+        ]
         self.diff.mm_embeddings = self._mm_embeddings
 
     def set_mrope_position(
@@ -441,7 +450,8 @@ class PyResult:
         return self._log_probs and self._log_probs.cum_log_probs
 
     @property
-    def mm_embedding_handle(self) -> Dict[str, Any] | None:
+    def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:
+        """Returns a list of SharedTensorContainer handles, one per multimodal item."""
         return self._mm_embeddings
 
     @property
@@ -485,7 +495,7 @@ class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handle', 'additional_context_outputs',
+         'mm_embedding_handles', 'additional_context_outputs',
          'additional_generation_outputs', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
 
@@ -662,8 +672,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             additional_outputs=additional_outputs)
         self.child_requests = []
 
-        self._py_sampling_strategy: "Strategy | None" = None
-
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
             # Pre-squeeze to 1D if needed (remove batch dimension)
@@ -832,10 +840,12 @@ def executor_request_to_llm_request(
     multimodal_hashes = None
     multimodal_positions = None
     multimodal_lengths = None
+    multimodal_uuids = None
     if executor_request.multimodal_input is not None:
         multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
         multimodal_positions = executor_request.multimodal_input.multimodal_positions
         multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
+        multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
@@ -865,6 +875,7 @@ def executor_request_to_llm_request(
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
+        multimodal_uuids=multimodal_uuids,
         multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,

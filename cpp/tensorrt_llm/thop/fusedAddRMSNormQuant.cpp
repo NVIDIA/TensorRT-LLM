@@ -43,16 +43,18 @@ namespace torch_ext
 // gamma: [N] - RMSNorm weight (fp16/bf16)
 // sf_scale: [1] - optional scale factor for FP4 quantization (float)
 // use_rms_norm: bool - if true use RMSNorm, else use LayerNorm
+// output_hp_norm: bool - if true, also output high precision normalized values (same dtype as input) for MoE gate.
 // Returns:
 //   normed_output: [M, N/8] - FP4 quantized normalized output (uint32_t, packed)
 //   output: [M, N] - pre-norm output (input + residual), same dtype as input
 //   sf_out: scale factors for FP4 (uint8_t), swizzled layout
+//   high_precision_normed_output: [M, N] - normalized output before quant (only if output_hp_norm=true, else empty)
 //
 // NOTE: This kernel requires SM90 (Hopper) or SM100 (Blackwell) GPU architecture.
 // NOTE: Hidden dimension N must be >= 2048 and <= 16384.
-std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_add_rms_norm_quant(at::Tensor const& input,
-    at::Tensor const& residual, at::Tensor const& gamma, std::optional<at::Tensor> const& sf_scale, bool use_rms_norm,
-    double eps)
+std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_add_rms_norm_quant(
+    at::Tensor const& input, at::Tensor const& residual, at::Tensor const& gamma,
+    std::optional<at::Tensor> const& sf_scale, bool use_rms_norm, double eps, bool output_hp_norm)
 {
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
@@ -116,6 +118,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_add_rms_norm_quant(at::Tens
     int64_t const sfSizePadded = tensorrt_llm::computeSwizzledLayoutSFSize(m_padded, n / sfVecSize);
     at::Tensor sf_out_padded = at::detail::empty_cuda({sfSizePadded}, SF_DTYPE, input.device(), std::nullopt);
     at::Tensor sf_out = (m_padded == m) ? sf_out_padded : sf_out_padded.narrow(0, 0, sfSize);
+    std::optional<at::Tensor> high_precision_normed_output = std::nullopt;
+    if (output_hp_norm)
+    {
+        at::Tensor hp_normed_output_padded
+            = at::detail::empty_cuda({m_padded, n}, input.scalar_type(), input.device(), std::nullopt);
+        high_precision_normed_output
+            = (m_padded == m) ? hp_normed_output_padded : hp_normed_output_padded.narrow(0, 0, m);
+    }
 
     // Get number of SMs for persistent kernel
     static int const multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -152,12 +162,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_add_rms_norm_quant(at::Tens
         param.bias = nullptr;                                                                                          \
         param.gamma = reinterpret_cast<T const*>(gamma.data_ptr());                                                    \
         param.beta = nullptr;                                                                                          \
+        param.high_precision_normed_output                                                                             \
+            = output_hp_norm ? reinterpret_cast<T*>(high_precision_normed_output.value().data_ptr()) : nullptr;        \
         param.m = static_cast<int>(m);                                                                                 \
         param.n = static_cast<int>(n);                                                                                 \
         param.layernorm_eps = static_cast<float>(eps);                                                                 \
         param.stream = stream;                                                                                         \
         param.counters = counters;                                                                                     \
-        tensorrt_llm::kernels::invokeWSLayerNorm<Param>(param, use_rms_norm, multiProcessorCount);                     \
+        tensorrt_llm::kernels::invokeWSLayerNorm<Param>(param, use_rms_norm, multiProcessorCount, output_hp_norm);     \
     } while (0)
 
     if (input.scalar_type() == at::ScalarType::Half)
@@ -180,7 +192,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_add_rms_norm_quant(at::Tens
 
 #undef LAUNCH_FUSED_ADD_RMS_NORM_QUANT
     // No explicit sync needed - kernel runs asynchronously on the stream
-    return std::make_tuple(normed_output, output, sf_out);
+    return std::make_tuple(normed_output, output, sf_out, high_precision_normed_output);
 }
 
 } // namespace torch_ext
@@ -191,7 +203,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fused_add_rms_norm_quant(Tensor input, Tensor residual, Tensor gamma, "
-        "Tensor? sf_scale, bool use_rms_norm=True, float eps=1e-6) -> (Tensor, Tensor, Tensor)");
+        "Tensor? sf_scale, bool use_rms_norm=True, float eps=1e-6, bool output_hp_norm=False) -> (Tensor, Tensor, "
+        "Tensor, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -436,10 +436,8 @@ def create_py_executor(
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
-    if not llm_args.disable_overlap_scheduler:
-        model_engine_max_seq_len = model_engine.max_seq_len + 1
-        if spec_config is not None:
-            model_engine_max_seq_len += spec_config.max_total_draft_tokens
+    if not llm_args.disable_overlap_scheduler and spec_config is not None:
+        model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)

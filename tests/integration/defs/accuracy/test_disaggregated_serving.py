@@ -135,16 +135,18 @@ def run_accuracy_test(llm: "DuckLLM",
 
 @contextlib.contextmanager
 def launch_disaggregated_llm(
-        disaggregated_server_config: Dict[str, Any],
-        ctx_server_config: Dict[str, Any],
-        gen_server_config: Dict[str, Any],
-        model_name: str,
-        tensor_parallel_size: int = 1,
-        ctx_model: str = None,
-        gen_model: str = None,
-        server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
-        max_workers: int = 16,
-        enable_perf=False):
+    disaggregated_server_config: Dict[str, Any],
+    ctx_server_config: Dict[str, Any],
+    gen_server_config: Dict[str, Any],
+    model_name: str,
+    tensor_parallel_size: int = 1,
+    ctx_model: str = None,
+    gen_model: str = None,
+    server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
+    max_workers: int = 16,
+    enable_perf=False,
+    extra_env: Optional[Dict[str, str]] = None,
+):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -229,10 +231,14 @@ def launch_disaggregated_llm(
     ctx_servers = []
     current_gpu_offset = 0
 
+    base_env = os.environ.copy()
+    if extra_env:
+        base_env.update(extra_env)
+
     kv_cache_perf_dir = os.path.join(temp_dir.name, "kv_cache_perf")
 
     for i, port in enumerate(ctx_ports):
-        env = os.environ.copy()
+        env = base_env.copy()
         env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
@@ -262,7 +268,7 @@ def launch_disaggregated_llm(
     gen_servers = []
 
     for i, port in enumerate(gen_ports):
-        env = os.environ.copy()
+        env = base_env.copy()
         env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
@@ -449,6 +455,30 @@ def launch_disaggregated_llm(
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
                 _get_perf_metrics()
+
+            # Gracefully shut down all server processes
+            all_processes = list(
+                itertools.chain(ctx_processes, gen_processes, server_processes))
+
+            # SIGTERM triggers llm.shutdown() inside each trtllm-serve, cleaning up the executor and MPI workers.
+            for process in all_processes:
+                if process.poll() is None:
+                    process.terminate()
+
+            # Wait up to 5s total, then SIGKILL any process that doesn't exit.
+            # This is a safety net for when llm.shutdown() hangs.
+            deadline = time.monotonic() + 5
+            for process in all_processes:
+                remaining = max(0, deadline - time.monotonic())
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass  # already exited between timeout and kill
+                except OSError:
+                    pass  # process already gone
 
 
 def run_parallel_test(model_name: str,
@@ -1196,43 +1226,45 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("overlap_scheduler", [False])
     def test_auto_dtype(self, overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
-        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
-        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
-        ctx_server_config["kv_cache_config"] = {
-            "free_gpu_memory_fraction": 0.7,
+        cache_transceiver_config = {"backend": "DEFAULT"}
+        max_num_tokens = 8192
+        ctx_kv_cache_config = {
+            "free_gpu_memory_fraction": 0.3,
             "tokens_per_block": 64,
-            "dtype": "fp8"
+            "dtype": "fp8",
         }
-        ctx_server_config["moe_config"] = {
-            "backend": "TRTLLM",
-            "max_num_tokens": 16384
+        moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": cache_transceiver_config,
+            "kv_cache_config": ctx_kv_cache_config,
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "max_batch_size": 16,
+            "max_num_tokens": max_num_tokens,
+            "enable_autotuner": False,
         }
-        ctx_server_config["tensor_parallel_size"] = 4
-        ctx_server_config["pipeline_parallel_size"] = 1
-        ctx_server_config["moe_expert_parallel_size"] = 4
-        ctx_server_config["max_batch_size"] = 24
-        ctx_server_config["cuda_graph_config"] = None
-        ctx_server_config["enable_attention_dp"] = True
-        ctx_server_config["enable_autotuner"] = False
-        gen_server_config["kv_cache_config"] = {
+        gen_kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
             "tokens_per_block": 64,
-            "free_gpu_memory_fraction": 0.7,
-            "dtype": "fp8"
+            "dtype": "fp8",
         }
-        gen_server_config["moe_config"] = {
-            "backend": "TRTLLM",
-            "max_num_tokens": 16384
+        gen_server_config = {
+            "disable_overlap_scheduler": overlap_scheduler,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": cache_transceiver_config,
+            "kv_cache_config": gen_kv_cache_config,
+            "moe_config": moe_config,
+            "max_batch_size": 128,
+            "max_num_tokens": 1024,
+            "cuda_graph_config": None,
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "enable_autotuner": False,
         }
-        gen_server_config["max_batch_size"] = 128
-        gen_server_config["max_num_tokens"] = 128
-        gen_server_config["cuda_graph_config"] = None
-        gen_server_config["tensor_parallel_size"] = 4
-        gen_server_config["pipeline_parallel_size"] = 1
-        gen_server_config["moe_expert_parallel_size"] = 4
-        gen_server_config["enable_attention_dp"] = True
-        gen_server_config["enable_autotuner"] = False
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -1247,11 +1279,13 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
+                                      ctx_server_config=ctx_server_config,
+                                      gen_server_config=gen_server_config,
+                                      model_name=self.MODEL_PATH,
                                       max_workers=128) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+            run_accuracy_test(llm,
+                              model_name=self.MODEL_NAME,
+                              test_sets=["MMLU", "GSM8K"])
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
