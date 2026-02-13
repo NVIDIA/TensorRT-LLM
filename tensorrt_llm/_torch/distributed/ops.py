@@ -19,7 +19,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
+from ..flashinfer_utils import (IS_FLASHINFER_AVAILABLE,
+                                get_current_flashinfer_allreduce_workspace)
+
 _thread_local = threading.local()
+
+if IS_FLASHINFER_AVAILABLE:
+    from flashinfer.comm import vllm_all_reduce
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -688,6 +694,7 @@ class AllReduce(nn.Module):
         self.strategy = strategy
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None
+        self.flashinfer_allreduce = None
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
@@ -748,6 +755,30 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+
+            if self.strategy == AllReduceStrategy.FLASHINFER:
+                # We can safely fallback to AUTO here as the workspace will be initialized above when strategy == FLASHINFER
+                # This also allows dynamically switching between FLASHINFER and AUTO strategies based on the input size.
+
+                if not IS_FLASHINFER_AVAILABLE:
+                    logger.warning(
+                        "FlashInfer is not installed. Falling back to AUTO AllReduce strategy."
+                    )
+                    self.strategy = AllReduceStrategy.AUTO
+                    self.flashinfer_allreduce = None
+                else:
+                    try:
+                        self.flashinfer_allreduce = FlashInferVLLMAllReduce(
+                            mapping=self.mapping, dtype=dtype)
+                        self.flashinfer_allreduce_token_threshold = int(
+                            os.getenv("_FLASHINFER_ALLREDUCE_TOKEN_THRESHOLD",
+                                      "256"))
+                    except Exception as e:
+                        logger.warning(
+                            f"FlashInferVLLMAllReduce can't be enabled due to {e}. Falling back to AUTO strategy."
+                        )
+                        self.strategy = AllReduceStrategy.AUTO
+                        self.flashinfer_allreduce = None
 
     def forward(
         self,
@@ -814,10 +845,21 @@ class AllReduce(nn.Module):
             if mnnvl_output is not None:
                 return mnnvl_output
 
+        if self.flashinfer_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
+            # Token threshold: 0 means always try (no token gate), >0 means gate
+            within_token_threshold = (
+                self.flashinfer_allreduce_token_threshold == 0
+                or input.size(0) <= self.flashinfer_allreduce_token_threshold)
+            if within_token_threshold and self.flashinfer_allreduce.should_custom_ar(
+                    input, all_reduce_params):
+                return self.flashinfer_allreduce(
+                    input, all_reduce_params=all_reduce_params)
+
         # Fall back to regular AllReduce if specialized methods are not available or not applicable
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM
         if allreduce_strategy in (AllReduceStrategy.MNNVL,
-                                  AllReduceStrategy.SYMM_MEM):
+                                  AllReduceStrategy.SYMM_MEM,
+                                  AllReduceStrategy.FLASHINFER):
             allreduce_strategy = AllReduceStrategy.AUTO
 
         additional_args = {}
@@ -959,3 +1001,93 @@ class MoEAllReduce(nn.Module):
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
             )
+
+
+class FlashInferVLLMAllReduce(nn.Module):
+    """Custom AllReduce using the FlashInfer (vLLM) IPC-based kernel.
+
+    This is a low-latency alternative to NCCL for small tensors on NVLink
+    systems with 2/4/6/8 GPUs. For tensors exceeding the IPC buffer size,
+    or when other preconditions are not met, the caller (AllReduce.forward)
+    falls back to the standard allreduce path.
+    """
+
+    def __init__(self, mapping: Mapping, dtype: torch.dtype):
+        super().__init__()
+        self.mapping = mapping
+        self.dtype = dtype
+
+        self.num_ctas = 36
+        self.workspace = get_current_flashinfer_allreduce_workspace()
+        self.reg_buffer_size = self.workspace.max_size
+
+    def should_custom_ar(
+            self,
+            inp: torch.Tensor,
+            all_reduce_params: Optional[AllReduceParams] = None) -> bool:
+        inp_size = inp.numel() * inp.element_size()
+
+        # 1. Must fit in the IPC buffer
+        if inp_size > self.reg_buffer_size:
+            return False
+
+        # 2. Kernel loads 16-byte (128-bit) packed values;
+        #    total byte count must be a multiple of 16
+        if inp_size % 16 != 0:
+            return False
+
+        if not inp.is_contiguous():
+            return False
+        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
+        if all_reduce_params is not None and all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+            return False
+
+        return True
+
+    def custom_all_reduce(self, input: torch.Tensor, registered: bool = False):
+        assert input.is_contiguous(
+        ), "Input tensor must be contiguous for FlashInferVLLMAllReduce"
+        output_tensor = torch.empty_like(input)
+
+        try:
+            if registered:
+                vllm_all_reduce(self.workspace.fa, input, output_tensor, 0, 0,
+                                self.num_ctas)
+            else:
+                vllm_all_reduce(
+                    self.workspace.fa,
+                    input,
+                    output_tensor,
+                    self.workspace.buffer_ptrs_ipc.peer_ptrs[
+                        self.mapping.tp_rank],
+                    self.reg_buffer_size,
+                    self.num_ctas,
+                )
+        except Exception as e:
+            logger.error(f"FlashInferVLLMAllReduce failed: {e}")
+            raise
+
+        return output_tensor
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        *,
+        all_reduce_params: Optional[AllReduceParams] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass for vLLM custom AllReduce.
+        Args:
+            input (torch.Tensor): Input tensor to be reduced
+            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations
+        Returns:
+            torch.Tensor: Reduced tensor
+        """
+        if self.workspace._is_capturing:
+            if torch.cuda.is_current_stream_capturing():
+                return self.custom_all_reduce(input, registered=True)
+            else:
+                return torch.empty_like(input)
+        else:
+            return self.custom_all_reduce(input, registered=False)

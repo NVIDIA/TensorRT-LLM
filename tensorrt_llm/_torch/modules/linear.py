@@ -2589,7 +2589,9 @@ class Linear(nn.Module):
                     output = self.apply_linear(input, bias, lora_params,
                                                layer_idx)
                     output = self.all_reduce(
-                        output, all_reduce_params=all_reduce_params)
+                        output,
+                        all_reduce_params=all_reduce_params,
+                    )
             else:
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
