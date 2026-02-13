@@ -309,7 +309,8 @@ class ADPiecewiseRunner(nn.Module):
 
             torch.cuda.synchronize()
 
-            # Store the graph pool for sharing across segments
+            # Fallback: if no pool was provided at construction time, store the
+            # auto-created pool so subsequent captures within this runner reuse it.
             if self._graph_pool is None:
                 self._graph_pool = graph.pool()
 
