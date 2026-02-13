@@ -655,13 +655,17 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config.get("cp_type", None)
-            logger.info(
-                f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
-            )
-            return
+            if cp_type != CpType.HELIX:
+                logger.info(
+                    f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
+                )
+                return
 
         self._run_torch_compile_warmup(resource_manager)
-        self._run_autotuner_warmup(resource_manager)
+        # Autotuner warmup uses context-only requests. Helix CP
+        # is decode-only and runs into issues with autotuner warmup.
+        if not self.mapping.has_cp_helix():
+            self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
 
         # Set the value back to the original value after all warmups are complete
@@ -2400,7 +2404,6 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
-                    assert not self.is_warmup, "Warmup is not called for helix parallelism."
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
