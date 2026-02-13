@@ -6,9 +6,6 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-# NOTE: NGramDrafter and NGramPoolManager are deprecated internal classes.
-# They are kept for backward compatibility with user-provided drafter mode.
-# For new code, use NGramDecodingConfig directly for NGram speculative decoding.
 from tensorrt_llm._torch.speculative.ngram import NGramDrafter, NGramPoolManager
 from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
                                  NGramDecodingConfig,

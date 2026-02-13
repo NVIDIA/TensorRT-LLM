@@ -14,7 +14,7 @@ from .drafter import Drafter
 
 class NGramPoolManager(BaseResourceManager):
     """
-    Pool-based resource manager for NGram speculative decoding (two-model design).
+    Drafter for NGram. This class maintains the pattern-matches pairs for NGram drafter.
 
     For example, one of the existed pairs could be: ["I","love"] -> [["apple", "because", "it", "is"], ["banana", "and"]].
 

@@ -1106,51 +1106,27 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 class NGramDecodingConfig(DecodingBaseConfig):
     """
-    Configuration for NGram speculative decoding (two-model design).
-
-    Uses a Python pool-based drafter that matches n-gram patterns in previously
-    generated tokens to predict draft tokens. Draft tokens are produced by
-    NGramDrafter in a separate step; the target model then verifies them.
-
+    Configuration for NGram drafter speculative decoding.
     Arguments:
         max_draft_len: int
-            The maximum number of draft tokens to generate per step.
-
+                The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
         max_matching_ngram_size: int
-            Maximum n-gram size for pattern matching. Must be > 0.
-
-        max_total_draft_tokens: int
-            Maximum total draft tokens (linear tree: equals max_draft_len).
-
-        is_keep_all: bool
-            If True, keep all candidate pattern-match pairs; if False, only one
-            match per pattern (longest wins when updating).
-
-        is_use_oldest: bool
-            If True, use the oldest match when a pattern is hit; if False, use
-            the newest match.
-
-        is_public_pool: bool
-            If True, use a single shared pool for all requests; if False, each
-            request has its own pool.
+            The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
+        is_keep_all: bool = True
+            Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
+        is_use_oldest: bool = True
+            Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
+        is_public_pool: bool = True
+            Whether to use a common pool for all requests, or the pool is private for each request if False.
     """
-    max_matching_ngram_size: int = 1
-
+    max_matching_ngram_size: int = 0
     is_keep_all: bool = True
     is_use_oldest: bool = True
     is_public_pool: bool = True
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.max_total_draft_tokens = self.max_draft_len  # NGram only supports linear tree
-
-    @model_validator(mode='after')
-    def validate_ngram_config(self) -> 'NGramDecodingConfig':
-        """Validate NGram configuration."""
-        if self.max_matching_ngram_size == 0:
-            raise ValueError(
-                "max_matching_ngram_size must be > 0 for NGram. Got 0.")
-        return self
+        self.max_total_draft_tokens = self.max_draft_len  # Current NGram only support linear tree
 
     @classmethod
     def from_dict(cls, data: dict):

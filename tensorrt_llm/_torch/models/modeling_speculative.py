@@ -983,7 +983,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     assert key in model_config.extra_attrs
                     model_config.extra_attrs[key].update(value)
 
-            # spec_worker is created for all one-engine modes (MTP, Eagle3, NGram)
+            # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
@@ -1040,7 +1040,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                                      num_tokens]
 
             # get accepted tokens and next draft tokens
-            # spec_worker handles all one-engine modes: MTP, Eagle3, NGram
             return self.spec_worker(input_ids=spec_input_ids,
                                     position_ids=spec_position_ids,
                                     hidden_states=hidden_states,
