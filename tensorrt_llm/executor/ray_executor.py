@@ -127,7 +127,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             "TLLM_DISABLE_MPI": "1",
             "MASTER_ADDR": self.master_address,  # head-IP for NCCL/Gloo
         })
-        runtime_env["nsight"] = ray_worker_nsight_options
+        if ray_worker_nsight_options:
+            runtime_env["nsight"] = ray_worker_nsight_options
 
         placement_groups, self.bundle_indices = self._get_placement_group(
             tp_size=self.tp_size, worker_kwargs=worker_kwargs)

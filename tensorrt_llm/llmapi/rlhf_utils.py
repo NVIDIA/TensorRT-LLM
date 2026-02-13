@@ -145,9 +145,7 @@ class WorkerExtension:
         return weights_updated
 
     def start_profile(self):
-        print("david Starting profile at worker extension")
         torch.cuda.profiler.start()
 
     def stop_profile(self):
-        print("david Stopping profile at worker extension")
         torch.cuda.profiler.stop()
