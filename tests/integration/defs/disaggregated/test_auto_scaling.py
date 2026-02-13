@@ -147,14 +147,14 @@ def _run_worker(model_name,
         env = os.environ.copy()
         log_file = None
         log_path = None
+        stdout = None
+        stderr = None
         if save_log:
             log_path = os.path.join(work_dir, f"worker_{role}_{port}.log")
             log_file = open(log_path, "w+")
             stdout = log_file
             stderr = log_file
-        else:
-            stdout = sys.stdout
-            stderr = sys.stderr
+
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
         print(f"Running {role} on port {port}")

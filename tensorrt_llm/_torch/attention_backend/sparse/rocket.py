@@ -974,6 +974,7 @@ class RocketKVCacheManager(KVCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         num_extra_decoding_steps: int = 0,
+        draft_kv_cache_manager=None,
     ):
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -984,6 +985,7 @@ class RocketKVCacheManager(KVCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if prepare_resource:
             for req in requests:

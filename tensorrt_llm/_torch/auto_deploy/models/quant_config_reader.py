@@ -83,7 +83,7 @@ class QuantConfigReaderRegistry:
 
 @QuantConfigReaderRegistry.register("modelopt")
 class ModelOPTQuantConfigReader(QuantConfigReader):
-    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*")
+    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*", "*.mlp.gate")
 
     def read_config(self, config: Dict) -> Dict:
         producer = config.get("producer", {}).get("name")

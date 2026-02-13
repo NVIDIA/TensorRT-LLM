@@ -134,9 +134,11 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     backend: trtllm
+    allow_different_input_scales: false
   fuse_nvfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true
+    allow_different_input_scales: false
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   fuse_rmsnorm:
@@ -160,15 +162,16 @@ transforms:
   visualize_namespace:
     stage: visualize
     enabled: false
-  ############################################################################################
+  ###########################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
-  ############################################################################################
+  ###########################################################################################
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer
   insert_cached_mla_attention:
     stage: cache_init
-    backend: MultiHeadLatentAttention
+    requires_shape_prop: true
+    backend: flashinfer_mla
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm

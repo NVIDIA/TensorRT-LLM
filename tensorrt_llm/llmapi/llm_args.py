@@ -720,6 +720,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
+    # If set, drafting will use separate KV cache in one-model speculative decoding.
+    _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -1485,6 +1487,12 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
         return getattr(_ContextChunkingPolicy, self.value)
 
 
+class WaitingQueuePolicy(StrEnum):
+    """Waiting queue scheduling policy for managing pending requests."""
+
+    FCFS = "fcfs"  # First-Come-First-Served
+
+
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
 class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
@@ -1522,6 +1530,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None, description="The dynamic batch config to use")
+
+    waiting_queue_policy: WaitingQueuePolicy = Field(
+        default=WaitingQueuePolicy.FCFS,
+        description="The waiting queue scheduling policy")
 
     def _to_pybind(self):
         return _SchedulerConfig(

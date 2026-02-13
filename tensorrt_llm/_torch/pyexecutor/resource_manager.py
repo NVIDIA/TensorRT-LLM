@@ -135,7 +135,10 @@ def get_pp_layers(
     pp_layers = mapping.pp_layers(total_num_layers)
     if layer_mask is not None:
         pp_layers = [i for i in pp_layers if layer_mask[i]]
-    if spec_config is not None:
+    # Only add speculative layers when layer_mask is not provided.
+    # When layer_mask is provided, the caller explicitly controls which layers
+    # to include, so we should not add extra layers automatically.
+    if spec_config is not None and layer_mask is None:
         num_spec_layers = get_num_spec_layers(spec_config)
         total_num_layers += num_spec_layers
         if mapping.is_last_pp_rank():
@@ -586,6 +589,7 @@ class KVCacheManager(BaseResourceManager):
         # we need to make the KV cache manager aware that multiple autoregressive steps will
         # occur.
         num_extra_decoding_steps: int = 0,
+        draft_kv_cache_manager: Optional[BaseResourceManager] = None,
     ):
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space
@@ -604,6 +608,10 @@ class KVCacheManager(BaseResourceManager):
             # during warmup.
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
+            # Helix active rank sets past_seen_token_num = seqlen_this_rank_cp - 1
+            # in _prepare_tp_inputs; need token_num >= 2 so that doesn't go negative.
+            if self.mapping.has_cp_helix():
+                token_num = max(token_num, 2)
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -625,6 +633,12 @@ class KVCacheManager(BaseResourceManager):
                 for _ in range(num_extra_decoding_steps):
                     self.impl.add_token(req_id)
 
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.impl.add_sequence(
+                        req_id, token_num, beam_width, req)
+                    for _ in range(self.num_extra_kv_tokens):
+                        draft_kv_cache_manager.impl.add_token(req_id)
+
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
@@ -640,16 +654,22 @@ class KVCacheManager(BaseResourceManager):
                         req.py_prompt_len = req.prompt_len
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                        req.py_decoding_iter = 1
                     else:
                         req.py_helix_is_inactive_rank = True
                         req.prompt_len = token_num
                         req.py_prompt_len = req.prompt_len
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                        req.py_decoding_iter = 1
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     for _ in range(max_num_draft_tokens):
                         self.impl.add_token(req_id)
+
+                    if draft_kv_cache_manager is not None:
+                        for _ in range(max_num_draft_tokens):
+                            draft_kv_cache_manager.impl.add_token(req_id)
 
             # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
             if use_mrope:
@@ -1886,7 +1906,8 @@ class KVCacheManagerV2(BaseResourceManager):
             max_num_draft_tokens: int = 0,
             use_mrope: bool = False,
             max_beam_width: int = 1,
-            num_extra_decoding_steps: int = 0):
+            num_extra_decoding_steps: int = 0,
+            draft_kv_cache_manager: Optional['BaseResourceManager'] = None):
 
         beam_width = max_beam_width
         requests = []

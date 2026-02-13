@@ -244,7 +244,8 @@ def test_autodeploy_eagle3_acceptance_rate():
     # We directly instantiate the LLM class instead of using the main() function
     # so that we can stream the outputs to see acceptance rates without needing to
     # collect them in the executor.
-    llm = LLM(
+    # Use context manager to ensure proper cleanup and avoid thread leaks.
+    with LLM(
         model=base_model,
         skip_loading_weights=False,
         runtime="trtllm",
@@ -253,43 +254,43 @@ def test_autodeploy_eagle3_acceptance_rate():
         speculative_config=speculative_config,
         disable_overlap_scheduler=True,
         max_num_tokens=64,
-    )
+    ) as llm:
+        # Tokenize 2 prompts to test multiple sequential requests
+        batch_tok_ids = [llm.tokenizer.encode(p) for p in prompts[:2]]
 
-    # Tokenize 2 prompts to test multiple sequential requests
-    batch_tok_ids = [llm.tokenizer.encode(p) for p in prompts[:2]]
+        sampling_params = SamplingParams(max_tokens=128, temperature=0, seed=42)
 
-    sampling_params = SamplingParams(max_tokens=128, temperature=0, seed=42)
+        print("\nRunning Eagle3 speculative decoding with streaming...")
 
-    print("\nRunning Eagle3 speculative decoding with streaming...")
+        # Process each request sequentially and verify acceptance rate
+        for i in range(len(batch_tok_ids)):
+            num_tokens = 0
+            num_drafted = 0
+            num_accepted = 0
 
-    # Process each request sequentially and verify acceptance rate
-    for i in range(len(batch_tok_ids)):
-        num_tokens = 0
-        num_drafted = 0
-        num_accepted = 0
+            for output in llm.generate_async(batch_tok_ids[i], sampling_params, streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_drafted += max_draft_len
+                num_accepted += len(new_tokens) - num_tokens - 1
+                num_tokens = len(new_tokens)
 
-        for output in llm.generate_async(batch_tok_ids[i], sampling_params, streaming=True):
-            new_tokens = output.outputs[0].token_ids
-            num_drafted += max_draft_len
-            num_accepted += len(new_tokens) - num_tokens - 1
-            num_tokens = len(new_tokens)
+            accept_rate = num_accepted / num_drafted
 
-        accept_rate = num_accepted / num_drafted
+            print(f"\nRequest {i + 1} Acceptance Rate Statistics:")
+            print(f"  Total tokens drafted: {num_drafted}")
+            print(f"  Total tokens accepted: {num_accepted}")
+            print(f"  Acceptance rate: {accept_rate:.2%}")
 
-        print(f"\nRequest {i + 1} Acceptance Rate Statistics:")
-        print(f"  Total tokens drafted: {num_drafted}")
-        print(f"  Total tokens accepted: {num_accepted}")
-        print(f"  Acceptance rate: {accept_rate:.2%}")
+            # Verify acceptance rate is above minimum threshold (10%)
+            min_acceptance_rate = 0.10
+            assert accept_rate > min_acceptance_rate, (
+                f"Request {i + 1}: Acceptance rate {accept_rate:.2%} is below minimum threshold "
+                f"{min_acceptance_rate:.0%}"
+            )
 
-        # Verify acceptance rate is above minimum threshold (10%)
-        min_acceptance_rate = 0.10
-        assert accept_rate > min_acceptance_rate, (
-            f"Request {i + 1}: Acceptance rate {accept_rate:.2%} is below minimum threshold {min_acceptance_rate:.0%}"
-        )
-
-    print("\n" + "=" * 80)
-    print("SUCCESS! All requests passed acceptance rate threshold")
-    print("=" * 80)
+        print("\n" + "=" * 80)
+        print("SUCCESS! All requests passed acceptance rate threshold")
+        print("=" * 80)
 
 
 def load_weights(model_path: Path, model: torch.nn.Module):

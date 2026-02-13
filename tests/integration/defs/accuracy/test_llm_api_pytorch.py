@@ -3133,6 +3133,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_post_blackwell
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
         [(8, 1, 8, False, False, True, True, 16)],
@@ -5690,6 +5691,17 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(40000)
     @pytest.mark.parametrize(
+        "use_cpp_mamba",
+        [
+            False,
+            True,
+        ],
+        ids=[
+            "python_mamba_cache",
+            "cpp_mamba_cache",
+        ],
+    )
+    @pytest.mark.parametrize(
         "attention_dp",
         [
             False,
@@ -5700,7 +5712,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             "attention_dp_on",
         ],
     )
-    def test_fp8_4gpus(self, attention_dp):
+    def test_fp8_4gpus(self, attention_dp, use_cpp_mamba, monkeypatch):
+        monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA",
+                           "1" if use_cpp_mamba else "0")
+
         with LLM(
                 f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-fp8-fp8kv",
                 kv_cache_config=KvCacheConfig(
