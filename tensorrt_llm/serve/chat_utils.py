@@ -277,17 +277,19 @@ def parse_chat_messages_coroutines(
     mm_placeholder_counts = []
     mm_data_tracker = MultimodalDataTracker(model_config.model_type,
                                             multimodal_server_config)
-
     for msg in messages:
         parsed_msg = parse_chat_message_content(msg, mm_data_tracker)
         conversation.append(parsed_msg)
+        mm_placeholder_count_value = 0
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:
                 mm_data_tracker.add_data(mdata["modality"],
                                          mdata["data"],
                                          is_embedding=mdata["is_embedding"])
+                mm_placeholder_count_value += 1
         mm_placeholder_count = mm_data_tracker.placeholder_counts()
-        if mm_placeholder_count:
+        if mm_placeholder_count_value:
+            mm_placeholder_count[next(iter(mm_placeholder_count))] = mm_placeholder_count_value
             parsed_msg["content"] = add_multimodal_placeholders(
                 model_config.model_type, parsed_msg["content"],
                 mm_placeholder_count)
