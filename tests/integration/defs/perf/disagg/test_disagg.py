@@ -96,7 +96,7 @@ class TestDisaggBenchmark:
             logger.info(f"Benchmark: {test_config.benchmark_type}")
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
-            InfoPrinter.print(test_config.config_path, test_config.test_id)
+            InfoPrinter.print(test_config)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
@@ -176,7 +176,7 @@ class TestDisaggBenchmark:
 
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
-            InfoPrinter.print(test_config.config_path, test_config.test_id)
+            InfoPrinter.print(test_config)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
@@ -258,7 +258,7 @@ class TestDisaggBenchmark:
 
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
-            InfoPrinter.print(test_config.config_path, test_config.test_id)
+            InfoPrinter.print(test_config)
             logger.info(f"{'=' * 60}")
 
             if EnvManager.get_debug_mode():
