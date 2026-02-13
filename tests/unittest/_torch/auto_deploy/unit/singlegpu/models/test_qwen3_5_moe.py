@@ -419,7 +419,9 @@ def ref_moe_forward(module, hidden_states):
             continue
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states_flat[token_idx]
-        gate, up = F.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
+        # Runtime stacked layout is [w3(up), w1(gate)] for gate_up_proj.
+        # This differs from raw HF checkpoint ordering [w1(gate), w3(up)].
+        up, gate = F.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
         current_hidden_states = F.silu(gate) * up
         current_hidden_states = F.linear(current_hidden_states, down_proj[expert_idx])
         current_hidden_states = current_hidden_states * router_top_value[token_idx, top_k_pos, None]
@@ -1226,10 +1228,11 @@ def test_multimodal_forward_matches_reference():
     ref_output = ref_multimodal_forward(
         model.model, input_ids, pixel_values=pixel_values, image_grid_thw=image_grid_thw
     )
+    ref_logits = model.lm_head(ref_output.last_hidden_state.to(model.lm_head.weight.dtype)).float()
 
     torch.testing.assert_close(
         our_output.logits,
-        ref_output.logits,
+        ref_logits,
         rtol=1e-5,
         atol=1e-5,
         msg="Multimodal forward should match step-by-step HF reference",

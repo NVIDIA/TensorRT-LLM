@@ -545,6 +545,10 @@ class Qwen3_5MoeExperts(nn.Module):
         )
         # Swap gate/up halves at load time: HF [gate, up] -> TRT-LLM [up, gate]
         self._register_load_state_dict_pre_hook(self._swap_gate_up)
+        # If transforms materialize expert-list params under this module
+        # (w1_expert_i, w2_expert_i, w3_expert_i), populate them from stacked
+        # tensors at load time. This keeps model-specific ordering policy local.
+        self._register_load_state_dict_pre_hook(self._populate_expert_list_params)
 
     @staticmethod
     def _swap_gate_up(state_dict, prefix, *args):
@@ -553,6 +557,33 @@ class Qwen3_5MoeExperts(nn.Module):
             w = state_dict[key]
             I = w.shape[1] // 2  # noqa: E741
             state_dict[key] = torch.cat([w[:, I:, :], w[:, :I, :]], dim=1)
+
+    def _populate_expert_list_params(self, state_dict, prefix, *args):
+        """Populate expert-list keys if they exist on this module.
+
+        Assumes `gate_up_proj` is already normalized to TRT-LLM order [w3, w1]
+        (by `_swap_gate_up`) and performs structural splitting only.
+        """
+        gate_key = prefix + "gate_up_proj"
+        if gate_key in state_dict:
+            w = state_dict[gate_key]
+            I = w.shape[1] // 2  # noqa: E741
+            w3, w1 = w[:, :I, :], w[:, I:, :]
+            for i in range(self.num_experts):
+                w1_name = f"w1_expert_{i}"
+                w3_name = f"w3_expert_{i}"
+                if hasattr(self, w1_name):
+                    state_dict[prefix + w1_name] = w1[i]
+                if hasattr(self, w3_name):
+                    state_dict[prefix + w3_name] = w3[i]
+
+        down_key = prefix + "down_proj"
+        if down_key in state_dict:
+            w2 = state_dict[down_key]
+            for i in range(self.num_experts):
+                w2_name = f"w2_expert_{i}"
+                if hasattr(self, w2_name):
+                    state_dict[prefix + w2_name] = w2[i]
 
 
 class Qwen3_5MoeTopKRouter(nn.Module):

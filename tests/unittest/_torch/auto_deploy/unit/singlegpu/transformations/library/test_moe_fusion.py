@@ -1152,3 +1152,80 @@ def test_pre_stacked_moe_fusion():
         is_op(n, torch.ops.auto_deploy.torch_moe_fused) for n in gm_transformed.graph.nodes
     )
     assert not has_torch_moe_fused_after, "torch_moe_fused should be replaced after transform"
+
+
+def test_split_moe_fused_for_sharding_transform():
+    """Test pre-sharding conversion: torch_moe_fused -> torch_moe expert lists."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(2345)
+
+    model = PreStackedMoEModel().to(device=device, dtype=dtype)
+    x = model.get_input(device=device, dtype=dtype)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "split_moe_fused_for_sharding": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
+
+    has_torch_moe = any(
+        is_op(n, torch.ops.auto_deploy.torch_moe) for n in gm_transformed.graph.nodes
+    )
+    assert has_torch_moe, "Expected torch_moe op after pre-sharding split transform"
+
+    has_torch_moe_fused = any(
+        is_op(n, torch.ops.auto_deploy.torch_moe_fused) for n in gm_transformed.graph.nodes
+    )
+    assert not has_torch_moe_fused, "torch_moe_fused should be rewritten before sharding"
+
+    with torch.inference_mode():
+        y_ref = model(x)
+        y_new = gm_transformed(x)
+    torch.testing.assert_close(y_new, y_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_split_moe_fused_for_sharding_load_hook():
+    """Test load hooks for transformed expert-list params."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(2345)
+
+    model = PreStackedMoEModel().to(device=device, dtype=dtype)
+    x = model.get_input(device=device, dtype=dtype)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "split_moe_fused_for_sharding": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
+
+    # Load from original stacked checkpoint; transform hooks should populate expert-list params.
+    missing, unexpected = gm_transformed.load_state_dict(model.state_dict(), strict=False)
+    assert not missing, f"Missing keys after transformed load: {missing}"
+    # stacked source keys can remain as harmless unexpected keys after conversion
+    assert all(k.endswith(("gate_up_proj", "down_proj")) for k in unexpected), unexpected
+
+    # Validate a representative split mapping for expert 0:
+    # gate_up_proj is runtime-layout [w3, w1] along dim=1.
+    source_gate_up = model.gate_up_proj.detach()
+    I = source_gate_up.shape[1] // 2  # noqa: E741
+    expected_w3 = source_gate_up[0, :I, :]
+    expected_w1 = source_gate_up[0, I:, :]
+    expected_w2 = model.down_proj.detach()[0]
+
+    actual_w1 = gm_transformed.get_parameter("w1_expert_0")
+    actual_w2 = gm_transformed.get_parameter("w2_expert_0")
+    actual_w3 = gm_transformed.get_parameter("w3_expert_0")
+
+    torch.testing.assert_close(actual_w1, expected_w1)
+    torch.testing.assert_close(actual_w2, expected_w2)
+    torch.testing.assert_close(actual_w3, expected_w3)
