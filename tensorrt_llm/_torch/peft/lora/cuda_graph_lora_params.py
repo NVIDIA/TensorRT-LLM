@@ -4,6 +4,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import use_pinned_memory
+
 
 @dataclass
 class LoraLayerParams:
@@ -78,7 +80,7 @@ class CudaGraphLoraParams:
 
         # sorted indices using slot ids as keys, mainly to group requests with the same slot id together in a batch
         self.sorted_ids = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
-        self.sorted_ids_host = torch.zeros_like(self.sorted_ids, device="cpu", pin_memory=True)
+        self.sorted_ids_host = torch.zeros_like(self.sorted_ids, device="cpu", pin_memory=use_pinned_memory())
 
         # persistent values for gen-only batch with cuda graph
         self.persistent_sorted_ids = self.sorted_ids
@@ -86,15 +88,15 @@ class CudaGraphLoraParams:
         self.slot_ids = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
 
         self.slot_counts = torch.zeros(max_lora_size, dtype=torch.int32, device=device)
-        self.slot_counts_host = torch.zeros_like(self.slot_counts, device="cpu", pin_memory=True)
+        self.slot_counts_host = torch.zeros_like(self.slot_counts, device="cpu", pin_memory=use_pinned_memory())
         self.slot_offsets_full = torch.zeros(max_lora_size + 1, dtype=torch.int64, device=device)
         self.slot_offsets = self.slot_offsets_full[:-1]
         self.slot_offsets_full_host = torch.zeros_like(
-            self.slot_offsets_full, device="cpu", pin_memory=True
+            self.slot_offsets_full, device="cpu", pin_memory=use_pinned_memory()
         )
 
         self.slot_ranks = torch.zeros(max_lora_size, dtype=torch.int32, device=device)
-        self.slot_ranks_host = torch.zeros_like(self.slot_ranks, device="cpu", pin_memory=True)
+        self.slot_ranks_host = torch.zeros_like(self.slot_ranks, device="cpu", pin_memory=use_pinned_memory())
 
         for key, info in self.layer_info.items():
             assert (
@@ -146,8 +148,8 @@ class CudaGraphLoraParams:
             # Weight pointers - managed by PEFT cache manager
             d_b_ptrs=torch.zeros(shape_2d, dtype=torch.int64, device=self.device),
             d_b_prime_ptrs=torch.zeros(shape_2d, dtype=torch.int64, device=self.device),
-            h_b_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=True),
-            h_b_prime_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=True),
+            h_b_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=use_pinned_memory()),
+            h_b_prime_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=use_pinned_memory()),
             d_output_sizes=output_hidden_sizes_device,
             d_output_sizes_offset=output_sizes_offset_device,
             h_output_sizes=output_hidden_sizes,

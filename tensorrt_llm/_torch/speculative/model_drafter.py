@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, use_pinned_memory
 from tensorrt_llm.logger import logger
 
 from ..attention_backend.trtllm import TrtllmAttention
@@ -597,11 +597,11 @@ class ModelDrafter(Drafter):
         # Create index tensors
         draft_indices_tensor = torch.tensor(draft_indices,
                                             dtype=torch.long,
-                                            pin_memory=True).to(
+                                            pin_memory=use_pinned_memory()).to(
                                                 device, non_blocking=True)
         target_indices_tensor = torch.tensor(target_indices,
                                              dtype=torch.long,
-                                             pin_memory=True).to(
+                                             pin_memory=use_pinned_memory()).to(
                                                  device, non_blocking=True)
 
         # Pre-slice draft tensors: [draft_length, batch_size]

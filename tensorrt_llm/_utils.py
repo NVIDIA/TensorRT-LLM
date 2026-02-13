@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@ import trace
 import traceback
 import weakref
 from contextlib import contextmanager
+from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
@@ -1257,18 +1258,23 @@ def confidential_compute_enabled() -> bool:
     Query NVML for the confidential compute state
     """
 
+    try:
+        import pynvml
+    except ImportError:
+        logger.error(f"pynvml not available; assuming CC=off")
+        return False
+
     cc_enabled = False
 
     try:
-        # Init
-        import pynvml
         pynvml.nvmlInit()
 
         # Hopper and newer supports a more nuanced query of confidential
         # compute settings
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
-        if (pynvml.nvmlSystemGetConfComputeSettings(cc_settings) ==
-                pynvml.NVML_SUCCESS):
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        if (ret == pynvml.NVML_SUCCESS):
             cc_enabled = (cc_settings.ccFeature
                           == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
                           or cc_settings.multiGpuMode
@@ -1294,6 +1300,24 @@ def confidential_compute_enabled() -> bool:
             pass
 
     return cc_enabled
+
+
+@lru_cache(maxsize=None)
+def use_pinned_memory() -> bool:
+    """
+    Return False when confidential compute is enabled, since pinned memory with
+    confidential compute active has only downsides (and no upside). When
+    confidential compute is enabled, all D2H and H2D copies become synchronous,
+    except for pageable H2D copies <2MB (most if not all H2D copies involved in
+    input preparation fall into this category).
+    """
+    return not confidential_compute_enabled()
+
+
+def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    if use_pinned_memory():
+        return tensor.pin_memory()
+    return tensor
 
 
 P = ParamSpec("P")
