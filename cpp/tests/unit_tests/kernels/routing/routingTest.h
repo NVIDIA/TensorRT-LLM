@@ -36,6 +36,8 @@ typedef testing::Types<float, __nv_bfloat16> FloatAndBf16Types;
 typedef testing::Types<__nv_bfloat16> Bf16Types;
 
 using RoutingMethodType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
+using RoutingPreprocessType = moe::dev::routing::RoutingPreprocessType;
+using RoutingPostprocessType = moe::dev::routing::RoutingPostprocessType;
 using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
 using namespace tensorrt_llm::runtime;
 
@@ -226,14 +228,13 @@ inline auto comp = [](PackedFloat const& a, PackedFloat const& b)
 struct RoutingKernelTestParam
 {
     RoutingMethodType routingMethod{RoutingMethodType::Renormalize};
-    int32_t numTokens;
-    int32_t numExperts;
+    int32_t numTokens{0};
+    int32_t numExperts{0};
     uint32_t topK{1};
 
     int32_t localExpertsStartIdx{0};
     int32_t localExpertsStrideLog2{0};
-    // we don't use any special striding, and we always test the GPU at logical idx 0
-    int32_t numLocalExperts{128};
+    int32_t numLocalExperts{0};
     int32_t paddingLog2{3};
     int32_t tileTokensDim{1};
 
@@ -244,12 +245,18 @@ struct RoutingKernelTestParam
     int requiredComputeCapability{9};
 
     // Check the input parameters
-    bool useTopKAsInput{false};
+    bool useTopKAsInput{false};       // When true, mPtrTopKIds + mPtrTopKWeights are provided as input
+    bool useTopKPackedAsInput{false}; // When true, mPtrTopKPacked is provided as input (without mPtrScores)
     bool hasInvalidTopKInput{false};
+    int32_t invalidExpertIdValue{-1}; // Value used to mark invalid topK entries: -1 or numExperts
 
     // Special for renormalize routing method
     bool doSoftmaxBeforeTopK{false};
     bool normTopkProb{true};
+
+    // Policy type selection for routingCustom (set automatically by build() if not overridden)
+    RoutingPreprocessType preprocessType{RoutingPreprocessType::None};
+    RoutingPostprocessType postprocessType{RoutingPostprocessType::Softmax};
 
     // Special for deepseek routing method
     int32_t nGroup{0};
@@ -259,57 +266,237 @@ struct RoutingKernelTestParam
     // Default constructor
     RoutingKernelTestParam() = default;
 
-    // Constructor with required parameters
-    RoutingKernelTestParam(int32_t nt, int32_t ne, uint32_t tk = 1)
-        : numTokens(nt)
-        , numExperts(ne)
-        , topK(tk)
+    // Copy / move constructors and assignment operators
+    RoutingKernelTestParam(RoutingKernelTestParam const& other) = default;
+    RoutingKernelTestParam(RoutingKernelTestParam&& other) = default;
+    RoutingKernelTestParam& operator=(RoutingKernelTestParam const& other) = default;
+    RoutingKernelTestParam& operator=(RoutingKernelTestParam&& other) = default;
+    ~RoutingKernelTestParam() = default;
+
+    //
+    // Fluent builder methods — each returns *this so calls can be chained.
+    // Usage:
+    //   auto param = RoutingKernelTestParam()
+    //       .withRoutingMethod(RoutingMethodType::Renormalize)
+    //       .withNumTokens(4)
+    //       .withNumExperts(128)
+    //       .withTopK(8)
+    //       .build();
+    //
+
+    RoutingKernelTestParam& withRoutingMethod(RoutingMethodType val)
     {
+        routingMethod = val;
+        return *this;
     }
 
-    // Constructor with all parameters
-    RoutingKernelTestParam(RoutingMethodType routingMethod, int32_t numTokens, int32_t numExperts, uint32_t topK,
-        int32_t expertParallelization = 1, int32_t expertParallelizationId = 0, int32_t tileTokensDim = 1,
-        int32_t paddingLog2 = 3, int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true,
-        bool useTopKAsInput = false, bool hasInvalidTopKInput = false, int32_t nGroup = 1, int32_t topkGroup = 1,
-        float routedScalingFactor = 1.0f, int requiredComputeCapability = 9)
-        : routingMethod(routingMethod)
-        , numTokens(numTokens)
-        , numExperts(numExperts)
-        , topK(topK)
-        , tileTokensDim(tileTokensDim)
-        , paddingLog2(paddingLog2)
-        , localExpertsStrideLog2(localExpertsStrideLog2)
-        , usePdl(usePdl)
-        , getExpWeights(getExpWeights)
-        , useTopKAsInput(useTopKAsInput)
-        , hasInvalidTopKInput(hasInvalidTopKInput)
-        , nGroup(nGroup)
-        , topkGroup(topkGroup)
-        , routedScalingFactor(routedScalingFactor)
-        , requiredComputeCapability(requiredComputeCapability)
+    RoutingKernelTestParam& withNumTokens(int32_t val)
     {
-        // Check the routing method
-        if (routingMethod != RoutingMethodType::Renormalize && routingMethod != RoutingMethodType::RenormalizeNaive
-            && routingMethod != RoutingMethodType::Llama4 && routingMethod != RoutingMethodType::DeepSeekV3)
+        numTokens = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withNumExperts(int32_t val)
+    {
+        numExperts = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withTopK(uint32_t val)
+    {
+        topK = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withExpertParallelization(int32_t ep, int32_t epId = 0)
+    {
+        mExpertParallelization = ep;
+        mExpertParallelizationId = epId;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withTileTokensDim(int32_t val)
+    {
+        tileTokensDim = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withPaddingLog2(int32_t val)
+    {
+        paddingLog2 = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withLocalExpertsStrideLog2(int32_t val)
+    {
+        localExpertsStrideLog2 = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withUsePdl(bool val)
+    {
+        usePdl = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withGetExpWeights(bool val)
+    {
+        getExpWeights = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withUseTopKAsInput(bool val)
+    {
+        useTopKAsInput = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withUseTopKPackedAsInput(bool val)
+    {
+        useTopKPackedAsInput = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withHasInvalidTopKInput(bool val)
+    {
+        hasInvalidTopKInput = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withInvalidExpertIdValue(int32_t val)
+    {
+        invalidExpertIdValue = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withNGroup(int32_t val)
+    {
+        nGroup = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withTopkGroup(int32_t val)
+    {
+        topkGroup = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withRoutedScalingFactor(float val)
+    {
+        routedScalingFactor = val;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withPreprocessType(RoutingPreprocessType val)
+    {
+        preprocessType = val;
+        mPreprocessTypeOverridden = true;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withPostprocessType(RoutingPostprocessType val)
+    {
+        postprocessType = val;
+        mPostprocessTypeOverridden = true;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withNormTopkProb(bool val)
+    {
+        normTopkProb = val;
+        mNormTopkProbOverridden = true;
+        return *this;
+    }
+
+    RoutingKernelTestParam& withRequiredComputeCapability(int val)
+    {
+        requiredComputeCapability = val;
+        return *this;
+    }
+
+    /// Finalize and validate. Must be called after all `with*()` setters.
+    RoutingKernelTestParam& build()
+    {
+        // Validate routing method
+        if (routingMethod != RoutingMethodType::Default && routingMethod != RoutingMethodType::Renormalize
+            && routingMethod != RoutingMethodType::RenormalizeNaive && routingMethod != RoutingMethodType::Llama4
+            && routingMethod != RoutingMethodType::DeepSeekV3 && routingMethod != RoutingMethodType::MiniMax2
+            && routingMethod != RoutingMethodType::SigmoidRenorm)
         {
             throw std::invalid_argument("Invalid routing method");
         }
 
-        // Set about the expert parallelization
-        numLocalExperts = numExperts / expertParallelization;
-        localExpertsStartIdx = numLocalExperts * expertParallelizationId;
+        // Derive expert parallelization parameters
+        numLocalExperts = numExperts / mExpertParallelization;
+        localExpertsStartIdx = numLocalExperts * mExpertParallelizationId;
 
-        // Apply routing method specific settings
-        if (routingMethod == RoutingMethodType::RenormalizeNaive)
+        // Apply routing-method-specific settings
+        if (routingMethod == RoutingMethodType::Default)
+        {
+            doSoftmaxBeforeTopK = true;
+            normTopkProb = false;
+        }
+        else if (routingMethod == RoutingMethodType::RenormalizeNaive)
         {
             doSoftmaxBeforeTopK = true;
             normTopkProb = true;
+        }
+        else if (routingMethod == RoutingMethodType::SigmoidRenorm)
+        {
+            doSoftmaxBeforeTopK = false;
+            if (!mNormTopkProbOverridden)
+            {
+                normTopkProb = true;
+            }
         }
         else
         {
             doSoftmaxBeforeTopK = false;
             normTopkProb = false;
+        }
+
+        // Derive policy types from routing method when not explicitly set
+        if (!mPreprocessTypeOverridden)
+        {
+            if (routingMethod == RoutingMethodType::Default || routingMethod == RoutingMethodType::RenormalizeNaive)
+            {
+                preprocessType = RoutingPreprocessType::Softmax;
+            }
+            else if (routingMethod == RoutingMethodType::MiniMax2)
+            {
+                preprocessType = RoutingPreprocessType::SigmoidBias;
+            }
+            else if (routingMethod == RoutingMethodType::SigmoidRenorm)
+            {
+                preprocessType = RoutingPreprocessType::Sigmoid;
+            }
+            else
+            {
+                preprocessType = RoutingPreprocessType::None;
+            }
+        }
+        if (!mPostprocessTypeOverridden)
+        {
+            if (routingMethod == RoutingMethodType::Default)
+            {
+                postprocessType = RoutingPostprocessType::None;
+            }
+            else if (routingMethod == RoutingMethodType::RenormalizeNaive)
+            {
+                postprocessType = RoutingPostprocessType::SumNormalize;
+            }
+            else if (routingMethod == RoutingMethodType::MiniMax2)
+            {
+                postprocessType = RoutingPostprocessType::ScaledSumNormalize;
+            }
+            else if (routingMethod == RoutingMethodType::SigmoidRenorm)
+            {
+                postprocessType = RoutingPostprocessType::SumNormalize;
+            }
+            else
+            {
+                postprocessType = RoutingPostprocessType::Softmax;
+            }
         }
 
         // Set singleClusterTokenNum
@@ -322,36 +509,36 @@ struct RoutingKernelTestParam
             singleClusterTokenNum = 256;
         }
 
+        // Cross-field validation
         if (hasInvalidTopKInput && !useTopKAsInput)
         {
             throw std::invalid_argument("hasInvalidTopKInput is only supported when useTopKAsInput is true");
         }
+        if (useTopKAsInput && useTopKPackedAsInput)
+        {
+            throw std::invalid_argument("useTopKAsInput and useTopKPackedAsInput are mutually exclusive");
+        }
+
+        return *this;
     }
-
-    // Copy constructor
-    RoutingKernelTestParam(RoutingKernelTestParam const& other) = default;
-
-    // Move constructor
-    RoutingKernelTestParam(RoutingKernelTestParam&& other) = default;
-
-    // Copy assignment operator
-    RoutingKernelTestParam& operator=(RoutingKernelTestParam const& other) = default;
-
-    // Move assignment operator
-    RoutingKernelTestParam& operator=(RoutingKernelTestParam&& other) = default;
-
-    // Destructor
-    ~RoutingKernelTestParam() = default;
 
     std::string toString() const
     {
         return tensorrt_llm::common::fmtstr(
             "RoutingKernelTestParam[num_tokens=%d, num_experts=%d, topK=%u, doSoftmaxBeforeTopK=%d, normTopkProb=%d, "
             "localExpertsStartIdx=%d, localExpertsStrideLog2=%d, numLocalExperts=%d, usePdl=%d, useTopKAsInput=%d, "
-            "hasInvalidTopKInput=%d]",
+            "useTopKPackedAsInput=%d, hasInvalidTopKInput=%d]",
             numTokens, numExperts, topK, doSoftmaxBeforeTopK, normTopkProb, localExpertsStartIdx,
-            localExpertsStrideLog2, numLocalExperts, usePdl, useTopKAsInput, hasInvalidTopKInput);
+            localExpertsStrideLog2, numLocalExperts, usePdl, useTopKAsInput, useTopKPackedAsInput, hasInvalidTopKInput);
     }
+
+private:
+    // Builder state — used by build() to derive public fields.
+    int32_t mExpertParallelization{1};
+    int32_t mExpertParallelizationId{0};
+    bool mPreprocessTypeOverridden{false};
+    bool mPostprocessTypeOverridden{false};
+    bool mNormTopkProbOverridden{false};
 };
 
 template <typename T>
