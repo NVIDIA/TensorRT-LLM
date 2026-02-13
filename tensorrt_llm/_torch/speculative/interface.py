@@ -1,5 +1,4 @@
 import copy
-import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -9,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional, Type
 import torch
 from torch import nn
 
+from tensorrt_llm import envs
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
@@ -46,7 +46,7 @@ def get_force_num_accepted_tokens() -> int:
     Returns:
         int: The forced number of accepted tokens, or 0 if not set or invalid.
     """
-    env_value = os.environ.get(FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR, "0")
+    env_value = envs.get_env(FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR)
     try:
         return int(env_value)
     except ValueError:
