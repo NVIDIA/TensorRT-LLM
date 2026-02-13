@@ -297,6 +297,24 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
         EXPECT_EQ(checkSetEqual(ie, permutedIdx, permutedIdxTest, "permuted idx"), true);
         EXPECT_EQ(checkSetEqual(ie, tokenIdx, tokenIdxTest, "token idx"), true);
     }
+
+    // Verify that invalid expert entries produce expandedIdxToPermutedIdx == -1.
+    // The loop above only checks valid experts (0..numExperts-1) and skips invalid entries.
+    if (param.hasInvalidTopKInput)
+    {
+        for (int it = 0; it < param.numTokens * param.topK; ++it)
+        {
+            int16_t const expertIdx = expIdxHostPtr[it].idx;
+            bool const isInvalid = (expertIdx < 0) || (expertIdx >= param.numExperts);
+            if (isInvalid)
+            {
+                int32_t const permIdxTest = hostExpToPermTest[it];
+                EXPECT_EQ(permIdxTest, -1)
+                    << "expandedIdxToPermutedIdx[" << it << "] should be -1 for invalid expertId=" << expertIdx
+                    << " but got " << permIdxTest;
+            }
+        }
+    }
 }
 
 template <typename T>
@@ -326,9 +344,18 @@ void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
     }
     // expert counts aren't always used, but if tokens > 8 * 1024, we are sure they are used
     if (param.numTokens > param.singleClusterTokenNum)
-    { //@Todo: check if this is always true
+    {
         assertEqual(bufferCast<int32_t>(*mPtrExpertCountsHost), expertCountsPtr, param.numExperts, "expert counts");
-        if (param.routingMethod != RoutingMethodType::DeepSeekV3)
+        // The second half of mPtrExpertCounts is only filled by the multi-kernel offsets pipeline
+        // (routingIndicesOffsetsKernel). It is NOT filled by the coop kernel or cluster kernel.
+        // On SM90+, both the scores path (RoutingCustom.cu) and the post-topK path
+        // (RoutingFromTopKIds.cu) may use the coop kernel instead of multi-kernel for medium
+        // token counts. Skip this check whenever the coop path could have been taken.
+        // The coop path requires SM90+ and numExperts <= 1024.
+        bool const coopMayBeUsed = (mDeviceProp.major >= 9) && (param.numExperts <= 1024);
+        bool const useMultiKernelPath = !param.useTopKAsInput && !param.useTopKPackedAsInput
+            && param.routingMethod != RoutingMethodType::DeepSeekV3 && !coopMayBeUsed;
+        if (useMultiKernelPath)
         {
             assertEqual(bufferCast<int32_t>(*mPtrExpertCountsHost), expertCountsPtr + param.numExperts,
                 param.numExperts, "expert counts (2)");
@@ -367,6 +394,13 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     {
         // Set the topk_ids as input
         mBufferManager->copy(*mPtrTopKIdsHost, *mPtrTopKIdsDevice);
+        mBufferManager->copy(*mPtrTopKWeightsHost, *mPtrTopKWeightsDevice);
+        mStream->synchronize();
+    }
+    else if (param.useTopKPackedAsInput)
+    {
+        // Set the topk_packed as input (computed by host reference, no scores)
+        mBufferManager->copy(*mPtrTopKPackedHost, *mPtrTopKPackedDevice);
         mBufferManager->copy(*mPtrTopKWeightsHost, *mPtrTopKWeightsDevice);
         mStream->synchronize();
     }

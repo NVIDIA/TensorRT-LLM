@@ -74,6 +74,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     MiniMaxM2MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
+    SigmoidRenormMoeRoutingMethod,
     create_moe,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
@@ -258,9 +259,7 @@ def _run_autotune_test(
         _ = run_forward_fn()
 
     # Check if we should run full tactic replay
-    if not run_all_tactics or not supports_autotuner_capture(
-        backend_type, quant_algo, use_flashinfer
-    ):
+    if not run_all_tactics or not supports_autotuner_capture(backend_type, quant_algo):
         # Simple accuracy check for unsupported backends or when run_all_tactics is False
         with torch.inference_mode():
             output = run_forward_fn()
@@ -368,6 +367,13 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
             top_k=top_k,
             num_experts=num_experts,
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
+        )
+
+    # SigmoidRenorm routing method requires num_experts
+    if routing_method_cls == SigmoidRenormMoeRoutingMethod:
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
         )
 
     # Fallback: try with just top_k
@@ -787,6 +793,7 @@ ROUTING_METHODS = [
     Llama4RenormalizeMoeRoutingMethod,  # Top1 -> Sigmoid (Llama4)
     DeepSeekV3MoeRoutingMethod,  # Sigmoid -> BiasAdd -> Group TopK (DeepSeek-V3)
     MiniMaxM2MoeRoutingMethod,  # Sigmoid -> BiasAdd -> TopK -> Renormalize (MiniMax-M2)
+    SigmoidRenormMoeRoutingMethod,  # Sigmoid -> TopK -> Renormalize
 ]
 
 
@@ -1161,7 +1168,7 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     comm_methods=COMM_METHODS,
     swiglu_combos=SWIGLU_COMBOS,
     model_configs=MOE_MODEL_CONFIGS,
-    seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
+    seq_lens=[1, 8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
     backend_types=BACKEND_TYPES,
     quant_algos=QUANT_ALGOS,
