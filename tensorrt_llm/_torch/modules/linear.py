@@ -449,6 +449,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         weight_shape = (out_features, in_features)
         module.weight = Parameter(torch.empty(weight_shape, dtype=dtype),
                                   requires_grad=False)
+        if (module.quant_config is not None
+                and module.quant_config.layer_quant_mode.has_fp4_kv_cache()
+                and module.weights_loading_config.weight_mode
+                == WeightMode.FUSED_QKV_LINEAR):
+            # KV-only FP4 cache override can run with unquantized fused QKV weights.
+            # Attention still expects KV cache scales in this mode.
+            module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+            module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                             requires_grad=False)
 
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
@@ -496,6 +506,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
                         shard_key]
                     copy_weight_shard(module.weight, weight, shard_offset,
                                       shard_size)
+
+        if hasattr(module, "kv_scales"):
+            k_scales = [
+                w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w
+            ]
+            v_scales = [
+                w["v_scale"][...].reshape([]) for w in weights if "v_scale" in w
+            ]
+            if k_scales:
+                assert v_scales, "k_scale and v_scale must be loaded together"
+                copy_weight(
+                    module.kv_scales,
+                    torch.tensor(
+                        [1.0, max(k_scales).item(),
+                         max(v_scales).item()],
+                        dtype=torch.float32))
+                module.inv_kv_scales.data = 1.0 / module.kv_scales
 
     def load_weights_fused_gate_up_linear(
             self,

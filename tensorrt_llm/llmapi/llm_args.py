@@ -1759,7 +1759,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     dtype: str = Field(default="auto",
-                       description="The data type to use for the KV cache.")
+                       description="The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -1810,6 +1810,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if not 0 <= v <= 1:
             raise ValueError(
                 "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
+
+    @field_validator('dtype')
+    @classmethod
+    def validate_dtype(cls, v: str):
+        v = v.lower()
+        if v not in ("auto", "fp8", "nvfp4"):
+            raise ValueError(
+                'kv_cache_config.dtype must be one of "auto", "fp8", or "nvfp4"'
             )
         return v
 
@@ -3306,6 +3316,8 @@ class TorchLlmArgs(BaseLlmArgs):
             return self
         elif self.kv_cache_config.dtype == 'fp8':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+        elif self.kv_cache_config.dtype == 'nvfp4':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
