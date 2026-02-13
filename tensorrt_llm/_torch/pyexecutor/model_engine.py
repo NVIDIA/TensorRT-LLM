@@ -669,7 +669,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config.get("cp_type", None)
-            if cp_type != CpType.HELIX:
+            if cp_type is not None:
                 logger.info(
                     f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
                 )
