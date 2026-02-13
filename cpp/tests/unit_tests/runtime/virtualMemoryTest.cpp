@@ -18,6 +18,7 @@
 #include <nvml.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
@@ -57,9 +58,11 @@ protected:
         TLLM_CU_CHECK(cuDevicePrimaryCtxRetain(&ctx, dev));
         TLLM_CU_CHECK(cuCtxSetCurrent(ctx));
 
-        // Initialize NVML
-        nvmlReturn_t nvmlResult = nvmlInit();
-        TLLM_CHECK_WITH_INFO(nvmlResult == NVML_SUCCESS, "Failed to initialize NVML: %s", nvmlErrorString(nvmlResult));
+        // Initialize NVML via wrapper
+        mNvml = tensorrt_llm::common::NVMLWrapper::getInstance();
+        nvmlReturn_t nvmlResult = mNvml->nvmlInit();
+        TLLM_CHECK_WITH_INFO(
+            nvmlResult == NVML_SUCCESS, "Failed to initialize NVML: %s", mNvml->nvmlErrorString(nvmlResult));
 
         if (!memoryInfoAvailable())
         {
@@ -88,14 +91,16 @@ protected:
 
     static size_t getCurrentProcessMemoryInfo()
     {
+        auto nvml = tensorrt_llm::common::NVMLWrapper::getInstance();
+
         // Get current process ID
         uint32_t currentPid = static_cast<uint32_t>(getpid());
 
         // Get device handle for GPU 0
         nvmlDevice_t device;
-        auto nvmlResult = nvmlDeviceGetHandleByIndex(0, &device);
+        auto nvmlResult = nvml->nvmlDeviceGetHandleByIndex(0, &device);
         TLLM_CHECK_WITH_INFO(
-            nvmlResult == NVML_SUCCESS, "Failed to get device handle: %s", nvmlErrorString(nvmlResult));
+            nvmlResult == NVML_SUCCESS, "Failed to get device handle: %s", nvml->nvmlErrorString(nvmlResult));
 
         // Get running processes
         unsigned int processCount = 1;
@@ -103,9 +108,9 @@ protected:
         nvmlResult = NVML_ERROR_INSUFFICIENT_SIZE;
         while (nvmlResult == NVML_ERROR_INSUFFICIENT_SIZE)
         {
-            nvmlResult = nvmlDeviceGetComputeRunningProcesses_v3(device, &processCount, processes.data());
+            nvmlResult = nvml->nvmlDeviceGetComputeRunningProcesses(device, &processCount, processes.data());
             TLLM_CHECK_WITH_INFO(nvmlResult == NVML_SUCCESS || nvmlResult == NVML_ERROR_INSUFFICIENT_SIZE,
-                "Failed to get process count: %s", nvmlErrorString(nvmlResult));
+                "Failed to get process count: %s", nvml->nvmlErrorString(nvmlResult));
             processes.resize(processCount);
         }
 
@@ -120,6 +125,8 @@ protected:
 
         return 0;
     }
+
+    std::shared_ptr<tensorrt_llm::common::NVMLWrapper> mNvml;
 };
 
 class VirtualMemoryTest : public VirtualMemoryTestBase
