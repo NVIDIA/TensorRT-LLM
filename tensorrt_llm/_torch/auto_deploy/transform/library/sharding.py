@@ -1934,14 +1934,20 @@ def _process_delta_sharding(
     layer_subgraph: LayerSubgraph,
     transform_container: ShardingTransformContainer,
 ) -> int:
-    """Process TP sharding for Gated DeltaNet layers (Qwen3NextGatedDeltaNet).
+    """Process TP sharding for Gated DeltaNet layers.
 
-    Sharding strategy:
-      in_proj_qkvz, in_proj_ba  -> column sharding
-      out_proj                   -> row sharding + all_reduce
-      conv1d weight              -> column sharding (fused dims: [key_dim, key_dim, value_dim])
-      A_log, dt_bias             -> column sharding
-      norm.weight                -> replicated (operates on constant head_v_dim)
+    Supports two layouts:
+      - Fused (2 opening nodes, e.g. Qwen3Next):
+          in_proj_qkvz, in_proj_ba  -> column sharding
+      - Unfused (4 opening nodes, e.g. Qwen3.5 MoE):
+          in_proj_qkv, in_proj_z, in_proj_b, in_proj_a  -> column sharding
+
+    Common sharding strategy:
+      opening projections          -> column sharding
+      out_proj                     -> row sharding + all_reduce
+      conv1d weight                -> column sharding (fused dims: [key_dim, key_dim, value_dim])
+      A_log, dt_bias               -> column sharding
+      norm.weight                  -> replicated (operates on constant head_v_dim)
 
     The splits in fix_query_key_value_ordering operate on dim=-1 (features per head)
     and do NOT need updating. Only the split after conv1d (which uses
@@ -1950,13 +1956,13 @@ def _process_delta_sharding(
     """
     config = transform_container.config
     world_size = config.world_size
-    assert len(layer_subgraph.opening_nodes) == 2, (
-        "Expecting exactly two opening nodes for Delta layer"
+    opening_nodes = layer_subgraph.opening_nodes
+    assert len(opening_nodes) in (2, 4), (
+        f"Expecting 2 (fused) or 4 (unfused) opening nodes for Delta layer, got {len(opening_nodes)}"
     )
-    in_proj_qkvz, in_proj_ba = layer_subgraph.opening_nodes
     out_proj = layer_subgraph.terminating_node
     subgraph_nodes = layer_subgraph.subgraph_nodes
-    gm = in_proj_qkvz.graph.owning_module
+    gm = opening_nodes[0].graph.owning_module
 
     # ##############################################################
     # ########## identify conv1d and split node after it ###########
@@ -1977,7 +1983,7 @@ def _process_delta_sharding(
     # ##############################################################
     if not transform_container.add(
         WeightShardingInfo.from_node(
-            in_proj_qkvz,
+            opening_nodes[0],
             split_dim=SplitDimension.COLUMN,
             config=config,
             dist_op=None,
@@ -1987,16 +1993,17 @@ def _process_delta_sharding(
     ):
         return 0  # already sharded
 
-    transform_container.add(
-        WeightShardingInfo.from_node(
-            in_proj_ba,
-            split_dim=SplitDimension.COLUMN,
-            config=config,
-            dist_op=None,
-            min_local_shape=1,
-            layer_type=LayerType.DELTA,
+    for proj_node in opening_nodes[1:]:
+        transform_container.add(
+            WeightShardingInfo.from_node(
+                proj_node,
+                split_dim=SplitDimension.COLUMN,
+                config=config,
+                dist_op=None,
+                min_local_shape=1,
+                layer_type=LayerType.DELTA,
+            )
         )
-    )
 
     # ##############################################################
     # ############## update split node after conv1d ################
@@ -2030,9 +2037,7 @@ def _process_delta_sharding(
     # ##############################################################
     # Shard conv1d weight (with fused dims), A_log, dt_bias. Skip norm weights (replicated).
     delta_node = list(filtered_nodes(subgraph_nodes, is_any_delta_op))[0]
-    weight_nodes = [
-        n for n in get_all_weights_in_subgraph([in_proj_qkvz, in_proj_ba], [delta_node])
-    ]
+    weight_nodes = [n for n in get_all_weights_in_subgraph(opening_nodes, [delta_node])]
     for weight_node in weight_nodes:
         weight_key = weight_node.target
         try:

@@ -1379,8 +1379,10 @@ def get_layer_after_linear_node(
 
         if len(delta_nodes) == 1:
             head_size = shape(delta_nodes[0])[-1]
-            # Gated DeltaNet layers should have 2 opening linear nodes and one terminating.
-            if len(intermediate_lin_nodes) > 0 or len(opening_linear_nodes) != 2:
+            # Gated DeltaNet layers should have 2 opening linear nodes (fused qkvz + ba,
+            # e.g. Qwen3Next) or 4 opening linear nodes (unfused qkv + z + b + a,
+            # e.g. Qwen3.5 MoE) and one terminating node.
+            if len(intermediate_lin_nodes) > 0 or len(opening_linear_nodes) not in (2, 4):
                 return LayerType.UNKNOWN, 1
             # Gated DeltaNet layer should have 4 to 6 intermediate weight nodes:
             # - conv1d weight

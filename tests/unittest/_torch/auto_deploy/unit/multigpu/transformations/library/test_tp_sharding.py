@@ -322,6 +322,93 @@ class GDN_Block(nn.Module):
         return self.out_proj(normed.reshape(b, s, -1))
 
 
+class GDN_Block_Unfused(nn.Module):
+    """Gated DeltaNet block with unfused projections for testing sharding.
+
+    Based on Qwen3.5 MoE's Qwen3_5MoeGatedDeltaNet. Uses 4 separate opening
+    projections (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a) instead of
+    the 2 fused projections in GDN_Block (in_proj_qkvz, in_proj_ba).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_kernel_size: int = 4,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.key_dim = head_k_dim * num_k_heads
+        self.value_dim = head_v_dim * num_v_heads
+
+        # 4 separate projections (unfused, matching Qwen3.5 MoE layout)
+        self.in_proj_qkv = nn.Linear(hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+        self.in_proj_z = nn.Linear(hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(hidden_size, num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(hidden_size, num_v_heads, bias=False)
+
+        conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            kernel_size=conv_kernel_size,
+            groups=conv_dim,
+            bias=bias,
+            padding=conv_kernel_size - 1,
+        )
+
+        self.A_log = nn.Parameter(torch.randn(num_v_heads))
+        self.dt_bias = nn.Parameter(torch.ones(num_v_heads))
+        self.norm = nn.LayerNorm(head_v_dim)  # operates on head_v_dim -- NOT sharded
+        self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+
+        # 1. Separate projections (4 opening nodes)
+        mixed_qkv = self.in_proj_qkv(x)  # [b, s, conv_dim]
+        z = self.in_proj_z(x)  # [b, s, value_dim]
+        z = z.reshape(b, s, self.num_v_heads, self.head_v_dim)
+        b_tensor = self.in_proj_b(x)  # [b, s, num_v_heads]
+        a = self.in_proj_a(x)  # [b, s, num_v_heads]
+
+        # 2. Conv1d + silu on the QKV path
+        mixed_qkv_conv = F.silu(self.conv1d(mixed_qkv.transpose(1, 2))[:, :, :s].transpose(1, 2))
+
+        # 3. Split back into q, k, v
+        q_conv, k_conv, v_conv = torch.split(
+            mixed_qkv_conv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        q_conv = q_conv.reshape(b, s, q_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
+        k_conv = k_conv.reshape(b, s, k_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
+        v_conv = v_conv.reshape(b, s, v_conv.shape[-1] // self.head_v_dim, self.head_v_dim)
+
+        # 4. Repeat q, k to match num_v_heads when num_v_heads > num_k_heads (GQA)
+        if self.num_v_heads // self.num_k_heads > 1:
+            q_conv = q_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            k_conv = k_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+        # 5. Gated delta rule
+        beta = b_tensor.sigmoid()
+        g = -self.A_log.exp() * F.softplus(a + self.dt_bias)
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q_conv, k_conv, v_conv, g, beta)
+
+        # 6. Gated norm on head_v_dim, then project
+        attn_out_flat = attn_out.reshape(-1, self.head_v_dim)
+        z_flat = z.reshape(-1, self.head_v_dim)
+        normed = self.norm(attn_out_flat) * z_flat
+        return self.out_proj(normed.reshape(b, s, -1))
+
+
 def _run_sharding_execution_job(
     model_cls: nn.Module,
     dist_op_expected: str,
@@ -396,7 +483,7 @@ def _run_sharding_execution_job(
             v_head_dim=v_head_dim,
             bias=bias,
         ).to(device="cuda", dtype=torch.float16)
-    elif model_cls == GDN_Block:
+    elif model_cls in (GDN_Block, GDN_Block_Unfused):
         num_k_heads_gdn = 4
         num_v_heads_gdn = 8
         head_k_dim = 8
@@ -417,7 +504,7 @@ def _run_sharding_execution_job(
     x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
 
     # Scale down GDN_Block weights if needed to avoid numerical instability
-    if model_cls == GDN_Block:
+    if model_cls in (GDN_Block, GDN_Block_Unfused):
         with torch.no_grad():
             y_test = model(x)
         if torch.isnan(y_test).any():
@@ -433,7 +520,7 @@ def _run_sharding_execution_job(
         min_local_size = 1
 
     def _get_expected_num_params(num_p_og: int) -> int:
-        if model_cls == GDN_Block:
+        if model_cls in (GDN_Block, GDN_Block_Unfused):
             # norm.weight + norm.bias are replicated (operate on constant head_v_dim)
             norm_params = 2 * head_v_dim
             return (num_p_og - norm_params) // world_size + norm_params
@@ -571,7 +658,7 @@ def _run_pattern_detection_job(
             v_head_dim=v_head_dim,
             bias=bias,
         ).to(device="cuda", dtype=torch.float16)
-    elif model_cls == GDN_Block:
+    elif model_cls in (GDN_Block, GDN_Block_Unfused):
         num_k_heads_gdn = 4
         num_v_heads_gdn = 8
         head_k_dim = 8
@@ -829,6 +916,7 @@ def _run_pattern_detection_job(
         (NemotronHMamba2Mixer, "torch_dist_all_reduce"),
         (MLA_Block, "torch_dist_all_reduce"),
         (GDN_Block, "torch_dist_all_reduce"),
+        (GDN_Block_Unfused, "torch_dist_all_reduce"),
     ),
 )
 def test_sharding(
