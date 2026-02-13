@@ -8,7 +8,6 @@ import re
 import subprocess
 import tempfile
 import time
-import uuid
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union
@@ -145,8 +144,7 @@ def launch_disaggregated_llm(
         gen_model: str = None,
         server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
         max_workers: int = 16,
-        enable_perf=False,
-        service_discovery_backend: str = "etcd"):
+        enable_perf=False):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -174,20 +172,9 @@ def launch_disaggregated_llm(
     serve_port = get_free_port()
     disaggregated_server_config["port"] = serve_port
 
-    # Handle service discovery backend (etcd or HTTP)
-    etcd_process = None
-    etcd_data_dir = None
-    if service_discovery_backend == "etcd":
-        etcd_data_dir = os.path.join(temp_dir.name, f"etcd-{uuid.uuid4()}")
-        etcd_process = subprocess.Popen(["etcd", "--data-dir", etcd_data_dir])
-        cluster_uri = "etcd://localhost:2379"
-        print(f"Started etcd for service discovery at {cluster_uri}")
-    elif service_discovery_backend == "http":
-        cluster_uri = f"http://localhost:{serve_port}"
-        print(f"Using HTTP service discovery at {cluster_uri}")
-    else:
-        raise ValueError(
-            f"Unknown service_discovery_backend: {service_discovery_backend}")
+    # Use HTTP service discovery
+    cluster_uri = f"http://localhost:{serve_port}"
+    print(f"Using HTTP service discovery at {cluster_uri}")
 
     # Create service discovery config
     disagg_cluster = {
@@ -493,15 +480,6 @@ def launch_disaggregated_llm(
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
                 _get_perf_metrics()
-
-            # Cleanup etcd if it was started
-            if etcd_process:
-                try:
-                    etcd_process.kill()
-                    etcd_process.wait(timeout=10)
-                    print("Stopped etcd process")
-                except Exception as e:
-                    print(f"Failed to stop etcd process: {e}")
 
 
 def run_parallel_test(model_name: str,
