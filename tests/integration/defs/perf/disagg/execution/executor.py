@@ -304,7 +304,9 @@ class JobManager:
             
             # Get directory name and remote paths
             dir_name = os.path.basename(final_dir)
-            remote_base = f"trtllm/disagg_test/{gpu}_{trtllm_branch}/{pipeline_id}/tests"
+            # Replace '/' in branch name with '-' to avoid directory path issues
+            branch_safe = trtllm_branch.replace('/', '-')
+            remote_base = f"trtllm/disagg_test/{gpu}_{branch_safe}/{pipeline_id}/tests"
             remote_dir_path = f"{remote_base}/{dir_name}"
             
             # Upload 1: Upload directory structure
