@@ -3220,6 +3220,12 @@ class PyExecutor:
             self.perf_manager.append_step_metrics(
                 request, self.iter_counter, batch_token_time=batch_token_time)
 
+            # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
+            # independently of whether append_step_metrics early-returned.
+            # This is critical for E2E latency computation in tracing/Prometheus.
+            if request.return_perf_metrics and request.py_decoding_iter >= 1:
+                request.update_perf_metrics(self.iter_counter)
+
             request_done = False
             if request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:

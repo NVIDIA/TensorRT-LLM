@@ -229,14 +229,10 @@ class PerfMetricsManager:
         metric["token_time"] = step_token_time
 
         if is_ctx:
-            if request.py_decoding_iter >= 1:
-                # Last ctx chunk: update perf metrics (sets first_token_time)
-                request.update_perf_metrics(iter_counter)
             # Mark complete when context is done (remaining == 0 after move_to_next_chunk)
             if request.context_remaining_length == 0:
                 perf.ctx_chunks_complete = True
             perf.ctx_chunk_metrics.append(metric)
         else:
-            request.update_perf_metrics(iter_counter)
             metric["iter"] = request.py_decoding_iter
             perf.step_metrics.append(metric)
