@@ -111,7 +111,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         llm_args = worker_kwargs.get("llm_args")
         placement_config = getattr(llm_args, 'ray_placement_config',
                                    None) if llm_args else None
-        ray_worker_nsight_options = getattr(llm_args, 'ray_worker_nsight_options', None) if llm_args else None
+        ray_worker_nsight_options = getattr(
+            llm_args, 'ray_worker_nsight_options', None) if llm_args else None
 
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
@@ -195,17 +196,16 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             ])
 
     @unwrap_ray_errors()
-    def collective_rpc(self,
-                       method: str,
-                       args: tuple = (),
-                       kwargs: Optional[dict] = None,
-                       non_block: bool = False,
-                       target_ranks: int | list[int] | None = None) -> list[Any]:
-        workers = (
-            self.workers if target_ranks is None else
-            [self.workers[rank] for rank in target_ranks] if isinstance(target_ranks, list) else
-            [self.workers[target_ranks]]
-        )
+    def collective_rpc(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
+        workers = (self.workers if target_ranks is None else
+                   [self.workers[rank] for rank in target_ranks] if isinstance(
+                       target_ranks, list) else [self.workers[target_ranks]])
         kwargs = kwargs or {}
 
         refs = []
