@@ -658,6 +658,27 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_fp8_eagle3_kv_cache_v2(self):
+        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        use_kv_cache_manager_v2=True)
+        spec_config = Eagle3DecodingConfig(max_draft_len=3,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=True)
+        pytorch_config = dict(
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1), )
+        with LLM(model_path,
+                 max_batch_size=16,
+                 tensor_parallel_size=8,
+                 speculative_config=spec_config,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @skip_pre_hopper
     @parametrize_with_ids("torch_compile", [False, True])

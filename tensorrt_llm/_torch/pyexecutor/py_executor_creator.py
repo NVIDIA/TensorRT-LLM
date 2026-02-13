@@ -340,6 +340,10 @@ def create_py_executor(
         if cache_transceiver_config is not None or kv_connector_config is not None:
             spec_config._allow_separate_draft_kv_cache = False
 
+        if kv_cache_config.use_kv_cache_manager_v2:
+            # TODO: support separate draft KV cache on V2 KV cache manager
+            spec_config._allow_separate_draft_kv_cache = False
+
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
