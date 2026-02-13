@@ -25,8 +25,5 @@ methods:
       prompt_logprobs:
         annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]]]
         default: null
-      time_breakdown_metrics:
-        annotation: Optional[Dict]
-        default: null
     return_annotation: None
 properties: {}

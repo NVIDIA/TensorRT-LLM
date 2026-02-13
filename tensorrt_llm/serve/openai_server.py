@@ -604,9 +604,9 @@ class OpenAIServer:
                 item["server_first_token_time"] = raw_request.state.server_first_token_time
             if output.disaggregated_params:
                 item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
-            # Extract time_breakdown_metrics for per-step timing analysis
-            if hasattr(output, 'time_breakdown_metrics') and output.time_breakdown_metrics is not None:
-                item["time_breakdown_metrics"] = output.time_breakdown_metrics
+            # Request-level time breakdown (on GenerationResult/RequestOutput, not CompletionOutput)
+            if getattr(res, 'time_breakdown_metrics', None) is not None:
+                item["time_breakdown_metrics"] = res.time_breakdown_metrics
             if self.perf_metrics is not None:
                 async with self.perf_metrics_lock:
                     self.perf_metrics.append(item)
