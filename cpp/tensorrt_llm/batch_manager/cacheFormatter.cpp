@@ -85,7 +85,21 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     }
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
-    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+
+    // Try to get blocks from reuse tree. If blocks are not found (e.g., in disaggregated mode with PP,
+    // blocks may not be fully populated yet across all pipeline stages), fall back to sending all blocks.
+    auto maybeBlockRange = BlockRange::tryFromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+    if (!maybeBlockRange.has_value())
+    {
+        TLLM_LOG_WARNING(
+            "Blocks not found in reuse tree for request %lu, falling back to sending all blocks. "
+            "This can happen in disaggregated mode with pipeline parallelism when blocks are not yet "
+            "fully populated across all pipeline stages.",
+            llmRequest.mRequestId);
+        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+    }
+
+    return maybeBlockRange.value();
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,

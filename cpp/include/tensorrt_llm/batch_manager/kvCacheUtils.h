@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include <optional>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -69,7 +70,7 @@ public:
         return BlockRange(cacheManager, requestId);
     }
 
-    static BlockRange fromReuseTree(
+    static std::optional<BlockRange> tryFromReuseTree(
         BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
     {
 
@@ -80,8 +81,12 @@ public:
         auto windowSize = cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
         // Find the last block in the reuse tree for the provided full sequence of block keys
         auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
-        // TODO: handle the case where the last block is not found
-        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
+        // If block not found in reuse tree (e.g., in disaggregated mode with PP, blocks may not be fully populated
+        // yet), return nullopt to signal fallback to non-reuse path
+        if (!lastBlock)
+        {
+            return std::nullopt;
+        }
         int32_t const numBlocksToCollect = indexFromEnd + 1;
 
         std::vector<SizeType32> blockIds;
@@ -101,7 +106,15 @@ public:
         std::reverse(blockIds.begin(), blockIds.end());
         std::unordered_map<SizeType32, std::vector<SizeType32>> blockIdsPerWindow;
         blockIdsPerWindow[windowSize] = blockIds;
-        return BlockRange(cacheManager, blockIdsPerWindow, 0);
+        return std::optional<BlockRange>(BlockRange(cacheManager, blockIdsPerWindow, 0));
+    }
+
+    static BlockRange fromReuseTree(
+        BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
+    {
+        auto result = tryFromReuseTree(cacheManager, lastBlockKey, indexFromEnd);
+        TLLM_CHECK_WITH_INFO(result.has_value(), "Couldn't find the requested block in the reuse tree");
+        return result.value();
     }
 
     void setBlockIdsForWindow(SizeType32 windowSize, std::vector<SizeType32> blockIds)
