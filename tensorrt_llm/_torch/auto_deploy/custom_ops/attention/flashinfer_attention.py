@@ -379,7 +379,7 @@ def flashinfer_mha_with_cache(
 
     # check if we need to re-combine outputs
     if num_prefill > 0 and num_decode > 0:
-        y = torch.zeros_like(q)  # Initialize with zeros for padding positions
+        y = torch.empty_like(q)
     else:
         y = None
 
@@ -454,22 +454,20 @@ def flashinfer_mha_with_cache(
             y = y_decode
 
     # Reshape to match input shape [b, s, ...]
-    # y has shape [b*s, num_heads, head_dim] or [num_total_tokens, num_heads, head_dim]
-    # q_shape_og is [b, s, ...] (padded shape)
-    # We need to ensure y has b*s elements before reshaping
+    # y has shape [num_total_tokens, n_heads, head_dim] (pure) or [b*s, n_heads, head_dim] (mixed).
+    # q_shape_og is [b, s, ...] which may be padded (bucketed) for piecewise CG.
+    # Pad with zeros if y is smaller than the padded shape, so downstream ops
+    # (o_proj, residual add, LayerNorm) don't see garbage in padding positions.
     bs = b * s
     if y.shape[0] < bs:
-        # Pure prefill or decode: pad with zeros to match padded shape
-        y_padded = torch.zeros(
-            (bs, y.shape[1], y.shape[2]),
-            dtype=y.dtype,
-            device=y.device,
-        )
+        y_padded = torch.zeros((bs, y.shape[1], y.shape[2]), dtype=y.dtype, device=y.device)
         y_padded[: y.shape[0]] = y
-        return y_padded.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
-    else:
-        # Mixed batch: y already has shape [b*s, num_heads, head_dim] with zeros in padding positions
-        return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
+        y = y_padded
+    elif num_total_tokens < bs:
+        # Mixed batch: y is already [b*s, ...] but positions [num_total_tokens:] are uninitialized
+        y[num_total_tokens:].zero_()
+
+    return y.view(q_shape_og)
 
 
 @flashinfer_mha_with_cache.register_fake

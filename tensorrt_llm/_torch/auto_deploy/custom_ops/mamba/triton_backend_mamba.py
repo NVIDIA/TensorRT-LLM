@@ -137,21 +137,13 @@ def _triton_cached_ssm(
         )
 
     if num_total_tokens > 0:
-        # Reshape computed tokens to match input shape [b, s, num_heads, head_dim]
-        # preallocated_ssm_out[:num_total_tokens] has shape [num_total_tokens, num_heads, head_dim]
-        # We need to reshape to [b, s, num_heads, head_dim] where the first num_total_tokens
-        # positions (in flattened layout) contain the real data
-        output = torch.zeros(
-            (b, s, num_heads, head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        # Flatten both tensors to copy real tokens
-        output_flat = output.view(bs, num_heads, head_dim)
-        output_flat[:num_total_tokens] = preallocated_ssm_out[:num_total_tokens].to(
-            hidden_states.dtype
-        )
-        return output
+        # Cast to input dtype if needed (prefill may compute in higher precision)
+        if preallocated_ssm_out.dtype != hidden_states.dtype:
+            preallocated_ssm_out = preallocated_ssm_out.to(hidden_states.dtype)
+        # Zero padding positions so downstream ops don't see garbage (piecewise CG)
+        if num_total_tokens < bs:
+            preallocated_ssm_out[num_total_tokens:].zero_()
+        return preallocated_ssm_out.view(b, s, num_heads, head_dim)
     else:
         return torch.empty_like(hidden_states)
 

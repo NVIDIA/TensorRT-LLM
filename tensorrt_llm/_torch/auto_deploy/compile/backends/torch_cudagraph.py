@@ -1,8 +1,7 @@
 """Compile backend with cudagraph.
 
-Supports two modes:
-1. Monolithic CUDA graph (existing): captures entire model as one graph for decode-only.
-2. Piecewise CUDA graph (new): splits model at dynamic ops, captures static segments
+1. Monolithic CUDA graph: captures entire model as one graph for decode-only.
+2. Piecewise CUDA graph: splits model at dynamic ops, captures static segments
    individually. Used for prefill/mixed batches when piecewise_enabled=True.
 
 When piecewise_enabled=True, a DualModeCapturedGraph is returned that dispatches:
@@ -30,7 +29,11 @@ from ..piecewise_runner import ADPiecewiseRunner
 from ..piecewise_utils import SplitInfo, split_graph_at_dynamic_ops
 
 
-# Trivial FX ops that do NOT launch CUDA kernels — used to identify empty static segments
+# Trivial FX ops that are metadata-only or typically no-ops — used to identify
+# static segments with no meaningful GPU compute (e.g., between adjacent dynamic ops).
+# NOTE: reshape, contiguous, and to *can* launch kernels in edge cases (non-contiguous
+# tensors, dtype/device casts), but in practice these appear only as lightweight
+# plumbing in empty partitions.
 _TRIVIAL_CALL_FUNCTIONS = {operator.getitem, getattr}
 _TRIVIAL_CALL_METHODS = {
     "view",
@@ -48,13 +51,7 @@ _TRIVIAL_CALL_METHODS = {
 
 
 def _submod_has_cuda_ops(submod: nn.Module) -> bool:
-    """Check if a submodule has operations that would launch CUDA kernels.
-
-    Returns False for trivial submodules that only contain FX plumbing
-    (getitem, reshape, etc.) with no real GPU compute. These occur when
-    two dynamic ops are adjacent in the model graph, creating an empty
-    static partition between them.
-    """
+    """Check if a submodule has ops beyond those in _TRIVIAL_CALL_FUNCTIONS/METHODS."""
     if not isinstance(submod, GraphModule):
         return True  # Conservative: non-FX modules assumed to have GPU ops
 
@@ -266,19 +263,16 @@ class PiecewiseCapturedGraph(nn.Module):
         # Create a new GraphModule that shares all parameters/buffers/submodules
         # with the original (zero-copy) but has its OWN copy of the FX graph
         # (so split_graph_at_dynamic_ops mutations don't affect the original).
-        # We must NOT use copy.deepcopy(model) — that duplicates ALL weight tensors
-        # on GPU, effectively doubling memory usage and causing OOM for large models.
         gm = GraphModule(model, copy.deepcopy(model.graph))
 
         # Split graph at dynamic op boundaries
         self.split_info = split_graph_at_dynamic_ops(gm)
         self.split_gm = self.split_info.split_gm
 
-        # Phase C: Wrap static submodules in ADPiecewiseRunner
-        # Skip trivial submodules that have no CUDA ops (e.g., between adjacent
-        # dynamic ops — only contain getitem/reshape plumbing). Capturing these
-        # as CUDA graphs produces empty graphs and triggers PyTorch warnings.
-        graph_pool = None
+        # Skip trivial submodules that have no CUDA ops (only contain getitem/reshape plumbing).
+        # Capturing these as CUDA graphs produces empty graphs and triggers PyTorch warnings.
+        # Create a shared pool upfront so all runners share memory allocations.
+        graph_pool = torch.cuda.graph_pool_handle()
         num_wrapped = 0
         num_skipped = 0
         for idx in self.split_info.static_submod_indices:
@@ -301,9 +295,6 @@ class PiecewiseCapturedGraph(nn.Module):
                 )
                 setattr(self.split_gm, submod_name, runner)
                 num_wrapped += 1
-                # Share the graph pool across all runners
-                if graph_pool is None:
-                    graph_pool = runner.graph_pool
 
         self._is_prepared = True
         ad_logger.info(
@@ -348,8 +339,6 @@ class PiecewiseCapturedGraph(nn.Module):
             ADPiecewiseRunner.set_current_num_tokens(nt)
 
             with CudaGraphWarmUpPhase():
-                # Warmup phase: run eagerly, tracking data_ptr() to identify
-                # static (weight) vs dynamic (activation) tensors
                 ADPiecewiseRunner.set_current_phase("warmup")
                 for _ in range(warmup_iters):
                     self.split_gm(*args, **kwargs)
@@ -381,7 +370,6 @@ class PiecewiseCapturedGraph(nn.Module):
             # Set num_tokens context for all ADPiecewiseRunners.
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
             result = self.split_gm(*args, **kwargs)
-            ADPiecewiseRunner.set_current_num_tokens(None)
             return result
         else:
             # Fallback: model is not a GraphModule, run eagerly
@@ -524,32 +512,21 @@ class TorchCudagraphCompiler(CompilerBackend):
             with CudaGraphWarmUpPhase():
                 return self.get_args_kwargs_for_compile(batch_size)
 
-        if not self.piecewise_enabled:
-            # ── MONOLITHIC ONLY (existing behavior, unchanged) ──
-            captured_model = CapturedGraph(self.model, num_batched_inputs=self.num_batched_inputs)
-            captured_model.capture_graph(get_args_kwargs_warmup, self.cuda_graph_batch_sizes)
-            return captured_model
-
-        # ── DUAL MODE: monolithic (decode) + piecewise (prefill/mixed) ──
-        ad_logger.info("TorchCudagraphCompiler: dual-mode enabled (monolithic + piecewise)")
-
-        # 1. Build monolithic CG for decode-only batches
         monolithic = CapturedGraph(self.model, num_batched_inputs=self.num_batched_inputs)
         monolithic.capture_graph(get_args_kwargs_warmup, self.cuda_graph_batch_sizes)
 
-        # 2. Build piecewise CG for prefill/mixed batches
-        piecewise = PiecewiseCapturedGraph(
-            model=self.model,
-            piecewise_num_tokens=self.piecewise_num_tokens,
-        )
-        piecewise.prepare()
+        piecewise = None
+        if self.piecewise_enabled:
+            ad_logger.info("TorchCudagraphCompiler: dual-mode enabled (monolithic + piecewise)")
+            piecewise = PiecewiseCapturedGraph(
+                model=self.model,
+                piecewise_num_tokens=self.piecewise_num_tokens,
+            )
+            piecewise.prepare()
 
-        # Warmup and capture piecewise graphs if we have a mixed args generator
-        if self.get_mixed_args_kwargs_for_compile is not None and self.piecewise_num_tokens:
-            piecewise.warmup_and_capture(self.get_mixed_args_kwargs_for_compile)
+            if self.get_mixed_args_kwargs_for_compile is not None and self.piecewise_num_tokens:
+                piecewise.warmup_and_capture(self.get_mixed_args_kwargs_for_compile)
 
-        # 3. Return dual-mode dispatcher
-        return DualModeCapturedGraph(
-            monolithic,
-            piecewise,
-        )
+        if piecewise is not None:
+            return DualModeCapturedGraph(monolithic, piecewise)
+        return monolithic
