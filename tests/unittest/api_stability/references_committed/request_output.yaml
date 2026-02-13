@@ -27,6 +27,6 @@ properties:
   finished:
     annotation: bool
     default: inspect._empty
-  mm_embedding_handle:
-    annotation: Optional[Dict[str, Any]]
+  disaggregated_params:
+    annotation: Optional[DisaggregatedParams]
     default: inspect._empty
