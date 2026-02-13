@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,6 +43,12 @@ struct PackedScoreIdx
 struct DataBase
 {
     bool mUsePdl{false};
+
+    // Controls programmaticStreamSerializationAllowed launch attribute independently of mUsePdl.
+    // When false, the launch attribute is 0 even if mUsePdl is true, preventing the NEXT kernel
+    // from starting early. The kernel still does cudaGridDependencySynchronize/Trigger internally.
+    // Set to false on the LAST routing kernel so downstream GEMM waits via stream serialization.
+    bool mPdlAllowOverlap{true};
 
     // optional: only used as an intermediate buffer when the number of tokens is large.
     // dim: max([2*NumThreads] = [512], mNumExperts*2)
@@ -100,8 +106,10 @@ struct DataBase
     int32_t mNumTokens;
     int32_t mNumExperts;
     int32_t mTopK;
-    int32_t mPaddingLog2;
+    // Cluster-wide tile size in token dimension.
     int32_t mTileTokensDim;
+    // log2() of the padding size in cluster-wide tile.
+    int32_t mPaddingLog2;
 
     /// For expert parallelization
     int32_t mLocalExpertsStartIdx;
@@ -109,15 +117,16 @@ struct DataBase
     int32_t mNumLocalExperts;
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool isPow2_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
 struct KernelParamsBase
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
     static constexpr int MaxNumExperts = MaxNumExperts_;
     static constexpr int MaxNumTopExperts = MaxNumTopExperts_;
-    static constexpr bool UsePdl = UsePdl_;
-    static constexpr bool isPow2 = isPow2_;
+
+    bool mUsePdl = false;
+    bool mIsPow2 = false;
 
     // Public pointer members
     int32_t* mPtrExpertCounts = nullptr;
@@ -146,6 +155,8 @@ struct KernelParamsBase
     template <typename DataType>
     void setBaseParams(DataType const& data)
     {
+        mUsePdl = data.mUsePdl;
+        mIsPow2 = data.mPaddingLog2 > 0;
         mPtrExpertCounts = data.mPtrExpertCounts;
         mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
         mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
@@ -175,12 +186,14 @@ namespace routingDeepSeek
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct Data : public DataBase
 {
-    tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
+    tg::Dtype mDtypeOutput{tg::Dtype::Bfloat16};
 
     //
     // Grouped Gemm Launch Config Buffers
     //
     void const* mPtrRoutingBias;
+    // Dtype of the routing bias buffer (Bfloat16 or Fp32).
+    tg::Dtype mDtypeBias{tg::Dtype::Bfloat16};
 
     int32_t mHiddenDim; // not used
     int32_t mNumExpertGroups;
@@ -190,9 +203,8 @@ struct Data : public DataBase
     bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool UseGroups_, bool isPow2_,
-    bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_, isPow2_, UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool UseGroups_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
@@ -205,7 +217,9 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
     // Note: this variable(mPtrTopKWeightsFull) might need to be added back for the low-latency kernels for MoE in
     // tllm-gen in the future
 
-    OutputT const* mPtrRoutingBias = nullptr;
+    // Type-erased bias pointer — supports both float and bfloat16 without conversion.
+    void const* mPtrRoutingBias = nullptr;
+    tg::Dtype mDtypeBias = tg::Dtype::Bfloat16;
 
     int32_t mNumExpertGroups = 0;
     int32_t mNumExpertsPerGroup = 0;
@@ -221,8 +235,8 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 
         params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*) data.mPtrTopKPacked;
 
-        // params.mPtrTopKWeightsFull = static_cast<OutputT*>(data.mPtrTopKWeightsFull);
-        params.mPtrRoutingBias = static_cast<OutputT const*>(data.mPtrRoutingBias);
+        params.mPtrRoutingBias = data.mPtrRoutingBias;
+        params.mDtypeBias = data.mDtypeBias;
 
         params.mNumExpertGroups = data.mNumExpertGroups;
         params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
@@ -247,11 +261,11 @@ namespace routingLlama4
 
 struct Data : public DataBase
 {
-    tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
+    tg::Dtype mDtypeOutput{tg::Dtype::Bfloat16};
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_, isPow2_, UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
@@ -277,40 +291,69 @@ void run(Data const& data, void* stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace routingRenormalize
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Routing preprocess/postprocess policy type enums.
+// These are used to select the compile-time policy at dispatch time.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class RoutingPreprocessType
+{
+    None,        // No preprocessing before topK
+    Softmax,     // Apply softmax on all expert scores before topK
+    Sigmoid,     // Apply sigmoid(score) for topK selection (Cohere-style, no bias)
+    SigmoidBias, // Apply sigmoid(score) + bias for topK selection (DeepSeek-style)
+};
+
+enum class RoutingPostprocessType
+{
+    None,               // No postprocessing after topK
+    Softmax,            // Apply softmax on top-K scores
+    SumNormalize,       // Normalize top-K scores by their sum
+    ScaledSumNormalize, // Recover sigmoid scores, normalize by sum and scale (DeepSeek-style)
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace routingCustom
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Data : public DataBase
 {
-    tg::Dtype mDtypeExpW{tg::Dtype::Fp32};
-    tg::Dtype mDtypeElt{tg::Dtype::Bfloat16};
+    tg::Dtype mDtypeOutput{tg::Dtype::Fp32};    // OutputT: expert weights dtype (typically Bfloat16)
+    tg::Dtype mDtypeInput{tg::Dtype::Bfloat16}; // InputT: routing logits dtype (Bfloat16 or Fp32)
 
-    bool mDoSoftmaxBeforeTopK{false};
+    RoutingPreprocessType mPreprocessType{RoutingPreprocessType::None};
+    RoutingPostprocessType mPostprocessType{RoutingPostprocessType::Softmax};
     bool mNormTopkProb{true}; // Default value is true for Qwen3 model
-    // If true, applies softmax normalization after selecting top-K experts.
-    // Use this for models that require post-selection normalization (e.g., specific Qwen variants).
-    // Mutually exclusive with mDoSoftmaxBeforeTopK when both normalization paths are active.
-    // NOTE: Don't need to use this variable for now.
-    bool mApplySoftmaxAfterTopK{true};
+
+    // Optional: per-expert routing bias (used by SigmoidBias preprocess).
+    void const* mPtrRoutingBias{nullptr};
+    // Dtype of the routing bias buffer (Bfloat16 or Fp32). Used to read mPtrRoutingBias correctly.
+    tg::Dtype mDtypeBias{tg::Dtype::Bfloat16};
+    // Optional: scaling factor applied to final scores (used by ScaledSumNormalize postprocess).
+    float mRouteScale{1.0f};
+    // Optional: epsilon added to the sum before division to prevent division by zero.
+    // MiniMax2 uses 1e-20f; DeepSeek uses 0.0f (no epsilon).
+    float mSumEpsilon{0.0f};
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool DoSoftmaxBeforeTopK_,
-    bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_, isPow2_, UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, typename ExpertSelectPolicy_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
+    using ExpertSelectPolicy = ExpertSelectPolicy_;
 
-    static constexpr bool DoSoftmaxBeforeTopK = DoSoftmaxBeforeTopK_;
+    // Expert select policy params — empty structs have zero register cost.
+    using ExpertSelectParams = typename ExpertSelectPolicy::template Params<OutputT>;
 
     PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
     int32_t mTopK = 0;
 
-    bool mNormTopkProb = true;
-    bool mApplySoftmaxAfterTopK = false;
+    ExpertSelectParams mExpertSelectParams;
 
     static KernelParams setKernelParams(Data const& data)
     {
@@ -318,16 +361,33 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
         params.setBaseParams(data);
 
         params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*) data.mPtrTopKPacked;
-        params.mNormTopkProb = data.mNormTopkProb;
-        params.mApplySoftmaxAfterTopK = data.mApplySoftmaxAfterTopK;
         params.mTopK = data.mTopK;
+
+        // Policy populates only the fields it needs from Data.
+        params.mExpertSelectParams.set(data);
         return params;
     }
 };
 
 void run(Data const& data, void* stream);
 
-} // namespace routingRenormalize
+} // namespace routingCustom
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Shared utility for post-topK pipeline when mPtrTopKIds != nullptr.
+// All routing methods (Custom, DeepSeek, Llama4) use the same workflow in this case:
+// 1. Reset expert counts
+// 2. Run histogram kernel
+// 3. Run offsets kernel
+// Since the kernels are shared and we don't need routing-method-specific logic,
+// we can use routingCustom's launch mechanism.
+//
+// This function works with any Data type that inherits from DataBase.
+// Implementation is in RoutingFromTopKIds.cu
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename DataType>
+void runPostTopKPipeline(DataType const& data, uint32_t numThreadsHist, void* stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 } // namespace routing
