@@ -6,8 +6,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
-                                 SADecodingConfig)
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SADecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root

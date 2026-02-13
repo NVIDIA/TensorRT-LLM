@@ -207,8 +207,7 @@ def get_spec_decoder(
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args)
     if spec_config.spec_dec_mode.is_sa():
-        return SASampler(sampler_args,
-                        max_draft_len=spec_config.max_draft_len)
+        return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

@@ -31,7 +31,7 @@ import torch
 
 from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecMetadata, SpecWorkerBase
-from .spec_sampler_base import SampleStateSpec, SampleStateTensorsSpec, SpecSamplerBase
+from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
 from .suffix_automaton import SuffixAutomatonManager
 
 if TYPE_CHECKING:

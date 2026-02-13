@@ -1107,15 +1107,20 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 class NGramDecodingConfig(DecodingBaseConfig):
     """
     Configuration for NGram drafter speculative decoding.
+
     Arguments:
         max_draft_len: int
                 The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
+
         max_matching_ngram_size: int
             The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
+
         is_keep_all: bool = True
             Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
+
         is_use_oldest: bool = True
             Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
+
         is_public_pool: bool = True
             Whether to use a common pool for all requests, or the pool is private for each request if False.
     """
