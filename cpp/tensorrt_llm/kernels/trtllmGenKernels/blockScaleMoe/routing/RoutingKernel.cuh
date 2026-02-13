@@ -15,7 +15,7 @@
  */
 #pragma once
 
-#include "DevKernel.h"
+#include "RoutingDevKernel.h"
 #include "RoutingKernel.h"
 #include "RoutingKernelTopK.cuh"
 
@@ -45,6 +45,21 @@ static constexpr int WarpSize = 32;
 static constexpr int NumBlocksPerCluster = 8;
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Dereference a type-erased pointer at the given index, reading the value in its native dtype.
+/// Returns float since routing computations are done in float for numerical stability.
+__forceinline__ __device__ float loadScalar(void const* ptr, int idx, batchedGemm::trtllm::gen::Dtype dtype)
+{
+    namespace tg = batchedGemm::trtllm::gen;
+    switch (dtype)
+    {
+    case tg::Dtype::Fp32: return static_cast<float const*>(ptr)[idx];
+    case tg::Dtype::Bfloat16: return static_cast<float>(static_cast<__nv_bfloat16 const*>(ptr)[idx]);
+    default: return 0.f;
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -391,7 +406,7 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
 #pragma unroll
     for (int e = 0; e < ExpertsPerThread; e++)
     {
-        if constexpr (KernelParams::isPow2)
+        if (params.mIsPow2)
         {
             numCta[e] = divUpLog2<int32_t>(count[e], params.mPaddingLog2);
         }
@@ -411,7 +426,6 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
         int expert = threadIdx.x * ExpertsPerThread + e;
         if (expert < params.mNumExperts)
         {
-            // Strided loop to share this work between blocks.
             for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocksPerCluster)
             {
                 const int32_t localExpertIdx
@@ -419,7 +433,7 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
                 params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
                 int32_t mnLimit1;
                 int32_t mnLimit2;
-                if constexpr (KernelParams::isPow2)
+                if (params.mIsPow2)
                 {
                     mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, params.mPaddingLog2);
                     mnLimit2 = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2) + count[e];
@@ -432,9 +446,8 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
                 params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
             }
 
-            // get the padded offset associated with this expert
             int32_t offset;
-            if constexpr (KernelParams::isPow2)
+            if (params.mIsPow2)
             {
                 offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
             }
@@ -443,16 +456,14 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
                 offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
             }
 
-            // write expert offsets to shared
             smemExpertOffset[expert] = offset + blockExpertOffset[e];
         }
     }
 
-    // write out padded count
     if (clusterBlockRank == 0 && warpIdx == NumWarps - 1 && cute::elect_one_sync())
     {
         int32_t permutedIdxSize;
-        if constexpr (KernelParams::isPow2)
+        if (params.mIsPow2)
         {
             permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
         }
@@ -471,17 +482,6 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
     // Note: I observed a perf benefit to doing this before the final loop so the compiler can
     // implement break with EXIT.
     __cluster_barrier_wait();
-
-    // trigger the secondary kernel when using PDL
-    // We can't do it earlier because FC1 depends on the mPtrCtaIdxXyToBatchIdx,
-    // mPtrCtaIdxXyToMnLimit, mPtrNumNonExitingCtas and mPtrTotalNumPaddedTokens
-    // TODO: this is not sufficient to ensure visibility in the next kernel!
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    if constexpr (KernelParams::UsePdl)
-    {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
 
     // each thread has the same "expanded indexes" assigned to it as above
     // at this point, we know the final offsets of experts and the offsets within
@@ -515,6 +515,18 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
             params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
         }
     }
+
+    // Trigger the secondary kernel AFTER all global memory writes are complete.
+    // The downstream kernels (permute, FC1 GEMM) depend on mPtrCtaIdxXyToBatchIdx,
+    // mPtrCtaIdxXyToMnLimit, mPtrNumNonExitingCtas, mPtrPermutedIdxSize, AND
+    // mPtrExpandedIdxToPermutedIdx / mPtrPermutedIdxToTokenIdx.
+    // Triggering before the permutation writes causes the consumer to read stale data → NaN.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (params.mUsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -556,11 +568,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     __syncthreads();
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    // Wait on primary grid and trigger secondary kernel.
-    if constexpr (KernelParams::UsePdl)
+    // Wait on primary grid (but do NOT trigger yet — trigger after atomicAdd to mPtrExpertCounts).
+    if (params.mUsePdl)
     {
         cudaGridDependencySynchronize();
-        cudaTriggerProgrammaticLaunchCompletion();
     }
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
@@ -640,6 +651,15 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
             atomicAdd(&params.mPtrExpertCounts[expert], localExpertCount);
         }
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // Trigger AFTER all atomicAdds to mPtrExpertCounts are done, so the next kernel
+    // (routingIndicesOffsetsKernel) sees the complete histogram.
+    if (params.mUsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -673,7 +693,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
-    if constexpr (KernelParams::UsePdl)
+    if (params.mUsePdl)
     {
         cudaGridDependencySynchronize();
     }
@@ -704,7 +724,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 #pragma unroll
     for (int e = 0; e < ExpertsPerThread; e++)
     {
-        if constexpr (KernelParams::isPow2)
+        if (params.mIsPow2)
         {
             numCta[e] = divUpLog2<int32_t>(count[e], params.mPaddingLog2);
         }
@@ -723,9 +743,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         int expert = threadIdx.x * ExpertsPerThread + e;
         if (expert < params.mNumExperts)
         {
-            // Get the padded offset associated with this expert
             int32_t offset;
-            if constexpr (KernelParams::isPow2)
+            if (params.mIsPow2)
             {
                 offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
             }
@@ -734,19 +753,16 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
                 offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
             }
 
-            // Write expert offsets to shared
             smemExpertOffset[expert] = offset;
         }
     }
 
-    // Sync to make expert offsets available to all threads.
     __syncthreads();
 
-    // The first block writes out padded count (use last warp of actual thread count)
     if (blockIdx.x == 0 && warpIdx == NumThreadsBlock / WarpSize - 1 && cute::elect_one_sync())
     {
         int32_t permutedIdxSize;
-        if constexpr (KernelParams::isPow2)
+        if (params.mIsPow2)
         {
             permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
         }
@@ -764,7 +780,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         int expert = threadIdx.x * ExpertsPerThread + e;
         if (expert < params.mNumExperts)
         {
-            // Strided loop to share this work between blocks.
             for (int32_t cta = blockIdx.x; cta < numCta[e]; cta += gridDim.x)
             {
                 const int32_t localExpertIdx
@@ -772,7 +787,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
                 params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
                 int32_t mnLimit1;
                 int32_t mnLimit2;
-                if constexpr (KernelParams::isPow2)
+                if (params.mIsPow2)
                 {
                     mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, params.mPaddingLog2);
                     mnLimit2 = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2) + count[e];
@@ -965,7 +980,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     // Trigger secondary kernel.
     // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
     // dependency sync.
-    if constexpr (KernelParams::UsePdl)
+    if (params.mUsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
@@ -988,7 +1003,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
-    if constexpr (KernelParams::UsePdl)
+    if (params.mUsePdl)
     {
         cudaGridDependencySynchronize();
     }
@@ -998,11 +1013,307 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
-    if constexpr (KernelParams::UsePdl)
+    if (params.mUsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Cooperative launch kernel: fuses histogram + offsets computation for medium token counts.
+// This kernel is shared by routingCustom, routingDeepSeek, and can be used by other routing methods.
+// It uses cooperative groups to synchronize across multiple CTAs and compute expert counts,
+// offsets, and permutation indices in a single kernel launch.
+//
+// Requirements:
+//   - MaxNumExperts <= 1024 (enforced by static_assert)
+//   - SM90+ architecture (cooperative groups)
+//   - mPtrPermutedIdxSize must be non-null (needed for permutation)
+//
+// The kernel handles both mPtrTopKIds and mPtrTopKPacked input formats.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+template <typename KernelParams>
+__global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesCoopKernel(KernelParams params)
+{
+    // number of experts is bounded by number of threads (coop kernel requires MaxNumExperts <= 1024)
+    using OutputT = typename KernelParams::OutputT;
+    static constexpr int MaxNumExperts = KernelParams::MaxNumExperts;
+    static constexpr int NumThreads = MaxNumExperts;
+    static_assert(MaxNumExperts <= 1024, "Coop kernel requires MaxNumExperts <= 1024");
+
+    __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
+    __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[MaxNumExperts];
+    // needed for the exclusive sum of token offsets
+    using Scan = cub::BlockScan<int32_t, NumThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+    __shared__ typename Scan::TempStorage tempStorage;
+    // 64 elements -> 128+ registers. Above that we may start to see spilling to local memory.
+    static constexpr int MaxExpandedIdxPerThread = 64;
+
+    // Initialize grid.
+    cg::grid_group grid = cg::this_grid();
+    // Note: the following is more efficient than grid.block_index() because we don't use y and z.
+    int32_t const gridBlockIdx = blockIdx.x;
+    int32_t const gridThreadIdx = NumThreads * gridBlockIdx + threadIdx.x;
+    int32_t const numBlocks = gridDim.x;
+    int32_t const numThreadsPerGrid = numBlocks * NumThreads;
+
+    int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+
+    auto expandedIdxSize = params.mNumTokens * params.mTopK;
+
+    // pre-fill the counts with 0 — each thread represents one expert
+    smemExpertCount[threadIdx.x] = 0;
+    __syncthreads();
+
+    // then wait on primary grid
+    if (params.mUsePdl)
+    {
+        cudaGridDependencySynchronize();
+    }
+
+    // each thread keeps has some number of "expanded indexes" assigned to it
+    // for each of these, we keep the associated expert and offset within expert in registers
+    int32_t expertIndexes[MaxExpandedIdxPerThread];
+    int32_t expertOffsets[MaxExpandedIdxPerThread];
+    auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    // In order to avoid a serialization LDG-ATOMS-LDG-ATOMS-..., we skip multiple iterations at a
+    // time, and branch between a fast path without bound checks and a slow path with bound checks.
+    int constexpr IterStride = 4;
+    static_assert(MaxExpandedIdxPerThread % IterStride == 0);
+
+    // Define a lambda to avoid code duplication in both branches.
+    // Use shared device function for expert index extraction.
+    auto loopBody = [&](int ii, int expandedIdx)
+    {
+        int32_t expertIdx = getExpertIdxFromInputWithWeights(params, expandedIdx, params.mPtrTopKWeights);
+        expertIndexes[ii] = expertIdx;
+        // check whether this expert is local to our GPU at all and ignore if not
+        auto localExpertIdx = expertIdx - params.mLocalExpertsStartIdx;
+        auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
+            && (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+        expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + expertIdx, 1) : 0;
+    };
+
+#pragma unroll
+    for (int32_t ii0 = 0; ii0 < MaxExpandedIdxPerThread; ii0 += IterStride)
+    {
+        // Whether it's safe to do multiple iterations without bound checks.
+        bool const takeFastPath = (ii0 + IterStride) * numThreadsPerGrid <= expandedIdxSize;
+        if (takeFastPath)
+        {
+#pragma unroll
+            for (int32_t jj = 0; jj < IterStride; jj++)
+            {
+                int const ii = ii0 + jj;
+                auto expandedIdx = static_cast<int32_t>(gridThreadIdx) + ii * numThreadsPerGrid;
+                loopBody(ii, expandedIdx);
+            }
+        }
+        else
+        {
+            bool doBreak = false;
+#pragma unroll
+            for (int32_t jj = 0; jj < IterStride; jj++)
+            {
+                int const ii = ii0 + jj;
+                auto expandedIdx = static_cast<int32_t>(gridThreadIdx) + ii * numThreadsPerGrid;
+                if (expandedIdx >= expandedIdxSize)
+                {
+                    doBreak = true;
+                    break;
+                }
+                loopBody(ii, expandedIdx);
+            }
+            if (doBreak)
+            {
+                break;
+            }
+        }
+    }
+
+    // Make histogram (token counts per expert) available to all threads in the block.
+    __syncthreads();
+
+    //
+    // Each thread now represents one expert
+    //
+
+    // Add the local bin count to the common bin count and get a per-CTA offset.
+    int32_t const localExpertCount = smemExpertCount[threadIdx.x];
+
+    int32_t blockExpertOffset = 0;
+    if (threadIdx.x < params.mNumExperts)
+    {
+        blockExpertOffset = atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
+    }
+
+    // Sync to wait for completion of the histogram reduction.
+    grid.sync();
+
+    // Get total count for this expert.
+    int32_t count = (threadIdx.x < params.mNumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
+
+    // Note: the scan is redundant in all CTAs, but doing it in only 1 CTA would be worse for latency.
+
+    // Compute the runtime config for projections
+    // Whether or not an expert is local is taken into account when smemExpertCount is computed
+    // so we do not need to take it into account here.
+
+    int32_t numCta;
+    if (params.mIsPow2)
+    {
+        numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+    }
+    else
+    {
+        numCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
+    }
+
+    int32_t ctaOffset;
+    int32_t numNonExitingCtas;
+    Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
+
+    for (int32_t cta = gridBlockIdx; cta < numCta; cta += numBlocks)
+    {
+        const int32_t localExpertIdx = (threadIdx.x - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
+        params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
+        int32_t mnLimit1;
+        int32_t mnLimit2;
+        if (params.mIsPow2)
+        {
+            mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
+            mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count;
+        }
+        else
+        {
+            mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
+            mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
+        }
+        params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
+    }
+
+    int32_t offset;
+    if (params.mIsPow2)
+    {
+        offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+    }
+    else
+    {
+        offset = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
+    }
+    int32_t permutedIdxSize;
+    if (params.mIsPow2)
+    {
+        permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    }
+    else
+    {
+        permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+    }
+
+    // write out padded count
+    if (gridBlockIdx == 0 && warpIdx == NumThreads / WarpSize - 1 && cute::elect_one_sync())
+    {
+        params.mPtrPermutedIdxSize[0] = permutedIdxSize;
+        params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    }
+
+    // write expert offsets to shared
+    smemExpertOffset[threadIdx.x] = offset + blockExpertOffset;
+
+    // make expert offsets available to all threads
+    __syncthreads();
+
+    // each thread has the same "expanded indexes" assigned to it as above
+    // at this point, we know the final offsets of experts and the offsets within
+    // experts, which allows writing the final index values
+#pragma unroll
+    for (int32_t ii = 0; ii < MaxExpandedIdxPerThread; ++ii)
+    {
+        auto expandedIdx = static_cast<int32_t>(gridThreadIdx) + ii * numThreadsPerGrid;
+        if (expandedIdx >= expandedIdxSize)
+        {
+            break;
+        }
+        auto expertIdx = expertIndexes[ii];
+        // check whether this expert is local to our GPU at all
+        auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
+        auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
+            && (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+        auto tokenIdx = expandedIdx / params.mTopK;
+        auto permutedIdx = isLocalExpert ? int32_t{smemExpertOffset[expertIdx]} + expertOffsets[ii] : int32_t{-1};
+        if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
+        {
+            params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
+        }
+        if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert)
+        {
+            params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+        }
+        if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocalExpert)
+        {
+            params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
+        }
+    }
+
+    // Trigger the secondary kernel AFTER all global memory writes (including permutation indices).
+    // The downstream kernels depend on all routing outputs being visible.
+    if (params.mUsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+}
+#else
+template <typename KernelParams>
+__global__ void routingIndicesCoopKernel(KernelParams params)
+{
+    assert(false && "routingIndicesCoopKernel is only supported on SM90+ architectures");
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Shared device functions for coop kernel (used by both routingCustom and routingDeepSeek)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Device function to extract expert index from either mPtrTopKIds or mPtrTopKPacked.
+// This is the only difference between routingCustom and routingDeepSeek coop kernels.
+// For routingCustom: also writes to mPtrTopKWeights if provided.
+// For routingDeepSeek: simpler version that doesn't write weights.
+template <typename KernelParams>
+__forceinline__ __device__ int32_t getExpertIdxFromInput(KernelParams const& params, int32_t expandedIdx)
+{
+    if (params.mPtrTopKIds != nullptr)
+    {
+        return params.mPtrTopKIds[expandedIdx];
+    }
+    else
+    {
+        return params.mPtrTopKPacked[expandedIdx].idx;
+    }
+}
+
+// Overload for routingCustom that also writes topK weights if needed.
+template <typename KernelParams>
+__forceinline__ __device__ int32_t getExpertIdxFromInputWithWeights(
+    KernelParams const& params, int32_t expandedIdx, typename KernelParams::OutputT* topKWeights)
+{
+    if (params.mPtrTopKIds != nullptr)
+    {
+        return params.mPtrTopKIds[expandedIdx];
+    }
+    else
+    {
+        PackedScoreIdx<typename KernelParams::OutputT> scoreIdx = params.mPtrTopKPacked[expandedIdx];
+        if (topKWeights != nullptr)
+        {
+            topKWeights[expandedIdx] = static_cast<typename KernelParams::OutputT>(scoreIdx.score);
+        }
+        return scoreIdx.idx;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 } // namespace routing
 } // namespace moe::dev
