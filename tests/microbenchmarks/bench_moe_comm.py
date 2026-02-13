@@ -127,11 +127,13 @@ def _make_inputs(
     hidden_size: int,
     top_k: int,
     num_experts_total: int,
+    experts_per_rank: int,
     act_dtype: torch.dtype,
     device: torch.device,
     quant_algo: QuantAlgo,
     backend: Communication,
     moe: Optional[MoE] = None,
+    perfect_router: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     # Hidden states: payload we want to communicate.
     hidden_states = torch.randn(local_num_tokens, hidden_size, dtype=act_dtype, device=device)
@@ -141,17 +143,39 @@ def _make_inputs(
     # using Cutlass' quantize_input() (outside the timed comm region).
     if quant_algo != QuantAlgo.NO_QUANT and backend.supports_post_quant_dispatch():
         hidden_states, hidden_states_sf = moe.quantize_input(hidden_states, post_quant_comm=True)
-    # Routing IDs: global expert IDs in [0, num_experts_total).
-    token_selected_slots = torch.randint(
-        0,
-        num_experts_total,
-        (local_num_tokens, top_k),
-        dtype=torch.int32,
-        device=device,
-    )
-    # Router weights/scales.
-    # DeepEP expects router weights/topk_weights to be float32.
+    if perfect_router:
+        assert experts_per_rank > 0
+        assert num_experts_total % experts_per_rank == 0
+        ep_size = num_experts_total // experts_per_rank
+        rank = mpi_rank()
+        assert 0 <= rank < ep_size
+
+        # Fair routing across both ranks and experts:
+        # flatten (token, top-k) slots into a sequence and cycle as:
+        #   rank r expert0, rank r+1 expert0, ..., then rank r expert1, ...
+        flat_slots = torch.arange(local_num_tokens * top_k, device=device, dtype=torch.int64)
+        schedule = flat_slots + rank
+        target_rank = schedule % ep_size
+        local_expert = (schedule // ep_size) % experts_per_rank
+        token_selected_slots = (
+            (target_rank * experts_per_rank + local_expert)
+            .view(local_num_tokens, top_k)
+            .to(torch.int32)
+        )
+    else:
+        # Routing IDs: global expert IDs in [0, num_experts_total).
+        token_selected_slots = torch.randint(
+            0,
+            num_experts_total,
+            (local_num_tokens, top_k),
+            dtype=torch.int32,
+            device=device,
+        )
+        # Router weights/scales.
+
+    # The value of token_final_scales doesn't matter for communication.
     token_final_scales = torch.rand(local_num_tokens, top_k, dtype=torch.float32, device=device)
+
     return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
 
 
@@ -549,6 +573,11 @@ def parse_args() -> argparse.Namespace:
         default=1234,
         help="Base random seed for input generation (effective seed is random_seed + rank).",
     )
+    parser.add_argument(
+        "--perfect_router",
+        action="store_true",
+        help="Use deterministic balanced router assignments to avoid communication load imbalance.",
+    )
     return parser.parse_args()
 
 
@@ -678,6 +707,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                     "top_k": top_k,
                     "dtype": str(act_dtype),
                     "quant_algo": quant_algo.name,
+                    "perfect_router": bool(args.perfect_router),
                     "experts_per_rank": experts_per_rank,
                     "num_experts_total": num_experts_total,
                     "max_num_tokens_per_rank": max_num_tokens_per_rank,
@@ -760,11 +790,13 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                     hidden_size,
                     top_k,
                     num_experts_total,
+                    experts_per_rank,
                     act_dtype,
                     device,
                     quant_algo,
                     backend,
                     moe,
+                    bool(args.perfect_router),
                 )
             )
 
