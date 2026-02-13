@@ -91,7 +91,6 @@ def build_worker_config(base_config, server_type_config, disagg_cluster):
     EXCLUDE_FROM_WORKER = {
         'hostname', 'port', 'num_instances', 'urls', 'router', 'model',
         'context_servers', 'generation_servers', 'conditional_disagg_config',
-        'perf_metrics_max_requests'
     }
 
     # Start with top-level fields (exclude server-only)
@@ -419,12 +418,13 @@ def fetch_prometheus_metrics(server_url: str):
     return response.text
 
 
-def setup_disagg_cluster(config_file, model_name=None):
+def setup_disagg_cluster(config_file, model_name=None, env=None):
     """Load config, launch workers + disagg server, wait for ready.
 
     Args:
         config_file: Path to disaggregated server config YAML
         model_name: Model path override (defaults to config's 'model' field)
+        env: Environment variables to pass to subprocess (workers and disagg server)
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -473,7 +473,7 @@ def setup_disagg_cluster(config_file, model_name=None):
             str(next_device + j) for j in range(gpus_per_ctx))
         ctx_workers.append(
             run_ctx_worker(model, ctx_worker_config, work_dir, port=0,
-                           device=0))#device_ids)) # TODO set to device_ids for multi-gpu
+                           device=0, env=env))#device_ids)) # TODO set to device_ids for multi-gpu
         next_device += gpus_per_ctx
 
     for i in range(num_gen_instances):
@@ -481,7 +481,7 @@ def setup_disagg_cluster(config_file, model_name=None):
             str(next_device + j) for j in range(gpus_per_gen))
         gen_workers.append(
             run_gen_worker(model, gen_worker_config, work_dir, port=0,
-                           device=0))#device_ids)) # TODO set to device_ids for multi-gpu
+                           device=0, env=env))#device_ids)) # TODO set to device_ids for multi-gpu
         next_device += gpus_per_gen
 
     # Build minimal server config and launch
@@ -494,7 +494,7 @@ def setup_disagg_cluster(config_file, model_name=None):
         "conditional_disagg_config": config.get("conditional_disagg_config", None),
         "perf_metrics_max_requests": config.get("perf_metrics_max_requests", 0),
     }
-    disagg_server = run_disagg_server(server_config, work_dir, server_port)
+    disagg_server = run_disagg_server(server_config, work_dir, server_port, env=env)
 
     asyncio.run(wait_for_disagg_server_ready(server_port))
 
@@ -514,7 +514,7 @@ def run_disaggregated_test(example_dir,
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path)
+        setup_disagg_cluster(config_file, model_name=model_path, env=env)
 
     server_host = config.get("hostname", "localhost")
 
@@ -767,7 +767,7 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
     send_file = os.path.join(output_path, "rank_0_send.csv")
-    recv_file = os.path.join(output_path, "rank_1_recv.csv")
+    recv_file = os.path.join(output_path, "rank_0_recv.csv")
     assert os.path.exists(send_file)
     assert os.path.exists(recv_file)
     with open(send_file, "r") as f:
@@ -1348,7 +1348,7 @@ def get_config_for_benchmark(model_root, backend):
     serve_config = {
         "model": model_root,
         "hostname": "localhost",
-        "port": get_free_port_in_ci(),
+        "port": get_free_port(),
         "backend": "pytorch",
         "context_servers": {
             "num_instances": 1,
@@ -1362,7 +1362,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": [f"localhost:{get_free_port_in_ci()}"]
+            "urls": [f"localhost:{get_free_port()}"]
         },
         "generation_servers": {
             "num_instances": 1,
@@ -1375,7 +1375,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": [f"localhost:{get_free_port_in_ci()}"]
+            "urls": [f"localhost:{get_free_port()}"]
         }
     }
     return serve_config

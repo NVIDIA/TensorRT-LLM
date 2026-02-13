@@ -84,7 +84,7 @@ def periodic_check(timeout=300, interval=3):
     return decorator
 
 
-def _run_worker(model_name, worker_config, role, port, work_dir, device=-1, save_log=False):
+def _run_worker(model_name, worker_config, role, port, work_dir, device=-1, save_log=False, env=None):
     """Run a worker process (context or generation).
 
     Args:
@@ -95,6 +95,7 @@ def _run_worker(model_name, worker_config, role, port, work_dir, device=-1, save
         work_dir: Working directory for config files
         device: CUDA device ID (-1 for default)
         save_log: Whether to save logs to file
+        env: Environment variables for the subprocess
 
     Returns:
         ProcessWrapper: Wrapped subprocess
@@ -116,7 +117,10 @@ def _run_worker(model_name, worker_config, role, port, work_dir, device=-1, save
             "--server_role",
             "context" if role.startswith("ctx") else "generation",
         ]
-        env = os.environ.copy()
+        if env is None:
+            env = os.environ.copy()
+        else:
+            env = env.copy()
         log_file = None
         log_path = None
         if save_log:
@@ -138,23 +142,23 @@ def _run_worker(model_name, worker_config, role, port, work_dir, device=-1, save
         )
 
 
-def run_ctx_worker(model_name, ctx_worker_config, work_dir, port=0, device=0):
+def run_ctx_worker(model_name, ctx_worker_config, work_dir, port=0, device=0, env=None):
     """Launch a context worker with service discovery.
 
     Use port=0 to let the worker choose a free port.
     """
-    return _run_worker(model_name, ctx_worker_config, "ctx", port, work_dir, device)
+    return _run_worker(model_name, ctx_worker_config, "ctx", port, work_dir, device, env=env)
 
 
-def run_gen_worker(model_name, gen_worker_config, work_dir, port=0, device=1):
+def run_gen_worker(model_name, gen_worker_config, work_dir, port=0, device=1, env=None):
     """Launch a generation worker with service discovery.
 
     Use port=0 to let the worker choose a free port.
     """
-    return _run_worker(model_name, gen_worker_config, "gen", port, work_dir, device)
+    return _run_worker(model_name, gen_worker_config, "gen", port, work_dir, device, env=env)
 
 
-def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False):
+def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None):
     """Launch the disaggregated server.
 
     Args:
@@ -162,6 +166,7 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False):
         work_dir: Working directory for config files
         port: Port number
         save_log: Whether to save logs to file
+        env: Environment variables for the subprocess
 
     Returns:
         ProcessWrapper: Wrapped subprocess
@@ -181,7 +186,7 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False):
     else:
         stdout = sys.stdout
         stderr = sys.stderr
-    p = subprocess.Popen(cmds, stdout=stdout, stderr=stderr)
+    p = subprocess.Popen(cmds, env=env, stdout=stdout, stderr=stderr)
     return ProcessWrapper(p, log_file=log_file, log_path=log_path, port=port)
 
 
