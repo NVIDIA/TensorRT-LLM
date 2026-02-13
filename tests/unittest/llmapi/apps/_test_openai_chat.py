@@ -220,7 +220,6 @@ def test_multiple_responses(client: openai.OpenAI, model_name: str,
         messages=messages,
         max_completion_tokens=10,
         n=2,
-        temperature=0.0,
         extra_body=dict(best_of=4),
     )
     assert len(chat_completion.choices) == 2
@@ -246,7 +245,6 @@ def test_multiple_responses_and_beam_search(client: openai.OpenAI,
         messages=messages,
         max_completion_tokens=10,
         n=2,
-        temperature=0.0,
         extra_body=dict(use_beam_search=True),
     )
     assert len(chat_completion.choices) == 2
@@ -260,7 +258,6 @@ def test_multiple_responses_and_beam_search(client: openai.OpenAI,
         messages=messages,
         max_completion_tokens=10,
         n=2,
-        temperature=0.0,
         extra_body=dict(best_of=4),
     )
     assert len(chat_completion.choices) == 2
