@@ -27,7 +27,7 @@ from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
 from ..piecewise_runner import ADPiecewiseRunner
-from ..piecewise_utils import SplitInfo, split_graph_at_dynamic_ops, swap_to_inplace_ops
+from ..piecewise_utils import SplitInfo, split_graph_at_dynamic_ops
 
 
 # Trivial FX ops that do NOT launch CUDA kernels — used to identify empty static segments
@@ -263,26 +263,14 @@ class PiecewiseCapturedGraph(nn.Module):
             self._is_prepared = True
             return
 
-        # Phase A: Swap dynamic ops to inplace variants
-        # CRITICAL: We must NOT use copy.deepcopy(model) — that duplicates ALL weight
-        # tensors on GPU, effectively doubling memory usage and causing OOM for large
-        # models (e.g., 7B+ params).
-        #
-        # Instead, we create a new GraphModule that:
-        #   - Shares all parameters/buffers/submodules with the original (zero-copy)
-        #   - Has its OWN copy of the FX graph (so mutations don't affect the original)
-        #
-        # This is safe because:
-        # 1. swap_to_inplace_ops only modifies the FX graph (node targets, insertion)
-        # 2. split_graph_at_dynamic_ops creates new submodule wrappers that reference
-        #    the same underlying parameters — no weight duplication
-        # 3. The monolithic CG path (CapturedGraph) calls model(*args, **kwargs)
-        #    directly and doesn't depend on the FX graph structure at all
+        # Create a new GraphModule that shares all parameters/buffers/submodules
+        # with the original (zero-copy) but has its OWN copy of the FX graph
+        # (so split_graph_at_dynamic_ops mutations don't affect the original).
+        # We must NOT use copy.deepcopy(model) — that duplicates ALL weight tensors
+        # on GPU, effectively doubling memory usage and causing OOM for large models.
         gm = GraphModule(model, copy.deepcopy(model.graph))
-        num_swapped = swap_to_inplace_ops(gm)
-        ad_logger.info(f"PiecewiseCapturedGraph: swapped {num_swapped} ops to inplace variants")
 
-        # Phase B: Split graph at dynamic op boundaries
+        # Split graph at dynamic op boundaries
         self.split_info = split_graph_at_dynamic_ops(gm)
         self.split_gm = self.split_info.split_gm
 
