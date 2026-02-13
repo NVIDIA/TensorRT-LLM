@@ -313,6 +313,17 @@ class StorageManager:
         fallen_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
         self._prepare_free_slots(goals, level, fallen_pages)
 
+    def force_evict(
+        self, level: CacheLevel, min_num_pages: TypedIndexList[PoolGroupIndex, int]
+    ) -> None:
+        assert int(level) + 1 < self.num_cache_levels, "Cannot force eviction from last level"
+        next_lvl = CacheLevel(level + 1)
+        evicted = self._levels[level].controller.evict(min_num_pages)
+        goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
+        self._prepare_free_slots(
+            goals, next_lvl, cast(TypedIndexList[PoolGroupIndex, list[Page]], evicted)
+        )
+
     def _prepare_free_slots(
         self,
         goals: Array2D[CacheLevel, PoolGroupIndex, int],
@@ -580,14 +591,21 @@ class StorageManager:
                 overflow_slots.append((i, p))
         overflow_persistent_pages = [p for p in persistent_pages if p.slot_id >= new_num_slots]
         num_overflow_persistent = len(overflow_persistent_pages)
-        while (
-            overflow_slots and len(overflow_slots) + num_overflow_persistent > overflow_slots[0][0]
-        ):
-            overflow_slots.popleft()
-        overflow_pages = [s[1] for s in overflow_slots] + overflow_persistent_pages
+        if num_overflow_persistent > new_num_slots:
+            raise OutOfPagesError("Not enough slots to hold all persistent pages")
         allocator = pool_group._slot_allocator
         # prevent allocating slots with id >= new_num_slots
         allocator.prepare_for_shrink(new_num_slots)
+        min_num_evicted = 0
+        while overflow_slots and len(overflow_slots) + num_overflow_persistent > min(
+            new_num_slots, overflow_slots[0][0] + allocator.num_free_slots
+        ):
+            min_num_evicted = overflow_slots.popleft()[0] + 1
+        self.force_evict(
+            level, make_typed(lambda i: min_num_evicted if i == pg_idx else 0, self.num_pool_groups)
+        )
+        # These are the pages that will remain in the cache level and require defragmentation.
+        overflow_pages = [s[1] for s in overflow_slots] + overflow_persistent_pages
         requirements = filled_list(0, self.num_pool_groups)
         requirements[pg_idx] = len(overflow_pages)
         self.prepare_free_slots(level, requirements)
@@ -621,7 +639,11 @@ class StorageManager:
         num_cache_levels = self.num_cache_levels
         lvl_storage = self._levels[level].storage
         old_num_slots = lvl_storage.slot_count_list
-        new_quota = new_quota or lvl_storage.total_quota
+        new_quota = (
+            lvl_storage.total_quota
+            if new_quota is None
+            else round_up(new_quota, lvl_storage.pool_size_granularity)
+        )
         new_num_slots = lvl_storage._compute_slot_count_list(new_quota, new_ratio_list)
         if level != num_cache_levels - 1:
             assert persistent_pages is None, (

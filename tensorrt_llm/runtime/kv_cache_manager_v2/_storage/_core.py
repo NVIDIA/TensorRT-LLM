@@ -394,6 +394,7 @@ class SlotAllocator:
 
     def expand(self, new_num_slots: int) -> None:
         assert NDEBUG or self._check()
+        assert self._target_capacity == self._capacity
         old_num_slots = self._capacity
         assert new_num_slots > old_num_slots
         self._occupied_mask.resize(new_num_slots)
@@ -510,13 +511,12 @@ class PoolGroupBase:
         if self._destroyed:
             return
         allocator = self._slot_allocator
-        if allocator._capacity == 0:
-            return
-        allocator._synchronize()
+        if allocator._capacity != 0:
+            allocator._synchronize()
+            allocator.prepare_for_shrink(0)
+            allocator.finish_shrink()
         for pool in self._pools:
             pool.destroy()
-        allocator.prepare_for_shrink(0)
-        allocator.finish_shrink()
         self._destroyed = True
 
     @property
@@ -686,6 +686,7 @@ class CacheLevelStorage:
             size = pg.num_bytes
             total += size
             ret[i] = size
+        assert total > 0
         for i in typed_range(num_pool_groups):
             ret[i] /= total
         return ret

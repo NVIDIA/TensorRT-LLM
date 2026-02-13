@@ -99,7 +99,10 @@ static Py_hash_t ReferenceType_hash(ReferenceTypeObject* self)
         PyErr_SetString(PyExc_RuntimeError, "Reference is invalid");
         return -1;
     }
-    return (Py_hash_t) self->object_id;
+    Py_hash_t const h = (Py_hash_t) self->object_id;
+    /* Follow CPython hash implementation to remap -1 to -2, as -1 is reserved to signal
+       an error. */
+    return h == -1 ? -2 : h;
 }
 
 /* ReferenceType.__call__() - dereference the object */

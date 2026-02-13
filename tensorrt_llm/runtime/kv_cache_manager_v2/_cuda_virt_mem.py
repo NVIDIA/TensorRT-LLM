@@ -81,7 +81,7 @@ class NativePhysMemAllocator:
             _unwrap(drv.cuMemRelease(handle))
         except:
             print(
-                f"Failed to release handle {handle}. num_oustanding = {len(self._outstanding_handles)}"
+                f"Failed to release handle {handle}. num_outstanding = {len(self._outstanding_handles)}"
             )
             raise
 

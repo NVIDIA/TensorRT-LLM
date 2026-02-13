@@ -81,16 +81,6 @@ class Range:
 
 
 @dataclass(slots=True, frozen=True)
-class BufferSlice:
-    buffer_id: BufferId
-    num_slices: int = 1
-    slice_index: int = 1
-
-    def __post_init__(self) -> None:
-        assert 0 <= self.slice_index < self.num_slices
-
-
-@dataclass(slots=True, frozen=True)
 class AggregatedPageDesc:
     """
     The data you need would be in the following byte ranges:
@@ -101,7 +91,7 @@ class AggregatedPageDesc:
     size: int
     stride: int
     layer_group_id: LayerGroupId
-    buffers: Sequence[BufferSlice]
+    buffers: Sequence[BufferId]
 
 
 class KVCacheManager:
@@ -209,6 +199,9 @@ class KVCacheManager:
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int:
         """
         The multiplier to convert from base page indices to page indices expected by operators/kernels.
+
+        For layers in the same layer group, users are encouraged to share the computed page indices
+        between buffers of these layers, if the page index scale for these buffers are the same.
         """
         storage = self._storage
         attr = storage.get_buffer_attr(layer_id, data_role)
@@ -237,10 +230,12 @@ class KVCacheManager:
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """
+        When calling resize, all KV caches must be suspended.
         If best_efforts is True, we will try to resize the quota to the largest possible value that is
         still <= quota, and returns False only when we cannot resize the quota at all.
         If best_efforts is False, we will resize the quota to the exact value of quota, and give up
         if not possible.
+        For now, best_efforts=True is not yet implemented.
         """
         if best_efforts:
             raise NotImplementedError("Not implemented")
@@ -275,7 +270,7 @@ class KVCacheManager:
 
     @property
     def enable_partial_match(self) -> bool:
-        return True
+        return self._init_config.enable_partial_reuse
 
     @property
     def num_layers(self) -> int:
@@ -305,7 +300,7 @@ class KVCacheManager:
     def all_buffer_ids(self) -> Iterator[BufferId]:
         return iter(self._storage._buffer_attr.keys())
 
-    def get_aggregated_pages(self, buffers: Iterable[BufferSlice]) -> Iterator[AggregatedPageDesc]:
+    def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]:
         """
         Internally, we concatenate buffers into larger buffers.
         This API takes a iterator of buffers (unordered), and try to find those that can form
@@ -317,16 +312,16 @@ class KVCacheManager:
             A iterator of aggregated buffers.
         """
         # Group by (life_cycle, pool_index)
-        groups = defaultdict[tuple[LifeCycleId, PoolIndex], list[tuple[Range, BufferSlice]]](
-            list[tuple[Range, BufferSlice]]
+        groups = defaultdict[tuple[LifeCycleId, PoolIndex], list[tuple[Range, BufferId]]](
+            list[tuple[Range, BufferId]]
         )
         buffer_attr_map = self._storage._buffer_attr
         for b in buffers:
-            attr = buffer_attr_map[b.buffer_id]
-            slice_size = exact_div(attr.size, b.num_slices)
-            start = attr.offset + slice_size * b.slice_index
+            attr = buffer_attr_map[b]
+            size = attr.size
+            start = attr.offset
             key = (attr.life_cycle_id, attr.pool_index)
-            groups[key].append((Range(start, start + slice_size), b))
+            groups[key].append((Range(start, start + size), b))
 
         storage = self._storage._levels[GPU_LEVEL].storage
         lc2pg = self._storage._life_cycle_grouping
@@ -442,6 +437,11 @@ class KVCacheManager:
         )
 
     def adjust(self) -> None:
+        """
+        Adjust the cache level and ratio list.
+        This function should be called periodically to ensure the cache level and ratio list are
+        adjusted to the optimal values. All KV caches must be suspended before calling this function.
+        """
         assert all(
             unwrap_rawref(c).status == _KVCache.Status.SUSPENDED for c in self._living_kv_caches
         )
@@ -474,6 +474,7 @@ class KVCacheManager:
                 slot_size = storage.slot_size(pg_idx)
                 num_bytes[pg_idx] += (num_blocks - (stale_end - stale_beg)) * sum(slot_size)
             total = sum(num_bytes)
+            assert total > 0
             return typed_map(num_bytes, lambda x: x / total)
 
         avg_reused_length: int = round(self._avg_reused_length.value)

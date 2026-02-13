@@ -335,32 +335,34 @@ def find_index(seq: Iterable[T], predicate: Callable[[T], bool]) -> int:
     return i + 1
 
 
-mem_alignment: Final[int] = 2 << 20  # 2MB
+# mmap constants (Linux x86_64)
+MAP_PRIVATE: Final[int] = 0x02
+MAP_ANONYMOUS: Final[int] = 0x20
+PROT_READ: Final[int] = 0x1
+PROT_WRITE: Final[int] = 0x2
+MREMAP_MAYMOVE: Final[int] = 1
+MAP_FAILED: Final[int] = -1
 
-_libc = ctypes.CDLL(find_library("c"))
-_libc.aligned_alloc.restype = ctypes.c_void_p
-_libc.aligned_alloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+_libc = ctypes.CDLL(find_library("c"), use_errno=True)
+_libc.mmap.restype = ctypes.c_void_p
+_libc.mmap.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_longlong,
+]
+_libc.munmap.restype = ctypes.c_int
+_libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_libc.mremap.restype = ctypes.c_void_p
+_libc.mremap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
 _libc.madvise.restype = ctypes.c_int
 _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-_libc.realloc.restype = ctypes.c_void_p
-_libc.realloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-_libc.free.restype = None
-_libc.free.argtypes = [ctypes.c_void_p]
 _libc.posix_fallocate.restype = ctypes.c_int
 _libc.posix_fallocate.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
 
-
-def _aligned_alloc(alignment: int, size: int) -> int:
-    """
-    Allocates size bytes of uninitialized storage whose alignment is specified by alignment.
-    Returns the address as an integer.
-    Raises HostOOMError on failure.
-    """
-    assert size % alignment == 0
-    memptr: ctypes.c_void_p = _libc.aligned_alloc(ctypes.c_size_t(alignment), ctypes.c_size_t(size))
-    if memptr == ctypes.c_void_p(0):
-        raise HostOOMError("aligned_alloc failed")
-    return int(memptr)
+MADV_HUGEPAGE: Final[int] = 14
 
 
 def _madvise(ptr: int, size: int, advice: int) -> None:
@@ -369,27 +371,62 @@ def _madvise(ptr: int, size: int, advice: int) -> None:
     ret = _libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(size), ctypes.c_int(advice))
     if ret != 0:
         error_code = ctypes.get_errno()
-        error_msg = f"madvise failed with errno {error_code}: {errno.errorcode.get(error_code, 'Unknown error')}"
-        raise HostOOMError(error_msg)
+        # Advisory, so just warn
+        warnings.warn(
+            f"madvise failed with errno {error_code}: {errno.errorcode.get(error_code, 'Unknown error')}"
+        )
 
 
-MADV_HUGEPAGE: Final[int] = 14
-
-
-def _realloc(ptr: int, size: int) -> int:
+def _mmap(size: int) -> int:
     """
-    Reallocates size bytes of storage whose alignment is specified by alignment.
+    Allocates size bytes using mmap (anonymous, private).
     Returns the address as an integer.
-    Raises OSError on failure.
+    Raises HostOOMError on failure.
     """
-    ret = _libc.realloc(ctypes.c_void_p(ptr), ctypes.c_size_t(size))
-    if ret == ctypes.c_void_p(0):
-        raise HostOOMError("realloc failed.")
-    return int(ret)
+    prot = PROT_READ | PROT_WRITE
+    flags = MAP_PRIVATE | MAP_ANONYMOUS
+
+    ptr = _libc.mmap(
+        None,
+        ctypes.c_size_t(size),
+        ctypes.c_int(prot),
+        ctypes.c_int(flags),
+        ctypes.c_int(-1),
+        ctypes.c_longlong(0),
+    )
+
+    ptr_int = int(ptr) if ptr is not None else 0
+    if ptr_int == -1 or ptr_int == 0xFFFFFFFFFFFFFFFF or ptr_int == 0:
+        error_code = ctypes.get_errno()
+        raise HostOOMError(f"mmap failed with errno {error_code}")
+
+    return ptr_int
 
 
-def _free(ptr: int) -> None:
-    _libc.free(ctypes.c_void_p(ptr))
+def _munmap(ptr: int, size: int) -> None:
+    ret = _libc.munmap(ctypes.c_void_p(ptr), ctypes.c_size_t(size))
+    if ret != 0:
+        error_code = ctypes.get_errno()
+        warnings.warn(f"munmap failed with errno {error_code}")
+
+
+def _mremap(ptr: int, old_size: int, new_size: int) -> int:
+    """
+    Remaps memory using mremap.
+    Returns the new address as an integer.
+    Raises HostOOMError on failure.
+    """
+    ptr_new = _libc.mremap(
+        ctypes.c_void_p(ptr),
+        ctypes.c_size_t(old_size),
+        ctypes.c_size_t(new_size),
+        ctypes.c_int(MREMAP_MAYMOVE),
+    )
+    ptr_int = int(ptr_new) if ptr_new is not None else 0
+    if ptr_int == -1 or ptr_int == 0xFFFFFFFFFFFFFFFF or ptr_int == 0:
+        error_code = ctypes.get_errno()
+        raise HostOOMError(f"mremap failed with errno {error_code}")
+    return ptr_int
 
 
 def _posix_fallocate(fd: int, offset: int, length: int) -> None:
@@ -401,9 +438,10 @@ def _posix_fallocate(fd: int, offset: int, length: int) -> None:
 
 
 class HostMem:
-    ALIGNMENT: ClassVar[int] = 2 << 20
+    ALIGNMENT: ClassVar[int] = 4096  # 4KB
     """
-    Host memory aligned to 2MB, reallocable for low-cost resizing and registered to CUDA as page-locked memory.
+    Host memory, reallocable for low-cost resizing and registered to CUDA as page-locked memory.
+    Uses MADV_HUGEPAGE to opportunistically use Transparent Huge Pages (THP) where possible.
     Resizing will keep the original memory content, like `realloc` in C.
     """
     __slots__ = ("_address", "_size", "_num_registered_chunks")
@@ -431,17 +469,27 @@ class HostMem:
             self._address = 0
             self._size = 0
             return
-        self._address = _aligned_alloc(mem_alignment, size)
+
+        # Allocate with standard mmap (4KB alignment)
+        self._address = _mmap(size)
+        assert self._address % self.ALIGNMENT == 0
         self._size = size
-        _madvise(self._address, size, MADV_HUGEPAGE)
+
+        # Opportunistically advise huge pages for the whole range.
+        # The kernel will use huge pages for aligned 2MB chunks within this range.
+        _madvise(self._address, self._size, MADV_HUGEPAGE)
+
         self._register_to_cuda()
 
     def resize(self, new_size: int) -> None:
         self._unregister_from_cuda()
         try:
-            self._address = _realloc(self._address, new_size)
+            self._address = _mremap(self._address, self._size, new_size)
+            assert self._address % self.ALIGNMENT == 0
             self._size = new_size
-            _madvise(self._address, new_size, MADV_HUGEPAGE)
+
+            # Re-advise HUGEPAGE for the new range
+            _madvise(self._address, self._size, MADV_HUGEPAGE)
         finally:
             self._register_to_cuda()
 
@@ -449,7 +497,7 @@ class HostMem:
         if self._address == 0:
             return
         self._unregister_from_cuda()
-        _free(self._address)
+        _munmap(self._address, self._size)
         self._address = 0
         self._size = 0
 

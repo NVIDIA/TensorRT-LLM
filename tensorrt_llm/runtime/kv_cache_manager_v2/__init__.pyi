@@ -210,12 +210,6 @@ class BufferId(NamedTuple):
     role: DataRole
 
 @dataclass(slots=True, frozen=True)
-class BufferSlice:
-    buffer_id: BufferId
-    num_slices: int = 1
-    slice_index: int = 1
-
-@dataclass(slots=True, frozen=True)
 class AggregatedPageDesc:
     """The data you need would be in the following byte ranges.
 
@@ -226,7 +220,7 @@ class AggregatedPageDesc:
     size: int
     stride: int
     layer_group_id: LayerGroupId
-    buffers: Sequence[BufferSlice]
+    buffers: Sequence[BufferId]
 
 # From _core/_kv_cache_manager.py
 class KVCacheManager:
@@ -264,7 +258,5 @@ class KVCacheManager:
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
     @property
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
-    def get_aggregated_pages(
-        self, buffers: Iterable[BufferSlice]
-    ) -> Iterator[AggregatedPageDesc]: ...
+    def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
