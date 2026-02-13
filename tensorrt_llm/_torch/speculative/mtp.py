@@ -15,8 +15,8 @@ from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, Sampler, SampleState,
-                                  SampleStateTensors, TorchSampler, add_token,
-                                  int_tensor)
+                                  SampleStateTensors, AsyncWorkerMixin,
+                                  TorchSampler, add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -215,7 +215,7 @@ class MTPSpecMetadata(SpecMetadata):
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPSampler(Sampler[SampleStateMTP]):
+class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
     """
     MTP sampler.
     """
@@ -249,6 +249,7 @@ class MTPSampler(Sampler[SampleStateMTP]):
         self.mapping = None
         self.draft_len = nextn
         self.max_seq_len = args.max_seq_len
+        self._async_worker_init(args.enable_async_worker)
 
         seq_slots = args.max_num_sequences
         max_tokens = args.max_total_draft_tokens + 1
@@ -349,12 +350,11 @@ class MTPSampler(Sampler[SampleStateMTP]):
             next_draft_tokens=next_draft_tokens,
         )
         host = SampleStateTensorsMTP(
-            new_tokens=new_tokens.to('cpu', non_blocking=True),
-            new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
-            next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),
+            new_tokens=self._copy_to_host(new_tokens),
+            new_tokens_lens=self._copy_to_host(new_tokens_lens),
+            next_draft_tokens=self._copy_to_host(next_draft_tokens),
         )
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        sampler_event = self._record_sampler_event()
         # add dummy draft tokens to context requests to prepare kv cache in advance
         # with the max draft token length
         for request in scheduled_requests.context_requests:

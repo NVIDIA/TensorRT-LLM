@@ -39,6 +39,7 @@ from mpi4py import MPI
 from mpi4py.util import pkl5
 from packaging import version
 from typing_extensions import ParamSpec
+from ctypes import byref
 
 # isort: off
 import torch
@@ -1257,18 +1258,23 @@ def confidential_compute_enabled() -> bool:
     Query NVML for the confidential compute state
     """
 
+    try:
+        import pynvml
+    except ImportError:
+        logger.error(f"pynvml not available; assuming CC=off")
+        return False
+
     cc_enabled = False
 
     try:
-        # Init
-        import pynvml
         pynvml.nvmlInit()
 
         # Hopper and newer supports a more nuanced query of confidential
         # compute settings
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
-        if (pynvml.nvmlSystemGetConfComputeSettings(cc_settings) ==
-                pynvml.NVML_SUCCESS):
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        if (ret == pynvml.NVML_SUCCESS):
             cc_enabled = (cc_settings.ccFeature
                           == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
                           or cc_settings.multiGpuMode
