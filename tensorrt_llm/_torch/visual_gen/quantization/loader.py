@@ -86,7 +86,7 @@ class DynamicLinearWeightLoader:
     def _get_fused_names(self, full_name: str) -> List[str]:
         """Get checkpoint names for a fused module from params_map."""
         for suffix, names in self.params_map.items():
-            if full_name.endswith(suffix):
+            if full_name == suffix or full_name.endswith("." + suffix):
                 return names
         raise ValueError(
             f"No params_map entry for fused module '{full_name}'. "

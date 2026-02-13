@@ -19,34 +19,60 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
+from diffusers.models.embeddings import PixArtAlphaTextProjection as TextProjection
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.models.flux.attention_flux import FluxAttention, FluxPosEmbed
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
+from tensorrt_llm._torch.visual_gen.modules.attention import FluxJointAttention
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
+# HF checkpoint key → our module attribute name
+_WEIGHT_KEY_REMAPS = [
+    ("net.0.proj.", "up_proj."),  # GELU(proj=Linear) → up_proj Linear
+    ("net.2.", "down_proj."),  # net[2] output Linear → down_proj
+]
 
-class AdaLayerNormZero(nn.Module):
-    """Adaptive Layer Normalization with zero initialization for DiT blocks.
 
-    Computes: norm(x) * (1 + scale) + shift, with gating for attention and MLP.
+def _remap_checkpoint_keys(weights: dict) -> dict:
+    """Remap HuggingFace checkpoint keys to our module attribute names.
 
-    Returns 5 modulation parameters:
-    - norm_hidden_states: Normalized and shifted/scaled hidden states
-    - gate_msa: Gate for multi-head self-attention output
-    - shift_mlp, scale_mlp: Shift and scale for MLP input
-    - gate_mlp: Gate for MLP output
+    HF diffusers uses nn.ModuleList wrappers that add numeric indices to
+    weight key paths. Our simplified module structure uses plain attributes,
+    so we translate the keys at load time.
+    """
+    remapped = {}
+    for key, value in weights.items():
+        new_key = key
+        for old, new in _WEIGHT_KEY_REMAPS:
+            new_key = new_key.replace(old, new)
+        remapped[new_key] = value
+    return remapped
+
+
+class _AdaLayerNormBase(nn.Module):
+    """Base class for adaptive layer normalization variants.
+
+    All variants share the same structure: silu → linear → chunk → norm*scale+shift.
+    Subclasses only differ in the number of modulation parameters (num_chunks)
+    and how they parse the chunks in forward().
     """
 
     def __init__(
         self,
         embedding_dim: int,
-        num_embeddings: Optional[int] = None,
+        num_chunks: int,
+        conditioning_embedding_dim: Optional[int] = None,
         eps: float = 1e-5,
         elementwise_affine: bool = False,
+        bias: bool = True,
         dtype: torch.dtype = None,
         quant_config=None,
         skip_create_weights: bool = False,
@@ -54,18 +80,19 @@ class AdaLayerNormZero(nn.Module):
     ):
         super().__init__()
         self.silu = nn.SiLU()
-        # TRT-LLM Linear for quantization support
+        in_dim = (
+            conditioning_embedding_dim if conditioning_embedding_dim is not None else embedding_dim
+        )
         self.linear = Linear(
-            embedding_dim,
-            6 * embedding_dim,
-            bias=True,
+            in_dim,
+            num_chunks * embedding_dim,
+            bias=bias,
             dtype=dtype,
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
             disable_deep_gemm=True,
         )
-        # TRT-LLM LayerNorm (elementwise_affine=False → has_weights=False, has_bias=False)
         self.norm = LayerNorm(
             hidden_size=embedding_dim,
             eps=eps,
@@ -74,135 +101,62 @@ class AdaLayerNormZero(nn.Module):
             dtype=dtype,
         )
 
+
+class AdaLayerNormZero(_AdaLayerNormBase):
+    """Adaptive Layer Normalization for dual-stream DiT blocks.
+
+    Returns 5 modulation parameters: (norm_x, gate_msa, shift_mlp, scale_mlp, gate_mlp).
+    """
+
+    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, **kwargs):
+        super().__init__(embedding_dim, num_chunks=6, **kwargs)
+
+    @maybe_compile(dynamic=True)
     def forward(
-        self,
-        x: torch.Tensor,
-        emb: torch.Tensor,
+        self, x: torch.Tensor, emb: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass.
-
-        Args:
-            x: Input tensor (batch, seq, dim)
-            emb: Timestep embedding (batch, dim)
-
-        Returns:
-            Tuple of (norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp)
-        """
         emb = self.linear(self.silu(emb))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
-
         x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
-class AdaLayerNormZeroSingle(nn.Module):
-    """Simplified AdaLN for single-stream blocks.
+class AdaLayerNormZeroSingle(_AdaLayerNormBase):
+    """Adaptive Layer Normalization for single-stream blocks.
 
-    Returns only normalized hidden states and a gate.
+    Returns 2 modulation parameters: (norm_x, gate).
     """
 
-    def __init__(
-        self,
-        embedding_dim: int,
-        eps: float = 1e-5,
-        dtype: torch.dtype = None,
-        quant_config=None,
-        skip_create_weights: bool = False,
-        force_dynamic_quant: bool = False,
-    ):
-        super().__init__()
-        self.silu = nn.SiLU()
-        # TRT-LLM Linear for quantization support
-        self.linear = Linear(
-            embedding_dim,
-            3 * embedding_dim,
-            bias=True,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights,
-            force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
-        )
-        # TRT-LLM LayerNorm (no learnable params)
-        self.norm = LayerNorm(
-            hidden_size=embedding_dim, eps=eps, has_weights=False, has_bias=False, dtype=dtype
-        )
+    def __init__(self, embedding_dim: int, **kwargs):
+        super().__init__(embedding_dim, num_chunks=3, **kwargs)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        emb: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
-
-        Args:
-            x: Input tensor (batch, seq, dim)
-            emb: Timestep embedding (batch, dim)
-
-        Returns:
-            Tuple of (norm_hidden_states, gate)
-        """
+    @maybe_compile(dynamic=True)
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         emb = self.linear(self.silu(emb))
         shift, scale, gate = emb.chunk(3, dim=1)
-
         x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
         return x, gate
 
 
-class AdaLayerNormContinuous(nn.Module):
-    """Continuous adaptive layer normalization for output projection."""
+class AdaLayerNormContinuous(_AdaLayerNormBase):
+    """Continuous adaptive layer normalization for output projection.
 
-    def __init__(
-        self,
-        embedding_dim: int,
-        conditioning_embedding_dim: int,
-        eps: float = 1e-5,
-        elementwise_affine: bool = False,
-        dtype: torch.dtype = None,
-        quant_config=None,
-        skip_create_weights: bool = False,
-        force_dynamic_quant: bool = False,
-    ):
-        super().__init__()
-        self.silu = nn.SiLU()
-        # TRT-LLM Linear for quantization support
-        self.linear = Linear(
-            conditioning_embedding_dim,
-            2 * embedding_dim,
-            bias=True,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights,
-            force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
-        )
-        # TRT-LLM LayerNorm
-        self.norm = LayerNorm(
-            hidden_size=embedding_dim,
-            eps=eps,
-            has_weights=elementwise_affine,
-            has_bias=elementwise_affine,
-            dtype=dtype,
+    Shared by FLUX.1 and FLUX.2. Returns modulated tensor (scale+shift only, no gate).
+    """
+
+    def __init__(self, embedding_dim: int, conditioning_embedding_dim: int, **kwargs):
+        super().__init__(
+            embedding_dim,
+            num_chunks=2,
+            conditioning_embedding_dim=conditioning_embedding_dim,
+            **kwargs,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        emb: torch.Tensor,
-    ) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input tensor (batch, seq, dim)
-            emb: Conditioning embedding (batch, dim)
-
-        Returns:
-            Normalized and modulated tensor
-        """
+    @maybe_compile(dynamic=True)
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         emb = self.linear(self.silu(emb))
-        scale, shift = emb.chunk(2, dim=1)  # HF order: scale first, then shift
-
-        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        scale, shift = emb.unsqueeze(1).chunk(2, dim=-1)
+        x = self.norm(x) * (1 + scale) + shift
         return x
 
 
@@ -223,9 +177,7 @@ class CombinedTimestepTextProjEmbeddings(nn.Module):
         super().__init__()
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
-        self.text_embedder = PixArtAlphaTextProjection(
-            pooled_projection_dim, embedding_dim, act_fn="silu"
-        )
+        self.text_embedder = TextProjection(pooled_projection_dim, embedding_dim, act_fn="silu")
 
     def forward(
         self,
@@ -256,9 +208,7 @@ class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
         self.guidance_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
-        self.text_embedder = PixArtAlphaTextProjection(
-            pooled_projection_dim, embedding_dim, act_fn="silu"
-        )
+        self.text_embedder = TextProjection(pooled_projection_dim, embedding_dim, act_fn="silu")
 
     def forward(
         self,
@@ -290,119 +240,28 @@ def _gelu_tanh_eager(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
-class EagerGELU(nn.Module):
-    """nn.GELU replacement that bypasses torch.compile."""
+def _make_ffn(
+    dim: int,
+    mult: float = 4.0,
+    bias: bool = True,
+    config: Optional["DiffusionModelConfig"] = None,
+    layer_idx: int = 0,
+) -> MLP:
+    """Create an MLP feed-forward network using the shared TRT-LLM MLP module.
 
-    def __init__(self, approximate: str = "tanh"):
-        super().__init__()
-        self.approximate = approximate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.approximate == "tanh":
-            return _gelu_tanh_eager(x)
-        return F.gelu(x, approximate=self.approximate)
-
-
-class GELU(nn.Module):
-    """GELU activation with input projection.
-
-    This matches HuggingFace diffusers' GELU class which wraps the projection
-    inside the activation module. This ensures weight names match:
-    - `ff.net.0.proj.weight` instead of `ff.net.0.weight`
+    HF checkpoint key remapping in load_weights() translates HF names
+    (net.0.proj.*, net.2.*) to MLP attribute names (up_proj.*, down_proj.*).
     """
-
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        approximate: str = "none",
-        bias: bool = True,
-        dtype: torch.dtype = None,
-        quant_config=None,
-        skip_create_weights: bool = False,
-        force_dynamic_quant: bool = False,
-    ):
-        super().__init__()
-        # TRT-LLM Linear for quantization support
-        self.proj = Linear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights,
-            force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
-        )
-        self.approximate = approximate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        if self.approximate == "tanh":
-            return _gelu_tanh_eager(x)
-        return F.gelu(x, approximate=self.approximate)
-
-
-class FeedForward(nn.Module):
-    """GELU feed-forward network matching HuggingFace diffusers structure.
-
-    Weight naming matches HuggingFace:
-    - net.0: GELU module with proj (input projection)
-    - net.1: Dropout
-    - net.2: Linear (output projection)
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        dim_out: Optional[int] = None,
-        mult: float = 4.0,
-        dropout: float = 0.0,
-        activation_fn: str = "gelu-approximate",
-        bias: bool = True,
-        dtype: torch.dtype = None,
-        quant_config=None,
-        skip_create_weights: bool = False,
-        force_dynamic_quant: bool = False,
-    ):
-        super().__init__()
-        inner_dim = int(dim * mult)
-        dim_out = dim_out or dim
-
-        # Match HuggingFace FeedForward structure
-        approximate = "tanh" if activation_fn == "gelu-approximate" else "none"
-        act_fn = GELU(
-            dim,
-            inner_dim,
-            approximate=approximate,
-            bias=bias,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
-        )
-
-        self.net = nn.ModuleList(
-            [
-                act_fn,  # net.0 (GELU with proj)
-                nn.Dropout(dropout),  # net.1
-                Linear(  # net.2 - TRT-LLM Linear
-                    inner_dim,
-                    dim_out,
-                    bias=bias,
-                    dtype=dtype,
-                    quant_config=quant_config,
-                    skip_create_weights_in_init=skip_create_weights,
-                    force_dynamic_quantization=force_dynamic_quant,
-                    disable_deep_gemm=True,
-                ),
-            ]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for module in self.net:
-            x = module(x)
-        return x
+    return MLP(
+        hidden_size=dim,
+        intermediate_size=int(dim * mult),
+        bias=bias,
+        activation=_gelu_tanh_eager,
+        dtype=config.torch_dtype if config else None,
+        config=config,
+        layer_idx=layer_idx,
+        reduce_output=False,
+    )
 
 
 class FluxTransformerBlock(nn.Module):
@@ -413,7 +272,7 @@ class FluxTransformerBlock(nn.Module):
 
     Architecture:
     1. AdaLN for image (norm1) and text (norm1_context)
-    2. Joint attention (FluxAttention with added_kv_proj_dim)
+    2. Joint attention (FluxJointAttention with added_kv_proj_dim)
     3. Residual + gated attention output
     4. LayerNorm + modulation for FFN
     5. Separate FFNs for image (ff) and text (ff_context)
@@ -456,18 +315,13 @@ class FluxTransformerBlock(nn.Module):
         )
 
         # Joint attention
-        self.attn = FluxAttention(
-            query_dim=dim,
-            added_kv_proj_dim=dim,  # Enables joint attention
-            dim_head=attention_head_dim,
-            heads=num_attention_heads,
-            out_dim=dim,
+        self.attn = FluxJointAttention(
+            hidden_size=dim,
+            num_attention_heads=num_attention_heads,
+            head_dim=attention_head_dim,
+            added_kv_proj_dim=dim,
             bias=True,
             eps=eps,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
             config=config,
             layer_idx=layer_idx,
         )
@@ -480,25 +334,9 @@ class FluxTransformerBlock(nn.Module):
             hidden_size=dim, eps=1e-6, has_weights=False, has_bias=False, dtype=dtype
         )
 
-        # FFN layers
-        self.ff = FeedForward(
-            dim=dim,
-            dim_out=dim,
-            activation_fn="gelu-approximate",
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
-        )
-        self.ff_context = FeedForward(
-            dim=dim,
-            dim_out=dim,
-            activation_fn="gelu-approximate",
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
-        )
+        # FFN layers (shared TRT-LLM MLP module)
+        self.ff = _make_ffn(dim=dim, config=config, layer_idx=layer_idx)
+        self.ff_context = _make_ffn(dim=dim, config=config, layer_idx=layer_idx)
 
     def forward(
         self,
@@ -622,7 +460,7 @@ class FluxSingleTransformerBlock(nn.Module):
             force_dynamic_quantization=force_dynamic_quant,
             disable_deep_gemm=True,
         )
-        self.act_mlp = EagerGELU(approximate="tanh")
+        self.act_mlp = _gelu_tanh_eager
 
         # Output projection (concat of attn + mlp) - TRT-LLM Linear
         self.proj_out = Linear(
@@ -637,18 +475,13 @@ class FluxSingleTransformerBlock(nn.Module):
         )
 
         # Attention (no added_kv_proj_dim since tokens are already concatenated)
-        self.attn = FluxAttention(
-            query_dim=dim,
-            dim_head=attention_head_dim,
-            heads=num_attention_heads,
-            out_dim=dim,
+        self.attn = FluxJointAttention(
+            hidden_size=dim,
+            num_attention_heads=num_attention_heads,
+            head_dim=attention_head_dim,
             bias=True,
             eps=1e-6,
             pre_only=True,  # No output projection in attention
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
             config=config,
             layer_idx=layer_idx,
         )
@@ -987,16 +820,16 @@ class FluxTransformer2DModel(nn.Module):
         Args:
             weights: Dictionary of parameter name -> tensor
         """
-        from tqdm import tqdm
 
-        from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+        # Remap HF checkpoint keys to our module attribute names
+        weights = _remap_checkpoint_keys(weights)
 
         # Map fused QKV layer names to original HF checkpoint names
         # HF checkpoint has separate to_q, to_k, to_v / add_q_proj, add_k_proj, add_v_proj
-        # We fuse them into to_qkv / add_qkv_proj for better performance
+        # We fuse them into qkv_proj / add_qkv_proj for better performance
         params_map = {
-            "to_qkv": ["to_q", "to_k", "to_v"],
             "add_qkv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+            "qkv_proj": ["to_q", "to_k", "to_v"],
         }
 
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)

@@ -14,15 +14,20 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.models.flux2.attention_flux2 import (
-    Flux2Attention,
+from tensorrt_llm._torch.visual_gen.models.flux.attention_flux2 import (
     Flux2ParallelSelfAttention,
     Flux2PosEmbed,
     Flux2SwiGLU,
 )
+from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
+    AdaLayerNormContinuous,
+    _remap_checkpoint_keys,
+)
+from tensorrt_llm._torch.visual_gen.modules.attention import FluxJointAttention
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -30,69 +35,6 @@ if TYPE_CHECKING:
 # =============================================================================
 # Time + Guidance Embedding (matches HuggingFace structure exactly)
 # =============================================================================
-
-
-class Timesteps(nn.Module):
-    """Sinusoidal timestep embedding (matches HuggingFace diffusers)."""
-
-    def __init__(
-        self,
-        num_channels: int,
-        flip_sin_to_cos: bool = True,
-        downscale_freq_shift: float = 0,
-        scale: int = 1,
-    ):
-        super().__init__()
-        self.num_channels = num_channels
-        self.flip_sin_to_cos = flip_sin_to_cos
-        self.downscale_freq_shift = downscale_freq_shift
-        self.scale = scale
-
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        half_dim = self.num_channels // 2
-        exponent = -torch.log(torch.tensor(10000.0)) * torch.arange(
-            0, half_dim, dtype=torch.float32, device=timesteps.device
-        )
-        exponent = exponent / (half_dim - self.downscale_freq_shift)
-
-        emb = timesteps[:, None].float() * torch.exp(exponent)[None, :]
-        emb = self.scale * emb
-
-        # Concat sin and cos
-        if self.flip_sin_to_cos:
-            emb = torch.cat([torch.cos(emb), torch.sin(emb)], dim=-1)
-        else:
-            emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-
-        return emb
-
-
-class TimestepEmbedding(nn.Module):
-    """2-layer MLP for timestep embedding (matches HuggingFace diffusers)."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        time_embed_dim: int,
-        act_fn: str = "silu",
-        out_dim: Optional[int] = None,
-        sample_proj_bias: bool = True,
-        dtype: Optional[torch.dtype] = None,
-    ):
-        super().__init__()
-        self.linear_1 = Linear(in_channels, time_embed_dim, bias=sample_proj_bias, dtype=dtype)
-        self.act = nn.SiLU() if act_fn == "silu" else nn.GELU()
-
-        time_embed_dim_out = out_dim if out_dim is not None else time_embed_dim
-        self.linear_2 = Linear(
-            time_embed_dim, time_embed_dim_out, bias=sample_proj_bias, dtype=dtype
-        )
-
-    def forward(self, sample: torch.Tensor) -> torch.Tensor:
-        sample = self.linear_1(sample)
-        sample = self.act(sample)
-        sample = self.linear_2(sample)
-        return sample
 
 
 class Flux2TimestepGuidanceEmbeddings(nn.Module):
@@ -127,14 +69,12 @@ class Flux2TimestepGuidanceEmbeddings(nn.Module):
             in_channels=in_channels,
             time_embed_dim=embedding_dim,
             sample_proj_bias=bias,
-            dtype=dtype,
         )
 
         self.guidance_embedder = TimestepEmbedding(
             in_channels=in_channels,
             time_embed_dim=embedding_dim,
             sample_proj_bias=bias,
-            dtype=dtype,
         )
 
     def forward(self, timestep: torch.Tensor, guidance: torch.Tensor) -> torch.Tensor:
@@ -314,19 +254,15 @@ class Flux2TransformerBlock(nn.Module):
         self.norm1_context = LayerNorm(hidden_size=dim, eps=eps, has_weights=False, has_bias=False)
 
         # Joint attention
-        self.attn = Flux2Attention(
-            query_dim=dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
+        self.attn = FluxJointAttention(
+            hidden_size=dim,
+            num_attention_heads=num_attention_heads,
+            head_dim=attention_head_dim,
             bias=bias,
-            added_kv_proj_dim=dim,  # Enable joint attention
+            added_kv_proj_dim=dim,
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
             config=config,
             layer_idx=layer_idx,
         )
@@ -491,53 +427,6 @@ class Flux2SingleTransformerBlock(nn.Module):
         hidden_states = residual + hidden_states * mod_gate
 
         return hidden_states
-
-
-# =============================================================================
-# Output Normalization
-# =============================================================================
-
-
-class AdaLayerNormContinuous(nn.Module):
-    """Adaptive LayerNorm for output normalization (matches HuggingFace)."""
-
-    def __init__(
-        self,
-        embedding_dim: int,
-        conditioning_dim: int,
-        elementwise_affine: bool = False,
-        eps: float = 1e-6,
-        bias: bool = False,
-        dtype: Optional[torch.dtype] = None,
-        quant_config=None,
-        skip_create_weights: bool = False,
-        force_dynamic_quant: bool = False,
-    ):
-        super().__init__()
-        self.silu = nn.SiLU()
-        self.linear = Linear(
-            conditioning_dim,
-            2 * embedding_dim,
-            bias=bias,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights,
-            force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
-        )
-        # TRT-LLM LayerNorm
-        self.norm = LayerNorm(
-            hidden_size=embedding_dim,
-            eps=eps,
-            has_weights=elementwise_affine,
-            has_bias=elementwise_affine,
-        )
-
-    def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
-        emb = self.linear(self.silu(conditioning))
-        scale, shift = emb.unsqueeze(1).chunk(2, dim=-1)
-        x = self.norm(x) * (1 + scale) + shift
-        return x
 
 
 # =============================================================================
@@ -864,12 +753,15 @@ class Flux2Transformer2DModel(nn.Module):
         from tensorrt_llm._torch.modules.linear import Linear
         from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 
+        # Remap HF checkpoint keys to our module attribute names
+        weights = _remap_checkpoint_keys(weights)
+
         # Map fused QKV layer names to original HF checkpoint names
         # HF checkpoint has separate to_q, to_k, to_v / add_q_proj, add_k_proj, add_v_proj
-        # We fuse them into to_qkv / add_qkv_proj for better performance
+        # We fuse them into qkv_proj / add_qkv_proj for better performance
         params_map = {
-            "to_qkv": ["to_q", "to_k", "to_v"],
             "add_qkv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+            "qkv_proj": ["to_q", "to_k", "to_v"],
         }
 
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)

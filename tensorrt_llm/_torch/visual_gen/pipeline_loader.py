@@ -206,39 +206,8 @@ class PipelineLoader:
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
-        # =====================================================================
-        # STEP 6: torch.compile (must be AFTER post_load_weights / TeaCache)
-        # =====================================================================
-        self._maybe_compile(pipeline, config)
-
         logger.info(f"Pipeline loaded: {pipeline.__class__.__name__}")
         return pipeline
-
-    def _maybe_compile(self, pipeline: "BasePipeline", config: DiffusionModelConfig) -> None:
-        """Apply torch.compile to pipeline components if enabled.
-
-        Uses PipelineConfig settings:
-          - enable_torch_compile: master switch (default True)
-          - torch_compile_models: comma-separated component names (default "transformer")
-          - torch_compile_mode: compile mode (default "default")
-        """
-        pipeline_cfg = config.pipeline
-        if not pipeline_cfg.enable_torch_compile:
-            return
-
-        targets = [t.strip() for t in pipeline_cfg.torch_compile_models.split(",")]
-        mode = pipeline_cfg.torch_compile_mode
-
-        for name in targets:
-            component = getattr(pipeline, name, None)
-            if component is None or not hasattr(component, "forward"):
-                continue
-            logger.info(f"torch.compile: compiling {name}.forward (mode={mode})")
-            component.forward = torch.compile(
-                component.forward,
-                mode=mode,
-                dynamic=False,
-            )
 
     def _materialize_meta_tensors(self, module: torch.nn.Module) -> None:
         """

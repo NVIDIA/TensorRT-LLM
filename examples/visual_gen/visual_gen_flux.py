@@ -137,13 +137,6 @@ def parse_args():
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
     )
 
-    # torch.compile
-    parser.add_argument(
-        "--no_compile",
-        action="store_true",
-        help="Disable torch.compile (use eager mode)",
-    )
-
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -206,9 +199,6 @@ def build_diffusion_config(args):
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
         },
-        "pipeline": {
-            "enable_torch_compile": not args.no_compile,
-        },
     }
 
     if quant_config is not None:
@@ -226,11 +216,9 @@ def main():
     diffusion_config = build_diffusion_config(args)
 
     # Initialize VisualGen
-    compile_str = "eager" if args.no_compile else "compiled"
     logger.info(
         f"Initializing VisualGen: world_size={n_workers} "
-        f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}), "
-        f"mode={compile_str}"
+        f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size})"
     )
     visual_gen = VisualGen(
         model_path=args.model_path,
@@ -291,7 +279,6 @@ def main():
                     "model_path": args.model_path,
                     "linear_type": args.linear_type,
                     "attention_backend": args.attention_backend,
-                    "torch_compile": not args.no_compile,
                     "height": args.height,
                     "width": args.width,
                     "steps": args.steps,

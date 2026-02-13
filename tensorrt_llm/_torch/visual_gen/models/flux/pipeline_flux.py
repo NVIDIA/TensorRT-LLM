@@ -6,6 +6,7 @@
 import time
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
@@ -126,7 +127,7 @@ class FluxPipeline(BasePipeline):
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
             self.vae = AutoencoderKL.from_pretrained(
-                checkpoint_dir, subfolder=PipelineComponent.VAE, torch_dtype=torch.float32
+                checkpoint_dir, subfolder=PipelineComponent.VAE, torch_dtype=torch.bfloat16
             ).to(device)
 
             self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
@@ -236,8 +237,6 @@ class FluxPipeline(BasePipeline):
         logger.info(f"Latents shape: {latents.shape}")
 
         # Prepare timesteps with dynamic shifting (FLUX uses mu parameter)
-        import numpy as np
-
         image_seq_len = latents.shape[1]
         mu = self._compute_mu(image_seq_len, num_inference_steps)
 

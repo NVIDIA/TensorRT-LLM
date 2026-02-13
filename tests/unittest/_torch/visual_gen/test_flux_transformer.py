@@ -107,7 +107,7 @@ class TestFluxTransformer(unittest.TestCase):
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_flux2_model_structure(self):
         """Test FLUX.2 model can be instantiated with correct structure."""
-        from tensorrt_llm._torch.visual_gen.models.flux2.transformer_flux2 import (
+        from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import (
             Flux2Transformer2DModel,
         )
 
@@ -182,7 +182,7 @@ class TestFluxTransformer(unittest.TestCase):
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_flux2_forward_sanity(self):
         """Test FLUX.2 forward pass produces valid output."""
-        from tensorrt_llm._torch.visual_gen.models.flux2.transformer_flux2 import (
+        from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import (
             Flux2Transformer2DModel,
         )
 

@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,20 @@ from ..attention_backend.utils import create_attention
 
 if TYPE_CHECKING:
     from ..config import DiffusionModelConfig
+
+
+def _per_head_norm(x: torch.Tensor, norm_fn: RMSNorm) -> torch.Tensor:
+    """Apply RMSNorm per-head on a 4D tensor.
+
+    TRT-LLM RMSNorm expects 2D input. We reshape [B,S,H,D] -> [B*S*H, D],
+    apply norm, then reshape back.
+
+    Args:
+        x: Input tensor of shape [B, S, H, D]
+        norm_fn: TRT-LLM RMSNorm instance with hidden_size=D
+    """
+    B, S, H, D = x.shape
+    return norm_fn(x.reshape(B * S * H, D)).reshape(B, S, H, D)
 
 
 class QKVMode(str, Enum):
@@ -34,7 +48,14 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
-    """Attention module for visual generation models."""
+    """Attention module for visual generation models.
+
+    Args:
+        qk_norm_mode: "full" applies RMSNorm on the full q/k dim (Wan-style, 3D input).
+            "per_head" applies RMSNorm per attention head (FLUX-style, 4D input).
+        bias: Bias for QKV and output projections.
+        out_bias: Bias for output projection only. Defaults to ``bias`` if not set.
+    """
 
     def __init__(
         self,
@@ -44,7 +65,10 @@ class Attention(nn.Module):
         head_dim: Optional[int] = None,
         qkv_mode: QKVMode = QKVMode.FUSE_QKV,
         qk_norm: bool = True,
-        eps: float = 1e-6,  # TODO: remove this, we should add this to the config
+        qk_norm_mode: str = "full",
+        eps: float = 1e-6,
+        bias: bool = True,
+        out_bias: Optional[bool] = None,
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: Optional[int] = None,
     ):
@@ -62,6 +86,8 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads or num_attention_heads
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
+        self.bias = bias
+        self.out_bias = out_bias if out_bias is not None else bias
 
         # Select compute backend (orthogonal to parallelism)
         ulysses_size = config.parallel.dit_ulysses_size
@@ -73,6 +99,7 @@ class Attention(nn.Module):
             backend_name = base_backend
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
+        self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.eps = eps
 
@@ -82,11 +109,17 @@ class Attention(nn.Module):
         self._init_qkv_proj()
 
         if self.qk_norm:
+            if self.qk_norm_mode == "per_head":
+                q_norm_dim = self.head_dim
+                kv_norm_dim = self.head_dim
+            else:
+                q_norm_dim = self.q_dim
+                kv_norm_dim = self.kv_dim
             self.norm_q = RMSNorm(
-                hidden_size=self.q_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=q_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
             )
             self.norm_k = RMSNorm(
-                hidden_size=self.kv_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=kv_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
             )
 
         # TODO: Use weight mapper to create just a Linear module
@@ -95,6 +128,7 @@ class Attention(nn.Module):
                 Linear(
                     self.q_dim,
                     self.hidden_size,
+                    bias=self.out_bias,
                     dtype=self.dtype,
                     mapping=self.mapping,
                     quant_config=self.quant_config,
@@ -140,6 +174,7 @@ class Attention(nn.Module):
             self.qkv_proj = Linear(
                 self.hidden_size,
                 qkv_out_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -158,6 +193,7 @@ class Attention(nn.Module):
             self.to_q = Linear(
                 self.hidden_size,
                 self.q_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -167,6 +203,7 @@ class Attention(nn.Module):
             self.to_k = Linear(
                 self.hidden_size,
                 self.kv_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -176,6 +213,7 @@ class Attention(nn.Module):
             self.to_v = Linear(
                 self.hidden_size,
                 self.kv_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -202,8 +240,12 @@ class Attention(nn.Module):
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.qk_norm:
-            q = self.norm_q(q)
-            k = self.norm_k(k)
+            if self.qk_norm_mode == "per_head":
+                q = _per_head_norm(q, self.norm_q)
+                k = _per_head_norm(k, self.norm_k)
+            else:
+                q = self.norm_q(q)
+                k = self.norm_k(k)
         return q, k
 
     def _attn_impl(
@@ -282,3 +324,190 @@ class Attention(nn.Module):
         out = self._attn_impl(q, k, v, batch_size, seq_len, kv_seq_len)
         out = self.to_out[0](out)
         return out
+
+
+class FluxJointAttention(Attention):
+    """Joint attention module for FLUX transformer models (FLUX.1 and FLUX.2).
+
+    Extends base Attention with:
+    - Text-stream QKV projection (add_qkv_proj) for dual-stream blocks
+    - FLUX-style RoPE on concatenated text+image tokens
+    - pre_only mode for single-stream blocks (no output projection)
+
+    For dual-stream blocks: Returns (img_attn_output, txt_attn_output)
+    For single-stream blocks: pre_only=True, returns attention output only
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        head_dim: int = 128,
+        bias: bool = False,
+        added_kv_proj_dim: Optional[int] = None,
+        added_proj_bias: bool = True,
+        out_bias: bool = True,
+        eps: float = 1e-6,
+        pre_only: bool = False,
+        config: Optional["DiffusionModelConfig"] = None,
+        layer_idx: int = 0,
+    ):
+        super().__init__(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            head_dim=head_dim,
+            qkv_mode=QKVMode.FUSE_QKV,
+            qk_norm=True,
+            qk_norm_mode="per_head",
+            eps=eps,
+            bias=bias,
+            out_bias=out_bias,
+            config=config,
+            layer_idx=layer_idx,
+        )
+
+        self.pre_only = pre_only
+        self.added_kv_proj_dim = added_kv_proj_dim
+
+        # Delete output projection for single-stream blocks
+        if self.pre_only:
+            del self.to_out
+
+        # Text-stream projections for joint attention (dual-stream blocks only)
+        if added_kv_proj_dim is not None:
+            self.add_qkv_proj = Linear(
+                added_kv_proj_dim,
+                3 * self.q_dim,
+                bias=added_proj_bias,
+                dtype=self.dtype,
+                quant_config=self.quant_config,
+                skip_create_weights_in_init=self.skip_create_weights_in_init,
+                force_dynamic_quantization=self.force_dynamic_quantization,
+                disable_deep_gemm=True,
+                weights_loading_config=WeightsLoadingConfig(
+                    weight_mode=WeightMode.FUSED_QKV_LINEAR
+                ),
+                fused_weight_shard_indices_mapping={
+                    "q": (0, self.q_dim),
+                    "k": (self.q_dim, self.q_dim),
+                    "v": (2 * self.q_dim, self.q_dim),
+                },
+            )
+
+            self.norm_added_q = RMSNorm(
+                hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True
+            )
+            self.norm_added_k = RMSNorm(
+                hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True
+            )
+
+            self.to_add_out = Linear(
+                self.q_dim,
+                added_kv_proj_dim,
+                bias=out_bias,
+                dtype=self.dtype,
+                quant_config=self.quant_config,
+                skip_create_weights_in_init=self.skip_create_weights_in_init,
+                force_dynamic_quantization=self.force_dynamic_quantization,
+                disable_deep_gemm=True,
+            )
+
+    @staticmethod
+    def _apply_rope(
+        x: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply FLUX-style rotary embeddings to a 4D tensor.
+
+        Args:
+            x: Input [B, S, H, D]
+            freqs_cos: Cosine frequencies [S, D]
+            freqs_sin: Sine frequencies [S, D]
+        """
+        x_fp32 = x.float()
+        cos = freqs_cos.float().unsqueeze(0).unsqueeze(2)  # [1, S, 1, D]
+        sin = freqs_sin.float().unsqueeze(0).unsqueeze(2)
+
+        # Rotate pairs: [x0, x1, x2, x3, ...] -> [-x1, x0, -x3, x2, ...]
+        x_rotated = torch.stack([-x_fp32[..., 1::2], x_fp32[..., 0::2]], dim=-1).flatten(-2)
+        return (x_fp32 * cos + x_rotated * sin).to(x.dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Forward pass of joint attention.
+
+        Args:
+            hidden_states: Image tokens [batch, img_seq, dim]
+            encoder_hidden_states: Text tokens [batch, txt_seq, dim] (for dual-stream)
+            attention_mask: Optional attention mask (unused, for API compat)
+            image_rotary_emb: Tuple of (cos, sin) for RoPE
+
+        Returns:
+            For dual-stream: Tuple of (img_attn_output, txt_attn_output)
+            For single-stream: Attention output tensor
+        """
+        batch_size = hidden_states.shape[0]
+
+        # Image QKV via base (returns 3D), then reshape to 4D for per-head ops
+        query, key, value = self.get_qkv(hidden_states)
+        query = query.unflatten(-1, (self.num_attention_heads, self.head_dim))
+        key = key.unflatten(-1, (self.num_attention_heads, self.head_dim))
+        value = value.unflatten(-1, (self.num_attention_heads, self.head_dim))
+
+        # Per-head QK normalization via base (per_head mode operates on 4D)
+        query, key = self.apply_qk_norm(query, key)
+
+        # Text QKV for joint attention (dual-stream blocks)
+        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+            txt_seq_len = encoder_hidden_states.shape[1]
+
+            encoder_qkv = self.add_qkv_proj(encoder_hidden_states)
+            enc_q, enc_k, enc_v = encoder_qkv.chunk(3, dim=-1)
+            enc_q = enc_q.unflatten(-1, (self.num_attention_heads, self.head_dim))
+            enc_k = enc_k.unflatten(-1, (self.num_attention_heads, self.head_dim))
+            enc_v = enc_v.unflatten(-1, (self.num_attention_heads, self.head_dim))
+
+            enc_q = _per_head_norm(enc_q, self.norm_added_q)
+            enc_k = _per_head_norm(enc_k, self.norm_added_k)
+
+            # Concatenate text + image for joint attention
+            query = torch.cat([enc_q, query], dim=1)
+            key = torch.cat([enc_k, key], dim=1)
+            value = torch.cat([enc_v, value], dim=1)
+
+        # Apply RoPE
+        if image_rotary_emb is not None:
+            freqs_cos, freqs_sin = image_rotary_emb
+            query = self._apply_rope(query, freqs_cos, freqs_sin)
+            key = self._apply_rope(key, freqs_cos, freqs_sin)
+
+        # Flatten 4D→3D for base _attn_impl
+        seq_len = query.shape[1]
+        query = query.flatten(2)
+        key = key.flatten(2)
+        value = value.flatten(2)
+
+        hidden_states = self._attn_impl(query, key, value, batch_size, seq_len)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # Split and project outputs
+        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+            encoder_hidden_states_out, hidden_states = hidden_states.split(
+                [txt_seq_len, hidden_states.shape[1] - txt_seq_len], dim=1
+            )
+
+            if not self.pre_only:
+                hidden_states = self.to_out[0](hidden_states)
+            encoder_hidden_states_out = self.to_add_out(encoder_hidden_states_out)
+
+            return hidden_states, encoder_hidden_states_out
+        else:
+            if not self.pre_only:
+                hidden_states = self.to_out[0](hidden_states)
+            return hidden_states

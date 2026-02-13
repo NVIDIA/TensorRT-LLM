@@ -39,7 +39,7 @@ class TestFluxAttentionBackend(unittest.TestCase):
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_vanilla_backend_sanity(self):
         """Test FLUX attention works with VANILLA backend."""
-        from tensorrt_llm._torch.visual_gen.models.flux.attention_flux import FluxAttention
+        from tensorrt_llm._torch.visual_gen.modules.attention import FluxJointAttention
 
         batch_size = 2
         seq_len = 256
@@ -53,10 +53,10 @@ class TestFluxAttentionBackend(unittest.TestCase):
         config = self._create_config("VANILLA")
 
         attn = (
-            FluxAttention(
-                query_dim=dim,
-                heads=heads,
-                dim_head=dim_head,
+            FluxJointAttention(
+                hidden_size=dim,
+                num_attention_heads=heads,
+                head_dim=dim_head,
                 added_kv_proj_dim=dim,  # Enable dual-stream for text tokens
                 config=config,
                 layer_idx=0,
@@ -88,7 +88,7 @@ class TestFluxAttentionBackend(unittest.TestCase):
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_trtllm_backend_sanity(self):
         """Test FLUX attention works with TRTLLM backend."""
-        from tensorrt_llm._torch.visual_gen.models.flux.attention_flux import FluxAttention
+        from tensorrt_llm._torch.visual_gen.modules.attention import FluxJointAttention
 
         batch_size = 2
         seq_len = 256
@@ -102,10 +102,10 @@ class TestFluxAttentionBackend(unittest.TestCase):
         config = self._create_config("TRTLLM")
 
         attn = (
-            FluxAttention(
-                query_dim=dim,
-                heads=heads,
-                dim_head=dim_head,
+            FluxJointAttention(
+                hidden_size=dim,
+                num_attention_heads=heads,
+                head_dim=dim_head,
                 added_kv_proj_dim=dim,  # Enable dual-stream for text tokens
                 config=config,
                 layer_idx=0,
@@ -137,7 +137,7 @@ class TestFluxAttentionBackend(unittest.TestCase):
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_backend_equivalence(self):
         """Test VANILLA and TRTLLM backends produce similar outputs."""
-        from tensorrt_llm._torch.visual_gen.models.flux.attention_flux import FluxAttention
+        from tensorrt_llm._torch.visual_gen.modules.attention import FluxJointAttention
 
         batch_size = 1
         seq_len = 128
@@ -152,10 +152,10 @@ class TestFluxAttentionBackend(unittest.TestCase):
         # Create attention modules for both backends
         config = self._create_config("VANILLA")
         vanilla_attn = (
-            FluxAttention(
-                query_dim=dim,
-                heads=heads,
-                dim_head=dim_head,
+            FluxJointAttention(
+                hidden_size=dim,
+                num_attention_heads=heads,
+                head_dim=dim_head,
                 added_kv_proj_dim=dim,  # Enable dual-stream for text tokens
                 config=config,
                 layer_idx=0,
@@ -173,10 +173,10 @@ class TestFluxAttentionBackend(unittest.TestCase):
 
         config = self._create_config("TRTLLM")
         trtllm_attn = (
-            FluxAttention(
-                query_dim=dim,
-                heads=heads,
-                dim_head=dim_head,
+            FluxJointAttention(
+                hidden_size=dim,
+                num_attention_heads=heads,
+                head_dim=dim_head,
                 added_kv_proj_dim=dim,
                 config=config,
                 layer_idx=0,
@@ -259,7 +259,7 @@ class TestFlux2AttentionBackend(unittest.TestCase):
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_flux2_vanilla_backend_sanity(self):
         """Test FLUX.2 attention works with VANILLA backend."""
-        from tensorrt_llm._torch.visual_gen.models.flux2.attention_flux2 import Flux2Attention
+        from tensorrt_llm._torch.visual_gen.modules.attention import FluxJointAttention
 
         batch_size = 2
         seq_len = 128
@@ -273,10 +273,10 @@ class TestFlux2AttentionBackend(unittest.TestCase):
         config = self._create_config("VANILLA")
 
         attn = (
-            Flux2Attention(
-                query_dim=dim,
-                heads=heads,
-                dim_head=dim_head,
+            FluxJointAttention(
+                hidden_size=dim,
+                num_attention_heads=heads,
+                head_dim=dim_head,
                 added_kv_proj_dim=dim,  # Enable dual-stream for text tokens
                 config=config,
                 layer_idx=0,

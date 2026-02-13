@@ -19,11 +19,10 @@ Example structure:
 
 from ..pipeline import BasePipeline
 from ..pipeline_registry import AutoPipeline, register_pipeline
-from .flux import FluxPipeline
-from .flux2 import Flux2Pipeline
+from .flux import Flux2Pipeline, FluxPipeline
 
 # from .ltx2 import LTX2Pipeline  # Temporarily disabled due to diffusers import issue
-from .wan import WanPipeline, WanImageToVideoPipeline
+from .wan import WanImageToVideoPipeline, WanPipeline
 
 __all__ = [
     "AutoPipeline",

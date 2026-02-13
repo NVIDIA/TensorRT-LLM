@@ -12,6 +12,7 @@ Tests cover:
 import gc
 import os
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -76,16 +77,16 @@ def _find_first_quantizable_linear(transformer):
     # Try attention QKV in first transformer block
     if hasattr(transformer, "transformer_blocks") and len(transformer.transformer_blocks) > 0:
         block = transformer.transformer_blocks[0]
-        if hasattr(block, "attn") and hasattr(block.attn, "to_qkv"):
-            return block.attn.to_qkv, "transformer_blocks.0.attn.to_qkv"
+        if hasattr(block, "attn") and hasattr(block.attn, "qkv_proj"):
+            return block.attn.qkv_proj, "transformer_blocks.0.attn.qkv_proj"
     # Try single transformer blocks
     if (
         hasattr(transformer, "single_transformer_blocks")
         and len(transformer.single_transformer_blocks) > 0
     ):
         block = transformer.single_transformer_blocks[0]
-        if hasattr(block, "attn") and hasattr(block.attn, "to_qkv"):
-            return block.attn.to_qkv, "single_transformer_blocks.0.attn.to_qkv"
+        if hasattr(block, "attn") and hasattr(block.attn, "qkv_proj"):
+            return block.attn.qkv_proj, "single_transformer_blocks.0.attn.qkv_proj"
     # Fallback: first Linear in any block
     for name, module in transformer.named_modules():
         if isinstance(module, Linear) and "blocks" in name:
@@ -568,7 +569,8 @@ class TestFluxAttentionBackend:
         VANILLA and TRTLLM backends should work. This test verifies numerical
         consistency between them.
         """
-        # Load baseline transformer (default VANILLA)
+        # Run VANILLA first, save output, then free before loading TRTLLM
+        # (two full transformers don't fit in GPU memory simultaneously)
         print("\n[Attention Backend Test] Loading baseline transformer (VANILLA)...")
         args_baseline = DiffusionArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
@@ -576,12 +578,23 @@ class TestFluxAttentionBackend:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="VANILLA"),
-            pipeline=PipelineConfig(enable_torch_compile=False),
+            pipeline=PipelineConfig(),
         )
         pipeline_baseline = PipelineLoader(args_baseline).load()
         transformer_baseline = pipeline_baseline.transformer
 
-        # Load TRTLLM transformer
+        inputs = _get_flux_transformer_inputs(transformer_baseline)
+
+        print("[Attention Backend Test] Running VANILLA transformer forward...")
+        with torch.no_grad():
+            output_baseline = transformer_baseline(**inputs)
+        output_baseline = _extract_transformer_output(output_baseline).cpu()
+
+        del pipeline_baseline, transformer_baseline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Load and run TRTLLM backend
         print("[Attention Backend Test] Loading TRTLLM transformer...")
         args_trtllm = DiffusionArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
@@ -589,27 +602,15 @@ class TestFluxAttentionBackend:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="TRTLLM"),
-            pipeline=PipelineConfig(enable_torch_compile=False),
+            pipeline=PipelineConfig(),
         )
         pipeline_trtllm = PipelineLoader(args_trtllm).load()
         transformer_trtllm = pipeline_trtllm.transformer
 
-        # Create test inputs
-        inputs = _get_flux_transformer_inputs(transformer_baseline)
-
-        # Run both transformers
-        print("[Attention Backend Test] Running VANILLA transformer forward...")
-        with torch.no_grad():
-            output_baseline = transformer_baseline(**inputs)
-
         print("[Attention Backend Test] Running TRTLLM transformer forward...")
-        inputs_trtllm = {k: v.clone() for k, v in inputs.items()}
         with torch.no_grad():
-            output_trtllm = transformer_trtllm(**inputs_trtllm)
-
-        # Extract outputs
-        output_baseline = _extract_transformer_output(output_baseline)
-        output_trtllm = _extract_transformer_output(output_trtllm)
+            output_trtllm = transformer_trtllm(**inputs)
+        output_trtllm = _extract_transformer_output(output_trtllm).cpu()
 
         assert output_baseline.shape == output_trtllm.shape, (
             f"Output shape mismatch: VANILLA={output_baseline.shape}, TRTLLM={output_trtllm.shape}"
@@ -646,7 +647,124 @@ class TestFluxAttentionBackend:
 
         print(f"\n[PASS] TRTLLM backend matches VANILLA: cos_sim={cos_sim:.6f} (>0.99)")
 
-        del pipeline_baseline, pipeline_trtllm, transformer_baseline, transformer_trtllm
+        del pipeline_trtllm, transformer_trtllm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+# =============================================================================
+# End-to-End Pipeline Tests (vs HuggingFace Reference)
+# =============================================================================
+
+
+class TestFluxE2E:
+    """End-to-end pipeline tests: full generation compared to HuggingFace reference."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux1_e2e_vs_hf(self, flux1_checkpoint_exists):
+        """Full FLUX.1 pipeline (all components) generates image matching HF reference."""
+        from diffusers import FluxPipeline as HFFluxPipeline
+
+        # 1. Generate HF reference image
+        hf_pipe = HFFluxPipeline.from_pretrained(
+            FLUX1_CHECKPOINT_PATH, torch_dtype=torch.bfloat16
+        ).to("cuda")
+        hf_result = hf_pipe(
+            prompt="a tiny astronaut hatching from an egg on the moon",
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            guidance_scale=3.5,
+            generator=torch.Generator("cuda").manual_seed(42),
+        )
+        hf_image = np.array(hf_result.images[0])  # PIL -> (H, W, 3) uint8
+        del hf_pipe
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # 2. Load TRT-LLM pipeline (full, no skip_components)
+        args = DiffusionArgs(
+            checkpoint_path=FLUX1_CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            pipeline=PipelineConfig(),
+        )
+        pipeline = PipelineLoader(args).load()
+
+        # 3. Generate native image
+        result = pipeline.forward(
+            prompt="a tiny astronaut hatching from an egg on the moon",
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            guidance_scale=3.5,
+            seed=42,
+        )
+        native_image = result.image.cpu().numpy()  # (H, W, 3) uint8
+
+        # 4. Compute PSNR
+        mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
+        psnr = 10 * np.log10(255**2 / mse) if mse > 0 else float("inf")
+        print(f"\n[E2E FLUX.1] PSNR: {psnr:.2f} dB")
+
+        assert psnr > 20.0, f"PSNR too low: {psnr:.2f} dB (expected >20 dB)"
+
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_e2e_vs_hf(self, flux2_checkpoint_exists):
+        """Full FLUX.2 pipeline (all components) generates image matching HF reference."""
+        from diffusers import Flux2Pipeline as HFFlux2Pipeline
+
+        # 1. Generate HF reference image
+        hf_pipe = HFFlux2Pipeline.from_pretrained(
+            FLUX2_CHECKPOINT_PATH, torch_dtype=torch.bfloat16
+        ).to("cuda")
+        hf_result = hf_pipe(
+            prompt="a tiny astronaut hatching from an egg on the moon",
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            guidance_scale=3.5,
+            generator=torch.Generator("cuda").manual_seed(42),
+        )
+        hf_image = np.array(hf_result.images[0])  # PIL -> (H, W, 3) uint8
+        del hf_pipe
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # 2. Load TRT-LLM pipeline (full, no skip_components)
+        args = DiffusionArgs(
+            checkpoint_path=FLUX2_CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            pipeline=PipelineConfig(),
+        )
+        pipeline = PipelineLoader(args).load()
+
+        # 3. Generate native image
+        result = pipeline.forward(
+            prompt="a tiny astronaut hatching from an egg on the moon",
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            guidance_scale=3.5,
+            seed=42,
+        )
+        native_image = result.image.cpu().numpy()  # (H, W, 3) uint8
+
+        # 4. Compute PSNR
+        mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
+        psnr = 10 * np.log10(255**2 / mse) if mse > 0 else float("inf")
+        print(f"\n[E2E FLUX.2] PSNR: {psnr:.2f} dB")
+
+        # FLUX.2 uses Mistral3 text encoder + different VAE/RoPE, so more divergence
+        # from HF is expected (~15 dB) compared to FLUX.1 (~32 dB).
+        assert psnr > 12.0, f"PSNR too low: {psnr:.2f} dB (expected >12 dB)"
+
+        del pipeline
         gc.collect()
         torch.cuda.empty_cache()
 
