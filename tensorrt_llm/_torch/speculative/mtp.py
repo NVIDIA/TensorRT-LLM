@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     MambaHybridCacheManager
+from tensorrt_llm._utils import use_pinned_memory
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -15,8 +16,8 @@ from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, Sampler, SampleState,
-                                  SampleStateTensors, TorchSampler, add_token,
-                                  int_tensor)
+                                  SampleStateTensors, AsyncWorkerMixin,
+                                  TorchSampler, add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -171,7 +172,7 @@ class MTPSpecMetadata(SpecMetadata):
         batch_indices = torch.arange(num_seqs,
                                      dtype=torch.int,
                                      device='cpu',
-                                     pin_memory=True)
+                                     pin_memory=use_pinned_memory())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
@@ -201,21 +202,21 @@ class MTPSpecMetadata(SpecMetadata):
                         mtp_past_tokens_pool[slot_id].data_ptr())
                 mtp_hidden_states_ptrs = torch.tensor(mtp_hidden_states_ptrs,
                                                       dtype=torch.int64,
-                                                      pin_memory=True)
+                                                      pin_memory=use_pinned_memory())
                 mtp_past_tokens_ptrs = torch.tensor(mtp_past_tokens_ptrs,
                                                     dtype=torch.int64,
-                                                    pin_memory=True)
+                                                    pin_memory=use_pinned_memory())
                 self.mtp_hidden_states_ptrs[:num_seqs].copy_(
                     mtp_hidden_states_ptrs, non_blocking=True)
                 self.mtp_past_tokens_ptrs[:num_seqs].copy_(mtp_past_tokens_ptrs,
                                                            non_blocking=True)
             mtp_slot_ids = torch.tensor(mtp_slot_ids,
                                         dtype=torch.int,
-                                        pin_memory=True)
+                                        pin_memory=use_pinned_memory())
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPSampler(Sampler[SampleStateMTP]):
+class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
     """
     MTP sampler.
     """
@@ -242,6 +243,7 @@ class MTPSampler(Sampler[SampleStateMTP]):
         self.mapping = None
         self.draft_len = nextn
         self.max_seq_len = args.max_seq_len
+        self._async_worker_init(args.enable_async_worker)
 
         seq_slots = args.max_num_sequences
         max_tokens = args.max_total_draft_tokens + 1
@@ -342,12 +344,11 @@ class MTPSampler(Sampler[SampleStateMTP]):
             next_draft_tokens=next_draft_tokens,
         )
         host = SampleStateTensorsMTP(
-            new_tokens=new_tokens.to('cpu', non_blocking=True),
-            new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
-            next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),
+            new_tokens=self._copy_to_host(new_tokens),
+            new_tokens_lens=self._copy_to_host(new_tokens_lens),
+            next_draft_tokens=self._copy_to_host(next_draft_tokens),
         )
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        sampler_event = self._record_sampler_event()
         # add dummy draft tokens to context requests to prepare kv cache in advance
         # with the max draft token length
         for request in scheduled_requests.context_requests:

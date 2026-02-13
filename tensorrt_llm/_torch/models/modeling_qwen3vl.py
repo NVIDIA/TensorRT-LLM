@@ -17,7 +17,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import nvtx_range, nvtx_range_debug
+from ..._utils import nvtx_range, nvtx_range_debug, use_pinned_memory
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -716,7 +716,7 @@ class Qwen3VisionModel(torch.nn.Module):
         # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
         batch_size = len(seq_lens)
         prompt_lens = seq_lens
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=use_pinned_memory())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.num_contexts = batch_size

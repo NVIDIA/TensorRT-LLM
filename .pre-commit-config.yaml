@@ -1472,3 +1472,8 @@ repos:
         entry: ./scripts/dco_check.py
         language: script
         stages: [commit-msg]
+    -   id: pinned memory policy
+        name: Disallow raw pinned-memory APIs in runtime code
+        entry: ./scripts/check_pinned_memory_usage.py
+        language: script
+        files: ^(tensorrt_llm|triton_backend)/.*\.py$

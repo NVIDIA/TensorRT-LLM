@@ -110,19 +110,19 @@ class _TrtllmPlanner:
         # Workspace: pre-allocate a modest initial buffer (like flashinfer's 320MB).
         # thop.attention auto-resizes via resize_() if more space is needed during warm-up.
         self.workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-        self.host_pool_mapping = torch.zeros(1, 2, dtype=torch.int32, device="cpu", pin_memory=True)
-        self.host_total_kv_lens = torch.zeros(2, dtype=torch.int64, device="cpu", pin_memory=True)
+        self.host_pool_mapping = torch.zeros(1, 2, dtype=torch.int32, device="cpu", pin_memory=use_pinned_memory())
+        self.host_total_kv_lens = torch.zeros(2, dtype=torch.int64, device="cpu", pin_memory=use_pinned_memory())
         self.host_request_types = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=use_pinned_memory()
         )
         self.block_offsets = torch.zeros(
             1, max_batch, 2, max_blocks_per_seq, dtype=torch.int32, device=device
         )
         self.host_past_kv_lengths = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=use_pinned_memory()
         )
         self.host_context_lengths = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=True
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=use_pinned_memory()
         )
 
     def plan(
@@ -187,7 +187,7 @@ class _TrtllmPlanner:
         if t is not None:
             return t
 
-        t = torch.zeros(1, 2, dtype=torch.int64, device="cpu", pin_memory=True)
+        t = torch.zeros(1, 2, dtype=torch.int64, device="cpu", pin_memory=use_pinned_memory())
         t[0, 0] = ptr
         self._per_layer_pool_ptrs[ptr] = t
         return t

@@ -7,7 +7,7 @@ import torch
 
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
-from ..._utils import nvtx_range
+from ..._utils import nvtx_range, use_pinned_memory
 from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
@@ -178,14 +178,14 @@ class GuidedDecoder:
                                    device='cuda')
         self.bitmask_host = torch.empty_like(self.bitmask,
                                              device='cpu',
-                                             pin_memory=True)
+                                             pin_memory=use_pinned_memory())
         self.token_mask = torch.empty(self.max_num_sequences *
                                       (self.max_num_draft_tokens + 1),
                                       dtype=self.token_mask_dtype,
                                       device='cuda')
         self.token_mask_host = torch.empty_like(self.token_mask,
                                                 device='cpu',
-                                                pin_memory=True)
+                                                pin_memory=use_pinned_memory())
 
         # The number of tokens accepted by the grammar matcher in a build step.
         self.num_advanced_tokens: List[int] = [0] * self.max_num_sequences
@@ -457,10 +457,10 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self.new_tokens = torch.empty(self.max_num_draft_tokens + 1,
                                       self.max_num_sequences,
                                       dtype=torch.int32,
-                                      pin_memory=True)
+                                      pin_memory=use_pinned_memory())
         self.num_accepted_tokens = torch.empty(self.max_num_sequences,
                                                dtype=torch.int32,
-                                               pin_memory=True)
+                                               pin_memory=use_pinned_memory())
 
         # torch.compile kernels are called with GIL being held;
         # this could cause deadlock with CUDA callback to Python code.
