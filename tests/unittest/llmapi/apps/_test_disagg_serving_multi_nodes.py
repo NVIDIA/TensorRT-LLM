@@ -197,7 +197,7 @@ def test_completion(client: openai.OpenAI,
         # allow 5ms leniency when comparing the time points from disagg and ctx/gen servers
         validate_timing_metrics(perf_metrics,
                                 "multinode test_completion",
-                                time_leniency_seconds=0.005)
+                                time_tolerance_seconds=0.005)
         # sleep 10 seconds to ensure a successful wait_for_endpoint_ready on rank1
         time.sleep(10)
         disagg_server.terminate()
