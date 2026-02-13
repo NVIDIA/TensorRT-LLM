@@ -1885,3 +1885,193 @@ TEST_F(CapacitySchedulerTest, SimpleFitsStaticBatch)
         EXPECT_EQ(numIterations, 160);
     }
 }
+
+// Tests for reuse-aware capacity scheduling (JIRA-1543)
+TEST_F(CapacitySchedulerTest, ReuseAwareSchedulingAllowsMoreRequestsWithSharedPrefix)
+{
+    // This test verifies that when KV cache reuse is enabled and requests share
+    // a common prefix, the capacity scheduler correctly accounts for reusable blocks
+    // and can schedule more requests than would otherwise fit.
+    SizeType32 kvCacheMaxNumTokens = 100;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 4;
+    SizeType32 maxInputLen = 1000;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(
+        maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+
+    // Create requests with identical prompts (all tokens the same)
+    int32_t maxNewTokens = 5;
+    int32_t promptLen = 20; // 2 blocks worth of tokens
+
+    RequestList activeRequests;
+    auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen, 42);
+    std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+    // Create multiple requests with identical input tokens
+    activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 0));
+    activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 1));
+
+    auto addNewRequestsCb = [this](RequestList& activeRequests, int itCount) {};
+
+    // The key verification: with reuse-aware scheduling, the second request should
+    // benefit from the blocks cached by the first request. The scheduler should
+    // correctly estimate that the second request needs fewer new blocks.
+    std::vector<ExpectedState> expectedStates;
+    // First iteration: first request gets scheduled
+    expectedStates.push_back(ExpectedState{0, 1, {0, 1}, {{0, maxNewTokens, promptLen, 0}}});
+    // After first request stores context, second request can reuse those blocks
+    expectedStates.push_back(ExpectedState{1, maxNewTokens, {0, 1},
+        {{0, maxNewTokens, promptLen, 1, promptLen}, {1, maxNewTokens, promptLen, 0}}});
+    expectedStates.push_back(
+        ExpectedState{maxNewTokens, maxNewTokens + 1, {1}, {{1, maxNewTokens, promptLen, maxNewTokens - 1, promptLen}}});
+
+    int numIterations = runTest(
+        capacityScheduler, kvCacheManager, activeRequests, expectedStates, addNewRequestsCb, maxInputLen, peftCacheManager);
+
+    // Verify blocks were reused
+    EXPECT_GT(kvCacheManager->getNumReusedBlocks(), 0);
+    EXPECT_EQ(numIterations, maxNewTokens + 1);
+}
+
+TEST_F(CapacitySchedulerTest, ReuseAwareSchedulingWithPartialPrefixMatch)
+{
+    // Test that partial prefix matching works correctly
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    SizeType32 maxInputLen = 1000;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(
+        maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+
+    int32_t maxNewTokens = 5;
+    int32_t promptLen = 30; // 3 blocks worth of tokens
+
+    RequestList activeRequests;
+
+    // First request: tokens [0, 1, 2, ..., 29]
+    auto inputTokens0 = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), 0);
+
+    // Second request: first 2 blocks match, third block different
+    auto inputTokens1 = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(inputTokens1->begin(), inputTokens1->begin() + 20, 0); // First 20 tokens match
+    std::fill(inputTokens1->begin() + 20, inputTokens1->end(), 999); // Last 10 tokens different
+
+    activeRequests.push_back(createRequest(inputTokens0, maxNewTokens, 0));
+    activeRequests.push_back(createRequest(inputTokens1, maxNewTokens, 1));
+
+    auto addNewRequestsCb = [this](RequestList& activeRequests, int itCount) {};
+
+    std::vector<ExpectedState> expectedStates;
+    // First iteration: first request gets scheduled
+    expectedStates.push_back(ExpectedState{0, 1, {0, 1}, {{0, maxNewTokens, promptLen, 0}}});
+    // Second request should be able to reuse 2 of 3 context blocks
+    expectedStates.push_back(ExpectedState{1, maxNewTokens, {0, 1},
+        {{0, maxNewTokens, promptLen, 1, promptLen}, {1, maxNewTokens, promptLen, 0}}});
+    expectedStates.push_back(
+        ExpectedState{maxNewTokens, maxNewTokens + 1, {1}, {{1, maxNewTokens, promptLen, maxNewTokens - 1, promptLen}}});
+
+    int numIterations = runTest(
+        capacityScheduler, kvCacheManager, activeRequests, expectedStates, addNewRequestsCb, maxInputLen, peftCacheManager);
+
+    // Verify some blocks were reused (2 blocks should be reused)
+    EXPECT_EQ(kvCacheManager->getNumReusedBlocks(), 2);
+    EXPECT_EQ(numIterations, maxNewTokens + 1);
+}
+
+TEST_F(CapacitySchedulerTest, NoReuseWithDifferentPrompts)
+{
+    // Test that when prompts don't share a prefix, no reuse occurs
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 2;
+    SizeType32 maxInputLen = 1000;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(
+        maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+
+    int32_t maxNewTokens = 5;
+    int32_t promptLen = 20;
+
+    RequestList activeRequests;
+
+    // Two completely different prompts
+    auto inputTokens0 = std::make_shared<std::vector<int32_t>>(promptLen, 100);
+    auto inputTokens1 = std::make_shared<std::vector<int32_t>>(promptLen, 200);
+
+    activeRequests.push_back(createRequest(inputTokens0, maxNewTokens, 0));
+    activeRequests.push_back(createRequest(inputTokens1, maxNewTokens, 1));
+
+    auto addNewRequestsCb = [this](RequestList& activeRequests, int itCount) {};
+
+    std::vector<ExpectedState> expectedStates;
+    // Both requests should be scheduled, but no reuse should occur
+    expectedStates.push_back(
+        ExpectedState{0, maxNewTokens, {0, 1}, {{0, maxNewTokens, promptLen, 0}, {1, maxNewTokens, promptLen, 0}}});
+
+    int numIterations = runTest(
+        capacityScheduler, kvCacheManager, activeRequests, expectedStates, addNewRequestsCb, maxInputLen, peftCacheManager);
+
+    // No blocks should be reused since prompts are completely different
+    EXPECT_EQ(kvCacheManager->getNumReusedBlocks(), 0);
+}
+
+TEST_F(CapacitySchedulerTest, ReuseAwareSchedulingMaxUtilizationPolicy)
+{
+    // Test reuse-aware scheduling with MAX_UTILIZATION policy
+    SizeType32 kvCacheMaxNumTokens = 100;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 4;
+    SizeType32 maxInputLen = 1000;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(
+        maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+
+    int32_t maxNewTokens = 5;
+    int32_t promptLen = 20;
+
+    RequestList activeRequests;
+    auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen, 42);
+    std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+    activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 0));
+    activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 1));
+
+    auto addNewRequestsCb = [this](RequestList& activeRequests, int itCount) {};
+
+    std::vector<ExpectedState> expectedStates;
+    // With MAX_UTILIZATION, the second request should be delayed to benefit from reuse
+    expectedStates.push_back(ExpectedState{0, 1, {0, 1}, {{0, maxNewTokens, promptLen, 0}}});
+    expectedStates.push_back(ExpectedState{1, maxNewTokens, {0, 1},
+        {{0, maxNewTokens, promptLen, 1, promptLen}, {1, maxNewTokens, promptLen, 0}}});
+    expectedStates.push_back(
+        ExpectedState{maxNewTokens, maxNewTokens + 1, {1}, {{1, maxNewTokens, promptLen, maxNewTokens - 1, promptLen}}});
+
+    int numIterations = runTest(
+        capacityScheduler, kvCacheManager, activeRequests, expectedStates, addNewRequestsCb, maxInputLen, peftCacheManager);
+
+    EXPECT_GT(kvCacheManager->getNumReusedBlocks(), 0);
+    EXPECT_EQ(numIterations, maxNewTokens + 1);
+}
