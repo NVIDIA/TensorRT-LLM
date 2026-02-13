@@ -109,12 +109,13 @@ struct DataBase
     int32_t mNumLocalExperts;
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool isPow2_, bool UsePdl_>
 struct KernelParamsBase
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
     static constexpr int MaxNumExperts = MaxNumExperts_;
+    static constexpr int MaxNumTopExperts = MaxNumTopExperts_;
     static constexpr bool UsePdl = UsePdl_;
     static constexpr bool isPow2 = isPow2_;
 
@@ -191,13 +192,12 @@ struct Data : public DataBase
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool UseGroups_, bool isPow2_,
     bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_, isPow2_, UsePdl_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
 
     static constexpr bool UseGroups = UseGroups_;
-    static constexpr int MaxNumTopExperts = MaxNumTopExperts_;
 
     PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
@@ -250,8 +250,8 @@ struct Data : public DataBase
     tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_, isPow2_, UsePdl_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
@@ -296,9 +296,9 @@ struct Data : public DataBase
     bool mApplySoftmaxAfterTopK{true};
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool DoSoftmaxBeforeTopK_, bool isPow2_,
-    bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool DoSoftmaxBeforeTopK_,
+    bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_, isPow2_, UsePdl_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
