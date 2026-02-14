@@ -23,7 +23,7 @@ namespace routingMiniMax
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
-static constexpr int NumExpertsLimit = 512;
+static constexpr int NumExpertsLimit = 256;
 
 static constexpr int NumThreads = 1024;
 static constexpr int NumWarps = NumThreads / WarpSize;
@@ -32,7 +32,7 @@ static constexpr int MaxSupportedTopExperts = 10;
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 
-static constexpr int BlockKernelMaxNumTokens = 4;
+static constexpr int BlockKernelMaxNumTokens = 8;
 
 template <typename DataType, typename InputType, typename BiasType, int VecSize>
 __forceinline__ __device__ void routingTopKExperts(cg::thread_block_tile<WarpSize> const& warp,
