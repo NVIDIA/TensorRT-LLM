@@ -1577,8 +1577,8 @@ PERF_SANITY_TEST_CASES = get_aggr_test_cases() + get_disagg_test_cases() + MULTI
 @pytest.mark.parametrize("perf_sanity_test_case", PERF_SANITY_TEST_CASES)
 def test_e2e(output_dir, perf_sanity_test_case):
     # Create config and parse test case name
-    print(f"=================== output_dir: {output_dir} ===================")
     output_dir = "tests/scripts/"
+    print(f"=================== output_dir: {output_dir} ===================")
     config = PerfSanityTestConfig(perf_sanity_test_case, output_dir)
 
     # Parse config file to get server_configs and server_client_configs
