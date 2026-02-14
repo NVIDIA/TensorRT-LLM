@@ -4,6 +4,7 @@ from .interface import (SpecMetadata, SpecWorkerBase,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
+from .pard import PARDSpecMetadata, PARDWorker
 from .save_hidden_state import SaveHiddenStatesDrafter
 from .spec_tree_manager import SpecTreeManager
 from .utils import (get_draft_kv_cache_manager, get_num_extra_kv_tokens,
@@ -18,6 +19,8 @@ __all__ = [
     "MTPWorker",
     "NGramDrafter",
     "NGramPoolManager",
+    "PARDSpecMetadata",
+    "PARDWorker",
     "SaveHiddenStatesDrafter",
     "SpecMetadata",
     "SpecWorkerBase",

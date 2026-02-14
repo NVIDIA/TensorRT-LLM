@@ -388,8 +388,9 @@ class PyTorchModelEngine(ModelEngine):
         # Pre-allocated buffers for draft model to avoid implicit synchronization
         # These are used to build index tensors without creating tensors from Python lists
         max_first_draft_tokens = self.batch_size * (
-            self.original_max_draft_len + 1) if spec_config else self.batch_size
-        tokens_per_draft = self.original_max_draft_len + 1
+            self.original_max_total_draft_tokens +
+            1) if spec_config else self.batch_size
+        tokens_per_draft = self.original_max_total_draft_tokens + 1
         self.idx_accepted_tokens_cache = None
         self.draft_token_positions_cache = None
         if spec_config:
@@ -1891,7 +1892,7 @@ class PyTorchModelEngine(ModelEngine):
         # Pre-compute constants
         extend_requests = scheduled_requests.generation_requests
         num_extend_requests = len(extend_requests)
-        num_tokens_per_extend_request = self.original_max_draft_len + 1
+        num_tokens_per_extend_request = self.original_max_total_draft_tokens + 1
         spec_config = self.spec_config
 
         prompt_lengths = torch.empty(num_extend_requests,
