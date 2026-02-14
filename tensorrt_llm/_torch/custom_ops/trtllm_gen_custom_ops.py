@@ -89,6 +89,13 @@ def prepare_dummy_topk_and_hook(
             lambda: torch.randn(
                 num_experts, dtype=torch.bfloat16, device=hidden_states.device)
         })
+    if routing_method_type == RoutingMethodType.MiniMaxM2:
+        routing_cls_kwargs.update({
+            'callable_e_score_correction_bias':
+            lambda: torch.randn(
+                num_experts, dtype=torch.bfloat16, device=hidden_states.device)
+            'num_experts': num_experts,
+        })
     routing_method = ROUTING_METHOD_TYPE_TO_CLASS[routing_method_type](
         top_k=top_k, **routing_cls_kwargs)
 
