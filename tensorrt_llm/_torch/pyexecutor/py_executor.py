@@ -1920,17 +1920,29 @@ class PyExecutor:
                 # to ensure consistent batch sizes for accurate performance measurement.
                 if not self.is_warmup and not can_forward:
                     if self.enable_attention_dp:
-                        local_can_forward = self.num_fetch_requests + \
-                            len(scheduled_batch.generation_requests) >= self.benchmark_req_queues_size
-                        all_can_forward = self.dist.tp_allgather(
-                            local_can_forward)
-                        if all(all_can_forward):
+                        # Allgather local generation counts to get the total across all DP ranks, 
+                        # then compare against the target as the scheduled_batch.generation_requests is local to this rank.
+                        local_gen_count = len(
+                            scheduled_batch.generation_requests)
+                        all_gen_counts = self.dist.tp_allgather(
+                            local_gen_count)
+                        total_gen_count = sum(all_gen_counts)
+                        if self.dist.rank == 0:
+                            logger.info(
+                                f"benchmark check: local_gen_count={local_gen_count}, "
+                                f"all_gen_counts={all_gen_counts}, "
+                                f"total_gen_count={total_gen_count}, "
+                                f"benchmark_req_queues_size={self.benchmark_req_queues_size}"
+                            )
+                        if total_gen_count >= self.benchmark_req_queues_size:
                             can_forward = True
                             time.sleep(10)
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
+                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, "
+                                    f"total_gen_count: {total_gen_count}, "
+                                    f"scheduled_gen_batch: {local_gen_count}"
                                 )
                             time.sleep(10)
                             continue
