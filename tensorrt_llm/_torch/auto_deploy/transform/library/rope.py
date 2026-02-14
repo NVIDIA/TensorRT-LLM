@@ -656,6 +656,32 @@ def _try_build_cache_from_dynamic_cos_sin(
     return fused_node
 
 
+def _build_fused_cos_sin_cache(
+    graph: torch.fx.Graph,
+    cos_src: Node,
+    sin_src: Node,
+    half_head_dim: int,
+    reshape_to_2d: Optional[Node] = None,
+) -> Node:
+    """Slice cos/sin to half_head_dim, concat, and cast to float32.
+
+    If *reshape_to_2d* is provided (a node representing B*S), the fused
+    tensor is reshaped to ``[B*S, head_dim]`` before the dtype cast.
+    """
+    with graph.inserting_after(cos_src):
+        cos_prefix = graph.call_function(torch.ops.aten.slice, args=(cos_src, -1, 0, half_head_dim))
+    with graph.inserting_after(sin_src):
+        sin_prefix = graph.call_function(torch.ops.aten.slice, args=(sin_src, -1, 0, half_head_dim))
+    with graph.inserting_after(_get_last_node([cos_prefix, sin_prefix])):
+        fused = graph.call_function(torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1))
+    if reshape_to_2d is not None:
+        with graph.inserting_after(_get_last_node([reshape_to_2d, fused])):
+            fused = graph.call_function(torch.ops.aten.view, args=(fused, (reshape_to_2d, -1)))
+    with graph.inserting_after(fused):
+        fused_to = graph.call_function(torch.ops.aten.to, args=(fused, torch.float32))
+    return fused_to
+
+
 def _optimize_explicit(
     graph: GraphModule,
     node: Node,
@@ -727,25 +753,9 @@ def _optimize_explicit(
                     fused_cos_sin_to = dynamic_node
                 else:
                     # Fallback: build fused cache at runtime (slice + concat)
-                    with graph.inserting_after(cos_table_node):
-                        cos_prefix = graph.call_function(
-                            torch.ops.aten.slice,
-                            args=(cos_table_node, -1, 0, half_head_dim),
-                        )
-                    with graph.inserting_after(sin_table_node):
-                        sin_prefix = graph.call_function(
-                            torch.ops.aten.slice,
-                            args=(sin_table_node, -1, 0, half_head_dim),
-                        )
-                    with graph.inserting_after(_get_last_node([cos_prefix, sin_prefix])):
-                        fused_cos_sin = graph.call_function(
-                            torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
-                        )
-                    with graph.inserting_after(fused_cos_sin):
-                        fused_cos_sin_to = graph.call_function(
-                            torch.ops.aten.to,
-                            args=(fused_cos_sin, torch.float32),
-                        )
+                    fused_cos_sin_to = _build_fused_cos_sin_cache(
+                        graph, cos_table_node, sin_table_node, half_head_dim
+                    )
             cache[cache_key] = fused_cos_sin_to
 
         # Flatten real position_ids from [B, S] to [B*S] and ensure int32
@@ -768,31 +778,14 @@ def _optimize_explicit(
         if cache_key in cache:
             fused_cos_sin_to = cache[cache_key]
         else:
-            with graph.inserting_after(cos_node):
-                cos_prefix = graph.call_function(
-                    torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
-                )
-            with graph.inserting_after(sin_node):
-                sin_prefix = graph.call_function(
-                    torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
-                )
-            with graph.inserting_after(sin_prefix):
-                fused_cos_sin = graph.call_function(
-                    torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
-                )
             with graph.inserting_after(q_node):
                 sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
                 sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
             with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
                 bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
-            with graph.inserting_after(_get_last_node([bs_seq, fused_cos_sin])):
-                fused_cos_sin_flat = graph.call_function(
-                    torch.ops.aten.view, args=(fused_cos_sin, (bs_seq, -1))
-                )
-            with graph.inserting_after(fused_cos_sin_flat):
-                fused_cos_sin_to = graph.call_function(
-                    torch.ops.aten.to, args=(fused_cos_sin_flat, torch.float32)
-                )
+            fused_cos_sin_to = _build_fused_cos_sin_cache(
+                graph, cos_node, sin_node, half_head_dim, reshape_to_2d=bs_seq
+            )
             cache[cache_key] = fused_cos_sin_to
 
         with graph.inserting_before(node):
