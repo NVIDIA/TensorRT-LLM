@@ -2792,11 +2792,11 @@ int AttentionOp::initialize() noexcept
                 // Context attention of MLA is different
                 fmhaParams.numKvHeads = mNumHeads;
                 fmhaParams.headSize = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
-                // Ideally this should be mMLAParams.v_head_dim, but because we initialize both MLA
-                // context(v_head_dim=128) and gen(v_head_dim=512) runners in a single op, the headSizeV will be set to
-                // 512 when we create the gen attention op and that could fail to create the FmhaDispatcher for context
-                // phase. Luckily, for deepseek, qk_nope_head_dim is the same as v_head_dim in context phase.
-                fmhaParams.headSizeV = mMLAParams.qk_nope_head_dim;
+                // Use v_head_dim from the config for the context phase FMHA headSizeV.
+                // For generation MLA ops, mMLAParams.v_head_dim is kv_lora_rank and the FmhaDispatcher
+                // is not used anyway (generation uses a separate dispatcher).
+                // For context MLA ops, mMLAParams.v_head_dim is the actual config value.
+                fmhaParams.headSizeV = mMLAParams.v_head_dim;
                 fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
             }
         }
@@ -2891,10 +2891,13 @@ int AttentionOp::initialize() noexcept
                         "Deepseek should be supported by fmha in generation part.");
                 }
             }
-            if (!mIsGenerationMLA)
+            if (!mIsGenerationMLA && !mFmhaDispatcher->isSupported())
             {
-                TLLM_CHECK_WITH_INFO(
-                    mFmhaDispatcher->isSupported(), "Deepseek should be supported by fmha in context part.");
+                // For models where v_head_dim != qk_nope_head_dim (e.g. GLM5),
+                // the FMHA dispatcher may not have kernels for the resulting headSize/headSizeV.
+                // Fall back to unfused MHA instead of aborting.
+                TLLM_LOG_WARNING("FMHA is not supported for context MLA with headSize=%d, headSizeV=%d. "
+                    "Falling back to unfused MHA.", fmhaParams.headSize, fmhaParams.headSizeV);
             }
         }
 
