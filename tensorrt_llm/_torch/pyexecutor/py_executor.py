@@ -330,7 +330,7 @@ class PyExecutor:
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
-            enabled=self.llm_args.return_perf_metrics)
+            enabled=getattr(self.llm_args, 'return_perf_metrics', False))
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
