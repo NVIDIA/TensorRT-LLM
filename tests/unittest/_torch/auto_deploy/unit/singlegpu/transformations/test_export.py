@@ -308,7 +308,7 @@ class SimpleMoEForExport(nn.Module):
 @pytest.mark.parametrize("expert_attr_name", ["experts", "mlp_bank"])
 @pytest.mark.parametrize("num_experts", [4, 8])
 @pytest.mark.parametrize("num_moe_experts_for_export", [1, 2])
-@pytest.mark.parametrize("device", ["cpu"])
+@pytest.mark.parametrize("device", ["cuda"])
 def test_moe_export_with_reduced_experts(
     num_experts, num_moe_experts_for_export, device, expert_attr_name
 ):
@@ -405,6 +405,9 @@ if _HAS_GLM4:
         return 0
 
     @pytest.mark.skipif(not _HAS_GLM4, reason="GLM4 MoE Lite model not available on this branch")
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="GLM4 MoE Lite requires CUDA (uses noaux_tc_op)"
+    )
     @pytest.mark.parametrize("n_routed_experts", [8, 16])
     @pytest.mark.parametrize("num_moe_experts_for_export", [2])
     def test_glm4_moe_lite_export_with_reduced_experts(
@@ -414,12 +417,14 @@ if _HAS_GLM4:
         that the expanded graph has the correct structure and accepts the original
         state dict.
         """
+        # GLM4 MoE Lite uses noaux_tc_op which is CUDA-only, so we must use CUDA device
+        device = "cuda"
         config = _make_tiny_glm4_config(n_routed_experts=n_routed_experts)
-        model = Glm4MoeLiteForCausalLM(config)
+        model = Glm4MoeLiteForCausalLM(config).to(device)
         model.eval()
 
-        input_ids = torch.randint(0, config.vocab_size, (1, 8))
-        position_ids = torch.arange(8).unsqueeze(0)
+        input_ids = torch.randint(0, config.vocab_size, (1, 8), device=device)
+        position_ids = torch.arange(8, device=device).unsqueeze(0)
         sample_kwargs = {"input_ids": input_ids, "position_ids": position_ids}
 
         # --- full export (baseline) ---
