@@ -20,7 +20,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_attn import 
     _execute_kv_proj_in_aux_stream,
     _find_kv_proj_linears,
 )
-from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe import cuda_stream_manager
+from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import cuda_stream_manager
 
 # ---------------------------------------------------------------------------
 # Helpers -- mock MLA-like module

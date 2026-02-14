@@ -17,19 +17,18 @@ from typing import Callable, List, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
+from ...models.factory import ModelFactory
+
 # Reuse CachedSequenceInterface for the _apply signature.
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import create_derived_custom_op
-from ...utils.node_utils import is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
-
-# Reuse the stream infrastructure from the MoE multi-stream transform.
-from .multi_stream_moe import (
-    ModelFactory,
+from ...utils.multi_stream_utils import (
     _make_aux_stream_impl,
     cuda_stream_manager,
     record_event_passthrough,
 )
+from ...utils.node_utils import is_op
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 # ---------------------------------------------------------------------------
 # Supported linear op targets.  Extend this list to cover quantised variants.
