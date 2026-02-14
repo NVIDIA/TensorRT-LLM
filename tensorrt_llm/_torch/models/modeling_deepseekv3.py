@@ -718,7 +718,7 @@ class DeepseekV3Attention(MLA):
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
+        predicted_tokens_per_seq = model_config.spec_config.tokens_per_gen_step if model_config.spec_config is not None else 1
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
                          num_key_value_heads=config.num_key_value_heads,
@@ -766,7 +766,7 @@ class DeepseekV32Attention(MLA):
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
+        predicted_tokens_per_seq = model_config.spec_config.tokens_per_gen_step if model_config.spec_config is not None else 1
 
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
