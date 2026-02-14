@@ -34,7 +34,7 @@ using namespace cutlass;
 namespace sm120_blockscaled_gemm
 {
 
-template <int TileM_ = 32, int TileN_ = 128>
+template <int TileM_ = 32, int TileN_ = 128, int Stages_ = 4>
 struct SM120BlockScaledBuilder
 {
 
@@ -45,13 +45,17 @@ struct SM120BlockScaledBuilder
     using ElementAccum = float;
     using ElementD = cute::bfloat16_t;
 
-    static constexpr int AB_Stages = 4;
+    static constexpr int AB_Stages = Stages_;
     static constexpr int SF_Stages = 1;
     static constexpr int kTileM = TileM_;
     static constexpr int kTileN = TileN_;
     static constexpr int kSFVecSize = 128; // fixed for 1x128 quantization
     static constexpr int kTileSF = 1;      // 1 sf block contains 4 e8m0 per 512 k elements
     static constexpr int kTileK = 128;
+    static constexpr int kNumTileKPerSF = 512 / kTileK;
+    static constexpr int kNumStagePerSF = kNumTileKPerSF / AB_Stages;
+    static_assert(kNumStagePerSF > 0 && kNumStagePerSF <= 2, "kNumStagePerSF must be 1 or 2 ");
+    static_assert(kNumTileKPerSF % AB_Stages == 0, "kNumTileKPerSF must be divisible by AB_Stages");
     using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
     using ScaleTileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileSF>>;
     using ClusterShape = Shape<_1, _1, _1>;
@@ -59,11 +63,18 @@ struct SM120BlockScaledBuilder
 
     // ====== mma ======
     using PermMmaTileM = Int<32>;
-    using PermMmaTileN = Int<32>;
-    using PermMmaTileK = Int<32>;
+    // using PermMmaTileN = Int<64>;
+    // using PermMmaTileM = Layout<Shape<_16,_2,_2>, Stride<_1, _32, _16>>;
+    using PermMmaTileN = Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>;
+    using PermMmaTileK = Underscore;
     using MMA_Atom = MMA_Atom<SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<float_e4m3_t, float_e4m3_t, float, float_ue8m0_t,
         32>>; // sm120 16x8x32 fp8 mma
-    using TiledMma = TiledMMA<MMA_Atom, Layout<Shape<_2, _2, _1>>, Tile<PermMmaTileM, PermMmaTileN, PermMmaTileK>>;
+    using TiledMma = TiledMMA<MMA_Atom, Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>,
+        Tile<PermMmaTileM, PermMmaTileN, PermMmaTileK>>;
+    static_assert(kTileM % cute::size(PermMmaTileM{}) == 0, "size<0>(TileShape{}) % size(PermMmaTileM{}) == 0");
+    static_assert(kTileN % cute::size(PermMmaTileN{}) == 0, "size<1>(TileShape{}) % size(PermMmaTileN{}) == 0");
+    static constexpr int kNumMathThreads = size(TiledMma::ThrLayoutVMNK{});
+    static constexpr int kNumMathWarps = kNumMathThreads / 32;
 
     CUTE_HOST_DEVICE
     static auto ceil_div(int const& x, int const& y)
@@ -89,7 +100,10 @@ struct SM120BlockScaledBuilder
     CUTE_HOST_DEVICE
     static auto deduce_sfa_layout(ProblemShape const& problem_shape)
     {
-        auto [M, N, K, L] = problem_shape;
+        auto M = cute::get<0>(problem_shape);
+        auto N = cute::get<1>(problem_shape);
+        auto K = cute::get<2>(problem_shape);
+        auto L = cute::get<3>(problem_shape);
         auto scale_m = get_tma_aligned_size(M);
         auto scale_k = ceil_div(K, 128 * 4);
         return make_ordered_layout(make_shape(scale_m, scale_k, L), Step<_1, _2, _3>{});
@@ -98,7 +112,10 @@ struct SM120BlockScaledBuilder
     CUTE_HOST_DEVICE
     static auto deduce_sfb_layout(ProblemShape const& problem_shape)
     {
-        auto [M, N, K, L] = problem_shape;
+        auto M = cute::get<0>(problem_shape);
+        auto N = cute::get<1>(problem_shape);
+        auto K = cute::get<2>(problem_shape);
+        auto L = cute::get<3>(problem_shape);
         auto scale_n = get_tma_aligned_size(N);
         auto scale_k = ceil_div(K, 128 * 4);
         return make_ordered_layout(make_shape(scale_n, scale_k, L), Step<_1, _2, _3>{});
@@ -123,7 +140,7 @@ struct SM120BlockScaledBuilder
         auto tv_atom_sfa = tiled_atom_sfa.compose(AtomLayoutSFA_TV{}, _); // ((ThrV,FrgV),(RestM,RestK))
 
         // Tile the tensor for the Thread
-        auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+        auto thr_layout_vmnk = mma.get_thr_layout_vmnk(); // (_32,_4,_1,_1):(_1,_32,_0,_0)
         auto thr_tile
             = make_tile(_, make_tile(make_layout(size<1>(thr_layout_vmnk)), make_layout(size<3>(thr_layout_vmnk))));
         auto thr_tensor = zipped_divide(tv_atom_sfa, thr_tile); // ((ThrV,(ThrM,ThrK)),(FrgV,(RestM,RestK)))
@@ -188,7 +205,6 @@ struct SM120BlockScaledBuilder
     template <class SFBTensor, class ThrMma>
     CUTE_HOST_DEVICE static constexpr auto partition_fragment_SFB(SFBTensor&& sfbtensor, ThrMma& thread_mma)
     {
-        // using ValTypeSF = typename ThrMma::Atom::Traits::ValTypeSF;
         auto thr_tensor
             = make_tensor(static_cast<SFBTensor&&>(sfbtensor).data(), thrfrg_SFB(sfbtensor.layout(), thread_mma));
         auto thr_vmnk = thread_mma.thr_vmnk_;
@@ -204,13 +220,13 @@ struct SM120BlockScaledBuilder
         auto tile_shape_mnk = tile_shape(mma);
         auto ref_B = make_layout(make_shape(size<1>(tile_shape_mnk), _1{}));
         auto thr_tensor = thrfrg_SFB(ref_B, mma);
-        auto thr_layout_vmnk = mma.get_thr_layout_vmnk(); // (_32,_4,_1,_1):(_1,_32,_0,_0)
+        auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
         auto btile = make_tile(_,
             make_tile(make_layout(make_shape(size<1>(thr_layout_vmnk), size<2>(thr_layout_vmnk)),
                           make_stride(Int<0>{}, Int<1>{})),
-                _));                                          // (_,((_4,_1):(_0,_1),_))
-        auto tv_sfb = thr_tensor.compose(btile, _);           // mma_sfb_tv_layout
-        auto thridx_2_thrid = right_inverse(thr_layout_vmnk); // (_128:_1)
+                _));
+        auto tv_sfb = thr_tensor.compose(btile, _);
+        auto thridx_2_thrid = right_inverse(thr_layout_vmnk);
         auto tv_layout = tv_sfb.compose(thridx_2_thrid, _);
         return tv_layout;
     }
@@ -340,15 +356,76 @@ struct SM120BlockScaledBuilder
         EmptyBarrier ab_empty_mbar[AB_Stages];
         FullBarrier sf_full_mbar[SF_Stages];
         EmptyBarrier sf_empty_mbar[SF_Stages];
+        EmptyBarrier store_full_mbar[SF_Stages];
+        EmptyBarrier store_empty_mbar[SF_Stages];
     };
+};
 
-    static dim3 get_grid_shape(ProblemShape problem_shape)
+template <int BlockM, int BlockN, int kNum1DBlocksPerGroup = 16>
+struct SM120BlockScaledScheduler
+{
+
+    int32_t current_iter = -1;
+    int32_t current_group_idx = 0;
+    int32_t m_block_idx = -1;
+    int32_t n_block_idx = -1;
+    int32_t num_groups = 0;
+    int32_t num_m_blocks = 0;
+    int32_t num_n_blocks = 0;
+    int32_t cur_m_cumsum = 0;
+    int32_t* grouped_layout = nullptr;
+
+    __device__ __forceinline__ explicit SM120BlockScaledScheduler(
+        int shape_m, int shape_n, int num_groups_, int* grouped_layout_)
+        : num_m_blocks((shape_m + BlockM - 1) / BlockM)
+        , num_n_blocks((shape_n + BlockN - 1) / BlockN)
+        , num_groups(num_groups_)
+        , grouped_layout(grouped_layout_)
     {
-        auto [M, N, K, L] = problem_shape;
-        int grid_m = (M + kTileM - 1) / kTileM;
-        int grid_n = (N + kTileN - 1) / kTileN;
-        int grid_l = L;
-        return dim3(grid_m, grid_n, grid_l);
+    }
+
+    __device__ __forceinline__ void get_swizzle_block_idx(int block_idx)
+    {
+        // Swizzle for better L2 usages
+        auto const& num_blocks_per_group = num_m_blocks * kNum1DBlocksPerGroup;
+        auto const& group_idx = block_idx / num_blocks_per_group;
+        auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
+        auto in_group_idx = block_idx % num_blocks_per_group;
+        auto num_blocks_in_group = min(kNum1DBlocksPerGroup, num_n_blocks - first_block_idx);
+        m_block_idx = in_group_idx / num_blocks_in_group;
+        n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+    }
+
+    __device__ __forceinline__ bool get_next_block()
+    {
+        auto const& num_sms = gridDim.x;
+        auto next_block_idx = ++current_iter * num_sms + blockIdx.x;
+
+        while (true)
+        {
+            if (current_group_idx >= num_groups)
+            {
+                return false;
+            }
+
+            if (grouped_layout != nullptr)
+            {
+                num_m_blocks = (grouped_layout[current_group_idx] + BlockM - 1) / BlockM;
+            }
+            auto const next_m_cumsum = cur_m_cumsum + num_m_blocks;
+            if (next_block_idx < next_m_cumsum * num_n_blocks)
+            {
+                break;
+            }
+
+            ++current_group_idx;
+            cur_m_cumsum = next_m_cumsum;
+        }
+
+        auto const remain_blocks = next_block_idx - cur_m_cumsum * num_n_blocks;
+        get_swizzle_block_idx(remain_blocks);
+
+        return true;
     }
 };
 
