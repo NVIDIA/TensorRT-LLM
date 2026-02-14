@@ -484,6 +484,16 @@ def _try_prefuse_cos_sin_cache(
     try:
         prefused_tensor = _get_nested_attr(gm, prefused_path)
         if not prefused_tensor.is_meta:
+            # Ensure the buffer is float32 (FlashInfer requires float32 cache).
+            # model.to(dtype) may have cast it to a lower precision.
+            if prefused_tensor.dtype != torch.float32:
+                prefused_tensor = prefused_tensor.to(torch.float32)
+                # Update the buffer on the module so the get_attr reads float32.
+                parts = prefused_path.rsplit(".", 1)
+                parent = _get_nested_attr(gm, parts[0]) if len(parts) > 1 else gm
+                attr_name = parts[-1]
+                parent.register_buffer(attr_name, prefused_tensor, persistent=False)
+
             # Reuse the existing buffer directly
             with graph.inserting_after(_get_last_node([cos_source, sin_source])):
                 fused_node = graph.create_node("get_attr", prefused_path)
