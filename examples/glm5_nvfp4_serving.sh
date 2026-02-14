@@ -23,6 +23,7 @@
 #    which falls back to unfused MHA that doesn't support MLA (gibberish).
 #
 # B. TOKENIZER CONFIG (GLM-5-nvfp4-v1/tokenizer_config.json)
+#    NOTE: Need to confirm these are still required -- may work without them.
 #    GLM5's custom tokenizer class doesn't load via standard HF auto:
 #    - "tokenizer_class": "TokenizersBackend" -> "PreTrainedTokenizerFast"
 #      (tokenizer.json is standard format, PreTrainedTokenizerFast loads it fine)

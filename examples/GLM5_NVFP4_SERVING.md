@@ -53,6 +53,8 @@ Make these changes:
 
 ## Step 2 — Fix the tokenizer config
 
+> **Note:** These changes may not be required — needs confirmation. Try without them first.
+
 Edit `GLM-5-nvfp4-v1/tokenizer_config.json`:
 
 ```jsonc
