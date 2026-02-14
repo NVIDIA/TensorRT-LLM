@@ -5,9 +5,13 @@ import torch.nn as nn
 from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe import (
+    _execute_shared_expert_in_aux_stream,
     aux_stream_wrapper,
+    begin_aux_stream_passthrough,
     cuda_stream_manager,
+    end_aux_stream_passthrough,
     record_event_passthrough,
+    wait_aux_stream_passthrough,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import canonicalize_graph
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -141,3 +145,101 @@ def test_multi_stream_linear():
     graph.replay()
 
     assert torch.allclose(static_output, ref_output)
+
+
+# ---------------------------------------------------------------------------
+# Mock MoE custom op (for testing shared-expert-on-aux stream transform)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("auto_deploy::mock_moe_for_test", mutates_args=())
+def mock_moe_for_test(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Mock MoE: applies a simple linear transform (for testing only)."""
+    return torch.ops.aten.linear(x, expert_weight)
+
+
+@mock_moe_for_test.register_fake
+def mock_moe_for_test_fake(x, selected_experts, routing_weights, expert_weight):
+    return torch.ops.aten.linear(x, expert_weight)
+
+
+class MockSharedExpertMoE(nn.Module):
+    """Mimics a MoE layer with shared experts and a merge ``add``."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        # Shared-expert path
+        self.shared_up = nn.Linear(dim, dim, bias=False)
+        self.shared_down = nn.Linear(dim, dim, bias=False)
+        # Gate / routing
+        self.gate = nn.Linear(dim, 8, bias=False)
+        # Expert weight for mock MoE
+        self.expert_weight = nn.Parameter(torch.randn(dim, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Routing
+        logits = self.gate(x)
+        routing_weights, selected_experts = torch.topk(logits, k=2, dim=-1)
+
+        # Shared expert (runs first in eager, should go to aux stream)
+        shared_out = self.shared_down(torch.relu(self.shared_up(x)))
+
+        # Routed expert (mock MoE)
+        moe_out = torch.ops.auto_deploy.mock_moe_for_test(
+            x, selected_experts, routing_weights, self.expert_weight
+        )
+
+        return shared_out + moe_out
+
+
+def test_shared_expert_on_aux_stream():
+    """Test shared-expert-on-aux-stream transform: correctness + CUDA graph."""
+    dim = 128
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockSharedExpertMoE(dim).eval().to("cuda")
+
+    example_input = torch.randn(4, dim, device="cuda")
+    egm = torch.export.export(model, (example_input,))
+    gm = egm.module()
+
+    test_x = torch.randn(4, dim, device="cuda")
+    ref_output = model(test_x)
+
+    # Apply the transform.
+    gm, num_replaced = _execute_shared_expert_in_aux_stream(
+        gm, [torch.ops.auto_deploy.mock_moe_for_test]
+    )
+
+    assert num_replaced == 1, f"Expected 1 replacement, got {num_replaced}"
+
+    # Verify the graph now contains the three new stream-management nodes.
+    targets = {n.target for n in gm.graph.nodes if n.op == "call_function"}
+    assert begin_aux_stream_passthrough in targets, "begin_aux not found in graph"
+    assert end_aux_stream_passthrough in targets, "end_aux not found in graph"
+    assert wait_aux_stream_passthrough in targets, "wait_aux not found in graph"
+
+    y = gm(test_x)
+    assert torch.allclose(y, ref_output, atol=1e-5), (
+        f"Output mismatch: max diff = {(y - ref_output).abs().max()}"
+    )
+
+    # CUDA graph compatibility check.
+    static_x = torch.randn(4, dim, device="cuda")
+    static_output = torch.randn(4, dim, device="cuda")
+
+    cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(cuda_graph):
+        static_output.copy_(gm(static_x))
+
+    static_x.copy_(test_x)
+    cuda_graph.replay()
+
+    assert torch.allclose(static_output, ref_output, atol=1e-5), (
+        f"CUDA graph output mismatch: max diff = {(static_output - ref_output).abs().max()}"
+    )

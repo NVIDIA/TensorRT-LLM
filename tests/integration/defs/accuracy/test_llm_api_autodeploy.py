@@ -343,6 +343,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                     "sharding_source": ['factory', 'heuristic'],
                     "sharding_dims": ['ep', 'bmm'],
                 },
+                "multi_stream_moe": {
+                    "stage": "compile",
+                    "enabled": True,
+                },
             }
         }
 
