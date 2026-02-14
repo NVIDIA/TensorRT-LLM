@@ -14,6 +14,9 @@ attention through absorption mode (576/512 FMHA kernels).
 > has a built-in DSA indexer that routes context through absorption mode (576/512 kernels),
 > which works correctly.
 
+**Checkpoint:** [warnold-nv/GLM-5-nvfp4-v1](https://huggingface.co/warnold-nv/GLM-5-nvfp4-v1).  
+*Not an official NVIDIA checkpoint — for experimentation purposes only. Model Opt performed by Will Arnold.*
+
 ---
 
 ## Prerequisites
@@ -22,7 +25,7 @@ attention through absorption mode (576/512 FMHA kernels).
 |------|---------|
 | Hardware | 8× B200 GPUs (SM100) |
 | Container | `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc3` |
-| Model | GLM-5 NVFP4 checkpoint (e.g. `GLM-5-nvfp4-v1/`) |
+| Model | [GLM-5 NVFP4 checkpoint](https://huggingface.co/warnold-nv/GLM-5-nvfp4-v1) (e.g. `GLM-5-nvfp4-v1/`) |
 
 ---
 
