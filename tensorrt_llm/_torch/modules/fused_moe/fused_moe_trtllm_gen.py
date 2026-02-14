@@ -550,7 +550,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         if self.has_deepseek_fp8_block_scales:
             assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
-            # fp8_block_scale_moe_runner needs 2D shape for x_sf and only support SM100+
+            # fp8_quantize_1x128 returns 2D x_sf on SM100+, 1D on SM90
             if x_sf is None:
                 x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
 
