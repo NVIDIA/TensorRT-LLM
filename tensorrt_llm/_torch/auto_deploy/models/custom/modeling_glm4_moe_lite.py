@@ -32,7 +32,6 @@ from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
     _rope_deinterleave_load_hook,
-    build_cos_sin_caches,
 )
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
@@ -166,10 +165,10 @@ class Glm4MoeLiteRMSNorm(nn.Module):
 class Glm4MoeLiteRotaryEmbedding(nn.Module):
     """Rotary Position Embedding for GLM4 MoE Lite.
 
-    Simplified version that precomputes and caches cos/sin values.
-    Returns full cached values (not sliced by seq_len) to enable export.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    Stores only inv_freq and computes the full cos/sin table dynamically in
+    forward.  The rope.py optimization pass detects the computation pattern,
+    pre-computes a static fused cos_sin_cache, and replaces the dynamic ops
+    with flashinfer_rope.
     """
 
     def __init__(
@@ -183,38 +182,25 @@ class Glm4MoeLiteRotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        self.attention_scaling = attention_scaling
+        self._rope_scale = attention_scaling
 
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        # Build cos/sin cache with AD-specific naming
-        self._set_cos_sin_cache(max_position_embeddings)
-
-    def _set_cos_sin_cache(self, seq_len: int):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)  # [max_seq_len, D/2]
-
-        cos_full, sin_full, cos_sin_cache = build_cos_sin_caches(
-            freqs, scale=self.attention_scaling
-        )
-
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        self.register_buffer("_ad_cos_cached", cos_full, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin_full, persistent=False)
-        self.register_buffer("_ad_rope_cos_sin_cache", cos_sin_cache, persistent=False)
+        self.max_seq_len_cached = max_position_embeddings
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Return full cached cos/sin (not sliced) for export compatibility,
-        # plus pre-fused cache for FlashInfer RoPE optimization
-        return (
-            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_rope_cos_sin_cache,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Compute full [max_seq_len, D] cos/sin table dynamically from inv_freq.
+        # The optimization pass will detect this and replace with a static cache.
+        t = torch.arange(
+            self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype
         )
+        freqs = torch.outer(t, self.inv_freq)  # [max_seq_len, D/2]
+        emb = torch.cat([freqs, freqs], dim=-1)  # [max_seq_len, D]
+        cos = emb.cos() * self._rope_scale
+        sin = emb.sin() * self._rope_scale
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
@@ -240,11 +226,12 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
         super().__init__(dim, max_position_embeddings, base, attention_scaling)
+        # Override inv_freq with YaRN-modified version and set mscale
+        self._setup_buffers()
 
-    def _set_cos_sin_cache(self, seq_len: int):
-        self.max_seq_len_cached = seq_len
+    def _compute_yarn_inv_freq(self) -> torch.Tensor:
+        """Compute YaRN-modified inv_freq with frequency interpolation."""
         dim = self.dim
-
         freq_extra = 1.0 / (self.base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         freq_inter = 1.0 / (
             self.scaling_factor * self.base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
@@ -258,23 +245,17 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
             self.original_max_position_embeddings,
         )
         inv_freq_mask = 1.0 - self._yarn_linear_ramp_mask(low, high, dim // 2)
-        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+        return freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+
+    def _setup_buffers(self):
+        """Override inv_freq with YaRN-modified version and set scale."""
+        inv_freq = self._compute_yarn_inv_freq()
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        t = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-
-        _mscale = float(
+        self.max_seq_len_cached = self.max_position_embeddings
+        self._rope_scale = float(
             self._yarn_get_mscale(self.scaling_factor, self.mscale)
             / self._yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
         )
-
-        cos_full, sin_full, cos_sin_cache = build_cos_sin_caches(freqs, scale=_mscale)
-
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        self.register_buffer("_ad_cos_cached", cos_full, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin_full, persistent=False)
-        self.register_buffer("_ad_rope_cos_sin_cache", cos_sin_cache, persistent=False)
 
     @staticmethod
     def _yarn_find_correction_dim(
