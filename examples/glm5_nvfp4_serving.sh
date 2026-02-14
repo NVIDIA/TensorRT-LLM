@@ -30,22 +30,7 @@
 #      (HF expects "additional_special_tokens" as key name; the GLM5 field name
 #       "extra_special_tokens" causes 'list has no attribute keys' error)
 #
-# C. TRT-LLM C++ FIX (attentionOp.cpp, applied via sed at build time)
-#    DSV3 MLA assumes v_head_dim == qk_nope_head_dim. GLM5 differs (256 vs 192):
-#    - Line ~2799: change headSizeV = qk_nope_head_dim -> v_head_dim
-#    - Line ~2896: relax FMHA assertion to warning (safety net)
-#
-# D. TRT-LLM SOURCE BRANCH (new FMHA kernels for GLM5)
-#    Use PerkzZheng's branch which adds pre-compiled FMHA kernels:
-#    - github.com/PerkzZheng/TensorRT-LLM branch: user/perkzz/glm-flash-trtllm-gen
-#    - Ref: https://github.com/NVIDIA/TensorRT-LLM/compare/main...PerkzZheng:TensorRT-LLM:user/perkzz/glm-flash-trtllm-gen
-#
-# E. FLASHINFER PATCH (runtime, after pip install)
-#    Remove hardcoded qk_nope_head_dim==128 check in flashinfer/mla.py:
-#    - Post-absorption kernel operates on d_qk=576, d_v=512 regardless
-#    - Ref: https://github.com/Aphoh/flashinfer/commit/5fb657b
-#
-# F. SERVE CONFIG
+# C. SERVE CONFIG
 #    - sparse_attention_config with algorithm=dsa + GLM5 indexer params
 #    - kv_cache_config with dtype=fp8 for FP8 KV cache
 #    - --trust_remote_code (needed for tokenizer)
@@ -66,68 +51,7 @@ docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
 # Everything below runs INSIDE the Docker container
 # ============================================================
 
-# --- Step 3: Clone PerkzZheng's branch to /tmp ---
-cd /tmp
-git clone --branch user/perkzz/glm-flash-trtllm-gen --single-branch \
-    https://github.com/PerkzZheng/TensorRT-LLM.git TensorRT-LLM-GLM
-cd /tmp/TensorRT-LLM-GLM
-
-# --- Step 4: Apply C++ fixes ---
-# Fix 1: headSizeV = v_head_dim (GLM5: v_head_dim=256, qk_nope=192)
-sed -i 's/fmhaParams.headSizeV = mMLAParams.qk_nope_head_dim;/fmhaParams.headSizeV = mMLAParams.v_head_dim;/' \
-    cpp/tensorrt_llm/common/attentionOp.cpp
-
-# Fix 2: Relax FMHA assertion to warning (safety net)
-python3 -c "
-p = 'cpp/tensorrt_llm/common/attentionOp.cpp'
-with open(p) as f: c = f.read()
-old = '''            if (!mIsGenerationMLA)
-            {
-                TLLM_CHECK_WITH_INFO(
-                    mFmhaDispatcher->isSupported(), \"Deepseek should be supported by fmha in context part.\");
-            }'''
-new = '''            if (!mIsGenerationMLA && !mFmhaDispatcher->isSupported())
-            {
-                TLLM_LOG_WARNING(\"FMHA not supported for context MLA, falling back to unfused MHA.\");
-            }'''
-if old in c:
-    c = c.replace(old, new)
-    with open(p, 'w') as f: f.write(c)
-    print('Assertion relaxation applied')
-else:
-    print('Assertion pattern not found - may already be fixed')
-"
-
-# --- Step 5: Verify fixes ---
-echo "=== Verifying headSizeV fix ==="
-grep -n "headSizeV = mMLAParams" cpp/tensorrt_llm/common/attentionOp.cpp
-echo "=== Verifying assertion relaxation ==="
-grep -n "FMHA not supported for context MLA\|Deepseek should be supported" cpp/tensorrt_llm/common/attentionOp.cpp
-
-# --- Step 6: Build (~20-30 min with --fast_build -j32) ---
-python scripts/build_wheel.py \
-    --fast_build \
-    --cuda_architectures "100" \
-    --no-venv \
-    --job_count 32
-
-# --- Step 7: Install ---
-pip install build/tensorrt_llm*.whl --force-reinstall --no-deps
-
-# --- Step 8: Patch flashinfer ---
-python3 -c "
-import flashinfer, os
-path = os.path.join(os.path.dirname(flashinfer.__file__), 'mla.py')
-with open(path) as f: c = f.read()
-if 'qk_nope_head_dim != 128' in c:
-    c = c.replace('if qk_nope_head_dim != 128:', 'if False and qk_nope_head_dim != 128:')
-    with open(path, 'w') as f: f.write(c)
-    print('flashinfer patched')
-else:
-    print('already patched or not found')
-"
-
-# --- Step 9: Serve GLM5 ---
+# --- Step 3: Serve GLM5 ---
 cat > /tmp/glm5_config.yaml <<'YAML'
 sparse_attention_config:
   algorithm: dsa
@@ -150,6 +74,6 @@ trtllm-serve serve \
     --extra_llm_api_options /tmp/glm5_config.yaml
 
 # --- Test (from host node, not inside container) ---
-# curl http://172.17.0.2:8000/v1/completions \
-#   -H "Content-Type: application/json" \
-#   -d '{"model":"GLM-5-nvfp4-v1","prompt":"The capital of France is","max_tokens":50}'
+curl http://172.17.0.2:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"GLM-5-nvfp4-v1","prompt":"The capital of France is","max_tokens":50}'
