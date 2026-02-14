@@ -522,6 +522,12 @@ class TRTLLMGenFusedMoE(MoE):
             n_group = self.routing_method.routing_impl.n_group
             topk_group = self.routing_method.routing_impl.topk_group
             routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
+        elif isinstance(self.routing_method, MiniMaxM2MoeRoutingMethod):
+            top_k = self.routing_method.top_k
+            routing_bias = self.routing_method.e_score_correction_bias
+            n_group = None
+            topk_group = None
+            routed_scaling_factor = None
         else:
             top_k = self.routing_method.top_k
             routing_bias = None
@@ -1070,8 +1076,9 @@ class TRTLLMGenFusedMoE(MoE):
         else:
             is_deepseek_v3_routing = isinstance(self.routing_method,
                                                 DeepSeekV3MoeRoutingMethod)
+            is_minimax_routing = isinstance(self.routing_method, MiniMaxM2MoeRoutingMethod)
             top_k = self.routing_method.routing_impl.top_k if is_deepseek_v3_routing else self.routing_method.top_k
-            routing_bias = self.routing_method.e_score_correction_bias if is_deepseek_v3_routing else None
+            routing_bias = self.routing_method.e_score_correction_bias if (is_deepseek_v3_routing or is_minimax_routing) else None
             return fp4_block_scale_fake_output_without_finalize(
                 x,
                 self.num_experts,
