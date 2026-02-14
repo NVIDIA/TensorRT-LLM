@@ -73,8 +73,16 @@ def allocate_gpus(
         local_gpu_id = global_gpu_cursor % gpus_per_node
         return node_id, local_gpu_id
 
+    def align_cursor_to_node_boundary():
+        """Align cursor to next node boundary if we're mid-node."""
+        nonlocal global_gpu_cursor
+        if global_gpu_cursor % gpus_per_node != 0:
+            current_node = global_gpu_cursor // gpus_per_node
+            global_gpu_cursor = (current_node + 1) * gpus_per_node
+
     def assign_server(server_allocation: Dict[str, Any], world_size: int,
                       gpus_per_node: int):
+        """Assign GPUs contiguously for a single server instance."""
         nonlocal global_gpu_cursor
         for _ in range(world_size):
             node_id, gpu_id = get_gpu_location(gpus_per_node)
@@ -91,6 +99,11 @@ def allocate_gpus(
         world_size: int,
         gpus_per_node: int,
     ):
+        # Align to node boundary at the START of each server type (ctx / gen).
+        # 1) Instances of different server types don't share nodes.
+        # 2) Instances of the same server type can share nodes.
+        align_cursor_to_node_boundary()
+
         if server_type not in server_allocations:
             server_allocations[server_type] = {}
         for i in range(num_servers):
@@ -105,6 +118,42 @@ def allocate_gpus(
                    gpus_per_node)
     assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size,
                    gpus_per_node)
+
+    # Validate no port conflicts: each server binds to its first node.
+    bound_addresses = {}  # (first_node, port) -> (server_type, server_id)
+    for server_type in allocations:
+        for server_id, server in allocations[server_type].items():
+            first_node = list(server["nodes"].keys())[0]
+            port = server["port"]
+            addr = (first_node, port)
+            if addr in bound_addresses:
+                conflict = bound_addresses[addr]
+                # Build verbose allocation summary.
+                lines = ["", "=" * 60, "SERVER ALLOCATION SUMMARY", "=" * 60]
+                for stype in allocations:
+                    for sid, srv in allocations[stype].items():
+                        srv_first_node = list(srv["nodes"].keys())[0]
+                        srv_port = srv["port"]
+                        nodes_str = ", ".join(
+                            f"{n}: GPUs {gpus}"
+                            for n, gpus in srv["nodes"].items())
+                        marker = ""
+                        if (stype == server_type and sid == server_id) or \
+                           (stype == conflict[0] and sid == conflict[1]):
+                            marker = " <<<< CONFLICT"
+                        lines.append(
+                            f"  {stype} server {sid}: "
+                            f"bind={srv_first_node}:{srv_port}, "
+                            f"nodes=[{nodes_str}]{marker}")
+                lines.extend([
+                    "=" * 60,
+                    f"ERROR: {server_type} server {server_id} and "
+                    f"{conflict[0]} server {conflict[1]} both bind to "
+                    f"{first_node}:{port}",
+                    "=" * 60,
+                ])
+                raise RuntimeError("\n".join(lines))
+            bound_addresses[addr] = (server_type, server_id)
 
     return allocations
 
@@ -225,7 +274,12 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         if role == "GEN":
             env["TLLM_BENCHMARK_REQ_QUEUES_SIZE"] = str(concurrency)
 
-    # 5. Add profiling env vars (conditional)
+    # 5. Force NVLink two-sided alltoall method for workers to avoid hangs.
+    env["TRTLLM_FORCE_ALLTOALL_METHOD"] = "NVLinkTwoSided"
+    # 6. Enable perfect router for MoE load balancing.
+    env["ENABLE_PERFECT_ROUTER"] = "1"
+
+    # 7. Add profiling env vars (conditional)
     if nsys_on:
         env["TLLM_PROFILE_RECORD_GC"] = "1"
         env["TLLM_NVTX_DEBUG"] = "1"
@@ -370,14 +424,33 @@ def submit_job(config, log_dir, dry_run):
     ucx_warmup_requests = 2 * ctx_world_size * \
         gen_world_size if benchmark_config['mode'] == "e2e" else 0
 
-    total_nodes = ctx_nodes + gen_nodes
+    mode = config['benchmark']['mode']
+    if mode == 'gen_only_no_context':
+        total_nodes = gen_nodes
+    else:
+        total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
     # Generate log directory path based on configuration
     isl = benchmark_config['input_length']
     osl = benchmark_config['output_length']
-    gen_batch_size = worker_config['gen']['max_batch_size']
     gen_enable_attention_dp = worker_config['gen']['enable_attention_dp']
+
+    # Calculate global batch size from cuda_graph_config.max_batch_size (micro-batch)
+    # With AttnDP: dp_size = tp_size (tensor parallel acts as data parallel)
+    # Without AttnDP: dp_size = 1
+    # Global batch size = cuda_graph_config.max_batch_size * pp_size * dp_size
+    # Note: We use cuda_graph_config.max_batch_size (micro-batch) instead of
+    # worker_config.max_batch_size because the latter may be inflated to avoid
+    # deadlocks in disaggregated serving with attention DP.
+    cuda_graph_config = worker_config['gen'].get('cuda_graph_config', {})
+    if cuda_graph_config:
+        gen_batch_size = cuda_graph_config.get('max_batch_size',
+                                                worker_config['gen']['max_batch_size'])
+    else:
+        gen_batch_size = worker_config['gen']['max_batch_size']
+    dp_size = gen_tp_size if gen_enable_attention_dp else 1
+    global_batch_size = gen_batch_size * gen_pp_size * dp_size
 
     # Get eplb num_slots for gen worker
     load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
@@ -395,19 +468,27 @@ def submit_job(config, log_dir, dry_run):
     if 'log_dir' in env_config and env_config['log_dir']:
         log_dir = env_config['log_dir']
     if log_dir is None:
-        log_base = os.path.join(script_dir, "logs")
+        # Create flat log directory path with timestamp including hours, minutes and seconds
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
+        # Get eplb num_slots for gen worker
+        load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
+            'load_balancer', {})
+        if isinstance(load_balancer_config, str):
+            with open(load_balancer_config, 'r') as f:
+                load_balancer_config = yaml.safe_load(f)
+        eplb_num_slots = load_balancer_config.get('num_slots', 0)
 
-        # Determine directory suffix based on attention_dp
-        if gen_enable_attention_dp:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
-        else:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        gen_ep_size = worker_config['gen'].get('moe_expert_parallel_size', 1)
 
-        # Create full log directory path
-        log_dir = os.path.join(log_base, dir_suffix)
+        # Determine config suffix based on attention_dp
+        # Use global_batch_size (= max_batch_size * pp_size * dp_size) for clarity
+        attn_dp_str = "_attnDP" if gen_enable_attention_dp else ""
+        config_suffix = f"ctx{ctx_num}_gen{gen_num}_tp{gen_tp_size}_pp{gen_pp_size}_ep{gen_ep_size}_cp{gen_cp_size}_batch{global_batch_size}{attn_dp_str}"
+
+        # Create full log directory path as a single flat directory
+        log_dir = os.path.join(env_config['work_dir'],
+                               f"{timestamp}_{isl}-{osl}_{config_suffix}")
 
     # if trtllm_config.yaml exists, don't remove the directory, remove other files in the directory except trtllm_config.yaml
     # also don't remove concurrency_* folders

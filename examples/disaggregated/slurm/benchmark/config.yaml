@@ -32,6 +32,7 @@ environment:
   container_mount: "/lustre/fsw/coreai_comparch_trtllm:/lustre/fsw/coreai_comparch_trtllm"  # Format: path1:path1,path2:path2
   container_image: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/sqsh/trtllm-pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-20260201-10901.sqsh"
   model_path: "/lustre/fsw/coreai_comparch_trtllm/jiaganc/model/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/"
+  # model_path: "/lustre/fsw/coreai_comparch_trtllm/common/DeepSeek-V3.2-FP4-v2/"
   trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
   cuda_architectures: "100-real;103-real"  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
@@ -69,6 +70,7 @@ worker_config:
       cp_type: "HELIX"
       tokens_per_block: 32
       use_nccl_for_alltoall: false
+      fifo_version: 2
     max_batch_size: 8
     max_num_tokens: 16
     max_seq_len: 139776
