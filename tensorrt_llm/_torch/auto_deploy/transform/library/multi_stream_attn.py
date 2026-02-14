@@ -166,7 +166,6 @@ def _execute_kv_proj_in_aux_stream(gm: GraphModule) -> Tuple[GraphModule, int]:
             rec_node = graph.call_function(
                 record_event_passthrough,
                 args=(fork_point,),
-                kwargs={"device": torch.cuda.current_device()},
             )
 
         # Replace KV linear with its aux-stream variant.  The hidden-state
