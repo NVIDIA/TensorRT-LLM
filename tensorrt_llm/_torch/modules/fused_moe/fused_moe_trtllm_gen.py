@@ -42,7 +42,7 @@ from .quantization import (
     W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
-from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
+from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod, MiniMaxM2MoeRoutingMethod
 
 
 class TRTLLMGenFusedMoE(MoE):
