@@ -22,8 +22,7 @@
 /* ReferenceType object structure */
 typedef struct
 {
-    PyObject_HEAD Py_ssize_t object_id; /* ID of the referenced object */
-    int valid;                          /* 1 if valid, 0 if invalidated */
+    PyObject_HEAD Py_ssize_t object_id; /* ID of the referenced object. 0 if invalid. */
 } ReferenceTypeObject;
 
 /* Forward declarations */
@@ -52,7 +51,7 @@ static PyObject* ReferenceType_new(PyTypeObject* type, PyObject* args, PyObject*
         if (PyObject_TypeCheck(existing_ref, &ReferenceTypeType))
         {
             ReferenceTypeObject* ref_obj = (ReferenceTypeObject*) existing_ref;
-            if (ref_obj->valid)
+            if (ref_obj->object_id != 0)
             {
                 /* Return existing valid reference */
                 return existing_ref;
@@ -72,7 +71,6 @@ static PyObject* ReferenceType_new(PyTypeObject* type, PyObject* args, PyObject*
     if (self != NULL)
     {
         self->object_id = (Py_ssize_t) obj;
-        self->valid = 1;
 
         /* Set obj.__rawref__ to this new reference using cached attr name */
         if (PyObject_SetAttr(obj, rawref_attr_name, (PyObject*) self) < 0)
@@ -87,10 +85,21 @@ static PyObject* ReferenceType_new(PyTypeObject* type, PyObject* args, PyObject*
 /* ReferenceType.__init__ */
 static int ReferenceType_init(ReferenceTypeObject* self, PyObject* args, PyObject* kwds)
 {
-    /* __new__ already did all the work, including setting object_id and valid */
+    /* __new__ already did all the work, including setting object_id */
     /* Skip argument parsing since __new__ already validated them */
     /* This saves ~5-10% overhead on object creation */
     return 0;
+}
+
+/* ReferenceType.__hash__ */
+static Py_hash_t ReferenceType_hash(ReferenceTypeObject* self)
+{
+    if (self->object_id == 0)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "Reference is invalid");
+        return -1;
+    }
+    return (Py_hash_t) self->object_id;
 }
 
 /* ReferenceType.__call__() - dereference the object */
@@ -98,7 +107,7 @@ static PyObject* ReferenceType_call(ReferenceTypeObject* self, PyObject* args, P
 {
     PyObject* obj;
 
-    if (!self->valid)
+    if (self->object_id == 0)
     {
         Py_RETURN_NONE;
     }
@@ -119,21 +128,21 @@ static PyObject* ReferenceType_call(ReferenceTypeObject* self, PyObject* args, P
     }
 
     /* Object no longer valid */
-    self->valid = 0;
+    self->object_id = 0;
     Py_RETURN_NONE;
 }
 
 /* ReferenceType.invalidate() */
 static PyObject* ReferenceType_invalidate(ReferenceTypeObject* self, PyObject* Py_UNUSED(ignored))
 {
-    self->valid = 0;
+    self->object_id = 0;
     Py_RETURN_NONE;
 }
 
 /* ReferenceType.is_valid property getter */
 static PyObject* ReferenceType_is_valid(ReferenceTypeObject* self, void* closure)
 {
-    return PyBool_FromLong(self->valid);
+    return PyBool_FromLong(self->object_id != 0);
 }
 
 /* ReferenceType.__class_getitem__() - support for generic type subscripting */
@@ -170,6 +179,7 @@ static PyTypeObject ReferenceTypeType = {
     .tp_new = ReferenceType_new,
     .tp_init = (initproc) ReferenceType_init,
     .tp_call = (ternaryfunc) ReferenceType_call,
+    .tp_hash = (hashfunc) ReferenceType_hash,
     .tp_methods = ReferenceType_methods,
     .tp_getset = ReferenceType_getsetters,
 };
@@ -225,7 +235,6 @@ PyMODINIT_FUNC PyInit__rawref(void)
     if (null_ref != NULL)
     {
         null_ref->object_id = 0;
-        null_ref->valid = 0;
         if (PyModule_AddObject(m, "NULL", (PyObject*) null_ref) < 0)
         {
             Py_DECREF(null_ref);
