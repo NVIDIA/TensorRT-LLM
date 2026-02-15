@@ -489,33 +489,6 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-# -----------------------------------------------------------------------------
-# Model registry accuracy tests (at end of file)
-# -----------------------------------------------------------------------------
-
-
-def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
-    """Return (yaml_extra paths, world_size) from model registry."""
-    REGISTRY_PATH = Path(
-        __file__).resolve().parents[4] / "examples/auto_deploy/model_registry"
-
-    with open(REGISTRY_PATH / "models.yaml") as f:
-        registry = yaml.safe_load(f)
-    for entry in registry["models"]:
-        if entry["name"] == model_name:
-            config_dir = REGISTRY_PATH / "configs"
-            paths = [str(config_dir / f) for f in entry["yaml_extra"]]
-            # world_size from world_size_N.yaml (last match wins)
-            world_size = 1
-            for f in entry["yaml_extra"]:
-                s = str(f)
-                if "world_size_" in s and s.endswith(".yaml"):
-                    world_size = int(
-                        s.replace("world_size_", "").replace(".yaml", ""))
-            return paths, world_size
-    raise ValueError(f"Model '{model_name}' not found in model registry")
-
-
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     """Accuracy tests for models from the AutoDeploy model registry.
 
@@ -573,6 +546,27 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         ),
     ]
 
+    @staticmethod
+    def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
+        """Return (yaml_extra paths, world_size) from model registry."""
+        registry_path = (Path(__file__).resolve().parents[4] /
+                         "examples/auto_deploy/model_registry")
+        with open(registry_path / "models.yaml") as f:
+            registry = yaml.safe_load(f)
+        for entry in registry["models"]:
+            if entry["name"] == model_name:
+                config_dir = registry_path / "configs"
+                paths = [str(config_dir / f) for f in entry["yaml_extra"]]
+                # world_size from world_size_N.yaml (last match wins)
+                world_size = 1
+                for f in entry["yaml_extra"]:
+                    s = str(f)
+                    if "world_size_" in s and s.endswith(".yaml"):
+                        world_size = int(
+                            s.replace("world_size_", "").replace(".yaml", ""))
+                return paths, world_size
+        raise ValueError(f"Model '{model_name}' not found in model registry")
+
     def get_default_sampling_params(self):
         # Use end_id=None so _setup runs and tokenizes stop sequences (e.g. GSM8K).
         return SamplingParams(end_id=None,
@@ -587,7 +581,8 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
                                       accuracy_check):
         model_path = hf_id_to_local_model_dir(model_name)
-        yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
+        yaml_paths, registry_world_size = self._get_registry_yaml_extra(
+            model_name)
         merged = deep_merge_dicts(self.BASE_ACCURACY, config_overrides)
         effective_world_size = merged.get("world_size", registry_world_size)
         if get_device_count() < effective_world_size:
