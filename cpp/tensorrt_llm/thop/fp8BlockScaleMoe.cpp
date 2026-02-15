@@ -63,7 +63,8 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     }
     else if (routing_logits.has_value())
     {
-        if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
+        if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3
+            || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::MiniMax2)
         {
             TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::Float, "routing_logits must be float");
         }

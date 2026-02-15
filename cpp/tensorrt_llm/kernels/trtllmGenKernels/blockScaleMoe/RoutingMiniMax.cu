@@ -253,15 +253,44 @@ int32_t constexpr getMaxNumExperts(int32_t numExperts)
     }
 }
 
+// MiniMax-specific dispatch: InputT is always float (gate is float32).
+// Only OutputT varies based on mDtypeExpW (bf16 for bias/weights, or float).
+#define LAUNCH_ROUTING_MINIMAX_IMPL(                                                                                   \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, numExperts)                         \
+    if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1)                                                              \
+    {                                                                                                                  \
+        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, true), kernel, numBlocks, numThreads,      \
+            smemSize, stream);                                                                                         \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                       \
+    {                                                                                                                  \
+        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, false), kernel, numBlocks, numThreads,     \
+            smemSize, stream);                                                                                         \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag1)                                                     \
+    {                                                                                                                  \
+        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, numExperts, true), kernel, numBlocks,          \
+            numThreads, smemSize, stream);                                                                             \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
+    {                                                                                                                  \
+        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, numExperts, false), kernel, numBlocks,         \
+            numThreads, smemSize, stream);                                                                             \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                                       \
+    }
+
 #define LAUNCH_ROUTING_MINIMAX(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1)          \
     if (data.mNumExperts <= topk::MaxNumExpertsUnit)                                                                   \
     {                                                                                                                  \
-        LAUNCH_ROUTING_WITH_NUM_EXPERTS(                                                                               \
+        LAUNCH_ROUTING_MINIMAX_IMPL(                                                                                   \
             data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, topk::MaxNumExpertsUnit);   \
     }                                                                                                                  \
     else if (data.mNumExperts <= NumExpertsLimit)                                                                      \
     {                                                                                                                  \
-        LAUNCH_ROUTING_WITH_NUM_EXPERTS(                                                                               \
+        LAUNCH_ROUTING_MINIMAX_IMPL(                                                                                   \
             data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, NumExpertsLimit);           \
     }                                                                                                                  \
     else                                                                                                               \
