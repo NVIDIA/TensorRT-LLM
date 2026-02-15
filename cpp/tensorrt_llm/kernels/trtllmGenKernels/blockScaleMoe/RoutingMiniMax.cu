@@ -230,6 +230,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesHis
             {
                 params.mPtrTopKPacked[tokenIdx * params.mTopK + laneIdx] = packed;
             }
+            if (params.mPtrTopKWeights != nullptr && laneIdx < params.mTopK)
+            {
+                params.mPtrTopKWeights[tokenIdx * params.mTopK + laneIdx] = static_cast<OutputT>(finalW);
+            }
         }
     }
 }
