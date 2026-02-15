@@ -1235,13 +1235,11 @@ def shape(node: Node) -> Tuple[int, ...]:
 
 
 def get_weight_tensor(node: Node) -> torch.Tensor:
-    """Extract the weight tensor from a compute node."""
-    weight_node = get_weight_node(node)
-    if weight_node is None:
+    """Extract the weight tensor from a node within a GraphModule."""
+    weight_nodes = extract_weight_nodes(node)
+    if len(weight_nodes.weights) == 0:
         raise ValueError(f"Node {node.name} has no weight")
-
-    gm = node.graph.owning_module
-    return get_param_or_buffer(weight_node.target, gm)
+    return weight_nodes.weights[0].tensor
 
 
 def draw_graph(gm: GraphModule, filename: str):

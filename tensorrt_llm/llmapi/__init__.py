@@ -22,10 +22,13 @@ from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
+from .visual_gen import VisualGen, VisualGenParams
 
 __all__ = [
     'LLM',
     'AsyncLLM',
+    'VisualGen',
+    'VisualGenParams',
     'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',

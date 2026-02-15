@@ -5,7 +5,6 @@ import os
 import threading
 import time
 import traceback
-from collections import deque
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
@@ -32,7 +31,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
@@ -63,7 +62,8 @@ from .resource_manager import (ResourceManager, ResourceManagerType,
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
-                        SerializableSchedulerOutput)
+                        SerializableSchedulerOutput, WaitingQueue,
+                        create_waiting_queue)
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -253,30 +253,32 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
-    def __init__(self,
-                 resource_manager,
-                 scheduler: RequestScheduler,
-                 model_engine: ModelEngine,
-                 sampler: Sampler,
-                 dist: Distributed,
-                 max_num_sequences: int,
-                 drafter: Optional[Drafter] = None,
-                 disable_overlap_scheduler: bool = False,
-                 max_input_len: int = 0x7fffffff,
-                 max_batch_size: int = 8,
-                 max_beam_width: int = 1,
-                 max_draft_len: int = 0,
-                 max_total_draft_tokens: int = 0,
-                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-                 guided_decoder: Optional[GuidedDecoder] = None,
-                 garbage_collection_gen0_threshold: Optional[int] = None,
-                 start_worker: bool = True,
-                 kv_connector_manager: Optional[KvCacheConnectorManager] = None,
-                 max_seq_len: Optional[int] = None,
-                 peft_cache_config: Optional[PeftCacheConfig] = None,
-                 virtual_memory_pools: Optional[dict] = None,
-                 hang_detection_timeout: Optional[int] = None,
-                 execution_stream: Optional[torch.cuda.Stream] = None):
+    def __init__(
+            self,
+            resource_manager,
+            scheduler: RequestScheduler,
+            model_engine: ModelEngine,
+            sampler: Sampler,
+            dist: Distributed,
+            max_num_sequences: int,
+            drafter: Optional[Drafter] = None,
+            disable_overlap_scheduler: bool = False,
+            max_input_len: int = 0x7fffffff,
+            max_batch_size: int = 8,
+            max_beam_width: int = 1,
+            max_draft_len: int = 0,
+            max_total_draft_tokens: int = 0,
+            kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
+            guided_decoder: Optional[GuidedDecoder] = None,
+            garbage_collection_gen0_threshold: Optional[int] = None,
+            start_worker: bool = True,
+            kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+            max_seq_len: Optional[int] = None,
+            peft_cache_config: Optional[PeftCacheConfig] = None,
+            virtual_memory_pools: Optional[dict] = None,
+            hang_detection_timeout: Optional[int] = None,
+            execution_stream: Optional[torch.cuda.Stream] = None,
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -474,7 +476,8 @@ class PyExecutor:
                                                       self.hang_detector)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
-        self.waiting_queue: deque[RequestQueueItem] = deque()
+        self.waiting_queue: WaitingQueue = create_waiting_queue(
+            waiting_queue_policy)
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -2233,8 +2236,7 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
-    def _fetch_and_enqueue_requests(self,
-                                    waiting_queue: deque[RequestQueueItem],
+    def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
         # Block new requests while control requests are pending
@@ -2277,11 +2279,11 @@ class PyExecutor:
                                    > 1) and self.dist.rank > 0:
             attach_py_objects_to_requests(new_requests, py_request_objects)
 
-        waiting_queue.extend(new_requests)
+        waiting_queue.add_requests(new_requests)
 
     def _pop_from_waiting_queue(
         self,
-        waiting_queue: deque[RequestQueueItem],
+        waiting_queue: WaitingQueue,
         total_num_active_requests: int,
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
@@ -2302,7 +2304,7 @@ class PyExecutor:
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
-            self, waiting_queue: deque[RequestQueueItem],
+            self, waiting_queue: WaitingQueue,
             activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
         # 1. Gather info and calculate total_num_active_requests
@@ -3039,8 +3041,7 @@ class PyExecutor:
         canceled_req_ids_set = set(self.canceled_req_ids)
 
         # Remove canceled requests from the waiting queue
-        self.waiting_queue = deque(req for req in self.waiting_queue
-                                   if req.id not in canceled_req_ids_set)
+        self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
         still_pending_canceled_ids = []
         for request in self.active_requests:

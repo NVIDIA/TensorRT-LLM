@@ -339,7 +339,9 @@ MultimodalInput Serialization::deserializeMultimodalInput(std::istream& is)
     auto multimodalHashes = su::deserialize<std::vector<std::vector<SizeType32>>>(is);
     auto multimodalPositions = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalLengths = su::deserialize<std::vector<SizeType32>>(is);
-    return MultimodalInput{std::move(multimodalHashes), std::move(multimodalPositions), std::move(multimodalLengths)};
+    auto multimodalUuids = su::deserialize<std::optional<std::vector<std::optional<std::string>>>>(is);
+    return MultimodalInput{std::move(multimodalHashes), std::move(multimodalPositions), std::move(multimodalLengths),
+        std::move(multimodalUuids)};
 }
 
 void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostream& os)
@@ -347,6 +349,7 @@ void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostre
     su::serialize(multimodalInput.mMultimodalHashes, os);
     su::serialize(multimodalInput.mMultimodalPositions, os);
     su::serialize(multimodalInput.mMultimodalLengths, os);
+    su::serialize(multimodalInput.mMultimodalUuids, os);
 }
 
 size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
@@ -355,6 +358,7 @@ size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
     totalSize += su::serializedSize(multimodalInput.mMultimodalHashes);
     totalSize += su::serializedSize(multimodalInput.mMultimodalPositions);
     totalSize += su::serializedSize(multimodalInput.mMultimodalLengths);
+    totalSize += su::serializedSize(multimodalInput.mMultimodalUuids);
     return totalSize;
 }
 
@@ -2441,6 +2445,31 @@ KVCacheUpdatedData Serialization::deserializeKVCacheUpdatedData(std::istream& is
     return KVCacheUpdatedData{blockHash, cacheLevel, priority};
 }
 
+// MmKey
+size_t Serialization::serializedSize(MmKey const& key)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(key.hash);
+    totalSize += su::serializedSize(key.startOffset);
+    totalSize += su::serializedSize(key.uuid);
+    return totalSize;
+}
+
+void Serialization::serialize(MmKey const& key, std::ostream& os)
+{
+    su::serialize(key.hash, os);
+    su::serialize(key.startOffset, os);
+    su::serialize(key.uuid, os);
+}
+
+MmKey Serialization::deserializeMmKey(std::istream& is)
+{
+    auto hash = su::deserialize<std::array<uint8_t, 32>>(is);
+    auto startOffset = su::deserialize<SizeType32>(is);
+    auto uuid = su::deserialize<std::optional<std::string>>(is);
+    return MmKey{std::move(hash), startOffset, std::move(uuid)};
+}
+
 // UniqueToken
 size_t Serialization::serializedSize(tensorrt_llm::runtime::UniqueToken const& token)
 {
@@ -2490,6 +2519,7 @@ size_t Serialization::serializedSize(tensorrt_llm::batch_manager::kv_cache_manag
     totalSize += su::serializedSize(key.uniqueTokens);
     // std::vector<MmKey> where MmKey is pair<std::array<uint8_t,32>, SizeType32>
     totalSize += su::serializedSize(key.extraKeys);
+    totalSize += su::serializedSize(key.cacheSaltID);
     return totalSize;
 }
 
@@ -2499,6 +2529,7 @@ void Serialization::serialize(tensorrt_llm::batch_manager::kv_cache_manager::Blo
     su::serialize(key.loraTaskId, os);
     su::serialize(key.uniqueTokens, os);
     su::serialize(key.extraKeys, os);
+    su::serialize(key.cacheSaltID, os);
 }
 
 tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deserializeBlockKey(std::istream& is)
@@ -2507,11 +2538,13 @@ tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deseriali
     auto loraTaskId = su::deserialize<std::optional<tensorrt_llm::batch_manager::kv_cache_manager::LoraTaskIdType>>(is);
     auto uniqueTokens = su::deserialize<std::vector<tensorrt_llm::runtime::UniqueToken>>(is);
     auto extraKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
+    auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
     tensorrt_llm::batch_manager::kv_cache_manager::BlockKey key;
     key.usesExtraIds = usesExtraIds;
     key.loraTaskId = std::move(loraTaskId);
     key.uniqueTokens = std::move(uniqueTokens);
     key.extraKeys = std::move(extraKeys);
+    key.cacheSaltID = std::move(cacheSaltID);
     return key;
 }
 
