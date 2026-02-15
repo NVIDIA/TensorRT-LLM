@@ -84,17 +84,9 @@ def _bamba_mixer_torch_forward(
             )
         )
     else:
+        # The pattern matcher (match_causal_conv) will detect and replace this
         hidden_states_B_C = self.act(
-            torch.ops.auto_deploy.torch_causal_conv1d(
-                hidden_states_B_C,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                self.conv1d.stride[0],
-                self.conv1d.padding[0],
-                self.conv1d.dilation[0],
-                self.conv1d.groups,
-                self.conv1d.padding_mode,
-            )
+            self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
         )
 
     hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
