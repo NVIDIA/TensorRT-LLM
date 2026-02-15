@@ -38,13 +38,14 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 
 
 def prepare_dummy_token_selected_experts_hook(
-        input: torch.Tensor,
-        top_k: int,
-        num_experts: int,
-        n_group: Optional[int],
-        topk_group: Optional[int],
-        routed_scaling_factor: Optional[float],
-        routing_method_type: int = int(RoutingMethodType.Default),
+    input: torch.Tensor,
+    top_k: int,
+    num_experts: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int = int(RoutingMethodType.Default),
+    use_customized_router: bool = False,
 ):
     """
     Creates a hook function that generates dummy token_selected_experts for tuning.
@@ -59,7 +60,7 @@ def prepare_dummy_token_selected_experts_hook(
         A hook function that can be used with the tuner
     """
     tuner = AutoTuner.get()
-    if not tuner.is_tuning_mode:
+    if not tuner.is_tuning_mode or not use_customized_router:
         return lambda inputs: inputs
 
     input_tensor = input[0]
@@ -286,18 +287,6 @@ def fused_moe(
         tuner_input = input
         tuner_top_k = token_selected_experts.size(1)
 
-    tuning_config = MoERunner.tuning_config
-    tuning_config.inputs_pre_hook = prepare_dummy_token_selected_experts_hook(
-        tuner_input,
-        tuner_top_k,
-        fc1_expert_weights.shape[0] *
-        ep_size,  # num_experts from weight tensor shape
-        n_group,
-        topk_group,
-        routed_scaling_factor,
-        routing_method_type,
-    )
-
     # allocate workspace for profiling
     moe_runner = MoERunner(
         x_dtype=input.dtype,
@@ -318,6 +307,19 @@ def fused_moe(
         use_fused_finalize=use_fused_finalize,
         activation_type=activation_type,
         unpadded_hidden_size=unpadded_hidden_size,
+    )
+
+    tuning_config = MoERunner.tuning_config
+    tuning_config.inputs_pre_hook = prepare_dummy_token_selected_experts_hook(
+        tuner_input,
+        tuner_top_k,
+        fc1_expert_weights.shape[0] *
+        ep_size,  # num_experts from weight tensor shape
+        n_group,
+        topk_group,
+        routed_scaling_factor,
+        routing_method_type,
+        moe_runner.use_customized_router,
     )
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens

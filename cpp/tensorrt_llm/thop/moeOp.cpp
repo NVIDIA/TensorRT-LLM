@@ -666,7 +666,7 @@ public:
     }
 
     // TODO Update this to be able to tell if we are profiling swiglu bias
-    void runGemmProfile(torch::Tensor const& input, torch::optional<torch::Tensor> const& token_final_scales,
+    void runGemmProfile(torch::Tensor const& input, torch::optional<torch::Tensor> const& token_selected_experts,
         torch::Tensor const& fc1_expert_weights, torch::optional<torch::Tensor> const& fc1_expert_biases,
         torch::Tensor const& fc2_expert_weights, torch::optional<torch::Tensor> const& fc2_expert_biases,
         int64_t const top_k, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
@@ -753,7 +753,7 @@ public:
             TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
 
             void const* token_selected_experts_customized
-                = token_final_scales.has_value() ? token_final_scales.value().const_data_ptr() : nullptr;
+                = token_selected_experts.has_value() ? token_selected_experts.value().const_data_ptr() : nullptr;
             mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, token_selected_experts_customized,
                 use_customized_router, stream);
         }
