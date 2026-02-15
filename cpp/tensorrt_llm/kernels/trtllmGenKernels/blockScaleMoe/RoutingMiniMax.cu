@@ -254,23 +254,13 @@ int32_t constexpr getMaxNumExperts(int32_t numExperts)
 }
 
 // MiniMax-specific dispatch: InputT is always float (gate is float32).
-// Only OutputT varies based on mDtypeExpW (bf16 for bias/weights, or float).
-#define LAUNCH_ROUTING_MINIMAX_IMPL(                                                                                   \
-    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, numExperts)                         \
-    if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1)                                                              \
-    {                                                                                                                  \
-        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, true), kernel, numBlocks, numThreads,      \
-            smemSize, stream);                                                                                         \
-    }                                                                                                                  \
-    else if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                       \
+// OutputT varies based on mDtypeExpW (bf16 for bias/weights, or float).
+// DoSoftmaxBeforeTopK is always false (MiniMax uses sigmoid, not softmax).
+#define LAUNCH_ROUTING_MINIMAX_IMPL(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, numExperts)     \
+    if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                            \
     {                                                                                                                  \
         LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, false), kernel, numBlocks, numThreads,     \
             smemSize, stream);                                                                                         \
-    }                                                                                                                  \
-    else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag1)                                                     \
-    {                                                                                                                  \
-        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, numExperts, true), kernel, numBlocks,          \
-            numThreads, smemSize, stream);                                                                             \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
     {                                                                                                                  \
@@ -282,16 +272,16 @@ int32_t constexpr getMaxNumExperts(int32_t numExperts)
         TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                                       \
     }
 
-#define LAUNCH_ROUTING_MINIMAX(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1)          \
+#define LAUNCH_ROUTING_MINIMAX(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                      \
     if (data.mNumExperts <= topk::MaxNumExpertsUnit)                                                                   \
     {                                                                                                                  \
         LAUNCH_ROUTING_MINIMAX_IMPL(                                                                                   \
-            data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, topk::MaxNumExpertsUnit);   \
+            data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, topk::MaxNumExpertsUnit);               \
     }                                                                                                                  \
     else if (data.mNumExperts <= NumExpertsLimit)                                                                      \
     {                                                                                                                  \
         LAUNCH_ROUTING_MINIMAX_IMPL(                                                                                   \
-            data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, NumExpertsLimit);           \
+            data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, NumExpertsLimit);                       \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
@@ -349,8 +339,7 @@ void run(Data const& data, void* stream)
                 /*coopLaunch=*/false, routingMainKernel,
                 /*numBlocks=*/d.mNumTokens,
                 /*numThreads=*/numThreadsHist,
-                /*smemSize=*/0, stream,
-                /*extraFlag1=*/false);
+                /*smemSize=*/0, stream);
         }
         // else: large token count - will use routingIndicesHistogramScoresKernel below
     }
@@ -374,8 +363,7 @@ void run(Data const& data, void* stream)
             /*coopLaunch=*/false, routingInitExpertCounts,
             /*numBlocks=*/(2 * d.mNumExperts - 1) / numThreadsHist + 1,
             /*numThreads=*/numThreadsHist,
-            /*smemSize=*/0, stream,
-            /*extraFlag1=*/false);
+            /*smemSize=*/0, stream);
 
         // Only compute topK from scores if we didn't already do it in routingMainKernel
         constexpr int SmallTokenThreshold = 256;
@@ -388,23 +376,20 @@ void run(Data const& data, void* stream)
                 /*coopLaunch=*/false, routingIndicesHistogramScoresKernel,
                 /*numBlocks=*/maxNumBlocks,
                 /*numThreads=*/numThreadsHist,
-                /*smemSize=*/0, stream,
-                /*extraFlag1=*/false);
+                /*smemSize=*/0, stream);
         }
 
         LAUNCH_ROUTING_MINIMAX(d,
             /*coopLaunch=*/false, routingIndicesHistogramKernel,
             /*numBlocks=*/numBlocksHistogram,
             /*numThreads=*/numThreadsHist,
-            /*smemSize=*/0, stream,
-            /*extraFlag1=*/false);
+            /*smemSize=*/0, stream);
 
         LAUNCH_ROUTING_MINIMAX(d,
             /*coopLaunch=*/false, routingIndicesOffsetsKernel,
             /*numBlocks=*/numBlocksOffsets,
             /*numThreads=*/numThreadsHist,
-            /*smemSize=*/0, stream,
-            /*extraFlag1=*/false);
+            /*smemSize=*/0, stream);
     }
 }
 
