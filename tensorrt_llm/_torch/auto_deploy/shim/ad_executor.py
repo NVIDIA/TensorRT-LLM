@@ -747,12 +747,11 @@ class ADEngine(ModelEngine):
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
             # get cache indices and truncate the number of blocks according to total tokens
-            seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
             cache_indices = kv_cache_manager.get_cache_indices(request)
-            num_active_blocks = kv_cache_manager.get_num_kv_blocks(seq_len_with_cache[-1])
-            cache_loc.extend(cache_indices[:num_active_blocks])
-            pages_per_seq.append(num_active_blocks)
+            cache_loc.extend(cache_indices)
+            pages_per_seq.append(len(cache_indices))
             cu_num_pages.append(cu_num_pages[-1] + pages_per_seq[-1])
+            seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
             last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
 
             position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
