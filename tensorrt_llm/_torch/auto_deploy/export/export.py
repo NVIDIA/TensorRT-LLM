@@ -171,7 +171,7 @@ def _find_moe_module_lists(
 
 def _reduce_moe_experts(
     model: nn.Module,
-    min_num_experts: int,
+    num_moe_experts_for_export: int,
     args: Optional[Tuple[Any, ...]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
@@ -179,19 +179,21 @@ def _reduce_moe_experts(
 
     Uses a probe forward pass to identify which ``nn.ModuleList`` instances
     feed into ``torch_moe``-family custom ops (see :func:`_find_moe_module_lists`),
-    then truncates each to *min_num_experts* entries.  The returned list of dicts
-    carries the metadata needed by :func:`_restore_moe_experts` and
-    :func:`_expand_moe_experts_in_graph`.
+    then truncates each to *num_moe_experts_for_export* entries.  The returned
+    list of dicts carries the metadata needed by :func:`_restore_moe_experts`
+    and :func:`_expand_moe_experts_in_graph`.
     """
-    if min_num_experts < 1:
-        raise ValueError(f"min_num_experts must be >= 1, got {min_num_experts}")
+    if num_moe_experts_for_export < 1:
+        raise ValueError(
+            f"num_moe_experts_for_export must be >= 1, got {num_moe_experts_for_export}"
+        )
 
     moe_lists = _find_moe_module_lists(model, args, kwargs)
 
     reductions: List[Dict[str, Any]] = []
     for path, (parent, attr_name, mod_list) in moe_lists.items():
         orig_count = len(mod_list)
-        if orig_count <= min_num_experts:
+        if orig_count <= num_moe_experts_for_export:
             continue
 
         reductions.append(
@@ -203,10 +205,10 @@ def _reduce_moe_experts(
                 "expert_prefix": path,
             }
         )
-        setattr(parent, attr_name, nn.ModuleList(list(mod_list[:min_num_experts])))
+        setattr(parent, attr_name, nn.ModuleList(list(mod_list[:num_moe_experts_for_export])))
         ad_logger.info(
             f"Reduced MOE experts in '{path}' from {orig_count} to "
-            f"{min_num_experts} for faster export"
+            f"{num_moe_experts_for_export} for faster export"
         )
     return reductions
 
@@ -252,7 +254,12 @@ def _expand_moe_experts_in_graph(
     if not reductions:
         return
 
-    # MOE ops whose arguments include per-expert weight lists (from index 3 onward)
+    # MOE ops whose arguments include per-expert weight lists.
+    # All these ops share the same first 3 positional args (x, selected_experts,
+    # routing_weights) which are plain Tensors, followed by one or more
+    # List[Tensor] args that hold per-expert weights/scales.  We use the op
+    # schema to discover which arguments are Tensor[] rather than hard-coding
+    # the starting index.
     moe_ops = {
         torch.ops.auto_deploy.torch_moe,
         torch.ops.auto_deploy.torch_quant_fp8_moe,
@@ -266,11 +273,18 @@ def _expand_moe_experts_in_graph(
         if not is_op(node, moe_ops):
             continue
 
-        # Collect indices of list-of-node arguments (expert weight/scale lists)
+        # Collect indices of List[Tensor] arguments from the op schema – these
+        # are the per-expert weight / scale lists.
+        op = node.target
+        schema = op._schema if hasattr(op, "_schema") else next(iter(op._schemas.values()))
+        _tensor_list_types = ("Tensor[]", "List[Tensor]")
         list_arg_indices = [
             i
-            for i in range(3, len(node.args))
-            if isinstance(node.args[i], (list, tuple)) and len(node.args[i]) > 0
+            for i, arg_meta in enumerate(schema.arguments)
+            if any(t in str(arg_meta.type) for t in _tensor_list_types)
+            and i < len(node.args)
+            and isinstance(node.args[i], (list, tuple))
+            and len(node.args[i]) > 0
         ]
         if not list_arg_indices:
             continue
@@ -673,6 +687,7 @@ def torch_export_to_gm(
         return egm
 
     # Optionally reduce MOE experts for faster export tracing
+    # TODO (https://github.com/NVIDIA/TensorRT-LLM/issues/7547): Reuse the export patch system
     moe_reductions: List[Dict[str, Any]] = []
     if num_moe_experts_for_export is not None:
         moe_reductions = _reduce_moe_experts(model, num_moe_experts_for_export, args, kwargs)

@@ -343,6 +343,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                     "sharding_source": ['factory', 'heuristic'],
                     "sharding_dims": ['ep', 'bmm'],
                 },
+                "multi_stream_moe": {
+                    "stage": "compile",
+                    "enabled": True,
+                },
             }
         }
 
@@ -455,7 +459,15 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                 "fuse_nvfp4_moe": {
                     "allow_different_input_scales": True,
                 },
-            },
+                "multi_stream_moe": {
+                    "stage": "compile",
+                    "enabled": True,
+                },
+                "multi_stream_mla_attn": {
+                    "stage": "compile",
+                    "enabled": True,
+                },
+            }
         }
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
