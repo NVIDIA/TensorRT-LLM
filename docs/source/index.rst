@@ -65,6 +65,7 @@ Welcome to TensorRT LLM's Documentation!
    features/long-sequence.md
    features/lora.md
    features/multi-modality.md
+   features/visual-generation.md
    features/overlap-scheduler.md
    features/paged-attention-ifb-scheduler.md
    features/parallel-strategy.md
