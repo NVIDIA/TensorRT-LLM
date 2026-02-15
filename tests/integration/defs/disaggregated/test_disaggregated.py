@@ -131,10 +131,6 @@ def get_test_config(test_desc, example_dir, test_root):
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml"
          ),
-        "deepseek_v3_lite_fp8_transceiver_runtime_python":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_transceiver_runtime_python.yaml"
-         ),
         "deepseek_v3_lite_fp8_tp1":
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml"
