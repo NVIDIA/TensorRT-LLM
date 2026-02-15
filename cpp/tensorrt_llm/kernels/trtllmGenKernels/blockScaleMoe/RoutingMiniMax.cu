@@ -203,34 +203,40 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesHis
         int32_t topExp[MaxSupportedTopExperts];
         topk::reduceTopK(warp, topSel, topExp, laneVals, laneIdxs, float{-INFINITY}, params.mTopK);
 
-        // produce packed output weights from *unbiased prob* (sigmoid only)
+        // Produce final weights from *unbiased prob* (sigmoid only), renormalized over topK.
+        // All 32 warp lanes must participate in cg::reduce, so compute prob for all lanes
+        // and mask non-topK lanes to 0.
+        float prob = 0.f;
+        int32_t e = -1;
         if (laneIdx < params.mTopK)
         {
-            int e = topExp[laneIdx];
-
-            float prob = 0.f;
+            e = topExp[laneIdx];
             if (e >= 0 && e < params.mNumExperts)
             {
                 int64_t scoreIndex = int64_t{tokenIdx} * int64_t{params.mNumExperts} + int64_t{e};
                 float logit = static_cast<float>(params.mPtrScores[scoreIndex]);
                 prob = sigmoid_accurate(logit);
             }
+        }
 
-            // renorm if requested
-            float denom = 1.f;
-            if (params.mNormTopkProb)
-            {
-                float x = (laneIdx < params.mTopK) ? prob : 0.f;
-                denom = cg::reduce(warp, x, cg::plus<float>{}) + 1e-20f;
-            }
-            float finalW = (laneIdx < params.mTopK) ? (prob / denom) : 0.f;
+        // Renorm: all 32 lanes participate, non-topK lanes contribute 0
+        float finalW = prob;
+        if (params.mNormTopkProb)
+        {
+            float x = (laneIdx < params.mTopK) ? prob : 0.f;
+            float denom = cg::reduce(warp, x, cg::plus<float>{}) + 1e-20f;
+            finalW = (laneIdx < params.mTopK) ? (prob / denom) : 0.f;
+        }
 
+        // Write outputs (only topK lanes)
+        if (laneIdx < params.mTopK)
+        {
             PackedScoreIdx<OutputT> packed{static_cast<OutputT>(finalW), static_cast<int16_t>(e)};
-            if (params.mPtrTopKPacked != nullptr && laneIdx < params.mTopK)
+            if (params.mPtrTopKPacked != nullptr)
             {
                 params.mPtrTopKPacked[tokenIdx * params.mTopK + laneIdx] = packed;
             }
-            if (params.mPtrTopKWeights != nullptr && laneIdx < params.mTopK)
+            if (params.mPtrTopKWeights != nullptr)
             {
                 params.mPtrTopKWeights[tokenIdx * params.mTopK + laneIdx] = static_cast<OutputT>(finalW);
             }
