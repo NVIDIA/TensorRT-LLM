@@ -83,9 +83,11 @@ transforms:
   # proceeds normally.
   match_swiglu_pattern:
     stage: pattern_matcher
+    enabled: false
   match_nvfp4_swiglu_pattern:
     stage: pattern_matcher
     requires_shape_prop: true
+    enabled: false
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
@@ -164,7 +166,7 @@ transforms:
     backend: fla
   fuse_swiglu:
     stage: post_load_fusion
-    enabled: true
+    enabled: false
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
