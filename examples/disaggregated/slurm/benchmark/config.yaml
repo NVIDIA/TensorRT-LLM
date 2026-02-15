@@ -11,15 +11,15 @@ slurm:
 
 # Benchmark Mode
 benchmark:
-  mode: "gen_only"  # Options: e2e, gen_only, gen_only_no_context
+  mode: "gen_only_no_context"  # Options: e2e, gen_only, gen_only_no_context
   use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "1024"
-  input_length: 131072  # Input sequence length
+  concurrency_list: "512"
+  input_length: 252928  # Input sequence length
   output_length: 8192  # Output sequence length
-  dataset_file: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/datasets/deepseek-r1-fp4-131072-8192-32768-ratio-1_for_serve.json"
+  dataset_file: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/datasets/kimi-k2-fp4-252928-8192-8192-ratio-1_for_serve.json"
 
 # Hardware Configuration
 hardware:
@@ -31,7 +31,7 @@ hardware:
 environment:
   container_mount: "/lustre/fsw/coreai_comparch_trtllm:/lustre/fsw/coreai_comparch_trtllm"  # Format: path1:path1,path2:path2
   container_image: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/sqsh/trtllm-pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-20260201-10901.sqsh"
-  model_path: "/lustre/fsw/coreai_comparch_trtllm/common/DeepSeek-V3.2-FP4-v2/"
+  model_path: "/lustre/fsw/coreai_comparch_trtllm/common/Kimi-K2-Thinking-NVFP4/"
   trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
   cuda_architectures: "100-real;103-real"  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
@@ -58,24 +58,24 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 32
+    tensor_parallel_size: 64
+    moe_expert_parallel_size: 64
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: false
     pipeline_parallel_size: 1
-    context_parallel_size: 8
+    context_parallel_size: 1
     enable_autotuner: false
     cp_config:
       cp_type: "HELIX"
       tokens_per_block: 32
       use_nccl_for_alltoall: false
       fifo_version: 2
-    max_batch_size: 1024
-    max_num_tokens: 2048
-    max_seq_len: 25088
+    max_batch_size: 512
+    max_num_tokens: 1024
+    max_seq_len: 261632
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 256
+      max_batch_size: 8
     print_iter_log: true
     trust_remote_code: true
     kv_cache_config:
@@ -89,19 +89,19 @@ worker_config:
       # load_balancer:
       #   num_slots: 0
     cache_transceiver_config:
-      max_tokens_in_buffer: 132096
+      max_tokens_in_buffer: 253952
       backend: UCX
     stream_interval: 20
     num_postprocess_workers: 4
   ctx:
     max_batch_size: 1
-    max_num_tokens: 131104
-    max_seq_len: 131104
+    max_num_tokens: 252960
+    max_seq_len: 252960
     tensor_parallel_size: 1
     context_parallel_size: 1
     moe_expert_parallel_size: 1
     enable_attention_dp: false
-    pipeline_parallel_size: 4
+    pipeline_parallel_size: 8
     print_iter_log: true
     trust_remote_code: true
     cuda_graph_config: null
@@ -111,10 +111,14 @@ worker_config:
       free_gpu_memory_fraction: 0.5
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 132096
+      max_tokens_in_buffer: 253952
       backend: UCX
     pp_partition:
-    - 16
-    - 16
-    - 16
-    - 13
+    - 8
+    - 8
+    - 8
+    - 8
+    - 8
+    - 8
+    - 8
+    - 5
