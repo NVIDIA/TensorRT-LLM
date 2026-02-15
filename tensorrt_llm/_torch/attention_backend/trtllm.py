@@ -807,7 +807,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
-    draft_host_kv_cache_block_offsets: Optional[torch.Tensor] = None
 
     @property
     def max_seq_len(self) -> int:
@@ -914,6 +913,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
+            self.host_kv_cache_block_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
 
@@ -930,11 +930,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cache_name="draft_kv_cache_block_offsets",
                     dtype=torch.int32,
                     capture_graph=capture_graph,
-                )
-                self.draft_host_kv_cache_block_offsets = torch.empty_like(
-                    self.draft_kv_cache_block_offsets,
-                    device='cpu',
-                    pin_memory=True,
                 )
 
             if self.enable_flash_mla:
@@ -1141,22 +1136,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
-                # Copy blocks for all context requests
-                self.draft_kv_cache_manager.impl.copy_batch_block_offsets(
-                    self.draft_host_kv_cache_block_offsets,
-                    self.request_ids[:self.num_contexts], 1, 0)
-                # Copy blocks for all generation requests
-                self.draft_kv_cache_manager.impl.copy_batch_block_offsets(
-                    self.draft_host_kv_cache_block_offsets,
-                    self.request_ids[self.num_contexts:], self.beam_width,
-                    self.num_contexts)
-                for pool_idx in range(
-                        self.draft_host_kv_cache_block_offsets.shape[0]):
-                    self.draft_kv_cache_block_offsets[
-                        pool_idx, :self.num_seqs].copy_(
-                            self.draft_host_kv_cache_block_offsets[
-                                pool_idx, :self.num_seqs],
-                            non_blocking=True)
+                # Use the wrapper method which works for both V1 and V2
+                self.draft_kv_cache_manager.copy_batch_block_offsets(
+                    self.draft_kv_cache_block_offsets, self.request_ids,
+                    self.beam_width, self.num_contexts, self.num_seqs)
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         # Don't use self.kv_lens here because it includes extra tokens.
