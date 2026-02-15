@@ -98,8 +98,9 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
             n for n in self._ALWAYS_EXCLUDE if n not in excludes
         ]
         # Update dtype
+        torch_dtype = quant_config.get("torch_dtype", "float16")
         if quant_config.get("quant_algo") == "NVFP4":
-            quant_config["torch_dtype"] = "float16"
+            quant_config["torch_dtype"] = torch_dtype
 
         # Handle kv cache
         kv_algo = quant_config.get("kv_cache_quant_algo")
@@ -112,7 +113,7 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
 
         extra_model_kwargs: Dict[str, Any] = {}
         if quant_config.get("quant_algo", None) == "NVFP4":
-            extra_model_kwargs["torch_dtype"] = "float16"
+            extra_model_kwargs["torch_dtype"] = torch_dtype
 
         return extra_model_kwargs
 
