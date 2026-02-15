@@ -959,3 +959,126 @@ class MoEAllReduce(nn.Module):
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
             )
+
+
+def all_to_all_4d(
+    input: torch.Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """
+    All-to-all for 4D tensors (batch, seq, heads, head_dim).
+
+    Redistributes a 4D tensor along two dimensions using all-to-all communication.
+    This is used for Ulysses-style sequence parallelism to transform between:
+    - Sequence sharding [B, S/P, H, D] → Head sharding [B, S, H/P, D]
+    - Head sharding [B, S, H/P, D] → Sequence sharding [B, S/P, H, D]
+
+    Args:
+        input: Input tensor with shape [batch, seq, heads, head_dim]
+        scatter_dim: Dimension to split and scatter (1 for seq, 2 for heads)
+        gather_dim: Dimension to gather (1 for seq, 2 for heads)
+        process_group: PyTorch distributed process group. If None, uses default process group.
+
+    Returns:
+        Redistributed tensor with same shape as input
+
+    Example:
+        # Transform from sequence sharding to head sharding
+        # Input: [B, S/P, H, D] (each rank has S/P sequence)
+        output = all_to_all_4d(input, scatter_dim=2, gather_dim=1, process_group=pg)
+        # Output: [B, S, H/P, D] (each rank has H/P heads)
+
+        # Transform back from head sharding to sequence sharding
+        output = all_to_all_4d(input, scatter_dim=1, gather_dim=2, process_group=pg)
+    """
+    # Only support PyTorch distributed mode (not MPI mode)
+    if not mpi_disabled():
+        raise NotImplementedError(
+            "all_to_all_4d currently only supports PyTorch distributed mode. "
+            "MPI mode is not supported.")
+
+    # Get world size from process group
+    world_size = torch.distributed.get_world_size(group=process_group)
+
+    # If world_size is 1, no communication needed
+    if world_size == 1:
+        return input
+
+    # Validate dimensions
+    assert scatter_dim in [1, 2], "scatter_dim must be 1 (seq) or 2 (heads)"
+    assert gather_dim in [1, 2], "gather_dim must be 1 (seq) or 2 (heads)"
+    assert scatter_dim != gather_dim, "scatter_dim and gather_dim must be different"
+
+    batch, seq, heads, head_dim = input.shape
+
+    # Validate that the scatter dimension is divisible by world_size
+    scatter_size = input.shape[scatter_dim]
+    assert scatter_size % world_size == 0, \
+        f"Dimension {scatter_dim} size {scatter_size} must be divisible by world_size {world_size}"
+
+    # For all-to-all, we need to:
+    # 1. Split input along scatter_dim into world_size chunks
+    # 2. Send chunk i to rank i
+    # 3. Receive chunk from each rank and concatenate along gather_dim
+
+    # Reshape for all-to-all: move scatter_dim chunks to a new dimension
+    if scatter_dim == 1:  # Scatter along seq dimension
+        # [B, S, H, D] -> [B, P, S/P, H, D] where P = world_size
+        input_reshaped = input.view(batch, world_size, seq // world_size, heads,
+                                    head_dim)
+        # Transpose to group by destination rank: [B, P, S/P, H, D] -> [P, B, S/P, H, D]
+        input_transposed = input_reshaped.permute(1, 0, 2, 3, 4).contiguous()
+    else:  # scatter_dim == 2, scatter along heads dimension
+        # [B, S, H, D] -> [B, S, P, H/P, D] where P = world_size
+        input_reshaped = input.view(batch, seq, world_size, heads // world_size,
+                                    head_dim)
+        # Transpose to group by destination rank: [B, S, P, H/P, D] -> [P, B, S, H/P, D]
+        input_transposed = input_reshaped.permute(2, 0, 1, 3, 4).contiguous()
+
+    # Flatten to [P * ...] for all-to-all communication
+    # Shape: [P, B, ...] -> [P * B * ...]
+    input_flat = input_transposed.flatten()
+    output_flat = torch.empty_like(input_flat)
+
+    # Perform all-to-all communication using PyTorch distributed
+    # all_to_all_single splits input into world_size chunks and exchanges them
+    torch.distributed.all_to_all_single(output_flat,
+                                        input_flat,
+                                        group=process_group)
+
+    # Reshape output back to [P, B, ...] form
+    output_transposed = output_flat.view_as(input_transposed)
+
+    # Transpose back and reshape to final form
+    if gather_dim == 1:  # Gather along seq dimension
+        # [P, B, S/P, H, D] -> [B, P, S/P, H, D]
+        output_reshaped = output_transposed.permute(1, 0, 2, 3, 4).contiguous()
+        # [B, P, S/P, H, D] -> [B, S, H, D] where S = P * (S/P)
+        # When scattering heads and gathering seq: seq needs to be multiplied, heads needs to be divided
+        if scatter_dim == 2:
+            # Scattered heads, so we have H/P heads and need to gather S/P -> S sequence
+            gathered_seq = seq * world_size
+            sharded_heads = heads // world_size
+            output = output_reshaped.view(batch, gathered_seq, sharded_heads,
+                                          head_dim)
+        else:
+            # Scattered seq (should be impossible if gather_dim == 1), keep as is
+            output = output_reshaped.view(batch, seq, heads, head_dim)
+    else:  # gather_dim == 2, gather along heads dimension
+        # [P, B, S, H/P, D] -> [B, S, P, H/P, D]
+        output_reshaped = output_transposed.permute(1, 2, 0, 3, 4).contiguous()
+        # [B, S, P, H/P, D] -> [B, S, H, D] where H = P * (H/P)
+        # When scattering seq and gathering heads: heads needs to be multiplied, seq needs to be divided
+        if scatter_dim == 1:
+            # Scattered seq, so we have S/P seq and need to gather H/P -> H heads
+            gathered_heads = heads * world_size
+            sharded_seq = seq // world_size
+            output = output_reshaped.view(batch, sharded_seq, gathered_heads,
+                                          head_dim)
+        else:
+            # Scattered heads (should be impossible if gather_dim == 2), keep as is
+            output = output_reshaped.view(batch, seq, heads, head_dim)
+
+    return output
