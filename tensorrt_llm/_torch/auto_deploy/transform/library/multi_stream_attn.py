@@ -212,6 +212,4 @@ class MultiStreamMLAAttn(BaseTransform):
             is_clean=num_matches == 0,
             has_valid_shapes=num_matches == 0,
         )
-        with open("/tmp/after_multi_stream_mla_attn.txt", "w") as f:
-            f.write(str(gm.graph))
         return gm, info
