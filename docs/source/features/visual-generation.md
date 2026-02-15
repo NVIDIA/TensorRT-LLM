@@ -45,7 +45,7 @@ The example scripts under `examples/visual_gen/` demonstrate direct Python usage
 cd examples/visual_gen
 
 python visual_gen_wan_t2v.py \
-    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \  # or a local path
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --output_path output.mp4
@@ -74,7 +74,7 @@ parallel:
 **2. Launch the server:**
 
 ```bash
-trtllm-serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers \  # or a local path
+trtllm-serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --extra_visual_gen_options wan_config.yml
 ```
 
@@ -126,7 +126,7 @@ TensorRT-LLM VisualGen supports both **dynamic quantization** (on-the-fly at wei
 
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \  # or a local path
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --linear_type trtllm-fp8-per-tensor \
     --output_path output_fp8.mp4
