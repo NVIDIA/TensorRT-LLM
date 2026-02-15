@@ -32,7 +32,12 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.linear.swiglu import torch_swiglu_mlp
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code, get_attr_by_name
+from ...utils._graph import (
+    del_attr_by_name,
+    delete_all_unused_submodules,
+    eliminate_dead_code,
+    get_attr_by_name,
+)
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
@@ -42,6 +47,19 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+
+
+def _try_free_attr_node(gm: GraphModule, graph, attr_node: Node) -> None:
+    """Erase a get_attr node and eagerly delete its module attribute if it has no users.
+
+    This is used to free unfused weight tensors as soon as they are no longer
+    referenced in the graph, avoiding a temporary memory spike that would occur
+    if cleanup were deferred until after all nodes are processed.
+    """
+    if attr_node is not None and attr_node.op == "get_attr" and len(attr_node.users) == 0:
+        target = attr_node.target
+        graph.erase_node(attr_node)
+        del_attr_by_name(gm, target)
 
 
 def _swiglu_pattern_no_bias(x, gate_weight, up_weight, down_weight):
@@ -265,15 +283,21 @@ class FuseSwiGLU(BaseTransform):
             node.replace_all_uses_with(fused_node)
             graph.erase_node(node)
 
+            # Eagerly free unfused weight/bias tensors that are no longer referenced
+            # to avoid a temporary memory spike from holding both fused and unfused
+            # copies simultaneously across all layers.
+            _try_free_attr_node(gm, graph, gate_weight_node)
+            _try_free_attr_node(gm, graph, up_weight_node)
+            _try_free_attr_node(gm, graph, gate_bias_node)
+            _try_free_attr_node(gm, graph, up_bias_node)
+
             fused_weight_idx += 1
             cnt += 1
 
         if cnt > 0:
             gm.recompile()
 
-            # Clean up dead code and free memory from unfused weights
-            # The original gate_weight and up_weight tensors are no longer referenced
-            # after fusion, so we can delete them to save GPU memory.
+            # Clean up any remaining dead code and unused submodules
             eliminate_dead_code(gm)
             delete_all_unused_submodules(gm)
 
@@ -516,9 +540,9 @@ class FuseNVFP4SwiGLU(BaseTransform):
             gate_input_scale_node = node.args[4]
             gate_weight_scale_node = node.args[5]
             gate_alpha_node = node.args[6]
-            up_input_scale_node = node.args[7]  # noqa: F841
+            up_input_scale_node = node.args[7]
             up_weight_scale_node = node.args[8]
-            up_alpha_node = node.args[9]  # noqa: F841
+            up_alpha_node = node.args[9]
             down_input_scale_node = node.args[10]
             down_weight_scale_node = node.args[11]
             down_alpha_node = node.args[12]
@@ -567,11 +591,23 @@ class FuseNVFP4SwiGLU(BaseTransform):
             node.replace_all_uses_with(fused_node)
             graph.erase_node(node)
 
+            # Eagerly free unfused weight/scale tensors that are no longer referenced
+            # to avoid a temporary memory spike from holding both fused and unfused
+            # copies simultaneously across all layers.
+            _try_free_attr_node(gm, graph, gate_weight_node)
+            _try_free_attr_node(gm, graph, up_weight_node)
+            _try_free_attr_node(gm, graph, gate_weight_scale_node)
+            _try_free_attr_node(gm, graph, up_weight_scale_node)
+            _try_free_attr_node(gm, graph, up_input_scale_node)
+            _try_free_attr_node(gm, graph, up_alpha_node)
+
             fused_weight_idx += 1
             cnt += 1
 
         if cnt > 0:
             gm.recompile()
+
+            # Clean up any remaining dead code and unused submodules
             eliminate_dead_code(gm)
             delete_all_unused_submodules(gm)
 
