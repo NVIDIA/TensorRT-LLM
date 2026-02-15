@@ -324,16 +324,16 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
     elif is_weight_node(node):
         weights = []
         biases = []
-        
+
         if node.target.endswith("bias"):
-                biases=[
-                    WeightNode(
-                        node=node,
-                        node_key=node.target,
-                        tensor=get_param_or_buffer(node.target, gm),
-                        submod=gm.get_submodule(node.target.rpartition(".")[0]),
-                    )
-                ]
+            biases = [
+                WeightNode(
+                    node=node,
+                    node_key=node.target,
+                    tensor=get_param_or_buffer(node.target, gm),
+                    submod=gm.get_submodule(node.target.rpartition(".")[0]),
+                )
+            ]
         else:
             weights = [
                 WeightNode(
@@ -342,7 +342,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
                     tensor=get_param_or_buffer(node.target, gm),
                     submod=gm.get_submodule(node.target.rpartition(".")[0]),
                 )
-                ]
+            ]
         return WeightNodes(
             weights=weights,
             biases=biases,
