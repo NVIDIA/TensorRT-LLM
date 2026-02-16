@@ -432,7 +432,7 @@ def test_trtllm_attention_op_context_input_pos(seq, batch_size, n_heads, dtype, 
         device=device,
     )
 
-    # NOTE: "chunked prefill" (context tokens with non-zero `input_pos`) can behave
+    # https://nvbugspro.nvidia.com/bug/5904035 "chunked prefill" (context tokens with non-zero `input_pos`) can behave
     # differently depending on which TRT-LLM kernel path is selected.
     #
     # - On some paths (notably SM100 fallback), the context-stage output corresponds to
