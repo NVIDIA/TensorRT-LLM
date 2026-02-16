@@ -377,10 +377,13 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [1, 4, 8])
-    def test_fp8(self, world_size):
+    @pytest.mark.parametrize("enable_attention_dp", [True, False])
+    def test_fp8(self, world_size, enable_attention_dp):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
+        kwargs["transforms"]["detect_sharding"][
+            "enable_attention_dp"] = enable_attention_dp
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
@@ -398,10 +401,13 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip("Skipping FP4 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [4, 8])
-    def test_fp4(self, world_size):
+    @pytest.mark.parametrize("enable_attention_dp", [True, False])
+    def test_fp4(self, world_size, enable_attention_dp):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
+        kwargs["transforms"]["detect_sharding"][
+            "enable_attention_dp"] = enable_attention_dp
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_FP4,
                            tokenizer=self.MODEL_PATH_FP4,

@@ -148,6 +148,8 @@ def _process_moe_node(
         w2_list,
         w3_list,
         apply_routing_on_input,
+        mapping_config,
+        max_num_tokens,
     ) = extract_op_args(
         node,
         "x",
@@ -157,6 +159,8 @@ def _process_moe_node(
         "w2_weight",
         "w3_weight",
         "apply_routing_on_input",
+        "mapping_config",
+        "max_num_tokens",
     )
 
     # Stack weights based on MLP style
@@ -215,13 +219,23 @@ def _process_moe_node(
             args=(hidden_states, weight_dtype),
         )
 
+        # Build kwargs for new node - preserve all kwargs from original node
+        # and override with known values
+        fused_kwargs = dict(node.kwargs) if node.kwargs else {}
+        fused_kwargs.update(
+            {
+                "is_gated_mlp": is_gated_mlp,
+                "act_fn": act_fn,
+                "mapping_config": mapping_config,
+                "max_num_tokens": max_num_tokens,
+                "apply_routing_on_input": apply_routing_on_input,
+            }
+        )
+
         new_node = graph.call_function(
             replacement_op,
             args=(hidden_states, selected_experts, routing_weights, w_up_arg, w_down_arg),
-            kwargs={
-                "is_gated_mlp": is_gated_mlp,
-                "act_fn": act_fn,
-            },
+            kwargs=fused_kwargs,
         )
 
     node.replace_all_uses_with(new_node)
@@ -1900,10 +1914,14 @@ def _stack_nvfp4_moe_weights(
                 graph.get_attr(new_key_fc1_alpha),
                 graph.get_attr(new_key_fc2_alpha),
             )
-        kwargs = {
-            "is_gated_mlp": is_gated_mlp,
-            "act_fn": act_fn,
-        }
+        # Preserve original kwargs (mapping_config, max_num_tokens) and override with known values
+        kwargs = dict(node.kwargs) if node.kwargs else {}
+        kwargs.update(
+            {
+                "is_gated_mlp": is_gated_mlp,
+                "act_fn": act_fn,
+            }
+        )
         return args, kwargs
 
     fused_key_counter = 0
