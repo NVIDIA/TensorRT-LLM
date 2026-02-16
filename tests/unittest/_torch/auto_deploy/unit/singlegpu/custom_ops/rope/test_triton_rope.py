@@ -5,7 +5,7 @@ import torch
 from _custom_op_utils import torch_rope_reference
 
 # Import after we've imported torch (to ensure custom ops are registered)
-from tensorrt_llm._torch.auto_deploy.custom_ops import triton_rope  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.rope import triton_rope  # noqa: F401
 
 
 def _precompute_cos_sin_cache(
