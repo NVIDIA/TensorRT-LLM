@@ -3983,10 +3983,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.parametrize(
-        "moe_backend",
-        ["CUTLASS",
-         pytest.param("TRITON", marks=skip_no_hopper), "TRTLLM"])
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (1, 1, 1, False, True, True),
@@ -4042,11 +4039,15 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_blackwell
+    @pytest.mark.parametrize("moe_backend", [
+        pytest.param("TRITON", marks=skip_no_hopper),
+        pytest.param("TRTLLM", marks=skip_pre_blackwell)
+    ])
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
-        [(1, 1, 1, False, True, True, "TRTLLM")],
-        ids=["latency-TRTLLM"])
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (1, 1, 1, False, True, True),
+        ],
+        ids=["latency"])
     def test_w4a16_mxfp4(self, tp_size, pp_size, ep_size, attention_dp,
                          cuda_graph, overlap_scheduler, moe_backend):
         pytorch_config = dict(
