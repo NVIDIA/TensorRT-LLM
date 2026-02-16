@@ -95,7 +95,7 @@ CUresult copyDeviceToHost(
 CUresult copyDeviceToDevice(
     std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
 
-void copyBatchBlockOffsetsToDevice(
-    ITensor const& input, ITensor& output, ITensor const& copyIndex, bool copyVIdx, CUstream stream) noexcept;
+void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
+    ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
