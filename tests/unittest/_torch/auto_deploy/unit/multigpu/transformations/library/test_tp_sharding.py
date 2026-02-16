@@ -877,6 +877,59 @@ def _run_pattern_detection_job(
                                 layer_type=LayerType.MLA,
                             )
                         )
+        elif model_cls in (GDN_Block, GDN_Block_Unfused):
+            key_dim = num_k_heads_gdn * head_k_dim
+            value_dim = num_v_heads_gdn * head_v_dim
+            conv_fused_dims = (key_dim, key_dim, value_dim)
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    weight_name = node.args[1].name
+                    if "out_proj" in weight_name:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                        fused_weight_dims = None
+                    elif "in_proj_qkv" in weight_name and model_cls == GDN_Block_Unfused:
+                        # Unfused in_proj_qkv has contiguous [Q, K, V] and needs fused dims
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                        fused_weight_dims = conv_fused_dims
+                    else:
+                        # Fused in_proj_qkvz (interleaved), in_proj_ba, in_proj_z/b/a
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                        fused_weight_dims = None
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                            layer_type=LayerType.DELTA,
+                            fused_weight_dims=fused_weight_dims,
+                        )
+                    )
+                elif node.op == "get_attr" and isinstance(node.target, str):
+                    # Non-linear weight nodes: conv1d.weight, A_log, dt_bias
+                    target = node.target
+                    if "norm" in target:
+                        continue  # norm weights are replicated
+                    if "conv1d" in target and ("weight" in target or "bias" in target):
+                        fused_weight_dims = conv_fused_dims
+                    else:
+                        fused_weight_dims = None
+                    if "conv1d" in target or "A_log" in target or "dt_bias" in target:
+                        expected_transformations.append(
+                            WeightShardingInfo(
+                                target_node=node.name,
+                                split_dim=SplitDimension.COLUMN,
+                                config=config,
+                                dist_op=None,
+                                min_local_shape=1,
+                                layer_type=LayerType.DELTA,
+                                fused_weight_dims=fused_weight_dims,
+                            )
+                        )
 
     # get detected transformations
     optimizer = InferenceOptimizer(
@@ -944,6 +997,8 @@ def test_sharding(
         (GQA_Block, "torch_dist_all_reduce"),
         (NemotronHMamba2Mixer, "torch_dist_all_reduce"),
         (MLA_Block, "torch_dist_all_reduce"),
+        (GDN_Block, "torch_dist_all_reduce"),
+        (GDN_Block_Unfused, "torch_dist_all_reduce"),
     ),
 )
 def test_sharding_pattern_detection(
@@ -959,3 +1014,117 @@ def test_sharding_pattern_detection(
     No need to run distributed job, can be run on single process.
     """
     _run_pattern_detection_job(model_cls, bias, 0, world_size, from_config)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_unfused_delta_fused_weight_correctness(world_size: int):
+    """Verify that unfused in_proj_qkv is fused-sliced, not contiguously sliced.
+
+    This single-process test checks that the sharding transform applies
+    fused_weight_dims=(key_dim, key_dim, value_dim) to in_proj_qkv, producing
+    [Q_shard, K_shard, V_shard] per rank rather than a contiguous first-N-rows slice.
+    It also verifies the load hook correctly re-applies fused slicing from the
+    original state dict.
+    """
+    num_features = 32
+    num_k_heads = 4
+    num_v_heads = 8
+    head_k_dim = 8
+    head_v_dim = 8
+    key_dim = num_k_heads * head_k_dim  # 32
+    value_dim = num_v_heads * head_v_dim  # 64
+    rank = 0
+
+    model = GDN_Block_Unfused(
+        hidden_size=num_features,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+    ).to(device="cuda", dtype=torch.float16)
+
+    x = torch.randn(2, 4, num_features, device="cuda", dtype=torch.float16)
+
+    # Save original weight for in_proj_qkv before sharding
+    original_qkv_weight = model.in_proj_qkv.weight.data.clone()
+    original_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+    assert original_qkv_weight.shape[0] == key_dim * 2 + value_dim  # 128
+
+    # Export and apply sharding
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "use_sharding_from_factory": False,
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = rank
+    optimizer.shared_config.world_size = world_size
+    gm_transformed = optimizer(None, gm)
+    gm_transformed = gm_transformed.to("cuda")
+
+    # Find the sharded in_proj_qkv weight
+    sharded_qkv_weight = None
+    for name, param in gm_transformed.named_parameters():
+        if "in_proj_qkv" in name and "weight" in name:
+            sharded_qkv_weight = param.data
+            break
+    assert sharded_qkv_weight is not None, "Could not find sharded in_proj_qkv weight"
+
+    # Compute the expected fused slice: [Q_shard, K_shard, V_shard] for rank 0
+    q_rows = original_qkv_weight[0:key_dim]  # Q component
+    k_rows = original_qkv_weight[key_dim : key_dim * 2]  # K component
+    v_rows = original_qkv_weight[key_dim * 2 : key_dim * 2 + value_dim]  # V component
+    expected_fused_weight = torch.cat(
+        [
+            torch.tensor_split(q_rows, world_size, dim=0)[rank],
+            torch.tensor_split(k_rows, world_size, dim=0)[rank],
+            torch.tensor_split(v_rows, world_size, dim=0)[rank],
+        ],
+        dim=0,
+    )
+
+    # Verify the sharded weight matches the fused slice
+    expected_shard_rows = key_dim // world_size + key_dim // world_size + value_dim // world_size
+    assert sharded_qkv_weight.shape[0] == expected_shard_rows, (
+        f"Sharded in_proj_qkv has {sharded_qkv_weight.shape[0]} rows, "
+        f"expected {expected_shard_rows} (fused slice)"
+    )
+    torch.testing.assert_close(
+        sharded_qkv_weight,
+        expected_fused_weight,
+        msg="Sharded in_proj_qkv weight does not match expected fused slice. "
+        "This indicates contiguous slicing was used instead of fused per-component slicing.",
+    )
+
+    # Verify the contiguous (buggy) slice would differ
+    contiguous_slice = original_qkv_weight[0 : (key_dim * 2 + value_dim) // world_size]
+    assert not torch.equal(sharded_qkv_weight, contiguous_slice), (
+        "Sharded weight unexpectedly matches contiguous slice -- "
+        "fused_weight_dims may not be taking effect"
+    )
+
+    # Verify load hook: reload original state dict and check fused slicing is re-applied
+    for name, param in gm_transformed.named_parameters():
+        param.data.fill_(0.0)
+    gm_transformed.load_state_dict(original_state_dict, strict=False)
+
+    reloaded_qkv_weight = None
+    for name, param in gm_transformed.named_parameters():
+        if "in_proj_qkv" in name and "weight" in name:
+            reloaded_qkv_weight = param.data
+            break
+
+    torch.testing.assert_close(
+        reloaded_qkv_weight,
+        expected_fused_weight,
+        msg="After reloading original state dict, in_proj_qkv weight does not match "
+        "expected fused slice. The load hook may not be applying fused slicing correctly.",
+    )

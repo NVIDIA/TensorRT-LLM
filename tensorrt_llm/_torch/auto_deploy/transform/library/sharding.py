@@ -1068,7 +1068,8 @@ def _load_hook(
     if key not in state_dict:
         return
     p_to_load = state_dict[key]
-    p_to_load = p_to_load if param_shape == p_to_load.shape else f_split(p_to_load)
+    did_split = param_shape != p_to_load.shape
+    p_to_load = p_to_load if not did_split else f_split(p_to_load)
     state_dict[key] = p_to_load
 
 
@@ -1943,7 +1944,9 @@ def _process_delta_sharding(
           in_proj_qkv, in_proj_z, in_proj_b, in_proj_a  -> column sharding
 
     Common sharding strategy:
-      opening projections          -> column sharding
+      opening projections          -> column sharding (unfused in_proj_qkv uses
+                                      fused dims [key_dim, key_dim, value_dim]
+                                      to match its contiguous [Q, K, V] layout)
       out_proj                     -> row sharding + all_reduce
       conv1d weight                -> column sharding (fused dims: [key_dim, key_dim, value_dim])
       A_log, dt_bias               -> column sharding
@@ -1978,40 +1981,69 @@ def _process_delta_sharding(
         and len(list(n.users)) >= 3,
     )
 
-    # ##############################################################
-    # ####### shard the opening nodes (column, no fused dims) ######
-    # ##############################################################
-    if not transform_container.add(
-        WeightShardingInfo.from_node(
-            opening_nodes[0],
-            split_dim=SplitDimension.COLUMN,
-            config=config,
-            dist_op=None,
-            min_local_shape=1,
-            layer_type=LayerType.DELTA,
+    # Extract conv split sizes early (needed for fused_weight_dims on unfused in_proj_qkv)
+    conv_split_sizes_original = None
+    if split_node_after_conv is not None and len(split_node_after_conv.args) > 1:
+        conv_split_sizes_original = tuple(split_node_after_conv.args[1])
+        conv_dim = conv1d_node.args[-1]
+        assert sum(conv_split_sizes_original) == conv_dim, (
+            f"Split sizes {conv_split_sizes_original} (sum={sum(conv_split_sizes_original)}) "
+            f"do not match conv_dim {conv_dim}"
         )
-    ):
-        return 0  # already sharded
 
-    for proj_node in opening_nodes[1:]:
-        transform_container.add(
+    # ##############################################################
+    # ############## shard the opening nodes (column) ##############
+    # ##############################################################
+    # Unfused layout: in_proj_qkv has contiguous [Q, K, V] -- needs fused dims
+    # Fused layout: in_proj_qkvz has interleaved per-head-group -- contiguous sharding is correct
+
+    # For unfused layout (4 opening nodes), identify which node is the QKV projection
+    # by checking if its weight dimension matches conv_dim (key_dim*2 + value_dim)
+    qkv_node = None
+    if len(opening_nodes) == 4 and conv_split_sizes_original is not None:
+        conv_dim = sum(conv_split_sizes_original)
+        for node in opening_nodes:
+            # Get weight node to check its shape
+            weight_nodes = [n for n in node.all_input_nodes if n.op == "get_attr"]
+            if weight_nodes:
+                weight_key = weight_nodes[0].target
+                try:
+                    weight_param = gm.get_parameter(weight_key)
+                    # QKV projection output dim should match conv_dim
+                    if weight_param.shape[0] == conv_dim:
+                        qkv_node = node
+                        break
+                except AttributeError:
+                    continue
+
+    # Apply sharding to all opening nodes, with fused dims only for QKV
+    first_added = False
+    for proj_node in opening_nodes:
+        # Only apply fused_weight_dims to the QKV projection in unfused layout
+        fused_dims = conv_split_sizes_original if proj_node is qkv_node else None
+
+        result = transform_container.add(
             WeightShardingInfo.from_node(
                 proj_node,
                 split_dim=SplitDimension.COLUMN,
                 config=config,
                 dist_op=None,
                 min_local_shape=1,
+                fused_weight_dims=fused_dims,
                 layer_type=LayerType.DELTA,
             )
         )
 
+        # Check if the first node was already sharded
+        if not first_added and proj_node == opening_nodes[0]:
+            if not result:
+                return 0  # already sharded
+            first_added = True
+
     # ##############################################################
     # ############## update split node after conv1d ################
     # ##############################################################
-    # Save original split sizes before updating (needed for conv1d fused_weight_dims)
-    conv_split_sizes_original = None
     if split_node_after_conv is not None and len(split_node_after_conv.args) > 1:
-        conv_split_sizes_original = tuple(split_node_after_conv.args[1])
         split_args = list(split_node_after_conv.args)
         if len(split_args) > 1 and isinstance(split_args[1], (list, tuple)):
             split_args[1] = [s // world_size for s in split_args[1]]
@@ -2036,9 +2068,16 @@ def _process_delta_sharding(
     # ############## shard the remaining weights ###################
     # ##############################################################
     # Shard conv1d weight (with fused dims), A_log, dt_bias. Skip norm weights (replicated).
+    # Also skip weights belonging to opening/terminating linear ops (already handled above).
     delta_node = list(filtered_nodes(subgraph_nodes, is_any_delta_op))[0]
+    handled_weight_nodes = set()
+    for lin_node in list(opening_nodes) + [out_proj]:
+        handled_weight_nodes.update(n for n in lin_node.all_input_nodes if n.op == "get_attr")
     weight_nodes = [n for n in get_all_weights_in_subgraph(opening_nodes, [delta_node])]
     for weight_node in weight_nodes:
+        if weight_node in handled_weight_nodes:
+            continue
+
         weight_key = weight_node.target
         try:
             gm.get_parameter(weight_key)

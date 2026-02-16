@@ -830,7 +830,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: Qwen3_5MoeTextConfig):
+    def __init__(self, config: Qwen3_5MoeTextConfig, **kwargs):
         super().__init__(config)
         self.model = Qwen3_5MoeTextModel(config)
         self.vocab_size = config.vocab_size
