@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
+import pathlib
 
 import pytest
 import torch
@@ -22,7 +22,7 @@ from defs.conftest import skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm._torch.auto_deploy.utils._config import deep_merge_dicts
+from tensorrt_llm._torch.auto_deploy.utils import _config
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -496,30 +496,19 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     Model paths are resolved via hf_id_to_local_model_dir.
     """
 
-    # Set minimum possible seq len + small buffer, for test speed & memory usage
-    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
-                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
-    BASE_ACCURACY = {"max_seq_len": MAX_SEQ_LEN}
+    BASE_ACCURACY = {}
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
     MODEL_REGISTRY_ACCURACY_PARAMS = [
         pytest.param(
             "meta-llama/Llama-3.1-8B-Instruct",
-            {
-                "max_batch_size": 128,
-                "attn_backend": "flashinfer",
-            },
+            {},
             [MMLU, GSM8K],
             id="meta-llama_Llama-3.1-8B-Instruct",
         ),
         pytest.param(
             "google/gemma-3-1b-it",
-            {
-                "kv_cache_config": {
-                    "enable_block_reuse": False,
-                    "enable_partial_reuse": False,
-                },
-            },
+            {},
             [MMLU, GSM8K],
             id="google_gemma-3-1b-it",
         ),
@@ -548,7 +537,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     @staticmethod
     def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
         """Return (yaml_extra paths, world_size) from model registry."""
-        registry_path = (Path(__file__).resolve().parents[4] /
+        registry_path = (pathlib.Path(__file__).resolve().parents[4] /
                          "examples/auto_deploy/model_registry")
         with open(registry_path / "models.yaml") as f:
             registry = yaml.safe_load(f)
@@ -582,7 +571,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         model_path = hf_id_to_local_model_dir(model_name)
         yaml_paths, registry_world_size = self._get_registry_yaml_extra(
             model_name)
-        merged = deep_merge_dicts(self.BASE_ACCURACY, config_overrides)
+        merged = _config.deep_merge_dicts(self.BASE_ACCURACY, config_overrides)
         effective_world_size = merged.get("world_size", registry_world_size)
         if get_device_count() < effective_world_size:
             pytest.skip("Not enough devices for world size, skipping test")
@@ -597,5 +586,5 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                     task = task_cls(model_name)
                     try:
                         task.evaluate(llm, sampling_params=sampling_params)
-                    except Exception as e:
+                    except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
