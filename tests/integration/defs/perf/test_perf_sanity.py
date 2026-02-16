@@ -1276,13 +1276,13 @@ class PerfSanityTestConfig:
         """Collect error diagnostics and raise RuntimeError."""
         messages = [error_msg]
         log_files = []
-        output_dir = commands.output_dir
 
         # Collect benchmark log files
-        benchmark_logs = sorted(
-            glob.glob(os.path.join(output_dir, f"trtllm-benchmark.{server_idx}.*.log"))
-        )
-        log_files.extend(benchmark_logs)
+        # output_dir = commands.output_dir
+        # benchmark_logs = sorted(
+        #     glob.glob(os.path.join(output_dir, f"trtllm-benchmark.{server_idx}.*.log"))
+        # )
+        # log_files.extend(benchmark_logs)
 
         # Collect slurm job log files from jobWorkspace
         job_workspace = os.environ.get("jobWorkspace", "")
@@ -1296,12 +1296,12 @@ class PerfSanityTestConfig:
                 log_files.append(os.path.join(job_workspace, f"gen_server_{i}.log"))
             for i in range(num_ctx):
                 log_files.append(os.path.join(job_workspace, f"ctx_server_{i}.log"))
-            log_files.append(os.path.join(job_workspace, "disagg_server.log"))
+            # log_files.append(os.path.join(job_workspace, "disagg_server.log"))
 
         for log_file in log_files:
             if os.path.exists(log_file):
                 try:
-                    with open(log_file, "r") as f:
+                    with open(log_file, "r", errors="replace") as f:
                         lines = f.readlines()
                         tail_content = "".join(lines[-tail_lines:]) if lines else "(empty)"
                     messages.append(f"--- {log_file} [last {tail_lines} lines] ---")

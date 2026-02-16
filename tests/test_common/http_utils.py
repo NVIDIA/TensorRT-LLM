@@ -27,7 +27,7 @@ def wait_for_endpoint_ready(
             for check_file in check_files:
                 if os.path.exists(check_file):
                     try:
-                        with open(check_file, "r") as f:
+                        with open(check_file, "r", errors="replace") as f:
                             content = f.read()
                         for line in content.splitlines():
                             for keyword in ERROR_KEYWORDS:
