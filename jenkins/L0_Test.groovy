@@ -475,7 +475,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
 
         def cleanupCommands = [
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
-            "rm -rf ${jobWorkspace} || true",
+            // "rm -rf ${jobWorkspace} || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
