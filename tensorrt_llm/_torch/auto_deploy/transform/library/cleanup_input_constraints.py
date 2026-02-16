@@ -5,8 +5,11 @@ import torch
 from torch.fx import Graph, GraphModule
 from torch.utils._sympy.value_ranges import ValueRanges
 
+from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.node_utils import has_shape
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -29,7 +32,15 @@ class CleanupInputConstraints(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph: Graph = gm.graph
-        input_node = graph.find_nodes(op="placeholder")[1]
+        placeholders = graph.find_nodes(op="placeholder")
+        if len(placeholders) < 2:
+            return gm, TransformInfo(skipped=True, num_matches=0)
+        input_node = placeholders[1]
+        if not has_shape(input_node):
+            ad_logger.debug(
+                f"Input node {input_node.name} does not have a shape. Skipping cleanup_input_constraints transform."
+            )
+            return gm, TransformInfo(skipped=True, num_matches=0)
         sym_shape: torch.Size = input_node.meta["val"].shape
 
         # get expressions in the symbolic shape
