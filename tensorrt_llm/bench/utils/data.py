@@ -121,6 +121,14 @@ def create_dataset_from_stream(
         else:
             lora_requests.append(None)
 
+    # Early validation: check if any data was actually read from the stream
+    if len(prompts) == 0:
+        raise ValueError(
+            "No data was read from the dataset stream. "
+            "The dataset file may be empty, corrupted, or in an incorrect format. "
+            "Expected JSON lines with at least 'prompt', 'task_id' and 'output_tokens' fields."
+        )
+
     if modality is not None:
         # Multimodal data need extra preprocessing
         assert modality in [
