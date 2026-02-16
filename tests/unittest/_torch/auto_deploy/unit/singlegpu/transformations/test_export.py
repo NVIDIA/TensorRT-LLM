@@ -356,106 +356,98 @@ def test_moe_export_with_reduced_experts(
 # Real-model MOE export: GLM4 MoE Lite
 # ---------------------------------------------------------------------------
 
-try:
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_glm4_moe_lite import (
-        Glm4MoeLiteConfig,
-        Glm4MoeLiteForCausalLM,
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_glm4_moe_lite import (  # noqa: E402
+    Glm4MoeLiteConfig,
+    Glm4MoeLiteForCausalLM,
+)
+
+
+def _make_tiny_glm4_config(n_routed_experts: int = 8) -> Glm4MoeLiteConfig:
+    """Create a minimal ``Glm4MoeLiteConfig`` suitable for unit tests."""
+    return Glm4MoeLiteConfig(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        q_lora_rank=32,
+        kv_lora_rank=32,
+        qk_nope_head_dim=12,
+        qk_rope_head_dim=4,
+        v_head_dim=16,
+        n_routed_experts=n_routed_experts,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=64,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        norm_topk_prob=True,
+        first_k_dense_replace=1,  # layer 0 = dense MLP, layer 1 = MoE
+        max_position_embeddings=128,
+        rope_scaling=None,
+        pad_token_id=0,
     )
 
-    _HAS_GLM4 = True
-except ImportError:
-    _HAS_GLM4 = False
+
+def _count_moe_experts_in_graph(gm: GraphModule) -> int:
+    """Return the number of experts in the first ``torch_moe`` call in *gm*."""
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and "torch_moe" in str(node.target):
+            return len(node.args[3])  # w1_weight list length
+    return 0
 
 
-if _HAS_GLM4:
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="GLM4 MoE Lite requires CUDA (uses noaux_tc_op)"
+)
+@pytest.mark.parametrize("n_routed_experts", [8, 16])
+@pytest.mark.parametrize("num_moe_experts_for_export", [2])
+def test_glm4_moe_lite_export_with_reduced_experts(n_routed_experts, num_moe_experts_for_export):
+    """Export a tiny ``Glm4MoeLiteForCausalLM`` with reduced experts and verify
+    that the expanded graph has the correct structure and accepts the original
+    state dict.
+    """
+    # GLM4 MoE Lite uses noaux_tc_op which is CUDA-only, so we must use CUDA device
+    device = "cuda"
+    config = _make_tiny_glm4_config(n_routed_experts=n_routed_experts)
+    model = Glm4MoeLiteForCausalLM(config).to(device)
+    model.eval()
 
-    def _make_tiny_glm4_config(n_routed_experts: int = 8) -> Glm4MoeLiteConfig:
-        """Create a minimal ``Glm4MoeLiteConfig`` suitable for unit tests."""
-        return Glm4MoeLiteConfig(
-            vocab_size=256,
-            hidden_size=64,
-            intermediate_size=128,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            q_lora_rank=32,
-            kv_lora_rank=32,
-            qk_nope_head_dim=12,
-            qk_rope_head_dim=4,
-            v_head_dim=16,
-            n_routed_experts=n_routed_experts,
-            n_shared_experts=1,
-            num_experts_per_tok=2,
-            moe_intermediate_size=64,
-            n_group=1,
-            topk_group=1,
-            routed_scaling_factor=1.0,
-            norm_topk_prob=True,
-            first_k_dense_replace=1,  # layer 0 = dense MLP, layer 1 = MoE
-            max_position_embeddings=128,
-            rope_scaling=None,
-            pad_token_id=0,
-        )
+    input_ids = torch.randint(0, config.vocab_size, (1, 8), device=device)
+    position_ids = torch.arange(8, device=device).unsqueeze(0)
+    sample_kwargs = {"input_ids": input_ids, "position_ids": position_ids}
 
-    def _count_moe_experts_in_graph(gm: GraphModule) -> int:
-        """Return the number of experts in the first ``torch_moe`` call in *gm*."""
-        for node in gm.graph.nodes:
-            if node.op == "call_function" and "torch_moe" in str(node.target):
-                return len(node.args[3])  # w1_weight list length
-        return 0
+    # --- full export (baseline) ---
+    gm_full = torch_export_to_gm(model, kwargs=sample_kwargs)
 
-    @pytest.mark.skipif(not _HAS_GLM4, reason="GLM4 MoE Lite model not available on this branch")
-    @pytest.mark.skipif(
-        not torch.cuda.is_available(), reason="GLM4 MoE Lite requires CUDA (uses noaux_tc_op)"
+    # --- export with reduced experts ---
+    gm_reduced = torch_export_to_gm(
+        model,
+        kwargs=sample_kwargs,
+        num_moe_experts_for_export=num_moe_experts_for_export,
     )
-    @pytest.mark.parametrize("n_routed_experts", [8, 16])
-    @pytest.mark.parametrize("num_moe_experts_for_export", [2])
-    def test_glm4_moe_lite_export_with_reduced_experts(
-        n_routed_experts, num_moe_experts_for_export
-    ):
-        """Export a tiny ``Glm4MoeLiteForCausalLM`` with reduced experts and verify
-        that the expanded graph has the correct structure and accepts the original
-        state dict.
-        """
-        # GLM4 MoE Lite uses noaux_tc_op which is CUDA-only, so we must use CUDA device
-        device = "cuda"
-        config = _make_tiny_glm4_config(n_routed_experts=n_routed_experts)
-        model = Glm4MoeLiteForCausalLM(config).to(device)
-        model.eval()
 
-        input_ids = torch.randint(0, config.vocab_size, (1, 8), device=device)
-        position_ids = torch.arange(8, device=device).unsqueeze(0)
-        sample_kwargs = {"input_ids": input_ids, "position_ids": position_ids}
+    # Structural: both graphs must expose all experts
+    assert _count_moe_experts_in_graph(gm_full) == n_routed_experts
+    assert _count_moe_experts_in_graph(gm_reduced) == n_routed_experts
 
-        # --- full export (baseline) ---
-        gm_full = torch_export_to_gm(model, kwargs=sample_kwargs)
+    # State-dict keys must match between full and reduced exports
+    full_keys = set(gm_full.state_dict().keys())
+    reduced_keys = set(gm_reduced.state_dict().keys())
+    assert full_keys == reduced_keys, (
+        f"State-dict key mismatch.\n"
+        f"  Only in full: {full_keys - reduced_keys}\n"
+        f"  Only in reduced: {reduced_keys - full_keys}"
+    )
 
-        # --- export with reduced experts ---
-        gm_reduced = torch_export_to_gm(
-            model,
-            kwargs=sample_kwargs,
-            num_moe_experts_for_export=num_moe_experts_for_export,
-        )
+    # Load the original model weights into the reduced export graph
+    gm_reduced.load_state_dict(model.state_dict(), strict=False)
 
-        # Structural: both graphs must expose all experts
-        assert _count_moe_experts_in_graph(gm_full) == n_routed_experts
-        assert _count_moe_experts_in_graph(gm_reduced) == n_routed_experts
-
-        # State-dict keys must match between full and reduced exports
-        full_keys = set(gm_full.state_dict().keys())
-        reduced_keys = set(gm_reduced.state_dict().keys())
-        assert full_keys == reduced_keys, (
-            f"State-dict key mismatch.\n"
-            f"  Only in full: {full_keys - reduced_keys}\n"
-            f"  Only in reduced: {reduced_keys - full_keys}"
-        )
-
-        # Load the original model weights into the reduced export graph
-        gm_reduced.load_state_dict(model.state_dict(), strict=False)
-
-        # Source model must be fully restored
-        for name, mod in model.named_modules():
-            if hasattr(mod, "experts") and isinstance(mod.experts, nn.ModuleList):
-                assert len(mod.experts) == n_routed_experts, (
-                    f"Expert list in '{name}' was not restored to {n_routed_experts}"
-                )
+    # Source model must be fully restored
+    for name, mod in model.named_modules():
+        if hasattr(mod, "experts") and isinstance(mod.experts, nn.ModuleList):
+            assert len(mod.experts) == n_routed_experts, (
+                f"Expert list in '{name}' was not restored to {n_routed_experts}"
+            )
