@@ -22,7 +22,6 @@ from defs.conftest import skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm._torch.auto_deploy.utils import _config
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -492,26 +491,16 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     """Accuracy tests for models from the AutoDeploy model registry.
 
-    Config = yaml_extra (merged) + BASE_ACCURACY + config_overrides.
+    Config = yaml_extra (merged) + config_overrides.
     Model paths are resolved via hf_id_to_local_model_dir.
     """
 
-    BASE_ACCURACY = {}
-
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
     MODEL_REGISTRY_ACCURACY_PARAMS = [
-        pytest.param(
-            "meta-llama/Llama-3.1-8B-Instruct",
-            {},
-            [MMLU, GSM8K],
-            id="meta-llama_Llama-3.1-8B-Instruct",
-        ),
-        pytest.param(
-            "google/gemma-3-1b-it",
-            {},
-            [MMLU, GSM8K],
-            id="google_gemma-3-1b-it",
-        ),
+        pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
+                     id="meta-llama_Llama-3.1-8B-Instruct"),
+        pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
+                     id="google_gemma-3-1b-it"),
         pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
                      id="mistralai_Ministral-8B-Instruct-2410"),
         pytest.param("mistralai/Codestral-22B-v0.1", {}, [MMLU, GSM8K],
@@ -571,8 +560,8 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         model_path = hf_id_to_local_model_dir(model_name)
         yaml_paths, registry_world_size = self._get_registry_yaml_extra(
             model_name)
-        merged = _config.deep_merge_dicts(self.BASE_ACCURACY, config_overrides)
-        effective_world_size = merged.get("world_size", registry_world_size)
+        effective_world_size = config_overrides.get("world_size",
+                                                    registry_world_size)
         if get_device_count() < effective_world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         sampling_params = self.get_default_sampling_params()
@@ -580,7 +569,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
                            yaml_extra=yaml_paths,
-                           **merged) as llm:
+                           **config_overrides) as llm:
             if accuracy_check:
                 for task_cls in tasks:
                     task = task_cls(model_name)
