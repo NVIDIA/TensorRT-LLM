@@ -3182,7 +3182,7 @@ def get_kernel_traits_code(specs_names):
                                        replace('__use_tma_store__', 'false')
             snippet_ws_custom_mask = \
                 snippet_ws_template.replace('__placeholder__', '_custom_mask').\
-                                       replace('mask_type', '2').\
+                                       replace('mask_type', '4').\
                                        replace('__use_tma_store__', 'true')
         elif effective_sm >= 90:  #GMMA no flash yet
             snippet_template = '''    {{
