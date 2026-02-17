@@ -1,11 +1,8 @@
 # Local SLURM Launch Scripts
 
-`--image` can be obtained by:
+You can use `python3 submit.py ... ` to generate slurm scripts.
 
-```bash
-image=$(grep LLM_SBSA_DOCKER_IMAGE  $trtllm/jenkins/current_image_tags.properties | head -1 | awk -F "=" '{print $2}' )
-image=$(echo $image | sed 's|urm.nvidia.com/|urm.nvidia.com#|g')
-```
+Then launch the job: `sbatch {timestamp}/slurm_launch.sh`.
 
 ## Optional Arguments
 
@@ -21,6 +18,13 @@ image=$(echo $image | sed 's|urm.nvidia.com/|urm.nvidia.com#|g')
 - `--install-sh`: Path to slurm_install.sh script.
 - `--llm-src`: Path to LLM source code.
 - `--build-wheel`: Add this flag to build the wheel before running tests.
+
+`--image` can be obtained by:
+
+```bash
+image=$(grep LLM_SBSA_DOCKER_IMAGE  $trtllm/jenkins/current_image_tags.properties | head -1 | awk -F "=" '{print $2}' )
+image=$(echo $image | sed 's|urm.nvidia.com/|urm.nvidia.com#|g')
+```
 
 ## OCI
 
