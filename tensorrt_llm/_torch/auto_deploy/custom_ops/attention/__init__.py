@@ -21,16 +21,10 @@ This module provides various attention implementations and backends:
 - flashinfer_attention: FlashInfer-based optimized attention
 - triton_attention: Triton-based attention implementations
 - triton_attention_with_kv_cache: Triton attention with KV cache support
-- triton_attention_with_paged_kv_cache: Triton attention with paged KV cache
+- triton_paged_attention: Triton paged attention (two-stage flash-decode) with HND layout
+- triton_paged_attention_one_stage: Triton paged attention (single-stage) with HND layout
 - onnx_attention: Placeholder ops for ONNX export of attention mechanisms
-"""
 
-__all__ = [
-    "torch_attention",
-    "torch_backend_attention",
-    "flashinfer_attention",
-    "triton_attention",
-    "triton_attention_with_kv_cache",
-    "triton_attention_with_paged_kv_cache",
-    "onnx_attention",
-]
+All modules are auto-imported by the parent custom_ops/__init__.py via pkgutil.walk_packages,
+so no explicit imports are needed here.
+"""
