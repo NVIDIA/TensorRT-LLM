@@ -236,4 +236,4 @@ transforms:
     cuda_graph_batch_sizes: null
     backend: torch-compile
     piecewise_enabled: true
-    piecewise_num_tokens: [8, 16]
+    piecewise_num_tokens: null

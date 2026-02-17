@@ -203,7 +203,8 @@ class ADPiecewiseRunner(nn.Module):
         fast path, common for static segment chaining).
 
         When runtime input is smaller than the bucketed static buffer (padding case),
-        copy only the valid prefix and leave the remaining captured padding untouched.
+        copy the valid prefix and clear the padded tail. Clearing avoids stale values
+        from prior warmup/capture executions leaking into downstream ops.
         """
         for idx in entry.dynamic_indices:
             new_inp = flat_inputs[idx]
@@ -223,9 +224,9 @@ class ADPiecewiseRunner(nn.Module):
                 new_inp.shape[0] < static_inp.shape[0] and new_inp.shape[1:] == static_inp.shape[1:]
             ):
                 # Padded case: runtime input is smaller along dim 0.
-                # Copy real data into the front of the static buffer.
                 n = new_inp.shape[0]
                 static_inp[:n].copy_(new_inp, non_blocking=True)
+                static_inp[n:].zero_()
             elif (
                 new_inp.ndim >= 2
                 and new_inp.shape[1] < static_inp.shape[1]
@@ -235,6 +236,7 @@ class ADPiecewiseRunner(nn.Module):
                 # (e.g., [1, real, D] vs [1, bucket, D]).
                 n = new_inp.shape[1]
                 static_inp[:, :n].copy_(new_inp, non_blocking=True)
+                static_inp[:, n:].zero_()
             else:
                 # Fallback: shapes are incompatible — this is a real error
                 static_inp.copy_(new_inp, non_blocking=True)
