@@ -1665,7 +1665,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             not request.is_finished
             and not request.py_is_draft
             and (
-                (request.is_context_init_state and request.is_last_context_chunk)
+                # NB: sample_async currently receives logits corresponding to all prefill chunks,
+                #     not only the last chunk. Requests are therefore considered "new" at
+                #     the time of processing the first chunk, so that sampler resources can be
+                #     set up in time.
+                (request.is_context_init_state and request.is_first_context_chunk)
                 or request.is_disagg_generation_transmission_complete
             )
         )
