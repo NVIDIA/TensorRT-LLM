@@ -172,7 +172,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         }
 
         if (hasTimeoutTest || downloadResultSucceed) {
-            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml", stdioRetention: 'NONE')
         }
     }
 }
@@ -1631,7 +1631,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
-            junit(testResults: "${stageName}/results*.xml")
+            junit(testResults: "${stageName}/results*.xml", stdioRetention: 'NONE')
         }
 
         // Clean up the workspace
