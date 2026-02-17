@@ -78,7 +78,7 @@ echo ""
 #############################################
 
 echo "============================================"
-echo "1/4: WAN Baseline Test"
+echo "1/3: WAN Baseline Test"
 echo "============================================"
 echo ""
 
@@ -111,7 +111,7 @@ echo ""
 #############################################
 
 echo "============================================"
-echo "2/4: FLUX.1 Baseline Test"
+echo "2/3: FLUX.1 Baseline Test"
 echo "============================================"
 echo ""
 
@@ -143,7 +143,7 @@ echo ""
 #############################################
 
 echo "============================================"
-echo "3/4: FLUX.2 Baseline Test"
+echo "3/3: FLUX.2 Baseline Test"
 echo "============================================"
 echo ""
 
@@ -166,49 +166,6 @@ if [ -d "$FLUX2_MODEL" ]; then
     echo "   Output: $FLUX2_OUTPUT"
 else
     echo "⚠️  SKIPPED: FLUX.2 model not found at $FLUX2_MODEL"
-fi
-
-echo ""
-
-#############################################
-# LTX2 Baseline Test
-#############################################
-
-echo "============================================"
-echo "4/4: LTX2 Baseline Test"
-echo "============================================"
-echo ""
-
-LTX2_MODEL="${MODEL_ROOT}/LTX-2/"
-LTX2_OUTPUT="${OUTPUT_DIR}/ltx2_baseline.mp4"
-
-if [ -z "$SKIP_LTX2" ]; then
-    if [ -d "$LTX2_MODEL" ]; then
-        echo "Testing LTX2 with official diffusers..."
-        python ${PROJECT_ROOT}/examples/visual_gen/hf_ltx2.py \
-            --model_path "$LTX2_MODEL" \
-            --output_path "$LTX2_OUTPUT" \
-            --prompt "A woman with long brown hair and light skin smiles at another woman with long blonde hair. The woman with brown hair wears a black jacket and has a small, barely noticeable mole on her right cheek. The camera angle is a close-up, focused on the woman with brown hair's face. The lighting is warm and natural, likely from the setting sun, casting a soft glow on the scene. The scene appears to be real-life footage" \
-            --negative_prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-            --height 512 \
-            --width 768 \
-            --num_frames 121 \
-            --frame_rate 24.0 \
-            --steps 40 \
-            --guidance_scale 4.0 \
-            --seed 42
-        echo ""
-        echo "✅ LTX2 baseline test completed"
-        echo "   Output: $LTX2_OUTPUT"
-        echo ""
-        echo "   Note: If audio is silent, this is expected with"
-        echo "         current LTX-2 model weights (known issue)."
-    else
-        echo "⚠️  SKIPPED: LTX2 model not found at $LTX2_MODEL"
-    fi
-else
-    echo "⚠️  SKIPPED: av package not installed"
-    echo "   Install with: pip install av"
 fi
 
 echo ""
