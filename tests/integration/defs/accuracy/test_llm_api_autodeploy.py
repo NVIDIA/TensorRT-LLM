@@ -585,14 +585,22 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "enable_chunked_prefill": True,
-            "max_batch_size": 512,
+            "compile_backend": "torch-cudagraph",
+            "max_batch_size": 64,
             "max_seq_len": self.MAX_SEQ_LEN,
             "max_num_tokens": self.MAX_SEQ_LEN,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64],
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.7,
+                "free_gpu_memory_fraction": 0.5,
                 "tokens_per_block": 64,
-            }
+            },
+            "transforms": {
+                "detect_sharding": {
+                    "sharding_source": ['factory', 'heuristic'],
+                    "sharding_dims": ['ep', 'bmm'],
+                },
+            },
         }
 
     def get_default_sampling_params(self):

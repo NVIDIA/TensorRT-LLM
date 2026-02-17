@@ -2,7 +2,7 @@ runtime: trtllm
 compile_backend: torch-cudagraph
 max_seq_len: 2048
 max_num_tokens: 2048
-max_batch_size: 512
+max_batch_size: 64
 world_size: 8
 enable_chunked_prefill: true
 model_factory: AutoModelForCausalLM

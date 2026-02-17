@@ -976,6 +976,18 @@ def extract_output_tuple(node: Node, count: int = 2):
     return results
 
 
+def _get_op_schema(node: Node):
+    """Return the op schema for a call_function node."""
+    if node.op != "call_function":
+        raise ValueError(f"_get_op_schema only supports call_function nodes, got {node.op}")
+    op = node.target
+    if hasattr(op, "_schemas"):
+        return next(iter(op._schemas.values()))
+    elif hasattr(op, "_schema"):
+        return op._schema
+    raise RuntimeError(f"No schema found on op {op}")
+
+
 def extract_op_args(node: Node, *arg_names):
     """
     Given a call_function node for torch custom op,
@@ -984,16 +996,7 @@ def extract_op_args(node: Node, *arg_names):
     2. node.args[position_in_schema]
     3. the schema default
     """
-    if node.op != "call_function":
-        raise ValueError(f"extract_op_args only supports call_function nodes, got {node.op}")
-
-    op = node.target
-    if hasattr(op, "_schemas"):
-        schema = next(iter(op._schemas.values()))
-    elif hasattr(op, "_schema"):
-        schema = op._schema
-    else:
-        raise RuntimeError(f"No schema found on op {op}")
+    schema = _get_op_schema(node)
     args_meta = schema.arguments
 
     # name→index in signature, and name→default_value
@@ -1011,7 +1014,7 @@ def extract_op_args(node: Node, *arg_names):
             return args[i]
         if name in defs:
             return defs[name]
-        raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
+        raise RuntimeError(f"Could not find a value for '{name}' on op {node.target}")
 
     return [_get(n) for n in arg_names]
 
@@ -1031,17 +1034,7 @@ def set_op_args(node: Node, **name_value_pairs) -> None:
     This is the write-side complement to :func:`extract_op_args` and avoids
     manual index arithmetic when injecting new arguments into a node.
     """
-    if node.op != "call_function":
-        raise ValueError(f"set_op_args only supports call_function nodes, got {node.op}")
-
-    op = node.target
-    if hasattr(op, "_schemas"):
-        schema = next(iter(op._schemas.values()))
-    elif hasattr(op, "_schema"):
-        schema = op._schema
-    else:
-        raise RuntimeError(f"No schema found on op {op}")
-
+    schema = _get_op_schema(node)
     pos = {a.name: i for i, a in enumerate(schema.arguments)}
 
     args = list(node.args)
@@ -1049,7 +1042,7 @@ def set_op_args(node: Node, **name_value_pairs) -> None:
 
     for name, value in name_value_pairs.items():
         if name not in pos:
-            raise RuntimeError(f"'{name}' is not a valid argument for op {op}")
+            raise RuntimeError(f"'{name}' is not a valid argument for op {node.target}")
         if name in kwargs:
             kwargs[name] = value
         elif pos[name] < len(args):

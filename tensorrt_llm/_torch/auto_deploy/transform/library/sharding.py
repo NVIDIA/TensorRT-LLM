@@ -43,6 +43,7 @@ from ...utils.node_utils import (
     LayerType,
     WeightBiasInfoCache,
     bfs,
+    extract_op_args,
     extract_weight_name,
     extract_weight_nodes,
     filtered_nodes,
@@ -1838,22 +1839,15 @@ def _process_ssm_sharding(
     )
 
     # ##############################################################
-    # ############# update conv1d num output channels ##############
+    # ############# update conv1d groups for sharded channels ######
     # ##############################################################
     conv1d_nodes = [
         n for n in subgraph_nodes if is_op(n, [torch.ops.auto_deploy.torch_causal_conv1d])
     ]
     assert len(conv1d_nodes) == 1, "Expecting exactly one conv1d node"
     conv1d_node = conv1d_nodes[0]
-    # conv1d_node last argument is the number of output channels.
-    # This one is also sharded, so we need to update this parameter
-    conv_args = list(conv1d_node.args)
-    conv_args[-1] = conv1d_node.args[-1] // world_size
-    transform_container.add(
-        ParameterUpdateInfo(
-            config=transform_container.config, target_node=conv1d_node.name, args=tuple(conv_args)
-        )
-    )
+    [conv_groups] = extract_op_args(conv1d_node, "groups")
+    set_op_args(conv1d_node, groups=conv_groups // world_size)
 
     # ##############################################################
     # ############## shard the remaining weights ###################
@@ -1985,10 +1979,10 @@ def _process_delta_sharding(
     conv_split_sizes_original = None
     if split_node_after_conv is not None and len(split_node_after_conv.args) > 1:
         conv_split_sizes_original = tuple(split_node_after_conv.args[1])
-        conv_dim = conv1d_node.args[-1]
-        assert sum(conv_split_sizes_original) == conv_dim, (
+        [conv_groups] = extract_op_args(conv1d_node, "groups")
+        assert sum(conv_split_sizes_original) == conv_groups, (
             f"Split sizes {conv_split_sizes_original} (sum={sum(conv_split_sizes_original)}) "
-            f"do not match conv_dim {conv_dim}"
+            f"do not match conv1d groups {conv_groups}"
         )
 
     # ##############################################################
@@ -2056,13 +2050,10 @@ def _process_delta_sharding(
             )
 
     # ##############################################################
-    # ############# update conv1d num output channels ##############
+    # ############# update conv1d groups for sharded channels ######
     # ##############################################################
-    conv_args = list(conv1d_node.args)
-    conv_args[-1] = conv1d_node.args[-1] // world_size
-    transform_container.add(
-        ParameterUpdateInfo(config=config, target_node=conv1d_node.name, args=tuple(conv_args))
-    )
+    [conv_groups] = extract_op_args(conv1d_node, "groups")
+    set_op_args(conv1d_node, groups=conv_groups // world_size)
 
     # ##############################################################
     # ############## shard the remaining weights ###################
