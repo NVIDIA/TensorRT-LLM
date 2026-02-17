@@ -177,11 +177,12 @@ def pulseScan(llmRepo, branchName) {
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
                         "PULSE_REPO_URL=${llmRepo}",
+                        "PULSE_REPO_BRANCH=${branchName}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
-                        "PULSE_SCAN_PROJECT_VERSION=${branchName}",
+                        "PULSE_SCAN_PROJECT_VERSION=${branchName.replace("release/", "")}",
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
                     ]) {
-                        sh 'pulse scan --no-fail --sbom .'
+                        sh 'pulse scan --no-fail --sbom --override .'
                     }
                   }
             }
