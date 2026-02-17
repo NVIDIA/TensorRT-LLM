@@ -121,3 +121,5 @@ Skip testing for latest commit on pull request. `--comment "Reason for skipping 
 Reuse a previous pipeline to validate current commit. This action will also kill all currently running builds associated with the pull request. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break.
 
 </details>
+
+Greetings from dpitman@, this is a benign change to test a CI pipeline feature...
