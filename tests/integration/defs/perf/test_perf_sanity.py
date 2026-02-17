@@ -1541,7 +1541,7 @@ class PerfSanityTestConfig:
         check_perf_regression(
             new_data_dict,
             fail_on_regression=is_scenario_mode,
-            output_dir=self.perf_sanity_output_dir,
+            output_dir=self.test_output_dir,
         )
 
 
