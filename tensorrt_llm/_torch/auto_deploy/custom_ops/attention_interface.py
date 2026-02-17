@@ -35,7 +35,7 @@ from torch.types import Number
 
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-from ...._utils import nvtx_range, str_dtype_to_torch
+from ...._utils import nvtx_range, str_dtype_to_torch, use_pinned_memory
 from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
@@ -92,7 +92,7 @@ class InputBuffer:
         # Allocate contiguous buffers (device buffer starts on default device, use to() to move)
         self._device_buffer = torch.empty(self._total_bytes, dtype=torch.uint8)
         self._host_buffer = torch.empty(
-            self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+            self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=use_pinned_memory()
         )
 
         # Create persistent views into device and host buffers
@@ -276,7 +276,7 @@ class InputBuffer:
         # Host buffer must be re-allocated to ensure we have pinned memory
         old_host_buffer = self._host_buffer
         self._host_buffer = torch.empty(
-            self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+            self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=use_pinned_memory()
         )
         self._host_buffer[: old_host_buffer.numel()].copy_(old_host_buffer)
         del old_host_buffer

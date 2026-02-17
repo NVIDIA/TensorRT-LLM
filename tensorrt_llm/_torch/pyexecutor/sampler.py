@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
     MakeDecodingBatchInputOutput,
 )
-from tensorrt_llm._utils import mpi_disabled, nvtx_range, torch_dtype_to_binding
+from tensorrt_llm._utils import mpi_disabled, nvtx_range, torch_dtype_to_binding, use_pinned_memory
 from tensorrt_llm.bindings import (
     CudaStream,
     DataType,
@@ -981,7 +981,7 @@ class AsyncWorkerMixin:
         dest.copy_(src)
 
     def _copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
-        dest = torch.empty_like(src, device="cpu", pin_memory=True)
+        dest = torch.empty_like(src, device="cpu", pin_memory=use_pinned_memory())
         if self._async_worker_active():
             # Create a snapshot of the source on the main stream, so as to
             # guarantee that the tensor data hasn't been modified before the
@@ -1709,7 +1709,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 full_list.append(prompt_lens)
             # perform only a single copy
             full_list_tensor = torch.tensor(
-                full_list, device="cpu", dtype=torch.int32, pin_memory=True
+                full_list, device="cpu", dtype=torch.int32, pin_memory=use_pinned_memory()
             ).to(device="cuda", non_blocking=True)
             seq_slots_tensor = full_list_tensor[0]
             max_lens_tensor = full_list_tensor[1]
@@ -1769,7 +1769,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.store.first_finish_reasons[seq_slots] = (
             torch.tensor(
                 FinishReason.NOT_FINISHED.value,
-                pin_memory=True,
+                pin_memory=use_pinned_memory(),
                 dtype=self.store.first_finish_reasons.dtype,
             )
             .to(self.store.first_finish_reasons.device, non_blocking=True)
@@ -1918,6 +1918,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         pin_memory: bool = True,
         preallocate_extra_steps: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        pin_memory = pin_memory and use_pinned_memory()
         """Extract the logprobs from the request
 
         Returns:
@@ -2198,7 +2199,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                             for request_idx in grouped_requests[key].indices
                         ],
                         dtype=torch.int32,
-                        pin_memory=True,
+                        pin_memory=use_pinned_memory(),
                     ).to(
                         device="cuda", non_blocking=True
                     ),  # end_ids should be on device for beam search
@@ -2382,11 +2383,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in requests],
             dtype=torch.int64,  # for index_fill_
-            pin_memory=True,
+            pin_memory=use_pinned_memory(),
         )
         # necessary for beam search and max_length checks
         seq_lens_host = torch.tensor(
-            [r.max_beam_num_tokens for r in requests], dtype=torch.int32, pin_memory=True
+            [r.max_beam_num_tokens for r in requests], dtype=torch.int32, pin_memory=use_pinned_memory()
         )
         new_tokens_host = self._process_requests(
             scheduled_requests,
@@ -2573,12 +2574,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         assert req_bias is not None  # otherwise bias_to_index is empty
 
         bias_gather_indices_cuda = torch.tensor(
-            bias_gather_indices, pin_memory=True, dtype=torch.int32
+            bias_gather_indices, pin_memory=use_pinned_memory(), dtype=torch.int32
         ).to(logits.device, non_blocking=True)
         logits_bias_mask_cuda = torch.tensor(
-            logits_bias_masks, pin_memory=True, dtype=torch.bool
+            logits_bias_masks, pin_memory=use_pinned_memory(), dtype=torch.bool
         ).to(logits.device, non_blocking=True)
-        biases_tensor = torch.empty((len(bias_to_index), *req_bias.shape), pin_memory=True)
+        biases_tensor = torch.empty((len(bias_to_index), *req_bias.shape), pin_memory=use_pinned_memory())
         biases_tensor = torch.stack(
             tuple(bias_to_index.keys()),
             out=biases_tensor,
@@ -2613,7 +2614,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> _BatchedSamplingResult:
         grouped_requests = _group_requests_by_strategy_key(
             requests,
-            pin_memory=True,
+            pin_memory=use_pinned_memory(),
             strategy_to_key=self._grouped_sampler_cls.strategy_grouping_key,
             store=self.store,
             seq_slots=seq_slots,
@@ -2929,7 +2930,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         req_num_generation_steps_list = [1 + get_draft_token_length(req) for req in requests]
         req_num_generation_steps = torch.tensor(
-            req_num_generation_steps_list, dtype=torch.int32, pin_memory=True
+            req_num_generation_steps_list, dtype=torch.int32, pin_memory=use_pinned_memory()
         )
 
         # context requests do not have multiple beams yet, so beam width may differ in mixed batches
@@ -2937,11 +2938,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             req.get_beam_width_by_iter(False) if not req.is_context_init_state else 1
             for req in requests
         ]
-        req_num_beams = torch.tensor(req_num_beams_list, dtype=torch.int32, pin_memory=True)
+        req_num_beams = torch.tensor(req_num_beams_list, dtype=torch.int32, pin_memory=use_pinned_memory())
         # context requests do not have multiple beams yet, so beam width may differ after sampling
         req_num_output_beams_list = [req.get_beam_width_by_iter(True) for req in requests]
         req_num_beams_output = torch.tensor(
-            req_num_output_beams_list, dtype=torch.int32, pin_memory=True
+            req_num_output_beams_list, dtype=torch.int32, pin_memory=use_pinned_memory()
         )
 
         req_num_generated_tokens = req_num_generation_steps * req_num_beams
@@ -2949,7 +2950,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # NB: These offsets consider generated tokens _only_ (draft and target, but not context).
         #     Filter out the context tokens below.
         req_offsets, sum_num_generated_tokens = _PackedStepIndexer.calculate_request_offsets(
-            req_num_generated_tokens, pin_memory=True
+            req_num_generated_tokens, pin_memory=use_pinned_memory()
         )
 
         generation_requests_total_steps = (
@@ -2983,7 +2984,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 raw_logits_cuda.device, non_blocking=True
             )
             context_req_offsets_cuda = torch.tensor(
-                num_context_logits_prefix_sum, dtype=torch.int32, pin_memory=True
+                num_context_logits_prefix_sum, dtype=torch.int32, pin_memory=use_pinned_memory()
             ).to(device=raw_logits_cuda.device, non_blocking=True)
 
             if scheduled_requests.generation_requests:
@@ -3055,7 +3056,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
             ],
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=use_pinned_memory(),
         ).to(device="cuda", non_blocking=True)
 
     @nvtx_range("_write_finish_reasons")
@@ -3093,7 +3094,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         if with_stop_words := self._requests_with_stop_words(requests):
             stop_seq_slots = torch.tensor(
-                [r.py_seq_slot for r in with_stop_words], pin_memory=True
+                [r.py_seq_slot for r in with_stop_words], pin_memory=use_pinned_memory()
             ).to("cuda", non_blocking=True)
             stop_tokens = new_tokens[:, stop_seq_slots]
             stop_indices = self._request_indices_with_stop_words(requests)
@@ -3160,7 +3161,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         square = torch.ones(self.max_tokens, self.max_tokens, dtype=torch.bool)
         pad_id = torch.tensor(self._PAD_ID)
         mask = torch.where(square.tril(), torch.tensor(1), pad_id)
-        mask.pin_memory()
+        if use_pinned_memory():
+            mask = mask.pin_memory()
         return mask.to("cuda", non_blocking=True)
 
     def _padded_old_tokens(
@@ -3204,7 +3206,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 for beam_idx in range(self.max_beam_width)
             ]
             old_tokens.append(padded)
-        old_tokens_tensor = torch.tensor(old_tokens, pin_memory=True).to("cuda", non_blocking=True)
+        old_tokens_tensor = torch.tensor(old_tokens, pin_memory=use_pinned_memory()).to("cuda", non_blocking=True)
         assert old_tokens_tensor.shape == (
             len(requests),
             self.max_beam_width,
@@ -3228,7 +3230,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         predecessor_beams: torch.Tensor | None = None,
     ) -> torch.Tensor:
         per_step = torch.zeros(
-            (self.max_tokens, len(requests), self.max_beam_width), dtype=torch.bool, pin_memory=True
+            (self.max_tokens, len(requests), self.max_beam_width), dtype=torch.bool, pin_memory=use_pinned_memory()
         ).to("cuda", non_blocking=True)
 
         padded_tokens = self._padded_old_tokens(requests, tokens, predecessor_beams)
@@ -3241,7 +3243,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             lens = np.diff(ends, prepend=0)
             max_len = np.max(lens)
 
-            words = torch.zeros(len(lens), max_len.item(), dtype=torch.int32, pin_memory=True)
+            words = torch.zeros(len(lens), max_len.item(), dtype=torch.int32, pin_memory=use_pinned_memory())
             for step, (start, length) in enumerate(zip([0] + ends, lens)):
                 words[step, :length] = torch.tensor(swl[start : start + length], dtype=torch.int32)
             words_device = words.to("cuda", non_blocking=True)
@@ -3432,7 +3434,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> torch.Tensor:
         seq_slots_int64 = seq_slots
         seq_slots = torch.empty_like(
-            seq_slots_int64, dtype=torch.int32, pin_memory=True
+            seq_slots_int64, dtype=torch.int32, pin_memory=use_pinned_memory()
         )  # int32 suffices here
         seq_slots[:] = seq_slots_int64
 

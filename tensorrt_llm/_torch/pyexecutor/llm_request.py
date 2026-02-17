@@ -6,6 +6,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._utils import use_pinned_memory
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
@@ -85,7 +86,7 @@ class LogitsStorage:
                 (self.seq_length, self.beam_width, self.vocab_size),
                 dtype=logits.dtype,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=use_pinned_memory(),
                 requires_grad=False)
 
     def _init_chunked_storage(self, logits: torch.Tensor):
@@ -96,7 +97,7 @@ class LogitsStorage:
             (self.seq_length, self.beam_width, self.vocab_size),
             dtype=logits.dtype,
             device='cpu',
-            pin_memory=True,
+            pin_memory=use_pinned_memory(),
             requires_grad=False)
 
     def append(self, logits: torch.Tensor):

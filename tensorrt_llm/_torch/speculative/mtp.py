@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     MambaHybridCacheManager
+from tensorrt_llm._utils import use_pinned_memory
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -171,7 +172,7 @@ class MTPSpecMetadata(SpecMetadata):
         batch_indices = torch.arange(num_seqs,
                                      dtype=torch.int,
                                      device='cpu',
-                                     pin_memory=True)
+                                     pin_memory=use_pinned_memory())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
@@ -201,17 +202,17 @@ class MTPSpecMetadata(SpecMetadata):
                         mtp_past_tokens_pool[slot_id].data_ptr())
                 mtp_hidden_states_ptrs = torch.tensor(mtp_hidden_states_ptrs,
                                                       dtype=torch.int64,
-                                                      pin_memory=True)
+                                                      pin_memory=use_pinned_memory())
                 mtp_past_tokens_ptrs = torch.tensor(mtp_past_tokens_ptrs,
                                                     dtype=torch.int64,
-                                                    pin_memory=True)
+                                                    pin_memory=use_pinned_memory())
                 self.mtp_hidden_states_ptrs[:num_seqs].copy_(
                     mtp_hidden_states_ptrs, non_blocking=True)
                 self.mtp_past_tokens_ptrs[:num_seqs].copy_(mtp_past_tokens_ptrs,
                                                            non_blocking=True)
             mtp_slot_ids = torch.tensor(mtp_slot_ids,
                                         dtype=torch.int,
-                                        pin_memory=True)
+                                        pin_memory=use_pinned_memory())
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 

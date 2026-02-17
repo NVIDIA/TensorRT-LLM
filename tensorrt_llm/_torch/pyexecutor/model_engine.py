@@ -15,7 +15,8 @@ import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
-                                 torch_dtype_to_str, trace_func)
+                                 torch_dtype_to_str, trace_func,
+                                 use_pinned_memory)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
@@ -1894,15 +1895,15 @@ class PyTorchModelEngine(ModelEngine):
         prompt_lengths = torch.empty(num_extend_requests,
                                      dtype=torch.int,
                                      device='cpu',
-                                     pin_memory=True)
+                                     pin_memory=use_pinned_memory())
         num_cached_tokens_per_seq = torch.empty(num_extend_requests,
                                                 dtype=torch.int,
                                                 device='cpu',
-                                                pin_memory=True)
+                                                pin_memory=use_pinned_memory())
         previous_batch_indices = torch.empty(num_extend_requests,
                                              dtype=torch.int,
                                              device='cpu',
-                                             pin_memory=True)
+                                             pin_memory=use_pinned_memory())
 
         request_accepted_path = {}
         num_extend_dummy_requests = 0
@@ -2154,7 +2155,7 @@ class PyTorchModelEngine(ModelEngine):
                 # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
-                                            pin_memory=True,
+                                            pin_memory=use_pinned_memory(),
                                             target_keywords=getattr(
                                                 self.model,
                                                 "multimodal_data_device_paths",
@@ -2453,7 +2454,7 @@ class PyTorchModelEngine(ModelEngine):
                             multimodal_params.to_device(
                                 "multimodal_data",
                                 "cuda",
-                                pin_memory=True,
+                                pin_memory=use_pinned_memory(),
                                 target_keywords=[
                                     "mrope_config.mrope_position_deltas"
                                 ])
@@ -2470,7 +2471,7 @@ class PyTorchModelEngine(ModelEngine):
         def previous_seq_slots_device():
             previous_batch_indices_host = torch.tensor(previous_batch_indices,
                                                        dtype=torch.int,
-                                                       pin_memory=True)
+                                                       pin_memory=use_pinned_memory())
             previous_slots = self.previous_batch_indices_cuda[:
                                                               previous_batch_len]
             previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
@@ -2486,7 +2487,7 @@ class PyTorchModelEngine(ModelEngine):
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
                                      dtype=torch.int,
-                                     pin_memory=True)
+                                     pin_memory=use_pinned_memory())
             self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
             # Update input_ids_cuda with new tokens from new_tensors_device (draft model only)
@@ -2500,13 +2501,13 @@ class PyTorchModelEngine(ModelEngine):
                         for _, last_token_idx, _ in context_input_ids_positions
                     ],
                                                          dtype=torch.long,
-                                                         pin_memory=True)
+                                                         pin_memory=use_pinned_memory())
                     ctx_seq_slots_cpu = torch.tensor([
                         seq_slot
                         for _, _, seq_slot in context_input_ids_positions
                     ],
                                                      dtype=torch.long,
-                                                     pin_memory=True)
+                                                     pin_memory=use_pinned_memory())
                     # Copy to pre-allocated GPU buffers
                     self.draft_ctx_token_indices_cuda[:num_ctx_positions].copy_(
                         ctx_token_indices_cpu, non_blocking=True)
@@ -2539,10 +2540,10 @@ class PyTorchModelEngine(ModelEngine):
                     total_tokens = len(all_indices)
                     idx_tensor_cpu = torch.tensor(all_indices,
                                                   dtype=torch.long,
-                                                  pin_memory=True)
+                                                  pin_memory=use_pinned_memory())
                     seq_slots_tensor_cpu = torch.tensor(all_seq_slots,
                                                         dtype=torch.long,
-                                                        pin_memory=True)
+                                                        pin_memory=use_pinned_memory())
 
                     # Copy to pre-allocated GPU buffers
                     self.draft_first_draft_indices_cuda[:total_tokens].copy_(
@@ -2564,13 +2565,13 @@ class PyTorchModelEngine(ModelEngine):
         if num_draft_tokens > 0:
             draft_tokens = torch.tensor(draft_tokens,
                                         dtype=torch.int,
-                                        pin_memory=True)
+                                        pin_memory=use_pinned_memory())
             self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
                                                              non_blocking=True)
         if self.is_spec_decode and len(num_accepted_draft_tokens) > 0:
             num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
                                                      dtype=torch.int,
-                                                     pin_memory=True)
+                                                     pin_memory=use_pinned_memory())
             self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)].copy_(num_accepted_draft_tokens,
                                                   non_blocking=True)
@@ -2581,11 +2582,11 @@ class PyTorchModelEngine(ModelEngine):
                 num_first_draft = len(first_draft_seq_slots)
                 first_draft_seq_slots_cpu = torch.tensor(first_draft_seq_slots,
                                                          dtype=torch.int,
-                                                         pin_memory=True)
+                                                         pin_memory=use_pinned_memory())
                 first_draft_indices_cpu = torch.tensor(
                     first_draft_request_indices,
                     dtype=torch.int,
-                    pin_memory=True)
+                    pin_memory=use_pinned_memory())
 
                 # Copy to pre-allocated GPU buffers
                 self.draft_seq_slots_buffer_cuda[:num_first_draft].copy_(
@@ -2627,7 +2628,7 @@ class PyTorchModelEngine(ModelEngine):
                 kv_len_offsets_device = new_tokens_lens_device - self.runtime_draft_len - 1
                 previous_pos_indices_host = torch.tensor(previous_pos_indices,
                                                          dtype=torch.int,
-                                                         pin_memory=True)
+                                                         pin_memory=use_pinned_memory())
                 self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
                     previous_pos_indices_host, non_blocking=True)
 
@@ -2686,7 +2687,7 @@ class PyTorchModelEngine(ModelEngine):
             # `_create_dummy_context_requests` from `kv_cache_creater` makes an exception that I can not add multimodal_data to the dummy_request
             # so that we only replace position_ids with mrope_position_ids when it is not a dummy request and for models who is using mrope.
             mrope_position_ids = torch.cat(mrope_position_ids, dim=-1)
-            if mrope_position_ids.device.type == "cpu":
+            if mrope_position_ids.device.type == "cpu" and use_pinned_memory():
                 mrope_position_ids = mrope_position_ids.pin_memory()
             self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
                 mrope_position_ids[:, :, :total_num_tokens], non_blocking=True)
@@ -2695,7 +2696,7 @@ class PyTorchModelEngine(ModelEngine):
         else:
             position_ids = torch.tensor(position_ids,
                                         dtype=torch.int,
-                                        pin_memory=True)
+                                        pin_memory=use_pinned_memory())
             self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
                                                             non_blocking=True)
             final_position_ids = self.position_ids_cuda[:
@@ -2704,7 +2705,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.enable_spec_decode:
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
-                gather_ids, dtype=torch.int, pin_memory=True),
+                gather_ids, dtype=torch.int, pin_memory=use_pinned_memory()),
                                                          non_blocking=True)
 
             # Update gather_ids for first_draft_requests on GPU (draft model only)
@@ -2713,11 +2714,11 @@ class PyTorchModelEngine(ModelEngine):
                 num_first_draft = len(first_draft_seq_slots)
                 first_draft_seq_slots_cpu = torch.tensor(first_draft_seq_slots,
                                                          dtype=torch.int,
-                                                         pin_memory=True)
+                                                         pin_memory=use_pinned_memory())
                 first_draft_indices_cpu = torch.tensor(
                     first_draft_request_indices,
                     dtype=torch.int,
-                    pin_memory=True)
+                    pin_memory=use_pinned_memory())
 
                 # Copy to pre-allocated GPU buffers
                 self.draft_seq_slots_buffer_cuda[:num_first_draft].copy_(
@@ -2747,7 +2748,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.seq_lens = torch.tensor(
                 sequence_lengths,
                 dtype=torch.int,
-                pin_memory=True,
+                pin_memory=use_pinned_memory(),
             )
 
         num_generation_requests = len(gen_request_seq_slots)
@@ -2760,7 +2761,7 @@ class PyTorchModelEngine(ModelEngine):
                 # Convert to GPU tensor to avoid implicit sync
                 gen_request_seq_slots_tensor = torch.tensor(
                     gen_request_seq_slots, dtype=torch.long,
-                    pin_memory=True).to(device='cuda', non_blocking=True)
+                    pin_memory=use_pinned_memory()).to(device='cuda', non_blocking=True)
                 self.cache_indirection_attention[:num_generation_requests].copy_(
                     cache_indirection_buffer[gen_request_seq_slots_tensor])
             if cache_indirection_buffer is not None or is_cuda_graph_during_warmup:
@@ -2869,9 +2870,15 @@ class PyTorchModelEngine(ModelEngine):
         if mm_token_indices is not None:
             mask = torch.ones(total_num_tokens, dtype=torch.bool)
             mask[mm_token_indices] = False
-            inputs['mm_token_indices'] = mm_token_indices.pin_memory().to(
+            mm_idx = mm_token_indices
+            if use_pinned_memory():
+                mm_idx = mm_idx.pin_memory()
+            inputs['mm_token_indices'] = mm_idx.to(
                 "cuda", non_blocking=True)
-            inputs['text_token_indices'] = torch.where(mask)[0].pin_memory().to(
+            text_idx = torch.where(mask)[0]
+            if use_pinned_memory():
+                text_idx = text_idx.pin_memory()
+            inputs['text_token_indices'] = text_idx.to(
                 "cuda", non_blocking=True)
 
         num_generation_tokens = len(generation_requests) + len(
@@ -2929,7 +2936,7 @@ class PyTorchModelEngine(ModelEngine):
                     multimodal_data=request.py_multimodal_data, )
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
-                                            pin_memory=True)
+                                            pin_memory=use_pinned_memory())
                 multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot
@@ -2937,17 +2944,17 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
             "num_tokens should be less than or equal to max_num_tokens")
-        input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=use_pinned_memory())
         self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,
-                                    pin_memory=True)
+                                    pin_memory=use_pinned_memory())
         self.position_ids_cuda[:num_tokens].copy_(position_ids,
                                                   non_blocking=True)
         if self.enable_spec_decode:
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
-                gather_ids, dtype=torch.int, pin_memory=True),
+                gather_ids, dtype=torch.int, pin_memory=use_pinned_memory()),
                                                          non_blocking=True)
 
         if not attn_metadata.is_cuda_graph:
@@ -2960,7 +2967,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.seq_lens = torch.tensor(
                 sequence_lengths,
                 dtype=torch.int,
-                pin_memory=True,
+                pin_memory=use_pinned_memory(),
             )
 
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
@@ -3220,12 +3227,12 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
             "num_tokens should be less than or equal to max_num_tokens")
-        input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=use_pinned_memory())
         self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,
-                                    pin_memory=True)
+                                    pin_memory=use_pinned_memory())
         self.position_ids_cuda[:num_tokens].copy_(position_ids,
                                                   non_blocking=True)
 
@@ -3239,7 +3246,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.seq_lens = torch.tensor(
                 sequence_lengths,
                 dtype=torch.int,
-                pin_memory=True,
+                pin_memory=use_pinned_memory(),
             )
 
         attn_metadata.request_ids = request_ids

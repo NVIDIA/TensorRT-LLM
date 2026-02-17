@@ -26,6 +26,7 @@ from typing import Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
+from tensorrt_llm._utils import use_pinned_memory
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -439,7 +440,7 @@ def get_rejected_indices(
     # NB: torch.arange is needed to enable "advanced indexing",
     #   cf. https://numpy.org/devdocs/user/basics.indexing.html#integer-array-indexing
     token_idx = torch.arange(num_draft_tokens, dtype=torch.int32, device=generator.device)
-    draft_tokens_cuda = torch.tensor(draft_tokens, dtype=torch.int32, pin_memory=True).to(
+    draft_tokens_cuda = torch.tensor(draft_tokens, dtype=torch.int32, pin_memory=use_pinned_memory()).to(
         device=generator.device, non_blocking=True
     )
     p = draft_probs[token_idx, draft_tokens_cuda]

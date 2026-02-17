@@ -53,6 +53,8 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from tensorrt_llm._utils import use_pinned_memory
+
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op

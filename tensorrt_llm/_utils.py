@@ -1302,6 +1302,14 @@ def confidential_compute_enabled() -> bool:
     return cc_enabled
 
 
+@lru_cache(maxsize=None)
+def use_pinned_memory() -> bool:
+    """Return False when confidential compute is enabled to avoid DMA
+    contention between pinned-memory H2D copies and the sampler's async
+    D2H copies that share the CC bounce-buffer path."""
+    return not confidential_compute_enabled()
+
+
 P = ParamSpec("P")
 
 

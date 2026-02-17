@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
+from tensorrt_llm._utils import use_pinned_memory
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.mapping import Mapping
@@ -199,7 +200,8 @@ class AttentionMetadata:
 
         # The model executor sets seq_lens to None initially.
         if self._seq_lens is not None:
-            self._seq_lens = self._seq_lens.pin_memory()
+            if use_pinned_memory():
+                self._seq_lens = self._seq_lens.pin_memory()
 
             if self.is_cuda_graph and self._seq_lens_cuda is not None:
                 # Very important: do not reallocate if we are using CUDA graphs.
@@ -249,7 +251,8 @@ class AttentionMetadata:
         self.on_update()
         # The model executor sets seqlens to None initially.
         if self._seq_lens_kv is not None:
-            self._seq_lens_kv = self._seq_lens_kv.pin_memory()
+            if use_pinned_memory():
+                self._seq_lens_kv = self._seq_lens_kv.pin_memory()
             self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(non_blocking=True)
 
     @property

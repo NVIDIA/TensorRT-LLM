@@ -15,7 +15,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
-                                 torch_comm)
+                                 torch_comm, use_pinned_memory)
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -480,7 +480,7 @@ class KVCacheManager(BaseResourceManager):
                                                        2,
                                                        self.max_blocks_per_seq,
                                                        dtype=torch.int32,
-                                                       pin_memory=True,
+                                                       pin_memory=use_pinned_memory(),
                                                        device='cpu')
 
     def shutdown(self):
@@ -1709,7 +1709,7 @@ class KVCacheManagerV2(BaseResourceManager):
         ] for pool_id in range(self.num_pools)],
                                                    dtype=torch.int64,
                                                    device="cpu",
-                                                   pin_memory=True)
+                                                   pin_memory=use_pinned_memory())
 
         if kv_cache_config.dtype == "nvfp4":
             self.kv_cache_pool_pointers = torch.stack([
@@ -1757,7 +1757,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_pool_mapping = torch.tensor(kv_cache_pool_mapping_list,
                                                   dtype=torch.int32,
                                                   device="cpu",
-                                                  pin_memory=True)
+                                                  pin_memory=use_pinned_memory())
 
         # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel
         self.max_blocks_per_seq = (max_seq_len + tokens_per_block -
@@ -1807,7 +1807,7 @@ class KVCacheManagerV2(BaseResourceManager):
             2,  # key and value
             self.max_blocks_per_seq,
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=use_pinned_memory(),
             device='cpu')
 
     @property

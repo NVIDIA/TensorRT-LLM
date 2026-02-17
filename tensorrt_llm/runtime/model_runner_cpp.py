@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from .. import profiler
-from .._utils import mpi_broadcast
+from .._utils import mpi_broadcast, use_pinned_memory
 from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
 from ..bindings import executor as trtllm
 from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
@@ -855,7 +855,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 # 1. Both memory copy stream and kernel execution stream must be non-default streams
                 # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
                 prompt_table_data = self._prepare_embedding_table(
-                    prompt_table).pin_memory()
+                    prompt_table)
+                if use_pinned_memory():
+                    prompt_table_data = prompt_table_data.pin_memory()
             else:
                 prompt_table_data = self._prepare_embedding_table(
                     prompt_table).cuda()

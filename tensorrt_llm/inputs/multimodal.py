@@ -10,6 +10,7 @@ from blake3 import blake3
 from torchvision.transforms import ToPILImage
 
 import tensorrt_llm
+from tensorrt_llm._utils import use_pinned_memory
 from tensorrt_llm.logger import logger
 
 # Default hasher
@@ -381,7 +382,8 @@ class MultimodalParams:
 
                 pin_memory = kwargs.get('pin_memory', False)
                 try:
-                    if pin_memory and input_data.device.type == 'cpu':
+                    if pin_memory and use_pinned_memory(
+                    ) and input_data.device.type == 'cpu':
                         return input_data.pin_memory().to(device,
                                                           non_blocking=True)
                     else:

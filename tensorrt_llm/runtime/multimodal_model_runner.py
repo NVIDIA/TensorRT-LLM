@@ -29,7 +29,7 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
 from .. import profiler
 from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
                       supports_inflight_batching, torch_dtype_to_trt,
-                      trt_dtype_to_torch)
+                      trt_dtype_to_torch, use_pinned_memory)
 from ..functional import RopeEmbeddingUtils, RotaryScalingType
 from ..layers import MropeParams
 from ..logger import logger
@@ -1651,7 +1651,7 @@ class MultimodalModelRunner:
             # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
             pinned_embeds = torch.empty_like(image_embeds,
                                              device='cpu',
-                                             pin_memory=True)
+                                             pin_memory=use_pinned_memory())
             pinned_embeds.copy_(image_embeds, non_blocking=True)
             image_embeds = pinned_embeds
 
@@ -2140,7 +2140,9 @@ class MultimodalModelRunner:
                     # CUDA Stream Overlapping Requirements:
                     # 1. Both memory copy stream and kernel execution stream must be non-default streams
                     # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
-                    prompt_table = prompt_table.pin_memory().to(
+                    if use_pinned_memory():
+                        prompt_table = prompt_table.pin_memory()
+                    prompt_table = prompt_table.to(
                         dtype=self.model.dtype)
                 else:
                     prompt_table = prompt_table.cuda().to(
