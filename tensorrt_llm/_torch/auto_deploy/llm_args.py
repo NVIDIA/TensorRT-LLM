@@ -8,13 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.mapping import Mapping
 
-from ...llmapi.llm_args import (
-    BuildConfig,
-    EagleDecodingConfig,
-    SamplerType,
-    TorchLlmArgs,
-    _ParallelConfig,
-)
+from ...llmapi.llm_args import BuildConfig, EagleDecodingConfig, TorchLlmArgs, _ParallelConfig
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -91,6 +85,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             return cls.model_fields["max_seq_len"].get_default(call_default_factory=True)
         return value
 
+    @field_validator("max_beam_width", mode="after")
+    @classmethod
+    def ensure_no_beam_search(cls, value: Any) -> Any:
+        if value is not None and value > 1:
+            raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
+        return value
+
     @field_validator("build_config", mode="before")
     @classmethod
     def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:
@@ -156,15 +157,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         description="The model factory to use for loading the model.",
     )
 
-    model_kwargs: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Extra kwargs for the model config class to customize the model config. "
-        "These arguments take precedence over default values or config values in the model config "
-        "file. Arguments are resolved in order: 1) Default values in model config class, 2) Values "
-        "in model config file, 3) Values in model_kwargs. Note: if a kwarg doesn't exist in the "
-        "model config class, it will be ignored.",
-    )
-
+    # @williamz: Could we reuse `LoadFormat.DUMMY` in the `load_format`?
     skip_loading_weights: bool = Field(
         default=False,
         description="Whether to skip loading model weights during initialization. "
@@ -191,17 +184,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
-    sampler_type: Union[str, SamplerType] = Field(
-        default=SamplerType.TorchSampler,
-        description="The type of sampler to use. Options are TRTLLMSampler or TorchSampler. Defaults to TorchSampler.",
-    )
-
-    max_beam_width: int = Field(
-        default=1,
-        description="The maximum beam width. >1 is not supported by AutoDeploy.",
-        frozen=True,
-    )
-
     draft_checkpoint_loader: Optional[object] = Field(
         default=None,
         description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
@@ -222,10 +204,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
-    attn_backend: str = Field(
-        default="flashinfer",
-        description=_shortcut_description("Attention backend to use.", "attn_backend"),
-    )
     compile_backend: str = Field(
         default="torch-compile",
         description=_shortcut_description(
@@ -243,6 +221,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
+    # @williamz: These 2 differ.
     max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
     max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
 
