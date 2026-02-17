@@ -484,17 +484,23 @@ def setup_disagg_cluster(config_file, model_name=None, env=None):
     for i in range(num_ctx_instances):
         ",".join(str(next_device + j) for j in range(gpus_per_ctx))
         ctx_workers.append(
-            run_ctx_worker(
-                model, ctx_worker_config, work_dir, port=0, device=0,
-                env=env))  #device_ids)) # TODO set to device_ids for multi-gpu
+            run_ctx_worker(model,
+                           ctx_worker_config,
+                           work_dir,
+                           port=0,
+                           device=device_ids,
+                           env=env))
         next_device += gpus_per_ctx
 
     for i in range(num_gen_instances):
         ",".join(str(next_device + j) for j in range(gpus_per_gen))
         gen_workers.append(
-            run_gen_worker(
-                model, gen_worker_config, work_dir, port=0, device=0,
-                env=env))  #device_ids)) # TODO set to device_ids for multi-gpu
+            run_gen_worker(model,
+                           gen_worker_config,
+                           work_dir,
+                           port=0,
+                           device=device_ids,
+                           env=env))
         next_device += gpus_per_gen
 
     # Build minimal server config and launch
@@ -522,15 +528,14 @@ def setup_disagg_cluster(config_file, model_name=None, env=None):
     return config, ctx_workers, gen_workers, disagg_server, server_port, work_dir
 
 
-def run_disaggregated_test(
-        example_dir,
-        test_desc,
-        num_iters=2,  # TODO change back to 5 before merge
-        env=None,
-        cwd=None,
-        prompt_file="prompts.json",
-        extra_endpoints_test=None,
-        model_path=None):
+def run_disaggregated_test(example_dir,
+                           test_desc,
+                           num_iters=5,
+                           env=None,
+                           cwd=None,
+                           prompt_file="prompts.json",
+                           extra_endpoints_test=None,
+                           model_path=None):
     """Run disaggregated test using service discovery instead of MPI."""
 
     config_file = get_test_config(test_desc, example_dir,
@@ -1002,7 +1007,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1017,7 +1023,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1_mtp",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
 
 
 @pytest.mark.skip_less_device(4)
@@ -1098,7 +1105,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
                            env=env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1259,7 +1267,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1_two_mtp",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
 
 
 @pytest.fixture(scope="module")
