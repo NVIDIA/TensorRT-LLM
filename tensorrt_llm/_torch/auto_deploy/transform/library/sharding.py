@@ -38,17 +38,19 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
     LayerType,
+    WeightBiasInfoCache,
     bfs,
     extract_weight_name,
+    extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
-    get_all_weight_infos,
     get_all_weights_in_subgraph,
     is_any_attention_op,
     is_any_lin_op,
     is_any_moe_op,
     is_any_ssm_op,
     is_op,
+    is_weight_node,
     num_users_of_weight_node,
     shape,
     subgraph,
@@ -821,35 +823,44 @@ class Sharding(BaseTransform):
             )
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-        for source in config.sharding_source:
-            if source == ShardingSource.FACTORY:
-                if len(config.factory_config) == 0:
-                    ad_logger.debug(
-                        "No factory config found. Skipping sharding from factory config"
+        with WeightBiasInfoCache():
+            for source in config.sharding_source:
+                if source == ShardingSource.FACTORY:
+                    if len(config.factory_config) == 0:
+                        ad_logger.debug(
+                            "No factory config found. Skipping sharding from factory config"
+                        )
+                        continue
+                    ad_logger.info("Applying sharding from factory config")
+                    info += detect_sharding_from_config(
+                        gm, transform_container, ShardingSource.FACTORY
                     )
-                    continue
-                ad_logger.info("Applying sharding from factory config")
-                info += detect_sharding_from_config(gm, transform_container, ShardingSource.FACTORY)
-            elif source == ShardingSource.MANUAL:
-                if len(config.manual_config) == 0:
-                    ad_logger.debug("No manual config found. Skipping sharding from manual config")
-                    continue
-                ad_logger.info("Applying sharding from manual config")
-                info += detect_sharding_from_config(gm, transform_container, ShardingSource.MANUAL)
+                elif source == ShardingSource.MANUAL:
+                    if len(config.manual_config) == 0:
+                        ad_logger.debug(
+                            "No manual config found. Skipping sharding from manual config"
+                        )
+                        continue
+                    ad_logger.info("Applying sharding from manual config")
+                    info += detect_sharding_from_config(
+                        gm, transform_container, ShardingSource.MANUAL
+                    )
 
-            elif source == ShardingSource.HEURISTIC:
-                ad_logger.info(f"Running autodeploy sharding heuristics: {config.sharding_dims}")
-                # run TP sharding across ranks
-                if ShardingDim.TP in config.sharding_dims:
-                    info += detect_column_row_shard(gm, transform_container)
+                elif source == ShardingSource.HEURISTIC:
+                    ad_logger.info(
+                        f"Running autodeploy sharding heuristics: {config.sharding_dims}"
+                    )
+                    # run TP sharding across ranks
+                    if ShardingDim.TP in config.sharding_dims:
+                        info += detect_column_row_shard(gm, transform_container)
 
-                # run EP sharding across ranks
-                if ShardingDim.EP in config.sharding_dims:
-                    info += detect_ep_shard(gm, transform_container)
+                    # run EP sharding across ranks
+                    if ShardingDim.EP in config.sharding_dims:
+                        info += detect_ep_shard(gm, transform_container)
 
-                # run BMM sharding across ranks
-                if ShardingDim.BMM in config.sharding_dims:
-                    info += detect_dp_bmm_shard(gm, transform_container)
+                    # run BMM sharding across ranks
+                    if ShardingDim.BMM in config.sharding_dims:
+                        info += detect_dp_bmm_shard(gm, transform_container)
 
         return gm, info
 
@@ -889,18 +900,19 @@ class ShardingTransformExecutor(BaseTransform):
 
         num_matches = 0
         transforms = shared_config.sharding_transform_container
-        for tp_transform in transforms.weight_sharding_transforms:
-            if check_and_apply(tp_transform):
-                num_matches += 1
-        for bmm_transform in transforms.bmm_transforms:
-            if check_and_apply(bmm_transform):
-                num_matches += 1
-        for ep_transform in transforms.ep_transforms:
-            if check_and_apply(ep_transform):
-                num_matches += 1
-        for rmsnorm_transform in transforms.rmsnorm_transforms:
-            if check_and_apply(rmsnorm_transform):
-                num_matches += 1
+        with WeightBiasInfoCache():
+            for tp_transform in transforms.weight_sharding_transforms:
+                if check_and_apply(tp_transform):
+                    num_matches += 1
+            for bmm_transform in transforms.bmm_transforms:
+                if check_and_apply(bmm_transform):
+                    num_matches += 1
+            for ep_transform in transforms.ep_transforms:
+                if check_and_apply(ep_transform):
+                    num_matches += 1
+            for rmsnorm_transform in transforms.rmsnorm_transforms:
+                if check_and_apply(rmsnorm_transform):
+                    num_matches += 1
 
         # post-sharding cleanup transformations
         for update_transform in transforms.parameter_update_transforms:
@@ -1308,17 +1320,17 @@ def _shard_parameter_node(
         return
 
     # Shard weight using the unified function (also updates the parameter)
-    all_weight_infos = get_all_weight_infos(node)
+    weight_nodes = extract_weight_nodes(node)
     # Parametrized nodes must have at least one weight (for debugging)
-    assert len(all_weight_infos.weights) > 0, (
+    assert len(weight_nodes.weights) > 0, (
         f"Node {node.name} has no weights - weight mapping may be incorrect"
     )
 
-    for weight_info in all_weight_infos.weights:
+    for weight_node in weight_nodes.weights:
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
-            weight_tensor=weight_info.tensor,
-            param_key=weight_info.node_key,
+            weight_tensor=weight_node.tensor,
+            param_key=weight_node.node_key,
             dim=dim,
             rank=rank,
             world_size=world_size,
@@ -1328,22 +1340,22 @@ def _shard_parameter_node(
         if quantization_cb is not None:
             quantization_cb(
                 gm=gm,
-                submod=weight_info.submod,
+                submod=weight_node.submod,
                 node=node,
-                weight_key=weight_info.node_key,
+                weight_key=weight_node.node_key,
                 weight_new_shape=weight_new_shape,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
             )
 
-    for bias_info in all_weight_infos.biases:
+    for bias_node in weight_nodes.biases:
         if dim == 0:
             # update bias for dim 0 --> we can handle it like the weight
             shard_weight_tensor(
                 gm=gm,
-                weight_tensor=bias_info.tensor,
-                param_key=bias_info.node_key,
+                weight_tensor=bias_node.tensor,
+                param_key=bias_node.node_key,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
@@ -1358,10 +1370,10 @@ def _shard_parameter_node(
             args[2] = None
             node.args = tuple(args)
             gm.graph.erase_node(node_bias)
-            bias_param_name = bias_info.node_key.rpartition(".")[-1]
-            setattr(bias_info.submod, bias_param_name, None)
+            bias_param_name = bias_node.node_key.rpartition(".")[-1]
+            setattr(bias_node.submod, bias_param_name, None)
             gm._register_load_state_dict_pre_hook(
-                partial(_load_hook_remove, param_key=bias_info.node_key)
+                partial(_load_hook_remove, param_key=bias_node.node_key)
             )
 
     # # # column shard with no gather: the output is sharded
@@ -1844,6 +1856,7 @@ def _process_mla_sharding(
     - q_a_proj: # gather (simple shard, output is replicated)
     - q_b_proj: # column-sharding  (output is head-distributed)
     - kv_a_proj # gather (simple shard, output is replicated)
+    # This one is actually absorbed by the MLA kernel.
     - kv_b_proj # column-sharding (output is head-distributed)
     - o_proj # row-sharding + all-reduce
 
@@ -1858,8 +1871,41 @@ def _process_mla_sharding(
     q_a_proj, kv_a_proj = layer_subgraph.opening_nodes
     # extract q_b_proj and kv_b_proj nodes
     lin_nodes = list(filtered_nodes(layer_subgraph.subgraph_nodes, is_any_lin_op))
-    assert len(lin_nodes) == 2, "Expecting exactly two linear nodes in the interior of the subgraph"
-    q_b_proj, kv_b_proj = lin_nodes
+    assert len(lin_nodes) <= 2, (
+        "Expecting at most two linear nodes in the interior of the MLA layer"
+    )
+
+    if len(lin_nodes) == 1:
+        # we don't have explicit kv_b projection. Instead, it is
+        # absorbed by the MLA kernel.
+        mla_node = list(
+            filtered_nodes(layer_subgraph.subgraph_nodes, ops=torch.ops.auto_deploy.torch_mla)
+        )
+        assert len(mla_node) == 1, "Expecting exactly one MLA node"
+        mla_node = mla_node[0]
+        # torch_mla args:
+        # q_nope: [B, S, N, qk_nope_head_dim]
+        # q_pe: [B, S, N, qk_rope_head_dim]
+        # compressed_kv: [B, S, kv_lora_rank]
+        # kpe: [B, S, 1, qk_rope_head_dim]
+        # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+        # is_causal: bool
+        # scale: float
+        # layout: str
+
+        # we need to shard 4th argument: kv_b_proj_weight
+        assert is_weight_node(mla_node.args[4]), "Expecting weight node for kv_b_proj_weight"
+        # column-shard it
+        transform_container.add(
+            WeightShardingInfo.from_node(
+                mla_node.args[4],
+                split_dim=SplitDimension.COLUMN,
+                config=transform_container.config,
+                dist_op=None,
+                min_local_shape=1,
+                layer_type=LayerType.MLA,
+            )
+        )
 
     # extract o_proj node
     o_proj = layer_subgraph.terminating_node
@@ -1874,21 +1920,18 @@ def _process_mla_sharding(
 
     # extract the sub-subgraph from q_b_proj and kv_b_proj to o_proj
     sub_subgraph = subgraph(
-        sources=[q_b_proj, kv_b_proj],
+        sources=lin_nodes,
         boundary_condition=is_any_lin_op,
     )
     attention_subgraph = LayerSubgraph(
-        opening_nodes=[q_b_proj, kv_b_proj],
+        opening_nodes=lin_nodes,
         subgraph_nodes=sub_subgraph,
         terminating_node=o_proj,
         layer_type=LayerType.MLA,
         min_local_shape=layer_subgraph.min_local_shape,
     )
     # shard q_b_proj and kv_b_proj nodes
-    num_column_row_shards = _process_column_sharding(attention_subgraph, transform_container)
-    if num_column_row_shards < 2:
-        # it means that "someone else" already sharded these nodes. Skipping.
-        return 0
+    _process_column_sharding(attention_subgraph, transform_container)
 
     # update "empty" and "expand" nodes' args. Reference in modeling_deepseek.py:
     # query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
@@ -1914,6 +1957,27 @@ def _process_mla_sharding(
                 target_node=node_to_update.name, config=transform_container.config, args=tuple(args)
             )
         )
+
+    # update reshape nodes' args. Reference in modeling_deepseek.py:
+    # Output: [B, S, N, v_head_dim] -> [B, S, N * v_head_dim]
+    # attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+    # attn_output = self.o_proj(attn_output)
+    candidate_reshape = layer_subgraph.terminating_node.args[0]
+    if is_op(candidate_reshape, [torch.ops.aten.reshape]):
+        # reshape args are (attn_output, [bsz, q_len, num_heads * v_head_dim])
+        # set 3rd arg (num_heads * v_head_dim) to -1
+        reshape_args = list(candidate_reshape.args)
+        reshape_sizes = list(reshape_args[1])
+        reshape_sizes[2] = -1
+        reshape_args[1] = tuple(reshape_sizes)
+        transform_container.add(
+            ParameterUpdateInfo(
+                target_node=candidate_reshape.name,
+                config=transform_container.config,
+                args=tuple(reshape_args),
+            )
+        )
+        ad_logger.debug(f"\nUpdated reshape node {candidate_reshape} arguments to {reshape_args}")
 
     # shard o_proj node
     transform_container.add(

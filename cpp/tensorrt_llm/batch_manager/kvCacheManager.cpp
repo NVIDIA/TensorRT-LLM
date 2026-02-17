@@ -100,6 +100,7 @@ std::vector<MmKey> generateBlockHashExtraKeys(
     auto const multimodalHashes = llmRequest.getMultimodalHashes();
     auto const multimodalPositions = llmRequest.getMultimodalPositions();
     auto const multimodalLengths = llmRequest.getMultimodalLengths();
+    auto const multimodalUuids = llmRequest.getMultimodalUuids();
 
     if (!multimodalHashes || !multimodalPositions || !multimodalLengths || !(*multimodalHashes)
         || (*multimodalHashes)->empty() || !(*multimodalPositions) || (*multimodalPositions)->empty()
@@ -115,7 +116,7 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         return {};
     }
 
-    std::vector<MmKey> extraKeys; // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+    std::vector<MmKey> extraKeys;
     extraKeys.reserve((*multimodalPositions)->size());
     std::array<uint8_t, 32> mmHashArray;
 
@@ -145,7 +146,15 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)
         {
             uint64_t mmStartInBlock = (startPos >= startTokenIdx) ? 0 : static_cast<uint64_t>(startTokenIdx - startPos);
-            extraKeys.emplace_back(mmHashArray, mmStartInBlock);
+
+            // Get UUID if available
+            std::optional<std::string> uuid = std::nullopt;
+            if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
+            {
+                uuid = (*(*multimodalUuids))[i];
+            }
+
+            extraKeys.emplace_back(mmHashArray, mmStartInBlock, std::move(uuid));
         }
     }
 
@@ -222,8 +231,10 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     // block
     if (!blockKey.extraKeys.empty())
     {
-        for (auto const& [mmHash, startOffset] : blockKey.extraKeys)
+        for (auto const& mmKey : blockKey.extraKeys)
         {
+            auto const& mmHash = mmKey.hash;
+            auto const& startOffset = mmKey.startOffset;
             // Hash the multimodal hash array in 32-bit chunks (more efficient)
             for (size_t i = 0; i < 32; i += 4)
             {

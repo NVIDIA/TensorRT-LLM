@@ -50,7 +50,8 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
     // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
     // distributed among CP ranks. So, we transfer all blocks from send side.
-    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP)
+    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || !cacheManager->isEnablePartialReuse()
+        || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP)
     {
         // disable reuse path, and vwsa don't support reuse.
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
@@ -87,13 +88,13 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
 
-BlockRange getBlockRangeForReceiving(
-    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse, bool recvSideHasCP)
+BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    bool srcEnableBlockReuse, bool srcEnablePartialReuse, bool recvSideHasCP)
 {
     // Note: When recv side has CP, we request all blocks from send side right now.
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
-    if (poolNum == 1 && srcEnableBlockReuse && !recvSideHasCP)
+    if (poolNum == 1 && srcEnableBlockReuse && srcEnablePartialReuse && !recvSideHasCP)
     {
         // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
         auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
@@ -555,7 +556,8 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
-    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse());
+    auto blockRange = getBlockRangeForReceiving(
+        mCacheManager, llmRequest, destConfig.getEnableBlockReuse(), destConfig.getEnablePartialReuse());
 
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
 

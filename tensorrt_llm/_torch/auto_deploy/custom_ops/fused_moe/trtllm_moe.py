@@ -136,9 +136,9 @@ def trtllm_quant_fp8_moe_fused(
         routing_weights: Routing weights (B*S, TOP_K)
         fc1_expert_weights: FC1 weights [E, 2*I, H] for gated_mlp, [E, I, H] for mlp
         fc2_expert_weights: FC2 weights [E, H, I]
-        fc1_act_scale: FC1 activation scale [E]
+        fc1_act_scale: FC1 activation scalar (scalar)
         fc1_dequant_scale: FC1 dequant scale [E]
-        fc2_act_scale_reciprocal: FC2 activation scale reciprocal [E]
+        fc2_act_scale_reciprocal: FC2 activation scale reciprocal (scalar)
         fc2_dequant_scale: FC2 dequant scale [E]
         is_gated_mlp: True for gated_mlp, False for mlp
         act_fn: ActivationType.Silu for gated_mlp, ActivationType.Relu2 for mlp
@@ -153,24 +153,26 @@ def trtllm_quant_fp8_moe_fused(
     # Store original shape and flatten to 2D
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
-    # Quantize the input
-    x_q_fp8 = _quantize_fp8(x2d, fc1_act_scale[0])
 
-    # Scales are stored in float32
-    w1_input_scale = fc1_act_scale[0]
+    # Quantize the input using precomputed max scale
+    x_q_fp8 = _quantize_fp8(x2d, fc1_act_scale)
 
     # Prepare quant_scales for TensorRT-LLM (Cutlass) FP8 format:
     # [fc1_dequant_scale, fc2_act_scale_reciprocal, fc2_dequant_scale, gemm1_input_dequant_scale]
-    # For gated MLP:
-    # These are precomputed in `fused_moe` transform
-    # - fc1_dequant_scale: w1_weight_scale * w1_input_scale (combined for w1 and w3)
-    # - fc2_act_scale_reciprocal: 1 / w2_input_scale
-    # - fc1_dequant_scale: w2_weight_scale * w2_input_scale
-    # - fc1_act_scale: w1_input_scale
+    # These are precomputed in `fused_moe` transform:
+    # - fc1_dequant_scale: w1_weight_scale * max(w1_input_scale) [E]
+    # - fc2_act_scale_reciprocal: 1 / max(w2_input_scale) (scalar)
+    # - fc2_dequant_scale: w2_weight_scale * max(w2_input_scale) [E]
+    # - fc1_act_scale: max(w1_input_scale) (scalar)
 
     assert fc1_dequant_scale.ndim == 1, "fc1_dequant_scale must be 1D"
     assert fc2_dequant_scale.ndim == 1, "fc2_dequant_scale must be 1D"
-    quant_scales = [fc1_dequant_scale, fc2_act_scale_reciprocal, fc2_dequant_scale, w1_input_scale]
+    quant_scales = [
+        fc1_dequant_scale,
+        fc2_act_scale_reciprocal,
+        fc2_dequant_scale,
+        fc1_act_scale,
+    ]
 
     # Ensure contiguous tensors
     selected_experts = selected_experts.int().contiguous()

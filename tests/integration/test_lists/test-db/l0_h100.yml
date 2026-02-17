@@ -27,6 +27,7 @@ l0_h100:
   - unittest/_torch/speculative -k "not eagle3"
   - unittest/_torch/thop/parallel
   - unittest/_torch/thop/serial
+  - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # Only key models in H100: llama/mixtral/nemotron/deepseek
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
@@ -39,6 +40,10 @@ l0_h100:
   - unittest/disaggregated/test_remoteDictionary.py
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_messenger.py
+  - unittest/disaggregated/test_extractor.py
+  - unittest/disaggregated/test_extractor_v2.py
+  - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/region/test_block.py
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse
@@ -440,6 +445,8 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[triton_ssm-True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16[1]
+  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[False]
+  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[True]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate

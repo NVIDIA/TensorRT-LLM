@@ -324,6 +324,11 @@ zai-org/GLM-4.5-Air:
     spec_dec_algo: MTP
     kv_cache_quant_algo: FP8
     accuracy: 88.2
+GLM-4.7-Flash:
+  - accuracy: 83.434
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 81.046
 bigcode/starcoder2-3b:
   - accuracy: 20.2
 bigcode/starcoder2-7b:
@@ -366,3 +371,8 @@ nvidia/NVIDIA-Nemotron-Nano-9B-v2:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 82.525
+nvidia/NVIDIA-Nemotron-3-Super-120B-012726:
+  - accuracy: 82.363
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 82.121

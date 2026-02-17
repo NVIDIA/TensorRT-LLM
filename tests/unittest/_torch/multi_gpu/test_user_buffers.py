@@ -330,35 +330,40 @@ class UBTestModel(nn.Module):
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l1 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l2 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l3 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l4 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
@@ -460,7 +465,10 @@ def run_single_rank_ub_pass(
         # 3 AR_NORM replacement
         # 3 Scaled MM Prologue
         # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 0, 0, 0, 3, 0, 3, 0, 2, 0]
+        # 1 Insert copy for graph output
+        assert backend.match_count == [
+            3, 0, 2, 0, 0, 0, 0, 0, 3, 0, 3, 0, 2, 0, 1, 0
+        ]
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -759,7 +767,10 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
         # 3 AR_NORM replacement
         # 3 Prologue
         # 1 UB Finalize Removal
-        assert backend.match_count == [3, 0, 0, 0, 0, 0, 3, 0, 3, 0, 1, 0]
+        # 1 Insert copy for graph output
+        assert backend.match_count == [
+            3, 0, 0, 0, 0, 0, 0, 3, 0, 3, 0, 1, 0, 1, 0
+        ]
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -819,35 +830,40 @@ class UBFp4TestModel(nn.Module):
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l1 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l2 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l3 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l4 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
@@ -993,7 +1009,10 @@ def run_single_rank_ub_pass_fp4(
         # 3 AR_NORM replacement
         # 3 Scaled MM Prologue
         # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 0, 0, 0, 3, 0, 3, 0, 2, 0]
+        # 1 Insert copy for graph output
+        assert backend.match_count == [
+            3, 0, 2, 0, 0, 0, 0, 0, 3, 0, 3, 0, 2, 0, 1, 0
+        ]
         torch.cuda.synchronize()
         torch.testing.assert_close(output_fused,
                                    output_ref,

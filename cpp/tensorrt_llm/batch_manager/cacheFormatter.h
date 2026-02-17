@@ -53,7 +53,7 @@ using CacheTransBufferManager = kv_cache_manager::CacheTransBufferManager;
 using BlockRange = kv_cache_manager::BlockRange;
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    bool srcEnableBlockReuse, bool recvSideHasCP = false);
+    bool srcEnableBlockReuse, bool srcEnablePartialReuse, bool recvSideHasCP = false);
 
 // Used to support the cache transmission with different layouts and different protocols.
 class BaseCacheFormatter

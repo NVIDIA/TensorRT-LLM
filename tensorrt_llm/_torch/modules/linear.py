@@ -518,10 +518,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def pre_reload_weights(self, module: Linear):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            logger.warning(
-                f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
-            )
-            param = Parameter(torch.empty_like(metadata, device="cuda"),
+            # Extract meta tensor from metadata dict
+            meta_tensor = metadata['meta']
+            param = Parameter(torch.empty_like(meta_tensor, device="cuda"),
                               requires_grad=False)
             module.register_parameter(param_name, param)
 
@@ -557,6 +556,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        # GEMM ops require 2D matrices
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
             if module.input_scale is not None and not module.force_dynamic_quantization:
@@ -592,6 +598,11 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
             )
+
+        # Reshape output back to original shape (with out_features as last dim)
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+
         if bias is not None:
             output = output + bias
         return output
@@ -976,6 +987,12 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        # GEMM ops require 2D matrices
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         if input.dtype == torch.float8_e4m3fn:
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
@@ -1003,6 +1020,10 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+
+        # Reshape output back to original shape (with out_features as last dim)
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
 
         if bias is not None:
             output = output + bias
@@ -1213,6 +1234,15 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
+        # GEMM requires 2D. Only plain tensors support for now, skip for
+        # tuple and Fp4QuantizedTensor.
+        original_shape = None
+        if not isinstance(input,
+                          (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
+            original_shape = input.shape
+            input = input.reshape(-1, input.shape[-1])
+
         act_fp4, act_sf = self._input_prepare(module, input)
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
@@ -1229,6 +1259,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
+
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
 
         if bias is not None:
             output = output + bias
@@ -2353,6 +2386,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        enable_gemm_allreduce_fusion: bool = True,
     ):
         """
         Args:
@@ -2430,13 +2464,14 @@ class Linear(nn.Module):
         )
 
         device_supported = get_sm_version() >= 100
-        enable_gemm_allreduce_fusion = (os.environ.get(
+        enable_gemm_allreduce_fusion_env = (os.environ.get(
             "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
 
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,
             in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, enable_gemm_allreduce_fusion
+            device_supported, enable_gemm_allreduce_fusion,
+            enable_gemm_allreduce_fusion_env
         ])
         if self.use_fused_gemm_allreduce:
             self.use_fused_gemm_allreduce = ipc_nvls_supported()

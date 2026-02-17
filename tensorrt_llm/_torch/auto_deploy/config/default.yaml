@@ -50,6 +50,7 @@ transforms:
     expected_layout: bsnd
   match_rmsnorm_pattern:
     stage: pattern_matcher
+    run_shape_prop: true
   match_l2norm_pattern:
     stage: pattern_matcher
   ############################################################################################
@@ -75,6 +76,18 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_from_graph:
     stage: pattern_matcher
+  # SwiGLU pattern matching must run AFTER quantization transforms. For pre-quantized
+  # checkpoints (e.g., NVFP4), quantization converts torch_linear_simple ops to quantized
+  # ops first, and then match_nvfp4_swiglu_pattern captures the NVFP4 SwiGLU pattern.
+  # For non-quantized models, quantization transforms are no-ops, so match_swiglu_pattern
+  # proceeds normally.
+  match_swiglu_pattern:
+    stage: pattern_matcher
+    enabled: false
+  match_nvfp4_swiglu_pattern:
+    stage: pattern_matcher
+    requires_shape_prop: true
+    enabled: false
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
@@ -126,6 +139,8 @@ transforms:
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_nvfp4_swiglu:
+    stage: post_load_fusion
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -134,9 +149,11 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     backend: trtllm
+    allow_different_input_scales: false
   fuse_nvfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true
+    allow_different_input_scales: false
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true
@@ -148,6 +165,9 @@ transforms:
   fuse_l2norm:
     stage: post_load_fusion
     backend: fla
+  fuse_swiglu:
+    stage: post_load_fusion
+    enabled: false
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
@@ -161,15 +181,16 @@ transforms:
   visualize_namespace:
     stage: visualize
     enabled: false
-  ############################################################################################
+  ###########################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
-  ############################################################################################
+  ###########################################################################################
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer
   insert_cached_mla_attention:
     stage: cache_init
-    backend: MultiHeadLatentAttention
+    requires_shape_prop: true
+    backend: flashinfer_mla
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm
@@ -196,6 +217,9 @@ transforms:
   fuse_causal_conv_activation:
     stage: compile
   multi_stream_moe:
+    stage: compile
+    enabled: false
+  multi_stream_mla_attn:
     stage: compile
     enabled: false
   compile_model:

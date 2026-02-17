@@ -299,15 +299,16 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
 
     # Input scales (tensor-wise, replicated per expert for interface compatibility)
     x_scale = x.abs().max().item() / FP8_MAX
-    w1_input_scale_tensor = torch.full((E,), x_scale, device=device, dtype=torch.float32)
+    # Input scales: precomputed max values with shape [1] (new API)
+    w1_input_scale_max = torch.tensor([x_scale], device=device, dtype=torch.float32)
 
     # Compute intermediate activation scale by simulating first GEMM + ReLU^2
     # This ensures w2_input_scale matches the actual activation magnitude
     with torch.no_grad():
         # Simulate the first GEMM: quantize input, do FP8 matmul, apply ReLU^2
-        x_q = (x / w1_input_scale_tensor[0]).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
+        x_q = (x / w1_input_scale_max.item()).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
         # Dequantize and compute output for a sample
-        x_dq = x_q[:8].to(torch.float32) * w1_input_scale_tensor[0].item()
+        x_dq = x_q[:8].to(torch.float32) * w1_input_scale_max.item()
         w1_dq = w1_fp8_stacked[0].to(torch.float32) * w1_weight_scale[0].item()
         sample_out = torch.nn.functional.linear(x_dq.to(dtype), w1_dq.to(dtype))
         sample_act = torch.square(torch.nn.functional.relu(sample_out))
@@ -315,11 +316,11 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
         # Ensure scale is not too small
         intermediate_scale = max(intermediate_scale, 1e-6)
 
-    w2_input_scale_tensor = torch.full((E,), intermediate_scale, device=device, dtype=torch.float32)
+    w2_input_scale_max = torch.tensor([intermediate_scale], device=device, dtype=torch.float32)
 
     # Convert scales to lists for torch_quant_fp8_moe reference
-    w1_input_scale_list = [w1_input_scale_tensor[0].clone() for _ in range(E)]
-    w2_input_scale_list = [w2_input_scale_tensor[0].clone() for _ in range(E)]
+    w1_input_scale_list = [w1_input_scale_max[0].clone() for _ in range(E)]
+    w2_input_scale_list = [w2_input_scale_max[0].clone() for _ in range(E)]
     w1_weight_scale_list = [w1_weight_scale[e].clone() for e in range(E)]
     w2_weight_scale_list = [w2_weight_scale[e].clone() for e in range(E)]
 
@@ -327,7 +328,7 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
     w3_fp8_list = [torch.empty((1, 1), device=device, dtype=torch.float8_e4m3fn) for _ in range(E)]
     w3_fp8_stacked = torch.stack(w3_fp8_list).contiguous()
     w3_input_scale_list = [torch.ones((), device=device, dtype=torch.float32) for _ in range(E)]
-    w3_input_scale_tensor = torch.ones((E,), device=device, dtype=torch.float32)
+    w3_input_scale_max = torch.ones((1,), device=device, dtype=torch.float32)
     w3_weight_scale_list = [torch.ones((), device=device, dtype=torch.float32) for _ in range(E)]
     w3_weight_scale_tensor = torch.ones((E,), device=device, dtype=torch.float32)
 
@@ -352,7 +353,7 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
     # Create equal routing weights
     routing_weights = torch.ones((M, top_k), device=device, dtype=torch.float32) / top_k
 
-    # Triton FP8 quantized MoE (uses stacked tensors)
+    # Triton FP8 quantized MoE (uses stacked tensors with precomputed max input scales)
     out_triton = torch.ops.auto_deploy.triton_quant_fp8_moe(
         x,
         selected_experts.to(torch.int32),
@@ -360,9 +361,9 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
         w1_fp8_stacked,
         w2_fp8_stacked,
         w3_fp8_stacked,
-        w1_input_scale_tensor,
-        w2_input_scale_tensor,
-        w3_input_scale_tensor,
+        w1_input_scale_max,  # [1] precomputed max
+        w2_input_scale_max,  # [1] precomputed max
+        w3_input_scale_max,  # [1] precomputed max (unused)
         w1_weight_scale,
         w2_weight_scale,
         w3_weight_scale_tensor,
