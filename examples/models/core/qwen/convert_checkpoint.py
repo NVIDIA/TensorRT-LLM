@@ -59,7 +59,7 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4', 'int4_gptq'],
+        choices=['int8', 'int4', 'int4_gptq', 'int8_gptq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -191,6 +191,11 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         quant_config.has_zero_point = True
         quant_config.pre_quant_scale = False
         quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
+    elif args.weight_only_precision == 'int8_gptq':
+        quant_config.group_size = args.group_size
+        quant_config.has_zero_point = True
+        quant_config.pre_quant_scale = False
+        quant_config.quant_algo = QuantAlgo.W8A16_GPTQ
 
     return quant_config
 
@@ -217,7 +222,13 @@ def update_quant_config_from_hf(quant_config, hf_config,
                 'desc_act', False)
             if desc_act:
                 raise ValueError("GPTQ with desc_act=True is not implemented!")
-            quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
+            bits = hf_config_dict['quantization_config'].get('bits', 4)
+            if bits == 4:
+                quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
+            elif bits == 8:
+                quant_config.quant_algo = QuantAlgo.W8A16_GPTQ
+            else:
+                raise ValueError(f"Unsupported bits for GPTQ: {bits}")
             quant_config.group_size = hf_config_dict['quantization_config'].get(
                 'group_size', 128)
             quant_config.has_zero_point = hf_config_dict[
