@@ -595,6 +595,9 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
                 "free_gpu_memory_fraction": 0.5,
                 "tokens_per_block": 64,
             },
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
             "transforms": {
                 "detect_sharding": {
                     "sharding_source": ['factory', 'heuristic'],
@@ -613,13 +616,14 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("world_size", [8])
-    def test_auto_dtype(self, world_size):
+    def test_bf16(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_NAME,
                            tokenizer=self.MODEL_NAME,
+                           dtype="bfloat16",
                            world_size=world_size,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
