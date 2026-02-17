@@ -36,48 +36,6 @@ from dataclasses import dataclass
 from random import randint
 from typing import Any
 
-# Clear inherited MPI job/namespace environment variables to avoid conflicts when spawning workers
-# Triton may have been started with mpirun, which sets these variables
-# We need fresh MPI initialization for each Python backend process
-# Only clear job-specific vars, preserve config vars (OMPI_MCA_*, PMIX_MCA_*, etc.)
-_mpi_job_env_vars = {
-    # OMPI job-specific variables
-    'OMPI_COMM_WORLD_SIZE',
-    'OMPI_COMM_WORLD_RANK',
-    'OMPI_COMM_WORLD_LOCAL_SIZE',
-    'OMPI_COMM_WORLD_LOCAL_RANK',
-    'OMPI_COMM_WORLD_NODE_RANK',
-    'OMPI_UNIVERSE_SIZE',
-    'OMPI_FIRST_RANKS',
-    'OMPI_APP_CTX_NUM_PROCS',
-    # PMIx job-specific variables
-    'PMIX_RANK',
-    'PMIX_NAMESPACE',
-    'PMIX_SERVER_URI',
-    'PMIX_SERVER_URI2',
-    'PMIX_SERVER_URI21',
-    'PMIX_SERVER_URI3',
-    'PMIX_SERVER_TMPDIR',
-    'PMIX_SYSTEM_TMPDIR',
-    'PMIX_SECURITY_MODE',
-    'PMIX_GDS_MODULE',
-    'PMIX_BFROPS_MODULE',
-    'PMIX_PTL_MODULE',
-    'PMIX_VERSION',
-    'PMIX_HOSTNAME',
-    # PMI variables
-    'PMI_RANK',
-    'PMI_SIZE',
-    'PMI_FD',
-    'PMI_SPAWNED',
-    'PMI_APPNUM',
-}
-# Also clear vars with these prefixes (runtime state, not config)
-_mpi_job_prefixes = ('OMPI_MCA_orte_', 'ORTE_')
-for key in list(os.environ.keys()):
-    if key in _mpi_job_env_vars or key.startswith(_mpi_job_prefixes):
-        del os.environ[key]
-
 import numpy as np
 import pandas as pd
 import triton_python_backend_utils as pb_utils

@@ -54,7 +54,8 @@ def parse_arguments():
     parser.add_argument(
         '--no-mpi',
         action='store_true',
-        help='Launch tritonserver without MPI (single instance mode)',
+        help=
+        'Launch tritonserver without MPI. Required for multi-instance deployments.',
         default=False,
     )
 
