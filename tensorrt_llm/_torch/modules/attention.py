@@ -154,6 +154,7 @@ class Attention(nn.Module):
         attn_output_gate: Optional[bool] = None,
         use_custom_cublas_mm: bool = False,
         reduce_output: bool = True,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         """
         Initialize the Attention module.
@@ -174,6 +175,7 @@ class Attention(nn.Module):
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
             disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
             attn_output_gate (Optional[bool]): Determines whether to use an output gate in the attention Op. If False, the decision is automatically handled by the attention backend based on its capabilities.
+            mapping_with_cp (Optional[Mapping]): Override mapping with CP configuration.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -230,26 +232,42 @@ class Attention(nn.Module):
             self.dense_bias = bias
 
         # tensor parallel
-        tp_size = config.mapping.tp_size
-        pp_size = config.mapping.pp_size
-        cp_size = config.mapping.cp_size
-        if config.mapping.enable_attention_dp:
+        if mapping_with_cp is not None:
+            logger.warning_once(
+                "[Attention::__init__] Overriding mapping with CP detected.",
+                key="attention_init_mapping_with_cp")
+            self.mapping = mapping_with_cp
+        else:
+            self.mapping = config.mapping
+
+        tp_size = self.mapping.tp_size
+        pp_size = self.mapping.pp_size
+        cp_size = self.mapping.cp_size
+        dp_size = 1
+        if self.mapping.enable_attention_dp:
+            dp_size = tp_size
             tp_size = 1
 
+        if self.mapping.cp_size > 1:
+            assert self.mapping.has_cp_helix(
+            ), f"CP type must be HELIX for Attention, but got {self.mapping.cp_config['cp_type']}."
+
         mapping = Mapping(
-            world_size=tp_size * pp_size * cp_size,
+            world_size=dp_size * tp_size * pp_size * cp_size,
             tp_size=tp_size,
-            pp_size=pp_size,
+            pp_size=pp_size * dp_size,
             cp_size=cp_size,
-            cp_config=config.mapping.cp_config,
-            rank=config.mapping.rank,
-            gpus_per_node=config.mapping.gpus_per_node,
-            enable_attention_dp=config.mapping.enable_attention_dp,
+            cp_config=self.mapping.cp_config,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
         )
         self.tp_size = tp_size
+        self.cp_size = cp_size
         self.tp_rank = mapping.tp_rank
-        assert self.num_heads % tp_size == 0
+        assert self.num_heads % (tp_size * cp_size) == 0
         self.num_heads = self.num_heads // tp_size
+        self.num_heads_tp_cp = self.num_heads // cp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
         self.q_size = self.num_heads * self.head_dim
@@ -289,12 +307,24 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
+        # For Helix CP, combine TP and CP for the output projection so each
+        # rank's o_proj input is num_heads_tp_cp * head_dim.
+        mapping_o = Mapping(
+            world_size=dp_size * tp_size * pp_size * cp_size,
+            tp_size=tp_size * cp_size,
+            pp_size=pp_size * dp_size,
+            cp_size=1,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
+        )
+
         self.o_proj = Linear(
             tp_size * self.q_size,
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
-            mapping=mapping,
+            mapping=mapping_o,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -425,6 +455,57 @@ class Attention(nn.Module):
             attention_mask=mask_type,
             is_gen_only=False)
 
+    def _helix_post_process(self, partial_o: torch.Tensor,
+                            softmax_stats: torch.Tensor) -> torch.Tensor:
+        """Helix CP post-processing: all-to-all exchange and combine partial
+        attention outputs across CP ranks."""
+        head_dim = self.head_dim
+
+        if self.mapping.cp_config.get("use_nccl_for_alltoall", True):
+            # NCCL-based implementation using alltoall_helix.
+            chunks = []
+            for t in [partial_o, softmax_stats]:
+                t = t.transpose(1, 0).contiguous()
+                chunks.extend(torch.split(t,
+                                          t.shape[0] // self.mapping.cp_size))
+            gathered = alltoall_helix(chunks, self.mapping.cp_group)
+            gathered = [t.transpose(1, 2).contiguous() for t in gathered]
+            return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
+                                                       1.0)
+        else:
+            # FIFO-based implementation using MNNVL workspace.
+            helix = HelixAllToAllNative.get(self.mapping)
+            num_tokens = partial_o.shape[0]
+            cp_size = self.mapping.cp_size
+            fifo_version = self.mapping.cp_config.get("fifo_version", 2)
+
+            if fifo_version == 1:
+                partial_o = partial_o.view(num_tokens, cp_size,
+                                           self.num_heads_tp_cp,
+                                           head_dim).transpose(1,
+                                                               2).contiguous()
+                softmax_stats = softmax_stats.view(num_tokens, cp_size,
+                                                   self.num_heads_tp_cp,
+                                                   2).transpose(1,
+                                                                2).contiguous()
+                partial_o_out, softmax_stats_out = helix.alltoall_native(
+                    partial_o, softmax_stats)
+                return torch.ops.trtllm.helix_post_process_native(
+                    partial_o_out, softmax_stats_out, 1.0, 2)
+            else:
+                partial_o = partial_o.view(num_tokens, cp_size,
+                                           self.num_heads_tp_cp * head_dim)
+                softmax_stats = softmax_stats.view(num_tokens, cp_size,
+                                                   self.num_heads_tp_cp * 2)
+                partial_o_out, softmax_stats_out = helix.alltoall_native(
+                    partial_o, softmax_stats)
+                gathered_o = partial_o_out.view(num_tokens, cp_size,
+                                                self.num_heads_tp_cp, head_dim)
+                gathered_stats = softmax_stats_out.view(num_tokens, cp_size,
+                                                        self.num_heads_tp_cp, 2)
+                return torch.ops.trtllm.helix_post_process_native(
+                    gathered_o, gathered_stats, 1.0, 1)
+
     def _attn_impl(
         self,
         q: torch.Tensor,
@@ -449,6 +530,42 @@ class Attention(nn.Module):
         if v is not None:
             v = v[:num_tokens, :]
 
+        mrope_config = None
+        if mrope_rotary_cos_sin is not None or mrope_position_deltas is not None:
+            mrope_config = dict()
+            if mrope_rotary_cos_sin is not None:
+                mrope_config["mrope_rotary_cos_sin"] = mrope_rotary_cos_sin
+            if mrope_position_deltas is not None:
+                mrope_config["mrope_position_deltas"] = mrope_position_deltas
+
+        # Helix CP generation path: get partial outputs with softmax stats,
+        # then exchange and combine across CP ranks.
+        # NOTE: The helix post-process combine step works on unquantized
+        # (BF16/FP16) partial outputs and softmax stats from each rank.
+        # We intentionally skip passing out_scale/out_scale_sf to FMHA here
+        # so it produces BF16 output. After combining, the downstream o_proj
+        # linear layer handles quantization (FP8/NVFP4) in its apply() method.
+        if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
+            softmax_stats = torch.empty((num_tokens, self.num_heads, 2),
+                                        device=q.device,
+                                        dtype=torch.float32)
+            attn_output = self.attn.forward(
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask=attention_mask,
+                mrope_config=mrope_config,
+                attention_window_size=attention_window_size,
+                attention_mask_data=attention_mask_data,
+                softmax_stats_tensor=softmax_stats,
+                attention_sinks=attention_sinks)
+            if isinstance(attn_output, tuple):
+                attn_output = attn_output[0]
+            attn_output = self._helix_post_process(attn_output, softmax_stats)
+            return attn_output, None
+
+        # Normal (non-helix) path.
         out_scale = None
         out_scale_sf = None
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
@@ -464,14 +581,6 @@ class Attention(nn.Module):
         ):
             kv_scales_sf = self.qkv_proj.kv_scales
             kv_scales_sf_inv = self.qkv_proj.inv_kv_scales
-
-        mrope_config = None
-        if mrope_rotary_cos_sin is not None or mrope_position_deltas is not None:
-            mrope_config = dict()
-            if mrope_rotary_cos_sin is not None:
-                mrope_config["mrope_rotary_cos_sin"] = mrope_rotary_cos_sin
-            if mrope_position_deltas is not None:
-                mrope_config["mrope_position_deltas"] = mrope_position_deltas
 
         attn_output = self.attn.forward(
             q,
@@ -640,6 +749,7 @@ class Attention(nn.Module):
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
+
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -750,7 +860,6 @@ class MLA(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
-        enable_helix_test: bool = False,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -775,7 +884,6 @@ class MLA(nn.Module):
             dtype (torch.dtype): The data type.
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
-            enable_helix_test (bool): Whether to enable helix unit test.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -796,7 +904,6 @@ class MLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
-        self.enable_helix_test = enable_helix_test
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -861,11 +968,7 @@ class MLA(nn.Module):
         self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size -
                                        1) // tp_size
 
-        if self.enable_helix_test:
-            rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps",
-                                   1e-6)
-        else:
-            rms_norm_eps = config.pretrained_config.rms_norm_eps
+        rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
@@ -1259,11 +1362,6 @@ class MLA(nn.Module):
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
         hidden_size = self.o_proj.in_features
-        if self.enable_helix_test and num_contexts > 0:
-            # note: for testing Helix parallelism, we ensure that the output is
-            # large enough for the context phase, but we then cut it again in
-            # `forward_context`
-            hidden_size *= self.mapping.cp_size
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
@@ -1502,12 +1600,6 @@ class MLA(nn.Module):
             ],
             -1,
         )
-
-        if self.enable_helix_test:
-            # While helix parallelism is mainly meant for generation, we set the
-            # helix position offsets for the context phase to get the math right
-            # in test_mla_helix.py.
-            attn_metadata.helix_position_offsets = position_ids
 
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
         maybe_compiled_copy_(
@@ -2305,13 +2397,6 @@ class MLA(nn.Module):
                               attn_metadata,
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
-
-        if self.enable_helix_test and self.mapping.has_cp_helix():
-            # note: for allowing testing Helix parallelism, we ensure that
-            # the output is compatible with o_proj even in the context phase,
-            # thus we cut it to num_heads_tp_cp * v_head_dim
-            attn_output = attn_output[:, :self.num_heads_tp_cp *
-                                      self.v_head_dim].contiguous()
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
