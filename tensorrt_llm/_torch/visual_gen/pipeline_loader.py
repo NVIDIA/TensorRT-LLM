@@ -206,6 +206,22 @@ class PipelineLoader:
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
+        if config.pipeline.enable_torch_compile:
+            torch._dynamo.config.capture_scalar_outputs = True
+            torch._dynamo.config.cache_size_limit = 128  # TODO: what's the best way to set this?
+            pipeline.torch_compile()
+        else:
+            logger.info("torch.compile disabled by config")
+
+        pipeline.warmup()
+
+        if config.pipeline.enable_layerwise_nvtx_marker:
+            from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
+
+            marker = LayerwiseNvtxMarker()
+            module_prefix = pipeline.__class__.__name__
+            marker.register_hooks(pipeline.transformer, module_prefix)
+
         logger.info(f"Pipeline loaded: {pipeline.__class__.__name__}")
         return pipeline
 

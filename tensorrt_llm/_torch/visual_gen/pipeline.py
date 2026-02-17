@@ -5,9 +5,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
@@ -34,6 +36,25 @@ class BasePipeline(nn.Module):
 
         # Initialize transformer
         self._init_transformer()
+
+        # CUDA graph runner — wrap transformer.forward
+        # Order matters: TeaCache will wrap on top of it and still call the
+        # graphed transformer.forward if should_compute == True.
+        if self.model_config.pipeline.enable_cuda_graph and self.transformer is not None:
+            if self.model_config.pipeline.enable_torch_compile:
+                logger.warning(
+                    "Cuda graphs with torch compile is not supported yet. "
+                    "Only using torch compile for better performance. "
+                )
+                return
+
+            self.cuda_graph_runner = CUDAGraphRunner(
+                CUDAGraphRunnerConfig(
+                    use_cuda_graph=model_config.pipeline.enable_cuda_graph,
+                )
+            )
+            logger.info("Cuda graph runner enabled, wrapping transformer.forward")
+            self.transformer.forward = self.cuda_graph_runner.wrap(self.transformer.forward)
 
     @property
     def rank(self):
@@ -121,6 +142,97 @@ class BasePipeline(nn.Module):
         logger.info("TeaCache: Initializing...")
         self.cache_backend = TeaCacheBackend(teacache_cfg)
         self.cache_backend.enable(model)
+
+    def torch_compile(self) -> None:
+        """Apply torch.compile to pipeline components based on PipelineConfig.
+
+        For transformer models, compiles each block in the ModuleList individually.
+        This enables future block-wise offloading and keeps compilation efficient
+        (all blocks share the same structure, so compile cost is paid once).
+
+        For non-transformer components, compiles the entire module.
+        """
+        pipeline_config = self.model_config.pipeline
+        compile_mode = pipeline_config.torch_compile_mode
+
+        for name in pipeline_config.torch_compile_models:
+            model = getattr(self, name, None)
+            if model is None:
+                logger.warning(f"torch.compile: component '{name}' not found, skipping")
+                continue
+
+            # For transformer models with ModuleList blocks, compile per-block
+            blocks_attr = self._find_transformer_blocks(model)
+            if blocks_attr:
+                for block_name in blocks_attr:
+                    blocks = getattr(model, block_name)
+                    logger.info(
+                        f"torch.compile: {name}.{block_name} "
+                        f"({len(blocks)} blocks, mode={compile_mode})"
+                    )
+                    compiled_blocks = []
+                    for block in blocks:
+                        # NOTE: dynamic=False is helpful for speed
+                        compiled_blocks.append(
+                            torch.compile(block, mode=compile_mode, dynamic=False)
+                        )
+                    setattr(model, block_name, nn.ModuleList(compiled_blocks))
+            else:
+                logger.info(f"torch.compile: {name} (whole module, mode={compile_mode})")
+                compiled = torch.compile(model, mode=compile_mode, dynamic=False)
+                setattr(self, name, compiled)
+
+    @staticmethod
+    def _find_transformer_blocks(model: nn.Module) -> list:
+        """Find ModuleList children that look like transformer blocks.
+
+        Returns list of attribute names containing nn.ModuleList with >1 elements.
+        """
+        block_names = []
+        for name, child in model.named_children():
+            if isinstance(child, nn.ModuleList) and len(child) > 1:
+                block_names.append(name)
+        return block_names
+
+    def warmup(self) -> None:
+        """Run warmup inference to trigger torch.compile and CUDA initialization.
+
+        Runs a short denoising loop with dummy inputs. This:
+        1. Triggers torch.compile's lazy compilation (first forward trace + codegen)
+        2. Warms up CUDA kernels and allocators
+        3. Populates any lazy caches (e.g., RoPE frequencies)
+
+        Called automatically by PipelineLoader after model loading and torch.compile.
+        """
+        warmup_steps = self.model_config.pipeline.warmup_steps
+        if warmup_steps <= 0:
+            logger.info("Warmup disabled (warmup_steps=0)")
+            return
+
+        logger.info(f"Running warmup ({warmup_steps} steps)...")
+        warmup_start = time.time()
+
+        self._run_warmup(warmup_steps)
+
+        torch.cuda.synchronize()
+        elapsed = time.time() - warmup_start
+        logger.info(f"Warmup completed in {elapsed:.2f}s")
+
+    def _run_warmup(self, warmup_steps: int) -> None:
+        """Execute warmup forward passes. Subclasses should override for model-specific warmup.
+
+        Default implementation runs the transformer forward with dummy tensors matching
+        typical input shapes. Subclasses can override to run the full pipeline with
+        reduced steps for more thorough warmup.
+
+        Args:
+            warmup_steps: Number of denoising steps to run
+        """
+        # Subclasses should override this with model-specific warmup
+        logger.warning(
+            f"{self.__class__.__name__} does not implement _run_warmup(); "
+            "skipping warmup. Override _run_warmup() for model-specific warmup."
+        )
 
     def decode_latents(
         self,
@@ -355,6 +467,7 @@ class BasePipeline(nn.Module):
 
         return noise_pred, extra_noise_preds, t_transformer, t_cfg
 
+    @nvtx_range("_scheduler_step", color="blue")
     def _scheduler_step(
         self,
         latents,
@@ -379,6 +492,7 @@ class BasePipeline(nn.Module):
         t_sched = time.time() - t_start
         return latents, extra_stream_latents, t_sched
 
+    @nvtx_range("denoise_loop", color="blue")
     def denoise(
         self,
         latents: torch.Tensor,
@@ -476,30 +590,31 @@ class BasePipeline(nn.Module):
                     current_guidance_scale = guidance_scale_2
 
             # Denoise
-            if do_cfg_parallel:
-                timestep = t.expand(latents.shape[0])
-                noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
-                    latents,
-                    extra_stream_latents,
-                    timestep,
-                    cfg_config["local_embeds"],
-                    forward_fn,
-                    current_guidance_scale,
-                    guidance_rescale,
-                    cfg_config["ulysses_size"],
-                    local_extras,
-                )
-            else:
-                noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
-                    latents,
-                    extra_stream_latents,
-                    t,
-                    prompt_embeds,
-                    forward_fn,
-                    current_guidance_scale,
-                    guidance_rescale,
-                    local_extras,
-                )
+            with nvtx_range(f"denoise_step {i}"):
+                if do_cfg_parallel:
+                    timestep = t.expand(latents.shape[0])
+                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
+                        latents,
+                        extra_stream_latents,
+                        timestep,
+                        cfg_config["local_embeds"],
+                        forward_fn,
+                        current_guidance_scale,
+                        guidance_rescale,
+                        cfg_config["ulysses_size"],
+                        local_extras,
+                    )
+                else:
+                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
+                        latents,
+                        extra_stream_latents,
+                        t,
+                        prompt_embeds,
+                        forward_fn,
+                        current_guidance_scale,
+                        guidance_rescale,
+                        local_extras,
+                    )
 
             # Scheduler step for all streams
             latents, extra_stream_latents, t_sched = self._scheduler_step(
