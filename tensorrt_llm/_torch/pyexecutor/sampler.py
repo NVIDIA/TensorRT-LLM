@@ -1205,16 +1205,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         log_probs_store: "TorchSampler.LogProbsStore"
         """Holds data related to log-probs handling."""
         
-        stop_words: torch.Tensor | None = None
+        stop_words: torch.Tensor
         """ Shape: max_num_stop_words, max_stop_word_length, batch_size,
            Usage: Stores the stop words for each request as a padded tensor."""
-        past_tokens: torch.Tensor | None = None
+        past_tokens: torch.Tensor
         """ Shape: max_stop_word_length,batch_size, beam_width
            Usage: Stores the last max_stop_word_length tokens for each beam."""
-        max_stop_word_length: torch.Tensor | None = None
+        max_stop_word_lengths: torch.Tensor
         """ Shape: batch_size,
            Usage: Stores the size of the longest stop word for each request."""
-        
+        num_accepted_draft_tokens: torch.Tensor
+        """ Shape: batch_size,
+           Usage: Stores the number of accepted tokens for each request."""
 
         def __post_init__(self):
             assert self.new_tokens.shape == self.finish_reasons.shape
@@ -1227,7 +1229,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         end_ids = int_tensor((self.max_num_sequences,))
         stop_words = int_tensor(self.stop_words_shape)
         past_tokens = int_tensor(self.past_tokens_shape)
-        max_stop_word_length = torch.empty(self.max_num_sequences, device="cpu", dtype=torch.int)
+        num_accepted_draft_tokens = torch.empty(
+            self.max_num_sequences, device="cpu", dtype=torch.int32
+        )
+        max_stop_word_lengths = torch.empty(self.max_num_sequences, device="cpu", dtype=torch.int)
         # Only used for logprobs processing or beam search
         sampled_log_probs = torch.empty(self.LOGPROBS_SHAPE, device="cuda", dtype=torch.float32)
         # Only used for logprobs processing
@@ -1275,7 +1280,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             beam_search_store=beam_search_store,
             stop_words=stop_words,
             past_tokens=past_tokens,
-            max_stop_word_length=max_stop_word_length,
+            max_stop_word_lengths=max_stop_word_lengths,
+            num_accepted_draft_tokens=num_accepted_draft_tokens,
         )
 
     @dataclass(frozen=True, kw_only=True)
@@ -1318,16 +1324,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self.max_num_sequences,
             self.max_beam_width,
         )
-        self.stop_words_shape = (
-            self.max_num_stop_words,
-            self.max_stop_word_length,
-            self.max_num_sequences,
-        )
-        self.past_tokens_shape = (
-            self.max_stop_word_length - 1 + self.max_tokens,
-            self.max_num_sequences,
-            self.max_beam_width,
-        )
+
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
         # AutoDeploy build creates the sampler in inference mode,
@@ -1800,7 +1797,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         the stop words tensor, the maximum stop word length and the number of stop words
 
         Args:
-            stop_words_list: list[list[int]]. The list of stop words
+            stop_words_list: list[list[int]]. List of lists. The first list contains the
+            tokens of the stop_sequences the second list contains the prefix sum of the
+            stop word lengths.
 
         Returns:
             stop_words: torch.Tensor. The stop words device tensor
@@ -1811,12 +1810,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self.max_num_stop_words, self.max_stop_word_length, device="cpu", dtype=torch.int32
         )
         stop_words.fill_(self._EMPTY_STOP_WORD_TOKEN_ID)
-        words, lens = stop_words_list
+        words, cumulative_stop_word_lengths = stop_words_list
         words = torch.tensor(words, device="cpu", dtype=torch.int32)
         beg = 0
         max_stop_word_length = 0
         num_stop_words = 0
-        for idx, end in enumerate(lens):
+        for idx, end in enumerate(cumulative_stop_word_lengths):
             if end == -1:
                 break
             length = end - beg
@@ -1877,6 +1876,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._stop_words_index_offset = torch.arange(
             max(0, self.max_stop_word_length - 1), device="cuda"
         ).unsqueeze(1)
+        # These dimensions should not change during this resize
+        assert self.max_num_sequences == self.stop_words_shape[2]
+        assert self.max_num_sequences == self.past_tokens_shape[1]
+        assert self.max_beam_width == self.past_tokens_shape[2]
+
         self.past_tokens_shape = (
             self.max_stop_word_length - 1 + self.max_tokens,
             self.max_num_sequences,
@@ -1894,6 +1898,76 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # if the sizes are constant, this does nothing
         self.store.stop_words.resize_(self.stop_words_shape)
         self.store.past_tokens.resize_(self.past_tokens_shape)
+
+    def _maybe_resize_stop_words_buffer(
+        self, total_max_length: int, total_max_num_stop_words: int
+    ) -> bool:
+        if (
+            total_max_length > self.max_stop_word_length
+            or total_max_num_stop_words > self.max_num_stop_words
+        ):
+            self.max_stop_word_length = max(total_max_length, self.max_stop_word_length)
+            self.max_num_stop_words = max(total_max_num_stop_words, self.max_num_stop_words)
+            self._resize_stop_word_buffers()
+            return True
+        return False
+
+    def _reprocess_stop_words_buffer(
+        self, scheduled_requests: ScheduledRequests
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[int]]:
+        stop_words = []
+        past_tokens = []
+        stop_word_seq_slots = []
+        # Rerun with the new size. Set the stop words and past tokens for all the requests.
+        for request in scheduled_requests.all_requests():
+            if request.py_stop_words_list is not None:
+                extracted_stop_words, _, _ = self._extract_stop_words(request.py_stop_words_list)
+                stop_word_seq_slots.append(request.py_seq_slot)
+                stop_words.append(extracted_stop_words)
+                past_tokens.append(self._get_past_tokens(request))
+        return stop_words, past_tokens, stop_word_seq_slots
+
+    def _update_stop_words_buffer(
+        self,
+        scheduled_requests: ScheduledRequests,
+        total_max_length: int,
+        total_max_num_stop_words: int,
+        stop_words: list[torch.Tensor],
+        past_tokens: list[torch.Tensor],
+        stop_word_seq_slots: list[int],
+    ):
+        # Potentially resize the buffers and update
+        # stop_words, past_tokens and stop_word_seq_slots
+        # In case of a resize all requests in the batch need to be re-processed
+        if self._maybe_resize_stop_words_buffer(total_max_length, total_max_num_stop_words):
+            stop_words, past_tokens, stop_word_seq_slots = self._reprocess_stop_words_buffer(
+                scheduled_requests
+            )
+
+        # Host Tensor for host access of self.store.num_accepted_draft_tokens
+        stop_word_seq_slots_tensor_host = torch.tensor(
+            stop_word_seq_slots, device="cpu", dtype=torch.int32
+        )
+        # Device Tensor for device access of self.store.stop_words and self.store.past_tokens
+        stop_word_seq_slots_tensor_cuda = stop_word_seq_slots_tensor_host.to(
+            device="cuda", non_blocking=True
+        )
+        # stop_word_seq_slots x max_num_stop_words x max_stop_word_length
+        stop_words_cuda = torch.stack(stop_words).to(device="cuda", non_blocking=True)
+        # stop_word_seq_slots x max_stop_word_length x beam_width
+        past_tokens_cuda = torch.stack(past_tokens).to(device="cuda", non_blocking=True)
+
+        # Reset the accepted tokens buffer for the stop word sequence slots
+        self.store.num_accepted_draft_tokens[stop_word_seq_slots_tensor_host] = 0
+
+        self.store.stop_words[..., stop_word_seq_slots_tensor_cuda] = stop_words_cuda.permute(
+            1, 2, 0
+        )
+        # Past tokens will be shifted by 1 to the left on their first sampling iteration
+        # We need to consider this here.
+        self.store.past_tokens[1 : self.max_stop_word_length, stop_word_seq_slots_tensor_cuda] = (
+            past_tokens_cuda.permute(1, 0, 2)
+        )
 
     @override
     def validate_request(self, request: LlmRequest) -> None:
@@ -1921,11 +1995,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         stop_word_seq_slots: list[int] = []
         max_lens: list[int] = []
         end_ids: list[int] = []
-        stop_words = []
-        past_tokens = []
-        max_stop_word_length = []
-        total_max_length = 0
-        total_max_num_stop_words = 0
+        stop_words: list[torch.Tensor] = []
+        past_tokens: list[torch.Tensor] = []
+        max_stop_word_lengths: list[int] = []
+        total_max_length: int = 0
+        total_max_num_stop_words: int = 0
         prompt_lens: list[int] = []
         for request in self._filter_new_requests(scheduled_requests):
             slot = request.py_seq_slot
@@ -1945,7 +2019,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 past_tokens.append(self._get_past_tokens(request))
                 total_max_length = max(total_max_length, max_length)
                 total_max_num_stop_words = max(total_max_num_stop_words, num_stop_words)
-                max_stop_word_length.append(max_length)
+                max_stop_word_lengths.append(max_length)
+                else:
+                    # max stop word length is used to determine if a request has stop words
+                    # explicitly set it to 0 here to avoid stale data from previous requests
+                    max_stop_word_lengths.append(0)
 
             if self._use_beam_search:
                 assert not (request.py_return_log_probs and request.py_num_logprobs > 1), (
@@ -1960,70 +2038,40 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             if self._use_beam_search:
                 full_list.append(prompt_lens)
             # perform only a single copy
-            full_list_tensor = torch.tensor(
+            full_list_tensor_host = torch.tensor(
                 full_list, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
-            ).to(device="cuda", non_blocking=True)
-            seq_slots_tensor = full_list_tensor[0]
-            max_lens_tensor = full_list_tensor[1]
-            end_ids_tensor = full_list_tensor[2]
-            self.store.max_lengths_tensor[seq_slots_tensor] = max_lens_tensor
-            self.store.end_ids[seq_slots_tensor] = end_ids_tensor
+            )
+            full_list_tensor_cuda = full_list_tensor_host.to(device="cuda", non_blocking=True)
+            seq_slots_tensor_host = full_list_tensor_host[0]
+            seq_slots_tensor_cuda = full_list_tensor_cuda[0]
+            max_lens_tensor_cuda = full_list_tensor_cuda[1]
+            end_ids_tensor_cuda = full_list_tensor_cuda[2]
+            self.store.max_lengths_tensor[seq_slots_tensor_cuda] = max_lens_tensor_cuda
+            self.store.end_ids[seq_slots_tensor_cuda] = end_ids_tensor_cuda
+            self.store.max_stop_word_lengths[seq_slots_tensor_host] = torch.tensor(
+                max_stop_word_lengths, device="cpu", dtype=torch.int32
+            )
 
-            # Resize stop words buffer if necessary
+            # Handle stop words only if any new ones are added
             if len(stop_word_seq_slots) > 0:
-                stop_words_buffer_needs_resize = False
-                if total_max_length > self.max_stop_word_length:
-                    self.max_stop_word_length = total_max_length
-                    stop_words_buffer_needs_resize = True
-                if total_max_num_stop_words > self.max_num_stop_words:
-                    self.max_num_stop_words = total_max_num_stop_words
-                    stop_words_buffer_needs_resize = True
-                if stop_words_buffer_needs_resize:
-                    self._resize_stop_word_buffers()
-                    stop_words = []
-                    past_tokens = []
-                    stop_word_seq_slots = []
-                    max_stop_word_length = []
-                    # Rerun with the new size. Set the stop words and past tokens for all the requests.
-                    for request in scheduled_requests.all_requests():
-                        if request.py_stop_words_list is not None:
-                            extracted_stop_words, max_length, _ = self._extract_stop_words(
-                                request.py_stop_words_list
-                            )
-                            stop_word_seq_slots.append(request.py_seq_slot)
-                            stop_words.append(extracted_stop_words)
-                            past_tokens.append(self._get_past_tokens(request))
-                            max_stop_word_length.append(max_length)
-                #
-                stop_word_seq_slots_tensor_host = torch.tensor(
-                    stop_word_seq_slots, device="cpu", dtype=torch.int32
-                )
-                stop_word_seq_slots_tensor_cuda = stop_word_seq_slots_tensor_host.to(
-                    device="cuda", non_blocking=True
-                )
-                # batch size x num_stop_words x max_stop_word_length
-                stop_words_cuda = torch.stack(stop_words).to(device="cuda", non_blocking=True)
-                # batch size x max_stop_word_length x beam_width
-                past_tokens_cuda = torch.stack(past_tokens).to(device="cuda", non_blocking=True)
-                self.store.stop_words[..., stop_word_seq_slots_tensor_cuda] = (
-                    stop_words_cuda.permute(1, 2, 0)
-                )
-                self.store.past_tokens[
-                    : self.max_stop_word_length - 1, stop_word_seq_slots_tensor_cuda
-                ] = past_tokens_cuda.permute(1, 0, 2)
-                self.store.max_stop_word_length[stop_word_seq_slots_tensor_host] = torch.tensor(
-                    max_stop_word_length, device="cpu", dtype=torch.int32
+                self._update_stop_words_buffer(
+                    scheduled_requests,
+                    total_max_length,
+                    total_max_num_stop_words,
+                    stop_words,
+                    past_tokens,
+                    stop_word_seq_slots,
                 )
 
             if self._use_beam_search:
-                prompt_lens_tensor = full_list_tensor[3]
+                prompt_lens_tensor_cuda = full_list_tensor_cuda[3]
                 beam_search_store = self.store.beam_search_store
                 assert beam_search_store is not None
                 self._prepare_beam_search(
                     beam_search_store,
                     self.store.log_probs_store,
-                    seq_slots=seq_slots_tensor,
-                    prompt_lens=prompt_lens_tensor,
+                    seq_slots=seq_slots_tensor_cuda,
+                    prompt_lens=prompt_lens_tensor_cuda,
                 )
 
     @staticmethod
@@ -2634,6 +2682,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 processed += num_accepted
                 self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=processed)
             req.py_decoding_iter += 1
+            self.store.num_accepted_draft_tokens[req.py_seq_slot] = req.py_num_accepted_draft_tokens
 
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)
@@ -2653,6 +2702,32 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             log_probs_store = self.store.log_probs_store
             log_probs_store.topk_vals.resize_(self.TOPK_LOGPROBS_SHAPE)
             log_probs_store.topk_indices.resize_(self.TOPK_LOGPROBS_SHAPE)
+
+    def _prepare_stop_word_handling_for_finish_reasons(
+        self, seq_slots_host: torch.Tensor
+    ) -> tuple[torch.Tensor | int | None, torch.Tensor | None, bool]:
+        stop_word_mask = self.store.max_stop_word_lengths[seq_slots_host] > 0
+        batch_has_stop_words = stop_word_mask.any()
+        num_accepted_tokens: torch.Tensor | int | None = None
+        stop_word_indices: torch.Tensor | None = None
+        single_token_stop_words_only: bool = False
+        if batch_has_stop_words:
+            num_accepted_tokens = 1
+            # Only calculate num_accepted_tokens from the accepted draft tokens if speculative decoding is enabled
+            if self.max_tokens > 1:
+                num_accepted_tokens = (
+                    self.store.num_accepted_draft_tokens[seq_slots_host].to(
+                        device="cuda", non_blocking=True
+                    )
+                    + 1
+                )
+            stop_word_indices = torch.nonzero(stop_word_mask)[:, 0].to(
+                device="cuda", non_blocking=True
+            )
+            single_token_stop_words_only = (
+                self.store.max_stop_word_lengths[seq_slots_host].max().item() == 1
+            )
+        return num_accepted_tokens, stop_word_indices, single_token_stop_words_only
 
     @override
     @torch.inference_mode()
@@ -2685,29 +2760,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # Prepare stop word handling
-        stop_word_mask = self.store.max_stop_word_length[seq_slots_host] > 0
-        batch_has_stop_words = stop_word_mask.any()
-        draft_lengths: torch.Tensor | int | None = None
-        stop_word_indices: torch.Tensor | None = None
-        single_token_stop_words_only: bool = False
-        if batch_has_stop_words:
-            draft_lengths = 1
-            # Only calculate the draft lengths if speculative decoding is enabled
-            if self.max_tokens > 1:
-                draft_lengths = (
-                    torch.tensor(
-                        [r.py_num_accepted_draft_tokens for r in requests],
-                        dtype=torch.int32,
-                        pin_memory=prefer_pinned(),
-                    ).to(device="cuda", non_blocking=True)
-                    + 1
-                )
-            stop_word_indices = torch.nonzero(stop_word_mask)[:, 0].to(
-                device="cuda", non_blocking=True
-            )
-            single_token_stop_words_only = (
-                self.store.max_stop_word_length[seq_slots_host].max() == 1
-            )
+        num_accepted_tokens, stop_word_indices, single_token_stop_words_only = (
+            self._prepare_stop_word_handling_for_finish_reasons(seq_slots_host)
+        )
         new_tokens_host = self._process_requests(
             scheduled_requests,
             model_outputs,
@@ -2731,7 +2786,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             first_finish_reasons=(
                 beam_search_store.first_finish_reasons if beam_search_store is not None else None
             ),
-            draft_lengths=draft_lengths,
+            num_accepted_tokens=num_accepted_tokens,
             stop_word_indices=stop_word_indices,
             single_token_stop_words_only=single_token_stop_words_only,
         )
@@ -3385,7 +3440,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots: torch.Tensor,
         seq_lens: torch.Tensor,
         new_tokens: torch.Tensor,
-        draft_lengths: torch.Tensor | int | None = None,
+        num_accepted_tokens: torch.Tensor | int | None = None,
         stop_word_indices: torch.Tensor | None = None,
         single_token_stop_words_only: bool = False,
         first_finish_reasons: torch.Tensor | None = None,
@@ -3399,7 +3454,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots: the sequence slots of the processed requests. Used to determine where to
             read and write from the finish_reasons and new_tokens buffers. Shape: (len(requests),)
             new_tokens: a buffer containing the newly generated tokens.
-            draft_lengths: a buffer containing the number of accepted draft tokens +1 for each request.
+            num_accepted_tokens: a buffer containing the number of accepted draft tokens +1 for each request.
             stop_word_indices: the indices of the requests that have stop words in the current batch.
             single_token_stop_words_only: whether the stop words are single tokens only.
             first_finish_reasons: the first finish reason of each beam. Shape: (max_batch_size, max_beam_width)
@@ -3416,7 +3471,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batched_finish_reasons = finish_reasons[:, seq_slots]
 
         if stop_word_indices is not None:
-            assert draft_lengths is not None, "draft_lengths is required for stop words"
+            assert num_accepted_tokens is not None, "draft_lengths is required for stop words"
             stop_seq_slots = seq_slots[stop_word_indices]
             stop_tokens = new_tokens[:, stop_seq_slots]
             stop_words_func = (
@@ -3428,9 +3483,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 stop_words_func(
                     stop_seq_slots,
                     stop_tokens,
-                    draft_lengths=draft_lengths[stop_word_indices]
-                    if isinstance(draft_lengths, torch.Tensor)
-                    else draft_lengths,
+                    num_accepted_tokens=num_accepted_tokens[stop_word_indices]
+                    if isinstance(num_accepted_tokens, torch.Tensor)
+                    else num_accepted_tokens,
                 ),
                 self._reason_tensors[FinishReason.STOP_WORDS],
                 batched_finish_reasons[:, stop_word_indices],
@@ -3483,7 +3538,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         seq_slots: torch.Tensor,
         tokens: torch.Tensor,
-        draft_lengths: torch.Tensor | int,
+        num_accepted_tokens: torch.Tensor | int,
     ) -> torch.Tensor:
         # num_words, len_words, batch_size
         # unsqueeze the beam_width dimension to match the past tokens tensor
@@ -3500,11 +3555,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         full_tokens = self._past_token_buffer[:, : seq_slots.shape[0]]
 
         index_tensor = (
-            (self._stop_words_index_offset + draft_lengths)
+            (self._stop_words_index_offset + num_accepted_tokens)
             .unsqueeze(2)
             .expand(-1, seq_slots.shape[0], self.max_beam_width)
         )
-        torch.gather(
+        _ = torch.gather(
             past_tokens_batch,
             dim=0,
             index=index_tensor,
@@ -3530,7 +3585,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # Check the stop words at each step
         for step_idx in range(self.max_tokens):
-            torch.eq(
+            _ = torch.eq(
                 full_tokens[:, step_idx : step_idx + self.max_stop_word_length],
                 stop_words,
                 out=matches[step_idx],
@@ -3551,7 +3606,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         seq_slots: torch.Tensor,
         tokens: torch.Tensor,
-        draft_lengths: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
     ) -> torch.Tensor:
         per_step = torch.zeros(
             (self.max_tokens, seq_slots.shape[0], self.max_beam_width),
@@ -3562,7 +3617,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         stop_words = self.store.stop_words[:, -1:, seq_slots].unsqueeze(3)
         full_tokens = tokens.unsqueeze(0)
         matches = full_tokens == stop_words
-        torch.any(matches, dim=0, out=per_step)
+        _ = torch.any(matches, dim=0, out=per_step)
         return per_step
 
     @nvtx_range("_process_logprobs")
