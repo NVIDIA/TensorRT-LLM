@@ -90,9 +90,13 @@ def is_dynamic_cached_op(node: Node) -> bool:
 
     # Strip the ".default" suffix if present for matching
     dynamic_ops = _get_all_dynamic_op_names()
-    # Check with namespace::name format
+    # Check with namespace::name format AND base name (for wrapper functions
     for dyn_op in dynamic_ops:
         if dyn_op in op_name:
+            return True
+        # Also check by base op name without namespace prefix
+        base_name = dyn_op.split("::")[-1] if "::" in dyn_op else dyn_op
+        if base_name in op_name:
             return True
 
     return False

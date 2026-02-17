@@ -366,10 +366,10 @@ def flashinfer_mha_with_cache(
         v = v.to(torch.float8_e4m3fn)
 
     flashinfer.page.append_paged_kv_cache(
-        append_key=k,
-        append_value=v,
-        batch_indices=flashinfer_batch_indices,
-        positions=flashinfer_positions,
+        append_key=k[:num_total_tokens],
+        append_value=v[:num_total_tokens],
+        batch_indices=flashinfer_batch_indices[:num_total_tokens],
+        positions=flashinfer_positions[:num_total_tokens],
         paged_kv_cache=kv_cache,
         kv_indices=cache_loc,
         kv_indptr=cu_num_pages[: num_seq + 1],

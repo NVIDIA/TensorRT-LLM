@@ -135,11 +135,13 @@ class CompileModel(BaseTransform):
                     )
                 config_overrides["piecewise_num_tokens"] = valid_buckets
 
-        # Store final piecewise bucket sizes on SequenceInfo for runtime padding
-        final_buckets = config_overrides.get(
-            "piecewise_num_tokens", self.config.piecewise_num_tokens or []
-        )
-        cm.info.piecewise_bucket_sizes = final_buckets
+        # Only populate when piecewise is enabled so that the runtime padding
+        # guard (padded_num_tokens) stays inactive when piecewise_enabled=false.
+        if self.config.piecewise_enabled:
+            final_buckets = config_overrides.get(
+                "piecewise_num_tokens", self.config.piecewise_num_tokens or []
+            )
+            cm.info.piecewise_bucket_sizes = final_buckets
 
         # Merge config with any overrides
         config_dict = self.config.model_dump()
