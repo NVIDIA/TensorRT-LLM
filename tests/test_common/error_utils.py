@@ -2,7 +2,7 @@ import os
 
 ERROR_KEYWORDS = ["RuntimeError", "out of memory", "ValueError", "FileNotFoundError"]
 SLURM_LOG_TAIL_LINES = 200  # Number of lines to print from slurm job logs
-ERROR_CONTEXT_LINES = 50  # Number of lines to print before and after error line
+ERROR_CONTEXT_LINES = 100  # Number of lines to print before and after error line
 
 
 def check_error(file_path: str) -> list[tuple[int, str]]:
@@ -55,12 +55,12 @@ def report_error(
                 [f"Error line {line_idx}: {line_str}" for line_idx, line_str in error_lines]
             )
             messages.append(error_lines_str)
-            # Find the last error line number for context
-            last_idx = max(line_idx for line_idx, _ in error_lines)
+            # Find the first error line number for context
+            first_idx = min(line_idx for line_idx, _ in error_lines)
             if all_lines is not None:
                 # Use all_lines for error context
-                start_idx = max(0, last_idx - ERROR_CONTEXT_LINES - 1)
-                end_idx = min(len(all_lines), last_idx + ERROR_CONTEXT_LINES)
+                start_idx = max(0, first_idx - ERROR_CONTEXT_LINES - 1)
+                end_idx = min(len(all_lines), first_idx + ERROR_CONTEXT_LINES)
                 context_lines = all_lines[start_idx:end_idx]
                 messages.append("".join(context_lines))
         else:

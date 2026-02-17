@@ -342,7 +342,7 @@ def generate_pytest_command(
         f"pytest -v -s "
         f"--test-prefix={llm_src}/tests/integration/defs "
         f"--test-list={test_list_path} "
-        f"--output-dir={work_dir}/output "
+        f"--output-dir={work_dir} "
         f"-o junit_logging=out-err"
     )
 
