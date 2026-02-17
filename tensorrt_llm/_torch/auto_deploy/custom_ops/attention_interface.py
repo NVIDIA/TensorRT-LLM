@@ -656,16 +656,14 @@ class SequenceInfo:
             # Also resize any host-side page metadata lists/tensors to match.
             # These fields may be created lazily by nest_sequences() when cache_loc/pages_per_seq
             # are provided.
-            for tensor_name in ("cache_loc", "page_seq_indices", "page_in_seq"):
-                current = self._args_list.get(tensor_name)
-                if current is None:
-                    self._args_list[tensor_name] = [0] * estimated_capacity
-                    continue
-                if isinstance(current, list):
-                    old_size = len(current)
-                    current.extend([0] * (estimated_capacity - old_size))
-                else:
-                    self._args_list[tensor_name] = [0] * estimated_capacity
+            old_size = self._args_list.get("cache_loc")
+            if old_size is None:
+                self._args_list["cache_loc"] = [0] * estimated_capacity
+            if isinstance(old_size, list):
+                old_size = len(old_size)
+                old_size.extend([0] * (estimated_capacity - old_size))
+            else:
+                self._args_list["cache_loc"] = [0] * estimated_capacity
 
     @staticmethod
     def _get_page_assignments(
