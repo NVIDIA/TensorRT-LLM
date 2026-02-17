@@ -376,10 +376,12 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        # TODO(tabrizian): Remove the condition on the PP size once disagg support from KVCache reuse
+        # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
-            and not self.kv_cache_manager.is_vswa)
+            and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -1548,7 +1550,6 @@ class PyExecutor:
                 sample_state = executed_batch.sample_state
                 sample_state.scheduled_requests.context_requests = executed_batch.finished_ctx_reqs
                 self._update_requests(executed_batch.sample_state)
-
                 if self.kv_cache_transceiver:
                     self._send_kv_async(executed_batch.finished_ctx_reqs)
                 self._handle_canceled_requests()
@@ -2736,9 +2737,10 @@ class PyExecutor:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
-                    self.kv_cache_transceiver.respond_and_send_async(req)
-
+                    # Order is important here: we need to start the transfer before responding
+                    # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
+                    self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
@@ -3193,7 +3195,11 @@ class PyExecutor:
                                 logger.debug(
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
-                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa:
+
+                # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
+                # then we need to terminate the request. TODO(tabrizian): Remove this once disagg support from KVCache reuse
+                # path is fixed.
+                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
                     requests_to_terminate.append(request)
                 else:
                     if not request.is_disagg_context_transmission_state:
