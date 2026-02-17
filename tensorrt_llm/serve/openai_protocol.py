@@ -1,12 +1,14 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 import xgrammar
+from fastapi import UploadFile
 from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
@@ -1118,6 +1120,219 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
     )
+
+
+# ============================================================================
+# Diffusion API Protocol Classes
+# ============================================================================
+
+
+class ImageGenerationRequest(OpenAIBaseModel):
+    """OpenAI-compatible image generation request.
+
+    Follows the OpenAI Images API specification:
+    https://platform.openai.com/docs/api-reference/images/create
+    """
+    prompt: str
+    model: Optional[str] = None
+    n: int = Field(default=1, ge=1, le=10)
+    output_format: Literal["png", "webp", "jpeg"] = "png"
+    size: Optional[str] = Field(
+        default="auto",
+        description=(
+            "The size of the generated images. Must be in 'WxH' format like "
+            "1024x1024, 1536x1024 (landscape), 1024x1536 (portrait), etc. "
+            "Use 'auto' for model default size."))
+    quality: Literal["standard", "hd"] = "standard"
+    response_format: Literal["url", "b64_json"] = "url"
+    style: Optional[Literal["vivid", "natural"]] = "vivid"
+    user: Optional[str] = None
+
+    # Extended parameters for diffusion control
+    num_inference_steps: Optional[int] = Field(
+        default=None,
+        description=
+        "Number of denoising steps. More steps = higher quality but slower.")
+    guidance_scale: Optional[float] = Field(
+        default=None,
+        description=
+        "Classifier-free guidance scale. Higher values follow prompt more closely."
+    )
+    guidance_rescale: Optional[float] = Field(
+        default=None, description="Classifier-free guidance rescale.")
+    negative_prompt: Optional[str] = Field(
+        default=None,
+        description="Text describing what to avoid in the generated image.")
+    seed: Optional[int] = Field(default=None,
+                                description="Random seed for reproducibility.")
+
+    @field_validator("size")
+    @classmethod
+    def validate_size(cls, v):
+        """Validate size format is 'WxH' or 'auto'."""
+        if v is None or v == "auto":
+            return v
+        if not isinstance(v, str):
+            raise ValueError("size must be a string in 'WxH' format or 'auto'")
+        # Check format: should be like "1024x1024"
+        import re
+        if not re.match(r'^\d+x\d+$', v):
+            raise ValueError(
+                f"Invalid size format '{v}'. Must be in 'WxH' format "
+                "(e.g., '1024x1024', '1536x1024') or 'auto'.")
+        return v
+
+
+class ImageObject(OpenAIBaseModel):
+    """Generated image object in the response."""
+    b64_json: Optional[str] = None
+    url: Optional[str] = None
+    revised_prompt: Optional[str] = None
+
+
+class ImageGenerationResponse(OpenAIBaseModel):
+    """Response from image generation endpoint."""
+    created: int = Field(default_factory=lambda: int(time.time()))
+    data: List[ImageObject]
+    output_format: Literal["png", "webp", "jpeg"] = "png"
+    quality: Literal["low", "medium", "high"] = "medium"
+    size: Optional[str] = None
+
+
+class ImageEditRequest(OpenAIBaseModel):
+    """Request for image editing endpoint.
+
+    Follows the OpenAI Images API specification:
+    https://platform.openai.com/docs/api-reference/images/createEdit
+    """
+    image: Union[List[str], str] = Field(
+        description="Base64-encoded source image(s) to edit")
+    prompt: str = Field(description="Text description of desired edits")
+    model: Optional[str] = None
+    mask: Optional[str] = Field(
+        default=None,
+        description=
+        "Base64-encoded mask image (optional, black areas will be edited)")
+    n: int = Field(default=1, ge=1, le=10)
+    size: Optional[str] = Field(
+        default="auto",
+        description=(
+            "The size of the edited images. Must be in 'WxH' format like "
+            "1024x1024, 1536x1024 (landscape), 1024x1536 (portrait), etc. "
+            "Use 'auto' to match source image size."))
+    response_format: Literal["url", "b64_json"] = "url"
+    user: Optional[str] = None
+
+    # Extended parameters for diffusion control
+    num_inference_steps: Optional[int] = Field(
+        default=None, description="Number of denoising steps.")
+    guidance_scale: Optional[float] = Field(
+        default=None, description="Classifier-free guidance scale.")
+    guidance_rescale: Optional[float] = Field(
+        default=None, description="Classifier-free guidance rescale.")
+    negative_prompt: Optional[str] = Field(
+        default=None,
+        description="Text describing what to avoid in the edited image.")
+    seed: Optional[int] = Field(default=None,
+                                description="Random seed for reproducibility.")
+
+    @field_validator("size")
+    @classmethod
+    def validate_size(cls, v):
+        """Validate size format is 'WxH' or 'auto'."""
+        if v != "auto" and not re.match(r"^\d+x\d+$", v):
+            raise ValueError(
+                "Size must be 'auto' or in 'WxH' format (e.g., '1024x1024')")
+        return v
+
+
+class VideoGenerationRequest(OpenAIBaseModel):
+    """Video generation request (extended API).
+
+    This is an extension to the OpenAI API for video generation support.
+    """
+    prompt: str
+    input_reference: Optional[Union[str, UploadFile]] = Field(
+        default=None,
+        description="Optional image reference that guides generation.")
+    model: Optional[str] = None
+    size: Optional[str] = Field(
+        default="auto",
+        description=
+        ("The size of the generated video frames. Must be in 'WxH' format like "
+         "512x512, 1024x576 (landscape), 576x1024 (portrait), etc. "
+         "Use 'auto' for model default size."))
+    seconds: float = Field(default=2.0,
+                           ge=1.0,
+                           le=16.0,
+                           description="Video duration in seconds.")
+
+    # Extended parameters for diffusion control
+    n: int = Field(default=1, ge=1, le=4)
+    fps: int = Field(default=24, ge=8, le=60, description="Frames per second.")
+    num_inference_steps: Optional[int] = Field(
+        default=None, description="Number of denoising steps.")
+    guidance_scale: Optional[float] = Field(
+        default=None, description="Classifier-free guidance scale.")
+    guidance_rescale: Optional[float] = Field(
+        default=None, description="Classifier-free guidance rescale.")
+    negative_prompt: Optional[str] = Field(
+        default=None,
+        description="Text describing what to avoid in the generated video.")
+    seed: Optional[int] = Field(default=None,
+                                description="Random seed for reproducibility.")
+
+    @field_validator("size")
+    @classmethod
+    def validate_size(cls, v):
+        """Validate size format is 'WxH' or 'auto'."""
+        if v is None or v == "auto":
+            return v
+        if not isinstance(v, str):
+            raise ValueError("size must be a string in 'WxH' format or 'auto'")
+        import re
+        if not re.match(r'^\d+x\d+$', v):
+            raise ValueError(
+                f"Invalid size format '{v}'. Must be in 'WxH' format "
+                "(e.g., '512x512', '1024x576') or 'auto'.")
+        return v
+
+
+class VideoJob(OpenAIBaseModel):
+    """Metadata for an asynchronous video generation job.
+
+    Follows the OpenAI Videos API specification:
+    https://platform.openai.com/docs/api-reference/videos
+    """
+    completed_at: Optional[int] = Field(
+        default=None, description="Unix timestamp of completion")
+    created_at: int = Field(description="Unix timestamp of creation")
+    error: Optional[str] = Field(default=None,
+                                 description="Error message if failed")
+    expires_at: Optional[int] = Field(
+        default=None, description="Unix timestamp of expiration")
+    id: str = Field(description="Unique identifier for the video")
+    model: str = Field(description="The model used for generation")
+    object: str = Field(default="video", description="Object type")
+    progress: Optional[int] = Field(
+        default=None,
+        description="Progress of the video generation job (0-100)")
+    prompt: str = Field(description="The prompt used to generate the video")
+    status: Literal["queued", "in_progress", "completed", "failed"] = Field(
+        description="Current status of the video generation job")
+
+    # Video properties
+    duration: Optional[float] = Field(default=None,
+                                      description="Video duration in seconds")
+    fps: Optional[int] = Field(default=None, description="Frames per second")
+    size: Optional[str] = Field(default=None,
+                                description="Video dimensions in 'WxH' format")
+
+
+class VideoJobList(OpenAIBaseModel):
+    """Response from listing video jobs endpoint."""
+    data: List[VideoJob] = Field(description="List of video jobs")
+    object: str = Field(default="list", description="Object type")
 
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
