@@ -25,6 +25,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 import yaml
+from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
 
 from defs.trt_test_alternative import print_info
@@ -65,8 +66,6 @@ SUPPORTED_GPU_MAPPING = {
 }
 
 DEFAULT_TIMEOUT = 5400
-SLURM_LOG_TAIL_LINES = 200  # Number of lines to print from slurm job logs
-
 AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity"
 DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
 
@@ -531,6 +530,11 @@ class AggrTestCmds(NamedTuple):
     client_cmds: Dict[int, List[List[str]]]
     timeout: int
     output_dir: str
+    test_output_dir: str
+
+    def get_server_logs(self, server_idx) -> List[str]:
+        server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
+        return [server_file_path]
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run all clients for a server and return outputs."""
@@ -544,42 +548,40 @@ class AggrTestCmds(NamedTuple):
             server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, server_port)
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
-            server_proc = subprocess.Popen(
-                server_cmd_with_port,
-                env=copy.deepcopy(os.environ),
-            )
+            server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
+            with open(server_file_path, "w") as server_ctx:
+                server_proc = subprocess.Popen(
+                    server_cmd_with_port,
+                    env=copy.deepcopy(os.environ),
+                    stdout=server_ctx,
+                    stderr=subprocess.STDOUT,
+                )
 
-            wait_for_endpoint_ready(
-                f"http://{server_hostname}:{server_port}/health",
-                timeout=self.timeout,
-                server_proc=server_proc,
-            )
+                wait_for_endpoint_ready(
+                    f"http://{server_hostname}:{server_port}/health",
+                    timeout=self.timeout,
+                    check_files=[server_file_path],
+                    server_proc=server_proc,
+                )
 
             # Run all clients for this server
             for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
                 client_file_path = os.path.join(
-                    self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
+                    self.test_output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
                 )
-                client_error_file_path = os.path.join(
-                    self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.error.log"
-                )
-
                 client_cmd_with_port = add_host_port_to_cmd(
                     client_cmd, server_hostname, server_port
                 )
                 print_info(f"Starting client. cmd is {client_cmd_with_port}")
 
-                result = subprocess.run(
+                output = subprocess.check_output(
                     client_cmd_with_port,
-                    capture_output=True,
+                    stderr=subprocess.STDOUT,
                     env=copy.deepcopy(os.environ),
-                    check=True,
-                )
-                output = result.stdout.decode()
+                ).decode()
+
                 with open(client_file_path, "w") as client_ctx:
                     client_ctx.write(output)
-                with open(client_error_file_path, "w") as client_err_ctx:
-                    client_err_ctx.write(result.stderr.decode())
                 outputs.append(output)
 
         finally:
@@ -604,10 +606,11 @@ class DisaggTestCmds(NamedTuple):
     num_ctx_servers: int
     num_gen_servers: int
     output_dir: str
+    test_output_dir: str
 
     def _generate_hostname_file(self, server_idx: int, port: int):
         """Create hostname file for coordination."""
-        hostnames_dir = os.path.join(self.output_dir, f"hostnames-{server_idx}")
+        hostnames_dir = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
         if not os.path.exists(hostnames_dir):
             os.makedirs(hostnames_dir, exist_ok=True)
         hostname_file = os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
@@ -617,7 +620,7 @@ class DisaggTestCmds(NamedTuple):
     def _generate_disagg_server_config(self, server_idx: int, disagg_server_port: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
-        hostnames_folder = os.path.join(self.output_dir, f"hostnames-{server_idx}")
+        hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
         expected_count = self.num_ctx_servers + self.num_gen_servers
         start_time = time.time()
         hostnames = []
@@ -665,7 +668,7 @@ class DisaggTestCmds(NamedTuple):
                 "urls": gen_hostnames,
             },
         }
-        config_path = os.path.join(self.output_dir, f"server_config.{server_idx}.yaml")
+        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         with open(config_path, "w") as f:
             yaml.dump(server_config, f)
         print_info(f"Server config file {config_path} generated")
@@ -673,7 +676,7 @@ class DisaggTestCmds(NamedTuple):
 
     def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
         """Wait for and read disagg server config."""
-        config_path = os.path.join(self.output_dir, f"server_config.{server_idx}.yaml")
+        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         start_time = time.time()
         while True:
             if os.path.exists(config_path):
@@ -708,10 +711,30 @@ class DisaggTestCmds(NamedTuple):
                 )
             time.sleep(10)
 
+    def get_server_logs(self, server_idx: int) -> List[str]:
+        server_logs = []
+        for i in range(self.num_ctx_servers):
+            server_logs.append(
+                os.path.join(self.test_output_dir, f"trtllm-serve.CTX_{i}.{server_idx}.log")
+            )
+            server_logs.append(os.path.join(self.output_dir, f"ctx_server_{i}.log"))
+        for i in range(self.num_gen_servers):
+            server_logs.append(
+                os.path.join(self.test_output_dir, f"trtllm-serve.GEN_{i}.{server_idx}.log")
+            )
+            server_logs.append(os.path.join(self.output_dir, f"gen_server_{i}.log"))
+        server_logs.append(
+            os.path.join(self.test_output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log")
+        )
+        server_logs.append(os.path.join(self.output_dir, "disagg_server.log"))
+        return server_logs
+
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
         outputs = []
-        benchmark_status_file = os.path.join(self.output_dir, f"benchmark_status.{server_idx}.txt")
+        benchmark_status_file = os.path.join(
+            self.test_output_dir, f"benchmark_status.{server_idx}.txt"
+        )
         port = get_free_port()
 
         ctx_cmd, gen_cmd, disagg_cmd = self.server_cmds[server_idx]
@@ -724,11 +747,18 @@ class DisaggTestCmds(NamedTuple):
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
                 )
-                server_proc = subprocess.Popen(
-                    server_cmd,
-                    env=copy.deepcopy(os.environ),
+                server_file_path = os.path.join(
+                    self.test_output_dir,
+                    f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
-                self.wait_for_benchmark_ready(benchmark_status_file)
+                with open(server_file_path, "w") as server_ctx:
+                    server_proc = subprocess.Popen(
+                        server_cmd,
+                        env=copy.deepcopy(os.environ),
+                        stdout=server_ctx,
+                        stderr=subprocess.STDOUT,
+                    )
+                    self.wait_for_benchmark_ready(benchmark_status_file)
             finally:
                 print_info(f"Server {self.disagg_serving_type} stopped")
                 server_proc.terminate()
@@ -738,11 +768,18 @@ class DisaggTestCmds(NamedTuple):
             try:
                 self._generate_disagg_server_config(server_idx, port)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
-                disagg_server_proc = subprocess.Popen(
-                    disagg_cmd,
-                    env=copy.deepcopy(os.environ),
+                disagg_server_file_path = os.path.join(
+                    self.test_output_dir,
+                    f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
-                self.wait_for_benchmark_ready(benchmark_status_file)
+                with open(disagg_server_file_path, "w") as disagg_server_ctx:
+                    disagg_server_proc = subprocess.Popen(
+                        disagg_cmd,
+                        env=copy.deepcopy(os.environ),
+                        stdout=disagg_server_ctx,
+                        stderr=subprocess.STDOUT,
+                    )
+                    self.wait_for_benchmark_ready(benchmark_status_file)
             finally:
                 print_info(f"Disagg server {self.disagg_serving_type} stopped")
                 disagg_server_proc.terminate()
@@ -753,37 +790,31 @@ class DisaggTestCmds(NamedTuple):
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
                 )
+
                 wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
                     timeout=self.timeout,
+                    check_files=self.get_server_logs(server_idx),
                 )
 
                 # Run all clients for this server
                 for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
                     benchmark_file_path = os.path.join(
-                        self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
+                        self.test_output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
                     )
-                    benchmark_error_file_path = os.path.join(
-                        self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.error.log"
-                    )
-
                     client_cmd_with_port = add_host_port_to_cmd(
                         client_cmd, disagg_server_hostname, disagg_server_port
                     )
                     print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
 
-                    result = subprocess.run(
+                    output = subprocess.check_output(
                         client_cmd_with_port,
-                        capture_output=True,
                         env=copy.deepcopy(os.environ),
-                        check=True,
-                    )
-                    output = result.stdout.decode()
+                        stderr=subprocess.STDOUT,
+                    ).decode()
 
                     with open(benchmark_file_path, "w") as benchmark_ctx:
                         benchmark_ctx.write(output)
-                    with open(benchmark_error_file_path, "w") as benchmark_err_ctx:
-                        benchmark_err_ctx.write(result.stderr.decode())
                     outputs.append(output)
 
             finally:
@@ -1147,28 +1178,28 @@ class PerfSanityTestConfig:
 
     def get_commands(self):
         """Get commands based on runtime and benchmark_mode."""
-        self.perf_sanity_output_dir = os.path.join(self._output_dir, self._test_param_labels)
-        os.makedirs(self.perf_sanity_output_dir, exist_ok=True)
+        self.test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
+        os.makedirs(self.test_output_dir, exist_ok=True)
 
         # ctx_only runs in aggregated mode (uses _get_aggr_commands)
         if self.runtime == "aggr_server":
-            return self._get_aggr_commands(self.perf_sanity_output_dir)
+            return self._get_aggr_commands(self._output_dir, self.test_output_dir)
         else:
-            return self._get_disagg_commands(self.perf_sanity_output_dir)
+            return self._get_disagg_commands(self._output_dir, self.test_output_dir)
 
-    def _get_aggr_commands(self, output_dir: str):
+    def _get_aggr_commands(self, output_dir: str, test_output_dir: str):
         """Get commands for aggregated server."""
         server_cmds = []
         client_cmds = {}
 
         for server_idx, client_configs in self.server_client_configs.items():
             server_config = self.server_configs[server_idx]
-            server_cmd = server_config.to_cmd(output_dir)
+            server_cmd = server_config.to_cmd(test_output_dir)
 
             # Generate extra-llm-api-config.yml
             config_content = server_config.generate_extra_llm_api_config()
             config_filename = f"extra-llm-api-config.aggr.{server_config.name}.yml"
-            config_path = os.path.join(output_dir, config_filename)
+            config_path = os.path.join(test_output_dir, config_filename)
             with open(config_path, "w") as f:
                 f.write(config_content)
 
@@ -1184,9 +1215,10 @@ class PerfSanityTestConfig:
             client_cmds=client_cmds,
             timeout=DEFAULT_TIMEOUT,
             output_dir=output_dir,
+            test_output_dir=test_output_dir,
         )
 
-    def _get_disagg_commands(self, output_dir: str):
+    def _get_disagg_commands(self, output_dir: str, test_output_dir: str):
         """Get commands for disaggregated server."""
         server_cmds = []
         client_cmds = {}
@@ -1197,21 +1229,21 @@ class PerfSanityTestConfig:
             disagg_serving_type = disagg_config.disagg_serving_type
 
             # Generate ctx server command
-            ctx_cmd = ctx_config.to_cmd(output_dir, numa_bind, "CTX")
+            ctx_cmd = ctx_config.to_cmd(test_output_dir, numa_bind, "CTX")
             if "CTX" in disagg_serving_type:
                 config_content = ctx_config.generate_extra_llm_api_config()
                 config_path = os.path.join(
-                    output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
+                    test_output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
                 )
                 with open(config_path, "w") as f:
                     f.write(config_content)
 
             # Generate gen server command
-            gen_cmd = gen_config.to_cmd(output_dir, numa_bind, "GEN")
+            gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
             if "GEN" in disagg_serving_type:
                 config_content = gen_config.generate_extra_llm_api_config()
                 config_path = os.path.join(
-                    output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
+                    test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
                 )
                 with open(config_path, "w") as f:
                     f.write(config_content)
@@ -1221,7 +1253,7 @@ class PerfSanityTestConfig:
                 "trtllm-serve",
                 "disaggregated",
                 "-c",
-                f"{output_dir}/server_config.{server_idx}.yaml",
+                f"{test_output_dir}/server_config.{server_idx}.yaml",
                 "-t",
                 str(timeout),
                 "-r",
@@ -1246,6 +1278,7 @@ class PerfSanityTestConfig:
             num_ctx_servers=disagg_config.num_ctx_servers,
             num_gen_servers=disagg_config.num_gen_servers,
             output_dir=output_dir,
+            test_output_dir=test_output_dir,
         )
 
     def _check_benchmark_errors(self, output: str) -> None:
@@ -1266,51 +1299,6 @@ class PerfSanityTestConfig:
             error_msg = "Benchmark output contains failure markers."
             raise RuntimeError(error_msg)
 
-    def _handle_error(
-        self,
-        error_msg: str,
-        commands,
-        server_idx: int,
-        tail_lines: int = SLURM_LOG_TAIL_LINES,
-    ):
-        """Collect error diagnostics and raise RuntimeError."""
-        messages = [error_msg]
-        log_files = []
-
-        # Collect benchmark log files
-        # output_dir = commands.output_dir
-        # benchmark_logs = sorted(
-        #     glob.glob(os.path.join(output_dir, f"trtllm-benchmark.{server_idx}.*.log"))
-        # )
-        # log_files.extend(benchmark_logs)
-
-        # Collect slurm job log files from jobWorkspace
-        job_workspace = os.environ.get("jobWorkspace", "")
-        if job_workspace:
-            num_gen = getattr(commands, "num_gen_servers", 0)
-            num_ctx = getattr(commands, "num_ctx_servers", 0)
-            # Aggregated server log
-            log_files.append(os.path.join(job_workspace, "run.log"))
-            # Disaggregated ctx/gen and server logs
-            for i in range(num_gen):
-                log_files.append(os.path.join(job_workspace, f"gen_server_{i}.log"))
-            for i in range(num_ctx):
-                log_files.append(os.path.join(job_workspace, f"ctx_server_{i}.log"))
-            # log_files.append(os.path.join(job_workspace, "disagg_server.log"))
-
-        for log_file in log_files:
-            if os.path.exists(log_file):
-                try:
-                    with open(log_file, "r", errors="replace") as f:
-                        lines = f.readlines()
-                        tail_content = "".join(lines[-tail_lines:]) if lines else "(empty)"
-                    messages.append(f"--- {log_file} [last {tail_lines} lines] ---")
-                    messages.append(tail_content)
-                except Exception as e:
-                    messages.append(f"Failed to read {log_file}: {e}")
-
-        raise RuntimeError("\n".join(messages))
-
     def run_ex(self, commands) -> Dict[int, List[str]]:
         """Run commands and collect outputs."""
         outputs = {}
@@ -1323,10 +1311,9 @@ class PerfSanityTestConfig:
 
             except Exception as e:
                 outputs[server_idx] = []
-                self._handle_error(
-                    f"Test command failed for server {server_idx}. Error: {e}",
-                    commands,
-                    server_idx,
+                report_error(
+                    error_msg=e,
+                    log_files=commands.get_server_logs(server_idx),
                 )
 
         return outputs
