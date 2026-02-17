@@ -1074,6 +1074,8 @@ def test_nvfp4_moe_different_input_scales(
             assert torch.allclose(actual_alpha, expected_alpha, rtol=1e-5, atol=1e-5), (
                 f"Alpha recomputation mismatch. Got {actual_alpha}, expected {expected_alpha}"
             )
+
+
 # =============================================================================
 # FineGrainedFP8 MoE Tests
 # =============================================================================
