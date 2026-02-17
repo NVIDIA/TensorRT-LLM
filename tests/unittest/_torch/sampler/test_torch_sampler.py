@@ -647,13 +647,18 @@ class TestFinishReasons:
                     disable_overlap_scheduler=False,
                 )
                 sampler = TorchSampler(args=sampler_args)
+                # setup the sampler store for the requests
+                scheduled_requests = ScheduledRequests()
+                scheduled_requests.context_requests = [req.request for req in requests]
+                sampler.setup_sampler_step(scheduled_requests)
 
                 # fill with garbage value so we can observe that finish reasons are filled
                 # with NOT_FINISHED before we write to them.
                 sampler.store.finish_reasons.fill_(205)
-                seq_slots = torch.tensor(
-                    [req.request.py_seq_slot for req in requests], device="cuda", dtype=torch.int64
+                seq_slots_host = torch.tensor(
+                    [req.request.py_seq_slot for req in requests], device="cpu", dtype=torch.int64
                 )
+                seq_slots_device = seq_slots_host.to(device="cuda", non_blocking=True)
                 seq_lens = torch.tensor(
                     [req.request.max_beam_num_tokens for req in requests],
                     dtype=torch.int32,
@@ -662,42 +667,26 @@ class TestFinishReasons:
                 new_tokens = torch.tensor(
                     [req.new_tokens for req in requests], dtype=torch.int32, device="cuda"
                 ).T
-                sampler.store.new_tokens[:, seq_slots, cls.BEAM] = new_tokens
-                max_seq_lens = torch.tensor(
-                    [
-                        min(
-                            sampler.max_seq_len,
-                            req.request.orig_prompt_len + req.request.py_max_new_tokens,
-                        )
-                        for req in requests
-                    ],
-                    dtype=torch.int32,
-                    device="cuda",
+                sampler.store.new_tokens[:, seq_slots_device, cls.BEAM] = new_tokens
+                num_accepted_tokens, stop_word_indices, single_token_stop_words_only = (
+                    sampler._prepare_stop_word_handling_for_finish_reasons(seq_slots_host)
                 )
-                end_ids = torch.tensor(
-                    [
-                        req.request.py_end_id if req.request.py_end_id is not None else -1
-                        for req in requests
-                    ],
-                    dtype=torch.int32,
-                    device="cuda",
-                )
-                sampler.store.max_lengths_tensor[seq_slots] = max_seq_lens
-                sampler.store.end_ids[seq_slots] = end_ids
 
                 def _uut():
                     with extra_context() if extra_context is not None else nullcontext():
                         sampler._write_finish_reasons(
-                            [req.request for req in requests],
                             finish_reasons=sampler.store.finish_reasons,
                             new_tokens=sampler.store.new_tokens,
                             seq_lens=seq_lens,
-                            seq_slots=seq_slots,
+                            seq_slots=seq_slots_device,
+                            num_accepted_tokens=num_accepted_tokens,
+                            stop_word_indices=stop_word_indices,
+                            single_token_stop_words_only=single_token_stop_words_only,
                         )
 
                 yield _uut
 
-                reasons = sampler.store.finish_reasons[:, seq_slots, cls.BEAM].T.tolist()
+                reasons = sampler.store.finish_reasons[:, seq_slots_device, cls.BEAM].T.tolist()
 
                 for actual, request in zip(reasons, requests, strict=True):
                     expected = request.finish_reasons
@@ -723,15 +712,6 @@ class TestFinishReasons:
                     stop_words_list=[[12, 13]],
                     new_tokens=[12, 13, 60],
                     finish_reasons=[cls.NOT_FINISHED, cls.STOP_WORDS, cls.NOT_FINISHED],
-                ),
-                cls.RequestCase(
-                    prompt=[7, 8, 6],
-                    stop_words_list=[[12, 13]],
-                    new_tokens=[60, 12, 13],
-                    # The request has stop words, but no draft is created
-                    # Tokens at indices greater than 0 should be ignored
-                    num_draft_tokens=0,
-                    finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.NOT_FINISHED],
                 ),
                 cls.RequestCase(
                     prompt=[1, 2, 3, 4],
@@ -807,6 +787,58 @@ class TestFinishReasons:
         def raising_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
                 patch_ctx.setattr(TorchSampler, "_are_stop_words", stop_words_that_raises)
+                patch_ctx.setattr(
+                    TorchSampler, "_are_stop_words_single_token", stop_words_that_raises
+                )
+                with pytest.raises(AssertionError) if expect_raise else nullcontext():
+                    yield
+
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1, 2]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                ),
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                ),
+            ],
+            extra_context=lambda: raising_stop_words_ctx(True),
+        )
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: raising_stop_words_ctx(False),
+        )
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+    @classmethod
+    def test_are_stop_words_single_token_is_called_when_single_token_stop_words_are_present(
+        cls, monkeypatch: pytest.MonkeyPatch
+    ):
+        """We don't want to call are_stop_words when there are only single token stop words because it's expensive"""
+
+        def stop_words_that_raises(*args, **kwargs):
+            raise AssertionError
+
+        @contextmanager
+        def raising_single_token_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(
+                    TorchSampler, "_are_stop_words_single_token", stop_words_that_raises
+                )
                 with pytest.raises(AssertionError) if expect_raise else nullcontext():
                     yield
 
@@ -819,15 +851,168 @@ class TestFinishReasons:
                     finish_reasons=[cls.NOT_FINISHED],
                 )
             ],
-            extra_context=lambda: raising_stop_words_ctx(True),
+            extra_context=lambda: raising_single_token_stop_words_ctx(True),
         )
         run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
 
-        uut_provider_without_stop_words = cls.RequestCase.build(
-            [cls.RequestCase(prompt=[1], new_tokens=[4], finish_reasons=[cls.NOT_FINISHED])],
-            extra_context=lambda: raising_stop_words_ctx(False),
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1, 2]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: raising_single_token_stop_words_ctx(False),
         )
-        run_test_with_warmup(uut_provider_without_stop_words, max_sync_s=0.5)
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+    @classmethod
+    def check_resize_and_update_stop_words_buffer(
+        cls,
+        old_stop_words: torch.Tensor,
+        old_past_tokens: torch.Tensor,
+        new_stop_words: torch.Tensor,
+        new_past_tokens: torch.Tensor,
+        seq_slots_to_compare: torch.Tensor,
+        num_draft_tokens: int,
+    ):
+        old_num_stop_words = old_stop_words.shape[0]
+        old_stop_word_length = old_stop_words.shape[1]
+
+        old_past_token_length = old_past_tokens.shape[0]
+
+        # These sizes should not change after the resize
+        assert old_stop_words.shape[2] == new_stop_words.shape[2]
+        assert old_past_tokens.shape[1] == new_past_tokens.shape[1]
+        assert old_past_tokens.shape[2] == new_past_tokens.shape[2]
+
+        assert (
+            new_stop_words[-old_num_stop_words:, -old_stop_word_length:, seq_slots_to_compare]
+            == old_stop_words[..., seq_slots_to_compare]
+        ).all()
+        # initial fill has an offset of 1, as there will be a shift happening during sample_async
+        assert (
+            new_past_tokens[-old_past_token_length:-num_draft_tokens, seq_slots_to_compare, :]
+            == old_past_tokens[:-num_draft_tokens, seq_slots_to_compare, :]
+        ).all()
+
+    @classmethod
+    def test_stop_words_buffer_resize(cls, monkeypatch: pytest.MonkeyPatch):
+        @contextmanager
+        def check_resize_ctx() -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                setup_sampler_step_orig = TorchSampler.setup_sampler_step
+
+                def setup_sampler_step_with_size_check(self, scheduled_requests: ScheduledRequests):
+                    # RequestCase.build calls setup_sampler_step to fill the buffers for all context requests
+                    # Move the context requests to the generation requests
+                    scheduled_requests.generation_requests = scheduled_requests.context_requests
+                    # Add a request that enforces a resize
+                    scheduled_requests.context_requests = [
+                        cls.RequestCase(
+                            prompt=[1],
+                            stop_words_list=[
+                                [x for x in range(2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH)]
+                            ],
+                            new_tokens=[4],
+                            finish_reasons=[cls.NOT_FINISHED],
+                        ).request
+                    ]
+                    # Store the old stop words and past tokens for comparison
+                    old_stop_words = self.store.stop_words.clone()
+                    old_past_tokens = self.store.past_tokens.clone()
+                    # Call setup sampler step to trigger the resize
+                    setup_sampler_step_orig(self, scheduled_requests)
+
+                    # Check if sizes are correct
+                    assert self.store.stop_words.shape[0] == TorchSampler.DEFAULT_MAX_STOP_WORDS
+                    assert (
+                        self.store.stop_words.shape[1]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH
+                    )
+                    assert self.max_tokens == 1
+                    assert (
+                        self.store.past_tokens.shape[0]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH - 1 + self.max_tokens
+                    )
+                    # Check if values are added correctly
+                    seq_slots_to_compare_cuda = torch.Tensor(
+                        [
+                            scheduled_requests.generation_requests[x].py_seq_slot
+                            for x in range(len(scheduled_requests.generation_requests))
+                        ]
+                    ).to(device="cuda", dtype=torch.int32, non_blocking=True)
+                    cls.check_resize_and_update_stop_words_buffer(
+                        old_stop_words,
+                        old_past_tokens,
+                        self.store.stop_words,
+                        self.store.past_tokens,
+                        seq_slots_to_compare_cuda,
+                        self.max_draft_len,
+                    )
+
+                patch_ctx.setattr(
+                    TorchSampler, "setup_sampler_step", setup_sampler_step_with_size_check
+                )
+                yield
+
+        # The test adds one more request
+        num_requests = 8
+        uut_provider_with_resize_on_demand = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1 + x],
+                    stop_words_list=[[x + 100]],
+                    new_tokens=[x + 4, x + 3, x + 2],
+                    finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.NOT_FINISHED],
+                )
+                for x in range(num_requests)
+            ],
+            extra_context=lambda: check_resize_ctx(),
+        )
+        run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=0.5)
+
+    @classmethod
+    def test_stop_words_buffer_resizes_on_demand(cls, monkeypatch: pytest.MonkeyPatch):
+        @contextmanager
+        def check_resize_ctx() -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                setup_sampler_step_orig = TorchSampler.setup_sampler_step
+
+                def setup_sampler_step_with_size_check(self, scheduled_requests: ScheduledRequests):
+                    setup_sampler_step_orig(self, scheduled_requests)
+                    assert self.store.stop_words.shape[0] == TorchSampler.DEFAULT_MAX_STOP_WORDS
+                    assert (
+                        self.store.stop_words.shape[1]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH
+                    )
+                    assert self.max_tokens == 1
+                    assert (
+                        self.store.past_tokens.shape[0]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH - 1 + self.max_tokens
+                    )
+
+                patch_ctx.setattr(
+                    TorchSampler, "setup_sampler_step", setup_sampler_step_with_size_check
+                )
+                yield
+
+        uut_provider_with_resize_on_demand = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[
+                        [x for x in range(2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH)]
+                    ],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: check_resize_ctx(),
+        )
+        run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
 
 
 class TestBatchedSampling:
@@ -1139,12 +1324,19 @@ class TestBatchedSampling:
         use_flashinfer: bool,
         max_draft_len: int,
         seq_slot_assignment: tuple[list[int], int],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> TorchSampler:
-        return self._build_sampler(
-            use_flashinfer=use_flashinfer,
-            max_draft_len=max_draft_len,
-            seq_slot_assignment=seq_slot_assignment,
-        )
+        # Patch the sampler to setup every context request.
+        def always_true(*args, **kwargs) -> bool:
+            return True
+
+        with monkeypatch.context() as patch_ctx:
+            patch_ctx.setattr(TorchSampler, "_is_new_request", always_true)
+            return self._build_sampler(
+                use_flashinfer=use_flashinfer,
+                max_draft_len=max_draft_len,
+                seq_slot_assignment=seq_slot_assignment,
+            )
 
     def _build_sampler(
         self,
