@@ -30,9 +30,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
-    _rope_deinterleave_load_hook,
-)
+from tensorrt_llm._torch.auto_deploy.models.custom import mla_rope_utils
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
 
@@ -798,7 +796,7 @@ class Glm4MoeLiteForCausalLM(Glm4MoeLitePreTrainedModel, GenerationMixin):
         # so the forward can use torch_rope_with_explicit_cos_sin (→ flashinfer_rope).
         self._register_load_state_dict_pre_hook(
             partial(
-                _rope_deinterleave_load_hook,
+                mla_rope_utils._rope_deinterleave_load_hook,
                 qk_rope_head_dim=config.qk_rope_head_dim,
                 qk_nope_head_dim=config.qk_nope_head_dim,
                 num_heads=config.num_attention_heads,
