@@ -143,6 +143,7 @@ def test_build_ad_eagle(register_mock_eagle_factory):
     This test uses the MockEagleDrafterFactory which builds MockEagle3ModelForCausalLM,
     a mock model that generates random hidden states for standalone Eagle testing.
     """
+
     llm_extra_args = {
         "model_factory": "MockEagleDrafter",
         "transforms": {
@@ -177,13 +178,10 @@ def test_eagle_model_torch_export():
     print("=" * 80)
 
     eagle_model_path = hf_id_to_local_model_dir(EAGLE_MODEL_HUB_ID)
-    if eagle_model_path is None:
-        pytest.skip("Eagle model not found (LLM_MODELS_ROOT not set or model missing)")
-
     eagle_path = Path(eagle_model_path)
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     dtype = torch.float16
 
     # Create model via EagleDrafterFactory (creates Eagle3DrafterForCausalLM)

@@ -1,5 +1,6 @@
 import copy
 import functools
+from collections import defaultdict
 from typing import Callable, Dict, List, Optional, Tuple, Union, final
 
 import torch
@@ -13,6 +14,7 @@ from tensorrt_llm.mapping import Mapping
 from ...._utils import torch_dtype_to_binding
 from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
+from ...speculative.utils import get_num_extra_kv_tokens
 from ..custom_ops.attention_interface import (
     CausalConvResourceHandler,
     KVPagedResourceHandler,
@@ -59,6 +61,8 @@ class CachedSequenceInterface:
         kv_cache_config: Optional[KvCacheConfig] = None,
         max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
+        extra_seq_len_for_kv_cache: int = 0,
+        spec_config=None,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -70,6 +74,8 @@ class CachedSequenceInterface:
             max_num_tokens: Maximum total tokens across all sequences. If None, computed from
                 max_seq_len and max_batch_size.
             vocab_size_padded: Padded vocabulary size of the model.
+            spec_config: Speculative decoding configuration. Passed to KVCacheManager for
+                runtime use (num_extra_kv_tokens, max_draft_len, etc.). Defaults to None.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -92,11 +98,15 @@ class CachedSequenceInterface:
         )
 
         self._resource_lookup: ResourceHandlerDict = {}
+        self._resource_counters: Dict[str, int] = defaultdict(int)
         self._caches: Dict[str, torch.Tensor] = {}
         # KVCacheManager (or MambaHybridCacheManager) for managed resources
         self._kv_cache_manager: Optional[Union[KVCacheManager, MambaHybridCacheManager]] = None
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
+        # Speculative decoding configuration
+        self._extra_seq_len_for_kv_cache: int = extra_seq_len_for_kv_cache
+        self._spec_config = spec_config
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -124,8 +134,50 @@ class CachedSequenceInterface:
                 raise ValueError(f"Invalid KVCacheConfig field: {k}")
 
     def add_resource(self, name: str, resource_handler: ResourceHandler) -> None:
-        """Add a resource handler to the cache interface."""
+        """Add a resource handler to the cache interface.
+
+        Low-level method that adds a single resource.
+        If you have a group of related resources that you want to have the same index and unique names,
+        use add_resource_group() instead.
+        """
         self._resource_lookup[name] = resource_handler
+
+    def add_resource_group(self, resources: ResourceHandlerDict) -> Dict[str, str]:
+        """Add a group of related resources with the same index, selected to avoid collisions.
+
+        Args:
+            resources: Dict mapping base names to resource handlers
+                       (e.g., {"k_cache": handler1, "v_cache": handler2})
+        Returns:
+            Dict mapping base names to unique names
+            (e.g., {"k_cache": "k_cache_0", "v_cache": "v_cache_0"})
+        """
+        # Use max counter among all keys to ensure fresh index for the group
+        idx = max(self._resource_counters.get(base_name, 0) for base_name in resources.keys())
+
+        result = {}
+        for base_name, handler in resources.items():
+            unique_name = f"{base_name}_{idx}"
+            self.add_resource(unique_name, handler)
+            result[base_name] = unique_name
+            self._resource_counters[base_name] = idx + 1
+
+        return result
+
+    def _update_kv_cache_manager_for_spec_dec(self) -> None:
+        """Update KVCacheManager spec-related attributes for speculative decoding.
+
+        We need these values to be properly set to get good KV cache allocation.
+        However, we cannot pass spec_config directly to the KVCacheManager constructor
+        because it would add an extra speculative layer that we have already handled.
+        """
+        self._kv_cache_manager.num_extra_kv_tokens = get_num_extra_kv_tokens(self._spec_config)
+        self._kv_cache_manager.max_draft_len = (
+            self._spec_config.max_draft_len if self._spec_config is not None else 0
+        )
+        self._kv_cache_manager.max_total_draft_tokens = (
+            self._spec_config.max_total_draft_tokens if self._spec_config is not None else 0
+        )
 
     @staticmethod
     def _check_n_groups_constraint(
@@ -388,7 +440,7 @@ class CachedSequenceInterface:
             {
                 "kv_cache_config": kv_cache_config,
                 "tokens_per_block": kv_cache_config.tokens_per_block,
-                "max_seq_len": self.info.max_seq_len,
+                "max_seq_len": self.info.max_seq_len + self._extra_seq_len_for_kv_cache,
                 "max_batch_size": self.info.max_batch_size,
                 "mapping": Mapping(),
                 "layer_mask": None,
@@ -519,6 +571,9 @@ class CachedSequenceInterface:
         else:
             # No typed state resources - use pure KVCacheManager
             self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
+
+        # Update KVCacheManager spec-related attributes for speculative decoding
+        self._update_kv_cache_manager_for_spec_dec()
 
         # 4. Store tuned config and ensure capacity
         self._kv_cache_config_tuned = kv_cache_config

@@ -156,6 +156,14 @@ class ModelFactory(ABC):
         """
         return None
 
+    @property
+    def hidden_size(self) -> Optional[int]:
+        return None
+
+    @property
+    def dtype(self) -> Optional[torch.dtype]:
+        return None
+
     def build_model(self, device: str) -> nn.Module:
         """Build the model on the desired device.
 

@@ -22,6 +22,10 @@ from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
+    ADHiddenStateManager,
+    EagleWrapperOutput,
+)
 from tensorrt_llm._torch.auto_deploy.utils._graph import get_input_embeddings, get_lm_head_weights
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
@@ -35,12 +39,10 @@ from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm._torch.speculative import get_spec_drafter
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
+from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens, get_spec_drafter
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
-    EagleDecodingConfig,
     KvCacheConfig,
     LoadFormat,
     SamplerType,
@@ -64,10 +66,10 @@ from ...pyexecutor.sampler import TorchSampler, TRTLLMSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
-    RequestList,
     ScheduledRequests,
     SimpleScheduler,
 )
+from ...speculative.eagle3 import Eagle3OneModelSampler
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -82,88 +84,33 @@ class ReportingInfo:
     enable_iter_req_stats: bool = False
 
 
-class ADHiddenStateManager(Eagle3ResourceManager):
-    def __init__(
-        self,
-        cache_seq_interface: CachedSequenceInterface,
-        config: EagleDecodingConfig,
-        max_num_requests: int,
-        max_seq_len: int,
-        max_num_tokens: int,
-    ):
-        hidden_state_buffer = self._get_hidden_state_buffers(cache_seq_interface)[0]
-        dtype = hidden_state_buffer.dtype
-        hidden_size = hidden_state_buffer.shape[1]
+def get_extra_seq_len_for_kv_cache(ad_config: LlmArgs) -> int:
+    """Compute extra sequence length needed for KV cache sizing.
 
-        super().__init__(config, dtype, hidden_size, max_num_requests, max_seq_len, max_num_tokens)
+    This accounts for:
+    - Overlap scheduler bookkeeping (+1 token)
+    - Speculative decoding draft tokens
+    - One-model spec dec extra tokens
 
-        self.hidden_state_write_indices: torch.Tensor = torch.empty(
-            max_num_tokens, dtype=torch.long, device="cuda"
-        )
+    Returns:
+        The additional sequence length to add to max_seq_len for KV cache.
+    """
+    extra_seq_len = 0
+    spec_config = ad_config.speculative_config
 
-    def _get_hidden_state_buffers(
-        self, cache_seq_interface: CachedSequenceInterface
-    ) -> List[torch.Tensor]:
-        hidden_state_buffers = []
-        for name, tensor in cache_seq_interface.named_args.items():
-            if "hidden_states_cache" in name:
-                hidden_state_buffers.append(tensor)
+    # Overlap scheduler requires extra tokens for bookkeeping lag
+    if not ad_config.disable_overlap_scheduler:
+        extra_seq_len += 1
+        if spec_config is not None:
+            extra_seq_len += spec_config.max_total_draft_tokens
 
-        if not hidden_state_buffers:
-            raise ValueError(
-                "No hidden_state_buffers found in cache_seq_interface. Check if we are actually running Eagle3."
-            )
-        return hidden_state_buffers
+    # Speculative decoding requires extra tokens for draft allocation
+    if spec_config is not None:
+        extra_seq_len += spec_config.max_total_draft_tokens
+        # One-model spec decoding modes need additional tokens
+        extra_seq_len += get_num_extra_kv_tokens(spec_config)
 
-    def prepare_hidden_states_capture(
-        self, ordered_requests: RequestList, cache_seq_interface: CachedSequenceInterface
-    ) -> None:
-        """Prepare the hidden states for capture by establishing indices that the hidden states will be written to."""
-        seq_lens = cache_seq_interface.info.seq_len
-        num_tokens = sum(seq_lens)
-
-        start_idx = 0
-        hidden_states_write_indices = []
-        for request, seq_len in zip(ordered_requests, seq_lens):
-            request_id = request.request_id
-            slot_id = self.slot_manager.get_slot(request_id)
-            self.start_indices[slot_id] = start_idx
-            hidden_states_write_indices.extend(range(start_idx, start_idx + seq_len))
-            start_idx += max(seq_len, self.max_total_draft_tokens + 1)
-            assert start_idx < self.hidden_states.shape[0], (
-                f"start_idx {start_idx} exceeds hidden_states capacity {self.hidden_states.shape[0]}"
-            )
-
-        if len(hidden_states_write_indices) != num_tokens:
-            raise ValueError(
-                f"len(hidden_state_write_indices) ({len(hidden_states_write_indices)}) != num_tokens \
-                ({num_tokens}). Check whether ordered_requests matches up with seq_lens."
-            )
-
-        hidden_state_write_indices_host = torch.tensor(
-            hidden_states_write_indices, dtype=torch.long
-        )
-
-        self.hidden_state_write_indices[:num_tokens].copy_(
-            hidden_state_write_indices_host, non_blocking=True
-        )
-
-    def capture_hidden_states(self, cache_seq_interface: CachedSequenceInterface) -> None:
-        """Capture configured hidden states that have been written by the model,
-        in a format that can be used by the draft model.
-        """
-        full_hidden_states = self._get_hidden_state_buffers(cache_seq_interface)
-        if not full_hidden_states:
-            return
-
-        num_tokens = sum(cache_seq_interface.info.seq_len)
-
-        hidden_states = [hidden_state[:num_tokens] for hidden_state in full_hidden_states]
-        hidden_states = torch.cat(hidden_states, dim=1)
-        hidden_states = hidden_states.to(dtype=self.dtype)
-
-        token_idx = self.hidden_state_write_indices[:num_tokens]
-        self.hidden_states[:, : hidden_states.shape[1]].index_copy_(0, token_idx, hidden_states)
+    return extra_seq_len
 
 
 def construct_draft_llm_args(
@@ -246,13 +193,21 @@ def create_draft_kv_cache_manager_maybe(
     # Get the appropriate KV cache manager class
     kv_cache_manager_cls = get_kv_cache_manager_cls(draft_model_engine.model.model_config)
 
+    # Similar to logic in py_executor_creator.py, we allocate extra tokens for speculative decoding
+    # and overlap scheduling. The core reason is because inputs now contain max_draft_len extra tokens,
+    # due to previous drafts, and the KV cache needs enough space to write entries for them.
+    # Note that this code is only exercised in two model spec dec;
+    # one model spec dec needs a similar adjustment (in fact, more, since it drafts in the model call)
+    # but that is handled separately (in the target model's KV cache).
+    max_seq_len_for_kv_cache = ad_config.max_seq_len + get_extra_seq_len_for_kv_cache(ad_config)
+
     return _create_kv_cache_manager(
         model_engine=draft_model_engine,
         kv_cache_manager_cls=kv_cache_manager_cls,
         mapping=dist_mapping,
         kv_cache_config=kv_cache_config_tuned,
         tokens_per_block=kv_cache_config_tuned.tokens_per_block,
-        max_seq_len=ad_config.max_seq_len,
+        max_seq_len=max_seq_len_for_kv_cache,
         max_batch_size=ad_config.max_batch_size,
         spec_config=ad_config.speculative_config,
         sparse_attn_config=ad_config.sparse_attention_config,
@@ -442,6 +397,8 @@ class ADEngine(ModelEngine):
             kv_cache_config=ad_config.kv_cache_config,
             max_num_tokens=ad_config.max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
+            extra_seq_len_for_kv_cache=get_extra_seq_len_for_kv_cache(ad_config),
+            spec_config=ad_config.speculative_config,
         )
 
         reporting_info = ReportingInfo(
@@ -753,7 +710,6 @@ class ADEngine(ModelEngine):
             cu_num_pages.append(cu_num_pages[-1] + pages_per_seq[-1])
             seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
             last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
-
             position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
 
         # check for logits_gather_info
@@ -790,6 +746,8 @@ class ADEngine(ModelEngine):
 
         self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
 
+        spec_resource_manager = spec_resource_manager or self.get_internal_resource_manager()
+
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
         ):
@@ -803,17 +761,44 @@ class ADEngine(ModelEngine):
         self.iter_states["num_generation_tokens"] = num_generation_tokens
 
     @nvtx_range("ad_compute_logits")
-    def _compute_logits(self) -> List[torch.Tensor]:
+    def _compute_logits(self):
+        """Run model forward and return outputs.
+
+        For regular models, returns raw logits tensor (same as upstream).
+        For one-model spec dec (EagleWrapper), returns a dict with logits,
+        new_tokens, new_tokens_lens, next_draft_tokens, next_new_tokens.
+        """
         # run the model
-        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
+        model_output = self.model(**self.cache_seq_interface.named_args)
+
+        # Handle EagleWrapperOutput (one-model spec dec)
+        if isinstance(model_output, EagleWrapperOutput):
+            return {
+                "logits": model_output.logits,  # not used for sampling, just compatibility
+                "new_tokens": model_output.new_tokens,
+                "new_tokens_lens": model_output.new_tokens_lens,
+                "next_draft_tokens": model_output.next_draft_tokens,
+                "next_new_tokens": model_output.next_new_tokens,
+            }
+
+        logits = model_output[0]
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
+        # Return raw tensor for compatibility with demollm and unit tests (same as upstream).
         return logits.float()
 
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
         return self.cache_seq_interface.info.max_batch_size
+
+    def get_internal_resource_manager(self):
+        """Get internal resource manager if the model has one.
+
+        For one-model speculative decoding, the resource manager is stored inside the model itself
+        instead of externally.
+        """
+        return getattr(self.model, "resource_manager", None)
 
     @torch.inference_mode()
     @maybe_pad_for_cuda_graph
@@ -834,10 +819,14 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
-        outputs = {
-            "logits": self._compute_logits(),
-        }
+        outputs = self._compute_logits()
 
+        # For one-model spec dec (without_logits=True), pass through all outputs
+        # The sampler will use new_tokens, etc. instead of sampling from logits
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.without_logits():
+            return outputs
+
+        # If we have an external spec resource manager (two-model spec dec),
         # save hidden states after running model.forward() in _compute_logits()
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER
@@ -846,6 +835,8 @@ class ADEngine(ModelEngine):
             spec_resource_manager, ADHiddenStateManager
         ):
             spec_resource_manager.capture_hidden_states(self.cache_seq_interface)
+
+        outputs = {"logits": outputs}
 
         if self.mapping is not None:
             self._execute_logit_post_processors(scheduled_requests, outputs)
@@ -984,8 +975,24 @@ def instantiate_sampler(
     dist_mapping: Mapping,
     engine: ADEngine,
 ):
-    if ad_config.sampler_type == SamplerType.TorchSampler:
-        # search sampler with speculative decoding
+    spec_config = ad_config.speculative_config
+
+    # Check for one-model speculative decoding mode
+    # In this mode, the model performs sampling internally and returns tokens,
+    # so we use Eagle3OneModelSampler which handles the pre-computed tokens
+    if spec_config is not None and spec_config.spec_dec_mode.is_eagle3_one_model():
+        sampler_args = TorchSampler.Args(
+            max_seq_len=ad_config.max_seq_len,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            max_num_sequences=max_num_sequences,
+            max_beam_width=ad_config.max_beam_width,
+            disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+        )
+        sampler = Eagle3OneModelSampler(sampler_args)
+
+    elif ad_config.sampler_type == SamplerType.TorchSampler:
+        # Regular TorchSampler for non-spec-dec or two-model spec-dec
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,
             max_draft_len=max_draft_len,
@@ -1065,33 +1072,41 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping, dist=dist)
 
     spec_config = ad_config.speculative_config
-    if spec_config is not None and not (
-        spec_config.spec_dec_mode.is_draft_target() or spec_config.spec_dec_mode.is_eagle3()
-    ):
-        raise ValueError(
-            "Currently, AutoDeploy only supports speculative decoding in draft target or eagle3 mode."
-        )
 
     if spec_config is not None and ad_config.guided_decoding_backend is not None:
         raise ValueError(
             "Guided decoding is not currently supported for speculative decoding in AutoDeploy."
         )
 
-    draft_model_engine = create_draft_model_engine_maybe(
-        ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, dist=dist
-    )
-
-    spec_resource_manager = (
-        ADHiddenStateManager(
-            cache_seq_interface=engine.cache_seq_interface,
-            config=spec_config,
-            max_num_requests=ad_config.max_batch_size,
-            max_seq_len=engine.llm_args.max_seq_len,
-            max_num_tokens=engine.llm_args.max_num_tokens,
+    if spec_config is not None and not (
+        spec_config.spec_dec_mode.is_draft_target()
+        or spec_config.spec_dec_mode.is_eagle3()
+        or spec_config.spec_dec_mode.is_eagle3_one_model()
+    ):
+        raise ValueError(
+            "Currently, AutoDeploy only supports speculative decoding in draft target, eagle3, or eagle3_one_model mode"
         )
-        if isinstance(spec_config, EagleDecodingConfig)
-        else None
-    )
+
+    # One Model spec dec does not require a separate draft model engine or spec resource manager.
+    if spec_config is not None and (
+        spec_config.spec_dec_mode.is_draft_target() or spec_config.spec_dec_mode.is_eagle3()
+    ):
+        draft_model_engine = create_draft_model_engine_maybe(
+            ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, dist=dist
+        )
+
+        spec_resource_manager = (
+            ADHiddenStateManager.build_from_target_engine(
+                engine=engine,
+                config=spec_config,
+                max_num_requests=ad_config.max_batch_size,
+            )
+            if spec_config.spec_dec_mode.is_eagle3()
+            else None
+        )
+    else:
+        draft_model_engine = None
+        spec_resource_manager = None
 
     # resource managers
     # KVCacheManager is now created and managed by CachedSequenceInterface during the
