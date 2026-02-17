@@ -535,6 +535,11 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
+        if self._mapping.enable_attention_dp:
+            logger.info(
+                "Attention DP is enabled, separate draft KV cache is not supported."
+            )
+            return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
     def _get_effective_draft_config(self) -> ModelConfig:
