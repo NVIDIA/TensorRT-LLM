@@ -687,8 +687,21 @@ class OpenAIServer:
 
             trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
+            # Skip multimodal multi-threading tokenization for now
+            has_multimodal = prompt.get("multi_modal_data") is not None or prompt.get("multi_modal_embeddings") is not None
+            if prompt.get("prompt") is not None and not has_multimodal:
+                prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(
+                    self.llm.input_processor, prompt, sampling_params
+                )
+                tokens_prompt = TokensPrompt(
+                    prompt_token_ids=prompt_token_ids,
+                    query_token_ids=extra_processed_inputs.get("query_token_ids") if extra_processed_inputs is not None else None
+                )
+            else:
+                tokens_prompt = prompt
+
             promise = self.generator.generate_async(
-                inputs=prompt,
+                inputs=tokens_prompt,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
