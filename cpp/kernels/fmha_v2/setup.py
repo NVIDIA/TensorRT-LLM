@@ -2233,9 +2233,6 @@ def selected_mask_types(kspec):
             custom_mask = '0'
             bidirectional_sliding_window_mask = '0'
 
-        if kspec.head_size not in [32, 64, 128]:
-            bidirectional_sliding_window_mask = '0'
-
     return padding_mask, causal_mask, sliding_or_chunked_causal_mask, bidirectional_sliding_window_mask, custom_mask
 
 
