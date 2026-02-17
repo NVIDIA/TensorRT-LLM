@@ -55,6 +55,8 @@ transforms:
     run_shape_prop: true
   match_l2norm_pattern:
     stage: pattern_matcher
+  match_moe_routing_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
