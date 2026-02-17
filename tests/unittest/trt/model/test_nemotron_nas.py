@@ -709,8 +709,7 @@ class TestNemotronNas(unittest.TestCase):
                                    atol=atol)
 
     @parameterized.expand(get_loader_test_cases, name_func=unittest_name_func)
-    def test_allclose_to_finegrained_fp8(self, hf_model_dir: str,
-                                         params: TestParams):
+    def test_allclose_to_hf_fp8(self, hf_model_dir: str, params: TestParams):
         runtime, config = self._from_fp8_quantized_engine(
             model_dir=hf_model_dir, params=params)
         self.allclose(
@@ -731,7 +730,7 @@ class TestNemotronNas(unittest.TestCase):
         os.environ.get("NEMOTRON_NAS_CKPT") is None,
         reason="You must define NEMOTRON_NAS_CKPT",
     )
-    def test_allclose_to_finegrained_fp8_accelerate(self):
+    def test_allclose_to_hf_fp8_accelerate(self):
         hf_model_dir = os.environ["NEMOTRON_NAS_CKPT"]
         params = TestParams(enable_paged_kv_cache=True,
                             enable_remove_input_padding=True,

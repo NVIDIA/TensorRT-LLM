@@ -319,7 +319,8 @@ def _run_sharding_execution_job(
         ).to(device="cuda", dtype=torch.float16)
     elif model_cls == FineGrainedFP8MLP:
         # FineGrainedFP8MLP needs features divisible by 128 (block size)
-        model = model_cls(128, 128, bias=bias).to("cuda")
+        num_features = 128
+        model = model_cls(num_features, num_features, bias=bias).to("cuda")
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
@@ -466,6 +467,10 @@ def _run_pattern_detection_job(
             v_head_dim=v_head_dim,
             bias=bias,
         ).to(device="cuda", dtype=torch.float16)
+    elif model_cls == FineGrainedFP8MLP:
+        # FineGrainedFP8MLP needs features divisible by 128 (block size)
+        num_features = 128
+        model = model_cls(num_features, num_features, bias=bias).to("cuda")
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
