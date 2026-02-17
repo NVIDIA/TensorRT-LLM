@@ -18,6 +18,7 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include <random>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -29,11 +30,19 @@ std::string genUniqueAgentName()
 {
     static std::atomic<uint64_t> counter{0};
 
-    // hostname+pid+counter++
+    // Generate a per-process random suffix to disambiguate agents across containers
+    // that may share the same hostname (--network host) and PID namespace.
+    static uint64_t const randomSuffix = []()
+    {
+        std::random_device rd;
+        return (static_cast<uint64_t>(rd()) << 32) | rd();
+    }();
+
     char hostname[1024];
     gethostname(hostname, sizeof(hostname));
     auto pid = static_cast<uint64_t>(::getpid());
-    return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(counter++);
+    return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(randomSuffix) + "_"
+        + std::to_string(counter++);
 }
 
 // NIXL connection is specific, and different from the UCX and mpi connection,
