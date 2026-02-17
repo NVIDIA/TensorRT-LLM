@@ -1,6 +1,6 @@
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Type, Union
+from typing import Any, Dict, Literal, Optional, Type, Union
 
 import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
@@ -12,7 +12,6 @@ from ...llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
-    SamplerType,
     TorchLlmArgs,
     _ParallelConfig,
 )
@@ -48,7 +47,6 @@ def _check_for_default_value_only(
 _TRANSFORMS_SHORTCUT_LOOKUP = {
     "attn_backend": ("insert_cached_attention.backend", "transformers_replace_cached_attn.backend"),
     "compile_backend": ("compile_model.backend",),
-    "cuda_graph_batch_sizes": ("compile_model.cuda_graph_batch_sizes",),
 }
 
 
@@ -81,15 +79,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         frozen=True,
     )
 
-    @field_validator("max_seq_len", mode="before")
+    @field_validator("max_beam_width", mode="after")
     @classmethod
-    def ensure_max_seq_len(cls, value: Any, info: ValidationInfo) -> Any:
-        # NOTE: the bass class's default value is `None`, which is incompatible with the validators
-        # defined in this child class. This is problematic when e.g. TRTLLM serve explicitly passes
-        # the bass class's default in.
-        if value is None:
-            # Fallback to the AutoDeployConfig default when not provided.
-            return cls.model_fields["max_seq_len"].get_default(call_default_factory=True)
+    def ensure_no_beam_search(cls, value: Any) -> Any:
+        if value is not None and value > 1:
+            raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
         return value
 
     @field_validator("build_config", mode="before")
@@ -228,17 +222,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
-    sampler_type: Union[str, SamplerType] = Field(
-        default=SamplerType.TorchSampler,
-        description="The type of sampler to use. Options are TRTLLMSampler or TorchSampler. Defaults to TorchSampler.",
-    )
-
-    max_beam_width: int = Field(
-        default=1,
-        description="The maximum beam width. >1 is not supported by AutoDeploy.",
-        frozen=True,
-    )
-
     draft_checkpoint_loader: Optional[object] = Field(
         default=None,
         description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
@@ -259,29 +242,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
-    attn_backend: str = Field(
-        default="flashinfer",
-        description=_shortcut_description("Attention backend to use.", "attn_backend"),
-    )
     compile_backend: str = Field(
         default="torch-compile",
         description=_shortcut_description(
             "The backend to use for compiling the model.", "compile_backend"
         ),
     )
-    # TODO(#9306): fold this into `CudaGraphConfig`.
-    cuda_graph_batch_sizes: Optional[List[int]] = Field(
-        default=None,
-        description=_shortcut_description(
-            "List of batch sizes for CUDA graph creation. If not provided, a heuristic will"
-            " be used to determine the batch sizes.",
-            "cuda_graph_batch_sizes",
-        ),
-    )
-
-    ### SEQUENCE INTERFACE CONFIG ##################################################################
-    max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
-    max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
 
     def model_dump(self, *args, **kwargs):
         """Convert the arguments to a dictionary that can be used as kwargs for the LLM API."""
@@ -334,28 +300,60 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def update_cuda_graph_batch_sizes(self):
-        # if not set, use heuristic
-        if self.cuda_graph_batch_sizes is None:
-            cg_bs = {1, self.max_batch_size}
-            # Only add batch sizes up to max_batch_size
-            cg_bs.update(range(1, min(128, self.max_batch_size) + 1, 16))
-            cg_bs.update(range(128, self.max_batch_size + 1, 128))
-        else:
-            cg_bs = [b for b in self.cuda_graph_batch_sizes if b <= self.max_batch_size]
-        self.cuda_graph_batch_sizes = sorted(cg_bs, reverse=True)
-        ad_logger.info(f"Using cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}")
+    def max_batch_size_must_be_at_least_that_of_cuda_graph_config(self):
+        """If provided, the top-level `max_batch_size` must be at least that of cuda graph config."""
+        if (
+            self.cuda_graph_config is not None
+            and (cg_mbs := self.cuda_graph_config.max_batch_size)
+            and "compile_model" in self.transforms
+        ):
+            if self.max_batch_size < cg_mbs:
+                raise ValueError(
+                    f"The top-level `max_batch_size` ({self.max_batch_size}) must be greater than "
+                    f"or equal to `cuda_graph_config.max_batch_size` ({cg_mbs})."
+                )
+        return self
 
-        # ensure that the cuda_graph_batch_sizes are updated in the shortcut and transform config
-        self.update_transforms_with_shortcuts()
+    @model_validator(mode="after")
+    def cap_max_batch_size_to_max_num_tokens(self):
+        """Ensure max_batch_size does not exceed max_num_tokens.
+
+        Since each sequence uses at least one token slot, max_batch_size cannot
+        exceed max_num_tokens. When only max_num_tokens is explicitly set, we
+        silently cap max_batch_size and warn. When both are explicitly set and
+        incompatible, we raise an error.
+        """
+        if self.max_num_tokens is not None and self.max_batch_size > self.max_num_tokens:
+            both_explicit = (
+                "max_batch_size" in self.model_fields_set
+                and "max_num_tokens" in self.model_fields_set
+            )
+            if both_explicit:
+                raise ValueError(
+                    f"max_batch_size ({self.max_batch_size}) cannot exceed "
+                    f"max_num_tokens ({self.max_num_tokens}). Each sequence "
+                    f"consumes at least one token slot."
+                )
+            ad_logger.warning(
+                f"max_batch_size ({self.max_batch_size}) exceeds max_num_tokens "
+                f"({self.max_num_tokens}). Capping max_batch_size to "
+                f"{self.max_num_tokens}."
+            )
+            self.max_batch_size = self.max_num_tokens
         return self
 
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:
-        """Create a model factory from the arguments."""
+        """Create a model factory from the arguments.
+
+        Side effects:
+            This method resolves `max_seq_len` when it has not been explicitly set by the user.
+            The value is inferred from the model configuration via the factory and written back to
+            `self.max_seq_len` so that all downstream consumers see the same value.
+        """
 
         # TODO (lucaslie): consider supporting Path objects in the model factory
-        return ModelFactoryRegistry.get(self.model_factory)(
+        factory = ModelFactoryRegistry.get(self.model_factory)(
             model=str(self.model),
             model_kwargs=self.model_kwargs,
             tokenizer=None if self.tokenizer is None else str(self.tokenizer),
@@ -366,6 +364,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             speculative_config=self.speculative_config,
             speculative_model_kwargs=self.speculative_model_kwargs or None,
         )
+
+        # The factory handles the logic internally for getting the `max_seq_len` if not provided
+        # by the user.
+        self.max_seq_len = factory.max_seq_len
+
+        return factory
 
     def is_cuda_graph_enabled(self) -> bool:
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]

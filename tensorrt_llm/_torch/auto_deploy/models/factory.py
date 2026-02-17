@@ -120,7 +120,7 @@ class ModelFactory(ABC):
         tokenizer: Optional[str] = None,
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         skip_loading_weights: bool = False,
-        max_seq_len: int = 512,
+        max_seq_len: Optional[int] = None,
         **kwargs,
     ):
         self._model = model
@@ -128,7 +128,7 @@ class ModelFactory(ABC):
         self._tokenizer = tokenizer
         self.tokenizer_kwargs = copy.deepcopy(tokenizer_kwargs or {})
         self.skip_loading_weights = skip_loading_weights
-        self.max_seq_len = max_seq_len
+        self._max_seq_len = max_seq_len
         self._prefetched_model_path: Optional[str] = None
         self._prefetched_tokenizer_path: Optional[str] = None
         self._sharding_config: Dict[str, Any] = {}
@@ -143,6 +143,16 @@ class ModelFactory(ABC):
     def tokenizer(self) -> Optional[str]:
         """The tokenizer path."""
         return self._prefetched_tokenizer_path or self._tokenizer or self.model
+
+    @property
+    @abstractmethod
+    def max_seq_len(self) -> int:
+        """The maximum sequence length.
+
+        Subclasses must implement this property. When `max_seq_len` was not explicitly provided
+        at construction time, the implementation should attempt to infer the value from the model
+        configuration and raise `ValueError` if that is not possible.
+        """
 
     @property
     def vocab_size_padded(self) -> Optional[int]:

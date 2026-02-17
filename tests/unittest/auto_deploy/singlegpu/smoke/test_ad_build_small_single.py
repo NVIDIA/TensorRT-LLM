@@ -19,9 +19,16 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     assert isinstance(llm_args, LlmArgs), f"Expected LlmArgs, got {type(llm_args)}"
 
     # check that llm_args and experiment_config have the same args
+    # Exclude max_seq_len from comparison: create_factory() resolves it from the model config,
+    # so the actual llm_args will have it set while a freshly re-created LlmArgs will not.
     expected_ad_config: LlmArgs = experiment_config.args
-    expected_llm_args: LlmArgs = LlmArgs(**expected_ad_config.model_dump())
-    assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"
+    expected_dump = expected_ad_config.model_dump(exclude={"max_seq_len"})
+    expected_llm_args: LlmArgs = LlmArgs(**expected_dump)
+    actual_dump = llm_args.model_dump(exclude={"max_seq_len"})
+    actual_llm_args: LlmArgs = LlmArgs(**actual_dump)
+    assert expected_llm_args == actual_llm_args, (
+        f"Expected llm args {expected_llm_args}, got {actual_llm_args}"
+    )
 
     # check expected parallel config
     world_size = expected_ad_config.world_size
@@ -51,7 +58,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "insert_cached_attention": {"backend": "flashinfer"},
                     # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
                     # "compile_model": {"backend": "torch-opt"},
-                    "compile_model": {"backend": "torch-cudagraph"},
+                    "compile_model": {
+                        "backend": "torch-cudagraph",
+                        "cuda_graph_batch_sizes": [1, 2],
+                    },
                 },
             },
         ),
@@ -123,7 +133,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
-                    "compile_model": {"backend": "torch-opt"},
+                    "compile_model": {
+                        "backend": "torch-opt",
+                        "cuda_graph_batch_sizes": [1, 2],
+                    },
                 },
             },
         ),
@@ -168,7 +181,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
-                    "compile_model": {"backend": "torch-cudagraph"},
+                    "compile_model": {
+                        "backend": "torch-cudagraph",
+                        "cuda_graph_batch_sizes": [1, 2],
+                    },
                 },
             },
         ),
@@ -198,7 +214,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
-                    "compile_model": {"backend": "torch-cudagraph"},
+                    "compile_model": {
+                        "backend": "torch-cudagraph",
+                        "cuda_graph_batch_sizes": [1, 2],
+                    },
                 },
             },
         ),

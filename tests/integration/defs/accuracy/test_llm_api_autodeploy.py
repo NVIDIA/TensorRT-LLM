@@ -153,7 +153,9 @@ def low_memory_overrides(config,
         "max_batch_size": max_batch_size,
         "max_seq_len": max_seq_len,
         "max_num_tokens": max_num_tokens,
-        "cuda_graph_batch_sizes": cuda_graph_batch_sizes,
+        "cuda_graph_config": {
+            "batch_sizes": cuda_graph_batch_sizes
+        },
     })
     kv_cache_config = config.setdefault("kv_cache_config", {})
     kv_cache_config["free_gpu_memory_fraction"] = free_gpu_memory_fraction
@@ -656,7 +658,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "max_num_tokens": self.MAX_NUM_TOKENS,
             "skip_loading_weights": False,
             "disable_overlap_scheduler": False,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "cuda_graph_config": {
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128]
+            },
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.8

@@ -13,3 +13,4 @@ transforms:
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
     enabled: true
+max_batch_size: 8
