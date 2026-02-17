@@ -3,15 +3,18 @@ import contextlib
 import copy
 import json
 import os
-import subprocess
-from typing import Generator, List, Optional, Tuple
+import tempfile
+from typing import List
 
 import aiohttp
 import pytest
 import yaml
-from defs.common import revise_disagg_config_file_with_free_ports
+from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import skip_no_hopper
-from defs.trt_test_alternative import popen
+from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
+                               run_ctx_worker, run_disagg_server,
+                               run_gen_worker, terminate,
+                               wait_for_disagg_server_ready)
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
@@ -23,45 +26,49 @@ from tensorrt_llm.serve.router import (KvCacheAwareRouter,
                                        block_key_hasher)
 
 
-def get_ctx_gen_server_urls_from_cfg(config_file: str):
-    with open(config_file, 'r') as file:
-        config = yaml.safe_load(file)
-    ctx_servers = []
-    gen_servers = []
-    for server in config["context_servers"]["urls"]:
-        ctx_servers.append("http://" + server)
-    for server in config["generation_servers"]["urls"]:
-        gen_servers.append("http://" + server)
-    return ctx_servers, gen_servers
+def build_worker_config(base_config, server_type_config, disagg_cluster):
+    """Build worker configuration by merging base config with server-type specific config.
 
+    Args:
+        base_config: Full YAML config (top-level)
+        server_type_config: context_servers or generation_servers section
+        disagg_cluster: Service discovery config
 
-def run_disaggregated_workers(
-    config_file: str,
-    stdout=None,
-    env: Optional[dict] = None,
-    cwd: Optional[str] = None,
-    num_ranks: Optional[int] = None
-) -> Tuple[Generator[subprocess.Popen, None, None], List[str], List[str]]:
+    Returns:
+        dict: Worker configuration for trtllm-serve
+    """
+    EXCLUDE_FROM_WORKER = {
+        'hostname',
+        'port',
+        'num_instances',
+        'urls',
+        'router',
+        'model',
+        'context_servers',
+        'generation_servers',
+        'conditional_disagg_config',
+    }
 
-    config_file = revise_disagg_config_file_with_free_ports(config_file)
-    ctx_servers, gen_servers = get_ctx_gen_server_urls_from_cfg(config_file)
+    worker_config = {
+        k: v
+        for k, v in base_config.items() if k not in EXCLUDE_FROM_WORKER
+    }
 
-    # TODO: auto detect num_ranks
-    assert num_ranks is not None
+    worker_config.update({
+        k: v
+        for k, v in server_type_config.items() if k not in EXCLUDE_FROM_WORKER
+    })
 
-    # Start workers
-    workers_cmd = [
-        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
-        config_file
-    ]
-    logger.info(f"Running workers with command: {' '.join(workers_cmd)}")
-    workers_proc = popen(workers_cmd,
-                         stdout=stdout,
-                         stderr=subprocess.STDOUT,
-                         env=env,
-                         cwd=cwd)
-    return workers_proc, ctx_servers, gen_servers
+    if 'free_gpu_memory_fraction' in worker_config:
+        frac = worker_config.pop('free_gpu_memory_fraction')
+        if 'kv_cache_config' not in worker_config:
+            worker_config['kv_cache_config'] = {}
+        worker_config['kv_cache_config'].setdefault('free_gpu_memory_fraction',
+                                                    frac)
+
+    worker_config['disagg_cluster'] = disagg_cluster
+
+    return worker_config
 
 
 DEFAULT_TIMEOUT_SERVER_START = 900
@@ -512,27 +519,97 @@ def load_default_prompts(disaggregated_example_root: str):
 
 
 @contextlib.contextmanager
-def background_workers(llm_venv, config_file: str, num_ranks: int = None):
+def background_workers(llm_venv, config_file: str):
     cwd = llm_venv.get_working_directory()
     os.chdir(cwd)
-    with open(os.path.join(cwd, 'output_workers.log'), 'w+') as log_file:
-        workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
-            config_file=config_file,
-            stdout=log_file,
-            env=llm_venv._new_env,
-            cwd=cwd,
-            num_ranks=num_ranks)
-        try:
-            with workers_proc as proc:
-                yield ctx_servers, gen_servers
-        except Exception:
-            log_file.seek(0)
-            logger.error("-------- Worker output --------")
-            logger.error(log_file.read())
-            raise
-        finally:
-            proc.terminate()
-            proc.wait()
+    env = llm_venv._new_env
+
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+
+    model = config.get("model")
+    ctx_server_cfg = config.get("context_servers", {})
+    gen_server_cfg = config.get("generation_servers", {})
+    num_ctx = ctx_server_cfg.get("num_instances", 1)
+    num_gen = gen_server_cfg.get("num_instances", 1)
+
+    disagg_port = get_free_port()
+    work_dir = tempfile.mkdtemp()
+    disagg_cluster = {
+        "cluster_uri": f"http://localhost:{disagg_port}",
+        "cluster_name": "test_cluster",
+        "heartbeat_interval_sec": HEARTBEAT_INTERVAL,
+        "inactive_timeout_sec": INACTIVE_TIMEOUT,
+        "minimal_instances": {
+            "context_servers": num_ctx,
+            "generation_servers": num_gen,
+        },
+    }
+
+    ctx_worker_config = build_worker_config(config, ctx_server_cfg,
+                                            disagg_cluster)
+    gen_worker_config = build_worker_config(config, gen_server_cfg,
+                                            disagg_cluster)
+
+    gpus_per_ctx = (ctx_server_cfg.get("tensor_parallel_size", 1) *
+                    ctx_server_cfg.get("pipeline_parallel_size", 1))
+    gpus_per_gen = (gen_server_cfg.get("tensor_parallel_size", 1) *
+                    gen_server_cfg.get("pipeline_parallel_size", 1))
+
+    ctx_workers = []
+    gen_workers = []
+    ctx_urls = []
+    gen_urls = []
+    next_device = 0
+
+    for i in range(num_ctx):
+        port = get_free_port()
+        ctx_urls.append(f"http://localhost:{port}")
+        ctx_workers.append(
+            run_ctx_worker(model,
+                           ctx_worker_config,
+                           work_dir,
+                           port=port,
+                           device=next_device,
+                           env=env))
+        next_device += gpus_per_ctx
+
+    for i in range(num_gen):
+        port = get_free_port()
+        gen_urls.append(f"http://localhost:{port}")
+        gen_workers.append(
+            run_gen_worker(model,
+                           gen_worker_config,
+                           work_dir,
+                           port=port,
+                           device=next_device,
+                           env=env))
+        next_device += gpus_per_gen
+
+    server_config = {
+        "hostname": "localhost",
+        "port": disagg_port,
+        "disagg_cluster": disagg_cluster,
+        "context_servers": {
+            "router": ctx_server_cfg.get("router", {})
+        },
+        "generation_servers": {
+            "router": gen_server_cfg.get("router", {})
+        },
+    }
+    disagg_server = run_disagg_server(server_config,
+                                      work_dir,
+                                      disagg_port,
+                                      env=env)
+
+    try:
+        asyncio.run(wait_for_disagg_server_ready(disagg_port))
+        yield ctx_urls, gen_urls
+    except Exception:
+        logger.error("-------- Service discovery workers error --------")
+        raise
+    finally:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
 
 
 @pytest.mark.skip(reason="https://nvbugs/5372970")
@@ -545,8 +622,8 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     prepare_llama_model(llama_model_root, llm_venv)
 
-    with background_workers(llm_venv, config_file,
-                            2) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers):
         tester = ConditionalWorkerTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts))
@@ -569,8 +646,8 @@ def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    with background_workers(llm_venv, config_file,
-                            2) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers):
         tester = ConditionalWorkerTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts))
@@ -585,8 +662,8 @@ def test_workers_kv_cache_events(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     prepare_llama_model(llama_model_root, llm_venv)
 
-    with background_workers(llm_venv, config_file,
-                            2) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers):
         tester = KvCacheEventWorkerTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 6))
@@ -602,8 +679,8 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance.yaml')
     prepare_llama_model(llama_model_root, llm_venv)
 
-    with background_workers(llm_venv, config_file,
-                            4) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
@@ -627,8 +704,8 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    with background_workers(llm_venv, config_file,
-                            4) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers):
         tester = KvCacheAwareRouterTester(ctx_servers,
                                           gen_servers,
                                           model_name="DeepSeek-V3-Lite/bf16",
@@ -646,7 +723,7 @@ def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     prepare_llama_model(llama_model_root, llm_venv)
 
-    with background_workers(llm_venv, config_file,
-                            2) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         asyncio.run(tester.test_eviction())
