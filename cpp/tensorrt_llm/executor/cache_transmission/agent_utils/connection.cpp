@@ -179,8 +179,8 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     TLLM_CHECK(deviceId == mAgentConnectionManager->getDeviceId());
     for (size_t i = 0; i < preAllocateBuffers.size(); i++)
     {
-        bufferDescs.emplace_back(
-            reinterpret_cast<uintptr_t>(preAllocateBuffers[i]->data()), preAllocateBuffers[i]->getSize(), deviceId);
+        bufferDescs.emplace_back(reinterpret_cast<uintptr_t>(preAllocateBuffers[i]->data()),
+            preAllocateBuffers[i]->getSizeInBytes(), deviceId);
     }
     std::string address = mAgentConnectionManager->getAgent()->getLocalConnectionInfo();
     std::optional<std::string> metadataOpt = std::nullopt;

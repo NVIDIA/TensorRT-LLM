@@ -1138,6 +1138,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             "video": "<|vision_start|><|video_pad|><|vision_end|>",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        placeholders_separator="",
     ),
 )
 class Qwen3VLModel(Qwen3VLModelBase):
