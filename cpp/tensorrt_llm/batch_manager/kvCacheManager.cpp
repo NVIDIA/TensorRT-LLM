@@ -1186,8 +1186,7 @@ void WindowBlockManager::offloadBlock(
 
 SizeType32 BlockManager::countReusableBlocks(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
-    TLLM_CHECK_WITH_INFO(
-        !isVariableWindow(), "countReusableBlocks does not work for variable window attention");
+    TLLM_CHECK_WITH_INFO(!isVariableWindow(), "countReusableBlocks does not work for variable window attention");
     auto const& onlyManager = mWindowBlockManagers.cbegin()->second;
     return onlyManager.countReusableBlocks(uniqueTokens, llmRequest);
 }
@@ -2506,8 +2505,7 @@ std::optional<BlockKey> KVCacheManager::findNewContextBlock(
     return newContextBlockOpt;
 }
 
-SizeType32 KVCacheManager::countReusableBlocks(
-    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+SizeType32 KVCacheManager::countReusableBlocks(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
     return mBlockManager.countReusableBlocks(uniqueTokens, llmRequest);
 }

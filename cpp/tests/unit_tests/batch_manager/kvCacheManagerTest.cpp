@@ -5754,8 +5754,8 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
 {
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr tokensPerBlock = 16;
-    auto constexpr promptLength = 64;  // 4 full context blocks
-    auto constexpr maxNewTokens = 32;  // 2 generation blocks
+    auto constexpr promptLength = 64; // 4 full context blocks
+    auto constexpr maxNewTokens = 32; // 2 generation blocks
     auto constexpr maxBeamWidth = 1;
     auto constexpr maxAttentionWindow = 512;
     auto constexpr maxNumTokens = 1024;
@@ -5805,7 +5805,8 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     EXPECT_EQ(reusableBlocks, expectedReusableBlocks);
 
     // neededOneStep: 4 shared blocks - 3 reusable = 1
-    auto const neededOneStep = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
+    auto const neededOneStep
+        = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     auto const expectedNeededOneStep = (promptLength / tokensPerBlock) - expectedReusableBlocks;
     EXPECT_EQ(neededOneStep, expectedNeededOneStep);
 
@@ -5926,7 +5927,8 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
 
     // getNeededBlocksOneStep should account for 2 reusable blocks
     // Total needed = 4 context blocks, minus 2 reusable = 2 blocks needed
-    auto const neededOneStep = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
+    auto const neededOneStep
+        = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, 2);
 }
 
@@ -5987,9 +5989,9 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
     // So: (5 context - 4 reusable) + 3 generation = 4 blocks needed
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 4 blocks
-    auto const numContextBlocks = promptLength / tokensPerBlock; // 5 blocks
+    auto const numContextBlocks = promptLength / tokensPerBlock;             // 5 blocks
     auto const expectedRemaining = (numContextBlocks - expectedReusableBlocks) + (maxNewTokens / tokensPerBlock);
-    EXPECT_EQ(remaining, expectedRemaining); // 1 context + 3 generation = 4
+    EXPECT_EQ(remaining, expectedRemaining);                                 // 1 context + 3 generation = 4
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
@@ -6046,10 +6048,11 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
 
     // storeContextBlocks only stores (48-1)/16 = 2 full blocks
     // So: 3 shared blocks - 2 reusable = 1 block needed
-    auto const neededOneStep = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
+    auto const neededOneStep
+        = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 2 blocks
-    auto const numSharedBlocks = promptLength / tokensPerBlock; // 3 blocks
-    EXPECT_EQ(neededOneStep, numSharedBlocks - expectedReusableBlocks); // 3 - 2 = 1
+    auto const numSharedBlocks = promptLength / tokensPerBlock;              // 3 blocks
+    EXPECT_EQ(neededOneStep, numSharedBlocks - expectedReusableBlocks);      // 3 - 2 = 1
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -6106,8 +6109,8 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr tokensPerBlock = 16;
-    auto constexpr sharedPrefixLength = 32; // 2 blocks of shared prefix
-    auto constexpr uniqueSuffixLength = 32; // 2 blocks of unique suffix
+    auto constexpr sharedPrefixLength = 32;                                // 2 blocks of shared prefix
+    auto constexpr uniqueSuffixLength = 32;                                // 2 blocks of unique suffix
     auto constexpr promptLength = sharedPrefixLength + uniqueSuffixLength; // 4 total blocks
     auto constexpr maxNewTokens = 16;
     auto constexpr maxBeamWidth = 1;
@@ -6174,7 +6177,8 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
     EXPECT_EQ(reusableBlocks, sharedPrefixLength / tokensPerBlock);
 
     // neededBlocksOneStep: 4 total - 2 reusable = 2 blocks
-    auto const neededOneStep = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
+    auto const neededOneStep
+        = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, uniqueSuffixLength / tokensPerBlock);
 
     // getRemainingBlocksToCompletion: (4 context - 2 reusable) + 1 gen = 3 blocks
