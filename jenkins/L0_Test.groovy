@@ -812,7 +812,7 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     // Temporarily disable to reduce the log size
-    extraInternalEnv += " NCCL_DEBUG=INFO"
+    // extraInternalEnv += " NCCL_DEBUG=INFO"
 
     // Container port allocation environment variables for avoiding port conflicts
     def portEnvVars = ""
