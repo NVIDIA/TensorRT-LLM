@@ -28,6 +28,7 @@ import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
+import numpy as np
 import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
@@ -181,17 +182,36 @@ class InputBuffer:
         """Get the current stored length for the specified tensor."""
         return self._current_lengths[name]
 
+    # Mapping from torch dtype to numpy dtype for fast list-to-pinned-memory writes
+    _TORCH_TO_NUMPY_DTYPE = {
+        torch.int: np.int32,
+        torch.int32: np.int32,
+        torch.int64: np.int64,
+        torch.long: np.int64,
+        torch.float: np.float32,
+        torch.float32: np.float32,
+        torch.float64: np.float64,
+        torch.double: np.float64,
+        torch.float16: np.float16,
+        torch.bool: np.bool_,
+    }
+
     def store(
         self,
         name: str,
-        data: List[Number],
+        data: "Union[List[Number], torch.Tensor]",
         fill_value: Optional[Number] = None,
     ) -> int:
         """Store data into the host buffer.
 
+        Accepts either a Python list or a torch.Tensor. When a Tensor is provided, it is
+        copied directly into pinned memory (fast path, avoids torch.tensor() from list).
+        When a list is provided, numpy is used to write directly into pinned memory,
+        which is faster than torch.tensor(list) for large lists.
+
         Args:
             name: Name of the tensor to store to.
-            data: List of values to store.
+            data: List of values or a 1-D torch.Tensor to store.
             fill_value: Optional value to fill the entire tensor with before storing.
 
         Returns:
@@ -203,11 +223,18 @@ class InputBuffer:
         if fill_value is not None:
             host_view.fill_(fill_value)
 
-        length = len(data)
-        assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
-
-        temp_tensor = torch.tensor(data, dtype=dtype)
-        host_view[:length].copy_(temp_tensor)
+        if isinstance(data, torch.Tensor):
+            length = data.numel()
+            assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
+            host_view[:length].copy_(data if data.dtype == dtype else data.to(dtype))
+        else:
+            length = len(data)
+            assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
+            np_dtype = self._TORCH_TO_NUMPY_DTYPE.get(dtype)
+            if np_dtype is not None:
+                host_view[:length].numpy()[:] = np.array(data, dtype=np_dtype)
+            else:
+                host_view[:length].copy_(torch.tensor(data, dtype=dtype))
 
         self._current_lengths[name] = length
         return length
@@ -661,8 +688,12 @@ class SequenceInfo:
             # Resize all truncatable page tensors together (they share the same max size)
             for tensor_name in ("cache_loc", "page_seq_indices", "page_in_seq"):
                 self._input_buffer.resize(tensor_name, estimated_capacity)
-                old_size = len(self._args_list[tensor_name])
-                self._args_list[tensor_name].extend([0] * (estimated_capacity - old_size))
+                current = self._args_list[tensor_name]
+                if isinstance(current, list):
+                    old_size = len(current)
+                    current.extend([0] * (estimated_capacity - old_size))
+                else:
+                    self._args_list[tensor_name] = [0] * estimated_capacity
 
     @staticmethod
     def _get_page_assignments(
@@ -824,7 +855,7 @@ class SequenceInfo:
     def _store_arg(
         self,
         name: str,
-        tnsr_like: List[Number],
+        tnsr_like: "Union[List[Number], torch.Tensor]",
         reset_val: Optional[Number] = None,
     ) -> None:
         """Store the argument into the pinned host buffer for later batch transfer to device.
@@ -832,14 +863,22 @@ class SequenceInfo:
         The data is stored in the host-side pinned memory buffer managed by InputBuffer.
         The actual H2D transfer happens in a single batch at the end of nest_sequences().
 
+        Accepts either a Python list or a 1-D torch.Tensor. Tensor inputs use a fast path
+        that avoids the expensive torch.tensor(list) conversion in InputBuffer.store().
+
         Args:
             name: Name of the argument to store.
-            tnsr_like: List of values to store.
+            tnsr_like: List of values or a 1-D torch.Tensor to store.
             reset_val: Value to reset/fill the tensor with before writing data.
         """
         with nvtx_range(f"ad_store_on_host_seq_info_arg_{name}"):
-            # Always store list object for Python access
-            self._args_list[name] = tnsr_like.copy()
+            # Store for Python access. Tensor data is stored as-is to avoid expensive
+            # .tolist() conversion on the hot path. Properties that need lists (seq_len,
+            # input_pos, cache_loc, pages_per_seq) always receive list inputs.
+            if isinstance(tnsr_like, torch.Tensor):
+                self._args_list[name] = tnsr_like
+            else:
+                self._args_list[name] = tnsr_like.copy()
 
             # Only store to buffer when the argument is active or requires copy
             is_active = name in self._active_args or f"{name}_host" in self._active_args
@@ -981,16 +1020,22 @@ class SequenceInfo:
             self._store_arg("cache_loc", cache_loc)
             self._store_arg("pages_per_seq", pages_per_seq)
 
-            # Auto-compute page_seq_indices and page_in_seq from pages_per_seq.
+            # Auto-compute page_seq_indices and page_in_seq from pages_per_seq using
+            # vectorized torch ops. This avoids the slow Python-list-to-tensor conversion
+            # that dominates host time for large page counts (e.g., 50k ISL models).
             # page_seq_indices[j] = which sequence page j belongs to
             # page_in_seq[j] = which page within that sequence (0-indexed)
-            page_seq_indices = []
-            page_in_seq_vals = []
-            for i, n_pages in enumerate(pages_per_seq):
-                page_seq_indices.extend([i] * n_pages)
-                page_in_seq_vals.extend(range(n_pages))
-            self._store_arg("page_seq_indices", page_seq_indices)
-            self._store_arg("page_in_seq", page_in_seq_vals)
+            pages_per_seq_t = torch.tensor(pages_per_seq, dtype=torch.int)
+            seq_indices = torch.arange(len(pages_per_seq), dtype=torch.int)
+            page_seq_indices_t = torch.repeat_interleave(seq_indices, pages_per_seq_t)
+            cu_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
+            cu_pages[1:] = pages_per_seq_t.cumsum(0)
+            total_pages = cu_pages[-1].item()
+            page_in_seq_t = torch.arange(total_pages, dtype=torch.int) - torch.repeat_interleave(
+                cu_pages[:-1], pages_per_seq_t
+            )
+            self._store_arg("page_seq_indices", page_seq_indices_t)
+            self._store_arg("page_in_seq", page_in_seq_t)
 
         # update cumulative number of pages
         if cu_num_pages is None:
