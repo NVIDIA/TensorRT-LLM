@@ -37,7 +37,7 @@ from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell)
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (run_ctx_worker, run_disagg_server,
-                               run_gen_worker, terminate, verify_cluster_info,
+                               run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
@@ -89,8 +89,15 @@ def build_worker_config(base_config, server_type_config, disagg_cluster):
     """
     # Fields to exclude from worker configs (not worker execution settings)
     EXCLUDE_FROM_WORKER = {
-        'hostname', 'port', 'num_instances', 'urls', 'router', 'model',
-        'context_servers', 'generation_servers', 'conditional_disagg_config',
+        'hostname',
+        'port',
+        'num_instances',
+        'urls',
+        'router',
+        'model',
+        'context_servers',
+        'generation_servers',
+        'conditional_disagg_config',
     }
 
     # Start with top-level fields (exclude server-only)
@@ -110,8 +117,8 @@ def build_worker_config(base_config, server_type_config, disagg_cluster):
         frac = worker_config.pop('free_gpu_memory_fraction')
         if 'kv_cache_config' not in worker_config:
             worker_config['kv_cache_config'] = {}
-        worker_config['kv_cache_config'].setdefault(
-            'free_gpu_memory_fraction', frac)
+        worker_config['kv_cache_config'].setdefault('free_gpu_memory_fraction',
+                                                    frac)
 
     # Add service discovery config
     worker_config['disagg_cluster'] = disagg_cluster
@@ -125,23 +132,30 @@ def get_test_config(test_desc, example_dir, test_root):
     config_map = {
         "2_ranks_diff_max_tokens":
         f"{test_configs_root}/disagg_config_diff_max_tokens.yaml",
-        "2_ranks": f"{test_configs_root}/disagg_config.yaml",
+        "2_ranks":
+        f"{test_configs_root}/disagg_config.yaml",
         "2_ranks_trt_backend":
         f"{test_configs_root}/disagg_config_trt_backend.yaml",
-        "gen_only": f"{test_configs_root}/disagg_config_gen_only.yaml",
+        "gen_only":
+        f"{test_configs_root}/disagg_config_gen_only.yaml",
         "gen_only_trt_backend":
         f"{test_configs_root}/disagg_config_gen_only_trt_backend.yaml",
         "gen_only_bs1":
         f"{test_configs_root}/disagg_config_gen_only_bs1.yaml",
-        "4_ranks": f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
+        "4_ranks":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
         "4_ranks_trt_backend":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1_trt_backend.yaml",
         "cuda_graph":
         f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml",
-        "mixed": f"{test_configs_root}/disagg_config_mixed.yaml",
-        "overlap": f"{test_configs_root}/disagg_config_overlap.yaml",
-        "tool_calls": f"{test_configs_root}/disagg_config_overlap.yaml",
-        "perf_metrics": f"{test_configs_root}/disagg_config_metrics.yaml",
+        "mixed":
+        f"{test_configs_root}/disagg_config_mixed.yaml",
+        "overlap":
+        f"{test_configs_root}/disagg_config_overlap.yaml",
+        "tool_calls":
+        f"{test_configs_root}/disagg_config_overlap.yaml",
+        "perf_metrics":
+        f"{test_configs_root}/disagg_config_metrics.yaml",
         "trtllm_sampler":
         f"{test_configs_root}/disagg_config_trtllm_sampler.yaml",
         "load_balance":
@@ -150,7 +164,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cache_aware_balance.yaml",
         "conditional":
         f"{test_configs_root}/disagg_config_conditional.yaml",
-        "ngram": f"{test_configs_root}/disagg_config_ngram.yaml",
+        "ngram":
+        f"{test_configs_root}/disagg_config_ngram.yaml",
         "ctxpp2_genpp2":
         f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml",
         "ctxtp2_genpp2":
@@ -449,18 +464,16 @@ def setup_disagg_cluster(config_file, model_name=None, env=None):
     }
 
     # Calculate GPUs per worker instance: tp * pp * cp
-    gpus_per_ctx = (ctx_servers.get("tensor_parallel_size", 1)
-                    * ctx_servers.get("pipeline_parallel_size", 1)
-                    * ctx_servers.get("context_parallel_size", 1))
-    gpus_per_gen = (gen_servers.get("tensor_parallel_size", 1)
-                    * gen_servers.get("pipeline_parallel_size", 1)
-                    * gen_servers.get("context_parallel_size", 1))
+    gpus_per_ctx = (ctx_servers.get("tensor_parallel_size", 1) *
+                    ctx_servers.get("pipeline_parallel_size", 1) *
+                    ctx_servers.get("context_parallel_size", 1))
+    gpus_per_gen = (gen_servers.get("tensor_parallel_size", 1) *
+                    gen_servers.get("pipeline_parallel_size", 1) *
+                    gen_servers.get("context_parallel_size", 1))
 
     # Build worker configs
-    ctx_worker_config = build_worker_config(config, ctx_servers,
-                                            disagg_cluster)
-    gen_worker_config = build_worker_config(config, gen_servers,
-                                            disagg_cluster)
+    ctx_worker_config = build_worker_config(config, ctx_servers, disagg_cluster)
+    gen_worker_config = build_worker_config(config, gen_servers, disagg_cluster)
 
     # Launch workers
     model = model_name or config.get("model")
@@ -469,19 +482,19 @@ def setup_disagg_cluster(config_file, model_name=None, env=None):
     next_device = 0
 
     for i in range(num_ctx_instances):
-        device_ids = ",".join(
-            str(next_device + j) for j in range(gpus_per_ctx))
+        ",".join(str(next_device + j) for j in range(gpus_per_ctx))
         ctx_workers.append(
-            run_ctx_worker(model, ctx_worker_config, work_dir, port=0,
-                           device=0, env=env))#device_ids)) # TODO set to device_ids for multi-gpu
+            run_ctx_worker(
+                model, ctx_worker_config, work_dir, port=0, device=0,
+                env=env))  #device_ids)) # TODO set to device_ids for multi-gpu
         next_device += gpus_per_ctx
 
     for i in range(num_gen_instances):
-        device_ids = ",".join(
-            str(next_device + j) for j in range(gpus_per_gen))
+        ",".join(str(next_device + j) for j in range(gpus_per_gen))
         gen_workers.append(
-            run_gen_worker(model, gen_worker_config, work_dir, port=0,
-                           device=0, env=env))#device_ids)) # TODO set to device_ids for multi-gpu
+            run_gen_worker(
+                model, gen_worker_config, work_dir, port=0, device=0,
+                env=env))  #device_ids)) # TODO set to device_ids for multi-gpu
         next_device += gpus_per_gen
 
     # Build minimal server config and launch
@@ -489,26 +502,35 @@ def setup_disagg_cluster(config_file, model_name=None, env=None):
         "hostname": server_host,
         "port": server_port,
         "disagg_cluster": disagg_cluster,
-        "context_servers": {"router": ctx_servers.get("router", {})},
-        "generation_servers": {"router": gen_servers.get("router", {})},
-        "conditional_disagg_config": config.get("conditional_disagg_config", None),
+        "context_servers": {
+            "router": ctx_servers.get("router", {})
+        },
+        "generation_servers": {
+            "router": gen_servers.get("router", {})
+        },
+        "conditional_disagg_config": config.get("conditional_disagg_config",
+                                                None),
         "perf_metrics_max_requests": config.get("perf_metrics_max_requests", 0),
     }
-    disagg_server = run_disagg_server(server_config, work_dir, server_port, env=env)
+    disagg_server = run_disagg_server(server_config,
+                                      work_dir,
+                                      server_port,
+                                      env=env)
 
     asyncio.run(wait_for_disagg_server_ready(server_port))
 
     return config, ctx_workers, gen_workers, disagg_server, server_port, work_dir
 
 
-def run_disaggregated_test(example_dir,
-                           test_desc,
-                           num_iters=2, # TODO change back to 5 before merge
-                           env=None,
-                           cwd=None,
-                           prompt_file="prompts.json",
-                           extra_endpoints_test=None,
-                           model_path=None):
+def run_disaggregated_test(
+        example_dir,
+        test_desc,
+        num_iters=2,  # TODO change back to 5 before merge
+        env=None,
+        cwd=None,
+        prompt_file="prompts.json",
+        extra_endpoints_test=None,
+        model_path=None):
     """Run disaggregated test using service discovery instead of MPI."""
 
     config_file = get_test_config(test_desc, example_dir,
@@ -838,7 +860,8 @@ def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
-                                   disaggregated_example_root, llama_model_root):
+                                   disaggregated_example_root,
+                                   llama_model_root):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
@@ -1029,7 +1052,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ucx",
                            env=env,
@@ -1050,7 +1073,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
@@ -1070,7 +1093,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
@@ -1398,6 +1421,9 @@ def run_disaggregated_aiperf(config_file,
                              cwd=None):
     """Run disaggregated test with genai-perf for performance/stress testing."""
     cleanup_output_files()
+    run_env = env.copy()
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file)
@@ -1654,8 +1680,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
     setup_model_symlink(llm_venv, benchmark_model_root, "DeepSeek-V3-Lite/bf16")
 
     test_desc = "deepseek_v3_lite_bf16_empty_batch"
-    config_file = get_test_config(test_desc,
-                                  disaggregated_example_root,
+    config_file = get_test_config(test_desc, disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
@@ -1774,8 +1799,7 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     model_dir = f"{llm_models_root()}/{model_path}"
     setup_model_symlink(llm_venv, model_dir, model_path)
 
-    config_file = get_test_config(test_desc,
-                                  disaggregated_example_root,
+    config_file = get_test_config(test_desc, disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     run_disaggregated_aiperf(config_file=config_file,
@@ -1870,6 +1894,8 @@ def run_disaggregated_cancel_test(example_dir,
                                   server_start_timeout=1200):
     """Run disaggregated test with request cancellation stress test."""
     cleanup_output_files()
+    run_env = env.copy()
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))

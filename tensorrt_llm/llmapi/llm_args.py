@@ -1183,6 +1183,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = kwargs[
                 'num_nextn_predict_layers']  # Current MTP only support linear tree
 
+        if not self.mtp_eagle_one_model:
+            logger.warning(
+                "2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing "
+                "in release 1.3. After that, the flag will be removed entirely."
+            )
+
     @classmethod
     def from_dict(cls, data: dict):
         out = cls(**data)
@@ -1487,6 +1493,12 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
         return getattr(_ContextChunkingPolicy, self.value)
 
 
+class WaitingQueuePolicy(StrEnum):
+    """Waiting queue scheduling policy for managing pending requests."""
+
+    FCFS = "fcfs"  # First-Come-First-Served
+
+
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
 class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
@@ -1524,6 +1536,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None, description="The dynamic batch config to use")
+
+    waiting_queue_policy: WaitingQueuePolicy = Field(
+        default=WaitingQueuePolicy.FCFS,
+        description="The waiting queue scheduling policy")
 
     def _to_pybind(self):
         return _SchedulerConfig(

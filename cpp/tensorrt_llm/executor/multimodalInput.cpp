@@ -21,10 +21,12 @@
 namespace tensorrt_llm::executor
 {
 MultimodalInput::MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
-    std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths)
+    std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
+    std::optional<std::vector<std::optional<std::string>>> multimodalUuids)
     : mMultimodalHashes(std::move(multimodalHashes))
     , mMultimodalPositions(std::move(multimodalPositions))
     , mMultimodalLengths(std::move(multimodalLengths))
+    , mMultimodalUuids(std::move(multimodalUuids))
 {
 }
 
@@ -41,6 +43,11 @@ std::vector<SizeType32> MultimodalInput::getMultimodalPositions() const
 std::vector<SizeType32> MultimodalInput::getMultimodalLengths() const
 {
     return mMultimodalLengths;
+}
+
+std::optional<std::vector<std::optional<std::string>>> const& MultimodalInput::getMultimodalUuids() const
+{
+    return mMultimodalUuids;
 }
 
 } // namespace tensorrt_llm::executor
