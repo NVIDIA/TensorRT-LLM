@@ -23,7 +23,7 @@ def get_1d_rotary_pos_embed(
     use_real: bool = True,
     repeat_interleave_real: bool = True,
     freqs_dtype: torch.dtype = torch.float64,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> "Tuple[torch.Tensor, torch.Tensor] | torch.Tensor":
     """Compute 1D rotary position embeddings.
 
     Args:
@@ -35,7 +35,8 @@ def get_1d_rotary_pos_embed(
         freqs_dtype: Dtype for frequency computation
 
     Returns:
-        Tuple of (cos, sin) tensors each of shape (seq_len, dim)
+        If use_real=True: Tuple of (cos, sin) tensors each of shape (seq_len, dim)
+        If use_real=False: Single complex tensor of shape (seq_len, dim/2)
     """
     assert dim % 2 == 0, f"dim must be even, got {dim}"
 
@@ -64,14 +65,12 @@ def get_1d_rotary_pos_embed(
 def apply_rotary_emb(
     x: torch.Tensor,
     freqs_cis: Tuple[torch.Tensor, torch.Tensor],
-    sequence_dim: int = 1,
 ) -> torch.Tensor:
     """Apply rotary position embeddings to input tensor.
 
     Args:
         x: Input tensor of shape (batch, seq_len, heads, dim) or (batch, seq_len, dim)
         freqs_cis: Tuple of (cos, sin) from get_1d_rotary_pos_embed or FluxPosEmbed
-        sequence_dim: Dimension containing sequence length (default: 1)
 
     Returns:
         Tensor with RoPE applied, same shape as input
@@ -143,6 +142,9 @@ class FluxPosEmbed(nn.Module):
             Tuple of (freqs_cos, freqs_sin), each of shape (seq_len, head_dim)
         """
         n_axes = ids.shape[-1]
+        assert n_axes == len(self.axes_dim), (
+            f"ids has {n_axes} axes but axes_dim has {len(self.axes_dim)} entries"
+        )
         cos_out = []
         sin_out = []
         pos = ids.float()

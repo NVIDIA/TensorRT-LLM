@@ -238,7 +238,7 @@ class FluxPipeline(BasePipeline):
 
         # Prepare timesteps with dynamic shifting (FLUX uses mu parameter)
         image_seq_len = latents.shape[1]
-        mu = self._compute_mu(image_seq_len, num_inference_steps)
+        mu = self._compute_mu(image_seq_len)
 
         # Match HF: create sigmas for non-flow mode, or None for flow mode
         use_flow_sigmas = getattr(self.scheduler.config, "use_flow_sigmas", None)
@@ -352,7 +352,7 @@ class FluxPipeline(BasePipeline):
 
         return prompt_embeds, pooled_prompt_embeds, text_ids
 
-    def _compute_mu(self, image_seq_len: int, num_steps: int) -> float:
+    def _compute_mu(self, image_seq_len: int) -> float:
         """Compute mu parameter for FLUX's dynamic timestep shifting.
 
         FLUX uses flow matching with dynamic shifting based on image resolution.
@@ -360,7 +360,6 @@ class FluxPipeline(BasePipeline):
 
         Args:
             image_seq_len: Number of latent patches (packed format)
-            num_steps: Number of denoising steps
 
         Returns:
             mu value for scheduler
@@ -472,17 +471,7 @@ class FluxPipeline(BasePipeline):
     def _decode_latents(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
         """Decode latents to image tensor."""
         # Unpack latents: (batch, seq_len, channels) -> (batch, channels, h, w)
-        batch_size = latents.shape[0]
-        num_patches = latents.shape[1]
-        channels = latents.shape[2]
-
-        # Calculate spatial dimensions
-        h = w = int(num_patches**0.5)
-        latents = latents.view(batch_size, h, w, channels)
-        latents = latents.permute(0, 3, 1, 2)  # (batch, channels, h, w)
-
-        # Unpatchify: (batch, 64, h, w) -> (batch, 16, 2h, 2w)
-        latents = self._unpatchify_latents(latents)
+        latents = self._unpack_latents(latents, height, width)
 
         # Scale latents (must include shift_factor, matching HF diffusers)
         latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
@@ -497,17 +486,3 @@ class FluxPipeline(BasePipeline):
         image = (image * 255).round().to(torch.uint8)
 
         return image[0]  # Remove batch dimension
-
-    def _unpatchify_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Convert packed latents back to spatial format.
-
-        FLUX uses 2x2 packing: (batch, 64, h, w) -> (batch, 16, 2h, 2w)
-        """
-        batch_size, num_channels, height, width = latents.shape
-
-        # 64 channels = 16 * 4 (2x2 packing)
-        latents = latents.reshape(batch_size, num_channels // 4, 2, 2, height, width)
-        latents = latents.permute(0, 1, 4, 2, 5, 3)  # (batch, 16, h, 2, w, 2)
-        latents = latents.reshape(batch_size, num_channels // 4, height * 2, width * 2)
-
-        return latents

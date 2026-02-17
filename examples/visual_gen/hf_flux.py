@@ -7,7 +7,7 @@
 import sys
 
 import torch
-from output_handler import OutputHandler, postprocess_hf_image_tensor
+from output_handler import OutputHandler
 
 from tensorrt_llm._torch.visual_gen import MediaOutput
 
@@ -61,16 +61,13 @@ def test_flux_baseline(
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
         generator=generator,
-        output_type="pt",
-        return_dict=False,
     )
 
-    # Extract image from result tuple
-    images = result[0]  # First element is images list
-    image = images[0] if isinstance(images, list) else images
+    # Extract PIL image and convert to (H, W, C) uint8 tensor
+    import numpy as np
 
-    # Post-process image tensor: (B, C, H, W) or (C, H, W) -> (H, W, C) uint8
-    image = postprocess_hf_image_tensor(image)
+    pil_image = result.images[0]
+    image = torch.from_numpy(np.array(pil_image))
 
     print("=" * 80)
     print("Generation Complete!")

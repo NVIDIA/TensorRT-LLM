@@ -31,9 +31,10 @@ SKIP_COMPONENTS = ["text_encoder", "text_encoder_2", "vae", "tokenizer", "tokeni
 
 
 def _get_flux_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
-    """Create test inputs appropriate for a FLUX transformer (FLUX.1 or FLUX.2).
+    """Create test inputs appropriate for a FLUX.1 transformer.
 
     Inspects the transformer's config to determine the correct input shapes.
+    Note: Generates 3-axis position IDs (FLUX.1 only). FLUX.2 uses 4-axis IDs.
     """
     torch.manual_seed(42)
     batch_size = 1

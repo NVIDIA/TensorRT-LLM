@@ -395,7 +395,7 @@ class Flux2Pipeline(BasePipeline):
         FLUX.2 uses 4-axis: (t, h, w, l) where text has t=h=w=0, l=position.
         Returns 2D tensor [seq_len, 4] (unbatched, like FLUX.1).
         """
-        batch_size, seq_len, _ = text_embeds.shape
+        _batch_size, seq_len, _ = text_embeds.shape
 
         l_ids = torch.arange(seq_len, device=text_embeds.device)
         text_ids = torch.stack(
