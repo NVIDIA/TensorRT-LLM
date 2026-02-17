@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """FLUX Text-to-Image generation using TensorRT-LLM Visual Generation.
 
 Supports both FLUX.1 and FLUX.2 models. The pipeline type is auto-detected
@@ -243,8 +246,8 @@ def main():
                 start_time = time.time()
 
                 output = visual_gen.generate(
+                    inputs=prompt,
                     params=VisualGenParams(
-                        prompt=prompt,
                         height=args.height,
                         width=args.width,
                         num_inference_steps=args.steps,
@@ -303,8 +306,8 @@ def main():
             start_time = time.time()
 
             output = visual_gen.generate(
+                inputs=args.prompt,
                 params=VisualGenParams(
-                    prompt=args.prompt,
                     height=args.height,
                     width=args.width,
                     num_inference_steps=args.steps,
