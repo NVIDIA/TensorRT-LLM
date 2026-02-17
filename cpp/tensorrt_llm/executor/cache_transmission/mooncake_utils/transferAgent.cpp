@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -36,8 +37,27 @@
 #include <thread>
 #include <unistd.h>
 
+using tensorrt_llm::pg_utils::get_world_pg;
+
 namespace tensorrt_llm::executor::kv_cache
 {
+
+namespace
+{
+// Helper function to get rank based on MPI availability
+int getRank()
+{
+    if (useMPI())
+    {
+        return mpi::MpiComm::world().getRank();
+    }
+    else
+    {
+        auto const& worldPg = get_world_pg();
+        return worldPg ? worldPg->getRank() : 0;
+    }
+}
+} // namespace
 
 MooncakeTransferStatus::MooncakeTransferStatus(transfer_engine_t engine, uint64_t batchId, size_t requestCount)
     : mEngine{engine}
@@ -338,7 +358,7 @@ MooncakeTransferAgent::MooncakeTransferAgent(BaseAgentConfig const& config)
     }
     else
     {
-        auto ip = common::getLocalIp(common::getEnvMooncakeInterface(), mpi::MpiComm::session().getRank());
+        auto ip = common::getLocalIp(common::getEnvMooncakeInterface(), getRank());
         if (!ip.empty())
             segmentName = ip;
     }
@@ -405,9 +425,8 @@ void MooncakeTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc c
 
 void MooncakeTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
 {
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "MooncakeTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
-        name.c_str());
+    TLLM_LOG_DEBUG(getRank(), "MooncakeTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s",
+        connectionInfo.c_str(), name.c_str());
 
     std::lock_guard<std::mutex> lock(mMutex);
     auto segmentId = openSegment(mEngine, connectionInfo.c_str());
