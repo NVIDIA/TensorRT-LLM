@@ -1491,6 +1491,13 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     int const tlength = DO_CROSS_ATTENTION
         ? params.memory_length_per_sample[batch_beam_idx] - 1
         : (params.length_per_sample ? (params.length_per_sample[batch_beam_idx] - 1) : static_cast<int>(timestep));
+    // Helix parallelism: determine if this rank is inactive and get the correct RoPE position.
+    int const batch_idx_for_helix = batch_beam_idx / params.beam_width;
+    bool const helix_inactive
+        = params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank[batch_idx_for_helix];
+    // RoPE position: use helix_position_offsets if available, otherwise default to tlength.
+    int const rope_position
+        = params.helix_position_offsets != nullptr ? params.helix_position_offsets[batch_beam_idx] : tlength;
     // When enable cyclic kv cache and one more block mode, we need to shift the index to the actual index in the
     // sequence. Otherwise, if the token is not the sink token, we need to add the bubblen length to the index.
     bool const enable_use_seq_idx_kv = kvCacheBuffer.mEnableOneMoreBlock && tlength > cyclic_kv_cache_len;
@@ -1670,12 +1677,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if (HANDLE_KV)
         {
             apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, tlength, rotary_embedding_inv_freq_cache);
+                rotary_embedding_scale, rope_position, rotary_embedding_inv_freq_cache);
         }
         else
         {
             apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale,
-                tlength, rotary_embedding_inv_freq_cache);
+                rope_position, rotary_embedding_inv_freq_cache);
         }
         break;
     }
@@ -1695,7 +1702,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts
 
         assert(half_rotary_dim % QK_VEC_SIZE == 0);
-        int position_idx = tlength;
+        int position_idx = rope_position;
         if (params.position_embedding_type == PositionEmbeddingType::kROPE_M && params.mrope_position_deltas != nullptr)
         {
             position_idx += params.mrope_position_deltas[batch_idx];
@@ -1716,7 +1723,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         constexpr int tidx_factor = (QK_VEC_SIZE > 1) ? QK_VEC_SIZE / 2 : 1;
         if (do_rotary)
         {
-            float rotary_embedding_m_scale = tlength <= params.rotary_embedding_original_max_positions
+            float rotary_embedding_m_scale = rope_position <= params.rotary_embedding_original_max_positions
                 ? params.rotary_embedding_short_m_scale
                 : params.rotary_embedding_long_m_scale;
             // The rotary cos_sin cache for the current timestep
@@ -2185,7 +2192,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Get the c_tile_id that handles the current timestep.
     int current_step_ctile_idx = kv_loop_length / timesteps_per_block;
     if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && qk_vec_idx < Dh
-        && (!MULTI_BLOCK_FLAG || c_tile == current_step_ctile_idx))
+        && (!MULTI_BLOCK_FLAG || c_tile == current_step_ctile_idx) && !helix_inactive)
     {
         // Trigger the stores to global memory.
         Qk_vec_k k_vec = *reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx]);
@@ -2462,7 +2469,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Store the values with bias back to global memory in the cache for V.
         //*reinterpret_cast<V_vec_k*>(&v_cache[params.timestep*Dh]) = v;
         // For MQA/GQA mode, write only with the first Q head of each group per KV head.
-        if ((hi == (hi_kv * qhead_per_kv)) && !DO_CROSS_ATTENTION)
+        if ((hi == (hi_kv * qhead_per_kv)) && !DO_CROSS_ATTENTION && !helix_inactive)
         {
             if (ENABLE_8BITS_KV_CACHE)
             {
