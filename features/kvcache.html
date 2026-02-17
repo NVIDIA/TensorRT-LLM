@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc3" />
+  <meta name="docsearch:version" content="1.3.0rc4" />
 
 
   </head>
@@ -580,6 +580,35 @@
 <p>KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a <code class="docutils literal notranslate"><span class="pre">cache_salt</span></code> parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users’ requests.</p>
 <p>To use cache salting, specify the <code class="docutils literal notranslate"><span class="pre">cache_salt</span></code> parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.</p>
 </section>
+<section id="multimodal-uuid-support-for-cache-identification">
+<h3>Multimodal UUID Support for Cache Identification<a class="headerlink" href="#multimodal-uuid-support-for-cache-identification" title="Link to this heading">#</a></h3>
+<p>When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.</p>
+<p>To enable deterministic cache management, you can provide custom UUID strings for your multimodal data using the <code class="docutils literal notranslate"><span class="pre">multi_modal_uuids</span></code> parameter when creating requests. When provided, these UUIDs are returned in KV cache events instead of computed content hashes, while the cache key itself is computed from <strong>both</strong> the UUID and content together for correctness.</p>
+<p><strong>Usage Example:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs</span><span class="w"> </span><span class="kn">import</span> <span class="n">TextPrompt</span>
+
+<span class="c1"># Provide custom UUIDs for your images</span>
+<span class="n">prompt</span> <span class="o">=</span> <span class="n">TextPrompt</span><span class="p">(</span>
+    <span class="n">prompt</span><span class="o">=</span><span class="s2">&quot;Describe these images.&quot;</span><span class="p">,</span>
+    <span class="n">multi_modal_data</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">image1</span><span class="p">,</span> <span class="n">image2</span><span class="p">]},</span>
+    <span class="n">multi_modal_uuids</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;image-uuid-001&quot;</span><span class="p">,</span> <span class="s2">&quot;image-uuid-002&quot;</span><span class="p">]}</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Key Features:</strong></p>
+<ul class="simple">
+<li><p><strong>Cache Correctness</strong>: When a UUID is provided, the cache key is computed from both the UUID and content together using <code class="docutils literal notranslate"><span class="pre">BLAKE3(UUID</span> <span class="pre">||</span> <span class="pre">Content)</span></code>. This ensures different content always produces different cache entries, even with the same UUID.</p></li>
+<li><p><strong>User Isolation</strong>: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.</p></li>
+<li><p><strong>Stable Event Identifiers</strong>: The original UUID string is preserved and returned in KV cache events via <code class="docutils literal notranslate"><span class="pre">get_kv_cache_events()</span></code>, enabling deterministic external cache management.</p></li>
+<li><p><strong>Partial UUID Support</strong>: You can provide UUIDs for some items and use <code class="docutils literal notranslate"><span class="pre">None</span></code> for others to fall back to content-only hashing.</p></li>
+<li><p><strong>Cross-Modality Support</strong>: Different modalities (images, videos) can each have their own UUIDs.</p></li>
+</ul>
+<p><strong>UUID Format:</strong></p>
+<ul class="simple">
+<li><p>Can be any string (e.g., “image-123”, “user-session-img-a”, database keys)</p></li>
+<li><p>Original UUID strings are preserved and returned in KV cache events</p></li>
+</ul>
+</section>
 <section id="enable-offloading-to-host-memory">
 <h3>Enable Offloading to Host Memory<a class="headerlink" href="#enable-offloading-to-host-memory" title="Link to this heading">#</a></h3>
 <p>Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property <code class="docutils literal notranslate"><span class="pre">host_cache_size</span></code> which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.</p>
@@ -664,6 +693,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-much-memory-is-allocated-to-kv-cache">How Much Memory is Allocated to KV Cache</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-disable-cross-request-reuse">Enable/Disable Cross Request Reuse</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-salting-for-secure-reuse">KV Cache Salting for Secure Reuse</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-uuid-support-for-cache-identification">Multimodal UUID Support for Cache Identification</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-offloading-to-host-memory">Enable Offloading to Host Memory</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#partial-reuse">Partial Reuse</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-window-size">Attention Window Size</a></li>
@@ -761,9 +791,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 08, 2026.</p>
+  <p>Last updated on February 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b464c75">b464c75</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4">26901e4</a>.</p>
   
 </div></div>
       
