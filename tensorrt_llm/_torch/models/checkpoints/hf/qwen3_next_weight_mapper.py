@@ -56,6 +56,7 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
         config = self.config.pretrained_config
         tp_size = self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
+        mtp_layer_offset = config.num_hidden_layers
 
         # linear_num_value_heads = config.linear_num_value_heads
         # linear_num_key_heads = config.linear_num_key_heads
@@ -64,9 +65,27 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
         linear_key_dim = config.linear_key_head_dim * config.linear_num_key_heads  # 16 * 128
         linear_value_dim = config.linear_value_head_dim * config.linear_num_value_heads  # 32 * 128
 
+        mtp_mapping = {
+            "mtp.fc": "fc",
+            "mtp.norm": "shared_head.norm",
+            "mtp.pre_fc_norm_embedding": "pre_fc_norm_embedding",
+            "mtp.pre_fc_norm_hidden": "pre_fc_norm_hidden",
+        }
+
         new_weights = {}
         for name, _ in weights.items():
             key = name
+
+            if key.startswith("mtp.layers."):
+                _, _, mtp_layer_idx, module_name = key.split(".", 3)
+                key = (f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}."
+                       f"{module_name}")
+            elif key.startswith("mtp."):
+                for mtp_prefix, trtllm_name in mtp_mapping.items():
+                    if key.startswith(mtp_prefix):
+                        suffix = key[len(mtp_prefix):]
+                        key = f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}"
+                        break
 
             if "A_log" in key:
                 w = split(weights[name], tp_size, tp_rank)
@@ -101,5 +120,22 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
                 new_weights[key] = w
             else:
                 new_weights[key] = weights[name]
+
+        if (self.config.spec_config is not None
+                and self.config.spec_config.spec_dec_mode.is_mtp_one_model()):
+            model_nextn = self.config.spec_config.num_nextn_predict_layers
+            ckpt_nextn = getattr(config, "num_nextn_predict_layers", 0)
+            if ckpt_nextn > 0 and model_nextn > ckpt_nextn:
+                for model_mtp_rel_idx in range(ckpt_nextn, model_nextn):
+                    ckpt_mtp_rel_idx = model_mtp_rel_idx % ckpt_nextn
+                    src_prefix = (f"model.layers."
+                                  f"{mtp_layer_offset + ckpt_mtp_rel_idx}.")
+                    dst_prefix = (f"model.layers."
+                                  f"{mtp_layer_offset + model_mtp_rel_idx}.")
+                    for key, val in list(new_weights.items()):
+                        if key.startswith(src_prefix):
+                            dst_key = f"{dst_prefix}{key[len(src_prefix):]}"
+                            if dst_key not in new_weights:
+                                new_weights[dst_key] = val
 
         return new_weights
