@@ -966,23 +966,6 @@ class SequenceInfo:
             self._store_arg("cache_loc", cache_loc)
             self._store_arg("pages_per_seq", pages_per_seq)
 
-            # Auto-compute page_seq_indices and page_in_seq from pages_per_seq using
-            # vectorized torch ops. This avoids the slow Python-list-to-tensor conversion
-            # that dominates host time for large page counts (e.g., 50k ISL models).
-            # page_seq_indices[j] = which sequence page j belongs to
-            # page_in_seq[j] = which page within that sequence (0-indexed)
-            pages_per_seq_t = torch.tensor(pages_per_seq, dtype=torch.int)
-            seq_indices = torch.arange(len(pages_per_seq), dtype=torch.int)
-            page_seq_indices_t = torch.repeat_interleave(seq_indices, pages_per_seq_t)
-            cu_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
-            cu_pages[1:] = pages_per_seq_t.cumsum(0)
-            total_pages = cu_pages[-1].item()
-            page_in_seq_t = torch.arange(total_pages, dtype=torch.int) - torch.repeat_interleave(
-                cu_pages[:-1], pages_per_seq_t
-            )
-            self._store_arg("page_seq_indices", page_seq_indices_t)
-            self._store_arg("page_in_seq", page_in_seq_t)
-
         # update cumulative number of pages
         if cu_num_pages is None:
             pages_per_seq = self.pages_per_seq
