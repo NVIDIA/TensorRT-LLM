@@ -497,7 +497,7 @@ window.addEventListener("load", load);</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +510,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc3" />
+  <meta name="docsearch:version" content="1.3.0rc4" />
 
 
   </head>
@@ -1132,7 +1132,7 @@ window.addEventListener("load", load);</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">id</span> <span class="o">=</span> <span class="nb">id</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span> <span class="o">=</span> <span class="n">sampling_params</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">postproc_params</span> <span class="o">=</span> <span class="n">postproc_params</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="c1"># Average decoded tokens per runtime iteration; set when the first LLM response arrives.</span>
@@ -1158,7 +1158,6 @@ window.addEventListener("load", load);</script>
             <span class="n">CompletionOutput</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">best_of</span><span class="p">)</span>
         <span class="p">]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_mm_embedding_handle</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">background_error_handler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1196,9 +1195,9 @@ window.addEventListener("load", load);</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span>
 
     <span class="nd">@property</span>
-    <span class="c1"># TODO: Keep this property only for backward compatibility. In the future, access multimodal embedding handles from disaggregated_params instead.</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">mm_embedding_handle</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_mm_embedding_handle</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">disaggregated_params</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Returns the disaggregated params.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_handle_sequence</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                          <span class="n">finish_reasons</span><span class="p">,</span>
@@ -1382,7 +1381,7 @@ window.addEventListener("load", load);</script>
                 <span class="c1"># Use `replace` to preserve things like `mrope_position_ids_handle` and</span>
                 <span class="c1"># `mrope_position_deltas_handle`. However, explicitly set</span>
                 <span class="c1"># `multimodal_embedding_handles=None` since they should no longer be needed.</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="o">=</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
                     <span class="n">existing_disagg_params</span> <span class="ow">or</span> <span class="n">DisaggregatedParams</span><span class="p">(),</span>
                     <span class="n">request_type</span><span class="o">=</span><span class="s2">&quot;context_only&quot;</span><span class="p">,</span>
                     <span class="n">first_gen_tokens</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">first_gen_tokens</span><span class="p">,</span>
@@ -1409,19 +1408,16 @@ window.addEventListener("load", load);</script>
             <span class="k">if</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_logits</span>
 
-            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;mm_embedding_handle&#39;</span>
-                       <span class="p">)</span> <span class="ow">and</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_mm_embedding_handle</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_embedding_handles</span> <span class="o">=</span> <span class="p">[</span>
-                        <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
-                    <span class="p">],</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_hashes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_multimodal_hashes</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s2">&quot;mm_embedding_handles&quot;</span>
+                       <span class="p">)</span> <span class="ow">and</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handles</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="c1"># mm_embedding_handles is a list of handles (one per multimodal item).</span>
+                <span class="n">mm_embedding_handles</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handles</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="o">.</span><span class="n">multimodal_embedding_handles</span> <span class="o">=</span> <span class="n">mm_embedding_handles</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="o">.</span><span class="n">multimodal_hashes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_multimodal_hashes</span>
                 <span class="k">else</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">DisaggregatedParams</span><span class="p">(</span>
-                        <span class="n">multimodal_embedding_handles</span><span class="o">=</span><span class="p">[</span>
-                            <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
-                        <span class="p">],</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="o">=</span> <span class="n">DisaggregatedParams</span><span class="p">(</span>
+                        <span class="n">multimodal_embedding_handles</span><span class="o">=</span><span class="n">mm_embedding_handles</span><span class="p">,</span>
                         <span class="n">multimodal_hashes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_multimodal_hashes</span><span class="p">)</span>
 
             <span class="c1"># Handle mrope handles for both:</span>
@@ -1430,9 +1426,9 @@ window.addEventListener("load", load);</script>
             <span class="c1">#    were already computed in encode phase, but mrope still needs forwarding)</span>
             <span class="k">if</span> <span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s2">&quot;mrope_position_ids_handle&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
                     <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_ids_handle</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_ids_handle</span> <span class="o">=</span> <span class="p">(</span>
                     <span class="n">response_result</span><span class="o">.</span><span class="n">mrope_position_ids_handle</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_deltas_handle</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_deltas_handle</span> <span class="o">=</span> <span class="p">(</span>
                     <span class="n">response_result</span><span class="o">.</span><span class="n">mrope_position_deltas_handle</span><span class="p">)</span>
 
             <span class="c1"># Processing background errors here ASAF during generation.</span>
@@ -1678,7 +1674,7 @@ window.addEventListener("load", load);</script>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span> <span class="o">=</span> <span class="n">generation_request</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_streaming</span> <span class="o">=</span> <span class="n">generation_request</span><span class="o">.</span><span class="n">streaming</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">disaggregated_params</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="o">=</span> <span class="n">disaggregated_params</span>
         <span class="c1"># minimal sampling params needed for logprob calculation</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_logprob_params</span> <span class="o">=</span> <span class="n">logprob_params</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">trace_headers</span> <span class="o">=</span> <span class="n">generation_request</span><span class="o">.</span><span class="n">trace_headers</span>
@@ -1799,7 +1795,7 @@ window.addEventListener("load", load);</script>
             <span class="s1">&#39;outputs&#39;</span><span class="p">,</span>
             <span class="s1">&#39;finished&#39;</span><span class="p">,</span>
             <span class="s2">&quot;context_logits&quot;</span><span class="p">,</span>
-            <span class="s2">&quot;mm_embedding_handle&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;disaggregated_params&quot;</span><span class="p">,</span>
         <span class="p">]</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -2086,9 +2082,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 08, 2026.</p>
+  <p>Last updated on February 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b464c75">b464c75</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4">26901e4</a>.</p>
   
 </div></div>
       
