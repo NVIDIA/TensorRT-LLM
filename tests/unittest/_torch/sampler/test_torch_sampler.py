@@ -15,25 +15,14 @@
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import product
-from typing import (
-    Callable,
-    ContextManager,
-    Final,
-    Generator,
-    Optional,
-    Protocol,
-    Type,
-    TypeVar,
-    Union,
-    cast,
-)
+from typing import Callable, ContextManager, Final, Generator, Optional, Type, TypeVar, Union, cast
 
 import flashinfer.sampling
 import numpy as np
 import pytest
 import torch
 from scipy.stats import power_divergence
-from utils.util import assert_no_cuda_sync, force_ampere
+from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
 from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
 from tensorrt_llm._torch.pyexecutor.sampler import (
@@ -363,53 +352,6 @@ class TestStrategySelection:
         assert torch_sampler.should_provide_draft_probs(request) == (not is_greedy)
 
 
-class UutProvider(Protocol):
-    def __call__(self, is_warmup: bool) -> ContextManager[Callable[[], None]]: ...
-
-
-def _run_test_with_warmup(
-    uut_provider: UutProvider,
-    warmup_sizes_bytes: tuple[int] = (4 * 2**30,),
-    *,
-    max_sync_s: Optional[float],
-):
-    """Run UUT including setup and warmup.
-
-    This is mainly used to check that the UUT does not CUDA device sync. Thus,
-    given that PyTorch's caching memory allocator can device sync when it runs
-    out of cached GPU memory segments, the warmup allocates some GPU memory.
-
-    The warmup also runs the test once. This avoids issues with things like lazy loading
-    of device code. The UUT provider can use the 'is_warmup' argument to adapt its
-    behavior to the warmup and final test runs.
-
-    If max_sync_s is provided, this helper checks that the UUT does not device sync,
-    assuming that the sync (CPU) part of the code takes no longer than max_sync_s
-    seconds to complete.
-
-    It is the user's responsibility to ensure that the amount of submitted work
-    does not exceed the CUDA driver/device queue capacity, which would make
-    the execution appear synchronous.
-    """
-    with torch.cuda.Stream():
-        with uut_provider(is_warmup=True) as uut:
-            bufs = []
-            for warmup_size in warmup_sizes_bytes:
-                bufs.append(
-                    torch.ones(warmup_size, device=torch.cuda.current_device(), dtype=torch.int8)
-                )
-            del bufs
-            uut()
-
-        with uut_provider(is_warmup=False) as uut:
-            with (
-                assert_no_cuda_sync(sync_timeout_s=max_sync_s)
-                if max_sync_s is not None
-                else nullcontext()
-            ):
-                uut()
-
-
 @force_ampere
 @pytest.mark.parametrize(
     "draft_len, with_ctx, with_gen",
@@ -630,7 +572,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         torch.testing.assert_close(res.result.req_offsets.to("cpu"), expected_req_offsets)
         torch.testing.assert_close(res.result.selected_logits.to("cpu"), expected_logits)
 
-    _run_test_with_warmup(_test_runner, max_sync_s=0.3)
+    run_test_with_warmup(_test_runner, max_sync_s=0.3)
 
 
 class TestFinishReasons:
@@ -852,7 +794,7 @@ class TestFinishReasons:
             ]
         )
 
-        _run_test_with_warmup(uut_provider, max_sync_s=0.5)
+        run_test_with_warmup(uut_provider, max_sync_s=0.5)
 
     @classmethod
     def test_are_stop_words_isnt_called_when_no_stop_words(cls, monkeypatch: pytest.MonkeyPatch):
@@ -879,13 +821,13 @@ class TestFinishReasons:
             ],
             extra_context=lambda: raising_stop_words_ctx(True),
         )
-        _run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
 
         uut_provider_without_stop_words = cls.RequestCase.build(
             [cls.RequestCase(prompt=[1], new_tokens=[4], finish_reasons=[cls.NOT_FINISHED])],
             extra_context=lambda: raising_stop_words_ctx(False),
         )
-        _run_test_with_warmup(uut_provider_without_stop_words, max_sync_s=0.5)
+        run_test_with_warmup(uut_provider_without_stop_words, max_sync_s=0.5)
 
 
 class TestBatchedSampling:
@@ -1532,7 +1474,7 @@ class TestBatchedSampling:
 
                 logit_offset += steps
 
-        _run_test_with_warmup(
+        run_test_with_warmup(
             _uut_provider,
             max_sync_s=None,  # NB: assert_no_cuda_sync called in TestBatchedSampler._sample
         )
@@ -2247,7 +2189,7 @@ class TestBatchedSampling:
                         num_samples=num_samples,
                     )
 
-        _run_test_with_warmup(
+        run_test_with_warmup(
             _uut_provider,
             max_sync_s=None,  # NB: assert_no_cuda_sync called in TestBatchedSampler._sample
         )
@@ -2443,4 +2385,4 @@ class TestBatchedSampling:
                 torch.testing.assert_close(new_tokens_host[:steps, seq_slot], req_tokens.cpu())
                 input_offset += steps
 
-        _run_test_with_warmup(_uut_provider, max_sync_s=0.2)
+        run_test_with_warmup(_uut_provider, max_sync_s=0.2)

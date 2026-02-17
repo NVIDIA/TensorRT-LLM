@@ -4,6 +4,9 @@ import pytest
 import torch
 from _custom_op_utils import torch_rope_reference
 
+# Import after we've imported torch (to ensure custom ops are registered)
+from tensorrt_llm._torch.auto_deploy.custom_ops.rope import triton_rope  # noqa: F401
+
 
 def _precompute_freqs_cis(
     seq_len: int, head_dim: int, rope_theta: Optional[float] = None
