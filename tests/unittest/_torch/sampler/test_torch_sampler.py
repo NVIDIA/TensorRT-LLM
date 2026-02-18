@@ -669,7 +669,11 @@ class TestFinishReasons:
                 ).T
                 sampler.store.new_tokens[:, seq_slots_device, cls.BEAM] = new_tokens
                 num_accepted_tokens, stop_word_indices, single_token_stop_words_only = (
-                    sampler._prepare_stop_word_handling_for_finish_reasons(seq_slots_host)
+                    sampler._prepare_stop_word_handling_for_finish_reasons(
+                        seq_slots_host,
+                        torch.zeros(len(requests), dtype=torch.bool),
+                        torch.zeros((0,), dtype=torch.bool),
+                    )
                 )
 
                 def _uut():
@@ -1324,19 +1328,12 @@ class TestBatchedSampling:
         use_flashinfer: bool,
         max_draft_len: int,
         seq_slot_assignment: tuple[list[int], int],
-        monkeypatch: pytest.MonkeyPatch,
     ) -> TorchSampler:
-        # Patch the sampler to setup every context request.
-        def always_true(*args, **kwargs) -> bool:
-            return True
-
-        with monkeypatch.context() as patch_ctx:
-            patch_ctx.setattr(TorchSampler, "_is_new_request", always_true)
-            return self._build_sampler(
-                use_flashinfer=use_flashinfer,
-                max_draft_len=max_draft_len,
-                seq_slot_assignment=seq_slot_assignment,
-            )
+        return self._build_sampler(
+            use_flashinfer=use_flashinfer,
+            max_draft_len=max_draft_len,
+            seq_slot_assignment=seq_slot_assignment,
+        )
 
     def _build_sampler(
         self,
@@ -1367,12 +1364,14 @@ class TestBatchedSampling:
         num_repeats: Optional[int] = None,
         allow_sync: bool = True,
         monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> torch.Tensor:
         """Call sample_async.
 
         Optionally, run sampling repeatedly, e.g., to gather statistics.
         """
         assert not scheduled_requests.context_requests
+
         num_actual_repeats = num_repeats if num_repeats is not None else 1
 
         T = TypeVar("T")
