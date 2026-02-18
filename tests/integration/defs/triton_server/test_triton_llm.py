@@ -3735,6 +3735,93 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
             output = venv_check_output(llm_backend_venv, run_cmd)
 
 
+def test_llmapi_backend_multi_instance(llm_backend_inflight_batcher_llm_root,
+                                       llm_backend_venv,
+                                       llm_backend_dataset_root,
+                                       tiny_llama_model_root):
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
+
+    # Prepare model repo
+    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
+    prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo)
+
+    # Modify model.yaml
+    model_config_path = os.path.join(new_model_repo, "tensorrt_llm", "1",
+                                     "model.yaml")
+    with open(model_config_path, "r") as f:
+        model_config = yaml.safe_load(f)
+    model_config["triton_config"]["decoupled"] = True
+    model_config["triton_config"]["max_batch_size"] = 0
+    model_config["tensor_parallel_size"] = 1
+    # Low KV cache to ensure both instances fit on GPU 0
+    model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.3}
+    model_config["model"] = tiny_llama_model_root
+    with open(model_config_path, "w") as f:
+        yaml.dump(model_config, f)
+
+    # Modify config.pbtxt for 2 instances on GPU 0
+    config_pbtxt_path = os.path.join(new_model_repo, "tensorrt_llm",
+                                     "config.pbtxt")
+    with open(config_pbtxt_path, "r") as f:
+        config_content = f.read()
+    # Replace instance_group to have 2 instances
+    original_instance_group = "instance_group [\n  {\n    count: 1\n    kind : KIND_CPU\n  }\n]"
+    assert original_instance_group in config_content, (
+        f"Expected instance_group block not found in config.pbtxt. "
+        f"The config.pbtxt format may have changed. Content:\n{config_content[:500]}"
+    )
+    config_content = config_content.replace(
+        original_instance_group,
+        "instance_group [\n  {\n    count: 2\n    kind : KIND_CPU\n  }\n]\n\nparameters {\n  key: \"gpu_device_ids\"\n  value: { string_value: \"0;0\" }\n}"
+    )
+    with open(config_pbtxt_path, "w") as f:
+        f.write(config_content)
+
+    with open(model_config_path, "r") as f:
+        model_config = yaml.safe_load(f)
+    print_info(f"DEBUG:: model_config: {model_config}")
+    with open(config_pbtxt_path, "r") as f:
+        print_info(f"DEBUG:: config.pbtxt:\n{f.read()}")
+
+    # Launch Triton Server with --no-mpi (required for multi-instance)
+    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
+                                    "launch_triton_server.py")
+    cmd = f"python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo} --no-mpi"
+    print_info(f"DEBUG:: launch_server with args: {cmd}")
+    check_call(cmd, shell=True)
+    check_server_ready()
+
+    # Test with grpc protocol and streaming (decoupled mode)
+    protocol = "grpc"
+
+    # Run end_to_end_test
+    run_cmd = [
+        f"{llm_backend_inflight_batcher_llm_root}/end_to_end_test.py",
+        f"--protocol={protocol}",
+        "--test-llmapi",
+        "--model-name=tensorrt_llm",
+        "--max-input-len=192",
+        f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
+        "--streaming",
+    ]
+    print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
+    venv_check_call(llm_backend_venv, run_cmd)
+
+    # Run benchmark_core_model
+    run_cmd = [
+        f"{llm_backend_inflight_batcher_llm_root}/benchmark_core_model.py",
+        "--max-input-len=300",
+        "--tensorrt-llm-model-name=tensorrt_llm",
+        f"--protocol={protocol}",
+        "--test-llmapi",
+        "dataset",
+        f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
+        f"--tokenizer-dir={tiny_llama_model_root}",
+    ]
+    print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
+    venv_check_call(llm_backend_venv, run_cmd)
+
+
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
 @pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
 @pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
