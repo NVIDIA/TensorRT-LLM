@@ -1852,7 +1852,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 tokens[beam_idx][len(tokens[beam_idx]) - max_len :], device="cpu", dtype=torch.int32
             )
         return past_tokens.to("cuda", non_blocking=True)
- 
+
     @staticmethod
     def _is_new_request(request: LlmRequest) -> bool:
         return (
@@ -1969,6 +1969,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             past_tokens_cuda.permute(1, 0, 2)
         )
 
+    @classmethod
+    def _filter_new_requests(cls, scheduled_requests: ScheduledRequests) -> Iterable[LlmRequest]:
+        return (
+            request
+            for request in scheduled_requests.context_requests
+            if cls._is_new_request(request)
+        )
+
     @override
     def validate_request(self, request: LlmRequest) -> None:
         if self._use_beam_search:
@@ -1990,7 +1998,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Args:
             requests: list[LlmRequest]. The requests to setup the sampler step for
         """
-        requests = scheduled_requests.context_requests
         seq_slots: list[int] = []
         stop_word_seq_slots: list[int] = []
         max_lens: list[int] = []
@@ -2704,9 +2711,24 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             log_probs_store.topk_indices.resize_(self.TOPK_LOGPROBS_SHAPE)
 
     def _prepare_stop_word_handling_for_finish_reasons(
-        self, seq_slots_host: torch.Tensor
+        self,
+        seq_slots_host: torch.Tensor,
+        is_draft_mask: torch.Tensor,
+        is_last_context_chunk: torch.Tensor,
     ) -> tuple[torch.Tensor | int | None, torch.Tensor | None, bool]:
+        """Prepare stop word handling for finish reasons.
+
+        Args:
+            seq_slots_host: The sequence slots of the processed requests. Used to determine where to
+            read and write from the finish_reasons and new_tokens buffers. Shape: (len(requests),)
+            is_draft_mask: A mask of requests that are drafts. Shape: (len(requests),)
+            is_last_context_chunk: A mask of context requests that are the last context chunk.
+            Shape: (len(context_requests),)
+        """
+        # Filter all requests, that have stop words
         stop_word_mask = self.store.max_stop_word_lengths[seq_slots_host] > 0
+        stop_word_mask &= ~is_draft_mask
+        stop_word_mask[: is_last_context_chunk.shape[0]] &= is_last_context_chunk
         batch_has_stop_words = stop_word_mask.any()
         num_accepted_tokens: torch.Tensor | int | None = None
         stop_word_indices: torch.Tensor | None = None
@@ -2760,8 +2782,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # Prepare stop word handling
+        # Draft requests need to be ignored for stop word handling as they never setup
+        # their buffers in the store.
+        is_draft_mask = torch.tensor([r.py_is_draft for r in requests], dtype=torch.bool)
+        is_last_context_chunk = torch.tensor(
+            [r.is_last_context_chunk for r in scheduled_requests.context_requests], dtype=torch.bool
+        )
         num_accepted_tokens, stop_word_indices, single_token_stop_words_only = (
-            self._prepare_stop_word_handling_for_finish_reasons(seq_slots_host)
+            self._prepare_stop_word_handling_for_finish_reasons(
+                seq_slots_host, is_draft_mask, is_last_context_chunk
+            )
         )
         new_tokens_host = self._process_requests(
             scheduled_requests,
