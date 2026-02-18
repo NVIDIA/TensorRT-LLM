@@ -136,8 +136,7 @@ class CudaGraphConfig(StrictBaseModel):
                     "max_batch_size must equal max(batch_sizes).\n"
                     f"CudaGraphConfig.batch_sizes: {self.batch_sizes}, "
                     f"max(batch_sizes): {derived_max}, "
-                    f"CudaGraphConfig.max_batch_size: {self.max_batch_size}"
-                )
+                    f"CudaGraphConfig.max_batch_size: {self.max_batch_size}")
         else:
             max_batch_size = self.max_batch_size or 128
             generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(

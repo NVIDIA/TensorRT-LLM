@@ -1,5 +1,3 @@
-# fmt: off
-# isort: off
 import tempfile
 from dataclasses import is_dataclass
 from enum import Enum
@@ -9,32 +7,37 @@ from typing import Annotated, Any, Literal, get_args, get_origin
 import pydantic_core
 import pytest
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from utils.llm_data import llm_models_root
-from pydantic import BaseModel, TypeAdapter
 
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy.llm_args import \
+    LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
-from tensorrt_llm._torch.auto_deploy.llm_args import \
-    LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, CalibConfig, ContextChunkingPolicy, CudaGraphConfig,
-    DecodingBaseConfig, DynamicBatchConfig, Eagle3DecodingConfig,
-    EagleDecodingConfig, ExtendedRuntimePerfKnobConfig, KvCacheConfig,
-    LookaheadDecodingConfig, MoeConfig, PeftCacheConfig, PybindMirror,
-    StrictBaseModel, TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-    update_llm_args_with_extra_dict)
-from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
-# isort: on
+# fmt: off
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, CalibConfig,
+                                          ContextChunkingPolicy,
+                                          CudaGraphConfig, DecodingBaseConfig,
+                                          DynamicBatchConfig,
+                                          Eagle3DecodingConfig,
+                                          EagleDecodingConfig,
+                                          ExtendedRuntimePerfKnobConfig,
+                                          KvCacheConfig,
+                                          LookaheadDecodingConfig, MoeConfig,
+                                          PeftCacheConfig, PybindMirror,
+                                          StrictBaseModel, TorchCompileConfig,
+                                          TorchLlmArgs, TrtLlmArgs,
+                                          update_llm_args_with_extra_dict)
 # fmt: on
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from tensorrt_llm.plugin import PluginConfig
