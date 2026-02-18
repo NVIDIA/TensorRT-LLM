@@ -28,6 +28,8 @@ Key Features:
 - LoRA and prompt tuning support
 - Disaggregated inference support
 
+Proto definitions are provided by the smg-grpc-proto package (pip install smg-grpc-proto).
+
 Usage:
     python -m tensorrt_llm.commands.serve /path/to/model \
         --grpc \
@@ -35,47 +37,15 @@ Usage:
         --port 50051
 """
 
-from pathlib import Path
-
-# Module directory for proto files
-GRPC_MODULE_DIR = Path(__file__).parent
-
-# Proto file path
-PROTO_FILE = GRPC_MODULE_DIR / "trtllm_service.proto"
-
-# Try to import generated protobuf modules
+# Try to import generated protobuf modules from smg-grpc-proto package
 try:
-    from . import trtllm_service_pb2, trtllm_service_pb2_grpc
+    from smg_grpc_proto.generated import trtllm_service_pb2, trtllm_service_pb2_grpc
 
     PROTOS_AVAILABLE = True
 except ImportError:
     PROTOS_AVAILABLE = False
     trtllm_service_pb2 = None
     trtllm_service_pb2_grpc = None
-
-
-def compile_protos():
-    """Compile protobuf files to generate Python modules.
-
-    Run this function if the generated *_pb2.py files are missing.
-    Alternatively, run: python tensorrt_llm/grpc/compile_protos.py
-    """
-    from .compile_protos import main as compile_main
-
-    compile_main()
-
-
-def ensure_protos_available():
-    """Ensure protobuf modules are available, compiling if necessary."""
-    global PROTOS_AVAILABLE, trtllm_service_pb2, trtllm_service_pb2_grpc
-
-    if not PROTOS_AVAILABLE:
-        raise ImportError(
-            "gRPC protobuf modules are not available. "
-            "Please generate them by running: "
-            "python tensorrt_llm/grpc/compile_protos.py"
-        )
-
 
 # Try to import request manager
 try:
@@ -104,13 +74,9 @@ except ImportError:
     TrtllmServiceServicer = None
 
 __all__ = [
-    "GRPC_MODULE_DIR",
-    "PROTO_FILE",
     "PROTOS_AVAILABLE",
     "REQUEST_MANAGER_AVAILABLE",
     "SERVICER_AVAILABLE",
-    "compile_protos",
-    "ensure_protos_available",
     "trtllm_service_pb2",
     "trtllm_service_pb2_grpc",
     "GrpcRequestManager",
