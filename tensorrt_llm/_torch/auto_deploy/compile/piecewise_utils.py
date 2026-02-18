@@ -25,6 +25,7 @@ _CACHED_ATTENTION_OPS = [
     "auto_deploy::flashinfer_attention_mha_with_cache",
     "auto_deploy::triton_attention_flattened_mha_with_cache",
     "auto_deploy::torch_cached_attention_with_cache",
+    "auto_deploy::trtllm_attention_mha_with_cache",
 ]
 
 # Cached SSM ops (Python-level branching on batch_info_host)

@@ -512,10 +512,6 @@ class TorchCudagraphCompiler(CompilerBackend):
             with CudaGraphWarmUpPhase():
                 return self.get_args_kwargs_for_compile(batch_size)
 
-        def get_mixed_args_kwargs_warmup(batch_size: int):
-            with CudaGraphWarmUpPhase():
-                return self.get_mixed_args_kwargs_for_compile(batch_size)
-
         monolithic = CapturedGraph(self.model, num_batched_inputs=self.num_batched_inputs)
         monolithic.capture_graph(get_args_kwargs_warmup, self.cuda_graph_batch_sizes)
 
@@ -529,7 +525,7 @@ class TorchCudagraphCompiler(CompilerBackend):
             piecewise.prepare()
 
             if self.get_mixed_args_kwargs_for_compile is not None and self.piecewise_num_tokens:
-                piecewise.warmup_and_capture(get_mixed_args_kwargs_warmup)
+                piecewise.warmup_and_capture(self.get_mixed_args_kwargs_for_compile)
 
         if piecewise is not None:
             return DualModeCapturedGraph(monolithic, piecewise)
