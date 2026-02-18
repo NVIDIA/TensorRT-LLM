@@ -159,6 +159,7 @@ class LLaMAConfig(PretrainedConfig):
         head_size = getattr(hf_config, "kv_channels", head_dim)
         attn_bias = getattr(hf_config, 'bias', False) or getattr(
             hf_config, 'attention_bias', False)
+        mlp_bias = getattr(hf_config, 'mlp_bias', False)
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
         rotary_base = getattr(hf_config, "rope_theta", 10000.0)
         residual_mlp = getattr(hf_config, "parallel_attn_mlp_res", False)
@@ -205,6 +206,7 @@ class LLaMAConfig(PretrainedConfig):
             hidden_act=hidden_act,
             norm_epsilon=norm_epsilon,
             attn_bias=attn_bias,
+            mlp_bias=mlp_bias,
             rotary_base=rotary_base,
             rotary_scaling=rotary_scaling,
             residual_mlp=residual_mlp,
