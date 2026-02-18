@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Integration tests: VBench dimension scores for WAN and LTX-2 (TRT-LLM vs diffusers reference)."""
+"""Integration tests: VBench dimension scores for WAN (TRT-LLM vs diffusers golden scores)."""
 
 import glob
 import json
@@ -28,6 +28,7 @@ WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
 VISUAL_GEN_OUTPUT_VIDEO = "trtllm_output.mp4"
+WAN_TRTLLM_FP8_VIDEO = "trtllm_fp8_output.mp4"
 DIFFUSERS_REFERENCE_VIDEO = "diffusers_reference.mp4"
 WAN_T2V_PROMPT = "A cute cat playing piano"
 WAN_T2V_HEIGHT = 480
@@ -53,6 +54,9 @@ VBENCH_WAN_GOLDEN_SCORES = {
     "aesthetic_quality": 0.5033,
     "imaging_quality": 0.3033,
 }
+# FP8 comparison drops dynamic_degree
+VBENCH_DIMENSIONS_FP8 = [d for d in VBENCH_DIMENSIONS if d != "dynamic_degree"]
+VBENCH_WAN_GOLDEN_SCORES_FP8 = {k: v for k, v in VBENCH_WAN_GOLDEN_SCORES.items() if k != "dynamic_degree"}
 
 
 # TODO: Reference scores from bf16 baseline runs
@@ -200,6 +204,40 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
 
 
 @pytest.fixture(scope="session")
+def wan_trtllm_fp8_video_path(llm_venv, llm_root):
+    """Generate WAN 2.1 video via visual_gen_wan_t2v.py with --linear_type trtllm-fp8-per-tensor."""
+    scratch_space = llm_models_root()
+    model_path = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
+    if not os.path.isdir(model_path):
+        pytest.skip(
+            f"Wan T2V model not found: {model_path} "
+            f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
+        )
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, WAN_TRTLLM_FP8_VIDEO)
+    if os.path.isfile(output_path):
+        return output_path
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "visual_gen_wan_t2v.py")
+    assert os.path.isfile(script_path), f"Visual gen script not found: {script_path}"
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--height", str(WAN_T2V_HEIGHT),
+            "--width", str(WAN_T2V_WIDTH),
+            "--num_frames", str(WAN_T2V_NUM_FRAMES),
+            "--model_path", model_path,
+            "--prompt", WAN_T2V_PROMPT,
+            "--output_path", output_path,
+            "--linear_type", "trtllm-fp8-per-tensor",
+        ],
+    )
+    assert os.path.isfile(output_path), f"Visual gen FP8 did not produce {output_path}"
+    return output_path
+
+
+@pytest.fixture(scope="session")
 def wan22_a14b_fp8_video_path(_visual_gen_deps, llm_venv, llm_root):
     """Generate video with Wan 2.2 A14B FP8 checkpoint."""
     return _generate_wan_video(llm_venv, llm_root, WAN22_A14B_FP8_MODEL_SUBPATH, "wan22_fp8")
@@ -220,10 +258,12 @@ def _normalize_score(val):
     return float(val)
 
 
-def _get_per_video_scores(results, video_path_substr):
-    """From VBench results, get per-dimension score for the video whose path contains video_path_substr."""
+def _get_per_video_scores(results, video_path_substr, dimensions=None):
+    """From VBench results, get per-dimension score for the video whose path contains video_path_substr.
+    If dimensions is None, use VBENCH_DIMENSIONS."""
+    dims = dimensions if dimensions is not None else VBENCH_DIMENSIONS
     scores = {}
-    for dim in VBENCH_DIMENSIONS:
+    for dim in dims:
         dim_result = results[dim]
         assert isinstance(dim_result, list) and len(dim_result) >= 2, (
             f"Dimension '{dim}' result must be [overall_score, video_results]; got {type(dim_result)}"
@@ -265,6 +305,7 @@ def _run_vbench_and_report(
     title,
     golden_scores=None,
     max_score_diff=0.10,
+    dimensions=None,
 ):
     """Run VBench, print scores, and optionally assert against golden values.
 
@@ -272,6 +313,8 @@ def _run_vbench_and_report(
     for the operator to capture but no assertion is made.  Once golden values
     are populated, the comparison kicks in automatically.
     """
+    
+    dims = dimensions if dimensions is not None else VBENCH_DIMENSIONS
     output_path = os.path.join(
         llm_venv.get_working_directory(), "vbench_eval_output", title.replace(" ", "_").lower()
     )
@@ -286,7 +329,7 @@ def _run_vbench_and_report(
         "--mode",
         "custom_input",
     ]
-    cmd.extend(["--dimension"] + VBENCH_DIMENSIONS)
+    cmd.extend(["--dimension"] + dims)
     venv_check_call(llm_venv, cmd)
 
     pattern = os.path.join(output_path, "*_eval_results.json")
@@ -296,13 +339,13 @@ def _run_vbench_and_report(
     )
     with open(result_files[0], "r") as f:
         results = json.load(f)
-    for dim in VBENCH_DIMENSIONS:
+    for dim in dims:
         assert dim in results, (
             f"Expected dimension '{dim}' in results; keys: {list(results.keys())}"
         )
 
-    scores_trtllm = _get_per_video_scores(results, trtllm_filename)
-    max_len = max(len(d) for d in VBENCH_DIMENSIONS)
+    scores_trtllm = _get_per_video_scores(results, trtllm_filename, dimensions=dims)
+    max_len = max(len(d) for d in dims)
 
     if golden_scores is not None:
         header = f"{'Dimension':<{max_len}}  |  {'TRT-LLM':>10}  |  {'Golden':>10}  |  {'Diff':>8}"
@@ -332,7 +375,7 @@ def _run_vbench_and_report(
     max_diff_val = max(abs(scores_trtllm[d] - golden_scores[d]) for d in VBENCH_DIMENSIONS)
     print(f"max_diff={max_diff_val:.4f}  (threshold={max_score_diff})")
     print("=" * len(header) + "\n")
-    for dim in VBENCH_DIMENSIONS:
+    for dim in dims:
         diff = abs(scores_trtllm[dim] - golden_scores[dim])
         assert diff < max_score_diff or scores_trtllm[dim] >= golden_scores[dim], (
             f"Dimension '{dim}' score difference {diff:.4f} >= {max_score_diff} "
@@ -372,4 +415,20 @@ def test_vbench_dimension_score_wan22_a14b_nvfp4(
         title="WAN 2.2 A14B NVFP4",
         golden_scores=VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES,
         max_score_diff=0.05,
+    )
+
+
+def test_vbench_dimension_score_wan_fp8(vbench_repo_root, wan_trtllm_fp8_video_path, llm_venv):
+    """Run VBench on WAN 2.1 TRT-LLM FP8 video (--linear_type trtllm-fp8-per-tensor); compare to golden (no dynamic_degree)."""
+    videos_dir = os.path.dirname(wan_trtllm_fp8_video_path)
+    assert os.path.isfile(wan_trtllm_fp8_video_path), "TRT-LLM FP8 video must exist"
+    _run_vbench_and_compare_to_golden(
+        vbench_repo_root,
+        videos_dir,
+        WAN_TRTLLM_FP8_VIDEO,
+        VBENCH_WAN_GOLDEN_SCORES_FP8,
+        llm_venv,
+        title="WAN_FP8",
+        max_score_diff=0.05,
+        dimensions=VBENCH_DIMENSIONS_FP8,
     )
