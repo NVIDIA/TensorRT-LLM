@@ -1355,12 +1355,11 @@ class NVFP4LinearMethod(LinearMethodBase):
                 assert ws.dtype == torch.float8_e4m3fn  # TODO: or e8m0 for mxfp4 recipe?
                 weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
             if "weight_scale_2" in w:
-                ws2 = w["weight_scale_2"][...]
                 if weight_scale_2 is None:
-                    weight_scale_2 = ws2
+                    weight_scale_2 = w["weight_scale_2"][...]
                 else:
-                    # Take max for fused weights
-                    weight_scale_2 = torch.maximum(weight_scale_2, ws2)
+                    assert weight_scale_2 == w["weight_scale_2"][
+                        ...], "The weight_scale_2 should be same for all the weights"
 
         # Compute scaling factor and alpha required by GEMM kernels
         # For dynamic activation quantization, input_scale may be None (computed at runtime)

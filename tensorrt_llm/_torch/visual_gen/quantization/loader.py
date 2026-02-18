@@ -250,14 +250,14 @@ class DynamicLinearWeightLoader:
         # Build output weight dicts - each component gets:
         # - Its portion of the quantized weight
         # - Its portion of the block scales
-        # - The SAME global scale (weight_scale_2) for all - this is the key fix!
+        # - The SAME global scale (weight_scale_2) for all
         result = []
         for i, wd in enumerate(weight_dicts):
             new_wd = {
                 **wd,
                 "weight": qweight_splits[i],
                 "weight_scale": weight_scale_splits[i],
-                "weight_scale_2": weight_scale_2,  # Same for all components!
+                "weight_scale_2": weight_scale_2,
             }
             result.append(new_wd)
 
