@@ -326,7 +326,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
         weights = []
         biases = []
 
-        if node.target.endswith("bias"):
+        if node.target.rsplit(".", 1)[-1] == "bias":
             biases = [
                 WeightNode(
                     node=node,
@@ -356,7 +356,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             if (attr_node := find_get_attr_node(n)) is not None
         ]
         # separate weight nodes and bias nodes
-        bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]
+        bias_nodes = [n for n in all_weight_nodes if n.target.rsplit(".", 1)[-1] == "bias"]
         weight_nodes = [n for n in all_weight_nodes if n not in bias_nodes]
         weight_nodes = [
             WeightNode(
@@ -652,7 +652,7 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
         if not is_weight_node(node):
             continue
 
-        is_bias = node.target.endswith("bias")
+        is_bias = node.target.rsplit(".", 1)[-1] == "bias"
 
         # the weight to user mapping is reflective - the weight node "owns" itself
         node.meta["weight_nodes"] = [node]
@@ -697,78 +697,6 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
             else:
                 # No more nodes to traverse
                 break
-
-
-def _ensure_weight_mapping(node: Node) -> None:
-    """Ensure weight node mapping is computed. Lazily calls precompute if needed."""
-    gm = node.graph.owning_module
-    if "_weight_mapping_computed" not in gm.meta or not gm.meta["_weight_mapping_computed"]:
-        precompute_weight_node_mapping(gm)
-
-
-def get_weight_node(node: Node) -> Optional[Node]:
-    """Get the primary weight node for a compute node"""
-    _ensure_weight_mapping(node)
-    weight_nodes = node.meta.get("weight_nodes", [])
-    return weight_nodes[0] if weight_nodes else None
-
-
-def get_weight_nodes(node: Node) -> List[Node]:
-    """Get all weight nodes for a compute node"""
-    _ensure_weight_mapping(node)
-    return node.meta.get("weight_nodes", [])
-
-
-def get_bias_nodes(node: Node) -> List[Node]:
-    """Get all bias nodes for a compute node"""
-    _ensure_weight_mapping(node)
-    return node.meta.get("bias_nodes", [])
-
-
-@dataclass
-class WeightInfo:
-    """Lightweight weight info extracted from a weight node."""
-
-    node: Node
-    node_key: str
-    tensor: torch.Tensor
-    submod: nn.Module
-
-
-def _weight_node_to_info(weight_node: Node, gm: GraphModule) -> WeightInfo:
-    """Convert a weight node to WeightInfo."""
-    node_key = weight_node.target
-    tensor = get_param_or_buffer(node_key, gm)
-    submod = gm.get_submodule(node_key.rpartition(".")[0])
-    return WeightInfo(node=weight_node, node_key=node_key, tensor=tensor, submod=submod)
-
-
-def get_weight_info(node: Node) -> Optional[WeightInfo]:
-    """Extract weight info for the primary weight of a compute node."""
-    weight_node = get_weight_node(node)
-    if weight_node is None:
-        return None
-    return _weight_node_to_info(weight_node, node.graph.owning_module)
-
-
-@dataclass
-class AllWeightInfos:
-    """Container for all weight and bias infos of a compute node."""
-
-    weights: List[WeightInfo]
-    biases: List[WeightInfo]
-
-
-def get_all_weight_infos(node: Node) -> AllWeightInfos:
-    """Extract all weight and bias infos for a compute node."""
-    gm = node.graph.owning_module
-    weight_nodes = get_weight_nodes(node)
-    bias_nodes = get_bias_nodes(node)
-
-    return AllWeightInfos(
-        weights=[_weight_node_to_info(wn, gm) for wn in weight_nodes],
-        biases=[_weight_node_to_info(bn, gm) for bn in bias_nodes],
-    )
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
