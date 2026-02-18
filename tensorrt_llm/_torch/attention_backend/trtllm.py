@@ -1,3 +1,4 @@
+import functools
 import math
 import os
 import weakref
@@ -758,6 +759,33 @@ class TrtllmAttentionWrapper:
         return not (sm < 100 or sm in [120, 121])
 
 
+@functools.cache
+def generate_spec_decoding_position_offsets(max_num_requests: int,
+                                            draft_len: int) -> torch.Tensor:
+    width = draft_len + 1
+    row = torch.arange(width, dtype=torch.int, device='cuda')
+    return row.unsqueeze(0).expand(max_num_requests, -1).contiguous()
+
+
+@functools.cache
+def generate_spec_decoding_packed_mask(max_num_requests: int,
+                                       draft_len: int) -> torch.Tensor:
+    width = draft_len + 1
+    num_blocks = math.ceil(width / 32)
+    mask = torch.zeros([max_num_requests, width, num_blocks],
+                       dtype=torch.int,
+                       device='cuda')
+    remaining = width
+    for blk in range(num_blocks):
+        if remaining <= 0:
+            break
+        n = min(32, remaining)
+        vals = (torch.pow(2, torch.arange(n) + 1) - 1).int()
+        mask[:, blk * 32:blk * 32 + n, blk] = vals
+        remaining -= 32
+    return mask
+
+
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
@@ -1466,15 +1494,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:
+            # skip pre-allocating position_offsets and packed_mask when dynamic draft length is enabled
+            # We will use per-draft-len cached tensors for position_offsets and packed_mask instead
+            # Currently dynamic draft length is only supported for linear tree
+
+            is_linear_tree = not is_spec_dec_tree
+
             # These buffers are accessed more like removing input padding,
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
-            if self.spec_decoding_position_offsets is None:
+            if not is_linear_tree and self.spec_decoding_position_offsets is None:
                 self.spec_decoding_position_offsets = torch.empty(
                     [self.max_num_requests, max_total_draft_tokens + 1],
                     dtype=torch.int,
                     device='cuda',
                 )
-            if self.spec_decoding_packed_mask is None:
+            if not is_linear_tree and self.spec_decoding_packed_mask is None:
                 self.spec_decoding_packed_mask = torch.empty(
                     [
                         self.max_num_requests, max_total_draft_tokens + 1,
@@ -1510,7 +1544,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         spec_decoding_generation_lengths, non_blocking=True)
                 else:
                     self.generate_spec_decoding_generation_length(
-                        max_draft_len=max_total_draft_tokens)
+                        runtime_draft_len=max_total_draft_tokens)
 
             # Case 2/3: static tree
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
@@ -1558,48 +1592,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.spec_decoding_packed_mask.reshape(
                         -1)[:(max_draft_len + 1) * batch_size].copy_(
                             spec_decoding_packed_mask, non_blocking=True)
-                    # generation_lengths
                     self.generate_spec_decoding_generation_length(
-                        max_draft_len=max_draft_len)
+                        runtime_draft_len=max_draft_len)
 
             # Case 4: linear tree
             else:
+                # Currently dynamic draft length is only supported for linear tree
+                # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
+                # So we create cache for position offsets and packed mask for each draft length to avoid reallocation.
                 assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
-                # Prepare for the linear-tree.
-                # Populate the mask that won't change during inference phase.
-                self.generate_spec_decoding_position_offsets(
-                    max_draft_len=max_draft_len)
-                self.generate_spec_decoding_packed_mask(
-                    max_draft_len=max_draft_len)
+                runtime_draft_len = spec_metadata.runtime_draft_len
                 self.generate_spec_decoding_generation_length(
-                    max_draft_len=max_draft_len)
+                    runtime_draft_len=runtime_draft_len)
+                self.spec_decoding_position_offsets = generate_spec_decoding_position_offsets(
+                    self.max_num_requests, runtime_draft_len)
+                self.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
+                    self.max_num_requests, runtime_draft_len)
 
-    def generate_spec_decoding_position_offsets(self, max_draft_len):
-        position_offset = torch.arange(max_draft_len + 1,
-                                       dtype=torch.int,
-                                       device='cpu',
-                                       pin_memory=prefer_pinned())
-        # fill all the batches with same position offset
-        self.spec_decoding_position_offsets.copy_(position_offset,
-                                                  non_blocking=True)
-
-    def generate_spec_decoding_packed_mask(self, max_draft_len):
-        num_blocks = math.ceil((max_draft_len + 1) / 32)
-        tmp_max_draft_len = max_draft_len + 1
-        for block_idx in range(num_blocks):
-            if tmp_max_draft_len < 0:
-                break
-            dummy_idx = torch.arange(min(32, tmp_max_draft_len))
-            spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
-            self.spec_decoding_packed_mask[:, :, block_idx].copy_(
-                spec_decoding_packed_mask, non_blocking=True)
-            tmp_max_draft_len -= 32
-
-    def generate_spec_decoding_generation_length(self, max_draft_len):
-        spec_decoding_generation_length = torch.full((self.max_num_requests, ),
-                                                     max_draft_len + 1)
-        self.spec_decoding_generation_lengths[:self.max_num_requests].copy_(
-            spec_decoding_generation_length, non_blocking=True)
+    def generate_spec_decoding_generation_length(self, runtime_draft_len):
+        self.spec_decoding_generation_lengths[:self.max_num_requests].fill_(
+            runtime_draft_len + 1)
 
     def is_sm_version_trtllm_gen_kernel(self, sm):
         return not (sm < 100 or sm in [120, 121])
