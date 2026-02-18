@@ -5,11 +5,15 @@
 
 FLUX.2 has a DIFFERENT architecture from FLUX.1:
 - Different modulation: Flux2Modulation with mod_param_sets
-- Different embedding: time_guidance_embed (timestep + guidance combined)
+- Different embedding: time_guidance_embed (always, with optional guidance_embedder)
 - Different FFN: Flux2FeedForward with Flux2SwiGLU
 - Different single-stream: Fused QKV+MLP projection (to_qkv_mlp_proj)
 
-This module provides a native implementation matching HuggingFace diffusers exactly.
+Variants:
+- FLUX.2-dev (35B): guidance_embeds=True (default), guidance_embedder active
+- FLUX.2-klein (4B/9B): guidance_embeds=False, guidance_embedder=None
+
+All variants use `self.time_guidance_embed` to match HF checkpoint weight names.
 All linear layers use bias=False to match HF weights.
 """
 
@@ -41,14 +45,19 @@ if TYPE_CHECKING:
 
 
 class Flux2TimestepGuidanceEmbeddings(nn.Module):
-    """Combined timestep and guidance embedding for FLUX.2 (matches HuggingFace exactly).
+    """Timestep (and optional guidance) embedding for FLUX.2 (matches HuggingFace exactly).
+
+    Used for ALL FLUX.2 variants with the same attribute name `time_guidance_embed`:
+    - FLUX.2-dev (guidance_embeds=True): timestep_emb + guidance_emb
+    - FLUX.2-klein (guidance_embeds=False): timestep_emb only (guidance_embedder=None)
+
+    This ensures HF checkpoint weight names (`time_guidance_embed.timestep_embedder.*`)
+    always match our module attribute name.
 
     Structure:
     - time_proj: Sinusoidal projection (Timesteps)
     - timestep_embedder: 2-layer MLP (TimestepEmbedding)
-    - guidance_embedder: 2-layer MLP (TimestepEmbedding)
-
-    Output = timestep_emb + guidance_emb
+    - guidance_embedder: 2-layer MLP (TimestepEmbedding) or None
     """
 
     def __init__(
@@ -56,6 +65,7 @@ class Flux2TimestepGuidanceEmbeddings(nn.Module):
         in_channels: int = 256,
         embedding_dim: int = 6144,
         bias: bool = False,
+        guidance_embeds: bool = True,
         dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
@@ -67,38 +77,43 @@ class Flux2TimestepGuidanceEmbeddings(nn.Module):
             downscale_freq_shift=0,
         )
 
-        # Separate embedders for timestep and guidance
+        # Timestep embedder (always present)
         self.timestep_embedder = TimestepEmbedding(
             in_channels=in_channels,
             time_embed_dim=embedding_dim,
             sample_proj_bias=bias,
         )
 
-        self.guidance_embedder = TimestepEmbedding(
-            in_channels=in_channels,
-            time_embed_dim=embedding_dim,
-            sample_proj_bias=bias,
-        )
+        # Guidance embedder (only for variants with guidance_embeds=True)
+        if guidance_embeds:
+            self.guidance_embedder = TimestepEmbedding(
+                in_channels=in_channels,
+                time_embed_dim=embedding_dim,
+                sample_proj_bias=bias,
+            )
+        else:
+            self.guidance_embedder = None
 
-    def forward(self, timestep: torch.Tensor, guidance: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, timestep: torch.Tensor, guidance: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Args:
             timestep: [batch] timestep values (already scaled by 1000)
-            guidance: [batch] guidance scale values (already scaled by 1000)
+            guidance: [batch] guidance scale values (already scaled by 1000), or None
 
         Returns:
-            Combined embedding [batch, embedding_dim]
+            Embedding [batch, embedding_dim]
         """
-        # Sinusoidal projection
         timesteps_proj = self.time_proj(timestep)
-        guidance_proj = self.time_proj(guidance)
-
-        # MLP embedding
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(timestep.dtype))
-        guidance_emb = self.guidance_embedder(guidance_proj.to(guidance.dtype))
 
-        # Combine by addition (not concatenation)
-        return timesteps_emb + guidance_emb
+        if guidance is not None and self.guidance_embedder is not None:
+            guidance_proj = self.time_proj(guidance)
+            guidance_emb = self.guidance_embedder(guidance_proj.to(guidance.dtype))
+            return timesteps_emb + guidance_emb
+
+        return timesteps_emb
 
 
 # =============================================================================
@@ -521,11 +536,13 @@ class Flux2Transformer2DModel(nn.Module):
             axes_dim=axes_dims_rope,
         )
 
-        # Time + guidance embedding (small layers, optional quantization)
+        # Time embedding (always stored as time_guidance_embed to match HF weight names)
+        # When guidance_embeds=False (e.g., klein), guidance_embedder is None
         self.time_guidance_embed = Flux2TimestepGuidanceEmbeddings(
             in_channels=timestep_guidance_channels,
             embedding_dim=inner_dim,
             bias=False,
+            guidance_embeds=guidance_embeds,
             dtype=dtype,
         )
 
@@ -662,7 +679,7 @@ class Flux2Transformer2DModel(nn.Module):
         timestep: torch.Tensor,
         img_ids: torch.Tensor,
         txt_ids: torch.Tensor,
-        guidance: torch.Tensor,
+        guidance: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -689,9 +706,10 @@ class Flux2Transformer2DModel(nn.Module):
 
         # Scale timestep and guidance (FLUX convention)
         timestep = timestep.to(hidden_states.dtype) * 1000
-        guidance = guidance.to(hidden_states.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
 
-        # Time + guidance embedding
+        # Time embedding (handles both guided and unguided variants)
         temb = self.time_guidance_embed(timestep, guidance)
 
         # Handle batched IDs
@@ -787,13 +805,13 @@ class Flux2Transformer2DModel(nn.Module):
 
     def post_load_weights(self) -> None:
         """Call post_load_weights on all Linear modules and convert embedders to target dtype."""
-        # Convert time_guidance_embed components to target dtype
         target_dtype = self.model_config.torch_dtype
-        if hasattr(self, "time_guidance_embed"):
-            if hasattr(self.time_guidance_embed, "timestep_embedder"):
-                self.time_guidance_embed.timestep_embedder.to(target_dtype)
-            if hasattr(self.time_guidance_embed, "guidance_embedder"):
-                self.time_guidance_embed.guidance_embedder.to(target_dtype)
+
+        # Convert time embedding components to target dtype
+        if hasattr(self.time_guidance_embed, "timestep_embedder"):
+            self.time_guidance_embed.timestep_embedder.to(target_dtype)
+        if self.time_guidance_embed.guidance_embedder is not None:
+            self.time_guidance_embed.guidance_embedder.to(target_dtype)
 
         # Call post_load_weights on all Linear modules
         for _, module in self.named_modules():

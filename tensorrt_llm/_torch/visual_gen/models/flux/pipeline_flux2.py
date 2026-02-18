@@ -4,15 +4,21 @@
 """FLUX.2 Pipeline implementation following WAN pattern.
 
 This pipeline uses the TRT-LLM FLUX.2 transformer implementation.
-FLUX.2 uses Mistral3-based text encoder with multi-layer extraction (not CLIP + T5 like FLUX.1).
+
+Supported variants:
+- FLUX.2-dev (35B): Mistral3 text encoder, layers (10, 20, 30), embedded guidance
+- FLUX.2-klein (4B/9B): Qwen3 text encoder, layers (9, 18, 27), no guidance
+
+The text encoder type and hidden state layers are auto-detected from model_index.json.
 
 Key differences from FLUX.1:
-- Text encoder: Mistral3 (decoder-only, used as encoder via hidden state extraction)
-- Multi-layer fusion: Layers 10, 20, 30 are stacked -> 3 x 5120 = 15360 dim
-- No pooled embeddings: Guidance is handled via timestep embedding only
+- Text encoder: Mistral3 or Qwen3 (decoder-only, used as encoder via hidden state extraction)
+- Multi-layer fusion: 3 hidden layers stacked -> 3 x hidden_dim
+- No pooled embeddings: Guidance is handled via timestep embedding (dev) or not at all (klein)
 - 4-axis RoPE: (32, 32, 32, 32) instead of 3-axis
 """
 
+import json
 import os
 import time
 from typing import List, Optional, Tuple
@@ -21,7 +27,12 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 from diffusers.utils.torch_utils import randn_tensor
-from transformers import AutoProcessor, Mistral3ForConditionalGeneration
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    Mistral3ForConditionalGeneration,
+)
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
@@ -77,38 +88,52 @@ def format_input(prompts: List[str], system_message: str) -> List[List[dict]]:
 
 @register_pipeline("Flux2Pipeline")
 class Flux2Pipeline(BasePipeline):
-    """FLUX.2 Text-to-Image Pipeline (35B params).
+    """FLUX.2 Text-to-Image Pipeline.
+
+    Supports FLUX.2 model variants:
+    - FLUX.2-dev (35B): guidance_embeds=True, embedded guidance
+    - FLUX.2-klein (4B/9B): guidance_embeds=False, no guidance
 
     Uses Mistral3 for text encoding and native Flux2Transformer2DModel.
     Follows WAN pipeline pattern for DiffusionModelLoader integration.
     """
 
-    # Layers to extract from Mistral3 for multi-layer fusion
+    # Hidden state layers per text encoder type (auto-detected at load time)
+    _TEXT_ENCODER_CONFIG = {
+        "Mistral3ForConditionalGeneration": {
+            "hidden_layers": (10, 20, 30),
+            "system_message": SYSTEM_MESSAGE,
+        },
+        "Qwen3ForCausalLM": {
+            "hidden_layers": (9, 18, 27),
+            "system_message": None,  # Qwen3 uses simple user message
+        },
+    }
+    # Default for backward compatibility (FLUX.2-dev)
     HIDDEN_STATE_LAYERS: Tuple[int, ...] = (10, 20, 30)
 
     @staticmethod
     def _compute_flux2_timestep_embedding(module, timestep, guidance=None):
         """Compute timestep embedding for FLUX.2 transformer.
 
-        FLUX.2 uses time_guidance_embed (timestep + guidance combined).
+        Always uses time_guidance_embed (handles both guided and unguided variants).
 
         Args:
             module: Flux2Transformer2DModel instance
             timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B]
+            guidance: Guidance scale tensor [B] (optional, None for klein)
 
         Returns:
-            Timestep + guidance embedding for TeaCache distance calculation
+            Timestep embedding for TeaCache distance calculation
         """
-        # Cast to embedder's dtype (avoid int8 quantized layers)
-        te_dtype = next(module.time_guidance_embed.timestep_embedder.linear_1.parameters()).dtype
+        embed = module.time_guidance_embed
+        te_dtype = next(embed.timestep_embedder.linear_1.parameters()).dtype
         if te_dtype != torch.int8:
             t = timestep.to(te_dtype)
             g = guidance.to(te_dtype) if guidance is not None else None
         else:
-            t = timestep
-            g = guidance
-        return module.time_guidance_embed(t, g)
+            t, g = timestep, guidance
+        return embed(t, g)
 
     @property
     def dtype(self):
@@ -125,31 +150,66 @@ class Flux2Pipeline(BasePipeline):
         logger.info("Creating FLUX.2 transformer with quantization support...")
         self.transformer = Flux2Transformer2DModel(model_config=self.model_config)
 
+    def _detect_text_encoder_type(self, checkpoint_dir: str) -> str:
+        """Detect text encoder class from model_index.json."""
+        model_index_path = os.path.join(checkpoint_dir, "model_index.json")
+        if os.path.exists(model_index_path):
+            with open(model_index_path) as f:
+                index = json.load(f)
+            text_encoder_info = index.get("text_encoder", [])
+            if len(text_encoder_info) >= 2:
+                return text_encoder_info[1]
+        return "Mistral3ForConditionalGeneration"  # Default for FLUX.2-dev
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
         device: torch.device,
         skip_components: Optional[list] = None,
     ) -> None:
-        """Load VAE, text encoder (Mistral3), tokenizer, and scheduler from checkpoint."""
+        """Load VAE, text encoder, tokenizer, and scheduler from checkpoint.
+
+        Auto-detects text encoder type from model_index.json:
+        - Mistral3ForConditionalGeneration: FLUX.2-dev (uses AutoProcessor)
+        - Qwen3ForCausalLM: FLUX.2-klein (uses AutoTokenizer)
+        """
         skip_components = skip_components or []
 
-        # Tokenizer (PixtralProcessor for Mistral3)
-        # Use full path instead of subfolder to avoid AutoConfig trying to read root config.json
-        if PipelineComponent.TOKENIZER not in skip_components:
-            logger.info("Loading tokenizer (PixtralProcessor)...")
-            tokenizer_path = os.path.join(checkpoint_dir, PipelineComponent.TOKENIZER)
-            self.tokenizer = AutoProcessor.from_pretrained(tokenizer_path)
+        # Auto-detect text encoder type and configure hidden state layers
+        self._text_encoder_class = self._detect_text_encoder_type(checkpoint_dir)
+        te_config = self._TEXT_ENCODER_CONFIG.get(self._text_encoder_class, {})
+        self.HIDDEN_STATE_LAYERS = te_config.get("hidden_layers", (10, 20, 30))
+        logger.info(
+            f"Detected text encoder: {self._text_encoder_class}, "
+            f"hidden layers: {self.HIDDEN_STATE_LAYERS}"
+        )
 
-        # Text encoder (Mistral3)
-        # Use full path to avoid AutoConfig issues
+        # Tokenizer (type depends on text encoder)
+        if PipelineComponent.TOKENIZER not in skip_components:
+            tokenizer_path = os.path.join(checkpoint_dir, PipelineComponent.TOKENIZER)
+            if self._text_encoder_class == "Qwen3ForCausalLM":
+                logger.info("Loading tokenizer (Qwen2TokenizerFast)...")
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            else:
+                logger.info("Loading tokenizer (PixtralProcessor)...")
+                self.tokenizer = AutoProcessor.from_pretrained(tokenizer_path)
+
+        # Text encoder (loaded based on detected type)
         if PipelineComponent.TEXT_ENCODER not in skip_components:
-            logger.info("Loading text encoder (Mistral3)...")
+            logger.info(f"Loading text encoder ({self._text_encoder_class})...")
             text_encoder_path = os.path.join(checkpoint_dir, PipelineComponent.TEXT_ENCODER)
-            self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-                text_encoder_path,
-                torch_dtype=self.model_config.torch_dtype,
-            ).to(device)
+            if self._text_encoder_class == "Mistral3ForConditionalGeneration":
+                # Mistral3 is a multimodal model (not pure CausalLM)
+                self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+                    text_encoder_path,
+                    torch_dtype=self.model_config.torch_dtype,
+                ).to(device)
+            else:
+                # Qwen3 and other CausalLM text encoders
+                self.text_encoder = AutoModelForCausalLM.from_pretrained(
+                    text_encoder_path,
+                    torch_dtype=self.model_config.torch_dtype,
+                ).to(device)
 
         # VAE (FLUX.2-specific VAE with BatchNorm)
         # Use full path to avoid AutoConfig issues
@@ -191,20 +251,23 @@ class Flux2Pipeline(BasePipeline):
         super().post_load_weights()
         if self.transformer is not None:
             # Register TeaCache extractor for FLUX.2 (must be after device placement)
+            # Only set guidance_param_name for variants with guidance_embeds
+            guidance_param = "guidance" if self.transformer.guidance_embeds else None
+            forward_params = [
+                "hidden_states",
+                "encoder_hidden_states",
+                "timestep",
+                "img_ids",
+                "txt_ids",
+                "guidance",
+                "return_dict",
+            ]
             register_extractor_from_config(
                 ExtractorConfig(
                     model_class_name="Flux2Transformer2DModel",
                     timestep_embed_fn=self._compute_flux2_timestep_embedding,
-                    guidance_param_name="guidance",
-                    forward_params=[
-                        "hidden_states",
-                        "encoder_hidden_states",
-                        "timestep",
-                        "img_ids",
-                        "txt_ids",
-                        "guidance",
-                        "return_dict",
-                    ],
+                    guidance_param_name=guidance_param,
+                    forward_params=forward_params,
                     return_dict_default=False,
                 )
             )
@@ -263,23 +326,30 @@ class Flux2Pipeline(BasePipeline):
         logger.info(f"Latents shape: {latents.shape}")
 
         # Prepare timesteps with dynamic shifting
+        # Use explicit linear sigmas (matches HF diffusers exactly)
+        # This is critical for step-distilled models like FLUX.2-klein
+        import numpy as np
+
         image_seq_len = latents.shape[1]
         mu = compute_empirical_mu(image_seq_len, num_inference_steps)
+        sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
 
-        # Check if scheduler uses dynamic shifting
+        # If scheduler uses flow sigmas, let it compute its own (override linear)
         if (
-            hasattr(self.scheduler.config, "use_dynamic_shifting")
-            and self.scheduler.config.use_dynamic_shifting
+            hasattr(self.scheduler.config, "use_flow_sigmas")
+            and self.scheduler.config.use_flow_sigmas
         ):
             self.scheduler.set_timesteps(num_inference_steps, device=self.device, mu=mu)
         else:
-            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            self.scheduler.set_timesteps(sigmas=sigmas.tolist(), device=self.device, mu=mu)
         timesteps = self.scheduler.timesteps
 
-        # Prepare guidance (embedded for FLUX.2)
-        guidance = torch.full(
-            [latents.shape[0]], guidance_scale, device=self.device, dtype=torch.float32
-        )
+        # Prepare guidance (only for variants with guidance_embeds=True)
+        guidance = None
+        if self.transformer.guidance_embeds:
+            guidance = torch.full(
+                [latents.shape[0]], guidance_scale, device=self.device, dtype=torch.float32
+            )
 
         # Denoising loop using forward_fn callback (WAN pattern)
         def forward_fn(
@@ -325,23 +395,59 @@ class Flux2Pipeline(BasePipeline):
         prompt: str,
         max_sequence_length: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode prompt using Mistral3 multi-layer extraction.
+        """Encode prompt using multi-layer hidden state extraction.
 
-        FLUX.2 uses:
-        1. Format prompts with system message using chat template
-        2. Run through Mistral3 with output_hidden_states=True
-        3. Extract hidden states from layers 10, 20, 30
-        4. Stack and reshape: [B, 3, seq, 5120] -> [B, seq, 15360]
+        Supports both text encoder types:
+        - Mistral3: system message + PixtralProcessor chat template
+        - Qwen3: simple user message + Qwen2TokenizerFast chat template
 
         Returns:
             Tuple of (prompt_embeds, text_ids)
         """
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
-        # Format prompts with system message (PixtralProcessor format)
-        messages_batch = format_input(prompt, SYSTEM_MESSAGE)
+        # Tokenize (format depends on text encoder type)
+        text_encoder_class = getattr(
+            self, "_text_encoder_class", "Mistral3ForConditionalGeneration"
+        )
+        if text_encoder_class == "Qwen3ForCausalLM":
+            input_ids, attention_mask = self._tokenize_qwen3(prompt, max_sequence_length)
+        else:
+            input_ids, attention_mask = self._tokenize_mistral3(prompt, max_sequence_length)
 
-        # Tokenize using chat template
+        # Forward pass - extract hidden states
+        outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+
+        # Multi-layer extraction: stack specified layers
+        stacked = torch.stack([outputs.hidden_states[k] for k in self.HIDDEN_STATE_LAYERS], dim=1)
+        stacked = stacked.to(dtype=self.dtype, device=self.device)
+
+        # Reshape: [B, num_layers, seq, hidden_dim] -> [B, seq, num_layers * hidden_dim]
+        batch_size, num_layers, seq_len, hidden_dim = stacked.shape
+        prompt_embeds = stacked.permute(0, 2, 1, 3).reshape(
+            batch_size, seq_len, num_layers * hidden_dim
+        )
+
+        # NOTE: Do NOT zero out padding tokens for decoder-only models.
+        # Causal attention means hidden states at padding positions carry
+        # meaningful context from earlier tokens. (HF diffusers does not zero out either.)
+
+        # Prepare 4-axis text IDs for FLUX.2 RoPE
+        text_ids = self._prepare_text_ids(prompt_embeds)
+        text_ids = text_ids.to(self.device)
+
+        return prompt_embeds, text_ids
+
+    def _tokenize_mistral3(
+        self, prompt: List[str], max_sequence_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize prompt using Mistral3 PixtralProcessor chat template."""
+        messages_batch = format_input(prompt, SYSTEM_MESSAGE)
         inputs = self.tokenizer.apply_chat_template(
             messages_batch,
             add_generation_prompt=False,
@@ -352,42 +458,36 @@ class Flux2Pipeline(BasePipeline):
             truncation=True,
             max_length=max_sequence_length,
         )
+        return inputs["input_ids"].to(self.device), inputs["attention_mask"].to(self.device)
 
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
+    def _tokenize_qwen3(
+        self, prompt: List[str], max_sequence_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize prompt using Qwen3 chat template (matches HF diffusers exactly)."""
+        all_input_ids = []
+        all_attention_masks = []
 
-        # Forward pass - extract hidden states
-        outputs = self.text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+        for single_prompt in prompt:
+            messages = [{"role": "user", "content": single_prompt}]
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            inputs = self.tokenizer(
+                text,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=max_sequence_length,
+            )
+            all_input_ids.append(inputs["input_ids"])
+            all_attention_masks.append(inputs["attention_mask"])
 
-        # Multi-layer extraction: stack layers 10, 20, 30
-        stacked = torch.stack(
-            [outputs.hidden_states[k] for k in self.HIDDEN_STATE_LAYERS], dim=1
-        )  # [B, 3, seq_len, 5120]
-
-        stacked = stacked.to(dtype=self.dtype, device=self.device)
-
-        # Reshape: [B, 3, seq, 5120] -> [B, seq, 15360]
-        batch_size, num_layers, seq_len, hidden_dim = stacked.shape
-        prompt_embeds = stacked.permute(0, 2, 1, 3).reshape(
-            batch_size, seq_len, num_layers * hidden_dim
-        )
-
-        # NOTE: Do NOT zero out padding tokens for Mistral3 (decoder-only).
-        # Unlike encoder models (T5/CLIP in WAN), Mistral3's causal attention
-        # means hidden states at padding positions carry meaningful context
-        # from earlier tokens. Zeroing them destroys the embedding information.
-        # (HF diffusers does not zero out either.)
-
-        # Prepare 4-axis text IDs for FLUX.2 RoPE
-        text_ids = self._prepare_text_ids(prompt_embeds)
-        text_ids = text_ids.to(self.device)
-
-        return prompt_embeds, text_ids
+        input_ids = torch.cat(all_input_ids, dim=0).to(self.device)
+        attention_mask = torch.cat(all_attention_masks, dim=0).to(self.device)
+        return input_ids, attention_mask
 
     def _prepare_text_ids(self, text_embeds: torch.Tensor) -> torch.Tensor:
         """Prepare 4-axis position IDs for text tokens.
