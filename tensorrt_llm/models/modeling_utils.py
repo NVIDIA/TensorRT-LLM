@@ -136,7 +136,7 @@ class QuantConfig(StrictBaseModel):
         default=None, description="Quantization algorithm.")
     kv_cache_quant_algo: Optional[QuantAlgo] = Field(
         default=None, description="KV cache quantization algorithm.")
-    group_size: int = Field(
+    group_size: Optional[int] = Field(
         default=128, description="Group size for group-wise quantization.")
     smoothquant_val: float = Field(
         default=0.5,
