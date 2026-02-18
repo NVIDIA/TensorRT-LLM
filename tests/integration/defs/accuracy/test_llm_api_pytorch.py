@@ -3904,12 +3904,31 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @parametrize_with_ids("eagle3_one_model", [True, False])
-    @parametrize_with_ids("enable_chunked_prefill", [False, True])
-    def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
+    @parametrize_with_ids(
+        "eagle3_one_model,enable_chunked_prefill,max_concurrency,draft_len_schedule",
+        [
+            # Base coverage: eagle3_one_model x enable_chunked_prefill.
+            (True, True, None, None),
+            (True, False, None, None),
+            (False, True, None, None),
+            (False, False, None, None),
+            # Test max_concurrency control and draft_len_schedule.
+            (True, False, None, {
+                50: 4,
+                200: 3,
+                350: 2
+            }),
+            (True, False, 100, None),
+        ])
+    def test_eagle3(self, eagle3_one_model, enable_chunked_prefill,
+                    max_concurrency, draft_len_schedule):
+        max_draft_len = 4
+        cuda_graph_config = CudaGraphConfig(
+            max_batch_size=500
+            if draft_len_schedule or max_concurrency is not None else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not eagle3_one_model,
-            cuda_graph_config=CudaGraphConfig(),
+            cuda_graph_config=cuda_graph_config,
         )
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -3919,10 +3938,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
         target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
 
-        draft_len = 4
-        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=eagle3_one_model)
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=eagle_model_dir,
+            eagle3_one_model=eagle3_one_model,
+            max_concurrency=max_concurrency,
+            draft_len_schedule=draft_len_schedule)
 
         llm = LLM(model=target_model_dir,
                   **pytorch_config,

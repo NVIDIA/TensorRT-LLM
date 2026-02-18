@@ -343,7 +343,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        self.num_tokens -= (self.num_generations) * self.max_draft_len
+        self.num_tokens -= (self.num_generations) * self.runtime_draft_len
 
     def maybe_capture_hidden_states(
             self,
@@ -403,6 +403,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
+
     def forward(self,
                 input_ids,
                 position_ids,
@@ -412,6 +413,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 spec_metadata,
                 draft_model,
                 resource_manager=None):
+
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        # skip the draft forward if the runtime draft length is 0
+        if runtime_draft_len == 0:
+            return self.skip_drafting(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model)
+
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -438,7 +447,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata=spec_metadata,
             draft_model=draft_model)
 
-        # Predict draft tokens
         next_draft_tokens = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
@@ -447,11 +455,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             resource_manager)
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i in range(self.max_draft_len):
+            for i in range(runtime_draft_len):
                 if i == 0:
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *
-                        (self.max_draft_len + 1)).long()
+                        (runtime_draft_len + 1)).long()
                     gather_ids_gen = (start_ids_gen +
                                       num_accepted_tokens[num_contexts:] - 1 +
                                       attn_metadata.num_ctx_tokens)
@@ -513,7 +521,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     # update kv_lens_cuda
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            self.max_draft_len -
+                            runtime_draft_len -
                             num_accepted_tokens[num_contexts:])
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
@@ -559,11 +567,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        # Reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens, self.max_draft_len)
-
-        # Use base implementation for strict acceptance
+            num_gens, spec_metadata.runtime_draft_len)
         return self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
@@ -620,7 +625,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             accepted_tokens, num_contexts)
 
         # generation
-        input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
+        input_ids_gen = accepted_tokens[
+            num_contexts:, :spec_metadata.runtime_draft_len + 1].flatten()
 
         # get draft inputs
         input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
