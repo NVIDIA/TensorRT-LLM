@@ -122,6 +122,15 @@ class BatchedLogitsProcessor(ABC):
         pass  # noqa
 
 
+DEFAULT_SAMPLING_PARAMS: dict = {
+    "repetition_penalty": 1.0,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+}
+
+
 @dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """Sampling parameters for text generation.
@@ -427,6 +436,19 @@ class SamplingParams:
                     self.stop_token_ids.append(stop_token)
             if not self.stop_token_ids:
                 self.stop_token_ids = None
+
+        # load default sampling params from generation_config or defaults if not set by user
+        for key, default_value in DEFAULT_SAMPLING_PARAMS.items():
+            if getattr(self, key) is None:
+                try:
+                    value = generation_config[key]
+                except (KeyError, TypeError):
+                    value = default_value
+
+                setattr(self, key, value)
+
+        # re-validate after loading from generation_config to catch invalid values
+        self._validate()
 
         return self
 
