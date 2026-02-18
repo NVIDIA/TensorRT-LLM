@@ -504,8 +504,7 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.architectures[
-                        0] == "DeepseekV32ForCausalLM":
+                if pretrained_config.architectures[0] in ("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"):
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
                     if sparse_attention_config:
