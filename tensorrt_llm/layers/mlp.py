@@ -106,6 +106,7 @@ class MLP(Module):
         dtype=None,
         tp_group=None,
         tp_size=1,
+        tp_rank=0,
         quant_mode=QuantMode(0),
         inner_layernorm=False,
         eps=1e-05,
@@ -134,7 +135,27 @@ class MLP(Module):
                               dtype=dtype,
                               tp_group=tp_group,
                               tp_size=tp_size,
+                              tp_rank=tp_rank,
                               is_expert=is_expert)
+        
+        # self.fc = ColumnLinear(
+        #     hidden_size,
+        #     fc_output_size,
+        #     bias=bias,
+        #     dtype=dtype,
+        #     tp_group=tp_group,
+        #     tp_size=tp_size,
+        #     # TODO (williamj): disable it once self.proj can be sharded correctly.
+        #     gather_output=True)
+        # self.proj = RowLinear(
+        #     ffn_hidden_size,
+        #     hidden_size,
+        #     bias=bias,
+        #     dtype=dtype,
+        #     # TODO (williamj): use tensor parallel for self.proj.
+        #     tp_group=1,
+        #     tp_size=1,
+        #     is_expert=is_expert)
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
@@ -275,6 +296,7 @@ class FusedGatedMLP(Module):
         dtype=None,
         tp_group=None,
         tp_size=1,
+        tp_rank=0,
         quant_mode=QuantMode(0),
         inner_layernorm=False,
         eps=1e-05,
@@ -288,6 +310,7 @@ class FusedGatedMLP(Module):
         self.dtype = dtype
         self.tp_group = tp_group
         self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.quant_mode = quant_mode
 
         self.fused_fc = ColumnLinear(
@@ -307,6 +330,7 @@ class FusedGatedMLP(Module):
                               dtype=dtype,
                               tp_group=tp_group,
                               tp_size=tp_size,
+                              tp_rank=tp_rank,
                               is_expert=is_expert)
 
         # see optimize_model's add_lora for LoRA initialization

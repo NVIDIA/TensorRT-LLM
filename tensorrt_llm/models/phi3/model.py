@@ -25,6 +25,11 @@ class Phi3DecoderLayer(Module):
         self.layer_idx = layer_idx
         tp_group = config.mapping.tp_group
         tp_size = config.mapping.tp_size
+        tp_rank = config.mapping.tp_rank
+
+        import os
+        mpi_rank = int(os.environ.get('OMPI_COMM_WORLD_RANK', '0'))
+        print(f"[LAYER {layer_idx}] MPI RANK: {mpi_rank}, MAPPING TP_RANK: {tp_rank}, TP_SIZE: {tp_size}")
 
         attention_mask_type = AttentionMaskType.causal
         block_sparse_attn_params = BlockSparseAttnParams()
@@ -131,6 +136,7 @@ class Phi3DecoderLayer(Module):
                           dtype=config.dtype,
                           tp_group=tp_group,
                           tp_size=tp_size,
+                          tp_rank=tp_rank,
                           quant_mode=config.quant_mode,
                           bias=self.small_variant,
                           **mlp_kwargs)
@@ -168,7 +174,8 @@ class Phi3DecoderLayer(Module):
                 lora_layer_params=lora_layer_params)
         else:
             feed_forward_hidden_states = self.mlp(
-                post_attention_output, lora_layer_params=lora_layer_params)
+                post_attention_output, 
+                lora_layer_params=lora_layer_params)
         hidden_states = post_attention_input + feed_forward_hidden_states
         if use_cache:
             return (hidden_states, presents)

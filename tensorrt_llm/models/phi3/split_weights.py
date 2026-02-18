@@ -194,6 +194,8 @@ def split_weights_tp(config, weights, dtype):
             mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(
                 weights, prefix, dtype)
             split_v = split_matrix_tp(mlp_proj_weight, tp_size, rank, dim=1)
+            # # TODO: make it tensor parallel.
+            # split_v = split_matrix_tp(mlp_proj_weight, 1, 0, dim=1)
             weights.update(get_quant_weight(split_v, prefix, mlp_proj_bias))
         else:
             mlp_proj_weight = get_weight(weights, prefix, dtype)
