@@ -797,6 +797,25 @@ class ADEngine(ModelEngine):
             _ungathered_input_ids=new_tokens.flatten() if new_tokens is not None else None,
             **extra_args,
         )
+        # scatter the new tokens into the input_ids tensor if provided
+        if new_tokens is not None:
+            self.cache_seq_interface.info.rescatter_input_ids(new_tokens.flatten())
+
+        # Set padded_num_tokens for piecewise CG bucket alignment (prefill/mixed only).
+        # This makes _shape_for_forward return tensors sized to the bucket, while
+        # batch_info_host and other metadata stay unchanged for correct dynamic op behavior.
+        seq_info = self.cache_seq_interface.info
+        if not seq_info.is_generate and seq_info.piecewise_bucket_sizes:
+            total_tokens = seq_info.total_num_tokens
+            bucket = seq_info.find_nearest_piecewise_bucket(total_tokens)
+            if bucket is not None and bucket > total_tokens:
+                seq_info.padded_num_tokens = bucket
+                # Clear padded tails so bucketed piecewise replay never sees stale
+                # values (e.g. overlap-scheduler dummy tokens like -1) in embedding.
+                seq_info.named_args["input_ids"][:, total_tokens:bucket].fill_(0)
+                seq_info.named_args["position_ids"][:, total_tokens:bucket].fill_(0)
+
+        self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
 
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
@@ -814,6 +833,16 @@ class ADEngine(ModelEngine):
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
+
+        # Reset piecewise padding after forward and truncate logits to real token count.
+        seq_info = self.cache_seq_interface.info
+        padded = seq_info.padded_num_tokens
+        if padded is not None:
+            real_tokens = seq_info.total_num_tokens
+            # Truncate logits from [1, padded, vocab] to [1, real, vocab]
+            logits = logits[:, :real_tokens, :]
+            seq_info.padded_num_tokens = None
+
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.

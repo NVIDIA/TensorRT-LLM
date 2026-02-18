@@ -119,6 +119,10 @@ def _cuda_cached_causal_conv1d(
             pad_slot_id=PAD_SLOT_ID,
         )
 
+    # Zero padding positions beyond valid tokens (for piecewise CUDA graph)
+    if num_total_tokens < bs:
+        inp_flat[num_total_tokens:].zero_()
+
 
 @_cuda_cached_causal_conv1d.register_fake
 def _cuda_cached_causal_conv1d_fake(
