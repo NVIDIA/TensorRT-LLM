@@ -809,6 +809,10 @@ class ADEngine(ModelEngine):
             bucket = seq_info.find_nearest_piecewise_bucket(total_tokens)
             if bucket is not None and bucket > total_tokens:
                 seq_info.padded_num_tokens = bucket
+                # Clear padded tails so bucketed piecewise replay never sees stale
+                # values (e.g. overlap-scheduler dummy tokens like -1) in embedding.
+                seq_info.named_args["input_ids"][:, total_tokens:bucket].fill_(0)
+                seq_info.named_args["position_ids"][:, total_tokens:bucket].fill_(0)
 
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
