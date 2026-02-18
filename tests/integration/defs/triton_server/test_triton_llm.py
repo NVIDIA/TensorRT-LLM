@@ -3765,8 +3765,13 @@ def test_llmapi_backend_multi_instance(llm_backend_inflight_batcher_llm_root,
     with open(config_pbtxt_path, "r") as f:
         config_content = f.read()
     # Replace instance_group to have 2 instances
+    original_instance_group = "instance_group [\n  {\n    count: 1\n    kind : KIND_CPU\n  }\n]"
+    assert original_instance_group in config_content, (
+        f"Expected instance_group block not found in config.pbtxt. "
+        f"The config.pbtxt format may have changed. Content:\n{config_content[:500]}"
+    )
     config_content = config_content.replace(
-        "instance_group [\n  {\n    count: 1\n    kind : KIND_CPU\n  }\n]",
+        original_instance_group,
         "instance_group [\n  {\n    count: 2\n    kind : KIND_CPU\n  }\n]\n\nparameters {\n  key: \"gpu_device_ids\"\n  value: { string_value: \"0;0\" }\n}"
     )
     with open(config_pbtxt_path, "w") as f:
