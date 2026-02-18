@@ -12,3 +12,4 @@ kv_cache_config:
   tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
+# skip_loading_weights: true

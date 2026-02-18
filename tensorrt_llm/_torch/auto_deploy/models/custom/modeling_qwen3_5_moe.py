@@ -13,7 +13,8 @@ This implementation differs from the HuggingFace original in the following ways:
   * Unnecessary output fields have been removed.
   * The GatedDeltaNet forward is adapted from the Qwen3Next GDN patch
     (tensorrt_llm/_torch/auto_deploy/models/patches/qwen3_next.py).
-  * The MoE forward is adapted from the Qwen3Next MoE patch.
+  * The MoE implementation uses expert lists (individual nn.Linear layers per expert)
+    that directly match the checkpoint structure, dispatched via torch_moe op.
   * mRoPE cos/sin can be computed outside the export boundary (Option 3) and
     passed in as ``position_embeddings`` to allow 3D spatial position IDs for
     multimodal inputs without requiring the export graph to handle mRoPE internally.
@@ -518,18 +519,27 @@ class Qwen3_5MoeMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+class Qwen3_5MoeExpert(nn.Module):
+    """Single expert with gate, up, and down projections."""
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False)
+
+
 class Qwen3_5MoeExperts(nn.Module):
-    """Expert weights stored as fused 3D tensors.
+    """Expert weights stored as numbered expert modules.
 
-    The checkpoint stores ``gate_up_proj`` in HF format ``[gate(w1), up(w3)]``.
-    A load-time pre-hook swaps the halves so that the parameter is stored in
-    TRT-LLM format ``[up(w3), gate(w1)]``, which is what ``torch_moe_fused``
-    expects as ``w3_w1_stacked_weight``.
+    The checkpoint stores experts as fused 3D tensors:
+        - gate_up_proj: [num_experts, 2*intermediate_dim, hidden_dim] in [gate, up] order
+        - down_proj: [num_experts, hidden_dim, intermediate_dim]
 
-    Parameters:
-        gate_up_proj: shape [num_experts, 2 * intermediate_dim, hidden_dim]
-                      stored in TRT-LLM order [up(w3), gate(w1)] after loading.
-        down_proj:    shape [num_experts, hidden_dim, intermediate_dim]
+    A load hook splits these into individual expert modules with structure:
+        - {expert_id}.gate_proj.weight: [intermediate_dim, hidden_dim]
+        - {expert_id}.up_proj.weight: [intermediate_dim, hidden_dim]
+        - {expert_id}.down_proj.weight: [hidden_dim, intermediate_dim]
     """
 
     def __init__(self, config: Qwen3_5MoeTextConfig):
@@ -537,53 +547,59 @@ class Qwen3_5MoeExperts(nn.Module):
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
-        )
-        # Swap gate/up halves at load time: HF [gate, up] -> TRT-LLM [up, gate]
-        self._register_load_state_dict_pre_hook(self._swap_gate_up)
-        # If transforms materialize expert-list params under this module
-        # (w1_expert_i, w2_expert_i, w3_expert_i), populate them from stacked
-        # tensors at load time. This keeps model-specific ordering policy local.
-        self._register_load_state_dict_pre_hook(self._populate_expert_list_params)
+
+        # Register each expert as a numbered attribute (0, 1, 2, ...)
+        for i in range(self.num_experts):
+            setattr(self, str(i), Qwen3_5MoeExpert(self.hidden_dim, self.intermediate_dim))
+
+        # Register load hook to split fused checkpoint weights into expert list
+        self._register_load_state_dict_pre_hook(self._load_from_fused_checkpoint)
 
     @staticmethod
-    def _swap_gate_up(state_dict, prefix, *args):
-        key = prefix + "gate_up_proj"
-        if key in state_dict:
-            w = state_dict[key]
-            I = w.shape[1] // 2  # noqa: E741
-            state_dict[key] = torch.cat([w[:, I:, :], w[:, :I, :]], dim=1)
+    def _load_from_fused_checkpoint(state_dict, prefix, *args):
+        """Load from fused checkpoint format and split into individual experts.
 
-    def _populate_expert_list_params(self, state_dict, prefix, *args):
-        """Populate expert-list keys if they exist on this module.
+        Checkpoint format:
+            - gate_up_proj: [E, 2*I, H] with [gate, up] stacking
+            - down_proj: [E, H, I]
 
-        Assumes `gate_up_proj` is already normalized to TRT-LLM order [w3, w1]
-        (by `_swap_gate_up`) and performs structural splitting only.
+        Target format:
+            - {expert_id}.gate_proj.weight: [I, H]
+            - {expert_id}.up_proj.weight: [I, H]
+            - {expert_id}.down_proj.weight: [H, I]
         """
-        gate_key = prefix + "gate_up_proj"
-        if gate_key in state_dict:
-            w = state_dict[gate_key]
-            I = w.shape[1] // 2  # noqa: E741
-            w3, w1 = w[:, :I, :], w[:, I:, :]
-            for i in range(self.num_experts):
-                w1_name = f"w1_expert_{i}"
-                w3_name = f"w3_expert_{i}"
-                if hasattr(self, w1_name):
-                    state_dict[prefix + w1_name] = w1[i]
-                if hasattr(self, w3_name):
-                    state_dict[prefix + w3_name] = w3[i]
-
+        gate_up_key = prefix + "gate_up_proj"
         down_key = prefix + "down_proj"
+
+        if gate_up_key in state_dict:
+            # Split fused gate_up_proj: [E, 2*I, H] -> gate[E, I, H] + up[E, I, H]
+            fused = state_dict.pop(gate_up_key)
+            num_experts = fused.shape[0]
+            intermediate_dim = fused.shape[1] // 2
+
+            gate_weights = fused[:, :intermediate_dim, :]  # [E, I, H]
+            up_weights = fused[:, intermediate_dim:, :]  # [E, I, H]
+
+            # Populate individual expert gate_proj and up_proj
+            for i in range(num_experts):
+                state_dict[f"{prefix}{i}.gate_proj.weight"] = gate_weights[i]
+                state_dict[f"{prefix}{i}.up_proj.weight"] = up_weights[i]
+
         if down_key in state_dict:
-            w2 = state_dict[down_key]
-            for i in range(self.num_experts):
-                w2_name = f"w2_expert_{i}"
-                if hasattr(self, w2_name):
-                    state_dict[prefix + w2_name] = w2[i]
+            # Split down_proj: [E, H, I] -> individual [H, I]
+            fused = state_dict.pop(down_key)
+            num_experts = fused.shape[0]
+
+            for i in range(num_experts):
+                state_dict[f"{prefix}{i}.down_proj.weight"] = fused[i]
+
+    def __getitem__(self, idx: int) -> Qwen3_5MoeExpert:
+        """Allow list-like access to experts."""
+        return getattr(self, str(idx))
+
+    def __len__(self) -> int:
+        """Return number of experts."""
+        return self.num_experts
 
 
 class Qwen3_5MoeTopKRouter(nn.Module):
@@ -609,12 +625,10 @@ class Qwen3_5MoeTopKRouter(nn.Module):
 
 
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
-    """MoE block using torch_moe_fused custom op for routed experts.
+    """MoE block with expert list implementation.
 
-    Uses ``torch_moe_fused`` which accepts pre-stacked 3D weight tensors
-    directly, avoiding the overhead of slicing into per-expert lists.
-    The expert weights are stored in TRT-LLM format (gate/up halves swapped
-    at load time by ``Qwen3_5MoeExperts``).
+    Implements routed experts by iterating over selected experts and dispatching
+    tokens accordingly. Each expert is a separate nn.Linear triplet (gate, up, down).
     """
 
     def __init__(self, config: Qwen3_5MoeTextConfig):
@@ -633,13 +647,20 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # Router
         routing_weights, selected_experts = self.gate(hidden_states_flat)
 
-        # Routed experts via fused MoE (weights already in TRT-LLM format from load hook)
-        expert_output = torch.ops.auto_deploy.torch_moe_fused(
+        # Routed experts via torch_moe op with expert list weights
+        # Extract weight tensors from expert modules
+        w1_weights = [self.experts[i].gate_proj.weight for i in range(len(self.experts))]
+        w2_weights = [self.experts[i].down_proj.weight for i in range(len(self.experts))]
+        w3_weights = [self.experts[i].up_proj.weight for i in range(len(self.experts))]
+
+        expert_output = torch.ops.auto_deploy.torch_moe(
             hidden_states_flat,
             selected_experts,
             routing_weights,
-            self.experts.gate_up_proj,  # [E, 2*I, H] in [up(w3), gate(w1)] order
-            self.experts.down_proj,  # [E, H, I]
+            w1_weights,
+            w2_weights,
+            w3_weights,
+            is_gated_mlp=True,
         )
 
         # Shared expert with sigmoid gating
@@ -730,8 +751,9 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModel):
             module.dt_bias.data.fill_(1.0)
             module.A_log.data.copy_(torch.empty_like(module.A_log).uniform_(0, 16).log_())
         elif isinstance(module, Qwen3_5MoeExperts):
-            module.gate_up_proj.data.normal_(mean=0.0, std=std)
-            module.down_proj.data.normal_(mean=0.0, std=std)
+            # Expert weights are now individual nn.Linear layers in ModuleLists
+            # These are already initialized by super()._init_weights above
+            pass
         elif isinstance(module, Qwen3_5MoeTopKRouter):
             module.weight.data.normal_(mean=0.0, std=std)
 

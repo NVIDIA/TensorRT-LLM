@@ -103,8 +103,11 @@ def _init_block_weights(module, std=0.02):
     """
     for m in module.modules():
         if isinstance(m, Qwen3_5MoeExperts):
-            m.gate_up_proj.data.normal_(mean=0.0, std=std)
-            m.down_proj.data.normal_(mean=0.0, std=std)
+            # Initialize expert list weights
+            for i in range(len(m)):
+                m[i].gate_proj.weight.data.normal_(mean=0.0, std=std)
+                m[i].up_proj.weight.data.normal_(mean=0.0, std=std)
+                m[i].down_proj.weight.data.normal_(mean=0.0, std=std)
         elif isinstance(m, Qwen3_5MoeTopKRouter):
             # Use randn for non-trivial routing
             m.weight.data.normal_(mean=0.0, std=1.0)
@@ -390,7 +393,7 @@ def ref_attention_forward(module, hidden_states, position_embeddings):
 def ref_moe_forward(module, hidden_states):
     """HF-style SparseMoeBlock forward (manual expert dispatch loop).
 
-    Uses the HF Qwen3_5MoeExperts.forward dispatch logic instead of torch_moe.
+    Uses the expert list dispatch logic matching the new implementation.
     """
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states_flat = hidden_states.view(-1, hidden_dim)
@@ -402,10 +405,8 @@ def ref_moe_forward(module, hidden_states):
     router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
     router_top_value = router_top_value.to(hidden_states_flat.dtype)
 
-    # Expert dispatch (HF loop from Qwen3_5MoeExperts.forward)
-    gate_up_proj = module.experts.gate_up_proj  # [E, 2*I, H]
-    down_proj = module.experts.down_proj  # [E, H, I]
-    num_experts = module.experts.num_experts
+    # Expert dispatch using individual expert modules
+    num_experts = len(module.experts)
 
     final_hidden_states = torch.zeros_like(hidden_states_flat)
     with torch.no_grad():
@@ -414,16 +415,19 @@ def ref_moe_forward(module, hidden_states):
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
     for expert_idx in expert_hit:
-        expert_idx = expert_idx[0]
-        if expert_idx == num_experts:
+        expert_idx = expert_idx[0].item()
+        if expert_idx >= num_experts:
             continue
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states_flat[token_idx]
-        # Runtime stacked layout is [w3(up), w1(gate)] for gate_up_proj.
-        # This differs from raw HF checkpoint ordering [w1(gate), w3(up)].
-        up, gate = F.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
-        current_hidden_states = F.silu(gate) * up
-        current_hidden_states = F.linear(current_hidden_states, down_proj[expert_idx])
+
+        # Expert forward: SwiGLU with separate gate/up projections
+        expert = module.experts[expert_idx]
+        gate_output = expert.gate_proj(current_state)
+        up_output = expert.up_proj(current_state)
+        current_hidden_states = F.silu(gate_output) * up_output
+        current_hidden_states = expert.down_proj(current_hidden_states)
+
         current_hidden_states = current_hidden_states * router_top_value[token_idx, top_k_pos, None]
         final_hidden_states.index_add_(
             0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
