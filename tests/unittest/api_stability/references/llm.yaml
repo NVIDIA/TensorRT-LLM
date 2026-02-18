@@ -70,10 +70,6 @@ methods:
         default: null
         status: prototype
       # Runtime behavior
-      fail_fast_on_attention_window_too_large:
-        annotation: bool
-        default: false
-        status: prototype
       garbage_collection_gen0_threshold:
         annotation: int
         default: 20000
