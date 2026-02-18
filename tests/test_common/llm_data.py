@@ -43,6 +43,8 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3": "NVIDIA-Nemotron-Nano-31B-A3-v3",
     "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024": "Nemotron-Nano-3-30B-A3.5B-dev-1024",
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
+    "zai-org/GLM-4.7-Flash": "GLM-4.7-Flash",
+    "DeepInfra/GLM-4.7-Flash-NVFP4": "GLM-4.7-Flash-NVFP4",
     # AutoDeploy accuracy tests - overlapping with model registry
     "google/gemma-3-1b-it": "gemma/gemma-3-1b-it",
     "Qwen/QwQ-32B": "QwQ-32B",
