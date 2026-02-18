@@ -196,7 +196,7 @@ class PipelineConfig(BaseModel):
     """General pipeline configuration."""
 
     enable_torch_compile: bool = True
-    torch_compile_models: List[str] = [PipelineComponent.TRANSFORMER]
+    torch_compile_models: List[str] = []  # empty = auto detect transformer components
     torch_compile_mode: Literal["default", "max-autotune", "reduce-overhead"] = "default"
     enable_fullgraph: bool = False
     fuse_qkv: bool = True

@@ -177,7 +177,7 @@ class PipelineLoader:
         if pipeline.transformer is None:
             raise ValueError("Pipeline has no transformer component")
 
-        transformer_components = getattr(pipeline, "transformer_components", ["transformer"])
+        transformer_components = pipeline.transformer_components
         logger.info(f"Transformer components: {transformer_components}")
 
         transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
@@ -220,7 +220,9 @@ class PipelineLoader:
 
             marker = LayerwiseNvtxMarker()
             module_prefix = pipeline.__class__.__name__
-            marker.register_hooks(pipeline.transformer, module_prefix)
+            for transformer_component in transformer_components:
+                logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
+                marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
 
         logger.info(f"Pipeline loaded: {pipeline.__class__.__name__}")
         return pipeline

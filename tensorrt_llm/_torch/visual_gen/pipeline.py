@@ -9,7 +9,8 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
+from .config import PipelineComponent
+from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ class BasePipeline(nn.Module):
         self.model_config = model_config
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
+        self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -37,24 +39,40 @@ class BasePipeline(nn.Module):
         # Initialize transformer
         self._init_transformer()
 
-        # CUDA graph runner — wrap transformer.forward
+        # CUDA graph runner - wrap transformer.forward
         # Order matters: TeaCache will wrap on top of it and still call the
         # graphed transformer.forward if should_compute == True.
-        if self.model_config.pipeline.enable_cuda_graph and self.transformer is not None:
-            if self.model_config.pipeline.enable_torch_compile:
-                logger.warning(
-                    "Cuda graphs with torch compile is not supported yet. "
-                    "Only using torch compile for better performance. "
-                )
-                return
+        self._setup_cuda_graphs()
 
-            self.cuda_graph_runner = CUDAGraphRunner(
-                CUDAGraphRunnerConfig(
-                    use_cuda_graph=model_config.pipeline.enable_cuda_graph,
-                )
+    def _setup_cuda_graphs(self):
+        """Wrap all transformer components with CUDA graph capture/replay."""
+        cfg = self.model_config.pipeline
+        if not cfg.enable_cuda_graph:
+            return
+
+        if cfg.enable_torch_compile:
+            logger.warning(
+                "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
             )
-            logger.info("Cuda graph runner enabled, wrapping transformer.forward")
-            self.transformer.forward = self.cuda_graph_runner.wrap(self.transformer.forward)
+            return
+
+        if len(self.transformer_components) > 1:
+            logger.info(
+                "CUDA graph runner: multiple transformer components, using shared graph pool"
+            )
+            shared_pool = SharedGraphPool()
+        else:
+            shared_pool = None
+
+        for name in self.transformer_components:
+            model = getattr(self, name, None)
+            if model is None:
+                continue
+
+            runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True), shared_pool)
+            logger.info(f"CUDA graph runner: wrapping {name}.forward")
+            model.forward = runner.wrap(model.forward)
+            self._cuda_graph_runners[name] = runner
 
     @property
     def rank(self):
@@ -73,6 +91,11 @@ class BasePipeline(nn.Module):
     @property
     def device(self):
         return self.transformer.device
+
+    @property
+    def transformer_components(self) -> list:
+        """Return list of transformer components this pipeline needs."""
+        return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
 
     def infer(self, req: Any):
         raise NotImplementedError
@@ -155,7 +178,11 @@ class BasePipeline(nn.Module):
         pipeline_config = self.model_config.pipeline
         compile_mode = pipeline_config.torch_compile_mode
 
-        for name in pipeline_config.torch_compile_models:
+        targets = pipeline_config.torch_compile_models
+        if not targets:
+            targets = self.transformer_components
+
+        for name in targets:
             model = getattr(self, name, None)
             if model is None:
                 logger.warning(f"torch.compile: component '{name}' not found, skipping")
@@ -174,12 +201,22 @@ class BasePipeline(nn.Module):
                     for block in blocks:
                         # NOTE: dynamic=False is helpful for speed
                         compiled_blocks.append(
-                            torch.compile(block, mode=compile_mode, dynamic=False)
+                            torch.compile(
+                                block,
+                                mode=compile_mode,
+                                dynamic=False,
+                                fullgraph=pipeline_config.enable_fullgraph,
+                            )
                         )
                     setattr(model, block_name, nn.ModuleList(compiled_blocks))
             else:
                 logger.info(f"torch.compile: {name} (whole module, mode={compile_mode})")
-                compiled = torch.compile(model, mode=compile_mode, dynamic=False)
+                compiled = torch.compile(
+                    model,
+                    mode=compile_mode,
+                    dynamic=False,
+                    fullgraph=pipeline_config.enable_fullgraph,
+                )
                 setattr(self, name, compiled)
 
     @staticmethod
@@ -657,3 +694,9 @@ class BasePipeline(nn.Module):
                     )
 
         return (latents, extra_stream_latents) if has_extra_streams else latents
+
+    def cleanup(self):
+        """Call before dist.destroy_process_group()."""
+        for name, runner in self._cuda_graph_runners.items():
+            logger.info(f"Releasing CUDA graphs for {name}")
+            runner.clear()

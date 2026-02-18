@@ -80,6 +80,7 @@ class DiffusionExecutor:
         self.device_id = device_id
         self.diffusion_config = diffusion_config
 
+        self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
         self.rank = dist.get_rank()
         self.response_queue = queue.Queue()
@@ -239,6 +240,8 @@ def run_diffusion_worker(
             diffusion_config=diffusion_config,
         )
         executor.serve_forever()
+        if executor.pipeline is not None:
+            executor.pipeline.cleanup()
         dist.destroy_process_group()
 
     except Exception as e:

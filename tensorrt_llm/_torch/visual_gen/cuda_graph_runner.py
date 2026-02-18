@@ -27,6 +27,18 @@ class CUDAGraphRunnerConfig:
     cuda_graph_mem_pool: Any = None
 
 
+class SharedGraphPool:
+    """Mutable container for sharing a CUDA graph memory pool across multiple runners.
+
+    When multiple CUDAGraphRunners wrap different models that never execute
+    concurrently (e.g., WAN 2.2 high-noise / low-noise transformers), sharing
+    a pool lets CUDA alias memory between their graphs, avoiding duplication.
+    """
+
+    def __init__(self):
+        self.handle = None
+
+
 class CUDAGraphRunner:
     """
     Manages CUDA graph lifecycle for visual generation.
@@ -43,9 +55,10 @@ class CUDAGraphRunner:
 
     WARMUP_STEPS = 2
 
-    def __init__(self, config: CUDAGraphRunnerConfig):
+    def __init__(self, config: CUDAGraphRunnerConfig, shared_pool: SharedGraphPool = None):
         self.config = config
         self.enabled = config.use_cuda_graph
+        self._shared_pool = shared_pool
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType, Any] = {}  # weak refs
@@ -62,6 +75,12 @@ class CUDAGraphRunner:
             )
         )
         return input_shapes
+
+    def _get_pool(self):
+        """Return the best available pool: shared first, then own, then None."""
+        if self._shared_pool is not None and self._shared_pool.handle is not None:
+            return self._shared_pool.handle
+        return self.memory_pool
 
     def capture(
         self, key: KeyType, fn: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]
@@ -81,13 +100,17 @@ class CUDAGraphRunner:
             gc.collect()
             torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self.memory_pool):
+        with torch.cuda.graph(graph, pool=self._get_pool()):
             output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
+
+        # Publish pool so other runners sharing the same SharedGraphPool can reuse it
+        if self._shared_pool is not None and self._shared_pool.handle is None:
+            self._shared_pool.handle = self.memory_pool
 
     def replay(
         self,
@@ -136,16 +159,13 @@ class CUDAGraphRunner:
 
         return wrapper
 
-    def __del__(self):
-        self.clear()
-
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        if not self.graphs:
+            return
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
         self.graph_outputs.clear()
         self.static_inputs.clear()
-        del self.memory_pool
         self.memory_pool = None
-        torch.cuda.empty_cache()

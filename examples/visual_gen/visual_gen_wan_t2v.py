@@ -139,7 +139,7 @@ def parse_args():
         "--torch_compile_models",
         type=str,
         nargs="+",
-        default=["transformer"],
+        default=[],  # empty = auto detect transformer components
         help="Torch compile models",
     )
     parser.add_argument(

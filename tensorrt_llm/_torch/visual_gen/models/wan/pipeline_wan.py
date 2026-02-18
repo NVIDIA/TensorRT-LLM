@@ -254,6 +254,9 @@ class WanPipeline(BasePipeline):
             "1.3B": (480, 832, 33),
         }
         fallback = (720, 1280, 81)  # TODO: make this better
+        if self.is_wan22:
+            # Double warmup steps to also warmup the 2nd transformer
+            warmup_steps = warmup_steps * 2
 
         checkpoint_path = getattr(self.model_config.pretrained_config, "_name_or_path", "") or ""
         height, width, num_frames = fallback
@@ -275,6 +278,7 @@ class WanPipeline(BasePipeline):
                 num_inference_steps=warmup_steps,
                 guidance_scale=5.0,
                 seed=0,
+                max_sequence_length=512,  # should match DiffusionRequest.max_sequence_length
             )
 
     def infer(self, req):
