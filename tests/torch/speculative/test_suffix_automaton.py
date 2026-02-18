@@ -3,19 +3,12 @@
 Tests the native CUDA kernel implementation.
 """
 
-import pytest
 import torch
 
-from tensorrt_llm._torch.speculative import suffix_automaton as sa
 from tensorrt_llm._torch.speculative.suffix_automaton import (
     SAConfig,
     SuffixAutomatonManager,
 )  # noqa: I001
-
-# Skip all tests if native kernel is not available
-pytestmark = pytest.mark.skipif(
-    not sa.is_native_available(), reason="Native suffix automaton kernel not available"
-)
 
 
 class TestSuffixAutomatonManager:
@@ -577,15 +570,11 @@ class TestExtendNgram:
         manager.shutdown()
 
 
-class TestNativeKernelAvailability:
-    """Tests for native kernel availability."""
+class TestNativeKernel:
+    """Tests for native kernel."""
 
-    def test_is_native_available(self):
-        """Test native availability check."""
-        available = sa.is_native_available()
-        print(f"Native kernel available: {available}")
-        assert available, "Native kernel should be available for these tests"
-
+    def test_native_kernel(self):
+        """Test native kernel can be accessed."""
         # Verify we can access the native module
         from tensorrt_llm.bindings.internal import suffix_automaton as native
 
@@ -607,13 +596,9 @@ if __name__ == "__main__":
     print("Testing suffix automaton module (native kernel only)")
     print("=" * 60)
 
-    if not sa.is_native_available():
-        print("ERROR: Native kernel not available. Tests cannot run.")
-        exit(1)
-
-    print("\n--- Native kernel availability ---")
-    test = TestNativeKernelAvailability()
-    test.test_is_native_available()
+    print("\n--- Native kernel tests ---")
+    test = TestNativeKernel()
+    test.test_native_kernel()
 
     print("\n--- Manager tests ---")
     test = TestSuffixAutomatonManager()

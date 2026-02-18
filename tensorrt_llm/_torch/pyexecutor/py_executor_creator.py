@@ -288,10 +288,6 @@ def create_py_executor(
                 f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
                 "want to use non-greedy sampling, please set allow_advanced_sampling=True."
             )
-        elif spec_config.spec_dec_mode.is_mtp_one_model():
-            logger.warning(
-                "Advanced sampling is not supported for MTP yet - this will be added soon."
-            )
         # Check FLASHINFER compatibility with one-engine speculative decoding
         if llm_args.attn_backend == "FLASHINFER":
             raise ValueError(

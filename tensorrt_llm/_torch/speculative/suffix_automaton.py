@@ -23,23 +23,13 @@ from typing import Dict, List, Optional, Set
 
 import torch
 
+from tensorrt_llm.bindings.internal import suffix_automaton as _sa_native
+
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 
 logger = logging.getLogger(__name__)
-
-# Import native suffix automaton bindings (required)
-_sa_native = None
-try:
-    from tensorrt_llm.bindings.internal import suffix_automaton as _sa_native
-
-    logger.info("Native suffix automaton kernel available")
-except ImportError:
-    logger.error(
-        "Native suffix automaton kernel not available. "
-        "The suffix automaton module requires the native C++/CUDA kernel."
-    )
 
 
 @dataclass
@@ -421,8 +411,3 @@ class SuffixAutomatonManager(BaseResourceManager):
 
     def get_needed_resource_to_completion(self, request: LlmRequest):
         return 0
-
-
-def is_native_available() -> bool:
-    """Check if native suffix automaton kernel is available."""
-    return _sa_native is not None

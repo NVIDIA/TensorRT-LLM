@@ -30,11 +30,11 @@ def get_spec_metadata(spec_config,
                       is_draft_model=False,
                       max_seq_len=262144):
     if spec_config.spec_dec_mode.is_mtp_one_model():
-        # Create SA manager for MTP+SA if enabled
+        # Get SA manager from spec_resource_manager if MTP+SA mode
         sa_manager = None
-        if getattr(spec_config, 'use_sa_spec', False):
-            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
-                                                max_seq_len)
+        if spec_resource_manager is not None and hasattr(
+                spec_resource_manager, 'sa_manager'):
+            sa_manager = spec_resource_manager.sa_manager
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,
@@ -148,21 +148,33 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     max_num_tokens = model_engine.max_num_tokens
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
-        if spec_config.use_relaxed_acceptance_for_thinking:
+        # Create SA manager if MTP+SA mode is enabled
+        sa_manager = None
+        if getattr(spec_config, 'use_sa_spec', False):
+            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+                                                max_seq_len)
+        if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
             return MTPHiddenStatesManager(
                 spec_config,
                 model_config.torch_dtype,
                 model_config.hidden_size,
                 max_num_requests,
+                sa_manager=sa_manager,
             )
         else:
             return None
     if spec_dec_mode.is_mtp_one_model():
+        # Create SA manager if MTP+SA mode is enabled
+        sa_manager = None
+        if getattr(spec_config, 'use_sa_spec', False):
+            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+                                                max_seq_len)
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
+            sa_manager=sa_manager,
         )
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."

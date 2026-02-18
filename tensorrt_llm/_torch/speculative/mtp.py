@@ -43,14 +43,20 @@ class SampleStateMTP(SampleState[SampleStateTensorsMTP, SampleStateTensorsMTP]):
 
 class MTPHiddenStatesManager(BaseResourceManager):
 
-    def __init__(self, config: "MTPDecodingConfig", dtype: torch.dtype,
-                 hidden_size: int, max_num_requests: int):
+    def __init__(self,
+                 config: "MTPDecodingConfig",
+                 dtype: torch.dtype,
+                 hidden_size: int,
+                 max_num_requests: int,
+                 sa_manager=None):
         self.dtype = dtype
         self.num_nextn_predict_layers = config.num_nextn_predict_layers
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
         self.slot_manager = SlotManager(max_num_requests)
+        # Optional SA manager for MTP+SA mode
+        self.sa_manager = sa_manager
 
         # Since golden token's hidden state will always be generated after target model
         self.mtp_past_hidden_states_pool = torch.zeros(
@@ -90,13 +96,19 @@ class MTPHiddenStatesManager(BaseResourceManager):
             self.mtp_relaxed_delta_pool[free_slot_id].copy_(0,
                                                             non_blocking=True)
         self.slot_manager.remove_slot(request.request_id)
+        if self.sa_manager is not None:
+            self.sa_manager.remove_request(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
             self.slot_manager.add_slot(rid)
+        if self.sa_manager is not None:
+            self.sa_manager.add_dummy_requests(request_ids)
 
     def shutdown(self):
         self.slot_manager.shutdown()
+        if self.sa_manager is not None:
+            self.sa_manager.shutdown()
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
@@ -1224,7 +1236,6 @@ class MTPWorker(SpecWorkerBase):
 
         # select between MTP draft tokens and SA draft tokens
         # Check sa_match_len is not None to handle case where use_sa_spec is True
-        # but sa_manager was None during sample_and_accept_draft_tokens
         if self.spec_config.use_sa_spec and self.sa_match_len is not None and (
                 num_gens := self.sa_match_len.shape[0]) > 0:
             num_contexts = draft_tokens.shape[0] - num_gens
