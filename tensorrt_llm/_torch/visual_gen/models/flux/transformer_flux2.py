@@ -21,16 +21,16 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.models.flux.attention_flux2 import (
+from tensorrt_llm._torch.visual_gen.models.flux.attention import (
     Flux2ParallelSelfAttention,
     Flux2PosEmbed,
     Flux2SwiGLU,
+    FluxJointAttention,
 )
 from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     AdaLayerNormContinuous,
     _remap_checkpoint_keys,
 )
-from tensorrt_llm._torch.visual_gen.modules.attention import FluxJointAttention
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -385,16 +385,12 @@ class Flux2SingleTransformerBlock(nn.Module):
 
         # Parallel attention with fused QKV+MLP
         self.attn = Flux2ParallelSelfAttention(
-            query_dim=dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
+            hidden_size=dim,
+            num_attention_heads=num_attention_heads,
+            head_dim=attention_head_dim,
             mlp_ratio=mlp_ratio,
             bias=bias,
             eps=eps,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
             config=config,
             layer_idx=layer_idx,
         )

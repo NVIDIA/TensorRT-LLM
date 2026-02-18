@@ -30,8 +30,8 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
-from tensorrt_llm._torch.visual_gen.modules.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 
 if TYPE_CHECKING:
