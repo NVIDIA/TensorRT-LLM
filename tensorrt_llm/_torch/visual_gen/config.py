@@ -197,6 +197,9 @@ class TeaCacheConfig(BaseModel):
 class PipelineConfig(BaseModel):
     """General pipeline configuration."""
 
+    enable_torch_compile: bool = True
+    torch_compile_models: str = PipelineComponent.TRANSFORMER
+    torch_compile_mode: str = "default"
     fuse_qkv: bool = True
 
     # Offloading Config

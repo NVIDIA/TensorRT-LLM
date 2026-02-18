@@ -33,10 +33,9 @@ Before running these examples, ensure you have:
    e.g.
 
    ```bash
+   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
-   trtllm-serve $LLM_MODEL_DIR/LTX-2 --extra_visual_gen_options ./configs/ltx2.yml
-   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml
 
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml > /tmp/serve.log 2>&1 &
@@ -50,10 +49,9 @@ Before running these examples, ensure you have:
 
 Current supported & tested models:
 
-1. FLUX.1 for image generation (t2i)
-2. FLUX.2 for image generation (t2i)
-3. WAN T2V/I2V for video generation (t2v, ti2v, delete_video)
-4. LTX2 for video generation with audio (t2v, delete_video)
+1. WAN T2V/I2V for video generation (t2v, ti2v, delete_video)
+2. FLUX.1 for image generation (t2i)
+3. FLUX.2 for image generation (t2i)
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 

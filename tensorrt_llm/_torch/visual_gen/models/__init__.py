@@ -20,8 +20,6 @@ Example structure:
 from ..pipeline import BasePipeline
 from ..pipeline_registry import AutoPipeline, register_pipeline
 from .flux import Flux2Pipeline, FluxPipeline
-
-# from .ltx2 import LTX2Pipeline  # Temporarily disabled due to diffusers import issue
 from .wan import WanImageToVideoPipeline, WanPipeline
 
 __all__ = [
@@ -29,7 +27,6 @@ __all__ = [
     "BasePipeline",
     "FluxPipeline",
     "Flux2Pipeline",
-    # "LTX2Pipeline",  # Temporarily disabled
     "WanPipeline",
     "WanImageToVideoPipeline",
     "register_pipeline",

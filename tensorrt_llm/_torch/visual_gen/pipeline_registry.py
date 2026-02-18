@@ -100,7 +100,6 @@ class AutoPipeline:
                 if "Flux" in transformer_class:
                     return "FluxPipeline"
 
-
         raise ValueError(
             f"Cannot detect pipeline type for {checkpoint_dir}\n"
             f"Expected model_index.json with '_class_name' field at: {index_path}"
