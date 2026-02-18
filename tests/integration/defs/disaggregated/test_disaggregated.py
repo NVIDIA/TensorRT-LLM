@@ -22,6 +22,7 @@ import tempfile
 import time
 from collections import namedtuple
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 import yaml
@@ -36,8 +37,8 @@ from defs.common import parse_gsm8k_output, wait_for_server
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell)
 from defs.trt_test_alternative import check_call, check_output, print_info
-from disagg_test_utils import (run_ctx_worker, run_disagg_server,
-                               run_gen_worker, terminate,
+from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
+                               run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
@@ -75,7 +76,9 @@ def get_default_disagg_cluster_config():
     }
 
 
-def build_worker_config(base_config, server_type_config, disagg_cluster):
+def build_worker_config(base_config: dict[str, Any],
+                        server_type_config: dict[str, Any],
+                        disagg_cluster: dict[str, Any]) -> dict[str, Any]:
     """
     Build worker configuration by merging base config with server-type specific config.
 
@@ -433,7 +436,12 @@ def fetch_prometheus_metrics(server_url: str):
     return response.text
 
 
-def setup_disagg_cluster(config_file, model_name=None, env=None):
+def setup_disagg_cluster(
+    config_file: str,
+    model_name: str | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
+           ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
 
     Args:
@@ -482,7 +490,7 @@ def setup_disagg_cluster(config_file, model_name=None, env=None):
     next_device = 0
 
     for i in range(num_ctx_instances):
-        ",".join(str(next_device + j) for j in range(gpus_per_ctx))
+        device_ids = ",".join(str(next_device + j) for j in range(gpus_per_ctx))
         ctx_workers.append(
             run_ctx_worker(model,
                            ctx_worker_config,
@@ -493,7 +501,7 @@ def setup_disagg_cluster(config_file, model_name=None, env=None):
         next_device += gpus_per_ctx
 
     for i in range(num_gen_instances):
-        ",".join(str(next_device + j) for j in range(gpus_per_gen))
+        device_ids = ",".join(str(next_device + j) for j in range(gpus_per_gen))
         gen_workers.append(
             run_gen_worker(model,
                            gen_worker_config,
@@ -1428,7 +1436,26 @@ def run_disaggregated_aiperf(config_file,
                              threshold=0.8,
                              env=None,
                              cwd=None):
-    """Run disaggregated test with genai-perf for performance/stress testing."""
+    """Run disaggregated test with genai-perf for performance/stress testing.
+
+    Args:
+        config_file: Path to disaggregated server config YAML
+        model_path: Path to model for tokenizer
+        server_start_timeout: Timeout in seconds for server startup
+        input_tokens: Mean synthetic input tokens
+        output_tokens: Mean output tokens to generate
+        concurrency: Number of concurrent requests
+        endpoint_type: 'chat' or 'completions'
+        request_count: Total requests (if None, uses concurrency*1024 or num_dataset_entries)
+        warmup_request_count: Number of warmup requests
+        streaming: Whether to use streaming mode
+        random_seed: Random seed for reproducibility
+        accuracy_test: Whether to run accuracy test
+        threshold: Threshold for accuracy test
+        env: Environment variables dict
+        cwd: Working directory
+    """
+
     cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib,gdr_copy"
