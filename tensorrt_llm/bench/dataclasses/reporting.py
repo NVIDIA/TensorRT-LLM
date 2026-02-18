@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections import defaultdict
-from typing import Any, Dict, List, NamedTuple
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -43,7 +43,7 @@ class StatsKeeper:
     def __init__(self) -> None:
         self.requests: Dict[int, RequestRecord] = defaultdict(RequestRecord)
         self.num_complete: int = 0
-        self.total_energy: float = 0.0
+        self.total_energy: Optional[float] = None
 
     def register_request(
         self,
@@ -81,7 +81,7 @@ class StatsKeeper:
         if request_perf_item.response_is_final:
             self.num_complete = self.num_complete + 1
 
-    def set_energy(self, energy: float):
+    def set_energy(self, energy: Optional[float]):
         """Set the total energy for the benchmark."""
         self.total_energy = energy
 
