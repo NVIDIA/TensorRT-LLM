@@ -1317,14 +1317,14 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             addBlockToAllBeams(matchingBlock, sequence);
             // TODO: only add once for reused blocks
             ++mReusedBlocks;
-            if (!reusedBlockIds.count(matchingBlockId))
+            if (!mReusedBlockIds.count(matchingBlockId))
             {
-                reusedBlockIds.insert(matchingBlockId);
+                mReusedBlockIds.insert(matchingBlockId);
                 ++mReusedUniqueBlocks;
             }
             ++blockItr;
         }
-        else
+        else // matchingBlock == nullptr || numMatchedTokens + numMatched > sequence.getCurrentPrepopulatedPromptLen()
         {
             // If we haven't set a priority, set it to the default priority level (low)
             auto freeBlock = getFreeBlock(sequence,
