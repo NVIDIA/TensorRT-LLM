@@ -1,3 +1,9 @@
+# fmt: off
+# isort: off
+import json
+import math
+import os
+import shutil
 import tempfile
 from dataclasses import is_dataclass
 from enum import Enum
@@ -33,11 +39,16 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
                                           PeftCacheConfig, PybindMirror,
-                                          RayPlacementConfig, SpeculativeConfig,
+                                          RayPlacementConfig,
+                                          SkipSoftmaxAttentionConfig,
+                                          SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
                                           TorchLlmArgs, TrtLlmArgs,
                                           UserProvidedDecodingConfig,
+                                          _compute_skip_softmax_thresholds_from_checkpoint,
+                                          _resolve_sparse_attention_config,
                                           update_llm_args_with_extra_dict)
+# isort: on
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
@@ -1501,3 +1512,155 @@ class TestPydanticBestPractices:
                 + "\n".join(violations) +
                 "\n\nThese should be replaced with alternatives like validators, model_post_init, or classmethods. See this test's docstring for more details."
             )
+
+
+class TestSkipSoftmaxSparseAttentionConfig:
+    """Unit tests for skip softmax sparse attention with target_sparsity_ratio."""
+
+    def test_resolve_with_threshold_scale_factor_only(self):
+        """When threshold_scale_factor is provided, use it (no checkpoint needed)."""
+        data = {
+            "algorithm": "skip_softmax",
+            "threshold_scale_factor": {"prefill": 1000.0, "decode": 500.0},
+        }
+        cfg = _resolve_sparse_attention_config(data, model_path=None)
+        assert isinstance(cfg, SkipSoftmaxAttentionConfig)
+        assert cfg.threshold_scale_factor_prefill == 1000.0
+        assert cfg.threshold_scale_factor_decode == 500.0
+
+    def test_resolve_with_threshold_scale_factor_takes_precedence(self):
+        """When both threshold_scale_factor and target_sparsity_ratio exist, use threshold_scale_factor."""
+        data = {
+            "algorithm": "skip_softmax",
+            "threshold_scale_factor": {"prefill": 111.0, "decode": 222.0},
+            "target_sparsity_ratio": 0.8,
+        }
+        cfg = _resolve_sparse_attention_config(data, model_path="/some/path")
+        assert isinstance(cfg, SkipSoftmaxAttentionConfig)
+        assert cfg.threshold_scale_factor_prefill == 111.0
+        assert cfg.threshold_scale_factor_decode == 222.0
+
+    def test_compute_thresholds_from_checkpoint(self):
+        """Compute prefill/decode thresholds from checkpoint config and target_sparsity_ratio."""
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            config = {
+                "sparse_attention_config": {
+                    "threshold_scale_factor": {
+                        "prefill": {"a": 0.00007, "b": 7.929109},
+                        "decode": {"a": 0.00007, "b": 16.9025},
+                    }
+                }
+            }
+            with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+                json.dump(config, f)
+            prefill_t, decode_t = _compute_skip_softmax_thresholds_from_checkpoint(
+                tmp_dir, target_sparsity_ratio=0.5
+            )
+            expected_prefill = 0.00007 * math.exp(7.929109 * 0.5)
+            expected_decode = 0.00007 * math.exp(16.9025 * 0.5)
+            assert abs(prefill_t - expected_prefill) < 1e-9
+            assert abs(decode_t - expected_decode) < 1e-9
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_resolve_with_target_sparsity_ratio_and_checkpoint(self):
+        """Resolve target_sparsity_ratio using checkpoint config.json."""
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            config = {
+                "sparse_attention_config": {
+                    "threshold_scale_factor": {
+                        "prefill": {"a": 0.00007, "b": 7.929109},
+                        "decode": {"a": 0.00007, "b": 16.9025},
+                    }
+                }
+            }
+            with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+                json.dump(config, f)
+            data = {
+                "algorithm": "skip_softmax",
+                "target_sparsity_ratio": 0.5,
+            }
+            cfg = _resolve_sparse_attention_config(data, model_path=tmp_dir)
+            assert isinstance(cfg, SkipSoftmaxAttentionConfig)
+            expected_prefill = 0.00007 * math.exp(7.929109 * 0.5)
+            expected_decode = 0.00007 * math.exp(16.9025 * 0.5)
+            assert abs(cfg.threshold_scale_factor_prefill - expected_prefill) < 1e-9
+            assert abs(cfg.threshold_scale_factor_decode - expected_decode) < 1e-9
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_resolve_target_sparsity_ratio_without_model_path_raises(self):
+        """Using target_sparsity_ratio without model path must raise."""
+        data = {
+            "algorithm": "skip_softmax",
+            "target_sparsity_ratio": 0.8,
+        }
+        with pytest.raises(ValueError, match="Model path is required"):
+            _resolve_sparse_attention_config(data, model_path=None)
+        with pytest.raises(ValueError, match="Model path is required"):
+            _resolve_sparse_attention_config(data, model_path="")
+
+    def test_compute_thresholds_missing_checkpoint_structure_raises(self):
+        """Checkpoint without sparse_attention_config.threshold_scale_factor must raise."""
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            # config.json with no sparse_attention_config
+            with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+                json.dump({"architecture": "LlamaForCausalLM"}, f)
+            with pytest.raises(ValueError, match="sparse_attention_config.threshold_scale_factor"):
+                _compute_skip_softmax_thresholds_from_checkpoint(tmp_dir, 0.5)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_update_llm_args_with_sparse_attention_threshold_scale_factor(self):
+        """update_llm_args_with_extra_dict with sparse_attention_config (threshold_scale_factor)."""
+        yaml_content = """
+sparse_attention_config:
+  algorithm: skip_softmax
+  threshold_scale_factor:
+    prefill: 1000.0
+    decode: 500.0
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            dict_content = yaml.safe_load(open(f.name))
+        llm_args = TrtLlmArgs(model=llama_model_path).model_dump()
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args, dict_content)
+        cfg = llm_args_dict["sparse_attention_config"]
+        assert isinstance(cfg, SkipSoftmaxAttentionConfig)
+        assert cfg.threshold_scale_factor_prefill == 1000.0
+        assert cfg.threshold_scale_factor_decode == 500.0
+
+    def test_update_llm_args_with_sparse_attention_target_sparsity_ratio(self):
+        """update_llm_args_with_extra_dict with target_sparsity_ratio and model path."""
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            config = {
+                "sparse_attention_config": {
+                    "threshold_scale_factor": {
+                        "prefill": {"a": 0.00007, "b": 7.929109},
+                        "decode": {"a": 0.00007, "b": 16.9025},
+                    }
+                }
+            }
+            with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+                json.dump(config, f)
+            yaml_content = """
+sparse_attention_config:
+  algorithm: skip_softmax
+  target_sparsity_ratio: 0.8
+"""
+            dict_content = yaml.safe_load(yaml_content)
+            llm_args = TrtLlmArgs(model=tmp_dir).model_dump()
+            llm_args_dict = update_llm_args_with_extra_dict(llm_args, dict_content)
+            cfg = llm_args_dict["sparse_attention_config"]
+            assert isinstance(cfg, SkipSoftmaxAttentionConfig)
+            expected_prefill = 0.00007 * math.exp(7.929109 * 0.8)
+            expected_decode = 0.00007 * math.exp(16.9025 * 0.8)
+            assert abs(cfg.threshold_scale_factor_prefill - expected_prefill) < 1e-6
+            assert abs(cfg.threshold_scale_factor_decode - expected_decode) < 1e-6
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
