@@ -201,12 +201,12 @@ class BenchmarkStatistics(BaseModel):
 
     @computed_field
     def output_token_per_j(self) -> Optional[float]:
-        if self.total_energy is None:
+        if not self.total_energy:
             return None
         return float(self.total_output_tokens / self.total_energy)
 
     @computed_field
     def total_gpu_power(self) -> Optional[float]:
-        if self.total_energy is None:
+        if not self.total_energy or not self.total_latency_ns:
             return None
         return float((self.total_energy * 1e9) / self.total_latency_ns)
