@@ -455,8 +455,8 @@ class DiffusionModelConfig(BaseModel):
         # This allows simple configs like {"quant_algo": "FP8"} to work.
         if quant_algo is not None and not quant_config_dict.get("config_groups"):
             dynamic_weight_quant = quant_config_dict.get("dynamic", True)
-            # NVFP4 is W4A4 format - requires dynamic activation quantization too
-            # when using dynamic mode (since input_scale is not calibrated)
+            # NVFP4 requires dynamic activation quantization when using dynamic mode
+            # since input_scale is not calibrated
             if quant_algo == QuantAlgo.NVFP4 and dynamic_weight_quant:
                 dynamic_activation_quant = True
 

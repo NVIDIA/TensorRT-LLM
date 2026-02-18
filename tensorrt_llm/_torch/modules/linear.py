@@ -1194,7 +1194,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                  requires_grad=False)
 
-        # Global weight scale: amax_weight / (448*6) (ModelOpt convention)
+        # Global weight scale: amax_weight / (448*6)
         # Used for dynamic activation quantization to compute alpha at runtime
         module.weight_scale_2 = Parameter(torch.empty([1], dtype=torch.float32),
                                           requires_grad=False)
@@ -1304,14 +1304,7 @@ class NVFP4LinearMethod(LinearMethodBase):
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
                                tp_group: List[int]):
-        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
-        # GEMM ops require 2D matrices
-        original_shape = input.shape
-        if input.dim() > 2:
-            input = input.reshape(-1, input.shape[-1])
-
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
-
         output = torch.ops.trtllm.nvfp4_gemm_allreduce(act_fp4, module.weight,
                                                        act_sf,
                                                        module.weight_scale,
@@ -1320,10 +1313,6 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
-
-        # Reshape output back to original shape (with out_features as last dim)
-        if len(original_shape) > 2:
-            output = output.reshape(*original_shape[:-1], output.shape[-1])
 
         if bias is not None:
             output = output + bias
@@ -1370,8 +1359,7 @@ class NVFP4LinearMethod(LinearMethodBase):
                 if weight_scale_2 is None:
                     weight_scale_2 = ws2
                 else:
-                    # Take max for fused weights (like FP8 rescale_fused_weights)
-                    # Block scales already capture per-element variations
+                    # Take max for fused weights
                     weight_scale_2 = torch.maximum(weight_scale_2, ws2)
 
         # Compute scaling factor and alpha required by GEMM kernels
@@ -1399,10 +1387,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         assert len(weights) == 1
         weight_scale = weight_scale[0]
-        # Swizzle weight scale - skip for dynamically quantized weights (already in correct layout)
-        if not weights[0].get("_skip_scale_interleave", False):
-            weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
-        # Dynamic quant weights are already 1D in correct layout from fp4_quantize
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
 
         copy_weight(module.weight_scale, weight_scale)
 
@@ -1445,13 +1430,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_size=module.tp_size,
             tp_rank=module.tp_rank,
             tp_mode=module.tp_mode)
-        # Swizzle weight scales after concatenation - skip for dynamically quantized weights
         weight_scale = torch.cat(weight_scales, 0)
-        skip_interleave = any(
-            w.get("_skip_scale_interleave", False) for w in weights)
-        if not skip_interleave:
-            weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
-        # Dynamic quant weights are already 1D in correct layout from fp4_quantize
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
+
         copy_weight(module.weight_scale, weight_scale)
 
         # For dynamic activation quantization, input_scale and alpha are computed at runtime
@@ -1489,13 +1470,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_size=module.tp_size,
             tp_rank=module.tp_rank,
             tp_mode=module.tp_mode)
-        # Swizzle weight scales after concatenation - skip for dynamically quantized weights
         weight_scale = torch.cat(weight_scales, 0)
-        skip_interleave = any(
-            w.get("_skip_scale_interleave", False) for w in weights)
-        if not skip_interleave:
-            weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
-        # Dynamic quant weights are already 1D in correct layout from fp4_quantize
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
+
         copy_weight(module.weight_scale, weight_scale)
 
         # For dynamic activation quantization, input_scale and alpha are computed at runtime

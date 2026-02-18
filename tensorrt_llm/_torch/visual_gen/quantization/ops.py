@@ -122,7 +122,10 @@ def quantize_nvfp4(
     Returns:
         Tuple of:
             - qweight: Packed FP4 weight, shape (out_features, in_features // 2)
-            - weight_scale: Block-wise scales (FP8 E4M3), 1D tensor (already in correct layout for nvfp4_gemm)
+            - weight_scale: Block-wise scales (FP8 E4M3), 2D LINEAR layout
+                shape (out_features, in_features // block_size). Same format as
+                ModelOpt checkpoints; needs block_scale_interleave before use
+                in nvfp4_gemm.
             - weight_scale_2: Global weight scale (FP32), scalar tensor
                 Stored as amax_weight / (448*6) to match ModelOpt convention.
     """
@@ -132,15 +135,17 @@ def quantize_nvfp4(
     # Global scale for fp4_quantize kernel (multiplier form: (448*6) / amax)
     global_sf = FP8_E4M3_MAX * E2M1_MAX / amax_weight
 
-    # Quantize using TRT-LLM kernel
+    # Quantize using TRT-LLM kernel (isSfSwizzledLayout=False for LINEAR output)
+    # LINEAR layout matches ModelOpt checkpoint format so that the downstream
+    # weight loader in linear.py applies block_scale_interleave uniformly.
     qweight, weight_scale = torch.ops.trtllm.fp4_quantize(
-        weight.to(torch.bfloat16), global_sf, block_size, False
+        weight.to(torch.bfloat16), global_sf, block_size, False, False
     )
 
-    # View weight_scale as FP8 E4M3 dtype to match checkpoint format
-    # The kernel returns uint8 but the values are FP8 E4M3 encoded
-    # Keep as 1D - this matches the reference implementation and nvfp4_gemm expectations
-    weight_scale = weight_scale.view(torch.float8_e4m3fn)
+    # Reshape 1D LINEAR scale to 2D [out_features, in_features // block_size]
+    # to match ModelOpt checkpoint format expected by block_scale_interleave
+    scale_cols = in_features // block_size
+    weight_scale = weight_scale.view(torch.float8_e4m3fn).reshape(out_features, scale_cols)
 
     # weight_scale_2 in divisor form (ModelOpt convention): amax / (448*6)
     # This matches what load_weight_scales() expects from calibrated checkpoints

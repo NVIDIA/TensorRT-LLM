@@ -192,9 +192,6 @@ class DynamicLinearWeightLoader:
                 "weight": qweight,
                 "weight_scale": weight_scale,
                 "weight_scale_2": weight_scale_2,
-                # Flag to skip block_scale_interleave - dynamic quant scales are already
-                # in correct LINEAR layout from fp4_quantize kernel
-                "_skip_scale_interleave": True,
             }
         else:
             return weight_dict
@@ -247,20 +244,8 @@ class DynamicLinearWeightLoader:
         split_sizes = [w.shape[0] for w in bf16_weights]
         qweight_splits = torch.split(qweight, split_sizes, dim=0)
 
-        # Split weight_scale (block scales) proportionally
-        # weight_scale is 1D with size proportional to out_features
-        total_scale_size = weight_scale.numel()
-        total_out = sum(split_sizes)
-        scale_per_row = total_scale_size / ((total_out + 127) // 128 * 128)
-
-        # Simpler approach: split based on output feature ratio
-        weight_scale_splits = []
-        scale_offset = 0
-        for i, size in enumerate(split_sizes):
-            padded_size = (size + 127) // 128 * 128
-            num_scales = int(padded_size * scale_per_row)
-            weight_scale_splits.append(weight_scale[scale_offset : scale_offset + num_scales])
-            scale_offset += num_scales
+        # Split 2D weight_scale [total_out, scale_cols] along dim=0
+        weight_scale_splits = torch.split(weight_scale, split_sizes, dim=0)
 
         # Build output weight dicts - each component gets:
         # - Its portion of the quantized weight
@@ -273,7 +258,6 @@ class DynamicLinearWeightLoader:
                 "weight": qweight_splits[i],
                 "weight_scale": weight_scale_splits[i],
                 "weight_scale_2": weight_scale_2,  # Same for all components!
-                "_skip_scale_interleave": True,
             }
             result.append(new_wd)
 

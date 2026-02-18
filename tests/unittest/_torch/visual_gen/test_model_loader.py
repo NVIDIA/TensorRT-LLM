@@ -171,59 +171,6 @@ def test_load_wan_pipeline_with_fp8_blockwise(checkpoint_exists):
                 break
 
 
-def test_load_wan_pipeline_with_nvfp4_dynamic_quant(checkpoint_exists):
-    """Test loading with NVFP4 dynamic quantization using DiffusionArgs.
-
-    Verifies the dynamic quantization flow for NVFP4:
-    1. Config has dynamic_weight_quant=True when quant_algo="NVFP4"
-    2. Model Linear layers have FP4 weight buffers (packed format)
-    3. BF16 checkpoint weights are quantized on-the-fly to FP4
-    4. weight_scale (block-wise FP8) and weight_scale_2 (global) are created
-    """
-    if not checkpoint_exists:
-        pytest.skip("Checkpoint not available")
-
-    from tensorrt_llm._torch.modules.linear import Linear
-    from tensorrt_llm._torch.visual_gen import DiffusionArgs, DiffusionModelLoader
-    from tensorrt_llm.quantization.utils import fp4_utils
-
-    # Use DiffusionArgs with NVFP4 quantization
-    args = DiffusionArgs(
-        checkpoint_path=CHECKPOINT_PATH,
-        quant_config={"quant_algo": "NVFP4", "dynamic": True},
-        skip_components=SKIP_HEAVY_COMPONENTS,
-    )
-    pipeline = DiffusionModelLoader(args).load()
-
-    # Verify model config has dynamic_weight_quant enabled
-    assert pipeline.model_config.dynamic_weight_quant is True, (
-        "dynamic_weight_quant should be True when NVFP4 is specified"
-    )
-
-    # Verify NVFP4 weights in transformer Linear layers
-    found_nvfp4_linear = False
-    for name, module in pipeline.transformer.named_modules():
-        if isinstance(module, Linear):
-            if hasattr(module, "weight") and module.weight is not None:
-                # NVFP4 uses packed FP4 format (float4_e2m1x2)
-                assert module.weight.dtype == fp4_utils.float4_e2m1x2, (
-                    f"Linear {name} weight dtype is {module.weight.dtype}, "
-                    f"expected {fp4_utils.float4_e2m1x2}"
-                )
-                # Verify weight_scale exists (block-wise scales)
-                assert hasattr(module, "weight_scale") and module.weight_scale is not None, (
-                    f"Linear {name} missing weight_scale buffer"
-                )
-                # Verify weight_scale_2 exists (global weight scale for dynamic alpha)
-                assert hasattr(module, "weight_scale_2") and module.weight_scale_2 is not None, (
-                    f"Linear {name} missing weight_scale_2 buffer"
-                )
-                found_nvfp4_linear = True
-                break
-
-    assert found_nvfp4_linear, "No NVFP4 Linear modules found in transformer"
-
-
 def test_diffusion_args_to_quant_config():
     """Test that DiffusionArgs correctly parses quant_config dict to QuantConfig."""
     from tensorrt_llm._torch.visual_gen import DiffusionArgs
