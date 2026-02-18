@@ -16,9 +16,12 @@
 # limitations under the License.
 
 import os
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -1251,6 +1254,12 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             model_config,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+        # TODO: Remove enable_block_reuse=False once KV cache block reuse
+        # is supported for Mamba/SSM-based models
+        return {"kv_cache_config": {"enable_block_reuse": False}}
 
     def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
         new_weights = weight_mapper.preprocess_weights(weights)
