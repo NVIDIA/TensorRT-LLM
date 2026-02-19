@@ -497,7 +497,7 @@ def _try_prefuse_cos_sin_cache(
             # Reuse the existing buffer directly
             with graph.inserting_after(_get_last_node([cos_source, sin_source])):
                 fused_node = graph.create_node("get_attr", prefused_path)
-            fused_node.meta["val"] = torch.empty_like(prefused_tensor, device="meta")
+            fused_node.meta["val"] = prefused_tensor
             return fused_node
     except AttributeError:
         pass
@@ -520,7 +520,7 @@ def _try_prefuse_cos_sin_cache(
     # Create get_attr node
     with graph.inserting_after(_get_last_node([cos_source, sin_source])):
         fused_node = graph.create_node("get_attr", attr_name)
-    fused_node.meta["val"] = torch.empty_like(fused, device="meta")
+    fused_node.meta["val"] = fused
 
     return fused_node
 
@@ -607,12 +607,14 @@ def _try_build_cache_from_dynamic_cos_sin(
     emb_node = cos_emb
 
     # Step 3: BFS backward from emb_node to find inv_freq (get_attr buffer).
+    # Limit search depth to avoid traversing large portions of the graph.
+    _MAX_BFS_STEPS = 50
     visited = set()
     queue = [emb_node]
     inv_freq_node = None
     inv_freq_tensor = None
 
-    while queue:
+    while queue and len(visited) < _MAX_BFS_STEPS:
         current = queue.pop(0)
         if id(current) in visited:
             continue
@@ -658,10 +660,11 @@ def _try_build_cache_from_dynamic_cos_sin(
 
     gm.register_buffer(attr_name, fused, persistent=False)
 
-    # Create get_attr node
+    # Create get_attr node.  Store the real tensor in meta["val"] so that
+    # downstream passes (e.g. move_to_device) can .to(device) it directly.
     with graph.inserting_after(cos_table_node):
         fused_node = graph.create_node("get_attr", attr_name)
-    fused_node.meta["val"] = torch.empty_like(fused, device="meta")
+    fused_node.meta["val"] = fused
 
     return fused_node
 
