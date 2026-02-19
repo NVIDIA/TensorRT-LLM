@@ -199,6 +199,15 @@ class Sampler(ABC, Generic[GenericSampleState]):
 
         If the request is not supported by the sampler, this should raise an
         appropriate exception.
+
+        Args:
+            request: The request to validate
+
+        Returns:
+            None if request is valid
+
+        Raises:
+            Appropriate exception if request is not supported by sampler.
         """
 
     def should_provide_draft_probs(self, request: LlmRequest) -> bool:
