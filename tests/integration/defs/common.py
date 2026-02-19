@@ -303,7 +303,7 @@ def convert_weights(llm_venv,
                 "--use_weight_only", "--weight_only_precision=int4_awq",
                 "--group_size=128"
             ])
-        if 'hf_fp8' in model:
+        if 'finegrained_fp8' in model:
             convert_cmd.extend(["--use_fp8"])
 
     elif "draft_target_model" in model:

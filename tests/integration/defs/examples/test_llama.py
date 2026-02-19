@@ -538,7 +538,7 @@ def test_llm_llama_1gpu(run_type, data_type, fp8_cache, llama_example_root,
         model_dir = convert_weights(llm_venv=llm_venv,
                                     example_root=llama_example_root,
                                     cmodel_dir=cmodel_dir,
-                                    model="llama_v3_hf_fp8",
+                                    model="llama_v3_finegrained_fp8",
                                     model_path=llama_model_root,
                                     fp8_kv_cache=fp8_cache,
                                     data_type=data_type)

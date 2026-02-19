@@ -51,6 +51,7 @@ from ...utils.node_utils import (
     is_any_lin_op,
     is_any_moe_op,
     is_any_ssm_op,
+    is_fake_quantized_linear_op,
     is_op,
     is_weight_node,
     num_users_of_weight_node,
@@ -69,6 +70,26 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+
+
+########################################################
+#  Helper functions
+########################################################
+def is_quantized_linear_scale_tensor(node: "Node", weight_node_key: str) -> bool:
+    """Check if a weight node is a scale tensor for a quantized linear op.
+
+    Scale tensors (e.g., weight_scale_inv for FineGrained FP8) are in "block space" and should
+    not be sharded with the same min_local_shape as the actual weight tensor.
+    They are handled separately by quantization_cb.
+
+    Args:
+        node: The linear operation node
+        weight_node_key: The parameter key of the weight node (e.g., "model.layers.0.self_attn.v_proj.weight_scale_inv")
+
+    Returns:
+        True if this is a scale tensor for a quantized linear op, False otherwise
+    """
+    return is_fake_quantized_linear_op(node) and "_scale" in weight_node_key
 
 
 ########################################################
@@ -487,6 +508,47 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         return
 
 
+class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
+    """Tensor-parallel sharding for FineGrainedFP8 quantized linears.
+
+    FineGrained FP8 uses per-block weight scales (weight_scale_inv) with shape [N/block_n, K/block_k].
+    When sharding the weight along a dimension, we also need to shard the scale tensor.
+    """
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def shard_scales(
+        self,
+        dim: int,
+        rank: int,
+        world_size: int,
+        weight_shape: torch.Size,
+        *,
+        weight_scale_inv: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        # weight_scale_inv has shape [N/block_n, K/block_k]
+        # When we shard weight along dim, we need to shard scale along the same dim
+        sharded_scale = torch.tensor_split(weight_scale_inv, world_size, dim=dim)[rank]
+        return {"weight_scale_inv": sharded_scale}
+
+    def shard_load_hook(
+        self,
+        state_dict,
+        prefix,
+        *args,
+        weight_name: str,
+        weight_shape: torch.Size,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        scale_key = weight_name + "_scale_inv"
+        if scale_key in state_dict:
+            scale = state_dict[scale_key]
+            state_dict[scale_key] = torch.tensor_split(scale, world_size, dim=dim)[rank]
+
+
 def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
     # assert weight_scale.dim() == 1
     weight_shape_original = list(sharded_uint8_weight_shape)
@@ -717,9 +779,37 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         _insert_sharded_moe(gm, node, self.config, scale_names=self.scale_names())
 
 
+class FineGrainedFP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
+    """FineGrainedFP8-specific EP sharding behavior.
+
+    FineGrained FP8 MoE uses per-block weight scales (weight_scale_inv) for each expert's weights.
+    """
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe):
+            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
+            return False
+        return True
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_moe(
+            gm,
+            node,
+            self.config,
+            scale_names=self.scale_names(),
+        )
+
+
 EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe),
+        FineGrainedFP8EPShardingInfo,
+    ),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
@@ -1215,6 +1305,10 @@ TP_SHARDING_RULES = [
         lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear),
         FP4WeightShardingInfo,
     ),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear),
+        FineGrainedFP8WeightShardingInfo,
+    ),
 ]
 
 
@@ -1370,6 +1464,12 @@ def _shard_parameter_node(
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims,
         )
+        if is_quantized_linear_scale_tensor(node, weight_node.node_key):
+            ad_logger.debug(
+                f"Skipping scale tensor {weight_node.node_key} in shard_weight_tensor - "
+                f"will be handled by weight's quantization_cb"
+            )
+            continue
         if quantization_cb is not None:
             quantization_cb(
                 gm=gm,
