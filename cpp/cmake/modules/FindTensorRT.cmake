@@ -95,8 +95,8 @@ if(TensorRT_FIND_COMPONENTS)
 
     find_library(
       TensorRT_OnnxParser_LIBRARY
-      NAMES "nvonnxparser_${TensorRT_VERSION_MAJOR}"
-            nvonnxparser
+      NAMES nvonnxparser
+            "nvonnxparser_${TensorRT_VERSION_MAJOR}"
             "libnvonnxparser.so.${TensorRT_VERSION_MAJOR}"
       PATHS ${TensorRT_ROOT} ${TensorRT_WELL_KNOWN_ROOT}/lib)
     if(TensorRT_OnnxParser_LIBRARY AND TensorRT_LIBRARIES)
