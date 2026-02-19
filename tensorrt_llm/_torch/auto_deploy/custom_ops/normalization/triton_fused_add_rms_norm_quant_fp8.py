@@ -85,18 +85,18 @@ def fused_add_rms_norm_quant_fp8_kernel(
     add_out = x + residual
     add_out_f32 = add_out.to(tl.float32)
 
-    # RMSNorm: variance -> normalize -> scale by weight
+    # RMSNorm: variance -> normalize -> scale by weight (all in FP32)
     var = tl.sum(add_out_f32 * add_out_f32, 0) * float(1.0 / N_COLS)
     normed = add_out_f32 / tl.sqrt(var + eps)
-    norm_out = (w.to(tl.float32) * normed).to(x.dtype)
+    norm_out_f32 = w.to(tl.float32) * normed
 
-    # Store BF16/FP16 norm output
+    # Store BF16/FP16 norm output (cast from FP32 for consumers needing native dtype)
     out_bf16_row = output_bf16_ptr + prog_id * row_stride_out
-    tl.store(out_bf16_row + offsets, norm_out, mask=mask)
+    tl.store(out_bf16_row + offsets, norm_out_f32.to(x.dtype), mask=mask)
 
-    # Fused FP8 quantization: scale -> clamp -> cast (all in registers)
+    # FP8 quantization from full FP32 norm (avoids BF16 round-trip precision loss)
     scale = tl.load(scale_ptr)
-    out_scaled = norm_out.to(tl.float32) / scale
+    out_scaled = norm_out_f32 / scale
     out_clamped = tl.maximum(tl.minimum(out_scaled, FP8_MAX), FP8_MIN)
     out_fp8 = out_clamped.to(tl.float8e4nv)
 
