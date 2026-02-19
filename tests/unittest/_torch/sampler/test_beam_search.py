@@ -1022,7 +1022,7 @@ class TestParameterValidation:
         assert fixed_params["max_beam_width"] > 2
         with pytest.raises(
                 RequestError,
-                match=".*Request beam width 2 is not equal to max_beam_width 4*"
+                match=".*Request beam width 2 is not equal to max_beam_width 4.*"
         ):
             _ = llm.generate(input_prompts,
                              sampling_params=SamplingParams(
@@ -1049,7 +1049,8 @@ class TestParameterValidation:
 
         with pytest.raises(
                 RequestError,
-                match=".*Beam search only supports logprobs when batch size is 1*"
+                match=
+                ".*Beam search only supports logprobs when batch size is 1.*"
         ) if batch_size > 1 else nullcontext():
             _ = llm.generate(input_prompts,
                              sampling_params=SamplingParams(
@@ -1090,7 +1091,7 @@ class TestParameterValidation:
         with pytest.raises(
                 RequestError,
                 match=
-                ".*Beam search only supports returning the sampled logprob per token*"
+                ".*Beam search only supports returning the sampled logprob per token.*"
         ):
             _ = llm.generate(input_prompts,
                              sampling_params=SamplingParams(
@@ -1105,7 +1106,7 @@ class TestParameterValidation:
         with pytest.raises(
                 RequestError,
                 match=
-                ".*Beam search does not support returning multiple logprobs per request*"
+                ".*Beam search does not support returning multiple logprobs per request.*"
         ):
             _ = llm.generate(input_prompts,
                              sampling_params=SamplingParams(
