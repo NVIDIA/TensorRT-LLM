@@ -1,73 +1,53 @@
 # GLM-5
 
-This guide walks you through running the GLM-5 model using TensorRT-LLM with the PyTorch backend.
+This guide walks you through running the GLM-5 model with TensorRT-LLM using the PyTorch backend.
 
 GLM-5 uses Multi-Latent Attention (MLA) with DeepSeek Sparse Attention (DSA). It shares the same architecture as DeepSeek V3.2 and reuses the `DeepseekV32ForCausalLM` code path in TensorRT-LLM.
 
-> [!NOTE]
-> This guide assumes that you replace placeholder values (e.g., `<YOUR_MODEL_DIR>`) with the appropriate paths.
 
 ## Table of Contents
 
-- [GLM-5](#glm-5)
-  - [Hardware Requirements](#hardware-requirements)
-  - [Downloading the Model Weights](#downloading-the-model-weights)
-  - [Prerequisites](#prerequisites)
-  - [Serving](#serving)
-  - [Notes and Troubleshooting](#notes-and-troubleshooting)
-
-## Hardware Requirements
-
-| GPU | GLM-5 FP4 |
-|-----|-----------|
-| B200/GB200 | 8 GPUs (SM100) |
+- [Downloading the Model Weights](#downloading-the-model-weights)
+- [Prerequisites](#prerequisites)
+- [Serving](#serving)
+  - [trtllm-serve](#trtllm-serve)
+    - [B200 FP8 Config](#b200-fp8-config)
+    - [Launching the Server](#launching-the-server)
+    - [Querying the Server](#querying-the-server)
+    - [Serving with MTP](#serving-with-mtp)
+- [Performance](#performance)
+- [Notes and Troubleshooting](#notes-and-troubleshooting)
 
 ## Downloading the Model Weights
 
 The following checkpoints are available:
 
 1. [zai-org/GLM-5](https://huggingface.co/zai-org/GLM-5) — Official BF16 checkpoint.
-2. [warnold-nv/GLM-5-nvfp4-v1](https://huggingface.co/warnold-nv/GLM-5-nvfp4-v1) — Unofficial NVFP4 checkpoint for experimentation only. *Quantized with ModelOpt by Will Arnold.*
+2. [zai-org/GLM-5-FP8](https://huggingface.co/zai-org/GLM-5-FP8) — Official FP8 checkpoint.
+3. [warnold-nv/GLM-5-nvfp4-v1](https://huggingface.co/warnold-nv/GLM-5-nvfp4-v1) — Unofficial NVFP4 checkpoint for experimentation only. *Quantized with ModelOpt by Will Arnold.*
 
 ```bash
 git lfs install
-git clone https://huggingface.co/warnold-nv/GLM-5-nvfp4-v1 <YOUR_MODEL_DIR>
+git clone https://huggingface.co/zai-org/GLM-5-FP8 /models/GLM-5-FP8
 ```
 
 ## Prerequisites
 
 | Item | Details |
 |------|---------|
-| Hardware | 8× B200 GPUs (SM100) |
+| Hardware | 8x B200 GPUs (SM100) |
 | Container | `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc3` with this PR installed |
 
-Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and start a TRT-LLM Docker container.
+Refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for instructions on building TensorRT-LLM from source and starting a TRT-LLM Docker container.
 
 ```bash
 docker run --gpus all --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
-    -v /path/to/your/models:/workspace/models \
+    -v /path/to/your/models:/models \
     -it nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc3 bash
 ```
 
-> **Everything below runs inside the Docker container.**
-
-### Config modifications
-
-GLM-5 uses `model_type: "glm_moe_dsa"`, which requires `transformers>=5.0.2`. TensorRT-LLM currently ships with `transformers==4.57.1`, so the model type and tokenizer class must be updated for the config to load correctly.
-
-Edit `<YOUR_MODEL_DIR>/config.json` — change `model_type`:
-
-```json
-{
-    "model_type": "deepseek_v32"
-}
-```
-
-Edit `<YOUR_MODEL_DIR>/tokenizer_config.json` — apply the following two changes:
-
-1. Change `"tokenizer_class"` from `"TokenizersBackend"` to `"PreTrainedTokenizerFast"`.
-2. Rename the key `"extra_special_tokens"` to `"additional_special_tokens"`.
+> **All commands below should be run inside the Docker container.**
 
 ---
 
@@ -75,36 +55,36 @@ Edit `<YOUR_MODEL_DIR>/tokenizer_config.json` — apply the following two change
 
 ### trtllm-serve
 
-Below is an example B200 serving configuration for min-latency in FP4. **Treat this as a starting point — tune for your model and workload to achieve the best performance.**
+Below is an example B200 serving configuration for GLM-5 in FP8. **Treat this as a starting point and tune the parameters for your workload.**
 
-#### B200 FP4 min-latency config
+#### B200 FP8 Config
 
 ```bash
 cat >./config.yml <<EOF
 cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 1024
+  enable_padding: true
+  max_batch_size: 128
 enable_attention_dp: false
 enable_chunked_prefill: true
 kv_cache_config:
-    enable_block_reuse: false
-    dtype: fp8
-# speculative_config:
-#   decoding_type: MTP
-#   num_nextn_predict_layers: 1
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.75
+  dtype: auto
 stream_interval: 10
+moe_config:
+  backend: DEEPGEMM
 EOF
 ```
 
-#### Launch trtllm-serve OpenAI-compatible API server
+#### Launching the Server
 
 ```bash
 trtllm-serve \
-  <YOUR_MODEL_DIR> \
+  /models/GLM-5-FP8 \
   --host localhost \
   --port 8000 \
   --backend pytorch \
-  --max_batch_size 32 \
+  --max_batch_size 128 \
   --max_num_tokens 8192 \
   --tp_size 8 \
   --ep_size 8 \
@@ -113,24 +93,56 @@ trtllm-serve \
 ```
 
 > [!WARNING]
-> You may encounter OOM issues with some configurations. Try reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. If using a max-throughput config, reduce `max_num_tokens` to `3072` to avoid OOM.
+> If you encounter OOM errors, try one or more of the following:
+> - Lower `kv_cache_config.free_gpu_memory_fraction` (e.g., `0.6`).
+> - Reduce `--max_num_tokens` to `3072` for max-throughput configs.
+> - Reduce `--max_batch_size` and `cuda_graph_config.max_batch_size` to `32` or `16` for min-latency configs.
 
-To query the server:
+#### Querying the Server
 
 ```bash
 curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
-      "model": "<YOUR_MODEL_DIR>",
-      "prompt": "Write a short poem about a cat and a dog",
-      "max_tokens": 256,
-      "temperature": 0.6
+      "model": "zai-org/GLM-5-FP8",
+      "prompt": "What is the capital of France?",
+      "max_tokens": 5,
+      "temperature": 0.01
   }'
 ```
 
+#### Serving with MTP
+
+GLM-5 natively supports Multi-Token Prediction (MTP). To enable it, add the `speculative_config` section to your config file and launch the server as before:
+
+```bash
+cat >./config.yml <<EOF
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 128
+enable_attention_dp: false
+enable_chunked_prefill: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.75
+  dtype: auto
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 1
+stream_interval: 10
+moe_config:
+  backend: DEEPGEMM
+EOF
+```
+
+## Performance
+
+The chart below shows the Pareto frontier of output-token throughput per GPU versus per-user latency on 8x B200 with GLM-5-FP8 and MTP enabled. Benchmarks were run using AI-Perf as the client against TRT-LLM v1.2.0rc4 (`cc45119`).
+
+![GLM-5 FP8 Performance on 8x B200 with MTP](perf.png)
+
 ## Notes and Troubleshooting
 
-- **Model Directory:** Update `<YOUR_MODEL_DIR>` with the actual path where the model weights reside.
-- **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
-- **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
-- **Architecture:** GLM-5 reuses the DeepSeek V3.2 attention implementation (`DeepseekV32Attention`), which includes a built-in DSA indexer that routes context attention through absorption mode. DSA parameters (`index_n_heads`, `index_head_dim`, `index_topk`) are read automatically from the model config.
+- **GPU memory:** Lower `--max_batch_size` or `--max_num_tokens` if you encounter out-of-memory errors.
+- **Configuration files:** Ensure that YAML config files are correctly formatted to avoid runtime errors.
+- **Architecture:** GLM-5 reuses the DeepSeek V3.2 attention implementation (`DeepseekV32Attention`), which includes a built-in DSA indexer that routes context attention through absorption mode. The DSA parameters (`index_n_heads`, `index_head_dim`, `index_topk`) are read automatically from the model config.

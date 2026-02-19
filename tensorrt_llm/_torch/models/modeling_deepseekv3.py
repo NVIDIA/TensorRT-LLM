@@ -1793,6 +1793,10 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
 
+        if model_config.pretrained_config.model_type == 'glm_moe_dsa':
+            model_config = copy.deepcopy(model_config)
+            model_config.pretrained_config.model_type = 'deepseek_v32'
+
         super().__init__(model=DeepseekV3Model(
             model_config, mapping_with_cp=self.mapping_with_cp),
                          model_config=model_config)

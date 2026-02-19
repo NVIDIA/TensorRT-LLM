@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
-from transformers.modeling_utils import get_parameter_device
+
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
@@ -549,7 +549,7 @@ class WanTransformer3DModel(nn.Module):
 
     @property
     def device(self):
-        return get_parameter_device(self)
+        return next(self.parameters()).device
 
     def __post_init__(self):
         self.apply_quant_config_exclude_modules()

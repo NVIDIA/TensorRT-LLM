@@ -1249,5 +1249,5 @@ class VilaModel(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
 
-AutoConfig.register(VilaConfig.model_type, VilaConfig)
+AutoConfig.register(VilaConfig.model_type, VilaConfig, exist_ok=True)
 AutoModel.register(VilaConfig, VilaModel)

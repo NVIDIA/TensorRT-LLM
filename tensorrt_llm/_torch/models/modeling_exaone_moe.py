@@ -48,12 +48,8 @@ from transformers import AutoConfig, PretrainedConfig  # isort: skip
 class ExaoneMoEConfig(PretrainedConfig):
     model_type = "exaone_moe"
 
-logger.warning_once(
-    "transformers does not support 'ExaoneMoEConfig'. "
-    "Register ExaoneMoEConfig to mimic the ExaoneMoE model.",
-    key="EXAONE_MOE_REGISTER_WARNING"
-)
-AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
+AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig,
+                    exist_ok=True)
 # End of the config register.
 # fmt: on
 
