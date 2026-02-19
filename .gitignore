@@ -87,6 +87,7 @@ cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.cpp
 .devcontainer/.env
 /examples/layer_wise_benchmarks/autotuner_cache/
 /examples/layer_wise_benchmarks/profiles/
+tensorrt_llm/grpc/trtllm_service_pb2*.py
 
 # User config files
 CLAUDE.local.md
