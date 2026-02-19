@@ -2163,13 +2163,17 @@ def _stack_finegrained_fp8_moe_weights(gm: GraphModule) -> int:
                 graph.get_attr(new_key_fc1_scale),
                 graph.get_attr(new_key_fc2_scale),
             )
+            fused_kwargs = dict(node.kwargs) if node.kwargs else {}
+            fused_kwargs.update(
+                {
+                    "is_gated_mlp": is_gated_mlp,
+                    "act_fn": node.kwargs.get("act_fn", int(ActivationType.Silu)),
+                }
+            )
             new_node = graph.call_function(
                 replacement_op,
                 args,
-                kwargs={
-                    "is_gated_mlp": is_gated_mlp,
-                    "act_fn": node.kwargs.get("act_fn", int(ActivationType.Silu)),
-                },
+                kwargs=fused_kwargs,
             )
 
         node.replace_all_uses_with(new_node)

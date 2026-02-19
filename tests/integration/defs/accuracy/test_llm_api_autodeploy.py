@@ -510,3 +510,54 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestMiniMaxM2(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for MiniMax M2.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    """
+
+    MODEL_NAME = "MiniMaxAI/MiniMax-M2"
+    # Set minimum possible seq len + small buffer, for test speed & memory usage
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init":
+            False,
+            "trust_remote_code":
+            True,
+            "skip_loading_weights":
+            False,
+            "compile_backend":
+            "torch-cudagraph",
+            "free_mem_ratio":
+            0.88,
+            "max_batch_size":
+            64,
+            "max_seq_len":
+            self.MAX_SEQ_LEN,
+            "max_num_tokens":
+            self.MAX_SEQ_LEN,
+            "enable_chunked_prefill":
+            True,
+            "cuda_graph_batch_sizes":
+            [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384],
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
+        }
+
+    @pytest.mark.skip_less_device(8)
+    def test_finegrained_fp8(self):
+        kwargs = self.get_default_kwargs()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           world_size=8,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

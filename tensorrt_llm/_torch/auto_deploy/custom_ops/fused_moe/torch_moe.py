@@ -787,6 +787,9 @@ def torch_quant_finegrained_fp8_moe(
     w3_weight_scale_inv: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     """
     FineGrainedFP8 MoE op using block-wise FP8 quantized linear operations.
@@ -873,7 +876,15 @@ def torch_quant_finegrained_fp8_moe(
 
         mlps = [make_finegrained_fp8_mlp(i) for i in range(len(w1_weight))]
 
-    return _template_moe(x, selected_experts, routing_weights, mlps)
+    return _template_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        mlps,
+        apply_routing_on_input,
+        mapping_config,
+        max_num_tokens,
+    )
 
 
 @torch_quant_finegrained_fp8_moe.register_fake
@@ -889,5 +900,8 @@ def torch_quant_finegrained_fp8_moe_fake(
     w3_weight_scale_inv: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
