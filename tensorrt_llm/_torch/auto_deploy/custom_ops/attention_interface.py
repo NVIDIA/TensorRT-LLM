@@ -28,6 +28,7 @@ import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
+import numpy as np
 import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
@@ -189,17 +190,36 @@ class InputBuffer:
         """
         return self._current_lengths[name]
 
+    # Mapping from torch dtype to numpy dtype for fast list-to-pinned-memory writes
+    _TORCH_TO_NUMPY_DTYPE = {
+        torch.int: np.int32,
+        torch.int32: np.int32,
+        torch.int64: np.int64,
+        torch.long: np.int64,
+        torch.float: np.float32,
+        torch.float32: np.float32,
+        torch.float64: np.float64,
+        torch.double: np.float64,
+        torch.float16: np.float16,
+        torch.bool: np.bool_,
+    }
+
     def store(
         self,
         name: str,
-        data: List[Number],
+        data: "Union[List[Number], torch.Tensor]",
         fill_value: Optional[Number] = None,
     ) -> int:
         """Store data into the host buffer.
 
+        Accepts either a Python list or a torch.Tensor. When a Tensor is provided, it is
+        copied directly into pinned memory (fast path, avoids torch.tensor() from list).
+        When a list is provided, numpy is used to write directly into pinned memory,
+        which is faster than torch.tensor(list) for large lists.
+
         Args:
             name: Name of the tensor to store to.
-            data: List of values to store.
+            data: List of values or a 1-D torch.Tensor to store.
             fill_value: Optional value to fill the entire tensor with before storing.
                        If None, only the provided data is written.
 
@@ -213,12 +233,18 @@ class InputBuffer:
         if fill_value is not None:
             host_view.fill_(fill_value)
 
-        # Convert list to tensor and copy to host buffer
-        length = len(data)
-        assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
-
-        temp_tensor = torch.tensor(data, dtype=dtype)
-        host_view[:length].copy_(temp_tensor)
+        if isinstance(data, torch.Tensor):
+            length = data.numel()
+            assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
+            host_view[:length].copy_(data if data.dtype == dtype else data.to(dtype))
+        else:
+            length = len(data)
+            assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
+            np_dtype = self._TORCH_TO_NUMPY_DTYPE.get(dtype)
+            if np_dtype is not None:
+                host_view[:length].numpy()[:] = np.array(data, dtype=np_dtype)
+            else:
+                host_view[:length].copy_(torch.tensor(data, dtype=dtype))
 
         self._current_lengths[name] = length
         return length
@@ -624,10 +650,20 @@ class SequenceInfo:
         estimated_capacity = estimated_capacity + 1
 
         if estimated_capacity > cache_loc_capacity:
+            # Resize cache_loc (the only truncatable tensor in InputBuffer)
             self._input_buffer.resize("cache_loc", estimated_capacity)
-            # Also resize the args_list to match
-            old_size = len(self._args_list["cache_loc"])
-            self._args_list["cache_loc"].extend([0] * (estimated_capacity - old_size))
+
+            # Also resize any host-side page metadata lists/tensors to match.
+            # These fields may be created lazily by nest_sequences() when cache_loc/pages_per_seq
+            # are provided.
+            old_size = self._args_list.get("cache_loc")
+            if old_size is None:
+                self._args_list["cache_loc"] = [0] * estimated_capacity
+            if isinstance(old_size, list):
+                old_size = len(old_size)
+                old_size.extend([0] * (estimated_capacity - old_size))
+            else:
+                self._args_list["cache_loc"] = [0] * estimated_capacity
 
     @staticmethod
     def _get_page_assignments(
@@ -766,7 +802,7 @@ class SequenceInfo:
     def _store_arg(
         self,
         name: str,
-        tnsr_like: List[Number],
+        tnsr_like: "Union[List[Number], torch.Tensor]",
         reset_val: Optional[Number] = None,
         force_copy: bool = False,
     ) -> None:
@@ -775,15 +811,23 @@ class SequenceInfo:
         The data is stored in the host-side pinned memory buffer managed by InputBuffer.
         The actual H2D transfer happens in a single batch at the end of nest_sequences().
 
+        Accepts either a Python list or a 1-D torch.Tensor. Tensor inputs use a fast path
+        that avoids the expensive torch.tensor(list) conversion in InputBuffer.store().
+
         Args:
             name: Name of the argument to store.
-            tnsr_like: List of values to store.
+            tnsr_like: List of values or a 1-D torch.Tensor to store.
             reset_val: Value to reset/fill the tensor with before writing data.
             force_copy: Whether to force immediate copy to device (for use outside nest_sequences).
         """
         with nvtx_range(f"ad_store_on_host_seq_info_arg_{name}"):
-            # Always store list object for Python access
-            self._args_list[name] = tnsr_like.copy()
+            # Store for Python access. Tensor data is stored as-is to avoid expensive
+            # .tolist() conversion on the hot path. Properties that need lists (seq_len,
+            # input_pos, cache_loc, pages_per_seq) always receive list inputs.
+            if isinstance(tnsr_like, torch.Tensor):
+                self._args_list[name] = tnsr_like
+            else:
+                self._args_list[name] = tnsr_like.copy()
 
             # Only store to buffer when the argument is active or force_copy is True
             if not (name in self._active_args or f"{name}_host" in self._active_args or force_copy):
