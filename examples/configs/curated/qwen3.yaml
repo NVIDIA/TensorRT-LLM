@@ -14,7 +14,6 @@ cuda_graph_config:
   - 128
   - 256
   - 384
-print_iter_log: true
 enable_attention_dp: true
 kv_cache_config:
   free_gpu_memory_fraction: 0.8
