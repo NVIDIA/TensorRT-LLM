@@ -1621,15 +1621,16 @@ class PyExecutor:
                 and self.kv_cache_transceiver \
                 and self.num_fetch_requests < self.benchmark_req_queues_size:
             if self.dist.rank == 0:
-                logger.info(f"FILL_LOOP_ENTER: starting benchmark fill loop, "
+                logger.info(f"Starting benchmark fill loop, "
                             f"num_fetch_requests={self.num_fetch_requests}/"
                             f"{self.benchmark_req_queues_size}, "
                             f"len(active_requests)={len(self.active_requests)}")
             while self.num_fetch_requests < self.benchmark_req_queues_size:
-                new_requests = self._fetch_and_activate_new_requests()
+                iter_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     return None, None
-                self._check_disagg_ctx_schedulable_status(new_requests)
+                new_requests += iter_requests
+                self._check_disagg_ctx_schedulable_status(iter_requests)
                 self._check_disagg_gen_transfer_status()
                 self._check_kv_transfer_timeout()
                 self.hang_detector.checkpoint()
@@ -1641,7 +1642,7 @@ class PyExecutor:
                     s = str(r.state)
                     active_states[s] = active_states.get(s, 0) + 1
                 logger.info(
-                    f"FILL_LOOP_DONE: benchmark fill complete, "
+                    f"Benchmark fill complete, "
                     f"num_fetch_requests={self.num_fetch_requests}/"
                     f"{self.benchmark_req_queues_size}, "
                     f"len(active_requests)={len(self.active_requests)}, "
