@@ -70,11 +70,24 @@ def getLLMRepo () {
     return LLM_REPO
 }
 
+def installTools() {
+    container("alpine") {
+        sh "mkdir -p $JENKINS_HOME"
+        sh "apt update"
+        sh "apt install -y git git-lfs openjdk-17-jdk python3-dev python3-venv curl unzip"
+    }
+}
+
 def checkoutSource ()
 {
-    def LLM_REPO = getLLMRepo()
-    sh "git config --global --add safe.directory ${env.WORKSPACE}"
-    trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
+    container("alpine") {
+        trtllm_utils.setupGitMirror()
+        stage("Checkout TRTLLM Source") {
+            def LLM_REPO = getLLMRepo()
+            sh "git config --global --add safe.directory ${env.WORKSPACE}"
+            trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
+        }
+    }
 }
 
 def getPulseToken() {
@@ -94,8 +107,6 @@ def getPulseToken() {
 def generateLockFiles(llmRepo, branchName)
 {
     container("alpine") {
-        sh "apt update"
-        sh "apt install -y python3-dev git curl git-lfs"
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | python3 -"
         sh "/root/.local/bin/poetry -h"
@@ -139,12 +150,7 @@ def generateLockFiles(llmRepo, branchName)
 def sonar_scan()
 {
     container("alpine") {
-        sh "mkdir -p $JENKINS_HOME"
         def scannerHome = tool 'sonarScanner'
-        sh "apt update"
-        sh "apt install -y git git-lfs openjdk-17-jdk"
-        checkoutSource()
-        sh "cd ${env.WORKSPACE}"
         withSonarQubeEnv() {
           sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName}"
         }
@@ -171,26 +177,42 @@ def pulseScan(llmRepo, branchName) {
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
                         "PULSE_REPO_URL=${llmRepo}",
+                        "PULSE_REPO_BRANCH=${branchName}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
-                        "PULSE_SCAN_PROJECT_VERSION=${branchName}",
+                        "PULSE_SCAN_PROJECT_VERSION=${branchName.replace("release/", "")}",
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
                     ]) {
-                        sh 'pulse scan --no-fail .'
+                        sh 'pulse scan --no-fail --sbom --override .'
                     }
                   }
             }
         }
-        sh "ls"
+    }
+    container("alpine") {
         sh "cat nspect_scan_report.json"
+        sh "cat sbom.cdx.json"
+        sh """
+            SBOM_ZIP="./sbom.zip"
+            if [ -f "\$SBOM_ZIP" ]; then
+                EXTRACTED_FOLDER=\$(unzip -Z1 "\$SBOM_ZIP" | head -1 | cut -d/ -f1)
+                JSON_FILE=\$(find "\$EXTRACTED_FOLDER" -type f -name "*.json" | head -n 1)
+                if [ -n "\$JSON_FILE" ]; then
+                    cat "\$JSON_FILE"
+                else
+                    echo "No JSON file found in SBOM archive"
+                fi
+            else
+                echo "SBOM zip does not exist"
+            fi
+        """
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
             def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
             sh """
                 export TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}
                 python3 -m venv venv
-                source venv/bin/activate
-                pip install requests
-                python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
+                venv/bin/pip install requests
+                venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
             """
         }
     }
@@ -208,7 +230,7 @@ pipeline {
     options {
         skipDefaultCheckout()
         timestamps()
-        timeout(time: 60, unit: 'MINUTES')
+        timeout(time: 150, unit: 'MINUTES')
     }
     environment {
         LLM_REPO = getLLMRepo()
@@ -221,43 +243,43 @@ pipeline {
             H 3 * * * %branchName=release/1.2;repoUrlKey=tensorrt_llm_github
         ''')
     }
-
     stages {
-        stage('TRT-LLM PLC Jobs') {
+        stage("Prepare Environment"){
+            steps {
+                script {
+                    installTools()
+                    checkoutSource()
+                }
+            }
+        }
+        stage('Run TRT-LLM PLC Jobs') {
             parallel {
                 stage("Source Code OSS Scanning"){
-                    agent {
-                        kubernetes createKubernetesPodConfig()
-                    }
                     stages {
-                        stage("Prepare Environment"){
-                            steps
-                            {
-                                checkoutSource()
-                                sh "cd ${env.WORKSPACE}"
-                            }
-                        }
                         stage("Generate Lock Files"){
                             steps
                             {
-                                generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                                script {
+                                    generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                                }
                             }
                         }
                         stage("Run Pulse Scanning"){
                             steps
                             {
-                                pulseScan(env.LLM_REPO, env.BRANCH_NAME)
+                                script {
+                                    pulseScan(env.LLM_REPO, env.BRANCH_NAME)
+                                }
                             }
                         }
                     }
                 }
                 stage("SonarQube Code Analysis"){
-                    agent {
-                        kubernetes createKubernetesPodConfig()
-                    }
                     steps
                     {
-                        sonar_scan()
+                        script {
+                            sonar_scan()
+                        }
                     }
                 }
             }

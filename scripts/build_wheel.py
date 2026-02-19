@@ -650,7 +650,7 @@ def main(*,
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --build=missing --remote=TensorRT-LLM --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
