@@ -22,7 +22,9 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
 )
 from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
 
 
@@ -577,4 +579,164 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_quant_finegrained_fp8_moe_fused", mutates_args=())
+def trtllm_quant_finegrained_fp8_moe_fused(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_weight_scale: torch.Tensor,
+    fc2_weight_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+) -> torch.Tensor:
+    """TensorRT-LLM Cutlass FP8 Block Scale MoE for FineGrainedFP8 format.
+
+    This op uses the DeepSeek FP8 block scale format which is compatible with FineGrained FP8.
+    Activations are quantized dynamically at runtime (no pre-computed activation scales).
+
+    Computes (per expert):
+        For gated_mlp:
+            y = (act(x @ w1.T) * (x @ w3.T)) @ w2.T  # act := SiLU
+        For mlp:
+            y = act(x @ w1.T) @ w2.T                 # act := ReLU^2
+
+    Notes:
+        - FC1 implements: fc1_output = (act(x @ w1.T) * (x @ w3.T)) or fc1_output = act(x @ w1.T)
+        - FC2 implements: fc2_output = fc1_output @ w2.T
+        - FC1 weights are concatenated w3 and w1 if gated_mlp, otherwise w1
+        - Uses per-block weight scales (128x128 blocks)
+        - On Hopper (SM90): Activation quantization happens dynamically inside the kernel
+        - On Blackwell (SM100+): Uses fp8_block_scale_moe_runner with external activation quantization
+
+    Parameters:
+        x: BF16/FP16 input tensor of shape (B, H) or (B, S, H)
+        selected_experts: Expert indices (B*S, TOP_K)
+        routing_weights: Routing weights (B*S, TOP_K)
+        fc1_expert_weights: FC1 FP8 weights [E, 2*I, H] for gated_mlp, [E, I, H] for mlp
+        fc2_expert_weights: FC2 FP8 weights [E, H, I]
+        fc1_weight_scale: FC1 block weight scales [E, 2*I/128, H/128] or [E, I/128, H/128]
+        fc2_weight_scale: FC2 block weight scales [E, H/128, I/128]
+        is_gated_mlp: True for gated_mlp, False for mlp
+        act_fn: ActivationType.Silu for gated_mlp, ActivationType.Relu2 for mlp
+
+    Returns:
+        Output tensor of shape (B, H) or (B, S, H)
+    """
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    act_fn = ActivationType.Swiglu if act_fn == ActivationType.Silu else act_fn
+
+    # Store original shape and flatten to 2D
+    x_shape = x.shape
+    x2d = x.view(-1, x_shape[-1])
+
+    # Ensure contiguous tensors with correct dtypes
+    selected_experts = selected_experts.int().contiguous()
+
+    if is_sm_100f():
+        # --- Blackwell (SM100+) Path ---
+        # Uses fp8_block_scale_moe_runner with pre-computed routing (topk_weights/topk_ids)
+
+        # Quantize activations externally (Blackwell kernel expects FP8 input)
+        x_fp8, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x2d)
+
+        # Infer parameters from weight shapes
+        num_experts = fc1_expert_weights.shape[0]
+        top_k = selected_experts.shape[-1]
+        # For gated MLP, fc1 weights have shape [E, 2*I, H], so intermediate_size = shape[1] // 2
+        # For non-gated MLP, fc1 weights have shape [E, I, H], so intermediate_size = shape[1]
+        intermediate_size = (
+            fc1_expert_weights.shape[1] // 2 if is_gated_mlp else fc1_expert_weights.shape[1]
+        )
+
+        # Blackwell kernel expects bfloat16 for topk_weights
+        routing_weights_bf16 = routing_weights.to(torch.bfloat16).contiguous()
+
+        # Blackwell kernel expects float32 for weight scales
+        fc1_weight_scale_f32 = fc1_weight_scale.to(torch.float32).contiguous()
+        fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
+
+        # Call Blackwell fp8_block_scale_moe_runner with pre-computed routing
+        output = torch.ops.trtllm.fp8_block_scale_moe_runner(
+            None,  # routing_logits - not needed when topk_weights/topk_ids provided
+            None,  # routing_bias - not needed for pre-computed routing
+            x_fp8,
+            x_sf,
+            fc1_expert_weights.contiguous(),
+            fc1_weight_scale_f32,
+            fc2_expert_weights.contiguous(),
+            fc2_weight_scale_f32,
+            num_experts,
+            top_k,
+            None,  # n_group - default 0 (no grouped routing)
+            None,  # topk_group - default 0
+            intermediate_size,
+            0,  # local_expert_offset - default 0 (no EP sharding)
+            num_experts,  # local_num_experts - same as num_experts (no EP sharding)
+            None,  # routed_scaling_factor - default 1.0
+            RoutingMethodType.Renormalize,  # routing weights already pre-computed
+            topk_weights=routing_weights_bf16,
+            topk_ids=selected_experts,
+        )
+
+        # Restore original shape
+        return output.view(x_shape)
+    else:
+        # --- Hopper (SM90) Path ---
+        # Uses fused_moe with DeepSeek FP8 block scale mode (activation quant inside kernel)
+
+        # TRTLLM kernel expects float32 for routing_weights
+        routing_weights = routing_weights.to(torch.float32).contiguous()
+
+        # For DeepSeek FP8 block scales, quant_scales is a tuple of
+        # (fc_weight_scales, proj_weight_scales).
+        # The kernel handles dynamic activation quantization internally.
+        # TRT-LLM fused_moe kernel requires float32 scales; HF checkpoints may
+        # store them in bfloat16, so cast here (matching the Blackwell path).
+        fc1_weight_scale_f32 = fc1_weight_scale.to(torch.float32).contiguous()
+        fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
+        quant_scales = (fc1_weight_scale_f32, fc2_weight_scale_f32)
+
+        # Call fused_moe with DeepSeek FP8 block scale mode
+        output = torch.ops.trtllm.fused_moe(
+            x2d,
+            selected_experts,
+            routing_weights,
+            fc1_expert_weights=fc1_expert_weights.contiguous(),
+            fc1_expert_biases=None,
+            fc2_expert_weights=fc2_expert_weights.contiguous(),
+            fc2_expert_biases=None,
+            output_dtype=x.dtype,
+            quant_scales=quant_scales,
+            activation_type=act_fn,
+            use_deepseek_fp8_block_scale=True,
+        )
+
+        # Restore original shape
+        return output[0].view(x_shape)
+
+
+@trtllm_quant_finegrained_fp8_moe_fused.register_fake
+def trtllm_quant_finegrained_fp8_moe_fused_fake(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_weight_scale: torch.Tensor,
+    fc2_weight_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+) -> torch.Tensor:
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)

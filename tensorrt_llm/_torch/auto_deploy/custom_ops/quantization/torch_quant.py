@@ -16,6 +16,8 @@
 from typing import List, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
@@ -429,3 +431,196 @@ def torch_fake_quant_int4_gptq_linear_fake(
 ) -> torch.Tensor:
     N = weight_quantized.size(1)
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
+
+
+@triton.jit
+def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
+    """Block-wise FP8 activation quantization, safe for all-zero blocks.
+
+    Identical to HuggingFace's act_quant_kernel except that the per-block scale
+    is clamped to a minimum of 1e-12 before dividing.  This avoids 0/0 = NaN
+    when every element in a block is zero.
+    """
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offs).to(tl.float32)
+    s = tl.max(tl.abs(x)) / 448.0
+    # Clamp scale so that all-zero blocks produce 0/eps = 0 instead of 0/0 = NaN.
+    s = tl.maximum(s, 1e-12)
+    y = x / s
+    y = y.to(y_ptr.dtype.element_ty)
+    tl.store(y_ptr + offs, y)
+    tl.store(s_ptr + pid, s)
+
+
+def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
+    """Block-wise FP8 activation quantization (CUDA-graph safe).
+
+    Drop-in replacement for ``transformers.integrations.finegrained_fp8.act_quant``
+    that fixes the NaN-on-zero-block bug by clamping the per-block scale inside
+    the Triton kernel itself.  No post-hoc fixup tensors are created, so the
+    op is fully compatible with CUDA graphs.
+    """
+    assert x.is_contiguous()
+    assert x.shape[-1] % block_size == 0
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    s = x.new_empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=torch.float32)
+
+    grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
+    _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+    return y, s
+
+
+@torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
+def torch_fake_quant_finegrained_fp8_linear(
+    input: torch.Tensor,  # [..., K]
+    weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [N] or None
+    input_scale: List[torch.Tensor],  # unused for FineGrained FP8 (input quantized on the fly)
+    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
+    input_zp: List[torch.Tensor],  # unused
+    weight_zp: List[torch.Tensor],  # unused
+) -> torch.Tensor:
+    """FineGrainedFP8 linear operation.
+    - weight_scale[0] = weight_scale_inv (per-block weight scale)
+    - input_scale, input_zp, weight_zp are unused
+    - block_size is inferred from weight and weight_scale_inv shapes
+    """
+    from transformers.integrations.finegrained_fp8 import w8a8_block_fp8_matmul_triton
+
+    weight_scale_inv = weight_scale[0]
+
+    # Infer block_size from weight and weight_scale_inv shapes
+    # weight shape: [N, K], weight_scale_inv shape: [N/block_n, K/block_k]
+    N, K = weight_quantized.shape
+    scale_n, scale_k = weight_scale_inv.shape
+    block_n = N // scale_n
+    block_k = K // scale_k
+    block_size = [block_n, block_k]
+
+    qinput, scale = _safe_act_quant(input, block_size[1])
+    output = w8a8_block_fp8_matmul_triton(
+        qinput,
+        weight_quantized,
+        scale,
+        weight_scale_inv,
+        block_size,
+        output_dtype=input.dtype,
+    )
+
+    if bias is not None:
+        output = output + bias
+
+    return output.to(dtype=input.dtype)
+
+
+@torch_fake_quant_finegrained_fp8_linear.register_fake
+def _torch_fake_quant_finegrained_fp8_linear_fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    out_features = weight_quantized.shape[0]
+    return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_finegrained_fp8_linear", mutates_args=())
+def trtllm_finegrained_fp8_linear(
+    input: torch.Tensor,  # [..., K] bfloat16
+    weight: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [N] or None
+    weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale
+) -> torch.Tensor:
+    """TRT-LLM optimized FineGrainedFP8 linear operation.
+
+    Uses TRT-LLM's optimized fp8_block_scaling_gemm kernel instead of HF's triton kernel.
+    - weight_scale: per-block weight scale with shape [ceil(N/128), ceil(K/128)]
+    - Input is dynamically quantized using fp8_quantize_1x128
+    - Assumes 128x128 block size (standard for DeepSeek/MiniMax style FP8)
+    """
+    from tensorrt_llm._utils import get_sm_version, is_sm_100f
+
+    # Ensure input is bfloat16 for the optimized kernel
+    if input.dtype == torch.float8_e4m3fn:
+        raise ValueError("trtllm_finegrained_fp8_linear expects bfloat16 input, not FP8")
+
+    # TRT-LLM fp8_block_scaling_gemm requires float32 scales; HF checkpoints may
+    # store weight_scale_inv in bfloat16 to save space, so cast here.
+    if weight_scale.dtype != torch.float32:
+        weight_scale = weight_scale.float()
+
+    # Derive effective block size from weight and scale shapes.
+    input_shape = input.shape
+    N, K = weight.shape
+    scale_n, scale_k = weight_scale.shape
+    if scale_n == 0 or scale_k == 0:
+        raise ValueError(
+            f"trtllm_finegrained_fp8_linear: weight_scale has zero dimension "
+            f"(shape={weight_scale.shape}), weight shape={weight.shape}. "
+            f"This usually means scale tensor sharding produced an empty tensor."
+        )
+    block_n = N // scale_n
+    block_k = K // scale_k
+
+    # TRT-LLM fp8_block_scaling_gemm requires exact 128x128 blocks.
+    # For small layers where a dimension < 128 (e.g. N=64), the derived block
+    # size will be < 128.  Fall back to the Triton-based implementation which
+    # handles arbitrary block sizes correctly.
+    if block_n != 128 or block_k != 128:
+        from transformers.integrations.finegrained_fp8 import w8a8_block_fp8_matmul_triton
+
+        block_size = [block_n, block_k]
+        qinput, act_scale = _safe_act_quant(input, block_size[1])
+        output = w8a8_block_fp8_matmul_triton(
+            qinput,
+            weight,
+            act_scale,
+            weight_scale,
+            block_size,
+            output_dtype=input.dtype,
+        )
+        if bias is not None:
+            output = output + bias
+        return output.reshape(*input_shape[:-1], N) if len(input_shape) > 2 else output
+
+    # Flatten input for GEMM: [..., K] -> [M, K]
+    input_2d = input.reshape(-1, input_shape[-1])
+
+    # SM version-specific paths (following linear.py pattern)
+    if is_sm_100f():
+        # Blackwell path: use fp8_quantize_1x128 + fp8_block_scaling_gemm
+        act_fp8, act_sf = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
+    elif get_sm_version() == 120:
+        # SM120 path
+        from tensorrt_llm._torch.modules.linear import per_token_quant_and_transform
+
+        act_fp8, act_sf = per_token_quant_and_transform(input_2d)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
+    else:
+        # Hopper (SM90) path
+        act_fp8, act_sf = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
+
+    if bias is not None:
+        output = output + bias
+
+    # Reshape back to original batch dimensions: [M, N] -> [..., N]
+    return output.reshape(*input_shape[:-1], weight.shape[0])
+
+
+@trtllm_finegrained_fp8_linear.register_fake
+def _trtllm_finegrained_fp8_linear_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    out_features = weight.shape[0]
+    return torch.empty((*input.shape[:-1], out_features), dtype=torch.bfloat16, device=input.device)
