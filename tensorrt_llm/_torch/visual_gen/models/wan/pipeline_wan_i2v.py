@@ -271,6 +271,38 @@ class WanImageToVideoPipeline(BasePipeline):
             # Save transformer_2 backend
             self.transformer_2_cache_backend = self.cache_backend
 
+    def _run_warmup(self, warmup_steps: int) -> None:
+        """Run warmup inference to trigger torch.compile and CUDA init.
+
+        Runs warmup inference with common shapes for Wan I2V models.
+        Creates a dummy black image for the image conditioning input.
+        """
+        common_shapes = [(480, 832, 33), (720, 1280, 81)]
+
+        if self.is_wan22:
+            warmup_steps = warmup_steps * 2
+
+        for height, width, num_frames in common_shapes:
+            logger.info(
+                f"Warmup: Wan I2V {height}x{width}, {num_frames} frames {warmup_steps} steps"
+            )
+
+            dummy_image = PIL.Image.new("RGB", (width, height))
+
+            with torch.no_grad():
+                self.forward(
+                    image=dummy_image,
+                    prompt="warmup",
+                    negative_prompt="",
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    num_inference_steps=warmup_steps,
+                    guidance_scale=5.0,
+                    seed=0,
+                    max_sequence_length=512,
+                )
+
     def infer(self, req):
         """Run inference with request parameters."""
         # Extract image from request (can be path, PIL Image, or torch.Tensor)

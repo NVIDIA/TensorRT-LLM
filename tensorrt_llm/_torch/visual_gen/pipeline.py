@@ -198,13 +198,13 @@ class BasePipeline(nn.Module):
                         f"({len(blocks)} blocks, mode={compile_mode})"
                     )
                     compiled_blocks = []
+                    # dynamic=None works better with multiple warmup shapes
                     for block in blocks:
-                        # NOTE: dynamic=False is helpful for speed
                         compiled_blocks.append(
                             torch.compile(
                                 block,
                                 mode=compile_mode,
-                                dynamic=False,
+                                dynamic=None,
                                 fullgraph=pipeline_config.enable_fullgraph,
                             )
                         )
@@ -214,7 +214,7 @@ class BasePipeline(nn.Module):
                 compiled = torch.compile(
                     model,
                     mode=compile_mode,
-                    dynamic=False,
+                    dynamic=None,
                     fullgraph=pipeline_config.enable_fullgraph,
                 )
                 setattr(self, name, compiled)

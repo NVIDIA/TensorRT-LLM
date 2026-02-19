@@ -245,41 +245,29 @@ class WanPipeline(BasePipeline):
     def _run_warmup(self, warmup_steps: int) -> None:
         """Run warmup inference to trigger torch.compile and CUDA init.
 
-        Detects model variant from checkpoint path and uses matching default
-        resolution so torch.compile traces the correct shape.
+        Runs warmup inference with common shapes for Wan models.
         """
-        # (height, width, num_frames) per variant keyword
-        variant_shapes = {
-            "480P": (480, 832, 81),
-            "1.3B": (480, 832, 33),
-        }
-        fallback = (720, 1280, 81)  # TODO: make this better
+        common_shapes = [(480, 832, 33), (720, 1280, 81)]
+        
         if self.is_wan22:
             # Double warmup steps to also warmup the 2nd transformer
             warmup_steps = warmup_steps * 2
 
-        checkpoint_path = getattr(self.model_config.pretrained_config, "_name_or_path", "") or ""
-        height, width, num_frames = fallback
-        for variant, shape in variant_shapes.items():
-            if variant in checkpoint_path:
-                height, width, num_frames = shape
-                logger.info(f"Warmup: Wan {variant} -> {height}x{width}, {num_frames} frames")
-                break
+        for height, width, num_frames in common_shapes:
+            logger.info(f"Warmup: Wan {height}x{width}, {num_frames} frames {warmup_steps} steps")
 
-        logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {warmup_steps} steps")
-
-        with torch.no_grad():
-            self.forward(
-                prompt="warmup",
-                negative_prompt="",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                num_inference_steps=warmup_steps,
-                guidance_scale=5.0,
-                seed=0,
-                max_sequence_length=512,  # should match DiffusionRequest.max_sequence_length
-            )
+            with torch.no_grad():
+                self.forward(
+                    prompt="warmup",
+                    negative_prompt="",
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    num_inference_steps=warmup_steps,
+                    guidance_scale=5.0,
+                    seed=0,
+                    max_sequence_length=512,  # should match DiffusionRequest.max_sequence_length
+                )
 
     def infer(self, req):
         """Run inference with request parameters."""

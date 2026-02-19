@@ -207,8 +207,7 @@ class PipelineLoader:
             pipeline.post_load_weights()
 
         if config.pipeline.enable_torch_compile:
-            torch._dynamo.config.capture_scalar_outputs = True
-            torch._dynamo.config.cache_size_limit = 128  # TODO: what's the best way to set this?
+            torch._dynamo.config.cache_size_limit = 128
             pipeline.torch_compile()
         else:
             logger.info("torch.compile disabled by config")

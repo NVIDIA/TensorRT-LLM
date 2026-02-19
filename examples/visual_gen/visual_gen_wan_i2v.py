@@ -126,6 +126,11 @@ def parse_args():
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
 
+    # Cuda graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
+    )
+
     # torch compile
     parser.add_argument(
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
