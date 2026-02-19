@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
     switch (output_buffer_kind)
     {
     case OutputBufferKind::NcclWindow:
-#if ENABLE_MULTI_DEVICE
+#if defined(ENABLE_MULTI_DEVICE)
         if (group.has_value() && group->size() > 0)
         {
             std::set<int> groupSet;
