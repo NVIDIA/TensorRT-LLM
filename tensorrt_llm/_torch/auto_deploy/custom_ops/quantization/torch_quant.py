@@ -481,6 +481,7 @@ def _dequant_block_fp8_weight(weight_fp8, weight_scale, block_n, block_k, dtype=
     return weight_fp8.to(dtype) * scale_expanded.to(dtype)
 
 
+
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
 def torch_fake_quant_finegrained_fp8_linear(
     input: torch.Tensor,  # [..., K]
