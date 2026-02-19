@@ -194,6 +194,13 @@ class Sampler(ABC, Generic[GenericSampleState]):
     def is_generation_model(self) -> bool:
         raise NotImplementedError
 
+    def validate_request(self, request: LlmRequest) -> None:
+        """Validate that the request can be processed by the sampler.
+
+        If the request is not supported by the sampler, this should raise an
+        appropriate exception.
+        """
+
     def should_provide_draft_probs(self, request: LlmRequest) -> bool:
         """Check if sampler wants to receive draft token probabilities."""
         return True  # conservative default
@@ -1736,6 +1743,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return [request for request in requests.context_requests if cls._is_new_request(request)]
 
     @override
+    def validate_request(self, request: LlmRequest) -> None:
+        if self._use_beam_search:
+            if request.py_return_log_probs:
+                if request.py_num_logprobs > 1:
+                    raise ValueError(
+                        "Beam search does not support returning multiple logprobs per request"
+                    )
+                if request.py_num_logprobs != 0:
+                    raise ValueError(
+                        "Beam search only supports returning the sampled logprob per token"
+                    )
+
+    @override
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         """Setup the sampler step for the requests
 
@@ -1756,8 +1776,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             end_ids.append(request.py_end_id if request.py_end_id is not None else -1)
 
             if self._use_beam_search:
-                if request.py_return_log_probs and request.py_num_logprobs > 1:
-                    raise ValueError("Beam search does not support multiple logprobs")
+                assert not (request.py_return_log_probs and request.py_num_logprobs > 1), (
+                    "Beam search does not support returning multiple logprobs per request"
+                )
                 prompt_lens.append(request.py_prompt_len)
 
             self._request_grouper.prepare_for_new_request(request, slot)
@@ -3795,6 +3816,15 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
                 non_blocking=True,
             )
 
+    @override
+    def validate_request(self, request: LlmRequest) -> None:
+        if (
+            self.max_batch_size > 1
+            and self.beam_width([request]) > 1
+            and request.py_return_log_probs
+        ):
+            raise ValueError("Beam search only supports logprobs when batch size is 1")
+
     @torch.inference_mode()
     @nvtx_range("sample_async")
     @override
@@ -3807,12 +3837,11 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
     ) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
-        if (
+        assert not (
             batch_size > 1
             and beam_width > 1
             and any(request.py_return_log_probs for request in scheduled_requests.all_requests())
-        ):
-            raise ValueError("Beam search is not supported for multiple prompts and logprobs")
+        ), "Beam search only supports logprobs when batch size is 1"
 
         self.setup_sampler_step(scheduled_requests)
 
