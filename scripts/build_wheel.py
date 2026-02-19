@@ -598,6 +598,18 @@ def main(*,
     if nvrtc_dynamic_linking:
         cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
 
+    # BOLT compatibility: Force dynamic linking for NVIDIA libraries
+    # Static NVIDIA libraries (libnvrtc_static.a, etc.) lack --emit-relocs,
+    # which BOLT requires for proper binary optimization.
+    bolt_enabled = any("ENABLE_BOLT_COMPATIBLE=ON" in var
+                       for var in extra_cmake_vars)
+    if bolt_enabled:
+        if not nvrtc_dynamic_linking:
+            cmake_def_args.append("-DNVRTC_DYNAMIC_LINKING=ON")
+            print(
+                "-- BOLT: Forcing NVRTC_DYNAMIC_LINKING=ON (static NVIDIA libs lack relocations)"
+            )
+
     targets = ["tensorrt_llm", "nvinfer_plugin_tensorrt_llm"]
 
     if cpp_only:
@@ -638,7 +650,7 @@ def main(*,
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --build=missing --remote=TensorRT-LLM --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"

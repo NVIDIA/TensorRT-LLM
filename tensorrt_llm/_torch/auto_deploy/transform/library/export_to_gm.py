@@ -41,6 +41,13 @@ class ExportToGMConfig(TransformConfig):
         "Default is to apply all registered patches.",
         default=None,
     )
+    num_moe_experts_for_export: Optional[int] = Field(
+        description="If set, only this many MOE experts are traced during torch.export, "
+        "and the graph is expanded to include all experts afterwards. "
+        "This can dramatically speed up export for large MOE models (e.g. 256 experts). "
+        "Recommended value: 2.",
+        default=None,
+    )
 
 
 @contextmanager
@@ -183,6 +190,7 @@ class ExportToGM(BaseTransform):
                     clone=self.config.clone_state_dict,
                     strict=self.config.strict,
                     patch_list=self.config.patch_list,
+                    num_moe_experts_for_export=self.config.num_moe_experts_for_export,
                 )
 
             # post process the sub graph module

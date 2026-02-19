@@ -64,6 +64,39 @@ KV cache salting provides a security mechanism to control which requests can reu
 
 To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
 
+### Multimodal UUID Support for Cache Identification
+
+When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
+
+To enable deterministic cache management, you can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. When provided, these UUIDs are returned in KV cache events instead of computed content hashes, while the cache key itself is computed from **both** the UUID and content together for correctness.
+
+**Usage Example:**
+
+```python
+from tensorrt_llm.inputs import TextPrompt
+
+# Provide custom UUIDs for your images
+prompt = TextPrompt(
+    prompt="Describe these images.",
+    multi_modal_data={"image": [image1, image2]},
+    multi_modal_uuids={"image": ["image-uuid-001", "image-uuid-002"]}
+)
+```
+
+**Key Features:**
+
+- **Cache Correctness**: When a UUID is provided, the cache key is computed from both the UUID and content together using `BLAKE3(UUID || Content)`. This ensures different content always produces different cache entries, even with the same UUID.
+- **User Isolation**: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.
+- **Stable Event Identifiers**: The original UUID string is preserved and returned in KV cache events via `get_kv_cache_events()`, enabling deterministic external cache management.
+- **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
+- **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
+
+**UUID Format:**
+
+- Can be any string (e.g., "image-123", "user-session-img-a", database keys)
+- Original UUID strings are preserved and returned in KV cache events
+
+
 ### Enable Offloading to Host Memory
 
 Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.

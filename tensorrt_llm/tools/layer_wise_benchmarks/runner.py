@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import inspect
 import itertools
 import os
 import unittest.mock
@@ -443,9 +444,9 @@ class Runner:
 
         def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
             # TODO: to be more general, we should call DecoderModel.forward
-            residual_fusion = hasattr(model.model.layers[layer_indices[0]], "next_layer_layernorm")
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
+                residual_fusion = "residual" in inspect.signature(layer.forward).parameters
                 if residual_fusion:
                     hidden_states, residual = layer(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs

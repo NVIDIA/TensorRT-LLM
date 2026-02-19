@@ -150,14 +150,14 @@ files = [
 
 [[package]]
 name = "filelock"
-version = "3.20.3"
+version = "3.24.3"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.20.3-py3-none-any.whl", hash = "sha256:4b0dda527ee31078689fc205ec4f1c1bf7d56cf88b6dc9426c4f230e46c2dce1"},
-    {file = "filelock-3.20.3.tar.gz", hash = "sha256:18c57ee915c7ec61cff0ecf7f0f869936c7c30191bb0cf406f1341778d0834e1"},
+    {file = "filelock-3.24.3-py3-none-any.whl", hash = "sha256:426e9a4660391f7f8a810d71b0555bce9008b0a1cc342ab1f6947d37639e002d"},
+    {file = "filelock-3.24.3.tar.gz", hash = "sha256:011a5644dc937c22699943ebbfc46e969cdde3e171470a6e40b9533e5a72affa"},
 ]
 
 [[package]]
@@ -752,18 +752,18 @@ testing = ["datasets", "numpy", "pytest", "pytest-asyncio", "requests", "ruff", 
 
 [[package]]
 name = "torchao"
-version = "0.15.0"
+version = "0.16.0"
 description = "Package for applying ao techniques to GPU models"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "torchao-0.15.0-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1cbe813201314ba6329a650a76944502f3e8ec4b1b44523f3f48676810d8d1f6"},
-    {file = "torchao-0.15.0-py3-none-any.whl", hash = "sha256:3f3812676048ef8a2a0e9d492d12d8971ba7a7ebb16f54aa56f690414e130d2c"},
+    {file = "torchao-0.16.0-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2d6293a0c57c9dd505efb025a7189459d154965fbed000efd638cf299f9362dd"},
+    {file = "torchao-0.16.0-py3-none-any.whl", hash = "sha256:d0a8d773351fd17b95fee81dfbcbf98577b567dcdbec47d221b0ee258432101d"},
 ]
 
 [package.extras]
-dev = ["bitsandbytes", "blobfile", "cmake (>=3.19.0,<4.0.0)", "diskcache", "expecttest", "fire", "hypothesis", "importlib_metadata", "lm_eval", "matplotlib", "ninja", "packaging", "pandas", "parameterized", "pre-commit", "pycocotools", "pytest (==8.4.2)", "ruff (==0.11.6)", "sentencepiece", "tabulate", "tiktoken", "tqdm", "transformers", "unittest-xml-reporting"]
+dev = ["bitsandbytes", "blobfile", "cmake (>=3.19.0,<4.0.0)", "diskcache", "expecttest", "fire", "hypothesis", "importlib_metadata", "lm_eval", "matplotlib", "ninja", "packaging", "pandas", "parameterized", "pre-commit", "pycocotools", "pytest (==8.4.2)", "pyyaml", "ruff (==0.11.6)", "sentencepiece", "tabulate", "tiktoken", "tqdm", "transformers", "unittest-xml-reporting"]
 
 [[package]]
 name = "tqdm"
