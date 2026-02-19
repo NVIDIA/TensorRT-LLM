@@ -526,11 +526,8 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
-                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
-                            req):
-                        self.impl.add_sequence(req.py_request_id,
-                                               req.prompt_len, req_beam_width,
-                                               req)
+                    if self.impl.add_sequence(req.py_request_id, req.prompt_len,
+                                              req_beam_width, req):
                         for _ in range(self.num_extra_kv_tokens):
                             self.impl.add_token(req.py_request_id)
                         for _ in range(get_draft_token_length(req)):
@@ -559,14 +556,6 @@ class KVCacheManager(BaseResourceManager):
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()
-
-        if self.kv_connector_manager is not None:
-            self.kv_connector_manager.build_scheduler_output(
-                scheduled_batch, self)
-
-    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
-        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
-            request)
 
     def add_dummy_requests(
         self,
