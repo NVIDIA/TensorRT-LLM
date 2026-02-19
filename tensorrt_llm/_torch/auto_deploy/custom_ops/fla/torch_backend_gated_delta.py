@@ -153,7 +153,9 @@ def _torch_gated_delta_prefill(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_gated_delta_rule", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::torch_cached_gated_delta_rule", mutates_args=("delta_cache",)
+)
 def torch_cached_gated_delta_rule(
     # INPUTS (dense but may be flattened across sequences)
     q: torch.Tensor,
