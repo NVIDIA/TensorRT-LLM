@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ namespace torch_ext
 std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
     torch::Tensor const& like, torch::List<int64_t> const& group, c10::optional<at::IntArrayRef> shape)
 {
-#if ENABLE_MULTI_DEVICE
+#if defined(ENABLE_MULTI_DEVICE)
     if (!like.defined() || !like.is_cuda())
     {
         TLLM_LOG_DEBUG("[create_nccl_window_tensor] invalid input tensor; defined=%d cuda=%d", like.defined() ? 1 : 0,
