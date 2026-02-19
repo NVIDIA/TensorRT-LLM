@@ -176,12 +176,13 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     NVTX3_SCOPED_RANGE(microBatcherScheduleRequests);
 
     RequestVector contextRequests, generationRequests;
+    // batchNumTokens tracks COMPUTE tokens only (excluding reusable cached tokens)
     SizeType32 batchNumTokens{0};
     SizeType32 scheduledReqSize{0};
     SizeType32 scheduledBeamWidth{0}; // 0 means no request is scheduled
 
     RequestVector contextsToBeChunked;
-    SizeType32 numChunkedTokens{0};
+    SizeType32 numChunkedComputeTokens{0};
     bool allContextRequestsFit{true};
 
     // 1. Select the generation phase requests that meet the criteria of total token size.
@@ -217,41 +218,51 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         }
         else if (llmReq->isContextInitState())
         {
+            // Reusable tokens set by capacity scheduler (from radix tree lookup).
+            // Only valid for the first context chunk; subsequent chunks must compute all remaining tokens.
+            SizeType32 const reusable = llmReq->isFirstContextChunk() ? llmReq->getEstimatedReusableTokens() : 0;
+
             if (!mCtxChunkConfig) // skip chunking
             {
                 constexpr SizeType32 beam{0};
                 reqNumTokens
                     = llmReq->getNumTokens(beam) + (llmReq->hasDraftTokens() ? llmReq->getNumDraftTokens() : 0);
-                TLLM_CHECK_WITH_INFO(!mMaxContextLength || reqNumTokens <= mMaxContextLength.value(),
-                    "The number of context tokens (%d) exceeds the limit value (%d)", reqNumTokens,
+                // Compute tokens = total - reusable (at least 1 to make progress)
+                SizeType32 const computeTokens = std::max(1, reqNumTokens - reusable);
+                TLLM_CHECK_WITH_INFO(!mMaxContextLength || computeTokens <= mMaxContextLength.value(),
+                    "Context compute tokens (%d) exceeds the limit value (%d)", computeTokens,
                     mMaxContextLength.value());
-                if (maxNumTokensRuntime && batchNumTokens + reqNumTokens > maxNumTokensRuntime.value())
+                if (maxNumTokensRuntime && batchNumTokens + computeTokens > maxNumTokensRuntime.value())
                 {
                     break;
                 }
-                TLLM_LOG_DEBUG("context request scheduled: ID %u", llmReq->mRequestId);
+                TLLM_LOG_DEBUG("context request scheduled: ID %u (reusable %d)", llmReq->mRequestId, reusable);
                 contextRequests.emplace_back(llmReq);
-                batchNumTokens += reqNumTokens;
+                batchNumTokens += computeTokens;
             }
             else
             {
                 llmReq->setContextChunkSize(llmReq->getContextRemainingLength());
                 auto const draftTokens
                     = (llmReq->isLastContextChunk() && llmReq->hasDraftTokens()) ? llmReq->getNumDraftTokens() : 0;
-                reqNumTokens = llmReq->getContextChunkSize() + draftTokens;
+                // Compute cost: context compute + draft tokens
+                // (reusable tokens only offset context tokens, not draft tokens)
+                SizeType32 const contextCompute = std::max(0, llmReq->getContextChunkSize() - reusable);
+                SizeType32 computeTokens = contextCompute + draftTokens;
 
                 if (mMaxContextLength)
                 {
-                    if (mMaxContextLength.value() < reqNumTokens)
+                    if (mMaxContextLength.value() < computeTokens)
                     {
                         // The context exceeds the length limit, we need to try chunking later.
-                        reqNumTokens = mMaxContextLength.value();
+                        computeTokens = mMaxContextLength.value();
                         allContextRequestsFit = false;
                     }
                 }
                 contextsToBeChunked.emplace_back(llmReq);
-                numChunkedTokens += reqNumTokens;
-                TLLM_LOG_DEBUG("contexts-to-be-chunked request scheduled: ID %u", llmReq->mRequestId);
+                numChunkedComputeTokens += computeTokens;
+                TLLM_LOG_DEBUG(
+                    "contexts-to-be-chunked request scheduled: ID %u (reusable %d)", llmReq->mRequestId, reusable);
             }
         }
         else // (llmReq->isGenerationInProgressState())
@@ -284,7 +295,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         }
     }
 
-    if (maxNumTokensRuntime && numChunkedTokens > maxNumTokensRuntime.value() - batchNumTokens)
+    if (maxNumTokensRuntime && numChunkedComputeTokens > maxNumTokensRuntime.value() - batchNumTokens)
     {
         allContextRequestsFit = false;
     }
@@ -303,9 +314,14 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         if (llmReq->getContextChunkSize() > 0)
         {
             contextRequests.emplace_back(llmReq);
-            batchNumTokens += llmReq->getContextChunkSize();
-            TLLM_LOG_DEBUG(
-                "context request scheduled: ID %lu, chunk size %d", llmReq->mRequestId, llmReq->getContextChunkSize());
+            // Only count compute tokens (total - reusable).
+            // Reusable credit only applies to the first context chunk.
+            SizeType32 const reusable = llmReq->isFirstContextChunk() ? llmReq->getEstimatedReusableTokens() : 0;
+            SizeType32 const computeTokens
+                = std::max(0, llmReq->getContextChunkSize() - std::min(reusable, llmReq->getContextChunkSize()));
+            batchNumTokens += computeTokens;
+            TLLM_LOG_DEBUG("context request scheduled: ID %lu, chunk size %d%s", llmReq->mRequestId,
+                llmReq->getContextChunkSize(), reusable > 0 ? (", reusable " + std::to_string(reusable)).c_str() : "");
         }
     }
 
