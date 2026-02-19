@@ -15,9 +15,9 @@ from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, Sampler, SampleState,
-                                  SampleStateTensors, AsyncWorkerMixin,
-                                  TorchSampler, add_token, int_tensor)
+from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, AsyncWorkerMixin, Sampler,
+                                  SampleState, SampleStateTensors, TorchSampler,
+                                  add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -200,12 +200,14 @@ class MTPSpecMetadata(SpecMetadata):
                     mtp_past_tokens_ptrs.append(
                         self.mtp_hidden_states_manager.
                         mtp_past_tokens_pool[slot_id].data_ptr())
-                mtp_hidden_states_ptrs = torch.tensor(mtp_hidden_states_ptrs,
-                                                      dtype=torch.int64,
-                                                      pin_memory=use_pinned_memory())
-                mtp_past_tokens_ptrs = torch.tensor(mtp_past_tokens_ptrs,
-                                                    dtype=torch.int64,
-                                                    pin_memory=use_pinned_memory())
+                mtp_hidden_states_ptrs = torch.tensor(
+                    mtp_hidden_states_ptrs,
+                    dtype=torch.int64,
+                    pin_memory=use_pinned_memory())
+                mtp_past_tokens_ptrs = torch.tensor(
+                    mtp_past_tokens_ptrs,
+                    dtype=torch.int64,
+                    pin_memory=use_pinned_memory())
                 self.mtp_hidden_states_ptrs[:num_seqs].copy_(
                     mtp_hidden_states_ptrs, non_blocking=True)
                 self.mtp_past_tokens_ptrs[:num_seqs].copy_(mtp_past_tokens_ptrs,

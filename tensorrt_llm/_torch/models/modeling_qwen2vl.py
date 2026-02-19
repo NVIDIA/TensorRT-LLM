@@ -775,7 +775,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
         batch_size = 1  # NOTE: Qwen2/2.5-VL concats all the pixel_values into a single tensor, so batch_size is 1
         prompt_lens = seq_lens
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=use_pinned_memory())
+        seq_lens = torch.tensor(seq_lens,
+                                dtype=torch.int,
+                                pin_memory=use_pinned_memory())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.num_contexts = len(seq_lens)

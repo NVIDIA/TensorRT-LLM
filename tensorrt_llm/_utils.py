@@ -1261,7 +1261,7 @@ def confidential_compute_enabled() -> bool:
     try:
         import pynvml
     except ImportError:
-        logger.error(f"pynvml not available; assuming CC=off")
+        logger.error("pynvml not available; assuming CC=off")
         return False
 
     cc_enabled = False
@@ -1315,6 +1315,10 @@ def use_pinned_memory() -> bool:
 
 
 def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper around torch.Tensor.pin_memory() that conditionally pins the tensor
+    memory if use_pinned_memory() returns True
+    """
     if use_pinned_memory():
         return tensor.pin_memory()
     return tensor

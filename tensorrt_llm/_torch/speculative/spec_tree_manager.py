@@ -124,7 +124,8 @@ class SpecTreeManager:
             torch.ones(self.dynamic_tree_max_topK,
                        dtype=torch.int32,
                        device='cpu',
-                       pin_memory=use_pinned_memory()) * self.dynamic_tree_max_topK
+                       pin_memory=use_pinned_memory()) *
+            self.dynamic_tree_max_topK
         ]
 
     # For the static tree
