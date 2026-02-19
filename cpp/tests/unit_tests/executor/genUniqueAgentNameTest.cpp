@@ -133,8 +133,7 @@ TEST(GenUniqueAgentNameTest, ThreadSafety)
         t.join();
     }
 
-    EXPECT_EQ(allNames.size(), kNumThreads * kCallsPerThread)
-        << "All names from concurrent threads must be unique";
+    EXPECT_EQ(allNames.size(), kNumThreads * kCallsPerThread) << "All names from concurrent threads must be unique";
 }
 
 TEST(GenUniqueAgentNameTest, HostnameAndPidAreConsistent)
