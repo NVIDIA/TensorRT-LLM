@@ -110,21 +110,22 @@ TEST(GenUniqueAgentNameTest, ThreadSafety)
     std::vector<std::thread> threads;
     for (int t = 0; t < kNumThreads; ++t)
     {
-        threads.emplace_back([&]()
-        {
-            std::vector<std::string> localNames;
-            localNames.reserve(kCallsPerThread);
-            for (int i = 0; i < kCallsPerThread; ++i)
+        threads.emplace_back(
+            [&]()
             {
-                localNames.push_back(genUniqueAgentName());
-            }
+                std::vector<std::string> localNames;
+                localNames.reserve(kCallsPerThread);
+                for (int i = 0; i < kCallsPerThread; ++i)
+                {
+                    localNames.push_back(genUniqueAgentName());
+                }
 
-            std::lock_guard<std::mutex> lock(mtx);
-            for (std::string& n : localNames)
-            {
-                allNames.insert(std::move(n));
-            }
-        });
+                std::lock_guard<std::mutex> lock(mtx);
+                for (std::string& n : localNames)
+                {
+                    allNames.insert(std::move(n));
+                }
+            });
     }
 
     for (std::thread& t : threads)
