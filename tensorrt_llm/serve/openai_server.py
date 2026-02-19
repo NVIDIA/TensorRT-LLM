@@ -123,6 +123,8 @@ class OpenAIServer:
         self.metrics_collector = None
         self.perf_metrics = None
         self.perf_metrics_lock = None
+        self._iteration_stats_collector_task = None
+        self._iteration_stats_wakeup_event = asyncio.Event()
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
@@ -158,8 +160,24 @@ class OpenAIServer:
                 self.disagg_cluster_worker= DisaggClusterWorker(self.server_role, self.host, self.port, self.disagg_cluster_config, self.disagg_cluster_storage)
                 await self.disagg_cluster_worker.register_worker()
 
+            # Start background iteration stats collector if metrics are enabled
+            # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
+            # tensorrt backend does not have this attribute but it always has iter stats enabled.
+            if self.metrics_collector and getattr(self.generator.args, "enable_iter_perf_stats", True):
+                self._iteration_stats_collector_task = asyncio.create_task(self._iteration_stats_collector_loop())
+                logger.info("Started background iteration stats collector task")
+
             # terminate rank0 worker
             yield
+
+            # Stop background iteration stats collector
+            if self._iteration_stats_collector_task is not None:
+                self._iteration_stats_collector_task.cancel()
+                try:
+                    await self._iteration_stats_collector_task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("Stopped background iteration stats collector task")
 
             if self.metadata_server is not None:
                 self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
@@ -568,7 +586,11 @@ class OpenAIServer:
         if not res.finished:
             return
         if self.metrics_collector:
-            self.metrics_collector.log_metrics_dict(res.metrics_dict)
+            self.metrics_collector.log_request_metrics_dict(res.metrics_dict)
+            # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
+            # Wake up the stats collector to drain iteration stats
+            if getattr(self.generator.args, "enable_iter_perf_stats", True):
+                self._iteration_stats_wakeup_event.set()
         if self.generator.args.return_perf_metrics:
             output = res.outputs[0]
             item = {
@@ -598,6 +620,49 @@ class OpenAIServer:
                              f" {disaggregated_params.disagg_request_id}")
 
         return chat_response
+
+    async def _iteration_stats_collector_loop(self):
+        """
+        Background task that continuously collects iteration statistics from the LLM engine.
+
+        This task runs in the background for the lifetime of the server and drains iteration
+        stats from the engine's stats queue, logging only the latest stats to Prometheus.
+        Since iteration stats are gauges (point-in-time metrics like KV cache hit rate),
+        only the most recent value is needed. This approach avoids blocking request completion
+        while collecting stats and minimizes redundant metric updates.
+
+        The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
+        requests complete.
+
+        The loop will continue until the task is cancelled during server shutdown.
+        """
+        try:
+            logger.info("Iteration stats collector loop started")
+            while True:
+                # Wait for signal that requests have completed and stats may be available
+                await self._iteration_stats_wakeup_event.wait()
+
+                # Clear the event for next wakeup
+                self._iteration_stats_wakeup_event.clear()
+
+                # Drain all available iteration stats from the queue, but only log the latest
+                # Since metrics are gauges (point-in-time values), only the most recent stat matters
+                try:
+                    latest_stat = None
+                    async for llm_stat in self.generator.get_stats_async(timeout=0.5):
+                        latest_stat = llm_stat  # Keep only the latest
+
+                    # Log only the most recent iteration stats to Prometheus
+                    if latest_stat is not None:
+                        self.metrics_collector.log_iteration_stats(latest_stat)
+                except Exception as e:
+                    # Log errors but continue collecting stats
+                    logger.error(f"Error collecting iteration stats: {e}", exc_info=True)
+                    # Brief sleep to avoid tight loop on persistent errors
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            logger.info("Iteration stats collector loop cancelled")
+            raise
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
