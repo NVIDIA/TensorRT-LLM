@@ -1274,13 +1274,11 @@ def confidential_compute_enabled() -> bool:
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
         ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
         pynvml._nvmlCheckReturn(ret)
-        if (ret == pynvml.NVML_SUCCESS):
-            cc_enabled = (cc_settings.ccFeature
-                          == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
-                          or cc_settings.multiGpuMode
-                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
-                          or cc_settings.multiGpuMode
-                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode
+            == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
     except pynvml.NVMLError_NotSupported:
         # Simple query for older GPUs
         try:
