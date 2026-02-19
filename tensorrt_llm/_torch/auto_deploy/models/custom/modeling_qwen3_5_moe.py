@@ -529,79 +529,6 @@ class Qwen3_5MoeExpert(nn.Module):
         self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False)
 
 
-class Qwen3_5MoeExperts(nn.Module):
-    """Expert weights stored as numbered expert modules.
-
-    The checkpoint stores experts as fused 3D tensors:
-        - gate_up_proj: [num_experts, 2*intermediate_dim, hidden_dim] in [gate, up] order
-        - down_proj: [num_experts, hidden_dim, intermediate_dim]
-
-    A load hook splits these into individual expert modules with structure:
-        - {expert_id}.gate_proj.weight: [intermediate_dim, hidden_dim]
-        - {expert_id}.up_proj.weight: [intermediate_dim, hidden_dim]
-        - {expert_id}.down_proj.weight: [hidden_dim, intermediate_dim]
-    """
-
-    def __init__(self, config: Qwen3_5MoeTextConfig):
-        super().__init__()
-        self.num_experts = config.num_experts
-        self.hidden_dim = config.hidden_size
-        self.intermediate_dim = config.moe_intermediate_size
-
-        # Register each expert as a numbered attribute (0, 1, 2, ...)
-        for i in range(self.num_experts):
-            setattr(self, str(i), Qwen3_5MoeExpert(self.hidden_dim, self.intermediate_dim))
-
-        # Register load hook to split fused checkpoint weights into expert list
-        self._register_load_state_dict_pre_hook(self._load_from_fused_checkpoint)
-
-    @staticmethod
-    def _load_from_fused_checkpoint(state_dict, prefix, *args):
-        """Load from fused checkpoint format and split into individual experts.
-
-        Checkpoint format:
-            - gate_up_proj: [E, 2*I, H] with [gate, up] stacking
-            - down_proj: [E, H, I]
-
-        Target format:
-            - {expert_id}.gate_proj.weight: [I, H]
-            - {expert_id}.up_proj.weight: [I, H]
-            - {expert_id}.down_proj.weight: [H, I]
-        """
-        gate_up_key = prefix + "gate_up_proj"
-        down_key = prefix + "down_proj"
-
-        if gate_up_key in state_dict:
-            # Split fused gate_up_proj: [E, 2*I, H] -> gate[E, I, H] + up[E, I, H]
-            fused = state_dict.pop(gate_up_key)
-            num_experts = fused.shape[0]
-            intermediate_dim = fused.shape[1] // 2
-
-            gate_weights = fused[:, :intermediate_dim, :]  # [E, I, H]
-            up_weights = fused[:, intermediate_dim:, :]  # [E, I, H]
-
-            # Populate individual expert gate_proj and up_proj
-            for i in range(num_experts):
-                state_dict[f"{prefix}{i}.gate_proj.weight"] = gate_weights[i]
-                state_dict[f"{prefix}{i}.up_proj.weight"] = up_weights[i]
-
-        if down_key in state_dict:
-            # Split down_proj: [E, H, I] -> individual [H, I]
-            fused = state_dict.pop(down_key)
-            num_experts = fused.shape[0]
-
-            for i in range(num_experts):
-                state_dict[f"{prefix}{i}.down_proj.weight"] = fused[i]
-
-    def __getitem__(self, idx: int) -> Qwen3_5MoeExpert:
-        """Allow list-like access to experts."""
-        return getattr(self, str(idx))
-
-    def __len__(self) -> int:
-        """Return number of experts."""
-        return self.num_experts
-
-
 class Qwen3_5MoeTopKRouter(nn.Module):
     """Top-K router with softmax normalization."""
 
@@ -634,11 +561,50 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
     def __init__(self, config: Qwen3_5MoeTextConfig):
         super().__init__()
         self.gate = Qwen3_5MoeTopKRouter(config)
-        self.experts = Qwen3_5MoeExperts(config)
+        self.experts = nn.ModuleList(
+            [
+                Qwen3_5MoeExpert(config.hidden_size, config.moe_intermediate_size)
+                for _ in range(config.num_experts)
+            ]
+        )
         self.shared_expert = Qwen3_5MoeMLP(
             config, intermediate_size=config.shared_expert_intermediate_size
         )
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
+        self._register_load_state_dict_pre_hook(self._load_experts_from_fused_checkpoint)
+
+    @staticmethod
+    def _load_experts_from_fused_checkpoint(state_dict, prefix, *args):
+        """Load fused MoE expert checkpoint tensors into per-expert ModuleList params.
+
+        Checkpoint format:
+            - experts.gate_up_proj: [E, 2*I, H] with [gate, up] stacking
+            - experts.down_proj: [E, H, I]
+
+        Target format:
+            - experts.{expert_id}.gate_proj.weight: [I, H]
+            - experts.{expert_id}.up_proj.weight: [I, H]
+            - experts.{expert_id}.down_proj.weight: [H, I]
+        """
+        gate_up_key = prefix + "experts.gate_up_proj"
+        down_key = prefix + "experts.down_proj"
+
+        if gate_up_key in state_dict:
+            fused = state_dict.pop(gate_up_key)
+            num_experts = fused.shape[0]
+            intermediate_dim = fused.shape[1] // 2
+            gate_weights = fused[:, :intermediate_dim, :]
+            up_weights = fused[:, intermediate_dim:, :]
+
+            for i in range(num_experts):
+                state_dict[f"{prefix}experts.{i}.gate_proj.weight"] = gate_weights[i]
+                state_dict[f"{prefix}experts.{i}.up_proj.weight"] = up_weights[i]
+
+        if down_key in state_dict:
+            fused = state_dict.pop(down_key)
+            num_experts = fused.shape[0]
+            for i in range(num_experts):
+                state_dict[f"{prefix}experts.{i}.down_proj.weight"] = fused[i]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -750,10 +716,6 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModel):
         elif isinstance(module, Qwen3_5MoeGatedDeltaNet):
             module.dt_bias.data.fill_(1.0)
             module.A_log.data.copy_(torch.empty_like(module.A_log).uniform_(0, 16).log_())
-        elif isinstance(module, Qwen3_5MoeExperts):
-            # Expert weights are now individual nn.Linear layers in ModuleLists
-            # These are already initialized by super()._init_weights above
-            pass
         elif isinstance(module, Qwen3_5MoeTopKRouter):
             module.weight.data.normal_(mean=0.0, std=std)
 

@@ -29,7 +29,6 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
     Qwen3_5MoeAttention,
     Qwen3_5MoeConfig,
     Qwen3_5MoeDecoderLayer,
-    Qwen3_5MoeExperts,
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeGatedDeltaNet,
@@ -102,8 +101,17 @@ def _init_block_weights(module, std=0.02):
     uninitialized (containing NaN/garbage). This function initializes them.
     """
     for m in module.modules():
-        if isinstance(m, Qwen3_5MoeExperts):
-            # Initialize expert list weights
+        if (
+            isinstance(m, torch.nn.ModuleList)
+            and len(m) > 0
+            and all(
+                hasattr(expert, "gate_proj")
+                and hasattr(expert, "up_proj")
+                and hasattr(expert, "down_proj")
+                for expert in m
+            )
+        ):
+            # Initialize MoE expert list weights
             for i in range(len(m)):
                 m[i].gate_proj.weight.data.normal_(mean=0.0, std=std)
                 m[i].up_proj.weight.data.normal_(mean=0.0, std=std)

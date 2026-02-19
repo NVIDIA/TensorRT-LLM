@@ -599,6 +599,11 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             "model_kwargs": {
                 "torch_dtype": "bfloat16",
             },
+            "transforms": {
+                "export_to_gm": {
+                    "num_moe_experts_for_export": 2,
+                },
+            },
         }
 
     def get_default_sampling_params(self):
