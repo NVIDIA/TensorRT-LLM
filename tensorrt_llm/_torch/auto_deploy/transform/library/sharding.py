@@ -2876,7 +2876,6 @@ def detect_column_row_shard(
         opening = layer.opening_nodes
         closing = layer.terminating_node
         layer_subgraph = layer.subgraph_nodes
-        min_local_shape = layer.min_local_shape
         nodes_linear = opening + [closing] + list(filtered_nodes(layer_subgraph, is_any_lin_op))
 
         if config.simple_shard_only or layer.layer_type == LayerType.UNKNOWN:
