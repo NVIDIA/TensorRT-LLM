@@ -10,7 +10,7 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
-from .mamba_cache_manager import MambaCacheManager, use_cpp_mamba_cache_manager
+from .mamba_cache_manager import MambaCacheManager
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -39,12 +39,6 @@ def create_kv_cache_transceiver(
         mamba_cache_manager: Optional[MambaCacheManager] = None):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
-        return None
-
-    if mamba_cache_manager is not None and not use_cpp_mamba_cache_manager():
-        raise ValueError(
-            "Disaggregated serving is not supported with python mamba cache manager. Please set TRTLLM_USE_CPP_MAMBA=1 to use C++ MambaCacheManager in disaggregated serving."
-        )
         return None
 
     if cache_transceiver_config.backend == "DEFAULT":
