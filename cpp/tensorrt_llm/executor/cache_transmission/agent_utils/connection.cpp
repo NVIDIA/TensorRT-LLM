@@ -32,7 +32,7 @@ std::string genUniqueAgentName()
 
     // Generate a per-process random suffix to disambiguate agents across containers
     // that may share the same hostname (--network host) and PID namespace.
-    static uint64_t const randomSuffix = []()
+    static uint64_t const sRandomSuffix = []()
     {
         std::random_device rd;
         return (static_cast<uint64_t>(rd()) << 32) | rd();
@@ -41,7 +41,7 @@ std::string genUniqueAgentName()
     char hostname[1024];
     gethostname(hostname, sizeof(hostname));
     auto pid = static_cast<uint64_t>(::getpid());
-    return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(randomSuffix) + "_"
+    return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(sRandomSuffix) + "_"
         + std::to_string(counter++);
 }
 
