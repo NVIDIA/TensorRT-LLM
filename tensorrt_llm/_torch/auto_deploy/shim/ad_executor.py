@@ -453,7 +453,9 @@ class ADEngine(ModelEngine):
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
+        build_and_optimize = InferenceOptimizer(
+            factory=factory, config=ad_config.transforms, mapping=mapping
+        )
 
         # construct engine
         return cls(
@@ -1035,15 +1037,10 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize process groups
     world_size = mpi_world_size()
     rank = mpi_rank()
-    enable_attention_dp = ad_config.transforms.get("detect_sharding", {}).get(
-        "enable_attention_dp", False
-    )
-    dist_mapping = Mapping(
-        rank=rank,
-        world_size=world_size,
-        tp_size=world_size,
-        enable_attention_dp=enable_attention_dp,
-    )
+
+    # Initialize Mapping from config
+    dist_mapping = ad_config.init_mapping_from_config(rank, world_size)
+
     dist = Distributed.get(dist_mapping)
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
@@ -1166,6 +1163,18 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             raise RuntimeError(
                 "Could not determine the vocabulary size. Required for guided decoding."
             )
+
+        # The tokenizer may be None if stripped from MPI kwargs to avoid pickle
+        # failures with trust_remote_code models. Reload it from the model path
+        # when guided decoding needs it.
+        if tokenizer is None and ad_config.model is not None:
+            ad_logger.info("Tokenizer not provided; loading from model path for guided decoding")
+            from tensorrt_llm.tokenizer import TransformersTokenizer
+
+            tokenizer = TransformersTokenizer.from_pretrained(
+                ad_config.model, trust_remote_code=ad_config.trust_remote_code
+            )
+
         guided_decoding_config = get_guided_decoding_config(
             guided_decoding_backend=guided_decoding_backend, tokenizer=tokenizer
         )

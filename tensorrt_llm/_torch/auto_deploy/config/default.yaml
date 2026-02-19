@@ -103,6 +103,7 @@ transforms:
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     shard_all_unprocessed: true
+    enable_attention_dp: false
     allreduce_strategy: 'NCCL'
     dist_backend: auto
     requires_shape_prop: true
