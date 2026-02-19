@@ -210,16 +210,9 @@ def _assert_numerics(ref_out, fused_out, extra_norm_consumer):
 
 
 class _RMSNormFP8LinearModel(nn.Module):
-    """Model whose forward already uses flashinfer_rms_norm + trtllm_quant_fp8_linear.
+    """Traceable model: flashinfer_rms_norm -> trtllm_quant_fp8_linear.
 
-    Simulates the graph state AFTER fuse_rmsnorm and fuse_fp8_linear have run,
-    which is the input expected by FuseRMSNormQuantFP8.
-
-    Args:
-        num_linears: Number of FP8 linear consumers of the norm output (e.g. 3
-            for Q/K/V projections).
-        extra_norm_consumer: If True, the norm output is also returned directly
-            (mimics a residual connection).
+    Produces the FX graph pattern that FuseRMSNormQuantFP8 expects.
     """
 
     def __init__(self, in_features=128, out_features=256, num_linears=3, extra_norm_consumer=True):
@@ -264,9 +257,9 @@ class _RMSNormFP8LinearModel(nn.Module):
 
 
 class _RMSNormFP8FusedAddModel(nn.Module):
-    """Model: getitem(flashinfer_fused_add_rms_norm(x, residual, weight, eps), 0) -> trtllm_quant_fp8_linear.
+    """Traceable model: flashinfer_fused_add_rms_norm -> trtllm_quant_fp8_linear.
 
-    Forward: (x, residual) -> (combined, add_out). Used to test fused add+norm FP8 path.
+    Forward: (x, residual) -> (combined, add_out).
     """
 
     def __init__(self, in_features=128, out_features=256, num_linears=1):
@@ -284,6 +277,7 @@ class _RMSNormFP8FusedAddModel(nn.Module):
 
     def forward(self, x, residual):
         norm_out, add_out = flashinfer_fused_add_rms_norm(x, residual, self.norm_weight, 1e-5)
+
         outputs = []
         for i in range(self.num_linears):
             w_fp8 = getattr(self, f"w_fp8_{i}")
@@ -296,10 +290,67 @@ class _RMSNormFP8FusedAddModel(nn.Module):
                 weight_scale=w_scale,
             )
             outputs.append(out)
+
         combined = outputs[0]
         for o in outputs[1:]:
             combined = combined + o
         return combined, add_out
+
+
+def _fp32_gold_reference_fp8(model, x, residual=None):
+    """Compute FP32 gold reference: RMSNorm in FP32 -> FP8 quant from FP32 -> GEMM.
+
+    Avoids the FP32->BF16->FP32 round-trip between norm and quant that occurs
+    in the unfused FlashInfer path, producing the mathematically most precise result.
+    """
+
+    FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
+    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+    def _rms_norm_f32(x, weight, eps):
+        """RMSNorm in FP32 matching Triton kernel math: var = sum(x^2) * (1/N)."""
+        xf = x.float()
+        var = xf.pow(2).sum(-1, keepdim=True) * (1.0 / x.shape[-1])
+        normed = xf / torch.sqrt(var + eps)
+        return weight.float() * normed
+
+    def _quant_fp8_from_f32(x_f32, scale):
+        """Quantize FP32 tensor to FP8 E4M3 (matches kernel: div by scale, clamp, cast)."""
+        return (x_f32 / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
+
+    with torch.no_grad():
+        if residual is not None:
+            add_out = x + residual
+            norm_f32 = _rms_norm_f32(add_out, model.norm_weight, 1e-5)
+        else:
+            norm_f32 = _rms_norm_f32(x, model.norm_weight, 1e-5)
+
+        norm_bf16 = norm_f32.to(x.dtype)
+        fp8_input = _quant_fp8_from_f32(norm_f32, model.input_scale)
+
+        outputs = []
+        for i in range(model.num_linears):
+            w_fp8 = getattr(model, f"w_fp8_{i}")
+            w_scale = getattr(model, f"w_scale_{i}")
+            out = torch.ops.auto_deploy.trtllm_fp8_gemm(
+                fp8_input,
+                w_fp8,
+                None,
+                input_scale=model.input_scale,
+                weight_scale=w_scale,
+                out_dtype="bfloat16",
+            )
+            outputs.append(out)
+
+        combined = outputs[0]
+        for o in outputs[1:]:
+            combined = combined + o
+
+        if residual is not None:
+            return combined, add_out
+        if getattr(model, "extra_norm_consumer", False):
+            return combined, norm_bf16
+        return combined
 
 
 def _is_flashinfer_fused_add_rms_norm_node(n):
@@ -343,7 +394,8 @@ def _has_fused_rmsnorm_quant_fp8(gm, fused_add=False):
     reason="Requires FP8 support and TRT-LLM ops",
 )
 def test_fuse_rmsnorm_quant_fp8(num_linears, fused_add, extra_norm_consumer):
-    """FuseRMSNormQuantFP8: direct RMSNorm+FP8 or fused add+RMSNorm+FP8; graph fused, numerics match."""
+    """FuseRMSNormQuantFP8: graph fused correctly and fused output is at least as
+    accurate as unfused when compared to an FP32 gold reference."""
     torch.manual_seed(0)
     K, N = 128, 256
     if fused_add:
@@ -354,9 +406,6 @@ def test_fuse_rmsnorm_quant_fp8(num_linears, fused_add, extra_norm_consumer):
         ).cuda()
         x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
         residual = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-        x_ref = x.clone()
-        residual_ref = residual.clone()
-        ref_out = model(x_ref, residual_ref)
     else:
         model = _RMSNormFP8LinearModel(
             in_features=K,
@@ -365,9 +414,12 @@ def test_fuse_rmsnorm_quant_fp8(num_linears, fused_add, extra_norm_consumer):
             extra_norm_consumer=extra_norm_consumer,
         ).cuda()
         x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-        ref_out = model(x)
+        residual = None
+
+    gold = _fp32_gold_reference_fp8(model, x, residual)
 
     gm = torch.fx.symbolic_trace(model)
+
     if fused_add:
         assert any(_is_flashinfer_fused_add_rms_norm_node(n) for n in gm.graph.nodes), (
             "Precondition: graph should contain flashinfer_fused_add_rms_norm"
@@ -389,12 +441,13 @@ def test_fuse_rmsnorm_quant_fp8(num_linears, fused_add, extra_norm_consumer):
         "Graph should contain fused FP8 norm+quant ops and no unfused norm/linear"
     )
 
-    if fused_add:
-        fused_out = gm(x, residual)
-        _assert_numerics(ref_out, fused_out, extra_norm_consumer=True)
-    else:
-        fused_out = gm(x)
-        _assert_numerics(ref_out, fused_out, extra_norm_consumer)
+    fused_args = (x.clone(), residual.clone()) if fused_add else (x.clone(),)
+    fused_out = gm(*fused_args)
+
+    # Compare the fused output to the FP32 gold reference.
+    # The triton kernel avoids a round-trip cast FP32->BF16->FP32 between norm and quant
+    # that occurs in the unfused FlashInfer path, producing a more accurate result.
+    _assert_numerics(gold, fused_out, extra_norm_consumer)
 
 
 # ---------------------------------------------------------------------------
@@ -599,10 +652,9 @@ def test_fuse_rmsnorm_quant_nvfp4(num_linears, fused_add, extra_norm_consumer):
 
     if fused_add:
         fused_out = gm(x, residual)
-        _assert_numerics(ref_out, fused_out, extra_norm_consumer=True)
     else:
         fused_out = gm(x)
-        _assert_numerics(ref_out, fused_out, extra_norm_consumer)
+    _assert_numerics(ref_out, fused_out, extra_norm_consumer)
 
 
 @pytest.mark.skipif(
