@@ -367,13 +367,11 @@ class SpecMetadata:
         self.temperatures[:len(temperatures)].copy_(torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=use_pinned_memory()),
                                                     non_blocking=True)
-        self.top_ks[:len(top_ks)].copy_(torch.tensor(top_ks,
-                                                     dtype=torch.int32,
-                                                     pin_memory=use_pinned_memory()),
+        self.top_ks[:len(top_ks)].copy_(torch.tensor(
+            top_ks, dtype=torch.int32, pin_memory=use_pinned_memory()),
                                         non_blocking=True)
-        self.top_ps[:len(top_ps)].copy_(torch.tensor(top_ps,
-                                                     dtype=torch.float32,
-                                                     pin_memory=use_pinned_memory()),
+        self.top_ps[:len(top_ps)].copy_(torch.tensor(
+            top_ps, dtype=torch.float32, pin_memory=use_pinned_memory()),
                                         non_blocking=True)
 
 

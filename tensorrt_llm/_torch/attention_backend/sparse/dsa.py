@@ -18,7 +18,8 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
-from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, use_pinned_memory
+from tensorrt_llm._utils import (get_size_in_bytes, get_sm_version,
+                                 use_pinned_memory)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -1171,12 +1172,10 @@ class Indexer(nn.Module):
             total_kv_per_request = seq_lens[:
                                             num_contexts] + start_positions[:
                                                                             num_contexts]
-            host_slot_mapping_fp8_fullkv = torch.empty(total_kv_len,
-                                                       dtype=torch.int64,
-                                                       pin_memory=use_pinned_memory())
-            host_slot_mapping_scale_fullkv = torch.empty(total_kv_len,
-                                                         dtype=torch.int64,
-                                                         pin_memory=use_pinned_memory())
+            host_slot_mapping_fp8_fullkv = torch.empty(
+                total_kv_len, dtype=torch.int64, pin_memory=use_pinned_memory())
+            host_slot_mapping_scale_fullkv = torch.empty(
+                total_kv_len, dtype=torch.int64, pin_memory=use_pinned_memory())
 
             req_indices = torch.repeat_interleave(
                 torch.arange(num_contexts, dtype=torch.int64, device='cpu'),

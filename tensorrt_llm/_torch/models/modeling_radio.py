@@ -595,7 +595,9 @@ class VisionTransformer(nn.Module):
         Call this function before forward pass
         """
         prompt_lens = seq_lengths
-        seq_lens = torch.tensor(seq_lengths, dtype=torch.int, pin_memory=use_pinned_memory())
+        seq_lens = torch.tensor(seq_lengths,
+                                dtype=torch.int,
+                                pin_memory=use_pinned_memory())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.seq_lens = seq_lens

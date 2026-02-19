@@ -240,9 +240,13 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
         # Prepare hidden states gather ids
         self.hidden_states_read_indices_host = torch.tensor(
-            hidden_states_read_indices, dtype=torch.long, pin_memory=use_pinned_memory())
+            hidden_states_read_indices,
+            dtype=torch.long,
+            pin_memory=use_pinned_memory())
         self.hidden_states_write_indices_host = torch.tensor(
-            hidden_states_write_indices, dtype=torch.long, pin_memory=use_pinned_memory())
+            hidden_states_write_indices,
+            dtype=torch.long,
+            pin_memory=use_pinned_memory())
         self.is_first_draft = is_first_draft and self.is_draft_model
         if self.is_draft_model:
             self.eagle3_resource_manager.is_first_draft = False
