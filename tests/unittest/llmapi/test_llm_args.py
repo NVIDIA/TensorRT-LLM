@@ -23,8 +23,8 @@ from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
 # fmt: off
-from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, CalibConfig,
-                                          ContextChunkingPolicy,
+from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
+                                          CalibConfig, ContextChunkingPolicy,
                                           CudaGraphConfig, DecodingBaseConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
@@ -33,8 +33,10 @@ from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, CalibConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
                                           PeftCacheConfig, PybindMirror,
+                                          RayPlacementConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
                                           TorchLlmArgs, TrtLlmArgs,
+                                          UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args

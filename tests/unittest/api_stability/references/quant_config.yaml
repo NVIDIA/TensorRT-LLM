@@ -8,7 +8,7 @@ methods:
         annotation: Optional[List[str]]
         default: null
       group_size:
-        annotation: int
+        annotation: Optional[int]
         default: 128
       has_zero_point:
         annotation: bool
