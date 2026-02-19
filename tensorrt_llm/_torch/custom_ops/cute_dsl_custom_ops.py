@@ -291,6 +291,46 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
                 num_non_exiting_tiles, global_sf)
 
 
+class FP8BlockScalingGroupedGemmInputsHelper(GroupedGemmInputsHelper):
+    """Helper class for FP8 blockscaling grouped GEMM input preparation.
+
+    """
+
+    def __init__(self,
+                 num_experts: int,
+                 top_k: int,
+                 num_local_experts: int,
+                 local_expert_offset: int,
+                 seed: int = 515):
+        # tile size is fixed as 1, as FP8 blockscaling grouped GEMM does not have alignment requirement
+        super().__init__(num_experts,
+                         top_k,
+                         num_local_experts,
+                         local_expert_offset,
+                         tile_size=1,
+                         seed=seed)
+
+    def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Pre-hook for FP8 blockscaling grouped GEMM kernel.
+
+        Generates:
+            - group_offset
+        """
+        a, b, a_sf, b_sf, group_offset = inputs
+        num_tokens = a.size(0)
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
+
+        group_offset = torch.zeros(self.num_local_experts + 1,
+                                   dtype=torch.int32,
+                                   device="cuda")
+        group_offset[1:] = torch.cumsum(torch.tensor(num_tokens_per_expert,
+                                                     dtype=torch.int32,
+                                                     device="cuda"),
+                                        dim=0)
+        return a, b, a_sf, b_sf, group_offset
+
+
 def get_dense_gemm_approximate_cta_nums(
         M: int, N: int, tile_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int]) -> int:
@@ -2797,16 +2837,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLFp8BlackwellGroupedGemmRunner(TunableRunner):
         kernel_class = Sm100BlockwiseContiguousGroupedGemmKernel
         kernel_cache = dict()
+        tuning_config_cache = dict()
 
-        tuning_config = TuningConfig(use_cold_l2_cache=True, )
-
-        def __init__(self, use_tvm_ffi: bool = True):
+        def __init__(self,
+                     num_experts: int,
+                     top_k: int,
+                     num_local_experts: int,
+                     local_expert_offset: int,
+                     use_tvm_ffi: bool = True):
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
                     f"{self.__class__.kernel_class.__name__} supports SM 100 and SM 103 only, but got SM {sm_version}"
                 )
+            self.num_experts = num_experts
+            self.top_k = top_k
+            self.num_local_experts = num_local_experts
+            self.local_expert_offset = local_expert_offset
             self.use_tvm_ffi = use_tvm_ffi
+
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+            )
 
         def get_valid_tactics(
             self,
@@ -2863,6 +2919,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_major,
                 )
             ]
+
+        def get_tuning_config(self):
+            key = self.unique_id()
+            if key not in self.__class__.tuning_config_cache:
+                helper = FP8BlockScalingGroupedGemmInputsHelper(
+                    self.num_experts, self.top_k, self.num_local_experts,
+                    self.local_expert_offset)
+                self.__class__.tuning_config_cache[key] = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        0, 0, helper.gen_tuning_buckets,
+                        helper.map_to_tuning_buckets), ),
+                    constraint_specs=(ConstraintSpec(2, 0,
+                                                     fp8_scale_infer_shape), ),
+                    inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cold_l2_cache=True,
+                )
+            return self.__class__.tuning_config_cache[key]
 
         def forward(
             self,
@@ -3071,11 +3144,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         group_offset: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
         use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
 
         tuner = AutoTuner.get()
-        runner = CuteDSLFp8BlackwellGroupedGemmRunner(use_tvm_ffi=use_tvm_ffi)
+        runner = CuteDSLFp8BlackwellGroupedGemmRunner(
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_tvm_ffi=use_tvm_ffi)
 
         if group_offset.dtype != torch.int32:
             group_offset = group_offset.to(torch.int32)
@@ -3084,7 +3166,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_fp8_blockwise_grouped_gemm_blackwell::gemm",
             [runner],
-            runner.__class__.tuning_config,
+            runner.get_tuning_config(),
             inputs,
         )
         return runner(inputs, tactic=best_tactic)

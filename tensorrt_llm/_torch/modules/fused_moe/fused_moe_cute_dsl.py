@@ -685,6 +685,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 input_scale=x_sf,
                 weight_scale=self.quant_scales[0],
                 group_offset=expert_first_token_offset,
+                num_experts=self.num_slots,
+                top_k=self.routing_method.experts_per_token,
+                num_local_experts=self.expert_size_per_partition,
+                local_expert_offset=self.slot_start,
             )
         else:
             x = cute_dsl_fp8_group_blockwise_gemm_ref(
@@ -703,6 +707,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 input_scale=x_sf,
                 weight_scale=self.quant_scales[1],
                 group_offset=expert_first_token_offset,
+                num_experts=self.num_slots,
+                top_k=self.routing_method.experts_per_token,
+                num_local_experts=self.expert_size_per_partition,
+                local_expert_offset=self.slot_start,
             )
         else:
             x = cute_dsl_fp8_group_blockwise_gemm_ref(
