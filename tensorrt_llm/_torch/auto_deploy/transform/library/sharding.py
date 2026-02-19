@@ -54,6 +54,7 @@ from ...utils.node_utils import (
     is_any_lin_op,
     is_any_moe_op,
     is_any_ssm_op,
+    is_fake_quantized_linear_op,
     is_op,
     is_weight_node,
     num_users_of_weight_node,
@@ -76,6 +77,26 @@ from ..interface import (
 ########################################################
 #  Helper functions
 ########################################################
+
+
+########################################################
+#  Helper functions
+########################################################
+def is_quantized_linear_scale_tensor(node: "Node", weight_node_key: str) -> bool:
+    """Check if a weight node is a scale tensor for a quantized linear op.
+
+    Scale tensors (e.g., weight_scale_inv for FineGrained FP8) are in "block space" and should
+    not be sharded with the same min_local_shape as the actual weight tensor.
+    They are handled separately by quantization_cb.
+
+    Args:
+        node: The linear operation node
+        weight_node_key: The parameter key of the weight node (e.g., "model.layers.0.self_attn.v_proj.weight_scale_inv")
+
+    Returns:
+        True if this is a scale tensor for a quantized linear op, False otherwise
+    """
+    return is_fake_quantized_linear_op(node) and "_scale" in weight_node_key
 
 
 ########################################################
@@ -206,11 +227,6 @@ class ShardingTransformConfig(TransformConfig):
                 moe_ep_size=self.world_size,
                 moe_cluster_size=1,
             )
-
-    enable_attention_dp: bool = Field(
-        default=False,
-        description="When True, skip TP sharding as attention data parallelism is enabled.",
-    )
 
     def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
         if sources is None:
@@ -1463,6 +1479,14 @@ def _shard_parameter_node(
     )
 
     for weight_node in weight_nodes.weights:
+        if is_quantized_linear_scale_tensor(node, weight_node.node_key):
+            # Scale tensors (e.g. weight_scale_inv) are sharded by
+            # quantization_cb (via QuantizationShardingMixin.shard_scales +
+            # shard_load_hook) when processing the main weight.  Calling
+            # shard_weight_tensor here would register a SECOND load hook
+            # that double-shards the scale during checkpoint loading.
+            continue
+
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
             weight_tensor=weight_node.tensor,
