@@ -77,6 +77,10 @@ def test_cute_dsl_fp8_block_scale_grouped_gemm(
             weight_scale=b_scale,
             group_offset=group_offset,
             use_tvm_ffi=use_tvm_ffi,
+            num_experts=num_experts,
+            top_k=1,
+            num_local_experts=num_experts,
+            local_expert_offset=0,
         )
     output = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
         input=a_fp8,
@@ -85,6 +89,10 @@ def test_cute_dsl_fp8_block_scale_grouped_gemm(
         weight_scale=b_scale,
         group_offset=group_offset,
         use_tvm_ffi=use_tvm_ffi,
+        num_experts=num_experts,
+        top_k=1,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
     )
 
     diff = calc_diff(output, output_expected)
