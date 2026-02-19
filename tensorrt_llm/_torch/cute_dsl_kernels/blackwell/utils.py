@@ -307,6 +307,57 @@ def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
 
 
 @dsl_user_op
+def blk_reduce_bf16(dst_gemm, src_smem, size, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def blk_reduce_fp32(dst_gemm, src_smem, size, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.noftz.f16 [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def griddepcontrol_wait(*, loc=None, ip=None) -> None:
     """
     This instruction is used to wait for the previous kernel's grid ending

@@ -382,8 +382,23 @@ nvidia/Nemotron-Super-V3:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 77.56
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    mtp_enabled: true
+    num_nextn_predict_layers: 3
+    accuracy: 77.56
 nvidia/Nemotron-3-Nano:
   - accuracy: 73.85
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 74.35
+nvidia/NVIDIA-Nemotron-3-Super-120B-012726:
+  - accuracy: 86.88
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 86.12
+GLM-4.7-Flash:
+  - accuracy: 73.562
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 70.955

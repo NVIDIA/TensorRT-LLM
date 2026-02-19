@@ -6,10 +6,11 @@ import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tensorrt_llm.mapping import Mapping
+
 from ...llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
-    KvCacheConfig,
     SamplerType,
     TorchLlmArgs,
     _ParallelConfig,
@@ -45,7 +46,6 @@ def _check_for_default_value_only(
 
 _TRANSFORMS_SHORTCUT_LOOKUP = {
     "attn_backend": ("insert_cached_attention.backend", "transformers_replace_cached_attn.backend"),
-    "free_mem_ratio": ("resize_kv_cache.free_mem_ratio",),
     "compile_backend": ("compile_model.backend",),
     "cuda_graph_batch_sizes": ("compile_model.cuda_graph_batch_sizes",),
 }
@@ -191,23 +191,9 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
-    # TODO: see if we can just remove this field and use kv_cache_config.dtype instead?
-    kv_cache_dtype: str = Field(
-        default="auto",
-        description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
-        "supported in AutoDeploy.",
-    )
-
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.TorchSampler,
         description="The type of sampler to use. Options are TRTLLMSampler or TorchSampler. Defaults to TorchSampler.",
-    )
-
-    # NOTE: we do not support copy_on_partial_reuse in AutoDeploy yet
-    # see https://github.com/NVIDIA/TensorRT-LLM/issues/7142
-    kv_cache_config: KvCacheConfig = Field(
-        default_factory=lambda **kwargs: KvCacheConfig(copy_on_partial_reuse=False, **kwargs),
-        description="KV cache config.",
     )
 
     max_beam_width: int = Field(
@@ -222,7 +208,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    mode: Literal["graph", "transformers"] = Field(
+    mode: Literal["graph", "transformers", "export_edgellm_onnx"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
         "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
@@ -239,12 +225,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     attn_backend: str = Field(
         default="flashinfer",
         description=_shortcut_description("Attention backend to use.", "attn_backend"),
-    )
-    free_mem_ratio: float = Field(
-        default=0.0,
-        description=_shortcut_description(
-            "The fraction of available memory to allocate for cache.", "free_mem_ratio"
-        ),
     )
     compile_backend: str = Field(
         default="torch-compile",
@@ -263,16 +243,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
-    max_num_tokens: Optional[int] = Field(default=None, description="The maximum number of tokens.")
     max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
     max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
-    attn_page_size: int = Field(
-        default=64,
-        ge=1,
-        description="Page size for attention (tokens_per_block). For triton and torch "
-        "backends, this should equal max_seq_len. Temporary field until tokens_per_block gets "
-        "properly passed through.",
-    )
 
     def model_dump(self, *args, **kwargs):
         """Convert the arguments to a dictionary that can be used as kwargs for the LLM API."""
@@ -292,23 +264,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return kwargs
 
     ### VALIDATION #################################################################################
-    @model_validator(mode="after")
-    # TODO: discuss what to do with this once we fully transition to the new inference optimizer
-    def update_attn_page_size(self):
-        # NOTE force attn_page_size to equal max_seq_len for triton backend
-        if self.transforms.get("insert_cached_attention", {}).get("backend") in [
-            "triton",
-            "torch",
-        ]:
-            self.attn_page_size = self.max_seq_len
-        # NOTE: (hg) For transformers mode. This is ugly.
-        if self.transforms.get("transformers_replace_cached_attn", {}).get("backend") in [
-            "triton",
-            "torch",
-        ]:
-            self.attn_page_size = self.max_seq_len
-        return self
-
     @field_validator("model_factory", mode="after")
     @classmethod
     def model_factory_exists(cls, value: str) -> str:
@@ -358,16 +313,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         self.update_transforms_with_shortcuts()
         return self
 
-    @field_validator("kv_cache_config", mode="after")
-    @classmethod
-    def validate_kv_cache_config(cls, kv_cache_config: KvCacheConfig) -> KvCacheConfig:
-        if kv_cache_config.copy_on_partial_reuse:
-            kv_cache_config.copy_on_partial_reuse = False
-            ad_logger.warning(
-                "copy_on_partial_reuse is not supported by AutoDeploy. Setting it to False."
-            )
-        return kv_cache_config
-
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments."""
@@ -385,6 +330,44 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     def is_cuda_graph_enabled(self) -> bool:
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]
 
+    def init_mapping_from_config(self, rank: int, world_size: int) -> Mapping:
+        sharding_config = self.transforms.get("detect_sharding", {})
+        dist_mapping_config = sharding_config.get("dist_mapping", {})
+        enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+
+        # Determine MoE parallelism dimensions
+        if enable_attention_dp:
+            # EP + TP 2D parallelism is currently NOT supported with attention-DP.
+            # EP-only: experts sharded across GPUs, use all-to-all dispatch/combine
+            moe_ep_size = self.world_size
+            moe_tp_size = 1
+            ad_logger.info(
+                f"Attention-DP with EP-only MoE: moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
+            )
+        else:
+            # No attention-DP: use dist_mapping config or defaults
+            moe_tp_size = dist_mapping_config.get("moe_tp", 1)
+            moe_ep_size = dist_mapping_config.get("moe_ep", self.world_size)
+
+        # Create Mapping with proper distributed configuration
+        try:
+            mapping = Mapping(
+                world_size=world_size,
+                rank=rank,
+                tp_size=dist_mapping_config.get("tp", self.world_size),
+                moe_tp_size=moe_tp_size,
+                moe_ep_size=moe_ep_size,
+                moe_cluster_size=dist_mapping_config.get("moe_cluster", 1),
+                enable_attention_dp=enable_attention_dp,
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid parallel grid config: {e}. "
+                f"Please check your dist_mapping configuration: {dist_mapping_config}"
+            ) from e
+
+        return mapping
+
     ### PRIVATE METHODS ############################################################################
     @classmethod
     def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
@@ -392,5 +375,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         mapping = {
             "graph": str(config_path / "default.yaml"),
             "transformers": str(config_path / "transformers.yaml"),
+            "export_edgellm_onnx": str(config_path / "export_edgellm_onnx.yaml"),
         }
         return mapping.get(mode)

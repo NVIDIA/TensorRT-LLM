@@ -5,10 +5,8 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
-from utils.util import check_accuracy, skip_pre_hopper
+from utils.util import check_accuracy, skip_no_hopper
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.triton_linear import TritonLinear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -21,11 +19,10 @@ MPI.pickle.__init__(
 )
 
 
-@pytest.mark.parametrize("linear_cls", [Linear, TritonLinear])
+@pytest.mark.parametrize(
+    "linear_cls",
+    [Linear, pytest.param(TritonLinear, marks=skip_no_hopper)])
 def test_linear_unquantized(linear_cls):
-    if not IS_TRITON_KERNELS_AVAILABLE and linear_cls is TritonLinear:
-        pytest.skip("Triton kernels are not available")
-
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
     num_tokens = 128
@@ -56,11 +53,10 @@ def test_linear_unquantized(linear_cls):
     check_accuracy(actual_c, reference_c, atol=0.01, rtol=0.01, percent=0.99)
 
 
-@pytest.mark.parametrize("linear_cls", [Linear, TritonLinear])
+@pytest.mark.parametrize(
+    "linear_cls",
+    [Linear, pytest.param(TritonLinear, marks=skip_no_hopper)])
 def test_linear_fp8qdq(linear_cls):
-    if not IS_TRITON_KERNELS_AVAILABLE and linear_cls is TritonLinear:
-        pytest.skip("Triton kernels are not available")
-
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
     num_tokens = 128
@@ -100,18 +96,12 @@ def test_linear_fp8qdq(linear_cls):
                    percent=0.99)
 
 
-@skip_pre_hopper
+@skip_no_hopper
 @pytest.mark.parametrize("activation_dtype",
                          [torch.bfloat16, torch.float8_e4m3fn])
 def test_linear_mxfp4(activation_dtype):
-    if not IS_TRITON_KERNELS_AVAILABLE:
-        pytest.skip("Triton kernels are not available")
-    if torch.cuda.get_device_capability(
-    )[0] < 10 and activation_dtype == torch.float8_e4m3fn:
+    if activation_dtype == torch.float8_e4m3fn:
         pytest.skip("Latest Triton requires BF16 activation on Hopper")
-    if torch.cuda.get_device_capability(
-    )[0] >= 10 and activation_dtype == torch.bfloat16:
-        pytest.skip("Latest Triton requires FP8 activation on Blackwell")
 
     dtype = torch.bfloat16
     num_tokens = 128

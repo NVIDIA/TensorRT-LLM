@@ -16,11 +16,14 @@
 
 import gc
 from contextlib import contextmanager
-from typing import Tuple
+from typing import Literal, Tuple, Union
 
 import torch
 
 from .logger import ad_logger
+
+Number = Union[int, float]
+ByteUnit = Literal["B", "KB", "MB", "GB", "TB"]
 
 
 @contextmanager
@@ -43,10 +46,38 @@ def cuda_memory_tracker(logger=ad_logger):
             logger.warning(f"Potential memory leak detected, leaked memory: {leaked} bytes")
 
 
-def get_mem_info_in_mb(empty_cache: bool = True) -> Tuple[int, int]:
+def bytes_to(bytes: int, *more_bytes: int, unit: ByteUnit) -> Union[Number, Tuple[Number, ...]]:
+    units = {"KB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30, "TB": 1 << 40}
+    bytes_converted = (bytes,) + more_bytes
+    unit = unit.upper()
+    if unit != "B":
+        bytes_converted = tuple(float(x) / units[unit.upper()] for x in bytes_converted)
+    return bytes_converted if more_bytes else bytes_converted[0]
+
+
+def get_mem_info(
+    empty_cache: bool = True, unit: ByteUnit = "B"
+) -> Tuple[Number, Number, Number, Number, Number]:
+    """Get the memory information of the current device.
+
+    Args:
+        empty_cache: Whether to empty the memory cache.
+        unit: The unit of the memory information. Defaults to bytes.
+
+    Returns:
+        A tuple of the
+            - total memory,
+            - free memory,
+            - reserved memory,
+            - allocated memory,
+            - fragmented memory
+        in the specified unit.
+    """
     if empty_cache:
         # Clear the memory cache to get the exact free memory
         torch.cuda.empty_cache()
     free_mem, total_mem = torch.cuda.mem_get_info()
-    MB = 1024**2
-    return free_mem // MB, total_mem // MB
+    res_mem = torch.cuda.memory_reserved()
+    alloc_mem = torch.cuda.memory_allocated()
+    frag_mem = res_mem - alloc_mem
+    return bytes_to(total_mem, free_mem, res_mem, alloc_mem, frag_mem, unit=unit)

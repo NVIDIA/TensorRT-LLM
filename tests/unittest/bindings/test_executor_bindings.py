@@ -1014,6 +1014,64 @@ def test_multimodal_input():
     assert config.multimodal_hashes == multimodal_hashes
     assert config.multimodal_positions == multimodal_positions
     assert config.multimodal_lengths == multimodal_lengths
+    # Default value for multimodal_uuids should be None
+    assert config.multimodal_uuids is None
+
+
+@pytest.mark.parametrize(
+    "multimodal_uuids,expected_uuids",
+    [
+        # Test with all UUIDs provided
+        (["sku-image-001", "sku-image-002"], ["sku-image-001", "sku-image-002"]
+         ),
+        # Test with partial UUIDs (some None)
+        (["sku-image-001", None], ["sku-image-001", None]),
+        # Test with empty list of UUIDs
+        ([], []),
+        # Test with None (default)
+        (None, None),
+    ],
+    ids=["all_uuids", "partial_uuids", "empty_list", "none_default"])
+def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
+    """Test MultimodalInput with user-provided UUIDs."""
+    multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
+    multimodal_positions = [10, 100]
+    multimodal_lengths = [50, 60]
+
+    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
+                                    multimodal_lengths, multimodal_uuids)
+    assert config.multimodal_hashes == multimodal_hashes
+    assert config.multimodal_positions == multimodal_positions
+    assert config.multimodal_lengths == multimodal_lengths
+    assert config.multimodal_uuids == expected_uuids
+
+
+def test_multimodal_input_pickle_with_uuids():
+    """Test pickling and unpickling of MultimodalInput with UUIDs."""
+    multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
+    multimodal_positions = [10, 100]
+    multimodal_lengths = [50, 60]
+    multimodal_uuids = ["test-uuid-1", None]
+
+    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
+                                    multimodal_lengths, multimodal_uuids)
+
+    # Pickle and unpickle
+    pickled = pickle.dumps(config)
+    restored = pickle.loads(pickled)
+
+    assert restored.multimodal_hashes == multimodal_hashes
+    assert restored.multimodal_positions == multimodal_positions
+    assert restored.multimodal_lengths == multimodal_lengths
+    assert restored.multimodal_uuids == multimodal_uuids
+
+    # Test with None UUIDs
+    config_no_uuids = trtllm.MultimodalInput(multimodal_hashes,
+                                             multimodal_positions,
+                                             multimodal_lengths)
+    pickled_no_uuids = pickle.dumps(config_no_uuids)
+    restored_no_uuids = pickle.loads(pickled_no_uuids)
+    assert restored_no_uuids.multimodal_uuids is None
 
 
 def test_mrope_config():
@@ -1198,9 +1256,9 @@ def test_result_pickle():
     result.sequence_index = 1
     result.is_sequence_final = True
     result.decoding_iter = 1
-    result.context_phase_params = trtllm.ContextPhaseParams([1, 2], 123,
-                                                            bytes([0, 1]),
-                                                            [10, 20, 30])
+    result.context_phase_params = trtllm.ContextPhaseParams(
+        [1, 2], 123, bytes([0,
+                            1]), [10, 20, 30], 1, "disagg_info_endpoint_24680")
     result.request_perf_metrics = trtllm.RequestPerfMetrics()
     result.request_perf_metrics.last_iter = 33
     result_str = pickle.dumps(result)
@@ -1220,6 +1278,8 @@ def test_result_pickle():
     assert result.context_phase_params.first_gen_tokens == result_copy.context_phase_params.first_gen_tokens
     assert result.context_phase_params.draft_tokens == result_copy.context_phase_params.draft_tokens
     assert result.context_phase_params.opaque_state == result_copy.context_phase_params.opaque_state
+    assert result.context_phase_params.ctx_dp_rank == result_copy.context_phase_params.ctx_dp_rank
+    assert result.context_phase_params.disagg_info_endpoint == result_copy.context_phase_params.disagg_info_endpoint
     assert result.request_perf_metrics.last_iter == result_copy.request_perf_metrics.last_iter
 
 

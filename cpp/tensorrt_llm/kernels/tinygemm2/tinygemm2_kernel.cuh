@@ -236,6 +236,7 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
         if (!weight_warp)
         {
             cudaGridDependencySynchronize();
+            cudaTriggerProgrammaticLaunchCompletion();
         }
 
         for (int ki = 0; ki < K_LOOPS_DMA; ki++)
@@ -294,6 +295,17 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
                         : "memory");
             }
 
+            stage += 4;
+            if (stage >= STAGES)
+            {
+                stage = warp_id % 4;
+                phase ^= 1;
+            }
+        }
+        // Wait for pending loads to be consumed before exiting, to avoid race
+        for (int i = 0; i < (STAGES / 4) - 1; i++)
+        {
+            bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
             stage += 4;
             if (stage >= STAGES)
             {
@@ -440,9 +452,6 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
 
             if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0)
                 profile[blockIdx.x].complete = gclock64();
-
-            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
-                cudaTriggerProgrammaticLaunchCompletion();
         }
     }
 #endif // end if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)

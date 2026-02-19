@@ -125,7 +125,9 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto const numPools = mCacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP);
+    auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    auto blockRange
+        = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
     auto const& windowSizes = blockRange.getWindowSizes();
     TLLM_CHECK_WITH_INFO(
         static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
@@ -357,8 +359,9 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto& bufferManager = session.getBufferManager();
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
     bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
-    auto blockRange
-        = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(), recvSideHasCP);
+    auto const srcPpSize = destConfig.getParallelConfig().mPipelineParallelism;
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
+        destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize);
     auto const numPools = mCacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     auto const& windowSizes = blockRange.getWindowSizes();

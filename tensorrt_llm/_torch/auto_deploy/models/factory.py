@@ -27,10 +27,6 @@ from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
 
-from ..custom_ops.attention_interface import CacheConfig
-from ..utils.cuda_mem_tracker import get_mem_info_in_mb
-from ..utils.logger import ad_logger
-
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 
 
@@ -211,13 +207,15 @@ class ModelFactory(ABC):
         """Returns the sharding config for this model."""
         return self._sharding_config
 
-    def get_cache_config(self) -> CacheConfig:
-        """Return the cache configuration for the model.
+    def get_cache_config_updates(self) -> Dict[str, Any]:
+        """Return updates for the KVCacheConfig for the model.
 
         Returns:
-            The cache configuration for the model.
+            A dictionary of updates for the KVCacheConfig for the model.
+
+        Check tensorrt_llm/llmapi/llm_args.py for the KVCacheConfig fields.
         """
-        return CacheConfig()
+        return {}
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model.
@@ -265,7 +263,9 @@ class ModelFactory(ABC):
         """
         return model_name_or_path
 
-    def load_or_random_init(self, model: nn.Module, device: DeviceLikeType):
+    def load_or_random_init(
+        self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
+    ):
         """Load the checkpoint into the model or randomly initialize the model.
 
         Args:
@@ -273,6 +273,7 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            disable_preload: If True, disable preloading weights to CPU before moving to device.
             load_factoy_model: If True, will load weights for the factory model in addition to main
                 gm. This is useful for the transformers model.
 
@@ -301,21 +302,11 @@ class ModelFactory(ABC):
                     <SIZE_OF_LARGEST_CHECKPOINT_FILE>
 
         """
-        ad_logger.info("Loading and initializing weights.")
-        free_mem_pre, _ = get_mem_info_in_mb()
-        ad_logger.info(f"Free memory before loading weights (MB): {free_mem_pre}")
         self._to_maybe_random(model, device)
-        params_size = sum(p.numel() * p.element_size() for p in model.parameters())
-        total_size_GB = params_size / (1024**3)
-        ad_logger.info(f"Estimated parameters memory: {total_size_GB:.2f} GB")
 
         if not self.skip_loading_weights:
             self.prefetch_checkpoint(force=True)
-            self._load_checkpoint(model, device)
-
-        ad_logger.info("Loading and initializing weights. Done.")
-        free_mem_post, _ = get_mem_info_in_mb()
-        ad_logger.info(f"Free memory after loading weights (MB): {free_mem_post}")
+            self._load_checkpoint(model, device, disable_preload=disable_preload)
 
     @staticmethod
     def _to_maybe_random(model: nn.Module, device: DeviceLikeType):
@@ -335,7 +326,9 @@ class ModelFactory(ABC):
         )
 
     @abstractmethod
-    def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
+    def _load_checkpoint(
+        self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
+    ):
         """Load the checkpoint into the model.
 
         Args:
@@ -343,6 +336,7 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            disable_preload: If True, disable preloading weights to CPU before moving to device.
         """
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:

@@ -675,6 +675,11 @@ private:
             {
                 continue;
             }
+            // If tileSizeQ < mNumHeadsQPerKv, this will result in 0, causing division by zero.
+            if (tileSizeQ < params.mNumHeadsQPerKv)
+            {
+                continue;
+            }
 
             // Update the tileSizeQ.
             selectKernelParamsCopy.mTileSizeQ = tileSizeQ;
@@ -920,12 +925,11 @@ public:
 
     static TllmFmhaKernelFactory& Get()
     {
-        int deviceId;
-        cudaGetDevice(&deviceId);
         static std::unique_ptr<TllmFmhaKernelFactory> sFactory[32] = {nullptr};
+        int const deviceId = tensorrt_llm::common::getDevice();
+        TLLM_CHECK_WITH_INFO(deviceId < 32, "Invalid deviceId %d (must be < 32)", deviceId);
         if (sFactory[deviceId] == nullptr)
         {
-            TLLM_CHECK_WITH_INFO(deviceId < 32, "Invalid deviceId %d", deviceId);
             sFactory[deviceId] = std::make_unique<TllmFmhaKernelFactory>(TllmFmhaKernelFactory());
         }
         return *(sFactory[deviceId]);
@@ -947,12 +951,12 @@ inline TllmGenFmhaKernel const* getTllmFmhaKernels(
     Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm)
 {
 
-#if !defined(EXCLUDE_SM_100) || !defined(EXCLUDE_SM_103)
+#ifndef EXCLUDE_SM_100F
     return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
         sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm);
 #else
     return nullptr;
-#endif // EXCLUDE_SM_100
+#endif // EXCLUDE_SM_100F
 }
 
 } // namespace kernels

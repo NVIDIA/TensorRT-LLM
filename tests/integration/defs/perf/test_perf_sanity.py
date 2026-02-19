@@ -14,10 +14,8 @@
 # limitations under the License.
 """TensorRT LLM perf sanity tests."""
 
-import contextlib
 import copy
 import glob
-import io
 import os
 import re
 import socket
@@ -27,9 +25,10 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 import yaml
+from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
 
-from defs.trt_test_alternative import print_error, print_info
+from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
@@ -44,7 +43,6 @@ from .open_search_db_utils import (
     prepare_baseline_data,
     prepare_regressive_test_cases,
 )
-from .utils import collect_and_clean_myelin_time
 
 # Model PATH of local dir synced from internal LLM models repo
 MODEL_PATH_DICT = {
@@ -56,6 +54,7 @@ MODEL_PATH_DICT = {
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
+    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
 }
 
 SUPPORTED_GPU_MAPPING = {
@@ -66,7 +65,9 @@ SUPPORTED_GPU_MAPPING = {
     "H200": "h200",
 }
 
-DEFAULT_TIMEOUT = 7200
+DEFAULT_TIMEOUT = 5400
+AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity"
+DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
 
 # Regex patterns for parsing benchmark output metrics
 # Key is the metric name used in database (e.g., "mean_e2el", "seq_throughput")
@@ -97,9 +98,20 @@ def get_model_dir(model_name: str) -> str:
     return ""
 
 
-def get_dataset_path() -> str:
-    """Get dataset path for benchmark."""
-    return os.path.join(llm_models_root(), "datasets", "ShareGPT_V3_unfiltered_cleaned_split.json")
+def get_dataset_dir(dataset_file: Optional[str]) -> str:
+    """Get dataset directory path from dataset file."""
+    if not dataset_file or dataset_file == "<dataset_file>":
+        return ""
+
+    # return os.path.join(llm_models_root(), "datasets", "ShareGPT_V3_unfiltered_cleaned_split.json")
+    llm_models_path = os.path.join(llm_models_root(), dataset_file)
+    if os.path.exists(llm_models_path):
+        return llm_models_path
+    elif os.path.exists(dataset_file):
+        return dataset_file
+    else:
+        print_info(f"Dataset file not found in {llm_models_path} and {dataset_file}")
+        return ""
 
 
 def to_env_dict(env_vars: str) -> Dict[str, str]:
@@ -141,6 +153,7 @@ class ServerConfig:
         self.disable_overlap_scheduler = server_config_data.get("disable_overlap_scheduler", False)
         self.num_postprocess_workers = server_config_data.get("num_postprocess_workers", 0)
         self.stream_interval = server_config_data.get("stream_interval", 10)
+        self.print_iter_log = server_config_data.get("print_iter_log", False)
         self.attn_backend = server_config_data.get("attn_backend", "TRTLLM")
         self.enable_chunked_prefill = server_config_data.get("enable_chunked_prefill", False)
         self.enable_attention_dp = server_config_data.get("enable_attention_dp", False)
@@ -213,6 +226,7 @@ class ServerConfig:
             self.eagle3_layers_to_capture = []
         self.max_draft_len = speculative_config.get("max_draft_len", 0)
         self.speculative_model = speculative_config.get("speculative_model", "")
+        self.eagle3_one_model = speculative_config.get("eagle3_one_model", False)
 
         # match_mode: "config" (default) or "scenario"
         self.match_mode = server_config_data.get("match_mode", "config")
@@ -270,15 +284,11 @@ class ServerConfig:
             "l_gpus_per_node",
             "l_max_batch_size",
             "b_disable_overlap_scheduler",
-            "l_num_postprocess_workers",
-            "s_attn_backend",
             "b_enable_chunked_prefill",
             "b_enable_attention_dp",
             "b_enable_lm_head_tp_in_adp",
             # attention_dp_config
             "b_attention_dp_balance",
-            # moe_config
-            "s_moe_backend",
             # cuda_graph_config
             "b_enable_cuda_graph",
             # kv_cache_config
@@ -340,6 +350,7 @@ class ServerConfig:
             "s_eagle3_layers_to_capture": ",".join(map(str, self.eagle3_layers_to_capture)),
             "l_max_draft_len": self.max_draft_len,
             "s_speculative_model_dir": self.speculative_model,
+            "b_eagle3_one_model": self.eagle3_one_model,
             "s_server_log_link": "",
             "s_server_env_var": self.env_vars,
         }
@@ -366,7 +377,12 @@ class ServerConfig:
 class ClientConfig:
     """Configurations of benchmark client."""
 
-    def __init__(self, client_config_data: dict, model_name: str, env_vars: str = ""):
+    def __init__(
+        self,
+        client_config_data: dict,
+        model_name: str,
+        env_vars: str = "",
+    ):
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
         self.iterations = client_config_data.get("iterations", 1)
@@ -378,6 +394,7 @@ class ClientConfig:
         self.streaming = client_config_data.get("streaming", True)
         self.trust_remote_code = client_config_data.get("trust_remote_code", True)
         self.model_path = ""
+        self.dataset_file = client_config_data.get("dataset_file", "")
         self.env_vars = env_vars
 
         # Generate default name if not provided
@@ -389,7 +406,7 @@ class ClientConfig:
         """Generate benchmark command."""
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(model_dir) else self.model_name
-        dataset_path = get_dataset_path()
+        dataset_path = get_dataset_dir(self.dataset_file)
         benchmark_cmd = [
             "python",
             "-m",
@@ -398,26 +415,36 @@ class ClientConfig:
             self.model_path,
             "--tokenizer",
             self.model_path,
-            "--dataset-name",
-            "random",
-            "--random-ids",
             "--num-prompts",
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--random-input-len",
-            str(self.isl),
-            "--random-output-len",
-            str(self.osl),
-            "--random-range-ratio",
-            str(self.random_range_ratio),
             "--ignore-eos",
+            "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
-        if dataset_path and os.path.exists(dataset_path):
+        if dataset_path:
+            benchmark_cmd.append("--dataset-name")
+            benchmark_cmd.append("trtllm_custom")
             benchmark_cmd.append("--dataset-path")
             benchmark_cmd.append(dataset_path)
+            print_info(f"Dataset: {dataset_path} exists. Use trtllm_custom dataset for benchmark.")
+        else:
+            benchmark_cmd.append("--dataset-name")
+            benchmark_cmd.append("random")
+            benchmark_cmd.append("--random-ids")
+            benchmark_cmd.append("--tokenize-on-client")
+            benchmark_cmd.append("--random-input-len")
+            benchmark_cmd.append(str(self.isl))
+            benchmark_cmd.append("--random-output-len")
+            benchmark_cmd.append(str(self.osl))
+            benchmark_cmd.append("--random-range-ratio")
+            benchmark_cmd.append(str(self.random_range_ratio))
+            print_info(
+                f"Dataset: {dataset_path} is not provided or does not exist. "
+                f"Use random dataset (random_range_ratio={self.random_range_ratio}) for benchmark."
+            )
         if self.backend:
             benchmark_cmd.append("--backend")
             benchmark_cmd.append(self.backend)
@@ -453,6 +480,7 @@ class ClientConfig:
             "l_isl": self.isl,
             "l_osl": self.osl,
             "d_random_range_ratio": self.random_range_ratio,
+            "s_dataset_file": self.dataset_file,
             "s_backend": self.backend,
             "b_use_chat_template": self.use_chat_template,
             "b_streaming": self.streaming,
@@ -502,6 +530,11 @@ class AggrTestCmds(NamedTuple):
     client_cmds: Dict[int, List[List[str]]]
     timeout: int
     output_dir: str
+    test_output_dir: str
+
+    def get_server_logs(self, server_idx) -> List[str]:
+        server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
+        return [server_file_path]
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run all clients for a server and return outputs."""
@@ -514,30 +547,28 @@ class AggrTestCmds(NamedTuple):
             server_port = get_free_port()
             server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, server_port)
 
-            server_file_path = os.path.join(self.output_dir, f"trtllm-serve.{server_idx}.log")
-
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
+            server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
             with open(server_file_path, "w") as server_ctx:
                 server_proc = subprocess.Popen(
                     server_cmd_with_port,
+                    env=copy.deepcopy(os.environ),
                     stdout=server_ctx,
                     stderr=subprocess.STDOUT,
-                    env=copy.deepcopy(os.environ),
                 )
 
-            wait_for_endpoint_ready(
-                f"http://{server_hostname}:{server_port}/health",
-                timeout=self.timeout,
-                check_files=[server_file_path],
-                server_proc=server_proc,
-            )
+                wait_for_endpoint_ready(
+                    f"http://{server_hostname}:{server_port}/health",
+                    timeout=self.timeout,
+                    check_files=[server_file_path],
+                    server_proc=server_proc,
+                )
 
             # Run all clients for this server
             for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
                 client_file_path = os.path.join(
-                    self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
+                    self.test_output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
                 )
-
                 client_cmd_with_port = add_host_port_to_cmd(
                     client_cmd, server_hostname, server_port
                 )
@@ -551,7 +582,6 @@ class AggrTestCmds(NamedTuple):
 
                 with open(client_file_path, "w") as client_ctx:
                     client_ctx.write(output)
-
                 outputs.append(output)
 
         finally:
@@ -576,10 +606,11 @@ class DisaggTestCmds(NamedTuple):
     num_ctx_servers: int
     num_gen_servers: int
     output_dir: str
+    test_output_dir: str
 
     def _generate_hostname_file(self, server_idx: int, port: int):
         """Create hostname file for coordination."""
-        hostnames_dir = os.path.join(self.output_dir, f"hostnames-{server_idx}")
+        hostnames_dir = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
         if not os.path.exists(hostnames_dir):
             os.makedirs(hostnames_dir, exist_ok=True)
         hostname_file = os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
@@ -589,7 +620,7 @@ class DisaggTestCmds(NamedTuple):
     def _generate_disagg_server_config(self, server_idx: int, disagg_server_port: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
-        hostnames_folder = os.path.join(self.output_dir, f"hostnames-{server_idx}")
+        hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
         expected_count = self.num_ctx_servers + self.num_gen_servers
         start_time = time.time()
         hostnames = []
@@ -602,8 +633,7 @@ class DisaggTestCmds(NamedTuple):
                 f"expected: {expected_count}"
             )
             if elapsed_time > self.timeout:
-                print_error(f"Time out. Hostnames files are not ready after {self.timeout}s")
-                break
+                raise RuntimeError(f"Time out. Hostnames files are not ready after {self.timeout}s")
             time.sleep(10)
             if not os.path.exists(hostnames_folder):
                 continue
@@ -638,7 +668,7 @@ class DisaggTestCmds(NamedTuple):
                 "urls": gen_hostnames,
             },
         }
-        config_path = os.path.join(self.output_dir, f"server_config.{server_idx}.yaml")
+        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         with open(config_path, "w") as f:
             yaml.dump(server_config, f)
         print_info(f"Server config file {config_path} generated")
@@ -646,7 +676,7 @@ class DisaggTestCmds(NamedTuple):
 
     def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
         """Wait for and read disagg server config."""
-        config_path = os.path.join(self.output_dir, f"server_config.{server_idx}.yaml")
+        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         start_time = time.time()
         while True:
             if os.path.exists(config_path):
@@ -654,8 +684,9 @@ class DisaggTestCmds(NamedTuple):
                 break
             elapsed_time = time.time() - start_time
             if elapsed_time > self.timeout:
-                print_error(f"Server config file {config_path} not found after {self.timeout}s")
-                break
+                raise RuntimeError(
+                    f"Server config file {config_path} not found after {self.timeout}s"
+                )
             print_info(f"Waiting for server config file, elapsed time: {elapsed_time}s")
             time.sleep(10)
 
@@ -675,22 +706,40 @@ class DisaggTestCmds(NamedTuple):
             elapsed_time = time.time() - start_time
             print_info(f"Waiting for benchmark status file, elapsed time: {elapsed_time}s")
             if elapsed_time > self.timeout:
-                print_error(f"Timeout waiting for benchmark status file after {self.timeout}s")
-                break
+                raise RuntimeError(
+                    f"Timeout waiting for benchmark status file after {self.timeout}s"
+                )
             time.sleep(10)
+
+    def get_server_logs(self, server_idx: int) -> List[str]:
+        server_logs = []
+        for i in range(self.num_ctx_servers):
+            server_logs.append(
+                os.path.join(self.test_output_dir, f"trtllm-serve.CTX_{i}.{server_idx}.log")
+            )
+            server_logs.append(os.path.join(self.output_dir, f"ctx_server_{i}.log"))
+        for i in range(self.num_gen_servers):
+            server_logs.append(
+                os.path.join(self.test_output_dir, f"trtllm-serve.GEN_{i}.{server_idx}.log")
+            )
+            server_logs.append(os.path.join(self.output_dir, f"gen_server_{i}.log"))
+        server_logs.append(
+            os.path.join(self.test_output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log")
+        )
+        server_logs.append(os.path.join(self.output_dir, "disagg_server.log"))
+        return server_logs
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
         outputs = []
-        benchmark_status_file = os.path.join(self.output_dir, f"benchmark_status.{server_idx}.txt")
+        benchmark_status_file = os.path.join(
+            self.test_output_dir, f"benchmark_status.{server_idx}.txt"
+        )
         port = get_free_port()
 
         ctx_cmd, gen_cmd, disagg_cmd = self.server_cmds[server_idx]
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
             self._generate_hostname_file(server_idx, port)
-            server_file_path = os.path.join(
-                self.output_dir, f"trtllm-serve.{server_idx}.{self.disagg_serving_type}.log"
-            )
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
             server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
@@ -698,34 +747,39 @@ class DisaggTestCmds(NamedTuple):
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
                 )
+                server_file_path = os.path.join(
+                    self.test_output_dir,
+                    f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
+                )
                 with open(server_file_path, "w") as server_ctx:
                     server_proc = subprocess.Popen(
                         server_cmd,
+                        env=copy.deepcopy(os.environ),
                         stdout=server_ctx,
                         stderr=subprocess.STDOUT,
-                        env=copy.deepcopy(os.environ),
                     )
-                self.wait_for_benchmark_ready(benchmark_status_file)
+                    self.wait_for_benchmark_ready(benchmark_status_file)
             finally:
                 print_info(f"Server {self.disagg_serving_type} stopped")
                 server_proc.terminate()
                 server_proc.wait()
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
-            disagg_server_file_path = os.path.join(
-                self.output_dir, f"trtllm-serve.{server_idx}.{self.disagg_serving_type}.log"
-            )
             try:
                 self._generate_disagg_server_config(server_idx, port)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
+                disagg_server_file_path = os.path.join(
+                    self.test_output_dir,
+                    f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
+                )
                 with open(disagg_server_file_path, "w") as disagg_server_ctx:
                     disagg_server_proc = subprocess.Popen(
                         disagg_cmd,
+                        env=copy.deepcopy(os.environ),
                         stdout=disagg_server_ctx,
                         stderr=subprocess.STDOUT,
-                        env=copy.deepcopy(os.environ),
                     )
-                self.wait_for_benchmark_ready(benchmark_status_file)
+                    self.wait_for_benchmark_ready(benchmark_status_file)
             finally:
                 print_info(f"Disagg server {self.disagg_serving_type} stopped")
                 disagg_server_proc.terminate()
@@ -736,33 +790,18 @@ class DisaggTestCmds(NamedTuple):
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
                 )
-                server_files = [
-                    os.path.join(self.output_dir, f"trtllm-serve.{server_idx}.DISAGG_SERVER.log"),
-                ]
-                for ctx_idx in range(self.num_ctx_servers):
-                    server_files.append(
-                        os.path.join(
-                            self.output_dir, f"trtllm-serve.{server_idx}.CTX_{ctx_idx}.log"
-                        )
-                    )
-                for gen_idx in range(self.num_gen_servers):
-                    server_files.append(
-                        os.path.join(
-                            self.output_dir, f"trtllm-serve.{server_idx}.GEN_{gen_idx}.log"
-                        )
-                    )
+
                 wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
                     timeout=self.timeout,
-                    check_files=server_files,
+                    check_files=self.get_server_logs(server_idx),
                 )
 
                 # Run all clients for this server
                 for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
                     benchmark_file_path = os.path.join(
-                        self.output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
+                        self.test_output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
                     )
-
                     client_cmd_with_port = add_host_port_to_cmd(
                         client_cmd, disagg_server_hostname, disagg_server_port
                     )
@@ -801,6 +840,75 @@ def parse_select_pattern(select_pattern: str) -> list:
     return [name.strip() for name in select_pattern.split(",")]
 
 
+def parse_test_string(test_case_name: str):
+    """Parse test case name to get config base name, select pattern, runtime, and benchmark_mode.
+
+    Test name formats:
+    - Disagg e2e: disagg_upload-e2e-{config_base}
+    - Disagg gen_only: disagg_upload-gen_only-{config_base}
+    - ctx_only: aggr_upload-ctx_only-{config_base} (runs aggr mode but reads disagg config)
+    - Regular aggr: aggr_upload-{config}-{server_name}
+
+    Returns:
+        tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode)
+            - runtime_mode: "aggregated" or "disaggregated"
+            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+    """
+    labels = test_case_name.split("-")
+
+    assert len(labels) > 1, "perf_sanity test must have a config file!"
+
+    prefix = labels[0]
+    is_disagg_prefix = "disagg" in prefix
+    is_aggr_prefix = "aggr" in prefix
+
+    if is_disagg_prefix:
+        # Disagg format: disagg_upload-{e2e|gen_only}-{config_base}
+        assert len(labels) > 2, "Disagg test must have benchmark_mode and config!"
+        benchmark_mode = labels[1]  # e2e or gen_only
+        assert benchmark_mode in ("e2e", "gen_only"), (
+            f"Invalid benchmark_mode for disagg: {benchmark_mode}"
+        )
+        runtime_mode = "disaggregated"
+        config_base_name = "-".join(labels[2:])
+        select_pattern = None
+    elif is_aggr_prefix:
+        # Check if this is ctx_only (aggr_upload-ctx_only-{config_base})
+        if len(labels) > 2 and labels[1] == "ctx_only":
+            # ctx_only: aggr_upload-ctx_only-{config_base}
+            # Runs in aggregated mode but reads disagg config
+            benchmark_mode = "ctx_only"
+            runtime_mode = "aggregated"
+            config_base_name = "-".join(labels[2:])
+            select_pattern = None
+        else:
+            # Regular aggr: aggr_upload-config_yml or aggr_upload-config_yml-server_config_name
+            benchmark_mode = None
+            runtime_mode = "aggregated"
+            config_base_name = labels[1]
+            # select_pattern is server config name (e.g., "r1_fp8_dep8_mtp1_1k1k")
+            select_pattern = "-".join(labels[2:]) if len(labels) > 2 else None
+    else:
+        raise ValueError(f"Invalid test name prefix: {prefix}")
+
+    return config_base_name, select_pattern, runtime_mode, benchmark_mode
+
+
+def get_config_dir(benchmark_mode: Optional[str]) -> str:
+    """Get config directory based on benchmark_mode.
+
+    Args:
+        benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+
+    Returns:
+        str: Config directory path (relative to llm_root)
+    """
+    if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+        return DISAGG_CONFIG_FOLDER
+    else:
+        return AGGR_CONFIG_FOLDER
+
+
 class PerfSanityTestConfig:
     """Configuration for perf sanity tests."""
 
@@ -808,15 +916,16 @@ class PerfSanityTestConfig:
         self._output_dir = output_dir
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
 
+        # Initialize server configs
+        self.server_configs: List = []
+        self.server_client_configs: Dict[int, List[ClientConfig]] = {}
+
         # Parse test case name
         self.parse_test_case_name(test_case_name)
 
     def parse_test_case_name(self, test_case_name: str):
         """Parse test case name into components."""
         self._test_param_labels = test_case_name
-
-        # Extract configs from test param labels
-        labels = self._test_param_labels.split("-")
 
         def get_gpu_type() -> str:
             try:
@@ -829,52 +938,47 @@ class PerfSanityTestConfig:
                 model = output.split()[-1]
                 return SUPPORTED_GPU_MAPPING.get(model, "unsupported")
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
-                print_error("Failed to get GPU type")
-            return "unsupported"
+                raise RuntimeError("Failed to get GPU type")
 
-        assert len(labels) > 1, "perf_sanity test must have a config file!"
-        is_disagg = "disagg" in labels[0]
-        self.upload_to_db = "upload" in labels[0]
+        self.upload_to_db = "upload" in test_case_name.split("-")[0]
         self.gpu_type = get_gpu_type()
 
-        if is_disagg:
-            # For disagg: disagg_upload-deepseek-r1-fp4_8k1k_ctx1_gen1_dep32_bs128_eplb0_mtp0_ccb-UCX
-            self.runtime = "multi_node_disagg_server"
-            self.config_dir = "tests/integration/defs/perf/disagg/test_configs/disagg/perf"
-            config_base = "-".join(labels[1:])
-            self.config_file = (
-                f"{config_base}.yaml" if not config_base.endswith(".yaml") else config_base
-            )
-            self.select_pattern = None
-        else:
-            # For aggr: aggr_upload-config_yml or aggr_upload-config_yml-server_config_name
-            self.runtime = "aggr_server"
-            self.config_dir = "tests/scripts/perf-sanity"
-            config_base = labels[1]
-            self.config_file = (
-                f"{config_base}.yaml"
-                if config_base and not config_base.endswith(".yaml")
-                else config_base
-            )
-            # select_pattern is server config name (e.g., "r1_fp8_dep8_mtp1_1k1k")
-            self.select_pattern = "-".join(labels[2:]) if len(labels) > 2 else None
-
-        self.config_dir = os.getenv(
-            "TRTLLM_CONFIG_FOLDER", os.path.join(get_llm_root(), self.config_dir)
+        # Parse test case name to get config_base_name, select_pattern, runtime, benchmark_mode
+        config_base_name, self.select_pattern, runtime, self.benchmark_mode = parse_test_string(
+            test_case_name
         )
 
-        # Initialize server configs
-        self.server_configs: List = []
-        self.server_client_configs: Dict[int, List[ClientConfig]] = {}
+        # Set runtime based on parsed result
+        if runtime == "disaggregated":
+            self.runtime = "multi_node_disagg_server"
+        else:
+            self.runtime = "aggr_server"
+
+        # Set config_file
+        self.config_file = (
+            f"{config_base_name}.yaml"
+            if not config_base_name.endswith(".yaml")
+            else config_base_name
+        )
+
+        # Get config_dir based on benchmark_mode
+        config_dir = get_config_dir(self.benchmark_mode)
+        self.config_dir = os.getenv(
+            "TRTLLM_CONFIG_FOLDER", os.path.join(get_llm_root(), config_dir)
+        )
 
     def parse_config_file(self):
-        """Parse config file based on runtime."""
+        """Parse config file based on runtime and benchmark_mode."""
         config_file_path = os.path.join(self.config_dir, self.config_file)
 
-        if self.runtime == "aggr_server":
-            self._parse_aggr_config_file(config_file_path)
-        elif self.runtime == "multi_node_disagg_server":
+        # benchmark_mode determines which parser to use:
+        # - e2e, gen_only, ctx_only: use _parse_disagg_config_file (reads disagg config)
+        # - None (normal aggr): use _parse_aggr_config_file
+        if self.benchmark_mode in ("e2e", "gen_only", "ctx_only"):
             self._parse_disagg_config_file(config_file_path, self.config_file)
+        else:
+            # Normal aggregated mode
+            self._parse_aggr_config_file(config_file_path)
 
     def _parse_aggr_config_file(self, config_file_path: str):
         """Parse YAML config file for aggregated server."""
@@ -922,7 +1026,9 @@ class PerfSanityTestConfig:
             client_configs = []
             for client_config_data in server_config_data["client_configs"]:
                 client_config = ClientConfig(
-                    client_config_data, server_config_data["model_name"], client_env_var
+                    client_config_data,
+                    server_config_data["model_name"],
+                    env_vars=client_env_var,
                 )
                 client_configs.append(client_config)
 
@@ -932,7 +1038,12 @@ class PerfSanityTestConfig:
         self.server_client_configs = server_client_configs
 
     def _parse_disagg_config_file(self, config_file_path: str, config_file: str):
-        """Parse YAML config file for disaggregated server."""
+        """Parse YAML config file for disaggregated server.
+
+        This method handles e2e, gen_only, and ctx_only modes.
+        For ctx_only: output is on par with _parse_aggr_config_file (single ServerConfig),
+                     OSL is set to 1, and cache_transceiver_config is ignored.
+        """
         disagg_serving_type = os.environ.get("DISAGG_SERVING_TYPE", "BENCHMARK")
 
         # Get config file base name (without extension)
@@ -954,9 +1065,13 @@ class PerfSanityTestConfig:
         model_name = metadata.get("model_name", "")
         assert model_name, "model_name is required in metadata section"
 
-        benchmark_mode = benchmark.get("mode", "e2e")
-        if "gen_only" in benchmark_mode:
-            hardware["num_ctx_servers"] = 0
+        # Use self.benchmark_mode instead of reading from config file
+        benchmark_mode = self.benchmark_mode
+        if benchmark_mode == "gen_only":
+            # Check if it's gen_only_no_context from config
+            config_mode = benchmark.get("mode", "e2e")
+            if "gen_only_no_context" in config_mode:
+                hardware["num_ctx_servers"] = 0
 
         worker_env_var = environment.get("worker_env_var", "")
         server_env_var = environment.get("server_env_var", "")
@@ -971,90 +1086,120 @@ class PerfSanityTestConfig:
         else:
             concurrency_values = [int(concurrency_str)]
 
-        # Gen only mode only runs max concurrency
-        if "gen_only" in benchmark_mode:
-            concurrency_values = [max(concurrency_values)]
+        # Gen only mode only runs the first concurrency
+        if benchmark_mode == "gen_only":
+            concurrency_values = [concurrency_values[0]]
 
-        # Create ctx server config
-        ctx_server_config_data = {
-            "concurrency": max(concurrency_values),
-            "name": config_file_base_name,
-            "model_name": model_name,
-            "gpus_per_node": gpus_per_node,
-            "disagg_run_type": "ctx",
-            **worker_config.get("ctx", {}),
-        }
+        # Handle ctx_only mode specially - output should be on par with _parse_aggr_config_file
+        if benchmark_mode == "ctx_only":
+            # Get ctx worker config and modify it
+            ctx_config = dict(worker_config.get("ctx", {}))
+            # Ignore cache_transceiver_config for ctx_only
+            ctx_config.pop("cache_transceiver_config", None)
+            # Disable overlap scheduler for ctx_only
+            ctx_config["disable_overlap_scheduler"] = True
 
-        # Create gen server config
-        gen_server_config_data = {
-            "concurrency": max(concurrency_values),
-            "name": config_file_base_name,
-            "model_name": model_name,
-            "gpus_per_node": gpus_per_node,
-            "disagg_run_type": "gen",
-            **worker_config.get("gen", {}),
-        }
+            # Create server config for ctx_only (single ServerConfig, not tuple)
+            ctx_server_config_data = {
+                "concurrency": -1,  # Same as aggr
+                "name": f"{benchmark_mode}-{config_file_base_name}",
+                "model_name": model_name,
+                "gpus_per_node": gpus_per_node,
+                "disagg_run_type": "aggr",  # Run as aggr
+                **ctx_config,
+            }
 
-        ctx_server_config = ServerConfig(ctx_server_config_data, worker_env_var)
-        gen_server_config = ServerConfig(gen_server_config_data, worker_env_var)
+            ctx_server_config = ServerConfig(ctx_server_config_data, worker_env_var)
+            self.server_configs = [ctx_server_config]
+        else:
+            # For e2e and gen_only modes - create ctx and gen server configs
+            ctx_server_config_data = {
+                "concurrency": concurrency_values[0],
+                "name": f"{benchmark_mode}-{config_file_base_name}",
+                "model_name": model_name,
+                "gpus_per_node": gpus_per_node,
+                "disagg_run_type": "ctx",
+                **worker_config.get("ctx", {}),
+            }
 
-        # Create disagg config
-        disagg_config = DisaggConfig(
-            name=config_file_base_name,
-            disagg_serving_type=disagg_serving_type,
-            hostname=socket.gethostname(),
-            numa_bind=numa_bind,
-            timeout=timeout,
-            benchmark_mode=benchmark_mode,
-            model_name=model_name,
-            hardware=hardware,
-            server_env_var=server_env_var,
-        )
+            gen_server_config_data = {
+                "concurrency": concurrency_values[0],
+                "name": f"{benchmark_mode}-{config_file_base_name}",
+                "model_name": model_name,
+                "gpus_per_node": gpus_per_node,
+                "disagg_run_type": "gen",
+                **worker_config.get("gen", {}),
+            }
 
-        # server_configs is a list with one element (tuple of ctx, gen, disagg config)
-        self.server_configs = [(ctx_server_config, gen_server_config, disagg_config)]
+            ctx_server_config = ServerConfig(ctx_server_config_data, worker_env_var)
+            gen_server_config = ServerConfig(gen_server_config_data, worker_env_var)
+
+            disagg_config = DisaggConfig(
+                name=f"{benchmark_mode}-{config_file_base_name}",
+                disagg_serving_type=disagg_serving_type,
+                hostname=socket.gethostname(),
+                numa_bind=numa_bind,
+                timeout=timeout,
+                benchmark_mode=benchmark_mode,
+                model_name=model_name,
+                hardware=hardware,
+                server_env_var=server_env_var,
+            )
+
+            # server_configs is a list with one element (tuple of ctx, gen, disagg config)
+            self.server_configs = [(ctx_server_config, gen_server_config, disagg_config)]
 
         # Create client configs for each concurrency value
+        # For ctx_only: OSL is set to 1 and dataset_file is empty
+        osl = 1 if benchmark_mode == "ctx_only" else benchmark.get("output_length", 1024)
+        dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
+
         client_configs = []
         for concurrency in concurrency_values:
             client_config_data = {
                 "concurrency": concurrency,
                 "iterations": benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
-                "osl": benchmark.get("output_length", 1024),
+                "osl": osl,
                 "random_range_ratio": benchmark.get("benchmark_ratio", 0.0),
                 "backend": "openai",
                 "use_chat_template": False,
                 "streaming": benchmark.get("streaming", True),
+                "dataset_file": dataset_file,
             }
-            client_config = ClientConfig(client_config_data, model_name, client_env_var)
+            client_config = ClientConfig(
+                client_config_data,
+                model_name,
+                env_vars=client_env_var,
+            )
             client_configs.append(client_config)
 
         self.server_client_configs = {0: client_configs}
 
     def get_commands(self):
-        """Get commands based on runtime."""
-        self.perf_sanity_output_dir = os.path.join(self._output_dir, self._test_param_labels)
-        os.makedirs(self.perf_sanity_output_dir, exist_ok=True)
+        """Get commands based on runtime and benchmark_mode."""
+        self.test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
+        os.makedirs(self.test_output_dir, exist_ok=True)
 
+        # ctx_only runs in aggregated mode (uses _get_aggr_commands)
         if self.runtime == "aggr_server":
-            return self._get_aggr_commands(self.perf_sanity_output_dir)
-        elif self.runtime == "multi_node_disagg_server":
-            return self._get_disagg_commands(self.perf_sanity_output_dir)
+            return self._get_aggr_commands(self._output_dir, self.test_output_dir)
+        else:
+            return self._get_disagg_commands(self._output_dir, self.test_output_dir)
 
-    def _get_aggr_commands(self, output_dir: str):
+    def _get_aggr_commands(self, output_dir: str, test_output_dir: str):
         """Get commands for aggregated server."""
         server_cmds = []
         client_cmds = {}
 
         for server_idx, client_configs in self.server_client_configs.items():
             server_config = self.server_configs[server_idx]
-            server_cmd = server_config.to_cmd(output_dir)
+            server_cmd = server_config.to_cmd(test_output_dir)
 
             # Generate extra-llm-api-config.yml
             config_content = server_config.generate_extra_llm_api_config()
             config_filename = f"extra-llm-api-config.aggr.{server_config.name}.yml"
-            config_path = os.path.join(output_dir, config_filename)
+            config_path = os.path.join(test_output_dir, config_filename)
             with open(config_path, "w") as f:
                 f.write(config_content)
 
@@ -1070,9 +1215,10 @@ class PerfSanityTestConfig:
             client_cmds=client_cmds,
             timeout=DEFAULT_TIMEOUT,
             output_dir=output_dir,
+            test_output_dir=test_output_dir,
         )
 
-    def _get_disagg_commands(self, output_dir: str):
+    def _get_disagg_commands(self, output_dir: str, test_output_dir: str):
         """Get commands for disaggregated server."""
         server_cmds = []
         client_cmds = {}
@@ -1083,21 +1229,21 @@ class PerfSanityTestConfig:
             disagg_serving_type = disagg_config.disagg_serving_type
 
             # Generate ctx server command
-            ctx_cmd = ctx_config.to_cmd(output_dir, numa_bind, "CTX")
+            ctx_cmd = ctx_config.to_cmd(test_output_dir, numa_bind, "CTX")
             if "CTX" in disagg_serving_type:
                 config_content = ctx_config.generate_extra_llm_api_config()
                 config_path = os.path.join(
-                    output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
+                    test_output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
                 )
                 with open(config_path, "w") as f:
                     f.write(config_content)
 
             # Generate gen server command
-            gen_cmd = gen_config.to_cmd(output_dir, numa_bind, "GEN")
+            gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
             if "GEN" in disagg_serving_type:
                 config_content = gen_config.generate_extra_llm_api_config()
                 config_path = os.path.join(
-                    output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
+                    test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
                 )
                 with open(config_path, "w") as f:
                     f.write(config_content)
@@ -1107,7 +1253,7 @@ class PerfSanityTestConfig:
                 "trtllm-serve",
                 "disaggregated",
                 "-c",
-                f"{output_dir}/server_config.{server_idx}.yaml",
+                f"{test_output_dir}/server_config.{server_idx}.yaml",
                 "-t",
                 str(timeout),
                 "-r",
@@ -1132,40 +1278,10 @@ class PerfSanityTestConfig:
             num_ctx_servers=disagg_config.num_ctx_servers,
             num_gen_servers=disagg_config.num_gen_servers,
             output_dir=output_dir,
+            test_output_dir=test_output_dir,
         )
 
-    def run_ex(self, commands) -> Dict[int, List[str]]:
-        """Run commands and collect outputs."""
-        outputs = {}
-
-        for server_idx in range(len(commands.server_cmds)):
-            try:
-                with io.StringIO() as buf:
-                    with contextlib.redirect_stdout(buf):
-                        server_outputs = commands.run_cmd(server_idx)
-                        for output in server_outputs:
-                            print(collect_and_clean_myelin_time(output))
-
-                    # Check for errors in each output
-                    for output in server_outputs:
-                        self._check_benchmark_output_for_errors(output)
-
-                    print(buf.getvalue())
-
-                outputs[server_idx] = server_outputs
-
-            except Exception as e:
-                print_error(f"Test command failed for server {server_idx}. Error: {e}")
-                if isinstance(e, subprocess.CalledProcessError):
-                    print_error("--- stdout ---")
-                    if e.stdout:
-                        print_error(e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout)
-                    print_error("--------------")
-                outputs[server_idx] = []
-
-        return outputs
-
-    def _check_benchmark_output_for_errors(self, output: str) -> None:
+    def _check_benchmark_errors(self, output: str) -> None:
         """Check whether the benchmark output contains error messages."""
         if not output:
             return
@@ -1176,12 +1292,31 @@ class PerfSanityTestConfig:
             failed_count = int(failed_requests_match.group(1))
             if failed_count > 0:
                 error_msg = f"Benchmark output contains {failed_count} failed requests."
-                raise Exception(error_msg)
+                raise RuntimeError(error_msg)
 
         # Check for explicit failure markers
         if "!FAILED REQUESTS!" in output or "!CHECK LOG FOR ERRORS!" in output:
             error_msg = "Benchmark output contains failure markers."
-            raise Exception(error_msg)
+            raise RuntimeError(error_msg)
+
+    def run_ex(self, commands) -> Dict[int, List[str]]:
+        """Run commands and collect outputs."""
+        outputs = {}
+        for server_idx in range(len(commands.server_cmds)):
+            try:
+                server_outputs = commands.run_cmd(server_idx)
+                for output in server_outputs:
+                    self._check_benchmark_errors(output)
+                outputs[server_idx] = server_outputs
+
+            except Exception as e:
+                outputs[server_idx] = []
+                report_error(
+                    error_msg=e,
+                    log_files=commands.get_server_logs(server_idx),
+                )
+
+        return outputs
 
     def get_perf_result(self, outputs: Dict[int, List[str]]):
         """Parse performance results from outputs."""
@@ -1223,11 +1358,8 @@ class PerfSanityTestConfig:
                         f"Some metrics in Server {server_idx} Client {client_idx} are missing. "
                         f"The broken metrics is {metrics}. "
                     )
-
         if error_msg:
             raise Exception(error_msg)
-
-        print_info("All servers passed")
 
     def upload_test_results_to_database(self):
         """Upload test results and baseline to database."""
@@ -1409,16 +1541,13 @@ class PerfSanityTestConfig:
         check_perf_regression(
             new_data_dict,
             fail_on_regression=is_scenario_mode,
-            output_dir=self.perf_sanity_output_dir,
+            output_dir=self.test_output_dir,
         )
 
 
 # Perf sanity test case parameters
 AGG_TEST_TYPES = ["aggr_upload", "aggr"]
 DISAGG_TEST_TYPES = ["disagg_upload", "disagg"]
-
-AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity"
-DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf"
 
 
 def get_server_config_names(yaml_path: str) -> List[str]:
@@ -1464,7 +1593,13 @@ def get_aggr_test_cases() -> List[str]:
 
 
 def get_disagg_test_cases() -> List[str]:
-    """Generate disagg test cases."""
+    """Generate disagg test cases with benchmark modes.
+
+    New format:
+    - Disagg e2e: {test_type}-e2e-{config_base}
+    - Disagg gen_only: {test_type}-gen_only-{config_base}
+    - ctx_only: aggr_{upload}-ctx_only-{config_base} (uses aggr prefix)
+    """
     llm_root = get_llm_root()
     disagg_config_dir = os.path.join(llm_root, DISAGG_CONFIG_FOLDER)
     yaml_files = glob.glob(os.path.join(disagg_config_dir, "*.yaml"))
@@ -1472,8 +1607,14 @@ def get_disagg_test_cases() -> List[str]:
 
     test_cases = []
     for config_yml in basenames:
+        # Disagg e2e and gen_only test cases
         for test_type in DISAGG_TEST_TYPES:
-            test_cases.append(f"{test_type}-{config_yml}")
+            test_cases.append(f"{test_type}-e2e-{config_yml}")
+            test_cases.append(f"{test_type}-gen_only-{config_yml}")
+
+        # ctx_only test cases (uses aggr prefix)
+        for test_type in AGG_TEST_TYPES:
+            test_cases.append(f"{test_type}-ctx_only-{config_yml}")
 
     return test_cases
 

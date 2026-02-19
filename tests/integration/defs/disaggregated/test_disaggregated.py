@@ -19,6 +19,7 @@ import re
 import subprocess
 import tempfile
 import time
+from collections import namedtuple
 from dataclasses import dataclass
 from typing import Callable
 
@@ -95,6 +96,7 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
+        "tool_calls": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
         "perf_metrics": (2, f"{test_configs_root}/disagg_config_metrics.yaml"),
         "trtllm_sampler":
         (2, f"{test_configs_root}/disagg_config_trtllm_sampler.yaml"),
@@ -200,6 +202,9 @@ def get_test_config(test_desc, example_dir, test_root):
         "gpt_oss_120b_stress":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml"),
+        "gpt_oss_120b_harmony":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml"),
         "cancel_stress_test":
         (2, f"{test_configs_root}/disagg_config_cancel_stress_test.yaml"),
         "cancel_stress_test_large":
@@ -247,6 +252,52 @@ def generate_worker_commands(model_path, config, server_config,
     return worker_commands
 
 
+ClientTestSet = namedtuple('ClientTestSet', [
+    'completion', 'completion_streaming', 'chat', 'chat_streaming',
+    'verify_completion', 'verify_streaming_completion', 'verify_chat',
+    'verify_streaming_chat'
+])
+
+
+def get_client_test_set(test_desc):
+    """Get the set of client tests to run for a given test description."""
+    if test_desc == "tool_calls":
+        return ClientTestSet(completion=False,
+                             completion_streaming=False,
+                             chat=True,
+                             chat_streaming=False,
+                             verify_completion=False,
+                             verify_streaming_completion=False,
+                             verify_chat=False,
+                             verify_streaming_chat=False)
+    if test_desc == "gpt_oss_120b_harmony":
+        return ClientTestSet(completion=True,
+                             completion_streaming=True,
+                             chat=True,
+                             chat_streaming=True,
+                             verify_completion=True,
+                             verify_streaming_completion=True,
+                             verify_chat=False,
+                             verify_streaming_chat=False)
+    if test_desc in ("overlap", "trtllm_sampler"):
+        return ClientTestSet(completion=True,
+                             completion_streaming=True,
+                             chat=True,
+                             chat_streaming=True,
+                             verify_completion=True,
+                             verify_streaming_completion=True,
+                             verify_chat=True,
+                             verify_streaming_chat=False)
+    return ClientTestSet(completion=True,
+                         completion_streaming=True,
+                         chat=False,
+                         chat_streaming=False,
+                         verify_completion=True,
+                         verify_streaming_completion=True,
+                         verify_chat=False,
+                         verify_streaming_chat=False)
+
+
 def run_client_tests(example_dir,
                      config_file,
                      test_desc,
@@ -258,8 +309,12 @@ def run_client_tests(example_dir,
                      server_url,
                      workers_proc,
                      server_proc,
-                     use_ray=False):
+                     use_ray=False,
+                     client_test_set=None):
     """Run client tests against the disaggregated server."""
+    if client_test_set is None:
+        client_test_set = get_client_test_set(test_desc)
+
     client_dir = f"{example_dir}/clients"
     for _ in range(num_iters):
         client_cmd = [
@@ -281,30 +336,35 @@ def run_client_tests(example_dir,
             worker_processes = [workers_proc]
 
         poll_procs = worker_processes + [server_proc]
-        check_call(client_cmd, env=env, poll_procs=poll_procs)
 
-        # Streaming client run
-        streaming_client_cmd = client_cmd + [
-            '--streaming', '-o', 'output_streaming.json'
-        ]
-        check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
+        # Run completion test (non-streaming)
+        if client_test_set.completion:
+            check_call(client_cmd, env=env, poll_procs=poll_procs)
 
-        # Run the chat completion endpoint test only for TinyLlama
-        if test_desc == "overlap" or test_desc == "trtllm_sampler":
-            chat_client_cmd = client_cmd + [
-                '-e', 'chat', '-o', 'output_chat.json'
+        # Run streaming completion test
+        if client_test_set.completion_streaming:
+            streaming_client_cmd = client_cmd + [
+                '--streaming', '-o', 'output_streaming.json'
             ]
+            check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
+
+        # Run chat completion test
+        if client_test_set.chat:
+            chat_output = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_client_cmd = client_cmd + ['-e', 'chat', '-o', chat_output]
             check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
 
-            streaming_chat_client_cmd = chat_client_cmd + [
-                '--streaming', '-o', 'output_streaming_chat.json'
+        # Run streaming chat completion test
+        if client_test_set.chat_streaming:
+            streaming_chat_client_cmd = client_cmd + [
+                '-e', 'chat', '--streaming', '-o', 'output_streaming_chat.json'
             ]
             check_call(streaming_chat_client_cmd,
                        env=env,
                        poll_procs=poll_procs)
 
-        # Skip output verification for long prompts test
-        if prompt_file == "long_prompts.json":
+        # Skip output verification for long prompts or tool call tests
+        if prompt_file == "long_prompts.json" or prompt_file == "tool_call_prompts.json":
             continue
 
         if extra_endpoints_test is not None:
@@ -313,11 +373,16 @@ def run_client_tests(example_dir,
         # Verify outputs
         not_expected_strings = ["Berlin Berlin"]
 
-        output_files = ['output.json', 'output_streaming.json']
-        if test_desc == "overlap" or test_desc == "trtllm_sampler":
-            # Disable streaming chat completion for overlap test
-            # due to bug
-            output_files.extend(['output_chat.json'])
+        output_files = []
+        if client_test_set.completion and client_test_set.verify_completion:
+            output_files.append('output.json')
+        if client_test_set.completion_streaming and client_test_set.verify_streaming_completion:
+            output_files.append('output_streaming.json')
+        if client_test_set.chat and client_test_set.verify_chat:
+            # Streaming chat completion output not verified due to known bug
+            output_files.append('output_chat.json')
+        if client_test_set.chat_streaming and client_test_set.verify_streaming_chat:
+            output_files.append('output_streaming_chat.json')
 
         if test_desc.startswith("gen_only"):
             continue
@@ -328,6 +393,11 @@ def run_client_tests(example_dir,
                 if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
                     expected_strings = [
                         "Berlin", ["Asyncio is a", "Asyncio module in"]
+                    ]
+                elif "gpt_oss_120b" in test_desc:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Using `asyncio` in Python"
                     ]
                 else:
                     expected_strings = [
@@ -366,11 +436,11 @@ def run_disaggregated_test(example_dir,
     cleanup_output_files()
     run_env = env.copy()
 
-    # on some CI nodes , we set UCX_TLS to "^ib" to avoid the issue that IB equipped but not available.
+    # on some CI nodes , we set UCX_TLS to "^ib,gdr_copy" to avoid the issue that IB equipped but not available, and gdr_copy pin buffer failed.
     # we set UCX_MM_ERROR_HANDLING to "y" to avoid the issue that NIXL cannot use IB or TCP for notify on some CI nodes,
     # setting it to "y" will enable NIXL to use system memory for notify.
 
-    run_env["UCX_TLS"] = "^ib"
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
@@ -788,6 +858,29 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
+                                                  llm_venv,
+                                                  disaggregated_example_root,
+                                                  llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "tool_calls",
+                           num_iters=1,
+                           prompt_file="tool_call_prompts.json",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                                             disaggregated_example_root,
                                             llama_model_root):
@@ -1167,7 +1260,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ucx",
                            env=env,
@@ -1194,7 +1287,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
@@ -1220,7 +1313,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
@@ -1502,7 +1595,7 @@ def run_disaggregated_benchmark(example_dir,
                                 skip_warmup=False):
     """Run disaggregated test with given configuration."""
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib"
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
     workers_cmd = [
         'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
@@ -1683,7 +1776,7 @@ def run_disaggregated_aiperf(config_file,
     """
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib"
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     workers_cmd = [
@@ -2056,6 +2149,27 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
                            prompt_file="long_prompts.json")
 
 
+@skip_pre_blackwell
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-120b'])
+def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
+                                            disaggregated_example_root,
+                                            llm_venv, model_path):
+    model_dir = f"{llm_models_root()}/{model_path}"
+    src_dst_dict = {
+        model_dir: f"{llm_venv.get_working_directory()}/{model_path}",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "gpt_oss_120b_harmony",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.timeout(12600)
 @pytest.mark.parametrize("test_config", [
     pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
@@ -2188,7 +2302,7 @@ def run_disaggregated_cancel_test(example_dir,
     """Run disaggregated test with request cancellation stress test."""
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib"
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
 
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))

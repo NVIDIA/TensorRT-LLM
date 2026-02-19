@@ -9,11 +9,16 @@ from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.utils import ActivationType
 
-from ...custom_ops.quant import TRTLLM_NVFP4_PACKING_FACTOR, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from ...custom_ops.quantization.quant import (
+    TRTLLM_NVFP4_PACKING_FACTOR,
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+)
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
+from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code, get_attr_by_name
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.logger import ad_logger
+from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import (
     BaseTransform,
@@ -143,6 +148,8 @@ def _process_moe_node(
         w2_list,
         w3_list,
         apply_routing_on_input,
+        mapping_config,
+        max_num_tokens,
     ) = extract_op_args(
         node,
         "x",
@@ -152,6 +159,8 @@ def _process_moe_node(
         "w2_weight",
         "w3_weight",
         "apply_routing_on_input",
+        "mapping_config",
+        "max_num_tokens",
     )
 
     # Stack weights based on MLP style
@@ -210,13 +219,23 @@ def _process_moe_node(
             args=(hidden_states, weight_dtype),
         )
 
+        # Build kwargs for new node - preserve all kwargs from original node
+        # and override with known values
+        fused_kwargs = dict(node.kwargs) if node.kwargs else {}
+        fused_kwargs.update(
+            {
+                "is_gated_mlp": is_gated_mlp,
+                "act_fn": act_fn,
+                "mapping_config": mapping_config,
+                "max_num_tokens": max_num_tokens,
+                "apply_routing_on_input": apply_routing_on_input,
+            }
+        )
+
         new_node = graph.call_function(
             replacement_op,
             args=(hidden_states, selected_experts, routing_weights, w_up_arg, w_down_arg),
-            kwargs={
-                "is_gated_mlp": is_gated_mlp,
-                "act_fn": act_fn,
-            },
+            kwargs=fused_kwargs,
         )
 
     node.replace_all_uses_with(new_node)
@@ -1292,11 +1311,48 @@ class MatchBmmMoePattern(BaseTransform):
         return gm, info
 
 
-def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
+def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> None:
+    """Remove original expert submodules after weights have been stacked.
+
+    This function attempts to free GPU memory by deleting the original expert
+    submodules whose weights have been replaced by fused/stacked versions.
+
+    Args:
+        gm: The GraphModule containing the expert submodules
+        weight_lists: List of weight node lists (e.g., [w1_list, w2_list, w3_list])
+    """
+    # Flatten all weight lists/
+    weight_lists_flat = [w for weights in weight_lists for w in weights]
+
+    for w in weight_lists_flat:
+        w_param = get_attr_by_name(gm, w.target)
+        if w_param is not None:
+            owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
+            owner_param = get_attr_by_name(owner_module, param_name)
+            if owner_param is w_param:
+                gm.delete_submodule(owner_module_path)
+            else:
+                # param w is not owned by owner_module, skip
+                continue
+        else:
+            continue
+
+
+def _stack_fp8_moe_weights(
+    gm: GraphModule,
+    backend: Literal["auto", "trtllm", "triton"],
+    allow_different_input_scales: bool = False,
+) -> int:
     """
     Stack per-expert FP8 weights and scales by materializing stacked tensors as parameters.
     This is fast because we directly stack the tensor values (not graph nodes).
     Similar to _insert_fused_moe_ops but for quantized MoE.
+
+    Args:
+        gm: The GraphModule to transform.
+        backend: Backend to use ('auto', 'trtllm', or 'triton').
+        allow_different_input_scales: If False (default), assert that all experts have identical
+            input scales and fail if not. If True, allow different scales (use max for quantization).
     """
 
     def _register_parameter(gm: GraphModule, target, value):
@@ -1356,23 +1412,26 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
 
         # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op
         # to avoid computing them at runtime.
-        fc1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked[0]).squeeze()
-        fc2_act_scale_recip = (1.0 / w2_input_scale_stacked[0]).to(torch.float32)
-        fc2_dequant = (w2_weight_scale_stacked * w2_input_scale_stacked[0]).squeeze()
+        # We use max scale to handle different input scales per expert (if enabled).
+        fc1_act_scale = fc1_act_scale.max()
+        fc2_act_scale = w2_input_scale_stacked.max()
+        fc1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked.max()).squeeze()
+        fc2_act_scale_recip = (1.0 / fc2_act_scale).to(torch.float32)
+        fc2_dequant = (w2_weight_scale_stacked * fc2_act_scale).squeeze()
 
+        new_key_fc1_expert_weights = f"quant_moe_w3_w1_stacked_{fused_key_counter}"
+        new_key_fc2_expert_weights = f"quant_moe_w2_stacked_{fused_key_counter}"
+        new_key_fc1_act_scale = f"quant_moe_fc1_act_scale_{fused_key_counter}"
         new_key_fc1_dequant = f"quant_moe_fc1_dequant_stacked_{fused_key_counter}"
         new_key_fc2_act_scale_recip = f"quant_moe_fc2_act_scale_recip_stacked_{fused_key_counter}"
         new_key_fc2_dequant = f"quant_moe_fc2_dequant_stacked_{fused_key_counter}"
-        new_key_fc1_expert_weights = f"quant_moe_w3_w1_stacked_{fused_key_counter}"
-        new_key_fc2_expert_weights = f"quant_moe_w2_stacked_{fused_key_counter}"
-        new_key_fc1_act_scale = f"quant_moe_w3_w1_input_scale_stacked_{fused_key_counter}"
 
-        _register_parameter(gm, new_key_fc1_dequant, fc1_dequant)
-        _register_parameter(gm, new_key_fc2_act_scale_recip, fc2_act_scale_recip)
-        _register_parameter(gm, new_key_fc2_dequant, fc2_dequant)
         _register_parameter(gm, new_key_fc1_expert_weights, fc1_expert_weights)
         _register_parameter(gm, new_key_fc2_expert_weights, fc2_expert_weights)
         _register_parameter(gm, new_key_fc1_act_scale, fc1_act_scale)
+        _register_parameter(gm, new_key_fc1_dequant, fc1_dequant)
+        _register_parameter(gm, new_key_fc2_act_scale_recip, fc2_act_scale_recip)
+        _register_parameter(gm, new_key_fc2_dequant, fc2_dequant)
 
         with graph.inserting_before(node):
             args = (
@@ -1393,19 +1452,27 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
         new_key_w1 = f"quant_moe_w1_stacked_{fused_key_counter}"
         new_key_w2 = f"quant_moe_w2_stacked_{fused_key_counter}"
         new_key_w3 = f"quant_moe_w3_stacked_{fused_key_counter}"
-        new_key_w1_input_scale = f"quant_moe_w1_input_scale_stacked_{fused_key_counter}"
-        new_key_w2_input_scale = f"quant_moe_w2_input_scale_stacked_{fused_key_counter}"
-        new_key_w3_input_scale = f"quant_moe_w3_input_scale_stacked_{fused_key_counter}"
         new_key_w1_weight_scale = f"quant_moe_w1_weight_scale_stacked_{fused_key_counter}"
         new_key_w2_weight_scale = f"quant_moe_w2_weight_scale_stacked_{fused_key_counter}"
         new_key_w3_weight_scale = f"quant_moe_w3_weight_scale_stacked_{fused_key_counter}"
+        w1_input_scale = w1_input_scale_stacked.max().reshape(1)
+        w2_input_scale = w2_input_scale_stacked.max().reshape(1)
+        # w3_input_scale: use max of w3 scales if present, else use empty tensor
+        w3_input_scale = (
+            w3_input_scale_stacked.max().reshape(1)
+            if w3_input_scale_stacked.numel() > 0
+            else torch.empty(1, device=w1_input_scale.device, dtype=w1_input_scale.dtype)
+        )
+        new_key_w1_input_scale = f"quant_moe_w1_input_scale_{fused_key_counter}"
+        new_key_w2_input_scale = f"quant_moe_w2_input_scale_{fused_key_counter}"
+        new_key_w3_input_scale = f"quant_moe_w3_input_scale_{fused_key_counter}"
 
         _register_parameter(gm, new_key_w1, w1_stacked)
         _register_parameter(gm, new_key_w2, w2_stacked)
         _register_parameter(gm, new_key_w3, w3_stacked)
-        _register_parameter(gm, new_key_w1_input_scale, w1_input_scale_stacked)
-        _register_parameter(gm, new_key_w2_input_scale, w2_input_scale_stacked)
-        _register_parameter(gm, new_key_w3_input_scale, w3_input_scale_stacked)
+        _register_parameter(gm, new_key_w1_input_scale, w1_input_scale)
+        _register_parameter(gm, new_key_w2_input_scale, w2_input_scale)
+        _register_parameter(gm, new_key_w3_input_scale, w3_input_scale)
         _register_parameter(gm, new_key_w1_weight_scale, w1_weight_scale_stacked)
         _register_parameter(gm, new_key_w2_weight_scale, w2_weight_scale_stacked)
         _register_parameter(gm, new_key_w3_weight_scale, w3_weight_scale_stacked)
@@ -1478,12 +1545,31 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
                 0, device=w1_input_scale_stacked.device, dtype=w1_input_scale_stacked.dtype
             )
         )
-        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
-            "All w1 scales should have the same value."
-        )
-        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
-            "All w2 scales should have the same value."
-        )
+        # Check if input scales are identical across experts
+        w1_input_scales_identical = torch.all(
+            w1_input_scale_stacked[0] == w1_input_scale_stacked
+        ).item()
+        w2_input_scales_identical = torch.all(
+            w2_input_scale_stacked[0] == w2_input_scale_stacked
+        ).item()
+
+        if not w1_input_scales_identical or not w2_input_scales_identical:
+            if not allow_different_input_scales:
+                # Fail with assertion
+                assert w1_input_scales_identical, (
+                    "All w1 input scales should have the same value. "
+                    "Set allow_different_input_scales=True to allow different scales (uses max)."
+                )
+                assert w2_input_scales_identical, (
+                    "All w2 input scales should have the same value. "
+                    "Set allow_different_input_scales=True to allow different scales (uses max)."
+                )
+            # Issue warning once and continue - max() will be used
+            ad_logger.warning_once(
+                "FP8 MoE: Input scales differ across experts. Using max(input_scale) for quantization. "
+                "This may impact accuracy if scales differ significantly.",
+                key="fp8_moe_different_input_scales",
+            )
 
         w1_weight_scale_stacked = _stack(w1_weight_scale, dim=0).to(torch.float32)
         w2_weight_scale_stacked = _stack(w2_weight_scale, dim=0).to(torch.float32)
@@ -1515,13 +1601,12 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
-
-    # Clean up after processing all nodes
-    # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
-    # will remove the parameters/buffers that are no longer referenced
-    eliminate_dead_code(gm)
-    delete_all_unused_submodules(gm)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     return fused_key_counter
 
@@ -1572,6 +1657,14 @@ class FuseFP8MoeConfig(TransformConfig):
         default="auto",
         description="Backend to use for FP8 MoE computation ('auto', 'trtllm' or 'triton'. default: 'auto').",
     )
+    allow_different_input_scales: bool = Field(
+        default=False,
+        description=(
+            "If False (default), assert that all experts have identical input scales and fail if not. "
+            "If True, allow different per-expert input scales by using max(input_scale) for quantization. "
+            "This matches TRT-LLM manual backend behavior but may impact accuracy if scales differ significantly."
+        ),
+    )
 
 
 @TransformRegistry.register("fuse_fp8_moe")
@@ -1581,6 +1674,10 @@ class FuseFP8Moe(BaseTransform):
     This runs after weights are loaded, similar to FuseMoe for unquantized MoE.
     """
 
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseFP8MoeConfig
+
     def _apply(
         self,
         gm: GraphModule,
@@ -1589,7 +1686,11 @@ class FuseFP8Moe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _stack_fp8_moe_weights(gm, backend=self.config.backend)
+            fused_key_counter = _stack_fp8_moe_weights(
+                gm,
+                backend=self.config.backend,
+                allow_different_input_scales=self.config.allow_different_input_scales,
+            )
 
         info = TransformInfo(
             skipped=(fused_key_counter == 0),
@@ -1600,7 +1701,10 @@ class FuseFP8Moe(BaseTransform):
         return gm, info
 
 
-def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
+def _stack_nvfp4_moe_weights(
+    gm: GraphModule,
+    allow_different_input_scales: bool = False,
+) -> int:
     def _register_parameter(gm: GraphModule, target, value):
         gm.register_parameter(target, torch.nn.Parameter(value, requires_grad=False))
 
@@ -1629,6 +1733,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             "w3_weight",
             "w1_input_scale",
             "w2_input_scale",
+            "w3_input_scale",
             "w1_weight_scale",
             "w2_weight_scale",
             "w3_weight_scale",
@@ -1650,20 +1755,79 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         if is_gated_mlp:
             # For gated MLP, concatenate w1 and w3 as [w3, w1]
             fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
-            # Expect w3 input scale and alpha to be the same as w1
-            fc1_act_scale = w1_input_scale_stacked
-            fc1_alpha_stacked = w1_alpha_stacked
             fc1_weight_blockscale_fp8_stacked = torch.cat(
                 [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
             ).contiguous()
+
+            # Check if all w1 and w3 input scales are identical across experts
+            all_scales_equal = (
+                torch.all(w1_input_scale_stacked == w1_input_scale_stacked[0])
+                and torch.all(w3_input_scale_stacked == w3_input_scale_stacked[0])
+                and torch.all(w1_input_scale_stacked == w3_input_scale_stacked)
+            )
+
+            if all_scales_equal:
+                # All scales are identical, no need for min() or alpha recomputation
+                fc1_act_scale = w1_input_scale_stacked[0]
+                fc1_alpha_stacked = w1_alpha_stacked
+            else:
+                if not allow_different_input_scales:
+                    assert False, (
+                        "FC1 input scales differ across experts (w1 and/or w3). "
+                        "Set allow_different_input_scales=True to allow different scales (uses min)."
+                    )
+                # Issue warning once and continue - min() will be used
+                ad_logger.warning_once(
+                    "NVFP4 MoE: Input scales differ across experts. Using min(input_scale) for "
+                    "FC1 quantization and recomputing alpha. This may impact accuracy if scales "
+                    "differ significantly.",
+                    key="nvfp4_moe_different_input_scales",
+                )
+                # Scales differ across experts - use global min scale and recompute alpha.
+                # Use min() because NVFP4 scales are in kernel format (2688/amax):
+                # smaller scale = larger amax = larger dynamic range.
+                fc1_act_scale = torch.minimum(
+                    w1_input_scale_stacked.min(), w3_input_scale_stacked.min()
+                )
+                # Recompute alpha using global input scale instead of per-expert input scale.
+                # Formula: new_alpha = old_alpha * per_expert_input_scale / global_input_scale
+                # This ensures alpha is consistent with the global fc1_act_scale used by the kernel.
+                fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
         else:
             fc1_expert_weights = w1_stacked
-            fc1_act_scale = w1_input_scale_stacked
-            fc1_alpha_stacked = w1_alpha_stacked
             fc1_weight_blockscale_fp8_stacked = w1_weight_blockscale_fp8_stacked
 
+            # Check if all w1 input scales are identical across experts
+            all_scales_equal = torch.all(w1_input_scale_stacked == w1_input_scale_stacked[0])
+
+            if all_scales_equal:
+                # All scales are identical, no need for min() or alpha recomputation
+                fc1_act_scale = w1_input_scale_stacked[0]
+                fc1_alpha_stacked = w1_alpha_stacked
+            else:
+                if not allow_different_input_scales:
+                    assert False, (
+                        "FC1 input scales differ across experts (w1). "
+                        "Set allow_different_input_scales=True to allow different scales (uses min)."
+                    )
+                # Issue warning once and continue - min() will be used
+                ad_logger.warning_once(
+                    "NVFP4 MoE: Input scales differ across experts. Using min(input_scale) for "
+                    "FC1 quantization and recomputing alpha. This may impact accuracy if scales "
+                    "differ significantly.",
+                    key="nvfp4_moe_different_input_scales",
+                )
+                # Scales differ across experts - use global min scale and recompute alpha
+                fc1_act_scale = w1_input_scale_stacked.min()
+                fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
+
         fc2_expert_weights = w2_stacked
+        # Keep fc2_act_scale per-expert (no global scale aggregation for fc2).
+        # The kernel supports per-expert scales for fc2, and intermediate activations
+        # naturally have different dynamic ranges per expert.
         fc2_act_scale = w2_input_scale_stacked
+        # No alpha recomputation needed since fc2 uses per-expert input scales.
+        fc2_alpha_stacked = w2_alpha_stacked
         fc2_weight_blockscale_fp8_stacked = w2_weight_blockscale_fp8_stacked
 
         new_key_fc1_expert_weights = f"nvfp4_moe_w3_w1_stacked_{fused_key_counter}"
@@ -1734,7 +1898,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         _register_parameter(gm, new_key_fc1_act_scale, fc1_act_scale)
         _register_parameter(gm, new_key_fc2_act_scale, fc2_act_scale)
         _register_parameter(gm, new_key_fc1_alpha, fc1_alpha_stacked)
-        _register_parameter(gm, new_key_fc2_alpha, w2_alpha_stacked)
+        _register_parameter(gm, new_key_fc2_alpha, fc2_alpha_stacked)
 
         with graph.inserting_before(node):
             args = (
@@ -1750,10 +1914,14 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
                 graph.get_attr(new_key_fc1_alpha),
                 graph.get_attr(new_key_fc2_alpha),
             )
-        kwargs = {
-            "is_gated_mlp": is_gated_mlp,
-            "act_fn": act_fn,
-        }
+        # Preserve original kwargs (mapping_config, max_num_tokens) and override with known values
+        kwargs = dict(node.kwargs) if node.kwargs else {}
+        kwargs.update(
+            {
+                "is_gated_mlp": is_gated_mlp,
+                "act_fn": act_fn,
+            }
+        )
         return args, kwargs
 
     fused_key_counter = 0
@@ -1774,6 +1942,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             w3_list,
             w1_input_scale,
             w2_input_scale,
+            w3_input_scale,
             w1_weight_scale,
             w2_weight_scale,
             w3_weight_scale,
@@ -1792,6 +1961,12 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         # Scales are buffers, not parameters
         w1_input_scale_stacked = _stack(w1_input_scale, dim=0)
         w2_input_scale_stacked = _stack(w2_input_scale, dim=0)
+        w3_input_scale_stacked = _stack(
+            w3_input_scale,
+            dim=0,
+            device=w1_input_scale_stacked.device,
+            dtype=w1_input_scale_stacked.dtype,
+        )
 
         # Use .view() not .to() to reinterpret bytes as float8, not value conversion
         w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).view(torch.float8_e4m3fn)
@@ -1826,12 +2001,31 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
     return fused_key_counter
 
 
+class FuseNVFP4MoeConfig(TransformConfig):
+    """Configuration for NVFP4 MoE fusion transform."""
+
+    allow_different_input_scales: bool = Field(
+        default=False,
+        description=(
+            "If False (default), assert that all experts have identical input scales and fail if not. "
+            "If True, allow different per-expert input scales by using min(input_scale) for quantization. "
+            "Note: NVFP4 uses min() (not max like FP8) because scales are in kernel format (2688/amax): "
+            "smaller scale = larger amax = larger dynamic range. "
+            "This may impact accuracy if scales differ significantly."
+        ),
+    )
+
+
 @TransformRegistry.register("fuse_nvfp4_moe")
 class FuseNVFP4Moe(BaseTransform):
     """
     Stack per-expert NVFP4 MoE weights and scales to avoid runtime stacking overhead.
     This runs after weights are loaded, similar to FuseFP8Moe.
     """
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseNVFP4MoeConfig
 
     def _apply(
         self,
@@ -1841,7 +2035,10 @@ class FuseNVFP4Moe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _stack_nvfp4_moe_weights(gm)
+            fused_key_counter = _stack_nvfp4_moe_weights(
+                gm,
+                allow_different_input_scales=self.config.allow_different_input_scales,
+            )
 
         info = TransformInfo(
             skipped=(fused_key_counter == 0),

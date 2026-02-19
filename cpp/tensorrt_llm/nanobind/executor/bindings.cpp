@@ -63,15 +63,15 @@ void initBindings(nb::module_& m)
         new (&self) tle::DecodingMode(nb::cast<tle::DecodingMode::UnderlyingType>(state[0]));
     };
     nb::class_<tle::DecodingMode>(m, "DecodingMode")
-        .def("Auto", &tle::DecodingMode::Auto)
-        .def("TopK", &tle::DecodingMode::TopK)
-        .def("TopP", &tle::DecodingMode::TopP)
-        .def("TopKTopP", &tle::DecodingMode::TopKTopP)
-        .def("BeamSearch", &tle::DecodingMode::BeamSearch)
-        .def("Medusa", &tle::DecodingMode::Medusa)
-        .def("Lookahead", &tle::DecodingMode::Lookahead)
-        .def("ExplicitDraftTokens", &tle::DecodingMode::ExplicitDraftTokens)
-        .def("Eagle", &tle::DecodingMode::Eagle)
+        .def_static("Auto", &tle::DecodingMode::Auto)
+        .def_static("TopK", &tle::DecodingMode::TopK)
+        .def_static("TopP", &tle::DecodingMode::TopP)
+        .def_static("TopKTopP", &tle::DecodingMode::TopKTopP)
+        .def_static("BeamSearch", &tle::DecodingMode::BeamSearch)
+        .def_static("Medusa", &tle::DecodingMode::Medusa)
+        .def_static("Lookahead", &tle::DecodingMode::Lookahead)
+        .def_static("ExplicitDraftTokens", &tle::DecodingMode::ExplicitDraftTokens)
+        .def_static("Eagle", &tle::DecodingMode::Eagle)
         .def("isAuto", &tle::DecodingMode::isAuto)
         .def("isTopK", &tle::DecodingMode::isTopK)
         .def("isTopP", &tle::DecodingMode::isTopP)
@@ -225,15 +225,20 @@ void initBindings(nb::module_& m)
         .def_prop_ro("mm_keys",
             [](tle::KVCacheStoredBlockData const& self)
             {
-                // Convert std::vector<MmKey> to Python list of tuples (bytes, int)
-                // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+                // Convert std::vector<MmKey> to Python list of tuples (bytes, int, optional<str>)
+                // MmKey = struct { hash, startOffset, uuid }
                 nb::list result;
                 for (auto const& mmKey : self.mmKeys)
                 {
-                    auto const& hashArray = mmKey.first;
-                    auto offset = mmKey.second;
-                    nb::bytes hashBytes(reinterpret_cast<char const*>(hashArray.data()), hashArray.size());
-                    result.append(nb::make_tuple(hashBytes, offset));
+                    nb::bytes hashBytes(reinterpret_cast<char const*>(mmKey.hash.data()), mmKey.hash.size());
+                    if (mmKey.uuid.has_value())
+                    {
+                        result.append(nb::make_tuple(hashBytes, mmKey.startOffset, mmKey.uuid.value()));
+                    }
+                    else
+                    {
+                        result.append(nb::make_tuple(hashBytes, mmKey.startOffset, nb::none()));
+                    }
                 }
                 return result;
             });

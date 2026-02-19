@@ -81,12 +81,12 @@ worker_config:
       decoding_type: MTP
       num_nextn_predict_layers: 1
   ctx:
-    max_batch_size: 16
+    max_batch_size: 1
     max_num_tokens: 131104
     max_seq_len: 131104
     tensor_parallel_size: 1
     moe_expert_parallel_size: 1
-    enable_attention_dp: true
+    enable_attention_dp: false
     pipeline_parallel_size: 4
     print_iter_log: true
     cuda_graph_config: null

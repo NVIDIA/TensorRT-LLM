@@ -1,6 +1,7 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
 import gc
+import time
 from typing import Optional
 
 import torch
@@ -10,6 +11,7 @@ import torch.nn as nn
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from ..utils.logger import ad_logger
 from .interface import (
     InferenceOptimizerConfig,
     SharedConfig,
@@ -21,14 +23,16 @@ from .interface import (
 
 
 class InferenceOptimizer:
-    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig):
+    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig, mapping=None):
         self.factory = factory
         self.config = self._clean_config(config)
         if not dist.is_initialized():
             local_rank, world_size = 0, 1
         else:
             local_rank, world_size = dist_ad.get_rank_world_size()
-        self.shared_config = SharedConfig(local_rank=local_rank, world_size=world_size)
+        self.shared_config = SharedConfig(
+            local_rank=local_rank, world_size=world_size, mapping=mapping
+        )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
         """Get a typed checked ("strict") config with sorted keys according to stages."""
@@ -64,11 +68,14 @@ class InferenceOptimizer:
             mod = nn.Module()
 
         # iterate over all transforms sorted by stage in the config
-        for t_name, t_config in self.config.items():
+        start_time = time.time()
+        for idx, (t_name, t_config) in enumerate(self.config.items()):
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
-            mod = transform(mod, cm, self.factory, self.shared_config)
+            mod = transform(mod, cm, self.factory, self.shared_config, idx)
+        total_time = time.time() - start_time
+        ad_logger.info(f"Total time for all transforms: {total_time:.2f}s")
 
         ############################################################################################
         # RETURN OPTIMIZED MODEL

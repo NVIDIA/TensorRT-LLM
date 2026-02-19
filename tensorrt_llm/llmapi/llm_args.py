@@ -444,10 +444,13 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA",
-                     "TRITON"] = Field(default='CUTLASS',
-                                       description="MoE backend to use.")
+    backend: Literal[
+        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
+        "TRITON"] = Field(
+            default='AUTO',
+            description="MoE backend to use. "
+            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+        )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -717,6 +720,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
+    # If set, drafting will use separate KV cache in one-model speculative decoding.
+    _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -838,6 +843,37 @@ class KvCacheConnectorConfig(StrictBaseModel):
         ..., description="The class name of the scheduler within the module.")
     connector_worker_class: str = Field(
         ..., description="The class name of the worker within the module.")
+
+
+class LayerwiseBenchmarksConfig(StrictBaseModel):
+    """
+    Configuration for layer-wise benchmarks calibration.
+    """
+    calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
+        default="NONE",
+        description=
+        "Instruct the layer-wise benchmarks calibrator to work on MARK mode, or COLLECT mode",
+        status="prototype")
+
+    calibration_file_path: Optional[str] = Field(
+        default=None,
+        description=
+        "The file path which the layer-wise benchmarks calibrator saves to or loads from",
+        status="prototype")
+
+    calibration_layer_indices: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Layer indices to filter. If None, all layers are collected in COLLECT mode.",
+        status="prototype")
+
+    @model_validator(mode='after')
+    def validate_calibration_file_path(self) -> 'LayerwiseBenchmarksConfig':
+        if self.calibration_mode == "COLLECT" and not self.calibration_file_path:
+            raise ValueError(
+                f"Expect calibration_file_path not to be empty when work on {self.calibration_mode} mode"
+            )
+        return self
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
@@ -1147,6 +1183,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = kwargs[
                 'num_nextn_predict_layers']  # Current MTP only support linear tree
 
+        if not self.mtp_eagle_one_model:
+            logger.warning(
+                "2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing "
+                "in release 1.3. After that, the flag will be removed entirely."
+            )
+
     @classmethod
     def from_dict(cls, data: dict):
         out = cls(**data)
@@ -1451,6 +1493,12 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
         return getattr(_ContextChunkingPolicy, self.value)
 
 
+class WaitingQueuePolicy(StrEnum):
+    """Waiting queue scheduling policy for managing pending requests."""
+
+    FCFS = "fcfs"  # First-Come-First-Served
+
+
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
 class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
@@ -1488,6 +1536,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None, description="The dynamic batch config to use")
+
+    waiting_queue_policy: WaitingQueuePolicy = Field(
+        default=WaitingQueuePolicy.FCFS,
+        description="The waiting queue scheduling policy")
 
     def _to_pybind(self):
         return _SchedulerConfig(
@@ -1726,6 +1778,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    use_kv_cache_manager_v2: bool = Field(
+        default=False,
+        status="prototype",
+        description="Whether to use the KV cache manager v2 (experimental).")
+
+    max_util_for_resume: float = Field(
+        default=0.95,
+        status="prototype",
+        description=
+        "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
+    )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1784,6 +1848,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive"
                 )
+        return v
+
+    @field_validator('max_util_for_resume')
+    @classmethod
+    def validate_max_util_for_resume(cls, v: float):
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
 
@@ -2009,12 +2081,6 @@ class BaseLlmArgs(StrictBaseModel):
         description="The format to load the model.",
         json_schema_extra={"type": "Literal['auto', 'dummy']"})
 
-    fail_fast_on_attention_window_too_large: bool = Field(
-        default=False,
-        description=
-        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
-        status="prototype")
-
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
@@ -2147,6 +2213,12 @@ class BaseLlmArgs(StrictBaseModel):
     return_perf_metrics: bool = Field(default=False,
                                       description="Return perf metrics.",
                                       status="prototype")
+
+    perf_metrics_max_requests: int = Field(
+        default=0,
+        description=
+        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
+        status="prototype")
 
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
         default=None,
@@ -2383,6 +2455,12 @@ class TrtLlmArgs(BaseLlmArgs):
 
     workspace: Optional[str] = Field(default=None,
                                      description="The workspace for the model.")
+
+    fail_fast_on_attention_window_too_large: bool = Field(
+        default=False,
+        description=
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
+        status="prototype")
 
     # Once set, the model will reuse the build_cache
     enable_build_cache: object = Field(
@@ -2864,12 +2942,6 @@ class TorchLlmArgs(BaseLlmArgs):
                                  description="Print iteration logs.",
                                  status="beta")
 
-    perf_metrics_max_requests: int = Field(
-        default=0,
-        description=
-        "The maximum number of requests for perf metrics. Must also set request_perf_metrics to true to get perf metrics.",
-        status="prototype")
-
     batch_wait_timeout_ms: float = Field(
         default=0,
         description=
@@ -2935,6 +3007,7 @@ class TorchLlmArgs(BaseLlmArgs):
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
                                    description="Allreduce strategy to use.",
                                    status="beta")
+
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description=
@@ -2995,6 +3068,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    # fp8 cute dsl configs
+    use_cute_dsl_blockscaling_mm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling mm implementation.",
+        status="prototype",
+    )
+    use_cute_dsl_blockscaling_bmm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -3010,6 +3095,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description="The max number of performance statistic entries.",
         status="prototype",
     )
+
+    layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
+        default_factory=LayerwiseBenchmarksConfig,
+        description="Configuration for layer-wise benchmarks calibration.",
+        status="prototype")
 
     @property
     def quant_config(self) -> QuantConfig:
@@ -3169,9 +3259,13 @@ class TorchLlmArgs(BaseLlmArgs):
         """Validate CUDA graph configuration.
 
         Ensures that:
-        1. If cuda_graph_config.batch_sizes is provided, cuda_graph_config.max_batch_size must be 0
-        2. If cuda_graph_config.batch_sizes is not provided, it is generated based on cuda_graph_config.max_batch_size
-        3. If both are provided, cuda_graph_config.batch_sizes must match the generated values
+        1. If cuda_graph_config.batch_sizes is provided, max_batch_size is
+           derived as max(batch_sizes).  If max_batch_size was already set it
+           must be compatible (equal to max(batch_sizes)); otherwise an error
+           is raised.
+        2. If only cuda_graph_config.max_batch_size is provided, batch_sizes
+           is generated from it.
+        3. If neither is provided, a default max_batch_size of 128 is used.
         """
         if self.cuda_graph_config is None:
             return self
@@ -3180,17 +3274,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
         if config.batch_sizes:
             config.batch_sizes = sorted(config.batch_sizes)
-            if config.max_batch_size != 0:
-                if config.batch_sizes != CudaGraphConfig._generate_cuda_graph_batch_sizes(
-                        config.max_batch_size, config.enable_padding):
-                    raise ValueError(
-                        "Please don't set both cuda_graph_config.batch_sizes "
-                        "and cuda_graph_config.max_batch_size.\n"
-                        f"cuda_graph_config.batch_sizes: {self.cuda_graph_config.batch_sizes}, "
-                        f"cuda_graph_config.max_batch_size: {self.cuda_graph_config.max_batch_size}"
-                    )
-            else:
-                config.max_batch_size = max(config.batch_sizes)
+            derived_max = max(config.batch_sizes)
+            if config.max_batch_size != 0 and config.max_batch_size != derived_max:
+                raise ValueError(
+                    "cuda_graph_config.max_batch_size is incompatible with "
+                    "cuda_graph_config.batch_sizes. When both are provided, "
+                    "max_batch_size must equal max(batch_sizes).\n"
+                    f"cuda_graph_config.batch_sizes: {config.batch_sizes}, "
+                    f"max(batch_sizes): {derived_max}, "
+                    f"cuda_graph_config.max_batch_size: {config.max_batch_size}"
+                )
+            config.max_batch_size = derived_max
         else:
             max_batch_size = config.max_batch_size or 128
             generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(

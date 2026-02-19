@@ -22,7 +22,6 @@ from torch.export import Dim
 from torch.fx import GraphModule
 
 # Import to register custom op
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
@@ -154,13 +153,12 @@ class TestGatherLogitsBeforeLmHeadTransform:
 
     def _create_cached_sequence_interface(self, max_batch_size: int = 8, device: str = "cuda"):
         """Create a mock CachedSequenceInterface for testing."""
-        seq_info = SequenceInfo(
+        return CachedSequenceInterface(
             max_seq_len=64,
             max_batch_size=max_batch_size,
+            device=device,
             max_num_tokens=1024,
         )
-        seq_info.to(device)
-        return CachedSequenceInterface(seq_info, device=device)
 
     def _check_gather_op_in_graph(self, gm: GraphModule) -> bool:
         """Check if gather_logits_before_lm_head op is in the graph."""

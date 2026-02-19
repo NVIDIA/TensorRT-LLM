@@ -49,15 +49,42 @@ graph TB
         CustomOps --> CUDAKernel
     end
 
+    subgraph "AutoDeploy_Flow"
+        ADExecutor[ADExecutor]
+        ADEngine[ADEngine]
+        GraphTransforms[Graph Transforms]
+        TorchExport[torch.export]
+        LLMAPI --> ADExecutor
+        ADExecutor --> ADEngine
+        ADEngine --> GraphTransforms
+        GraphTransforms --> TorchExport
+    end
+
+    subgraph "Visual_Gen_Flow"
+        VisualGenAPI[VisualGen API]
+        DiffusionClient[DiffusionRemoteClient]
+        DiffusionExecutor[DiffusionExecutor]
+        PipelineLoader[PipelineLoader]
+        DiffusionPipeline[BasePipeline WAN]
+        MediaOutput[MediaOutput]
+        LLMAPI --> VisualGenAPI
+        VisualGenAPI --> DiffusionClient
+        DiffusionClient --> DiffusionExecutor
+        DiffusionExecutor --> PipelineLoader
+        PipelineLoader --> DiffusionPipeline
+        DiffusionPipeline --> MediaOutput
+    end
+
     subgraph "Shared_Component"
         Shared_Decoder[Decoder]
         Shared_Scheduler[Scheduler]
         Sampling[Sampling]
         BatchManager[Batch Manager]
         KVCache[KV Cache Manager]
-        PyScheduler --> |Pybind|Shared_Scheduler
-        PyDecoder --> |Pybind|Shared_Decoder
-        Executor --> Shared_Decoder
+        PyScheduler --> |Nanobind|Shared_Scheduler
+        PyDecoder --> |Nanobind|Shared_Decoder
+        ADExecutor --> Shared_Scheduler
+        ADExecutor --> Shared_Decoder
         Shared_Decoder --> Sampling
         Executor --> Shared_Scheduler[Scheduler]
         Shared_Scheduler --> |In-flight Batching| BatchManager
@@ -68,12 +95,16 @@ graph TB
         Tokens[Generated Tokens]
         Stats[Performance Stats]
         Metrics[Accuracy Metrics]
+        GenImages[Generated Images]
+        GenVideos[Generated Videos]
     end
 
-    %% PyTorch_Flow ~~~ TensorRT_Flow 
+    PyTorch_Flow ~~~ TensorRT_Flow
 
     TensorRT_Flow --> Output_Results
     PyTorch_Flow --> Output_Results
+    AutoDeploy_Flow --> Output_Results
+    Visual_Gen_Flow --> Output_Results
 
     %% Force Output_Results to be between PyTorch_flow and TensorRT_flow
     PyTorch_Flow ~~~ Output_Results
@@ -85,7 +116,7 @@ graph TB
     %% CLI tools format
     classDef cli fill:#f9f,stroke:#333,stroke-width:2px;
     class CLI cli;
-    
+
     %% TRT flow format
     classDef trt fill:#bbf,stroke:#333,stroke-width:2px;
     class trtllmExecutor,TRTGraph,Plugins,Engine,Executor,cudaKernel trt;
@@ -94,15 +125,23 @@ graph TB
     classDef pytorch fill:#8bf,stroke:#333,stroke-width:2px;
     class PyExecutor,PyEngine,CustomOps,PyTorchOps,KernelLibs,PyScheduler,PyDecoder,CUDAKernel pytorch;
 
+    %% AutoDeploy flow format
+    classDef autodeploy fill:#9f8,stroke:#333,stroke-width:2px;
+    class ADExecutor,ADEngine,GraphTransforms,TorchExport autodeploy;
+
+    %% Visual Gen flow format
+    classDef visualgen fill:#d9c,stroke:#333,stroke-width:2px;
+    class VisualGenAPI,DiffusionClient,DiffusionExecutor,PipelineLoader,DiffusionPipeline,MediaOutput visualgen;
+
     %% Shared Componnet format
     classDef component fill:#fc8,stroke:#333,stroke-width:2px;
     class Shared_Decoder,Sampling,Shared_Scheduler,BatchManager,KVCache component;
-    
+
     %% APIs format
     classDef api fill:#bfb,stroke:#333,stroke-width:2px;
     class PythonAPI,CppAPI,LLMAPI api;
 
     %% Results format
     classDef result fill:#fbb,stroke:#333,stroke-width:2px;
-    class Tokens,Stats,Metrics result;
+    class Tokens,Stats,Metrics,GenImages,GenVideos result;
 ```

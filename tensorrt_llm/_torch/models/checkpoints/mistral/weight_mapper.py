@@ -49,6 +49,11 @@ class MistralWeightMapper(HfWeightMapper):
     # Adapted from:
     # https://github.com/vllm-project/vllm/blob/883b42896a9ed9791750d721fad26005b7569eba/vllm/model_executor/models/llama.py#L657
     def rename_by_params_map(self, params_map: dict[str, str], weights: dict) -> dict:
+        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+
+        # Check if input is a ConsumableWeightsDict to preserve the type
+        is_consumable = isinstance(weights, ConsumableWeightsDict)
+
         renamed_weights = {}
 
         for key in list(weights.keys()):
@@ -68,6 +73,9 @@ class MistralWeightMapper(HfWeightMapper):
 
             renamed_weights[new_key] = weights[key]
 
+        # Preserve ConsumableWeightsDict type if that's what was passed in
+        if is_consumable:
+            return ConsumableWeightsDict(renamed_weights)
         return renamed_weights
 
     def _permute_qk(self, module: nn.Module, new_name: str, weights: dict):

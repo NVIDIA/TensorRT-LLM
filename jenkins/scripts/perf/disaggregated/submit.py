@@ -4,12 +4,16 @@ import os
 
 import yaml
 
+DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
+
 
 def get_hardware_config(config, benchmark_mode):
     hardware = config.get("hardware", {})
     worker_config = config.get("worker_config", {})
 
-    num_ctx_servers = 0 if "gen_only" in benchmark_mode else hardware.get("num_ctx_servers")
+    num_ctx_servers = (
+        0 if "gen_only_no_context" in benchmark_mode else hardware.get("num_ctx_servers")
+    )
     num_gen_servers = hardware.get("num_gen_servers")
     gpus_per_node = hardware.get("gpus_per_node")
 
@@ -38,6 +42,9 @@ def get_hardware_config(config, benchmark_mode):
     nodes_per_ctx_server = (gpus_per_ctx_server + gpus_per_node - 1) // gpus_per_node
     nodes_per_gen_server = (gpus_per_gen_server + gpus_per_node - 1) // gpus_per_node
 
+    gpus_per_node_per_ctx_server = min(gpus_per_ctx_server, gpus_per_node)
+    gpus_per_node_per_gen_server = min(gpus_per_gen_server, gpus_per_node)
+
     total_nodes = num_ctx_servers * nodes_per_ctx_server + num_gen_servers * nodes_per_gen_server
     total_gpus = total_nodes * gpus_per_node
 
@@ -49,6 +56,8 @@ def get_hardware_config(config, benchmark_mode):
         "gpus_per_gen_server": gpus_per_gen_server,
         "nodes_per_ctx_server": nodes_per_ctx_server,
         "nodes_per_gen_server": nodes_per_gen_server,
+        "gpus_per_node_per_ctx_server": gpus_per_node_per_ctx_server,
+        "gpus_per_node_per_gen_server": gpus_per_node_per_gen_server,
         "total_nodes": total_nodes,
         "total_gpus": total_gpus,
     }
@@ -88,12 +97,10 @@ def get_env_config(config):
 def get_benchmark_config(config):
     benchmark = config.get("benchmark", {})
 
-    mode = benchmark.get("mode", "e2e")
     concurrency_str = benchmark.get("concurrency_list", "1")
     concurrency = int(concurrency_str) if isinstance(concurrency_str, str) else concurrency_str
 
     return {
-        "mode": mode,
         "concurrency": concurrency,
     }
 
@@ -102,7 +109,14 @@ def remove_whitespace_lines(lines):
     return [line.strip() for line in lines if line.strip()]
 
 
-def get_pytest_command_no_llmapilaunch(script_prefix_lines):
+def get_pytest_commands(script_prefix_lines):
+    # Get worker, disagg_server, benchmark pytest commands from pytest command.
+    # Worker pytest command is pytest command with trtllm-llmapi-launch and
+    # without --csv, --cov, --periodic flags.
+    # Disagg_server pytest command is pytest command without trtllm-llmapi-launch
+    # and without --csv, --cov, --periodic flags.
+    # Benchmark pytest command is pytest command without trtllm-llmapi-launch
+    # and with --csv, --cov, --periodic flags.
     pytest_command_line = None
     for line in script_prefix_lines:
         if "export pytestCommand=" in line:
@@ -110,20 +124,115 @@ def get_pytest_command_no_llmapilaunch(script_prefix_lines):
             break
 
     if not pytest_command_line:
-        return ""
+        return "", "", ""
 
-    # Replace pytestCommand with pytestCommandNoLLMAPILaunch
-    replaced_line = pytest_command_line.replace("pytestCommand", "pytestCommandNoLLMAPILaunch")
+    def split_pytest_command_line(command_line):
+        # After pytest, there are six types of substrings:
+        # Type 1: --xxx=yyy  (long option with value, self-contained)
+        # Type 2: --xxx=     (long option with empty value, self-contained)
+        # Type 3: --xxx      (long option flag, no value)
+        # Type 4: --xxx yyy  (long option with value as next arg)
+        # Type 5: -x yyy     (short single-letter option with value as next arg)
+        # Type 6: -x         (short option flag, e.g., -v, -vv)
+        parts = command_line.split()
+        pytest_index = None
+        for idx, part in enumerate(parts):
+            if "pytest" == part:
+                pytest_index = idx
+                break
+        if pytest_index is None:
+            return parts
 
-    # Split by space, find and remove the substring with trtllm-llmapi-launch
-    replaced_line_parts = replaced_line.split()
-    replaced_line_parts_no_llmapi = [
-        part for part in replaced_line_parts if "trtllm-llmapi-launch" not in part
+        grouped_parts = parts[: pytest_index + 1]
+        i = pytest_index + 1
+        while i < len(parts):
+            part = parts[i]
+            has_next = i + 1 < len(parts)
+            next_is_value = has_next and not parts[i + 1].startswith("-")
+
+            # Type 1 & 2: --xxx=yyy or --xxx= (self-contained, has '=')
+            if part.startswith("--") and "=" in part:
+                grouped_parts.append(part)
+                i += 1
+                continue
+
+            # Type 4: --xxx yyy (long option with value as next arg)
+            if part.startswith("--") and next_is_value:
+                grouped_parts.append(f"{part} {parts[i + 1]}")
+                i += 2
+                continue
+
+            # Type 3: --xxx (long option flag)
+            if part.startswith("--"):
+                grouped_parts.append(part)
+                i += 1
+                continue
+
+            # Type 5: -x yyy (short single-letter option with value as next arg)
+            # Only single letter after dash, e.g., -o, not -vv
+            if part.startswith("-") and len(part) == 2 and next_is_value:
+                grouped_parts.append(f"{part} {parts[i + 1]}")
+                i += 2
+                continue
+
+            # Type 6: -x (short option flag, including combined like -vv)
+            if part.startswith("-"):
+                grouped_parts.append(part)
+                i += 1
+                continue
+
+            # Other parts (shouldn't happen after pytest, but handle gracefully)
+            grouped_parts.append(part)
+            i += 1
+
+        return grouped_parts
+
+    def is_llmapi_launch(part):
+        return "trtllm-llmapi-launch" in part
+
+    def is_output_file_part(part):
+        return any(flag in part for flag in ("--csv", "--cov", "--periodic"))
+
+    worker_line = pytest_command_line.replace("pytestCommand", "partialPytestCommandWorker")
+    worker_parts = [
+        part for part in split_pytest_command_line(worker_line) if not is_output_file_part(part)
     ]
-    return " ".join(replaced_line_parts_no_llmapi)
+    worker_pytest_command = " ".join(worker_parts)
+
+    disagg_server_line = pytest_command_line.replace(
+        "pytestCommand", "partialPytestCommandDisaggServer"
+    )
+    disagg_server_parts = [
+        part
+        for part in split_pytest_command_line(disagg_server_line)
+        if not is_llmapi_launch(part) and not is_output_file_part(part)
+    ]
+    disagg_server_pytest_command = " ".join(disagg_server_parts)
+
+    benchmark_line = pytest_command_line.replace("pytestCommand", "partialPytestCommandBenchmark")
+    benchmark_parts = [
+        part for part in split_pytest_command_line(benchmark_line) if not is_llmapi_launch(part)
+    ]
+    benchmark_pytest_command = " ".join(benchmark_parts)
+
+    return (
+        worker_pytest_command,
+        disagg_server_pytest_command,
+        benchmark_pytest_command,
+    )
 
 
-def get_config_yaml(test_list_path, llm_src):
+def parse_test_case_name(test_list_path, llm_src):
+    """Parse test list to get config yaml path and benchmark mode.
+
+    Test formats for disagg:
+    - Disagg e2e: disagg_upload-e2e-{config_base}
+    - Disagg gen_only: disagg_upload-gen_only-{config_base}
+
+    Returns:
+        tuple: (config_yaml_path, benchmark_mode)
+            - benchmark_mode: "e2e" or "gen_only"
+    """
     with open(test_list_path, "r") as f:
         first_line = f.readline().strip()
 
@@ -133,32 +242,33 @@ def get_config_yaml(test_list_path, llm_src):
         )
     bracket_content = first_line.split("[")[-1].split("]")[0]
     parts = bracket_content.split("-")
-    if len(parts) < 2:
+
+    if len(parts) < 3:
         raise ValueError(
-            f"Invalid test name format. Expected format: prefix-config_name, got: {bracket_content}"
+            f"Invalid disagg test format. Expected: disagg-{{mode}}-{{config}}, "
+            f"got: {bracket_content}"
         )
 
-    # parts[0] is the prefix, parts[1:] is the config name
+    # parts[0] is the prefix, parts[1] is benchmark_mode, parts[2:] is the config name
     if "disagg" not in parts[0]:
         raise ValueError(
-            f"Invalid test name format. Expected format: disagg-config_name, got: {bracket_content}"
+            f"Invalid test name format. Expected format: disagg-mode-config_name, "
+            f"got: {bracket_content}"
         )
-    config_base_name = "-".join(parts[1:])
-    config_yaml_path = os.path.join(
-        llm_src,
-        "tests",
-        "integration",
-        "defs",
-        "perf",
-        "disagg",
-        "test_configs",
-        "disagg",
-        "perf",
-        f"{config_base_name}.yaml",
-    )
+
+    benchmark_mode = parts[1]  # e2e or gen_only
+    if benchmark_mode not in ("e2e", "gen_only"):
+        raise ValueError(
+            f"Invalid benchmark_mode for disagg: {benchmark_mode}. Expected 'e2e' or 'gen_only'."
+        )
+
+    config_base_name = "-".join(parts[2:])
+    config_yaml_path = os.path.join(llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml")
+
     if not os.path.exists(config_yaml_path):
         raise FileNotFoundError(f"Config file not found: {config_yaml_path}")
-    return config_yaml_path
+
+    return config_yaml_path, benchmark_mode
 
 
 def main():
@@ -196,7 +306,7 @@ def main():
 
     args = parser.parse_args()
 
-    config_yaml = get_config_yaml(args.test_list, args.llm_src)
+    config_yaml, benchmark_mode = parse_test_case_name(args.test_list, args.llm_src)
 
     with open(config_yaml, "r") as f:
         config = yaml.safe_load(f)
@@ -209,7 +319,6 @@ def main():
 
     benchmark_config = get_benchmark_config(config)
     print(f"Benchmark configuration: {benchmark_config}")
-    benchmark_mode = benchmark_config["mode"]
 
     hardware_config = get_hardware_config(config, benchmark_mode)
     print(f"Hardware configuration: {hardware_config}")
@@ -225,31 +334,40 @@ def main():
 
     srun_args_lines = srun_args_content.split()
 
-    # Extract pytestCommand and generate pytestCommandNoLLMAPILaunch
-    pytest_command_no_llmapi_launch = get_pytest_command_no_llmapilaunch(script_prefix_lines)
+    # Extract pytestCommand and generate partial pytest commands
+    (
+        worker_pytest_command,
+        disagg_server_pytest_command,
+        benchmark_pytest_command,
+    ) = get_pytest_commands(script_prefix_lines)
 
     # Build worker env vars, add extra env vars for gen_only mode
     worker_env_vars = env_config["worker_env_var"]
     server_env_vars = env_config["server_env_var"]
-    if "gen_only" in benchmark_config["mode"]:
-        concurrency = benchmark_config["concurrency"]
-        worker_env_vars = (
-            "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 "
-            f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-            f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {worker_env_vars}"
-        )
+    # Handle gen only mode
+    if "gen_only_no_context" in benchmark_mode:
+        worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {worker_env_vars}"
         server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
         script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
         srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
+    elif "gen_only" in benchmark_mode:
+        concurrency = benchmark_config.get("concurrency", 1)
+        worker_env_vars = (
+            f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
+            f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {worker_env_vars}"
+        )
 
     script_prefix_lines.extend(
         [
-            pytest_command_no_llmapi_launch,
-            f'export pytestCommandWorker="unset UCX_TLS && {worker_env_vars} $pytestCommand"',
-            f'export pytestCommandDisaggServer="{server_env_vars} $pytestCommandNoLLMAPILaunch"',
-            f'export pytestCommandBenchmark="{env_config["benchmark_env_var"]} $pytestCommandNoLLMAPILaunch"',
+            worker_pytest_command,
+            disagg_server_pytest_command,
+            benchmark_pytest_command,
+            f'export pytestCommandWorker="unset UCX_TLS && {worker_env_vars} $partialPytestCommandWorker"',
+            f'export pytestCommandDisaggServer="{server_env_vars} $partialPytestCommandDisaggServer"',
+            f'export pytestCommandBenchmark="{env_config["benchmark_env_var"]} $partialPytestCommandBenchmark"',
             f"export runScript={args.run_sh}",
             f"export installScript={install_script}",
+            f"export configYamlPath={config_yaml}",
             f"export numCtxServers={hardware_config['num_ctx_servers']}",
             f"export numGenServers={hardware_config['num_gen_servers']}",
             f"export gpusPerNode={hardware_config['gpus_per_node']}",
@@ -257,6 +375,8 @@ def main():
             f"export gpusPerGenServer={hardware_config['gpus_per_gen_server']}",
             f"export nodesPerCtxServer={hardware_config['nodes_per_ctx_server']}",
             f"export nodesPerGenServer={hardware_config['nodes_per_gen_server']}",
+            f"export gpusPerNodePerCtxServer={hardware_config['gpus_per_node_per_ctx_server']}",
+            f"export gpusPerNodePerGenServer={hardware_config['gpus_per_node_per_gen_server']}",
             f"export totalNodes={hardware_config['total_nodes']}",
             f"export totalGpus={hardware_config['total_gpus']}",
         ]

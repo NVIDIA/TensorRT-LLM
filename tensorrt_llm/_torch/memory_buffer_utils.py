@@ -79,16 +79,20 @@ class Buffers:
                 best_fit_block = block
                 smallest_sufficient_size = block.buffer.numel()
 
-        if reserve_buffer and best_fit_block is not None:
+        if best_fit_block is not None:
+            if reserve_buffer:
+                best_fit_block.is_reserved = True
             # A suitable buffer was found, so reuse it.
-            best_fit_block.is_reserved = True
             return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
 
         for block in list(candidate_blocks):
             if not block.is_reserved:
                 # Need to call del BufferBlock.buffer, otherwise memory isn't
                 # released and OOM may happen.
+                buffer_size = block.buffer.numel()
                 del block.buffer
+                if buffer_size >= 1024 * 1024 * 1024:
+                    torch.cuda.empty_cache()
                 candidate_blocks.remove(block)
 
         # No suitable buffer was found, so allocate a new one.

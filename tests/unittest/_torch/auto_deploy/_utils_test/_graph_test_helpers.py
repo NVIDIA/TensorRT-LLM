@@ -18,11 +18,11 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import ShardingT
 
 
 class FakeFactory(ModelFactory):
-    """Dummy factory to pass cache_config for testing."""
+    """Dummy factory to pass cache_config_updates for testing."""
 
-    def __init__(self, model=None, cache_config=None, quant_config=None):
+    def __init__(self, model=None, cache_config_updates=None, quant_config=None):
         self._model = model
-        self.cache_config = cache_config
+        self.cache_config_updates = cache_config_updates
         self.quant_config = quant_config
 
     def build_model(self, device: str):
@@ -34,8 +34,8 @@ class FakeFactory(ModelFactory):
     def _load_checkpoint(self, model, device):
         return
 
-    def get_cache_config(self):
-        return self.cache_config
+    def get_cache_config_updates(self):
+        return self.cache_config_updates
 
     def get_quant_config(self):
         return self.quant_config

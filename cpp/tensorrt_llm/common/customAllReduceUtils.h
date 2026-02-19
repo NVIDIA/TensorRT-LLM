@@ -115,7 +115,7 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
         || num_token_index
             >= AllReduceBestStrategyTable.at(sm_version).at(tp_index).at(fusion_op_index).at(hidden_size_index).size())
     {
-        return AllReduceStrategyType::NCCL_SYMMETRIC;
+        return AllReduceStrategyType::NCCL;
     }
 
     return static_cast<AllReduceStrategyType>(

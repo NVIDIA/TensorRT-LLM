@@ -56,14 +56,16 @@ cleanup_on_failure() {
 replace_placeholder() {
     file_path="$1"
     all_nodes_str="$2"
+    new_file_path="$3"
+    cp "$file_path" "$new_file_path"
     IFS=',' read -r -a node_array <<< "$all_nodes_str"
     for i in "${!node_array[@]}"; do
         current_val="${node_array[$i]}"
         placeholder="<node${i}_placeholder>"
 
         # Use sed to replace the placeholder with the value in-place
-        sed -i "s|$placeholder|$current_val|g" "${file_path}"
-        echo "Replaced $placeholder with $current_val in ${file_path}"
+        sed -i "s|$placeholder|$current_val|g" "${new_file_path}"
+        echo "Replaced $placeholder with $current_val in ${new_file_path}"
     done
 }
 
@@ -142,12 +144,15 @@ all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
 echo "all_nodes_str: ${all_nodes_str}"
 
+start_server_cmds_base_file=${full_logdir}/start_server_cmds_base.sh
 start_server_cmds_file=${full_logdir}/start_server_cmds.sh
-replace_placeholder ${start_server_cmds_file} ${all_nodes_str}
+replace_placeholder "${start_server_cmds_base_file}" "${all_nodes_str}" "${start_server_cmds_file}"
+server_config_base_file=${full_logdir}/server_config_base.yaml
 server_config_file=${full_logdir}/server_config.yaml
-replace_placeholder ${server_config_file} ${all_nodes_str}
+replace_placeholder "${server_config_base_file}" "${all_nodes_str}" "${server_config_file}"
+client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
-replace_placeholder ${client_cmds_file} ${all_nodes_str}
+replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
 # start the servers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
 echo "Starting worker commands from ${start_server_cmds_file}..."
@@ -164,7 +169,6 @@ done
 echo "Server is ready!"
 
 # Start client commands
-client_cmds_file=${full_logdir}/client_cmds.sh
 echo "Starting client commands from ${client_cmds_file}..."
 while read -r cmd <&3; do
     echo "Starting client command: ${cmd}"

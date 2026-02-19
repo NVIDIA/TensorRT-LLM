@@ -19,16 +19,19 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.commands.utils import (get_is_diffusion_model,
+                                         get_visual_gen_model_type)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig)
+                                 SchedulerConfig, VisualGen)
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
@@ -86,6 +89,45 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
+def is_non_default_or_required(param_name, value, backend):
+    """
+    Check if a parameter should be explicitly included in llm_args.
+
+    Returns True if parameter is either:
+    1. Always required (core params that must be present), OR
+    2. Different from its default value in the backend's LlmArgs class
+    """
+    always_include = {
+        "model", "backend", "tokenizer", "custom_tokenizer",
+        "postprocess_tokenizer_dir"
+    }
+
+    if param_name in always_include:
+        return True
+
+    if value is None:
+        return False
+
+    if backend == "tensorrt":
+        llm_args_class = TrtLlmArgs
+    elif backend == "_autodeploy":
+        from tensorrt_llm._torch.auto_deploy.llm_args import \
+            LlmArgs as AutoDeployLlmArgs
+        llm_args_class = AutoDeployLlmArgs
+    else:
+        llm_args_class = TorchLlmArgs
+
+    field_info = llm_args_class.model_fields.get(param_name)
+    if not field_info:
+        return False
+
+    default = field_info.default
+    if callable(default):
+        default = default()
+
+    return value != default
+
+
 def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
@@ -118,21 +160,9 @@ def get_llm_args(
         gpus_per_node = device_count()
         if gpus_per_node == 0:
             raise ValueError("No GPU devices found on the node")
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction, )
 
-    dynamic_batch_config = DynamicBatchConfig(
-        enable_batch_size_tuning=True,
-        enable_max_num_tokens_tuning=False,
-        dynamic_batch_moving_average_window=128)
-    scheduler_config = SchedulerConfig(
-        capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        dynamic_batch_config=dynamic_batch_config,
-    )
+    # TODO: This manual cp_type conversion can be removed once cp_config
+    # is refactored to a typed Pydantic model with enum coercion
     if cp_config is not None and "cp_type" in cp_config:
         cp_config = cp_config.copy()
         try:
@@ -141,33 +171,76 @@ def get_llm_args(
             raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
                              f"Must be one of: {', '.join([t.name for t in CpType])}")
 
-    llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "custom_tokenizer": custom_tokenizer,
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_parallel_size": pipeline_parallel_size,
-        "context_parallel_size": context_parallel_size,
-        "cp_config": cp_config if cp_config is not None else {},
-        "moe_expert_parallel_size": moe_expert_parallel_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "revision": revision,
-        "build_config": build_config,
-        "max_batch_size": max_batch_size,
-        "max_num_tokens": max_num_tokens,
-        "max_beam_width": max_beam_width,
-        "max_seq_len": max_seq_len,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend,
-        "num_postprocess_workers": num_postprocess_workers,
-        "postprocess_tokenizer_dir": tokenizer or model,
-        "reasoning_parser": reasoning_parser,
+    kv_cache_default_fraction = KvCacheConfig.model_fields[
+        'free_gpu_memory_fraction'].default
+
+    cli_maybe_overrides = {
+        "model":
+        model,
+        "backend":
+        backend,
+        "tokenizer":
+        tokenizer,
+        "custom_tokenizer":
+        custom_tokenizer,
+        "postprocess_tokenizer_dir":
+        tokenizer or model,
+        "kv_cache_config":
+        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction)
+        if free_gpu_memory_fraction != kv_cache_default_fraction else None,
+        "cp_config":
+        cp_config if cp_config else {},
+        "build_config":
+        BuildConfig(max_batch_size=max_batch_size,
+                    max_num_tokens=max_num_tokens,
+                    max_beam_width=max_beam_width,
+                    max_seq_len=max_seq_len) if backend == "tensorrt" else None,
+        "scheduler_config":
+        SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
+                        GUARANTEED_NO_EVICT,
+                        dynamic_batch_config=DynamicBatchConfig(
+                            enable_batch_size_tuning=True,
+                            enable_max_num_tokens_tuning=False,
+                            dynamic_batch_moving_average_window=128))
+        if backend == "tensorrt" else None,
+        "max_batch_size":
+        max_batch_size,
+        "max_beam_width":
+        max_beam_width,
+        "tensor_parallel_size":
+        tensor_parallel_size,
+        "pipeline_parallel_size":
+        pipeline_parallel_size,
+        "context_parallel_size":
+        context_parallel_size,
+        "moe_expert_parallel_size":
+        moe_expert_parallel_size,
+        "gpus_per_node":
+        gpus_per_node,
+        "trust_remote_code":
+        trust_remote_code,
+        "max_num_tokens":
+        max_num_tokens,
+        "max_seq_len":
+        max_seq_len,
+        "num_postprocess_workers":
+        num_postprocess_workers,
+        "enable_chunked_prefill":
+        enable_chunked_prefill,
+        "revision":
+        revision,
+        "reasoning_parser":
+        reasoning_parser,
+        "otlp_traces_endpoint":
+        otlp_traces_endpoint,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
-        "otlp_traces_endpoint": otlp_traces_endpoint,
-        "enable_chunked_prefill": enable_chunked_prefill,
+    }
+
+    llm_args = {
+        param: value
+        for param, value in cli_maybe_overrides.items()
+        if is_non_default_or_required(param, value, backend)
     }
 
     return llm_args, llm_args_extra_dict
@@ -186,7 +259,11 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                   socket.SOCK_STREAM)
+    address_family = socket.AF_INET6 if all(
+        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
         assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
         try:
@@ -213,7 +290,7 @@ def launch_server(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
 
-        server = OpenAIServer(llm=llm,
+        server = OpenAIServer(generator=llm,
                               model=model,
                               tool_parser=tool_parser,
                               server_role=server_role,
@@ -229,6 +306,124 @@ def launch_server(
         asyncio.run(server(host, port, sockets=[s]))
 
 
+def launch_grpc_server(host: str, port: int, llm_args: dict):
+    """
+    Launch a gRPC server for TensorRT-LLM.
+
+    This provides a high-performance gRPC interface designed for external routers
+    (e.g., sgl-router) using pre-tokenized input and raw token ID output.
+
+    Args:
+        host: Host to bind to
+        port: Port to bind to
+        llm_args: Arguments for LLM initialization (from get_llm_args)
+    """
+    import grpc
+
+    try:
+        from grpc_reflection.v1alpha import reflection
+        REFLECTION_AVAILABLE = True
+    except ImportError:
+        REFLECTION_AVAILABLE = False
+
+    from tensorrt_llm.grpc import trtllm_service_pb2, trtllm_service_pb2_grpc
+    from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
+    from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
+
+    async def serve_grpc_async():
+        logger.info("Initializing TensorRT-LLM gRPC server...")
+
+        backend = llm_args.get("backend")
+        model_path = llm_args.get("model", "")
+
+        if backend == "pytorch":
+            llm_args.pop("build_config", None)
+            llm = PyTorchLLM(**llm_args)
+        elif backend == "_autodeploy":
+            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+            llm_args.pop("build_config", None)
+            llm = AutoDeployLLM(**llm_args)
+        elif backend == "tensorrt" or backend == "trt":
+            llm_args.pop("backend")
+            llm = LLM(**llm_args)
+        else:
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
+
+        logger.info("Model loaded successfully")
+
+        # Create request manager
+        request_manager = GrpcRequestManager(llm)
+
+        # Create servicer
+        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
+
+        # Create gRPC server
+        server = grpc.aio.server(
+            options=[
+                ("grpc.max_send_message_length", -1),  # Unlimited
+                ("grpc.max_receive_message_length", -1),  # Unlimited
+                ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
+                ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
+            ], )
+
+        # Add servicer to server
+        trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(
+            servicer, server)
+
+        # Enable reflection for grpcurl and other tools
+        if REFLECTION_AVAILABLE:
+            service_names = (
+                trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
+                full_name,
+                reflection.SERVICE_NAME,
+            )
+            reflection.enable_server_reflection(service_names, server)
+            logger.info("gRPC reflection enabled")
+
+        # Bind to address
+        address = f"{host}:{port}"
+        server.add_insecure_port(address)
+
+        # Start server
+        await server.start()
+        logger.info(f"TensorRT-LLM gRPC server started on {address}")
+        logger.info("Server is ready to accept requests")
+
+        # Handle shutdown signals
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def signal_handler():
+            logger.info("Received shutdown signal")
+            stop_event.set()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+
+        # Serve until shutdown signal
+        try:
+            await stop_event.wait()
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        finally:
+            logger.info("Shutting down TensorRT-LLM gRPC server...")
+
+            # Stop gRPC server
+            await server.stop(grace=5.0)
+            logger.info("gRPC server stopped")
+
+            # Shutdown LLM
+            if hasattr(llm, "shutdown"):
+                llm.shutdown()
+            logger.info("LLM engine stopped")
+
+            logger.info("Shutdown complete")
+
+    asyncio.run(serve_grpc_async())
+
+
 def launch_mm_encoder_server(
     host: str,
     port: int,
@@ -236,12 +431,51 @@ def launch_mm_encoder_server(
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
     model = encoder_args["model"]
-    encoder_args.pop("build_config")
+    encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
 
-    server = OpenAIServer(llm=mm_encoder,
+    server = OpenAIServer(generator=mm_encoder,
                           model=model,
                           server_role=ServerRole.MM_ENCODER,
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None)
+    asyncio.run(server(host, port))
+
+
+def launch_visual_gen_server(
+    host: str,
+    port: int,
+    visual_gen_config: dict,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+):
+    """Launch a VISUAL_GEN model server for image/video generation.
+
+    Args:
+        host: Server hostname.
+        port: Server port.
+        visual_gen_config: Arguments for VISUAL_GEN model initialization.
+        metadata_server_cfg: Optional metadata server configuration.
+    """
+    model = visual_gen_config["model"]
+    logger.info(f"Initializing VisualGen ({model})")
+
+    n_workers = 1
+    parallel_config = visual_gen_config.get("parallel", {})
+    if parallel_config:
+        n_workers = parallel_config.get(
+            "dit_cfg_size", 1) * parallel_config.get("dit_ulysses_size", 1)
+        logger.info(f"World size: {n_workers}")
+        logger.info(f"CFG size: {parallel_config.get('dit_cfg_size', 1)}")
+        logger.info(
+            f"Ulysses size: {parallel_config.get('dit_ulysses_size', 1)}")
+
+    visual_gen_model = VisualGen(model_path=model,
+                                 n_workers=n_workers,
+                                 diffusion_config=visual_gen_config)
+
+    server = OpenAIServer(generator=visual_gen_model,
+                          model=model,
+                          server_role=ServerRole.VISUAL_GEN,
                           metadata_server_cfg=metadata_server_cfg,
                           tool_parser=None)
     asyncio.run(server(host, port))
@@ -472,6 +706,18 @@ class ChoiceWithAlias(click.Choice):
                   "Specify a custom chat template. "
                   "Can be a file path or one-liner template string",
                   "prototype"))
+@click.option(
+    "--grpc",
+    is_flag=True,
+    default=False,
+    help="Run gRPC server instead of OpenAI HTTP server. "
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
+@click.option("--extra_visual_gen_options",
+              type=str,
+              default=None,
+              help=help_info_with_stability_tag(
+                  "Path to a YAML file with extra VISUAL_GEN model options.",
+                  "prototype"))
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
@@ -487,7 +733,8 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str]):
+        custom_module_dirs: list[Path], chat_template: Optional[str],
+        grpc: bool, extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -501,73 +748,120 @@ def serve(
             logger.error(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
-    llm_args, _ = get_llm_args(
-        model=model,
-        tokenizer=tokenizer,
-        custom_tokenizer=custom_tokenizer,
-        backend=backend,
-        max_beam_width=max_beam_width,
-        max_batch_size=max_batch_size,
-        max_num_tokens=max_num_tokens,
-        max_seq_len=max_seq_len,
-        tensor_parallel_size=tensor_parallel_size,
-        pipeline_parallel_size=pipeline_parallel_size,
-        context_parallel_size=context_parallel_size,
-        moe_expert_parallel_size=moe_expert_parallel_size,
-        moe_cluster_parallel_size=moe_cluster_parallel_size,
-        gpus_per_node=gpus_per_node,
-        free_gpu_memory_fraction=free_gpu_memory_fraction,
-        num_postprocess_workers=num_postprocess_workers,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        reasoning_parser=reasoning_parser,
-        fail_fast_on_attention_window_too_large=
-        fail_fast_on_attention_window_too_large,
-        otlp_traces_endpoint=otlp_traces_endpoint,
-        enable_chunked_prefill=enable_chunked_prefill)
 
-    llm_args_extra_dict = {}
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_extra_dict = yaml.safe_load(f)
-    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
+    def _serve_llm():
+        nonlocal server_role
+        llm_args, _ = get_llm_args(
+            model=model,
+            tokenizer=tokenizer,
+            custom_tokenizer=custom_tokenizer,
+            backend=backend,
+            max_beam_width=max_beam_width,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            context_parallel_size=context_parallel_size,
+            moe_expert_parallel_size=moe_expert_parallel_size,
+            moe_cluster_parallel_size=moe_cluster_parallel_size,
+            gpus_per_node=gpus_per_node,
+            free_gpu_memory_fraction=free_gpu_memory_fraction,
+            num_postprocess_workers=num_postprocess_workers,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            reasoning_parser=reasoning_parser,
+            fail_fast_on_attention_window_too_large=
+            fail_fast_on_attention_window_too_large,
+            otlp_traces_endpoint=otlp_traces_endpoint,
+            enable_chunked_prefill=enable_chunked_prefill)
 
-    metadata_server_cfg = parse_metadata_server_config_file(
-        metadata_server_config_file)
+        llm_args_extra_dict = {}
+        if extra_llm_api_options is not None:
+            with open(extra_llm_api_options, 'r') as f:
+                llm_args_extra_dict = yaml.safe_load(f)
+        llm_args = update_llm_args_with_extra_dict(llm_args,
+                                                   llm_args_extra_dict)
 
-    # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
-    # but disagg_cluster_uri takes precedence over cluster uri in config file
-    disagg_cluster_config = llm_args.pop("disagg_cluster", None)
-    if disagg_cluster_config:
-        disagg_cluster_config = extract_disagg_cluster_config(
-            disagg_cluster_config, disagg_cluster_uri)
-    elif disagg_cluster_uri:
-        disagg_cluster_config = DisaggClusterConfig(
-            cluster_uri=disagg_cluster_uri)
+        metadata_server_cfg = parse_metadata_server_config_file(
+            metadata_server_config_file)
 
-    if metadata_server_cfg is not None or disagg_cluster_config is not None:
-        assert (
-            server_role is not None
-        ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
-        try:
-            server_role = ServerRole[server_role.upper()]
-        except ValueError:
-            raise ValueError(f"Invalid server role: {server_role}. " \
-                             f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+        # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
+        # but disagg_cluster_uri takes precedence over cluster uri in config file
+        disagg_cluster_config = llm_args.pop("disagg_cluster", None)
+        if disagg_cluster_config:
+            disagg_cluster_config = extract_disagg_cluster_config(
+                disagg_cluster_config, disagg_cluster_uri)
+        elif disagg_cluster_uri:
+            disagg_cluster_config = DisaggClusterConfig(
+                cluster_uri=disagg_cluster_uri)
 
-    # Parse media_io_kwargs from JSON string to dict if provided
-    parsed_media_io_kwargs = None
-    if media_io_kwargs is not None:
-        try:
-            parsed_media_io_kwargs = json.loads(media_io_kwargs)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON for media_io_kwargs: {e}")
+        if metadata_server_cfg is not None or disagg_cluster_config is not None:
+            assert (
+                server_role is not None
+            ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
+            try:
+                server_role = ServerRole[server_role.upper()]
+            except ValueError:
+                raise ValueError(f"Invalid server role: {server_role}. " \
+                                f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+        # Parse media_io_kwargs from JSON string to dict if provided
+        parsed_media_io_kwargs = None
+        if media_io_kwargs is not None:
+            try:
+                parsed_media_io_kwargs = json.loads(media_io_kwargs)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON for media_io_kwargs: {e}")
 
-    multimodal_server_config = MultimodalServerConfig(
-        media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, tool_parser, chat_template,
-                  metadata_server_cfg, server_role, disagg_cluster_config,
-                  multimodal_server_config)
+        multimodal_server_config = MultimodalServerConfig(
+            media_io_kwargs=parsed_media_io_kwargs)
+
+        if grpc:
+            # gRPC mode: launch gRPC server instead of OpenAI HTTP server
+            # Check for unsupported arguments that are silently ignored in gRPC mode
+            unsupported_args = {
+                "tool_parser": tool_parser,
+                "chat_template": chat_template,
+                "metadata_server_config_file": metadata_server_config_file,
+                "server_role": server_role,
+                "disagg_cluster_config": disagg_cluster_config,
+            }
+            for name, value in unsupported_args.items():
+                if value is not None:
+                    raise ValueError(
+                        f"Argument '{name}' is not supported when running in gRPC mode. "
+                        f"The gRPC server is designed for use with external routers that handle "
+                        f"these features (e.g., tool parsing, chat templates).")
+            launch_grpc_server(host, port, llm_args)
+        else:
+            # Default: launch OpenAI HTTP server
+            launch_server(host, port, llm_args, tool_parser, chat_template,
+                          metadata_server_cfg, server_role,
+                          disagg_cluster_config, multimodal_server_config)
+
+    def _serve_visual_gen():
+        visual_gen_config = {
+            "model": model,
+            "model_type": get_visual_gen_model_type(model),
+        }
+
+        visual_gen_extra_args = {}
+        if extra_visual_gen_options is not None:
+            with open(extra_visual_gen_options, 'r') as f:
+                visual_gen_extra_args = yaml.safe_load(f)
+
+        visual_gen_config.update(visual_gen_extra_args)
+
+        metadata_server_cfg = parse_metadata_server_config_file(
+            metadata_server_config_file)
+
+        launch_visual_gen_server(host, port, visual_gen_config,
+                                 metadata_server_cfg)
+
+    if get_is_diffusion_model(model):
+        _serve_visual_gen()
+    else:
+        _serve_llm()
 
 
 @click.command("mm_embedding_serve")

@@ -219,6 +219,7 @@ class JobManager:
 
             # Write temporary config file with replaced environment variables
             logger.info(f"Creating temporary config: {temp_config_path}")
+
             with open(temp_config_path, "w") as f:
                 yaml.dump(
                     test_config.config_data,
@@ -620,15 +621,8 @@ class JobManager:
             result["error"] = error_msg
             return result
 
-        # Check if required log file exists (7_accuracy_eval.log)
-        accuracy_log = os.path.join(result_dir, "7_accuracy_eval.log")
-        if not os.path.exists(accuracy_log):
-            error_msg = f"Accuracy evaluation log file not found: {accuracy_log}"
-            logger.error(error_msg)
-            result["error"] = error_msg
-            return result
-
         # Import and use AccuracyParser
+        # Note: AccuracyParser handles log file checking with glob pattern support
         from reporting.accuracy_parser import AccuracyParser
 
         accuracy_parser = AccuracyParser(metrics_config, accuracy_config, result_dir)

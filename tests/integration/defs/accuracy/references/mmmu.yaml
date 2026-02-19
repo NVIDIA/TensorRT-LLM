@@ -6,6 +6,14 @@ google/gemma-3-27b-it:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 48.0
+google/gemma-3-12b-it:
+  - accuracy: 50.44
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 49.0
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 50.11
 Qwen/Qwen2-VL-7B-Instruct:
   - accuracy: 48.44
 Qwen/Qwen2.5-VL-7B-Instruct:

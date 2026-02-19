@@ -176,6 +176,7 @@ def create_moe_backend(
             swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
     elif moe_cls == CutlassFusedMoE:
         return moe_cls(
@@ -195,6 +196,7 @@ def create_moe_backend(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
             activation_type=activation_type,
         )
     elif moe_cls == WideEPMoE:
@@ -255,6 +257,7 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            without_comm=without_comm,
         )
     elif moe_cls == TritonFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TritonFusedMoE."

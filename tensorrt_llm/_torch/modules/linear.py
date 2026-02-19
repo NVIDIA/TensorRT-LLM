@@ -518,10 +518,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def pre_reload_weights(self, module: Linear):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            logger.warning(
-                f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
-            )
-            param = Parameter(torch.empty_like(metadata, device="cuda"),
+            # Extract meta tensor from metadata dict
+            meta_tensor = metadata['meta']
+            param = Parameter(torch.empty_like(meta_tensor, device="cuda"),
                               requires_grad=False)
             module.register_parameter(param_name, param)
 
@@ -557,6 +556,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        # GEMM ops require 2D matrices
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
             if module.input_scale is not None and not module.force_dynamic_quantization:
@@ -592,6 +598,11 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
             )
+
+        # Reshape output back to original shape (with out_features as last dim)
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+
         if bias is not None:
             output = output + bias
         return output
@@ -752,7 +763,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         self.rescale_fused_weights(module)
 
         # Handle kv_scales for NVFP4 KV cache
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "0") == "1":
+        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
             k_scales = getattr(module, "tmp_k_scales", [])
             v_scales = getattr(module, "tmp_v_scales", [])
             if k_scales:
@@ -761,12 +772,10 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 # to avoid overflow when dequantizing NVFP4 in attention kernels.
                 copy_weight(
                     module.kv_scales,
-                    torch.tensor([
-                        1.0,
-                        max(k_scales).item() * 6.0,
-                        max(v_scales).item() * 6.0
-                    ],
-                                 dtype=torch.float32))
+                    torch.tensor(
+                        [1.0, max(k_scales).item(),
+                         max(v_scales).item()],
+                        dtype=torch.float32))
                 module.inv_kv_scales.data = 1.0 / module.kv_scales
 
         # Clean up temporary attributes
@@ -978,16 +987,21 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        # GEMM ops require 2D matrices
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         if input.dtype == torch.float8_e4m3fn:
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
         if is_sm_100f():
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                # TODO (@lmin): replace with cute_dsl gemm
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
             else:
@@ -1006,6 +1020,10 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+
+        # Reshape output back to original shape (with out_features as last dim)
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
 
         if bias is not None:
             output = output + bias
@@ -1216,6 +1234,15 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
+        # GEMM requires 2D. Only plain tensors support for now, skip for
+        # tuple and Fp4QuantizedTensor.
+        original_shape = None
+        if not isinstance(input,
+                          (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
+            original_shape = input.shape
+            input = input.reshape(-1, input.shape[-1])
+
         act_fp4, act_sf = self._input_prepare(module, input)
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
@@ -1232,6 +1259,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
+
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
 
         if bias is not None:
             output = output + bias
@@ -1364,18 +1394,13 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Load k and v scales, used for NVFP4 KV cache
         k_scale, v_scale = self.load_kv_scales(weights)
-        # NOTE: Currently the calibrated kv scales may cause overflow for certain input, disabling by default.
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "0") == "1":
+        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
             if len(k_scale) != 0:
                 assert len(v_scale) != 0
-                # The calibrated KV scales are amax / (6 * 448), but the requested KV scales are amax / 448,
-                # to avoid overflow when dequantizing NVFP4 in attention kernels using FP8 math.
                 copy_weight(
                     module.kv_scales,
                     torch.tensor(
-                        [1.0, max(k_scale) * 6.0,
-                         max(v_scale) * 6.0],
-                        dtype=torch.float32))
+                        [1.0, max(k_scale), max(v_scale)], dtype=torch.float32))
                 module.inv_kv_scales.data = 1.0 / module.kv_scales
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
@@ -2361,6 +2386,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        enable_gemm_allreduce_fusion: bool = True,
     ):
         """
         Args:
@@ -2438,13 +2464,14 @@ class Linear(nn.Module):
         )
 
         device_supported = get_sm_version() >= 100
-        enable_gemm_allreduce_fusion = (os.environ.get(
+        enable_gemm_allreduce_fusion_env = (os.environ.get(
             "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
 
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,
             in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, enable_gemm_allreduce_fusion
+            device_supported, enable_gemm_allreduce_fusion,
+            enable_gemm_allreduce_fusion_env
         ])
         if self.use_fused_gemm_allreduce:
             self.use_fused_gemm_allreduce = ipc_nvls_supported()

@@ -4,7 +4,6 @@ import pydantic
 import pytest
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
-from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 
 
 def test_custom_values():
@@ -14,7 +13,6 @@ def test_custom_values():
         "model_factory": "AutoModelForImageTextToText",
         "model_kwargs": {"custom_param": True},
         "skip_loading_weights": True,
-        "attn_page_size": 128,
         "max_seq_len": 2048,
         "transforms": {
             "detect_sharding": {
@@ -24,10 +22,6 @@ def test_custom_values():
             "insert_cached_attention": {
                 "stage": "cache_init",
                 "backend": "flashinfer",
-            },
-            "resize_kv_cache": {
-                "stage": "cache_init",
-                "free_mem_ratio": 0.9,
             },
         },
     }
@@ -39,30 +33,10 @@ def test_custom_values():
         "custom_param": True,
     }
     assert args.skip_loading_weights
-    assert args.transforms["resize_kv_cache"]["free_mem_ratio"] == 0.9
     assert args.transforms["detect_sharding"]["simple_shard_only"]
-    assert args.attn_page_size == 128
     assert args.max_seq_len == 2048
     # backend should be overridden if it was 'TRTLLM'
     assert args.transforms["insert_cached_attention"]["backend"] == "flashinfer"
-
-
-def test_free_mem_ratio_validation():
-    """Test free_mem_ratio validation."""
-
-    def get_transform_config(free_mem_ratio):
-        return {"resize_kv_cache": {"stage": "cache_init", "free_mem_ratio": free_mem_ratio}}
-
-    # Valid values
-    InferenceOptimizer(None, get_transform_config(0.0))
-    InferenceOptimizer(None, get_transform_config(1.0))
-    InferenceOptimizer(None, get_transform_config(0.5))
-
-    # Invalid values
-    with pytest.raises(ValueError):
-        InferenceOptimizer(None, get_transform_config(-0.1))
-    with pytest.raises(ValueError):
-        InferenceOptimizer(None, get_transform_config(1.1))
 
 
 # ================================
@@ -77,7 +51,6 @@ def test_config_params():
         "model": "test-model",
         "model_factory": "AutoModelForImageTextToText",
         "skip_loading_weights": True,
-        "attn_page_size": 17,
         "max_seq_len": 19,
         "max_batch_size": 5,
         "world_size": 3,
@@ -89,10 +62,6 @@ def test_config_params():
             "insert_cached_attention": {
                 "stage": "cache_init",
                 "backend": "flashinfer",
-            },
-            "resize_kv_cache": {
-                "stage": "cache_init",
-                "free_mem_ratio": 0.7,
             },
         },
     }
@@ -152,15 +121,10 @@ def test_config_flow(
     # Common assertions for both APIs
     assert instance.args.model_factory == test_config_params["model_factory"]
     assert (
-        instance.args.transforms["resize_kv_cache"]["free_mem_ratio"]
-        == test_config_params["transforms"]["resize_kv_cache"]["free_mem_ratio"]
-    )
-    assert (
         instance.args.transforms["detect_sharding"]["simple_shard_only"]
         == test_config_params["transforms"]["detect_sharding"]["simple_shard_only"]
     )
     assert instance.args.skip_loading_weights == test_config_params["skip_loading_weights"]
-    assert instance.args.attn_page_size == test_config_params["attn_page_size"]
     assert instance.args.max_seq_len == test_config_params["max_seq_len"]
     assert instance.args.max_batch_size == test_config_params["max_batch_size"]
 
@@ -213,23 +177,6 @@ def test_parallel_config_validation(parallel_field, invalid_value):
         ValueError, match="AutoDeploy only supports parallelization via the `world_size` argument."
     ):
         LlmArgs(**kwargs)
-
-
-@pytest.mark.parametrize(
-    "backend,expected_attn_page_size",
-    [
-        ("flashinfer", 64),  # Default attn_page_size
-        ("triton", 1024),  # Should equal max_seq_len
-    ],
-)
-def test_attention_backend_page_size_logic(backend, expected_attn_page_size):
-    """Test attn_page_size logic for different attention backends."""
-    args = LlmArgs(
-        model="test-model",
-        max_seq_len=1024,
-        transforms={"insert_cached_attention": {"stage": "cache_init", "backend": backend}},
-    )
-    assert args.attn_page_size == expected_attn_page_size
 
 
 # ================================
@@ -351,7 +298,7 @@ class TestSequenceInfoExampleBatchSize:
             max_batch_size=1,
             max_seq_len=128,
             max_num_tokens=128,
-            page_size=64,
+            tokens_per_block=64,
         )
 
         # Set example sequence (this is what's used during export)
@@ -371,7 +318,7 @@ class TestSequenceInfoExampleBatchSize:
             max_batch_size=32,
             max_seq_len=128,
             max_num_tokens=128,
-            page_size=64,
+            tokens_per_block=64,
         )
 
         seq_info.set_example_sequence()

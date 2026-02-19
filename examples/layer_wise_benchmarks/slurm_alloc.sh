@@ -12,6 +12,7 @@ salloc -A "$ACCOUNT" \
     -p "$PARTITION" \
     -N "$NODES" \
     --segment "$NODES" \
+    -J "$ACCOUNT-tensorrt_llm.layer_wise_benchmarks" \
     $EXTRA_ARGS \
     -t "$TIME" \
     --no-shell \

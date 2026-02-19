@@ -234,6 +234,29 @@ def get_model_yaml_config(model_label: str,
                 'enable_chunked_prefill': False,
             }
         },
+        # Qwen3-235B-A22B-FP4 with Eagle3 speculative decoding
+        {
+            'patterns': [
+                'qwen3_235b_a22b_fp4_eagle3-bench-pytorch',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'enable_autotuner': False,
+                'enable_chunked_prefill': False,
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3",
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
         # Llama-v3.3 models with fp8 quantization
         {
             'patterns': [
@@ -297,10 +320,10 @@ def get_model_yaml_config(model_label: str,
                 'num_postprocess_workers': 4
             }
         },
-        # GPT-OSS 120B speculative decoding (Eagle3 draft)
+        # GPT-OSS 120B speculative decoding with Eagle3
         {
             'patterns': [
-                'gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:4096-input_output_len:2048,128-reqs:1-con:1',
+                'gpt_oss_120b_eagle3-bench-pytorch',
             ],
             'config': {
                 'enable_attention_dp': False,
@@ -314,9 +337,34 @@ def get_model_yaml_config(model_label: str,
                     'decoding_type':
                     'Eagle',
                     'max_draft_len':
-                    5,
+                    3,
                     'speculative_model_dir':
-                    f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
+                    f'{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
+        # GPT-OSS 120B speculative decoding with Eagle3-throughput (https://nvbugspro.nvidia.com/bug/5832481)
+        {
+            'patterns': [
+                'gpt_oss_120b_eagle3_throughput-bench-pytorch',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': False,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f'{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3-throughput',
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
@@ -354,6 +402,13 @@ def get_model_yaml_config(model_label: str,
                     'cuda_graph_mode': True,
                 },
                 'guided_decoding_backend': 'xgrammar'
+            }
+        },
+        # Gemma3 models require FlashInfer backend due to sliding window attention
+        {
+            'patterns': ['gemma_3', 'gemma3'],
+            'config': {
+                'attn_backend': 'FLASHINFER',
             }
         }
     ]

@@ -9,8 +9,8 @@ import safetensors
 import torch
 import tqdm
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-    BaseWeightLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
 from tensorrt_llm._utils import (local_mpi_barrier, local_mpi_rank,
@@ -70,7 +70,7 @@ class HfWeightLoader(BaseWeightLoader):
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
-                                  description: str) -> dict[str, Any]:
+                                  description: str) -> ConsumableWeightsDict:
         """
         Load weight files in parallel using the specified loading function.
 
@@ -80,7 +80,7 @@ class HfWeightLoader(BaseWeightLoader):
             description: Description for the progress bar
 
         Returns:
-            Dictionary containing all loaded weights
+            ConsumableWeightsDict containing all loaded weights
         """
         weights = {}
         pbar = tqdm.tqdm(total=len(weight_files), desc=description)
@@ -91,7 +91,7 @@ class HfWeightLoader(BaseWeightLoader):
                          reduce_func=weights.update,
                          pbar=pbar)
 
-        return weights
+        return ConsumableWeightsDict(weights)
 
     @staticmethod
     def _load_safetensors_file(file):

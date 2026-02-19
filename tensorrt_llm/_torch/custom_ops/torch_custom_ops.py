@@ -1,5 +1,6 @@
+import threading
 from functools import lru_cache
-from typing import List, Mapping, Optional, Tuple, Union
+from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]
@@ -25,7 +26,7 @@ from ..utils import (ActivationType, fp4_scale_infer_shape,
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellLinear
+        CuteDSLNVFP4BlackwellRunner
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -819,7 +820,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                             "Please add other backends to allowed_backends.")
                 else:
                     # SM version OK, check if CuteDSL supports the current shape
-                    cutedsl_runner = CuteDSLNVFP4BlackwellLinear(
+                    cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
                         self.output_dtype)
                     cutedsl_tactics = cutedsl_runner.get_valid_tactics(
                         inputs, profile)
@@ -878,7 +879,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                          self.output_dtype)(inputs,
                                                             tactic=sub_tactic)
         elif backend == "cutedsl":
-            return CuteDSLNVFP4BlackwellLinear(
+            return CuteDSLNVFP4BlackwellRunner(
                 self.output_dtype, self.to_userbuffers)(inputs,
                                                         tactic=sub_tactic)
         else:
@@ -1450,17 +1451,17 @@ def _(
 
 def deep_gemm_gen_tuning_buckets(x: int):
     buckets = tuple(range(8, 128, 8))
+    # Clamp x to be between 4096 and 8192.
     if x >= 128:
+        x = min(x, 8192)
+        x = max(x, 4096)
         buckets += tuple(range(128, x, 128))
     return buckets
 
 
 class fp8SwapABGemmRunner(TunableRunner):
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
-        tune_max_num_tokens=4096,
-    )
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, deep_gemm_gen_tuning_buckets), ), )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool):
         self.output_dtype = output_dtype
@@ -1477,9 +1478,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        # Encode swap_ab as False (0) and True (1). Currently enabled when GEMM m <= 128.
-        input, _, _ = inputs
-        return [0, 1] if input.shape[0] <= 128 else [0]
+        return [0]
 
     def forward(
         self,
@@ -1494,8 +1493,7 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
-        forward_func = deep_gemm.fp8_gemm_ntt if tactic == 1 else deep_gemm.fp8_gemm_nt
-        forward_func(
+        deep_gemm.fp8_gemm_nt(
             (a, a_sf),
             (weight, weight_scale),
             output,
@@ -1511,14 +1509,13 @@ def fp8_swap_ab_gemm(
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
-    tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
     tuner = AutoTuner.get()
     fp8_swap_ab_gemm_runner = fp8SwapABGemmRunner(
         output_dtype,
         disable_ue8m0_cast,
     )
-    fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
         [fp8_swap_ab_gemm_runner],
@@ -1538,7 +1535,6 @@ def _(
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
     disable_ue8m0_cast: bool = False,
-    tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
@@ -1660,6 +1656,8 @@ def _(
 
 
 class AllReduceRunner(TunableRunner):
+    _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
+    _prealloc_done: ClassVar[set] = set()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -1688,6 +1686,42 @@ class AllReduceRunner(TunableRunner):
             self.op,
         )
 
+    @classmethod
+    def _maybe_preallocate_buffers(cls,
+                                   input_tensor: torch.Tensor,
+                                   group: List[int],
+                                   do_preparation: bool = False) -> None:
+        if not do_preparation:
+            return
+        if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
+            return
+        if input_tensor.numel() == 0 or input_tensor.size(0) == 0:
+            return
+        if hasattr(torch.cuda, "is_current_stream_capturing"):
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except (RuntimeError, AssertionError):
+                # If capture status can't be queried, avoid prealloc to be safe.
+                return
+
+        num_tokens = int(input_tensor.size(0))
+        if num_tokens <= 0:
+            return
+        group_key = tuple(group)
+        cache_key = (group_key, num_tokens)
+        with cls._prealloc_lock:
+            if cache_key in cls._prealloc_done:
+                return
+            cls._prealloc_done.add(cache_key)
+
+        logger.debug(
+            "[tunable_allreduce] Pre-allocating NCCL window buffers: "
+            "tokens=%d group=%s", num_tokens, list(group))
+        prealloc_input = input_tensor
+        torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
+                                                        2)
+
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -1695,8 +1729,7 @@ class AllReduceRunner(TunableRunner):
         **kwargs,
     ) -> List[int]:
         valid_strategies = [
-            # TODO: NCCL_SYMMETRIC will cause hang during tuning process
-            # AllReduceStrategy.NCCL_SYMMETRIC.value,
+            AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
@@ -1721,11 +1754,21 @@ class AllReduceRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
         input, residual, norm_weight, scale, bias, workspace = inputs
+        if do_preparation:
+            valid_tactics = self.get_valid_tactics(inputs,
+                                                   OptimizationProfile(),
+                                                   **kwargs)
+            if AllReduceStrategy.NCCL_SYMMETRIC.value in valid_tactics:
+                self._maybe_preallocate_buffers(input,
+                                                self.group,
+                                                do_preparation=True)
+            return input
         if tactic == -1:
-            # TODO: Use NCCL instead of NCCL_SYMMETRIC to avoid hanging during tuning process
-            tactic = AllReduceStrategy.NCCL.value
+            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
         return torch.ops.trtllm.allreduce(
             input,
@@ -1740,6 +1783,15 @@ class AllReduceRunner(TunableRunner):
             self.eps,
             self.trigger_completion_at_end,
         )
+
+
+@torch.library.register_fake("trtllm::preallocate_nccl_window_buffer")
+def _(
+    input: torch.Tensor,
+    group: List[int],
+    count: int,
+) -> None:
+    return None
 
 
 @torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())

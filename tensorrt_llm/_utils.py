@@ -23,6 +23,7 @@ import socket
 import struct
 import sys
 import tempfile
+import threading
 import trace
 import traceback
 import weakref
@@ -208,6 +209,12 @@ def binding_to_str_dtype(binding_dtype) -> str:
     ret = _binding_to_str_dtype.get(binding_dtype)
     assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
     return ret
+
+
+def binding_to_torch_dtype(binding_dtype) -> torch.dtype:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return str_dtype_to_torch(ret)
 
 
 def binding_dtype_size(dtype: DataType):
@@ -503,7 +510,17 @@ def set_mpi_comm(new_comm):
     comm = new_comm
 
 
+thread_local_comm = threading.local()
+
+
+def set_thread_local_mpi_comm(new_comm):
+    thread_local_comm.value = new_comm
+
+
 def mpi_comm():
+    if hasattr(thread_local_comm,
+               "value") and thread_local_comm.value is not None:
+        return thread_local_comm.value
     return comm
 
 
@@ -989,7 +1006,7 @@ class TensorWrapper:
     def __init__(
         self,
         data_ptr: int,
-        dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
+        dtype: Union[torch.dtype, str, np.dtype, trt.DataType, DataType],
         shape: Sequence[int],
         strides: Optional[Sequence[int]] = None,
     ):
@@ -1011,7 +1028,8 @@ class TensorWrapper:
         return getattr(self, "_shape", None)
 
     @dtype.setter
-    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType]):
+    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType,
+                                 DataType]):
         if isinstance(dtype, torch.dtype):
             self._dtype = dtype
         elif isinstance(dtype, str):
@@ -1020,6 +1038,8 @@ class TensorWrapper:
             self._dtype = np_dtype_to_torch(dtype)
         elif isinstance(dtype, trt.DataType):
             self._dtype = trt_dtype_to_torch(dtype)
+        elif isinstance(dtype, DataType):
+            self._dtype = binding_to_torch_dtype(dtype)
         else:
             raise TypeError(f"Unsupported dtype: {dtype}")
 
@@ -1185,14 +1205,24 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _mm_key_to_json(data):
-        # MmKey is a pair of (array<uint8_t, 32>, SizeType32)
-        hash_array, start_offset = data
+        # MmKey is a tuple of (hash_bytes, start_offset, uuid)
+        # where uuid is optional (None if content-hashed)
+        if len(data) == 3:
+            hash_array, start_offset, uuid = data
+        else:
+            # Backward compatibility: old format (hash_array, start_offset)
+            hash_array, start_offset = data
+            uuid = None
 
         # Convert array to hex string
         hash_hex = ''.join(f'{b:02x}' for b in hash_array)
+
+        # Use UUID from C++ if available, otherwise use hash_hex
+        hash_or_uuid = uuid if uuid is not None else hash_hex
+
         return {
             "type": "mm_key",
-            "hash": hash_hex,
+            "hash": hash_or_uuid,
             "start_offset": start_offset
         }
 

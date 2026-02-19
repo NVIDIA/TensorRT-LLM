@@ -43,6 +43,8 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3": "NVIDIA-Nemotron-Nano-31B-A3-v3",
     "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024": "Nemotron-Nano-3-30B-A3.5B-dev-1024",
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
+    "zai-org/GLM-4.7-Flash": "GLM-4.7-Flash",
+    "DeepInfra/GLM-4.7-Flash-NVFP4": "GLM-4.7-Flash-NVFP4",
 }
 
 
@@ -99,16 +101,31 @@ def mock_snapshot_download(repo_id: str, **kwargs) -> str:
     return local_path
 
 
-def with_mocked_hf_download(func):
+def with_mocked_hf_download_for_single_gpu(func):
     """Decorator to mock huggingface_hub.snapshot_download for tests.
 
     When applied, any calls to snapshot_download will be redirected to use
     local model paths from LLM_MODELS_ROOT instead of downloading from HuggingFace.
+
+    NOTE: We must patch snapshot_download at the location where it's actually imported
+    with 'from huggingface_hub import snapshot_download', since that creates a
+    local binding that won't be affected by patching huggingface_hub.snapshot_download.
+
+    Additionally sets HF_HUB_OFFLINE=1 to ensure no network requests are made to
+    HuggingFace.
+
+    WARNING: This decorator only works for single-GPU tests. For multi-GPU tests, the
+    mock won't be applied in MPI worker processes.
     """
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with patch("huggingface_hub.snapshot_download", side_effect=mock_snapshot_download):
+        with (
+            patch.dict(os.environ, {"HF_HUB_OFFLINE": "1"}),
+            patch(
+                "tensorrt_llm.llmapi.utils.snapshot_download", side_effect=mock_snapshot_download
+            ),
+        ):
             return func(*args, **kwargs)
 
     return wrapper

@@ -33,7 +33,7 @@ namespace kernels
 
 static constexpr size_t tllmGenGemmGatedActListLen = 13;
 
-#ifndef EXCLUDE_SM_100
+#ifndef EXCLUDE_SM_100F
 extern unsigned char GemmGatedActKernel_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin[];
 extern unsigned char GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f_cubin[];
 extern unsigned char GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin[];
@@ -47,9 +47,9 @@ extern unsigned char GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et1
 extern unsigned char GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin[];
 extern unsigned char GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin[];
 extern unsigned char GemmGatedActKernel_Fp32_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin[];
-#endif // EXCLUDE_SM_100
+#endif // EXCLUDE_SM_100F
 
-#ifndef EXCLUDE_SM_100
+#ifndef EXCLUDE_SM_100F
 extern unsigned int GemmGatedActKernel_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len;
 extern unsigned int GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f_cubin_len;
 extern unsigned int GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin_len;
@@ -63,11 +63,11 @@ extern unsigned int GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et12
 extern unsigned int GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin_len;
 extern unsigned int GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len;
 extern unsigned int GemmGatedActKernel_Fp32_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len;
-#endif // EXCLUDE_SM_100
+#endif // EXCLUDE_SM_100F
 
 
 static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
-#ifndef EXCLUDE_SM_100
+#ifndef EXCLUDE_SM_100F
 {GemmGatedActKernel_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 86016, "gemmGatedActKernel_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f", 448, "9676717a6339c1f0ed39de9935975d4d60468440174326380990d70d75cf357a", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -138,7 +138,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f_cubin_len, 168960, "gemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f", 224, "ec67e15fd7862d51b19dda2176f8129e4592a748eefb3e48b6a3fbc41868d6f2", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -209,7 +209,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 112640, "gemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f", 224, "caa8817305ecc3e91818c767f6a7989b7db55b6c49232c9a2e32d1c907228684", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -280,7 +280,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 110592, "gemmGatedActKernel_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f", 224, "48fc7f954cbb918fab79ff2ee54159c00da0687ee4ca60036b9fe5c746d97a2c", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -351,7 +351,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 86016, "gemmGatedActKernel_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f", 448, "0d61dc1cfefc5ca6d5e90afa70347394930cbf4c79eea20c1518de8e1222da54", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -422,7 +422,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f_cubin_len, 152576, "gemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f", 224, "403cbe5700ce7b2749b49c595661ceeedbf6e50c580709a37a610cc54a239b4d", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -493,7 +493,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 111616, "gemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f", 224, "c2d4a41c6e16594d2c46fece2ee0a15e783d4c914bf698c4b7fd7ac0c14c2dfc", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -564,7 +564,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 110592, "gemmGatedActKernel_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f", 224, "20c18093aeca9040c7914535312f7980bf9cfbb77430dc0ef9660d7a8b2f3340", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -635,7 +635,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_Fp16_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Fp16_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 86016, "gemmGatedActKernel_Fp16_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f", 448, "375daed8ff4ada0d0117299a9fd882c0598feeff34924a9d1479b1bc2a0c473e", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -706,7 +706,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f_cubin_len, 168960, "gemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_swiGlu_sm100f", 224, "d0abb1065fc2517d1208f38e0716cf6fa177a165ae5c560033fd2e1e81bffe16", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -777,7 +777,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 112640, "gemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_swiGlu_sm100f", 224, "22fefb0cbe12f8af7719f7dd3e9271d7386f20e57d8dd2809587d0e825d13681", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -848,7 +848,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 110592, "gemmGatedActKernel_Fp16_E4m3E4m3_Fp32_t128x8x256u2_s3_et128x8_m128x8x32_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f", 224, "48101b606e52817efdcfc9a17ad91b224fa8fd6c36283f5f370b8f6ae729fadc", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -919,7 +919,7 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
+ }, gemm::SmVersion::Sm100f},
 {GemmGatedActKernel_Fp32_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin, GemmGatedActKernel_Fp32_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f_cubin_len, 86016, "gemmGatedActKernel_Fp32_E2m1E2m1_Fp32_t128x8x256u2_s4_et128x8_m128x8x64_cga1x1x4_16dp256b_splitK4_TN_transOut_schedS_swiGlu_sm100f", 448, "0e648979b852a9c612006fa871fc73dc427ceacbd79201c7d1b4e52a0d64aec7", { { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
@@ -990,8 +990,8 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 , /* mTileScheduler */ gemm::TileScheduler(0)
  }, /* mActType */ gemmGatedAct::ActType(0)
 , /* mClampBeforeAct */ 0
- }, gemm::SmVersion::Sm100a},
-#endif // EXCLUDE_SM_100
+ }, gemm::SmVersion::Sm100f},
+#endif // EXCLUDE_SM_100F
 };
 // clang-format on
 } // namespace kernels

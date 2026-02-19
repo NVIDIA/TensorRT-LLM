@@ -183,8 +183,11 @@ def test_pip_install():
 
     subprocess.check_call("apt-get -y install libzmq3-dev", shell=True)
     subprocess.check_call("apt-get -y install python3-pip", shell=True)
-    subprocess.check_call("pip3 install --upgrade pip || true", shell=True)
-    subprocess.check_call("pip3 install --upgrade setuptools || true",
+    subprocess.check_call("pip3 install --ignore-installed pip || true",
+                          shell=True)
+    subprocess.check_call("pip3 install --ignore-installed setuptools || true",
+                          shell=True)
+    subprocess.check_call("pip3 install --ignore-installed wheel || true",
                           shell=True)
 
     download_wheel(args)

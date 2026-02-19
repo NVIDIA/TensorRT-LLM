@@ -1,5 +1,6 @@
 """Accuracy test result parser."""
 
+import glob
 import os
 import re
 from typing import Dict, List
@@ -28,40 +29,77 @@ class AccuracyParser:
         self.result_dir = result_dir
 
     def parse_and_validate(self) -> AccuracyValidationResult:
-        """Parse accuracy_eval.log and validate all configured datasets for all runs.
+        """Parse accuracy_eval.log(s) and validate all configured datasets for all runs.
 
         Supports multiple runs (e.g., pre-benchmark and post-benchmark).
+        Supports wildcard patterns in log_file (e.g., "7_accuracy_eval_*.log").
         All runs must pass for the validation to succeed.
 
         Returns:
             AccuracyValidationResult with validation results for all runs
         """
-        log_file = os.path.join(self.result_dir, self.metrics_config.log_file)
+        log_pattern = self.metrics_config.log_file
 
-        if not os.path.exists(log_file):
+        # Check if pattern contains wildcards
+        if "*" in log_pattern or "?" in log_pattern or "[" in log_pattern:
+            # Use glob to match multiple files
+            log_files = sorted(glob.glob(os.path.join(self.result_dir, log_pattern)))
+
+            if not log_files:
+                return {
+                    "success": False,
+                    "all_passed": False,
+                    "runs": [],
+                    "raw_results": [],
+                    "error": f"No log files found matching pattern: {log_pattern}",
+                }
+
+            logger.info(f"Found {len(log_files)} log file(s) matching pattern '{log_pattern}'")
+        else:
+            # Single file (backward compatible)
+            log_file = os.path.join(self.result_dir, log_pattern)
+
+            if not os.path.exists(log_file):
+                return {
+                    "success": False,
+                    "all_passed": False,
+                    "runs": [],
+                    "raw_results": [],
+                    "error": f"Log file not found: {log_file}",
+                }
+
+            log_files = [log_file]
+
+        # Read and merge all log files
+        combined_log_content = ""
+        failed_files = []
+
+        for log_file in log_files:
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                    combined_log_content += content
+                    if not content.endswith("\n"):
+                        combined_log_content += "\n"  # Ensure separation between files
+                    logger.info(f"Successfully read log file: {os.path.basename(log_file)}")
+            except Exception as e:
+                failed_files.append((log_file, str(e)))
+                logger.warning(f"Failed to read {log_file}: {e}")
+
+        if not combined_log_content:
+            error_msg = "No valid log content found."
+            if failed_files:
+                error_msg += f" Failed files: {failed_files}"
             return {
                 "success": False,
                 "all_passed": False,
                 "runs": [],
                 "raw_results": [],
-                "error": f"Log file not found: {log_file}",
-            }
-
-        # Read log file
-        try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                log_content = f.read()
-        except Exception as e:
-            return {
-                "success": False,
-                "all_passed": False,
-                "runs": [],
-                "raw_results": [],
-                "error": f"Failed to read log file: {e}",
+                "error": error_msg,
             }
 
         # Extract accuracy values for all runs
-        all_runs_results = self._extract_accuracy_values(log_content)
+        all_runs_results = self._extract_accuracy_values(combined_log_content)
 
         if not all_runs_results:
             return {

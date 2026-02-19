@@ -666,11 +666,8 @@ def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
                          ids=["llama3_1-8b"])
 @pytest.mark.parametrize("model_subdir", ["llama-3.1-model/Meta-Llama-3.1-8B"],
                          ids=["llama_v3_1"])
-@pytest.mark.parametrize("use_pytorch_backend", [False], ids=["trt_backend"])
-def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir,
-                                 use_pytorch_backend):
+def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir):
     "run bench mark in MIG mode, check if the throughput is increasing by concurrency"
-    skip_engine_build = False
     results = {}
     concurrency_list = [1, 32, 64, 128]
 
@@ -681,19 +678,17 @@ def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir,
                              model_name=model_name,
                              model_subdir=model_subdir,
                              streaming=False,
-                             use_pytorch_backend=use_pytorch_backend,
+                             use_pytorch_backend=True,
                              use_mpirun=False,
                              tp_size=1,
                              concurrency=concurrency,
-                             num_requests=num_requests,
-                             skip_engine_build=skip_engine_build)
+                             num_requests=num_requests)
 
         output = runner()
         results[concurrency] = output
 
     print(f"\n=== Benchmark Results Comparison ===")
     print(f"Model: {model_name}")
-    print(f"Backend: {'PyTorch' if use_pytorch_backend else 'TensorRT'}")
     print(
         f"{'Concurrency':<15} {'Throughput':<15} {'Latency':<15} {'Num Requests':<15}"
     )
@@ -1736,8 +1731,10 @@ def test_openai_mmencoder_example(llm_root, llm_venv):
          str(test_root / "_test_openai_mmencoder.py")])
 
 
-@pytest.mark.parametrize(
-    "model_name", ["meta-llama/Llama-3.1-8B-Instruct", "openai/gpt-oss-120b"])
+@pytest.mark.parametrize("model_name", [
+    "meta-llama/Llama-3.1-8B-Instruct",
+    pytest.param("openai/gpt-oss-120b", marks=skip_pre_hopper)
+])
 def test_openai_chat_guided_decoding(llm_root, llm_venv, model_name: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([

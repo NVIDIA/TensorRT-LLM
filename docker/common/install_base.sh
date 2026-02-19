@@ -68,6 +68,7 @@ init_ubuntu() {
     gdb \
     git-lfs \
     clang \
+    graphviz \
     lld \
     llvm \
     libclang-rt-dev \

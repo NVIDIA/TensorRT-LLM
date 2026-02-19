@@ -286,6 +286,60 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@skip_pre_hopper
+class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-3-12b-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-12b-it"
+    MAX_NUM_TOKENS = 12800
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<end_of_turn>"
+    )
+
+    # Gemma3 VLM needs KV cache reuse disabled for custom mask support.
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        free_gpu_memory_fraction=0.6,
+    )
+
+    kv_cache_config_fp8 = kv_cache_config.model_copy(update={"dtype": "fp8"})
+
+    def _make_llm(self, model_path: str, kv_cache_config: KvCacheConfig = None):
+        # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
+        if kv_cache_config is None:
+            kv_cache_config = self.kv_cache_config
+        return LLM(
+            model_path,
+            max_batch_size=16,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_seq_len=8704,  # 8192 + 512.
+            kv_cache_config=kv_cache_config,
+            attn_backend="FLASHINFER",
+            enable_chunked_prefill=False,
+        )
+
+    def test_auto_dtype(self):
+        with self._make_llm(self.MODEL_PATH) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    def test_fp8_prequantized(self):
+        model_path = f"{llm_models_root()}/gemma/gemma-3-12b-it-fp8"
+        with self._make_llm(model_path, self.kv_cache_config_fp8) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    @skip_pre_blackwell
+    def test_nvfp4_prequantized(self):
+        model_path = f"{llm_models_root()}/gemma/gemma-3-12b-it-fp4"
+        with self._make_llm(model_path, self.kv_cache_config_fp8) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
 class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-VL-30B-A3B-Instruct"

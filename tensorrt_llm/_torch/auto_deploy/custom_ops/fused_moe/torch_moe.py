@@ -1,9 +1,164 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Callable, List
 
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.mapping import Mapping
+
+
+def _template_moe_alltoall(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    mlps: List[Callable[[torch.Tensor], torch.Tensor]],
+    apply_routing_on_input: bool,
+    mapping: Mapping,
+    max_num_tokens: int = 0,
+) -> torch.Tensor:
+    """
+    Simple reference implementation of MoE with all-to-all for correctness verification.
+
+    This is a NAIVE but CORRECT implementation that:
+    1. All-gathers tokens/expert_ids/weights from all EP ranks (inefficient but simple)
+    2. Each rank processes only its local experts on the gathered data
+    3. All-reduces outputs to sum contributions from each rank
+
+    NOTE: This is intentionally simple and inefficient. Production code should use
+    _run_moe_with_alltoall with MoeAlltoAll for optimized dispatch/combine.
+
+    Args:
+        x: Input tensor (DP-sharded: each rank has different tokens)
+        selected_experts: Expert IDs in GLOBAL coordinates
+        routing_weights: Routing weights
+        mlps: List of LOCAL expert MLP functions (only this rank's experts)
+        apply_routing_on_input: If True, apply routing to input; else to output
+        mapping: Mapping object with moe_ep_size and moe_ep_rank
+        max_num_tokens: Maximum number of tokens per rank (used to pad tensors
+            to equal sizes across ranks before all_gather, since different DP
+            ranks may have different token counts)
+
+    Returns:
+        Output tensor (each rank gets back its original DP slice)
+    """
+    x_shape = x.shape
+    hidden_dim = x_shape[-1]
+    x_flat = x.view(-1, hidden_dim)
+    local_num_tokens = x_flat.shape[0]
+
+    # Pad tensors to max_num_tokens so all ranks have the same size for all_gather.
+    # With attention DP, different ranks can have different token counts.
+    # torch.distributed.all_gather requires identical tensor sizes across ranks.
+    if max_num_tokens > 0 and local_num_tokens < max_num_tokens:
+        pad_size = max_num_tokens - local_num_tokens
+        x_flat = torch.cat(
+            [x_flat, torch.zeros(pad_size, hidden_dim, dtype=x_flat.dtype, device=x_flat.device)],
+            dim=0,
+        )
+        # Pad expert IDs with -1 so they are filtered out by valid_mask below
+        selected_experts = torch.cat(
+            [
+                selected_experts,
+                torch.full(
+                    (pad_size, selected_experts.shape[1]),
+                    -1,
+                    dtype=selected_experts.dtype,
+                    device=selected_experts.device,
+                ),
+            ],
+            dim=0,
+        )
+        routing_weights = torch.cat(
+            [
+                routing_weights,
+                torch.zeros(
+                    pad_size,
+                    routing_weights.shape[1],
+                    dtype=routing_weights.dtype,
+                    device=routing_weights.device,
+                ),
+            ],
+            dim=0,
+        )
+
+    # Determine local expert ID range for this rank
+    local_num_experts = len(mlps)
+    global_num_experts = local_num_experts * mapping.moe_ep_size
+    local_expert_start = mapping.moe_ep_rank * local_num_experts
+    local_expert_end = local_expert_start + local_num_experts
+
+    # Step 1: All-gather tokens, selected_experts, routing_weights from all EP ranks
+    # Each EP rank has different tokens (DP-sharded)
+    gathered_x_list = [torch.zeros_like(x_flat) for _ in range(mapping.moe_ep_size)]
+    gathered_experts_list = [torch.zeros_like(selected_experts) for _ in range(mapping.moe_ep_size)]
+    gathered_weights_list = [torch.zeros_like(routing_weights) for _ in range(mapping.moe_ep_size)]
+
+    torch.distributed.all_gather(gathered_x_list, x_flat, group=None)
+    torch.distributed.all_gather(gathered_experts_list, selected_experts, group=None)
+    torch.distributed.all_gather(gathered_weights_list, routing_weights, group=None)
+
+    # Concatenate gathered tensors
+    all_x = torch.cat(gathered_x_list, dim=0)
+    all_experts = torch.cat(gathered_experts_list, dim=0)
+    all_weights = torch.cat(gathered_weights_list, dim=0)
+
+    # Step 2: Process LOCAL experts only (other ranks will process their experts)
+    output = torch.zeros_like(all_x)
+    valid_mask = (all_experts >= 0) & (all_experts < global_num_experts)
+    experts_fixed = torch.where(
+        valid_mask, all_experts, torch.full_like(all_experts, global_num_experts)
+    )
+    one_hot = F.one_hot(experts_fixed.long(), num_classes=global_num_experts + 1)
+    expert_mask = one_hot[..., :global_num_experts].permute(2, 1, 0)
+
+    # Only process experts in [local_expert_start, local_expert_end)
+    for global_expert_idx in range(local_expert_start, local_expert_end):
+        local_expert_idx = global_expert_idx - local_expert_start
+        idx, top_x = torch.where(expert_mask[global_expert_idx])
+        tokens_for_expert = all_x[None, top_x].reshape(-1, hidden_dim)
+        if not tokens_for_expert.shape[0]:
+            continue
+
+        if apply_routing_on_input:
+            scaled_input = tokens_for_expert * all_weights[top_x, idx, None]
+            expert_out = mlps[local_expert_idx](scaled_input)
+        else:
+            expert_out = mlps[local_expert_idx](tokens_for_expert)
+            expert_out = expert_out * all_weights[top_x, idx, None]
+
+        output.index_add_(0, top_x, expert_out.to(output.dtype))
+
+    # Step 3: All-reduce to sum contributions from all ranks
+    # Each rank contributes only its local experts, others contribute zeros
+    torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM, group=None)
+
+    # Step 4: Extract this rank's DP slice from the result
+    # Each rank's tokens are at position [rank * padded_tokens, (rank+1) * padded_tokens)
+    padded_tokens = x_flat.shape[0]
+    start_idx = mapping.moe_ep_rank * padded_tokens
+    end_idx = start_idx + padded_tokens
+    local_output = output[start_idx:end_idx]
+
+    # Remove padding to get back the original number of tokens
+    local_output = local_output[:local_num_tokens]
+
+    return local_output.view(x_shape)
 
 
 def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -32,19 +187,43 @@ def _template_moe(
     routing_weights: torch.Tensor,
     mlps: List[Callable[[torch.Tensor], torch.Tensor]],
     apply_routing_on_input: bool = False,
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
 ) -> torch.Tensor:
     """Mixtral-style generic MoE template, dispatching tokens to expert MLPs based on routing info.
 
     Args:
         x: Input tensor
-        selected_experts: Expert indices for each token
+        selected_experts: Expert indices for each token (GLOBAL coordinates when all-to-all enabled)
         routing_weights: Routing weights for each expert
-        mlps: List of MLP functions
+        mlps: List of MLP functions (LOCAL experts only when all-to-all enabled)
         apply_routing_on_input: If True, multiply routing weights with INPUT before MLP (BMM-based pattern).
                                 This means: silu(input * routing_weight)
                                 If False, multiply routing weights with OUTPUT after MLP (standard pattern).
                                 This means: silu(input) * routing_weight
+        mapping_config: Serialized Mapping config for distributed all-to-all
+        max_num_tokens: Maximum tokens for workspace allocation (all-to-all mode)
     """
+
+    # Check if all-to-all mode is enabled
+    mapping = deserialize_mapping(mapping_config) if mapping_config else None
+    enable_alltoall = (
+        mapping is not None and mapping.enable_attention_dp and mapping.moe_ep_size > 1
+    )
+
+    if enable_alltoall:
+        # ALL-TO-ALL MODE: Simple reference implementation using torch.distributed
+        # Tokens are DP-sharded, experts are EP-sharded
+        # Expert IDs are in GLOBAL coordinates, mlps contains only LOCAL experts
+        return _template_moe_alltoall(
+            x,
+            selected_experts,
+            routing_weights,
+            mlps,
+            apply_routing_on_input,
+            mapping,
+            max_num_tokens,
+        )
     x_shape = x.shape
     hidden_dim = x_shape[-1]
     x = x.view(-1, hidden_dim)
@@ -96,6 +275,8 @@ def torch_moe(
     w3_weight: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     """
@@ -146,7 +327,15 @@ def torch_moe(
 
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
 
-    return _template_moe(x, selected_experts, routing_weights, mlps, apply_routing_on_input)
+    return _template_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        mlps,
+        apply_routing_on_input,
+        mapping_config,
+        max_num_tokens,
+    )
 
 
 @torch_moe.register_fake
@@ -159,6 +348,8 @@ def torch_moe_fake(
     w3_weight: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
@@ -246,6 +437,9 @@ def torch_quant_fp8_moe(
     w3_weight_scale: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     """
     FP8 MoE op using quantized linear operations. Computes a Mixture-of-Experts layer similar to the reference
@@ -335,7 +529,15 @@ def torch_quant_fp8_moe(
 
         mlps = [make_fp8_mlp(i) for i in range(len(w1_weight))]
 
-    return _template_moe(x, selected_experts, routing_weights, mlps)
+    return _template_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        mlps,
+        apply_routing_on_input,
+        mapping_config,
+        max_num_tokens,
+    )
 
 
 @torch_quant_fp8_moe.register_fake
@@ -354,6 +556,9 @@ def torch_quant_fp8_moe_fake(
     w3_weight_scale: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -377,6 +582,9 @@ def torch_quant_nvfp4_moe(
     w3_alpha: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -479,7 +687,15 @@ def torch_quant_nvfp4_moe(
 
         mlps = [make_fp4_mlp(i) for i in range(len(w1_weight))]
 
-    return _template_moe(x, selected_experts, routing_weights, mlps)
+    return _template_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        mlps,
+        apply_routing_on_input,
+        mapping_config,
+        max_num_tokens,
+    )
 
 
 @torch_quant_nvfp4_moe.register_fake
@@ -501,6 +717,9 @@ def torch_quant_nvfp4_moe_fake(
     w3_alpha: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

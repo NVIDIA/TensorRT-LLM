@@ -204,6 +204,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.tokens_per_block
 
     def prepare(self) -> None:
+        super().prepare()
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)

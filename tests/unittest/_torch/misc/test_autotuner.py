@@ -1,4 +1,5 @@
 import itertools
+import json
 import os
 import pickle
 import sys
@@ -736,7 +737,10 @@ def _distributed_worker_function(world_size, strategy):
         # Each rank prefers different tactics
         prefer_tactics = [rank]
     runner = DistributedGemmRunner(prefer_tactics=prefer_tactics)
+    runner_independent = DistributedGemmRunner()
     config = TuningConfig(distributed_tuning_strategy=strategy)
+    config_independent = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.INDEPENDENT)
 
     # Keep temp_dir in function scope to prevent premature garbage collection
     temp_dir = None
@@ -749,40 +753,92 @@ def _distributed_worker_function(world_size, strategy):
         cache_path = dist.broadcast(None, root=0)
 
     with autotune(cache_path=cache_path):
-        tuner.choose_one(custom_op=f"test_distributed_{strategy}",
+        tuner.choose_one(custom_op=f"test_distributed_{strategy.value}",
                          runners=[runner],
                          tuning_config=config,
+                         inputs=inputs)
+        # run another normal gemm with INDEPENDENT strategy
+        tuner.choose_one(custom_op=f"test_distributed_normal_gemm",
+                         runners=[runner_independent],
+                         tuning_config=config_independent,
                          inputs=inputs)
 
     # Check only one file is created in the cache path
     assert len(os.listdir(os.path.dirname(
         cache_path))) == 1, "Only one rank file should be created"
 
+    dist.barrier()
+
     # Check cache for distributed tuning
     AutoTuner.get().profiling_cache.clear()
     AutoTuner.get().profiling_cache.load_cache(cache_path, rank)
 
     selected_runner, best_tactic = tuner.choose_one(
-        custom_op=f"test_distributed_{strategy}",
+        custom_op=f"test_distributed_{strategy.value}",
         runners=[runner],
         tuning_config=config,
         inputs=inputs)
 
+    # Verify cache file structure based on distributed strategy
+    with open(cache_path, 'r') as f:
+        cache_data = json.load(f)
+
+    # Helper to check if an op name appears in any cache key string
+    def has_op_in_section(section_data: dict, op_name: str) -> bool:
+        return any(op_name in key_str for key_str in section_data.keys())
+
+    assert 'metadata' in cache_data, "Metadata should be present"
+    assert f'rank_{rank}' in cache_data, f"rank {rank} should be present"
+
+    # The INDEPENDENT op "test_distributed_normal_gemm" should always be in rank-specific sections
+    assert has_op_in_section(cache_data[f'rank_{rank}'], 'test_distributed_normal_gemm'), \
+        f"rank {rank} should have test_distributed_normal_gemm"
+
+    if strategy == DistributedTuningStrategy.INDEPENDENT:
+        # Both ops use INDEPENDENT strategy, so no shared section
+        assert 'shared' not in cache_data or len(cache_data.get('shared', {})) == 0, \
+            "shared should not be present or be empty for INDEPENDENT strategy"
+        # Each rank should have 2 entries (the parameterized op + normal_gemm)
+        assert len(cache_data[f'rank_{rank}']) == 2, \
+            f"rank {rank} should have 2 entries, got {len(cache_data[f'rank_{rank}'])}"
+        assert has_op_in_section(cache_data[f'rank_{rank}'], f'test_distributed_{strategy.value}'), \
+            f"rank {rank} should have test_distributed_{strategy.value}"
+
+        assert len(
+            AutoTuner.get().profiling_cache.independent_op
+        ) == 0, f"Non-INDEPENDENT ops should not be present in the cache"
+    else:
+        # Non-INDEPENDENT ops go to shared section
+        assert 'shared' in cache_data, "shared section should be present"
+        # Each rank should have only 1 entry (the normal_gemm with INDEPENDENT strategy)
+        assert len(cache_data[f'rank_{rank}']) == 1, \
+            f"rank {rank} should have 1 entry, got {len(cache_data[f'rank_{rank}'])}"
+        # The parameterized op should NOT be in rank-specific section
+        assert not has_op_in_section(cache_data[f'rank_{rank}'], f'test_distributed_{strategy.value}'), \
+            f"rank {rank} should not have test_distributed_{strategy.value}"
+        # The parameterized op should be in shared section
+        assert has_op_in_section(cache_data['shared'], f'test_distributed_{strategy.value}'), \
+            f"shared should have test_distributed_{strategy.value}"
+
+        assert "test_distributed_normal_gemm" not in AutoTuner.get().profiling_cache.independent_op and \
+            f"test_distributed_{strategy.value}" in AutoTuner.get().profiling_cache.independent_op, \
+            f"Distributed tuning strategy is not recovered correctly from cache"
+
     if strategy == DistributedTuningStrategy.BROADCAST:
         # All ranks should select tactic 0
-        assert best_tactic == 0
+        assert best_tactic == 0, f"Rank {rank} with {strategy} should select tactic 0, got {best_tactic}"
     elif strategy == DistributedTuningStrategy.INDEPENDENT:
         # Each rank should select the tactic it prefers
-        assert best_tactic == rank
+        assert best_tactic == rank, f"Rank {rank} with {strategy} should select tactic {rank}, got {best_tactic}"
     elif strategy == DistributedTuningStrategy.MERGE:
         # Because tactic 0 is slower, two ranks should always select tactic 1
-        assert best_tactic == 1
+        assert best_tactic == 1, f"Rank {rank} with {strategy} should select tactic 1, got {best_tactic}"
     elif strategy == DistributedTuningStrategy.PARALLEL:
         # Tactic 1 or 3 should be selected since they are faster.
         # TODO: This might not cover the case that rank1 tunes nothing
-        assert best_tactic % 2 == 1
+        assert best_tactic % 2 == 1, f"Rank {rank} with {strategy} should select tactic 1, got {best_tactic}"
     else:
-        assert False, f"Unknown strategy: {strategy}"
+        assert False, f"Rank {rank} got unknown strategy: {strategy}"
 
     dist.barrier()
     return True

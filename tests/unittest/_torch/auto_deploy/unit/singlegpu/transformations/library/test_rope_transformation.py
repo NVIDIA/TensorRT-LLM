@@ -490,3 +490,64 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             None,  # check_num_matches
             False,  # skip_output_assert
         )
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads",
+    [
+        (8, 8),  # Standard MHA
+        (8, 1),  # MQA (DeepSeek-style)
+    ],
+)
+@torch.inference_mode()
+def test_optimize_interleaved_rope(num_heads, num_kv_heads):
+    """Test that optimize_rope replaces torch_rope_with_qk_interleaving
+    with triton_rope_on_interleaved_qk_inputs by tracing back through
+    aten.index.Tensor to find the cached cos/sin and position_ids."""
+    batch, seq, hid = 4, 12, 512
+    model = DSModel(hid, 16, num_heads, num_kv_heads, layout="BSND", mode="optimize")
+    model = model.to("cuda", torch.float16)
+
+    x = torch.randn(batch, seq, hid, device="cuda", dtype=torch.float16)
+    dynamic_shapes = model.get_dynamic_shapes()
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+
+    # Verify the graph contains torch_rope_with_qk_interleaving before optimization
+    assert any(
+        is_op(n, torch.ops.auto_deploy.torch_rope_with_qk_interleaving) for n in gm.graph.nodes
+    ), "Expected torch_rope_with_qk_interleaving in graph before optimization"
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "optimize_rope": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
+    gm_transformed.to("cuda")
+
+    def checker(gm):
+        has_triton = any(
+            is_op(n, torch.ops.auto_deploy.triton_rope_on_interleaved_qk_inputs)
+            for n in gm.graph.nodes
+        )
+        no_torch_rope = not any(
+            is_op(n, torch.ops.auto_deploy.torch_rope_with_qk_interleaving) for n in gm.graph.nodes
+        )
+        return has_triton and no_torch_rope
+
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        checker,
+        lambda num_p: num_p,
+        1e-2,  # atol
+        1e-2,  # rtol
+        True,  # test_load_hook
+        True,  # strict_loading
+        dynamic_shapes,  # dynamic_shapes
+        None,  # check_num_matches
+        False,  # skip_output_assert
+    )

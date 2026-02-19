@@ -1,24 +1,346 @@
 """Main export functionality with utilities for torch.export."""
 
+import re
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.export as te
 import torch.nn as nn
 from torch import fx
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from ..utils._graph import canonicalize_graph, lift_to_meta, load_buffers_and_params, tree_to
 from ..utils.logger import ad_logger
 from ..utils.node_utils import is_op
 from .interface import apply_export_patches
 
+if TYPE_CHECKING:
+    from ..llm_args import LlmArgs
+
 try:
     from modelopt.torch.quantization.utils import export_torch_mode as torch_export_context
 except ImportError:
     torch_export_context = nullcontext
+
+
+# =====================================================================
+# MOE export optimization: reduce experts for faster tracing, then
+# expand the graph back to include all experts after export.
+# =====================================================================
+
+
+def _infer_target_pattern(target_0: str, target_1: str) -> Tuple[str, str]:
+    """Infer ``(prefix, suffix)`` from two consecutive expert-weight targets.
+
+    Compares two ``get_attr`` targets that differ only in the expert index and
+    returns ``(prefix, suffix)`` such that ``target == prefix + str(idx) + suffix``.
+
+    Example::
+
+        >>> _infer_target_pattern('experts.0.gate.weight', 'experts.1.gate.weight')
+        ('experts.', '.gate.weight')
+    """
+    parts_0 = target_0.split(".")
+    parts_1 = target_1.split(".")
+    if len(parts_0) != len(parts_1):
+        raise ValueError(f"Target structure mismatch: {target_0} vs {target_1}")
+
+    diff_positions = [i for i, (a, b) in enumerate(zip(parts_0, parts_1)) if a != b]
+    if len(diff_positions) != 1:
+        raise ValueError(
+            f"Expected exactly one differing part, found {len(diff_positions)}: "
+            f"{target_0} vs {target_1}"
+        )
+
+    idx = diff_positions[0]
+    prefix = ".".join(parts_0[:idx]) + "." if idx > 0 else ""
+    suffix = "." + ".".join(parts_0[idx + 1 :]) if idx < len(parts_0) - 1 else ""
+    return prefix, suffix
+
+
+def _infer_single_target_pattern(target: str, expert_prefix: str) -> Tuple[str, str]:
+    """Infer ``(prefix, suffix)`` when only one expert target is available.
+
+    Uses the known *expert_prefix* to locate the expert index position.
+
+    Example::
+
+        >>> _infer_single_target_pattern('layer.0.experts.0.w.weight', 'layer.0.experts')
+        ('layer.0.experts.', '.w.weight')
+    """
+    full_prefix = expert_prefix + "."
+    if not target.startswith(full_prefix):
+        raise ValueError(f"Target '{target}' does not start with '{full_prefix}'")
+    remainder = target[len(full_prefix) :]  # e.g. '0.w.weight'
+    _idx_str, _, after_idx = remainder.partition(".")
+    suffix = "." + after_idx if after_idx else ""
+    return full_prefix, suffix
+
+
+def _register_nested_parameter(gm: fx.GraphModule, dotted_name: str, param: nn.Parameter) -> None:
+    """Register a parameter at a nested dotted path, creating intermediate modules as needed."""
+    parts = dotted_name.split(".")
+    current: nn.Module = gm
+    for part in parts[:-1]:
+        if hasattr(current, part):
+            current = getattr(current, part)
+        else:
+            new_mod = nn.Module()
+            current.add_module(part, new_mod)
+            current = new_mod
+    current.register_parameter(parts[-1], param)
+
+
+class _MoeExpertProbe(TorchDispatchMode):
+    """Dispatch mode that records parameter tensor IDs flowing into ``torch_moe``-family ops.
+
+    Used by :func:`_find_moe_module_lists` to discover which ``nn.ModuleList``
+    instances provide expert weights without relying on attribute naming conventions.
+    """
+
+    # MOE custom ops whose list arguments represent per-expert weight tensors.
+    _MOE_OP_NAMES = ("torch_moe", "torch_quant_fp8_moe", "torch_quant_nvfp4_moe")
+
+    def __init__(self):
+        super().__init__()
+        self.captured_param_ids: set = set()
+        self._moe_ops = self._collect_moe_ops()
+
+    @classmethod
+    def _collect_moe_ops(cls) -> set:
+        ops: set = set()
+        for name in cls._MOE_OP_NAMES:
+            try:
+                ops.add(getattr(torch.ops.auto_deploy, name).default)
+            except AttributeError:
+                pass
+        return ops
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func in self._moe_ops:
+            for arg in list(args) + list(kwargs.values()):
+                if isinstance(arg, (list, tuple)):
+                    for item in arg:
+                        if isinstance(item, torch.Tensor):
+                            self.captured_param_ids.add(id(item))
+        return func(*args, **kwargs)
+
+
+def _find_moe_module_lists(
+    model: nn.Module,
+    args: Optional[Tuple[Any, ...]] = None,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Tuple[nn.Module, str, nn.ModuleList]]:
+    """Identify ``nn.ModuleList`` instances whose parameters feed into ``torch_moe`` ops.
+
+    Runs a lightweight forward pass with :class:`_MoeExpertProbe` active to
+    discover which ``nn.ModuleList`` children of the model contribute
+    per-expert weight tensors to ``torch_moe``-family custom ops.
+
+    Returns:
+        Mapping of *module_list_path* → ``(parent_module, attr_name, module_list)``.
+    """
+    # Build reverse map:  id(param) → (parent_module, attr_name, module_list, full_path)
+    param_to_modlist: Dict[int, Tuple[nn.Module, str, nn.ModuleList, str]] = {}
+    for name, module in model.named_modules():
+        for attr_name, child in module.named_children():
+            if isinstance(child, nn.ModuleList) and len(child) > 0:
+                ml_path = f"{name}.{attr_name}" if name else attr_name
+                for param in child.parameters():
+                    param_to_modlist[id(param)] = (module, attr_name, child, ml_path)
+
+    # Run a quick forward pass to see which params flow into MOE ops.
+    probe = _MoeExpertProbe()
+    with torch.inference_mode(), probe:
+        model(*(args or ()), **(kwargs or {}))
+
+    # Cross-reference captured tensor IDs with ModuleList parameters.
+    result: Dict[str, Tuple[nn.Module, str, nn.ModuleList]] = {}
+    for pid in probe.captured_param_ids:
+        if pid in param_to_modlist:
+            parent, attr_name, mod_list, path = param_to_modlist[pid]
+            if path not in result:
+                result[path] = (parent, attr_name, mod_list)
+
+    return result
+
+
+def _reduce_moe_experts(
+    model: nn.Module,
+    num_moe_experts_for_export: int,
+    args: Optional[Tuple[Any, ...]] = None,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Reduce MOE expert ``nn.ModuleList``s for faster export tracing.
+
+    Uses a probe forward pass to identify which ``nn.ModuleList`` instances
+    feed into ``torch_moe``-family custom ops (see :func:`_find_moe_module_lists`),
+    then truncates each to *num_moe_experts_for_export* entries.  The returned
+    list of dicts carries the metadata needed by :func:`_restore_moe_experts`
+    and :func:`_expand_moe_experts_in_graph`.
+    """
+    if num_moe_experts_for_export < 1:
+        raise ValueError(
+            f"num_moe_experts_for_export must be >= 1, got {num_moe_experts_for_export}"
+        )
+
+    moe_lists = _find_moe_module_lists(model, args, kwargs)
+
+    reductions: List[Dict[str, Any]] = []
+    for path, (parent, attr_name, mod_list) in moe_lists.items():
+        orig_count = len(mod_list)
+        if orig_count <= num_moe_experts_for_export:
+            continue
+
+        reductions.append(
+            {
+                "module": parent,
+                "attr_name": attr_name,
+                "original_list": mod_list,
+                "original_count": orig_count,
+                "expert_prefix": path,
+            }
+        )
+        setattr(parent, attr_name, nn.ModuleList(list(mod_list[:num_moe_experts_for_export])))
+        ad_logger.info(
+            f"Reduced MOE experts in '{path}' from {orig_count} to "
+            f"{num_moe_experts_for_export} for faster export"
+        )
+    return reductions
+
+
+def _restore_moe_experts(reductions: List[Dict[str, Any]]) -> None:
+    """Restore MOE expert ``nn.ModuleList``s to their original state."""
+    for info in reductions:
+        setattr(info["module"], info["attr_name"], info["original_list"])
+
+
+def _find_original_num_experts(target: str, reductions: List[Dict[str, Any]]) -> Optional[int]:
+    """Return the original expert count for a ``get_attr`` *target*, or ``None``."""
+    for info in reductions:
+        if target.startswith(info["expert_prefix"] + "."):
+            return info["original_count"]
+    return None
+
+
+def _find_expert_prefix(target: str, reductions: List[Dict[str, Any]]) -> Optional[str]:
+    """Return the ``expert_prefix`` that matches *target*, or ``None``."""
+    for info in reductions:
+        if target.startswith(info["expert_prefix"] + "."):
+            return info["expert_prefix"]
+    return None
+
+
+def _expand_moe_experts_in_graph(
+    gm: fx.GraphModule,
+    model: nn.Module,
+    reductions: List[Dict[str, Any]],
+) -> None:
+    """Expand MOE expert weights in *gm* to match the full *model*.
+
+    After exporting with a reduced number of experts this function:
+
+    1. Finds every ``torch_moe``-family node whose weight-list arguments are
+       shorter than the original expert count.
+    2. Registers the missing expert parameters on *gm* (copied from the
+       already-restored *model*).
+    3. Creates the corresponding ``get_attr`` nodes and extends the weight
+       lists in the call node so the graph is equivalent to a full export.
+    """
+    if not reductions:
+        return
+
+    # MOE ops whose arguments include per-expert weight lists.
+    # All these ops share the same first 3 positional args (x, selected_experts,
+    # routing_weights) which are plain Tensors, followed by one or more
+    # List[Tensor] args that hold per-expert weights/scales.  We use the op
+    # schema to discover which arguments are Tensor[] rather than hard-coding
+    # the starting index.
+    moe_ops = {
+        torch.ops.auto_deploy.torch_moe,
+        torch.ops.auto_deploy.torch_quant_fp8_moe,
+        torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+    }
+
+    graph = gm.graph
+    num_expanded = 0
+
+    for node in list(graph.nodes):
+        if not is_op(node, moe_ops):
+            continue
+
+        # Collect indices of List[Tensor] arguments from the op schema – these
+        # are the per-expert weight / scale lists.
+        op = node.target
+        schema = op._schema if hasattr(op, "_schema") else next(iter(op._schemas.values()))
+        _tensor_list_types = ("Tensor[]", "List[Tensor]")
+        list_arg_indices = [
+            i
+            for i, arg_meta in enumerate(schema.arguments)
+            if any(t in str(arg_meta.type) for t in _tensor_list_types)
+            and i < len(node.args)
+            and isinstance(node.args[i], (list, tuple))
+            and len(node.args[i]) > 0
+        ]
+        if not list_arg_indices:
+            continue
+
+        first_list = node.args[list_arg_indices[0]]
+        current_num = len(first_list)
+        first_target = first_list[0].target
+        original_num = _find_original_num_experts(first_target, reductions)
+
+        if original_num is None or original_num <= current_num:
+            continue
+
+        ad_logger.debug(
+            f"Expanding MOE node '{node.name}': {current_num} -> {original_num} experts"
+        )
+
+        # Insert new get_attr nodes at the very beginning of the graph
+        first_graph_node = next(iter(graph.nodes))
+
+        new_args = list(node.args)
+        for li in list_arg_indices:
+            weight_list = list(node.args[li])
+
+            # Determine the naming pattern: prefix + <expert_idx> + suffix
+            if len(weight_list) >= 2:
+                prefix, suffix = _infer_target_pattern(weight_list[0].target, weight_list[1].target)
+            else:
+                ep = _find_expert_prefix(weight_list[0].target, reductions)
+                assert ep is not None, (
+                    f"Could not find expert prefix for target '{weight_list[0].target}'"
+                )
+                prefix, suffix = _infer_single_target_pattern(weight_list[0].target, ep)
+
+            # Add the missing expert weights
+            for expert_idx in range(current_num, original_num):
+                new_target = f"{prefix}{expert_idx}{suffix}"
+
+                # Copy the parameter from the restored model
+                orig_param = model.get_parameter(new_target)
+                _register_nested_parameter(gm, new_target, nn.Parameter(orig_param.data))
+
+                # Create a get_attr node
+                with graph.inserting_before(first_graph_node):
+                    new_node = graph.get_attr(new_target)
+                    new_node.meta["val"] = gm.get_parameter(new_target)
+
+                weight_list.append(new_node)
+
+            new_args[li] = weight_list
+
+        node.args = tuple(new_args)
+        num_expanded += 1
+
+    if num_expanded:
+        canonicalize_graph(gm)
+        ad_logger.info(f"Expanded {num_expanded} MOE node(s) in the exported graph")
 
 
 def _clean_up_device_info(gm: fx.GraphModule) -> None:
@@ -185,6 +507,49 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
+def _rename_nodes_with_module_hierarchy(gm: fx.GraphModule) -> None:
+    """Rename call_function nodes to reflect their module hierarchy.
+
+    Uses nn_module_stack metadata to build hierarchical names like:
+    'layers_0_self_attn_linear' instead of 'linear_2'
+    """
+    graph = gm.graph
+
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+
+        meta = getattr(node, "meta", None)
+        if not isinstance(meta, dict):
+            continue
+
+        nn_stack = meta.get("nn_module_stack")
+        if not nn_stack or not isinstance(nn_stack, dict):
+            continue
+
+        # Get innermost module path from the stack
+        # nn_module_stack is OrderedDict: {path: (qualified_name, module_class), ...}
+        module_path = list(nn_stack.keys())[-1] if nn_stack else ""
+        # Strip the "L__self__" prefix that torch.export adds (internal representation)
+        module_path = re.sub(r"^L__self__[._]?", "", module_path)
+
+        # Get op name from target
+        target = node.target
+        if hasattr(target, "__name__"):
+            op_name = target.__name__
+        elif hasattr(target, "_name"):
+            op_name = target._name
+        else:
+            op_name = str(target).split(".")[-1]
+
+        unique_name = graph._graph_namespace.create_name(op_name, node)
+        # Build new name: module_path + op_name (dots -> underscores)
+        if module_path:
+            node.name = f"{module_path}_{unique_name}".replace(".", "_")
+
+    gm.recompile()
+
+
 def _clean_up_assertions_and_guards(gm: fx.GraphModule):
     """This transformations removes shape checks and assertions from the graph."""
     check_ops = {
@@ -283,6 +648,7 @@ def torch_export_to_gm(
     strict: bool = False,
     patch_configs: Optional[Dict[str, Union[dict, Any]]] = None,
     patch_list: Optional[List[str]] = None,
+    num_moe_experts_for_export: Optional[int] = None,
 ) -> fx.GraphModule:
     """torch's export with wrapping into GraphModule + useful additions to the resulting module.
 
@@ -294,6 +660,8 @@ def torch_export_to_gm(
         4. Retain load hooks for state_dict loading from the original module.
         5. Manage parameter aliasing in the model.
         6. Remove assertions from the graph.
+        7. Optionally speed up export for MOE models by tracing with fewer experts
+           and expanding the graph afterward.
 
     Args:
         model: The model to export
@@ -306,6 +674,10 @@ def torch_export_to_gm(
                       will be applied with default settings.
         patch_list: Optional list of patch names to apply with default settings.
                    Cannot be used together with patch_configs.
+        num_moe_experts_for_export: If set, only this many experts are traced during
+            ``torch.export`` (the graph is expanded to include all experts afterward).
+            This can dramatically speed up export for large MOE models.
+            Recommended value: 2.
     """
 
     def _capture_fn(model, args, kwargs):
@@ -314,10 +686,23 @@ def torch_export_to_gm(
         assert isinstance(egm, fx.GraphModule)
         return egm
 
+    # Optionally reduce MOE experts for faster export tracing
+    # TODO (https://github.com/NVIDIA/TensorRT-LLM/issues/7547): Reuse the export patch system
+    moe_reductions: List[Dict[str, Any]] = []
+    if num_moe_experts_for_export is not None:
+        moe_reductions = _reduce_moe_experts(model, num_moe_experts_for_export, args, kwargs)
+
     # run capture with export
     egm = run_forward_for_capture(
         model, _capture_fn, args, kwargs, clone, patch_list=patch_list, patch_configs=patch_configs
     )
+
+    # Restore full expert lists on the source model and expand the graph to include
+    # all expert weights.  This must happen before the load-hook / deduplication
+    # post-processing so that those steps see the complete set of parameters.
+    if moe_reductions:
+        _restore_moe_experts(moe_reductions)
+        _expand_moe_experts_in_graph(egm, model, moe_reductions)
 
     # Export strips away all methods not traced during forward. The model could have
     # load hooks that contain logic for correct state_dict loading. We need to add those
@@ -338,7 +723,64 @@ def torch_export_to_gm(
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
 
+    # Rename nodes to reflect module hierarchy for better debuggability
+    _rename_nodes_with_module_hierarchy(egm)
+
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))
 
     return egm
+
+
+def export_onnx(ad_config: "LlmArgs") -> nn.Module:
+    """Export model to ONNX using InferenceOptimizer directly.
+
+    This is a lightweight export path that avoids initializing the full LLM executor,
+    which requires KVCacheManager and other runtime components not needed for ONNX export.
+
+    Args:
+        ad_config: The AutoDeploy configuration for the model. Should use a mode like
+            "export_edgellm_onnx" that includes the export_to_onnx transform.
+
+    Returns:
+        The transformed model after running through the inference optimizer pipeline.
+
+    Example:
+        >>> from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
+        >>> from tensorrt_llm._torch.auto_deploy.export import export_onnx
+        >>>
+        >>> ad_config = LlmArgs(
+        ...     model="meta-llama/Llama-2-7b-hf",
+        ...     mode="export_edgellm_onnx",
+        ...     max_batch_size=13,
+        ...     max_seq_len=4,
+        ...     device="cpu",
+        ... )
+        >>> ad_config.transforms["export_to_onnx"]["output_dir"] = "/tmp/onnx_output"
+        >>> model = export_onnx(ad_config)
+    """
+    # Import here to avoid circular imports
+    from ..shim.interface import CachedSequenceInterface
+    from ..transform.optimizer import InferenceOptimizer
+
+    # 1. Create factory from config
+    factory = ad_config.create_factory()
+
+    # 2. Create CachedSequenceInterface (lightweight, no KVCacheManager initialization)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=ad_config.max_seq_len,
+        max_batch_size=ad_config.max_batch_size,
+        device=ad_config.device,
+        kv_cache_config=ad_config.kv_cache_config,
+        max_num_tokens=ad_config.max_num_tokens,
+        vocab_size_padded=factory.vocab_size_padded,
+    )
+
+    # 3. Create InferenceOptimizer with transform config
+    inference_optimizer = InferenceOptimizer(
+        factory=factory,
+        config=ad_config.transforms,
+    )
+
+    # 4. Run the transform pipeline (includes export_to_onnx transform)
+    return inference_optimizer(cache_seq_interface)

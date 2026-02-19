@@ -276,6 +276,7 @@ class GuidedDecoder:
                     assert len(req.draft_tokens) == 0
                     self.num_advanced_draft_tokens[
                         slot] += self.num_advanced_tokens[slot]
+
             except Exception as e:
                 error_msg = f"Guided decoding error: {str(e)}"
                 failed_requests.append((req.request_id, error_msg))
@@ -406,10 +407,9 @@ class GuidedDecoder:
 
         for req in requests.valid_requests():
             slot = req.seq_slot
-            if self.num_advanced_draft_tokens[slot] <= 0:
-                continue
-            self.grammar_matchers[slot].rollback(
-                self.num_advanced_draft_tokens[slot])
+            if self.num_advanced_draft_tokens[slot] > 0:
+                self.grammar_matchers[slot].rollback(
+                    self.num_advanced_draft_tokens[slot])
             # Reset the drafting states.
             self.num_advanced_draft_tokens[slot] = 0
             self.is_draft_terminated[slot] = False

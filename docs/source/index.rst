@@ -14,6 +14,7 @@ Welcome to TensorRT LLM's Documentation!
    overview.md
    quick-start-guide.md
    installation/index.rst
+   supported-hardware.md
 
 
 .. toctree::
@@ -25,6 +26,7 @@ Welcome to TensorRT LLM's Documentation!
    examples/trtllm_serve_examples
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
+   deployment-guide/configuring-cpu-affinity.md
 
 .. toctree::
    :maxdepth: 2
@@ -65,6 +67,7 @@ Welcome to TensorRT LLM's Documentation!
    features/long-sequence.md
    features/lora.md
    features/multi-modality.md
+   features/visual-generation.md
    features/overlap-scheduler.md
    features/paged-attention-ifb-scheduler.md
    features/parallel-strategy.md
@@ -79,6 +82,7 @@ Welcome to TensorRT LLM's Documentation!
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
    features/kv-cache-connector.md
+   features/sparse-attention.md
 
 
 .. toctree::

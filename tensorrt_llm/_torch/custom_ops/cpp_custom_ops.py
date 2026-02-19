@@ -327,6 +327,84 @@ def _register_fake():
             outputs.append(output_tensor)
         return outputs
 
+    @torch.library.register_fake("trtllm::moe_a2a_dispatch")
+    def _(
+        token_selected_experts: torch.Tensor,
+        input_payloads: List[torch.Tensor],
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        num_experts: int,
+        eplb_local_stats: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
+        recv_tensors: List[torch.Tensor] = []
+        for payload in input_payloads:
+            elements_per_token = payload.shape[1]
+            recv_tensors.append(
+                payload.new_empty(
+                    (ep_size, runtime_max_tokens_per_rank, elements_per_token)))
+
+        if eplb_local_stats is None:
+            eplb_gathered_stats = workspace.new_empty((0, ), dtype=torch.int32)
+        else:
+            eplb_gathered_stats = workspace.new_empty(
+                (ep_size, eplb_local_stats.shape[0]), dtype=torch.int32)
+
+        combine_payload_offset = 0
+        return recv_tensors, combine_payload_offset, eplb_gathered_stats
+
+    @torch.library.register_fake("trtllm::moe_a2a_combine")
+    def _(
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        combine_payload_offset: int,
+        payload_in_workspace: bool,
+    ) -> torch.Tensor:
+        return payload.new_empty((local_num_tokens, payload.shape[2]))
+
+    @torch.library.register_fake("trtllm::moe_a2a_initialize")
+    def _(
+        workspace: torch.Tensor,
+        ep_rank: int,
+        ep_size: int,
+        max_num_tokens_per_rank: int,
+        eplb_stats_num_experts: Optional[int] = None,
+    ) -> torch.Tensor:
+        return torch.empty((10, ), dtype=torch.int64, device="cpu")
+
+    @torch.library.register_fake("trtllm::moe_a2a_sanitize_expert_ids")
+    def _(
+        expert_ids: torch.Tensor,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        ep_rank: int,
+        invalid_expert_id: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
+    def _(
+        workspace: torch.Tensor,
+        ep_rank: int,
+        ep_size: int,
+        runtime_max_tokens_per_rank: int,
+        combine_payload_offset: int,
+        out_dtype: torch.dtype,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        return workspace.new_empty(
+            (ep_size * runtime_max_tokens_per_rank, hidden_size),
+            dtype=out_dtype)
+
     @torch.library.register_fake("trtllm::get_moe_commworkspace_size_per_rank")
     def _(ep_size: int):
         return 0
@@ -925,7 +1003,9 @@ def _register_fake():
         sf_scale: Optional[torch.Tensor],
         use_rms_norm: bool = True,
         eps: float = 1e-5,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        output_hp_norm: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+               Optional[torch.Tensor]]:
         m, n = input.shape
         # normed_output_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
         normed_output_fp4 = input.new_empty((m, n // 8), dtype=torch.int32)
@@ -935,4 +1015,22 @@ def _register_fake():
         sf_vec_size = 16
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
-        return normed_output_fp4, output, sf_out
+        # high_precision_normed_output: [M, N] optional, only when output_hp_norm=True
+        hp_output = input.new_empty(
+            (m, n), dtype=input.dtype) if output_hp_norm else None
+        return normed_output_fp4, output, sf_out, hp_output
+
+    @torch.library.register_fake("trtllm::fused_relu2_quantize")
+    def _(
+        input: torch.Tensor,
+        sf_scale: torch.Tensor,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # input: 2D tensor [M, N] (bf16 or fp16)
+        # output_fp4: [M, N/2] (packed FP4 values, 2 values per byte)
+        # output_sf: swizzled scale factors
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf

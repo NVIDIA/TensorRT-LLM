@@ -102,6 +102,9 @@ MODEL_PATH_DICT = {
     "gemma_3_27b_it": "gemma/gemma-3-27b-it",
     "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
     "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
+    "gemma_3_12b_it": "gemma/gemma-3-12b-it",
+    "gemma_3_12b_it_fp8": "gemma/gemma-3-12b-it-fp8",
+    "gemma_3_12b_it_fp4": "gemma/gemma-3-12b-it-fp4",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
@@ -125,7 +128,8 @@ MODEL_PATH_DICT = {
     "qwen3_32b_fp4": "Qwen3/nvidia-Qwen3-32B-NVFP4",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
-    "qwen2_5_vl_7b_instruct": "multimodals/Qwen2.5-VL-7B-Instruct",
+    "qwen3_235b_a22b_fp4_eagle3": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+    "qwen2_5_vl_7b_instruct": "Qwen2.5-VL-7B-Instruct",
     "qwen2_5_vl_7b_instruct_fp8": "multimodals/Qwen2.5-VL-7B-Instruct-FP8",
     "qwen2_5_vl_7b_instruct_fp4": "multimodals/Qwen2.5-VL-7B-Instruct-FP4",
     "starcoder2_3b": "starcoder2-3b",
@@ -169,7 +173,8 @@ MODEL_PATH_DICT = {
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
-    "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b-Eagle3",
+    "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b",
+    "gpt_oss_120b_eagle3_throughput": "gpt_oss/gpt-oss-120b",
     "nemotron_nano_3_30b_fp8": "Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
     "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
@@ -238,6 +243,7 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.3_nemotron_super_49b_fp8",
     "llama_v3.1_nemotron_ultra_253b",
     "llama_v3.1_nemotron_ultra_253b_fp8",
+    "kimi_k2_nvfp4",
 }
 
 # Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
@@ -575,7 +581,6 @@ class PerfTestConfig:
         extra: bool = False,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-opt",
-        free_mem_ratio: float = 0.9,
         extra_runtime: str = "trtllm",
         skip_loading_weights: bool = False,
     ):
@@ -635,7 +640,6 @@ class PerfTestConfig:
         self.extra = extra
         # _autodeploy backend specific parameters
         self.ad_compile_backend = ad_compile_backend
-        self.free_mem_ratio = free_mem_ratio
         self.extra_runtime = extra_runtime
         self.skip_loading_weights = skip_loading_weights
         # Just build engines
@@ -1421,9 +1425,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     'compile_model': {
                         'backend': self._config.ad_compile_backend
                     },
-                    'resize_kv_cache': {
-                        'free_mem_ratio': self._config.free_mem_ratio
-                    },
                 },
                 'runtime': self._config.extra_runtime,
                 'skip_loading_weights': self._config.skip_loading_weights
@@ -1508,14 +1509,32 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         # Construct MPI command.
         mpi_cmd = []
-        if num_gpus > 1 and num_gpus <= 8 and not self._config.runtime == "bench":
-            if cpu_socket_count_gt_1():
-                mpi_cmd = [
-                    "mpirun", "--map-by", "socket", "-n", f"{num_gpus}",
-                    "--allow-run-as-root"
-                ]
-            else:
-                mpi_cmd = ["mpirun", "-n", f"{num_gpus}", "--allow-run-as-root"]
+        if num_gpus > 1 and num_gpus <= 8:
+            # For bench runtime: optionally use mpirun to propagate environment variables.
+            # Set TRTLLM_BENCH_USE_MPIRUN=1 to enable (needed for newer GPUs like GB10
+            # where Triton's bundled ptxas doesn't support the architecture).
+            if self._config.runtime == "bench" and os.getenv(
+                    "TRTLLM_BENCH_USE_MPIRUN"):
+                mpi_cmd = ["mpirun", "-n", f"{num_gpus}"]
+
+                # Pass environment variables that are set
+                for var in ["CPATH", "TRITON_PTXAS_PATH", "TRTLLM_LOG_LEVEL"]:
+                    if os.getenv(var):
+                        mpi_cmd.extend(["-x", var])
+
+                mpi_cmd.append("trtllm-llmapi-launch")
+            elif self._config.runtime != "bench":
+                # Non-bench runtimes (original behavior)
+                if cpu_socket_count_gt_1():
+                    mpi_cmd = [
+                        "mpirun", "--map-by", "socket", "-n", f"{num_gpus}",
+                        "--allow-run-as-root"
+                    ]
+                else:
+                    mpi_cmd = [
+                        "mpirun", "-n", f"{num_gpus}", "--allow-run-as-root"
+                    ]
+
         if self._build_script == "trtllm-bench":
             return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
                                            mpi_cmd, is_python)

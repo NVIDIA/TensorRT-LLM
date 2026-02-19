@@ -23,14 +23,19 @@ echo "=========================================="
 echo "Output path: $OUTPUT_PATH"
 echo ""
 
-# Show pytest PID if available (for debugging)
+# Terminate pytest process if still running
 if [ -f "$PID_FILE" ]; then
     PYTEST_PID=$(cat "$PID_FILE" | tr -d '\n')
     echo "Pytest PID: $PYTEST_PID"
 
-    # Check if pytest is still running
+    # Check if pytest is still running and kill it
     if kill -0 "$PYTEST_PID" 2>/dev/null; then
-        echo "Status: Still running"
+        echo "Status: Still running - terminating..."
+        if kill -9 "$PYTEST_PID" 2>/dev/null; then
+            echo "       [OK] Process killed"
+        else
+            echo "       [WARN] Failed to kill process (may already be gone)"
+        fi
     else
         echo "Status: Already terminated"
     fi

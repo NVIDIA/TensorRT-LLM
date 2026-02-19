@@ -22,6 +22,7 @@ import pytest
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,
                                           KvCacheConnectorConfig)
+from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
 
 from ..conftest import llm_models_root
 
@@ -439,3 +440,100 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
 
     # The KV cache of both prior requests should be freed, allowing the third request to run.
     model.generate([2] * 110, sampling_params=sampling_params)
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_priorities(enforce_single_worker, model_with_connector):
+    """Test that retention priorities flow through the connector correctly.
+
+    This test verifies that when KvCacheRetentionConfig is provided,
+    the RequestData.priorities field is populated with the correct
+    per-block priorities based on the token ranges.
+    """
+    BLOCK_SIZE = 32
+    NUM_INPUT_TOKENS = 64  # 2 blocks
+    NUM_TOKENS = 4
+    HIGH_PRIORITY = 80  # For system prompt blocks
+    LOW_PRIORITY = 10  # For user input / decode blocks
+
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True)
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    worker.get_finished.return_value = [], []
+
+    # Create retention config with different priorities for different token ranges:
+    # - First 32 tokens (block 0): high priority (e.g., system prompt)
+    # - Remaining tokens (block 1+): low priority (e.g., user input)
+    retention_config = KvCacheRetentionConfig(
+        token_range_retention_priorities=[
+            KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                token_start=0,
+                token_end=32,
+                priority=HIGH_PRIORITY,
+            ),
+            KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                token_start=32,
+                token_end=None,  # Extend to end of sequence
+                priority=LOW_PRIORITY,
+            ),
+        ],
+        decode_retention_priority=LOW_PRIORITY,
+    )
+
+    sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
+
+    generate_and_sleep(model, [0] * NUM_INPUT_TOKENS,
+                       sampling_params=sampling_params,
+                       kv_cache_retention_config=retention_config)
+
+    # Verify that build_connector_meta was called
+    assert scheduler.build_connector_meta.call_count >= 1
+
+    # Check the first call (new request) has priorities set
+    first_call = scheduler.build_connector_meta.call_args_list[0]
+    sched_output = first_call.args[0]
+
+    assert len(sched_output.new_requests) == 1
+    request = sched_output.new_requests[0]
+
+    # Should have 2 blocks for 64 input tokens with block size 32
+    expected_num_blocks = math.ceil(NUM_INPUT_TOKENS / BLOCK_SIZE)
+    assert len(request.new_block_ids) == expected_num_blocks
+
+    # Priorities should be set and match the retention config
+    assert request.priorities is not None
+    assert len(request.priorities) == len(request.new_block_ids)
+
+    # First block should have high priority, second block should have low priority
+    assert request.priorities[
+        0] == HIGH_PRIORITY, f"Expected priority {HIGH_PRIORITY} for block 0, got {request.priorities[0]}"
+    assert request.priorities[
+        1] == LOW_PRIORITY, f"Expected priority {LOW_PRIORITY} for block 1, got {request.priorities[1]}"
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_priorities_default(enforce_single_worker,
+                                      model_with_connector):
+    """Test that priorities are None when no retention config is provided."""
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True)
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    worker.get_finished.return_value = [], []
+
+    sampling_params = SamplingParams(max_tokens=4, ignore_eos=True)
+
+    # Generate without retention config
+    generate_and_sleep(model, [0] * 48, sampling_params=sampling_params)
+
+    first_call = scheduler.build_connector_meta.call_args_list[0]
+    sched_output = first_call.args[0]
+
+    assert len(sched_output.new_requests) == 1
+    request = sched_output.new_requests[0]
+
+    # Without retention config, priorities should be None
+    assert request.priorities is None

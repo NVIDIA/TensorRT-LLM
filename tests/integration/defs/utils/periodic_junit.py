@@ -207,6 +207,7 @@ class PeriodicJUnitXML:
 
             if should_flush_by_batch or should_flush_by_time:
                 if should_flush_by_batch:
+                    print()  # Add blank line before info message
                     self._log_info(
                         f"Completed {self.completed_tests} cases in the last "
                         f"{current_time - self.last_save_time:.0f} seconds")

@@ -1,17 +1,18 @@
 import itertools
+import math
 from typing import List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm.logger import logger
 
-from ..._utils import get_sm_version
+from ..._utils import get_sm_version, is_sm_100f
 from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import (fp4_scale_infer_shape,
+from ..utils import (fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
@@ -31,13 +32,19 @@ class GroupedGemmInputsHelper:
     IDX_A = 0
     IDX_SHAPE_INFER = IDX_A  # Default: use a tensor for shape inference
 
-    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                 local_expert_offset: int, tile_size: int):
+    def __init__(self,
+                 num_experts: int,
+                 top_k: int,
+                 num_local_experts: int,
+                 local_expert_offset: int,
+                 tile_size: int,
+                 seed: int = 515):
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
         self.tile_size = tile_size
+        self.seed = seed
         # Padding values should never be accessed.
         # Intentionally use a large padding value to expose issues early.
         self.pad_val = int(2e9)
@@ -82,118 +89,134 @@ class GroupedGemmInputsHelper:
             self, input_shapes: List[torch.Size]) -> int:
         return self.infer_shape_max_num_tiles(input_shapes) * self.tile_size
 
-    def generate_num_tokens_per_expert(self, num_tokens: int) -> List[int]:
-        average_num_tokens_per_expert = num_tokens * self.top_k / self.num_experts
-        balance = 0
-        num_tokens_per_expert = []
-        for i in range(self.num_local_experts):
-            balance += average_num_tokens_per_expert
-            if balance <= 1e-3:
-                continue
-            curr_num_tokens = int(balance) + 1
-            num_tokens_per_expert.append(curr_num_tokens)
-            balance -= curr_num_tokens
+    def generate_num_tokens_per_expert(self,
+                                       num_tokens: int,
+                                       approx_max_load: bool = False
+                                       ) -> List[int]:
+        ep_size = self.num_experts // self.num_local_experts
+        average_num_tokens_per_rank = num_tokens * self.top_k / ep_size
+
+        if approx_max_load:
+            # https://en.wikipedia.org/wiki/Balls_into_bins_problem
+            # The constant c can be measured empirically, we choose 1.0 for simplicity.
+            c = 1.0
+            extra_num_tokens_on_curr_rank = c * math.sqrt(
+                average_num_tokens_per_rank * math.log(ep_size))
+            num_tokens_on_curr_rank = math.ceil(average_num_tokens_per_rank +
+                                                extra_num_tokens_on_curr_rank)
+        else:
+            num_tokens_on_curr_rank = math.ceil(average_num_tokens_per_rank)
+
+        num_tokens_on_curr_rank = min(num_tokens * self.top_k,
+                                      num_tokens_on_curr_rank)
+
+        base, remainder = divmod(num_tokens_on_curr_rank,
+                                 self.num_local_experts)
+        num_tokens_per_expert = [base + 1] * remainder + [base] * (
+            self.num_local_experts - remainder)
+        assert len(num_tokens_per_expert) == self.num_local_experts
+        assert sum(num_tokens_per_expert) == num_tokens_on_curr_rank
         return num_tokens_per_expert
 
-    def generate_tile_idx_to_group_idx(
-            self, num_tokens_per_expert: List[int]) -> List[int]:
-        tile_idx_to_group_idx = []
-        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-            curr_num_tiles = (curr_num_tokens + self.tile_size -
-                              1) // self.tile_size
-            tile_idx_to_group_idx.extend([i] * curr_num_tiles)
-        return tile_idx_to_group_idx
-
-    def generate_tile_idx_to_mn_limit(
-            self, num_tokens_per_expert: List[int]) -> List[int]:
-        tile_idx_to_mn_limit = []
-        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-            curr_num_tiles = (curr_num_tokens + self.tile_size -
-                              1) // self.tile_size
-            prev_mn_limit = len(tile_idx_to_mn_limit) * self.tile_size
-            for j in range(curr_num_tiles):
-                tile_idx_to_mn_limit.append(prev_mn_limit + min(
-                    (j + 1) * self.tile_size, curr_num_tokens))
-        return tile_idx_to_mn_limit
-
-    def generate_permuted_idx_to_expanded_idx(
+    def generate_token_selected_experts(
             self, num_tokens: int,
-            num_tokens_per_expert: List[int]) -> List[int]:
-        permuted_idx_to_expanded_idx = []
-        colmajor_expanded_idx = 0
-        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-            curr_num_tiles = (curr_num_tokens + self.tile_size -
-                              1) // self.tile_size
-            for j in range(curr_num_tiles * self.tile_size):
-                if j < curr_num_tokens:
-                    token_idx = colmajor_expanded_idx % num_tokens
-                    topk_idx = colmajor_expanded_idx // num_tokens
-                    expanded_idx = token_idx * self.top_k + topk_idx
-                    permuted_idx_to_expanded_idx.append(expanded_idx)
-                    colmajor_expanded_idx += 1
-                else:
-                    permuted_idx_to_expanded_idx.append(self.pad_val)
-        return permuted_idx_to_expanded_idx
+            num_tokens_per_expert: List[int]) -> torch.Tensor:
+        """Balanced random based on rejection sampling.
+        """
+        token_selected_experts = -torch.ones(
+            num_tokens, self.top_k, dtype=torch.int32)
+        num_selected_experts = torch.zeros(num_tokens, dtype=torch.int32)
+
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            torch.manual_seed(self.seed)
+            selection_orders = [
+                torch.randperm(num_tokens)
+                for _ in range(self.num_local_experts)
+            ]
+
+        for j, num_tokens_j in enumerate(num_tokens_per_expert):
+            selection_order_j = selection_orders[j].tolist()
+            prioritized = torch.nonzero(num_selected_experts <= (
+                self.top_k - (self.num_experts - j))).squeeze(-1).tolist()
+            if len(prioritized) > 0:
+                selection_order_j = prioritized + [
+                    i for i in selection_order_j if i not in prioritized
+                ]
+            for i in selection_order_j:
+                if num_selected_experts[i] < self.top_k:
+                    token_selected_experts[
+                        i,
+                        num_selected_experts[i]] = j + self.local_expert_offset
+                    num_selected_experts[i] += 1
+                    num_tokens_j -= 1
+                    if num_tokens_j <= 0:
+                        break
+
+        assert ((token_selected_experts
+                 >= 0).sum(dim=-1) == num_selected_experts).all().item()
+        if self.num_local_experts == self.num_experts:
+            assert (num_selected_experts == self.top_k).all().item()
+        else:
+            assert (num_selected_experts <= self.top_k).all().item()
+        return token_selected_experts
 
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
-        tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
-            num_tokens_per_expert)
-        num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-        num_padding_tiles_val = tile_idx_to_group_idx.size(
-            0) - num_non_exiting_tiles_val
-        assert num_non_exiting_tiles_val > 0
-        assert num_padding_tiles_val >= 0
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
+        token_selected_experts = self.generate_token_selected_experts(
+            num_tokens, num_tokens_per_expert)
 
-        tile_idx_to_group_idx = torch.tensor(
-            tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_group_idx.dtype,
-            device=tile_idx_to_group_idx.device)
-        num_non_exiting_tiles = torch.tensor(
-            [num_non_exiting_tiles_val],
-            dtype=num_non_exiting_tiles.dtype,
-            device=num_non_exiting_tiles.device)
+        token_selected_experts = token_selected_experts.cuda()
+        token_final_scales = torch.ones_like(token_selected_experts,
+                                             dtype=torch.float32)
+        (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.num_local_experts,
+            tile_tokens_dim=self.tile_size,
+        )
         return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others
 
     def inputs_pre_hook_finalize_fusion(
             self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
-        tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
-            num_tokens_per_expert)
-        tile_idx_to_mn_limit_list = self.generate_tile_idx_to_mn_limit(
-            num_tokens_per_expert)
-        permuted_idx_to_expanded_idx_list = self.generate_permuted_idx_to_expanded_idx(
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
+        token_selected_experts = self.generate_token_selected_experts(
             num_tokens, num_tokens_per_expert)
-        num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-        num_padding_tiles_val = tile_idx_to_group_idx.size(
-            0) - num_non_exiting_tiles_val
-        assert num_non_exiting_tiles_val > 0
-        assert num_padding_tiles_val >= 0
-        assert len(tile_idx_to_mn_limit_list) == num_non_exiting_tiles_val
-        assert len(permuted_idx_to_expanded_idx_list
-                   ) == num_non_exiting_tiles_val * self.tile_size
 
-        tile_idx_to_group_idx = torch.tensor(
-            tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_group_idx.dtype,
-            device=tile_idx_to_group_idx.device)
-        tile_idx_to_mn_limit = torch.tensor(
-            tile_idx_to_mn_limit_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_mn_limit.dtype,
-            device=tile_idx_to_mn_limit.device)
-        permuted_idx_to_expanded_idx = torch.tensor(
-            permuted_idx_to_expanded_idx_list + [self.pad_val] *
-            (num_padding_tiles_val * self.tile_size),
-            dtype=permuted_idx_to_expanded_idx.dtype,
-            device=permuted_idx_to_expanded_idx.device)
-        num_non_exiting_tiles = torch.tensor(
-            [num_non_exiting_tiles_val],
-            dtype=num_non_exiting_tiles.dtype,
-            device=num_non_exiting_tiles.device)
+        token_selected_experts = token_selected_experts.cuda()
+        token_final_scales = torch.ones_like(token_selected_experts,
+                                             dtype=torch.float32)
+        (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.num_local_experts,
+            tile_tokens_dim=self.tile_size,
+        )
         return a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
 
 
@@ -221,44 +244,6 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     IDX_PERMUTED_IDX_TO_EXPANDED_IDX = 7
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
-    def generate_permuted_idx_to_expanded_idx(
-            self, num_tokens: int, num_tokens_per_expert: List[int],
-            max_num_permuted_tokens: int) -> List[int]:
-        """Generate permuted_idx_to_expanded_idx for gather operation.
-
-        Maps permuted index to expanded index (token_idx * top_k + topk_idx).
-
-        Args:
-            num_tokens: Total number of input tokens
-            num_tokens_per_expert: List of token counts per expert
-            max_num_permuted_tokens: Target size of the output list
-
-        Returns:
-            List of expanded IDs with length = max_num_permuted_tokens,
-            where permuted_idx_to_expanded_idx[permuted_idx] = expanded_idx
-            Padding tokens are marked with pad_val
-            Note: In kernel, use expanded_idx // top_k to get original token_idx
-        """
-        permuted_idx_to_expanded_idx = []
-        colmajor_expanded_idx = 0
-        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-            curr_num_tiles = (curr_num_tokens + self.tile_size -
-                              1) // self.tile_size
-            for j in range(curr_num_tiles * self.tile_size):
-                if j < curr_num_tokens:
-                    token_idx = colmajor_expanded_idx % num_tokens
-                    topk_idx = colmajor_expanded_idx // num_tokens
-                    expanded_idx = token_idx * self.top_k + topk_idx
-                    permuted_idx_to_expanded_idx.append(expanded_idx)
-                    colmajor_expanded_idx += 1
-                else:
-                    permuted_idx_to_expanded_idx.append(
-                        self.pad_val)  # Padding token
-        # Pad to max_num_permuted_tokens
-        while len(permuted_idx_to_expanded_idx) < max_num_permuted_tokens:
-            permuted_idx_to_expanded_idx.append(self.pad_val)
-        return permuted_idx_to_expanded_idx
-
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Pre-hook for gather-based SwiGLU fusion kernel.
 
@@ -276,39 +261,31 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             IDX_PERMUTED_IDX_TO_EXPANDED_IDX] is permuted_idx_to_expanded_idx
 
         max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
-        max_num_tiles = max_num_permuted_tokens // self.tile_size
-
         num_tokens = self.infer_num_tokens(max_num_permuted_tokens)
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
-        tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
-            num_tokens_per_expert)
-        tile_idx_to_mn_limit_list = self.generate_tile_idx_to_mn_limit(
-            num_tokens_per_expert)
-        permuted_idx_to_expanded_idx_list = self.generate_permuted_idx_to_expanded_idx(
-            num_tokens, num_tokens_per_expert, max_num_permuted_tokens)
-        num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-        num_padding_tiles_val = max_num_tiles - num_non_exiting_tiles_val
-        assert num_non_exiting_tiles_val > 0
-        assert num_padding_tiles_val >= 0
-        assert len(tile_idx_to_mn_limit_list) == num_non_exiting_tiles_val
-        assert len(permuted_idx_to_expanded_idx_list) == max_num_permuted_tokens
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
+        token_selected_experts = self.generate_token_selected_experts(
+            num_tokens, num_tokens_per_expert)
 
-        tile_idx_to_group_idx = torch.tensor(
-            tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_group_idx.dtype,
-            device=tile_idx_to_group_idx.device)
-        tile_idx_to_mn_limit = torch.tensor(
-            tile_idx_to_mn_limit_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_mn_limit.dtype,
-            device=tile_idx_to_mn_limit.device)
-        permuted_idx_to_expanded_idx = torch.tensor(
-            permuted_idx_to_expanded_idx_list,
-            dtype=permuted_idx_to_expanded_idx.dtype,
-            device=permuted_idx_to_expanded_idx.device)
-        num_non_exiting_tiles = torch.tensor(
-            [num_non_exiting_tiles_val],
-            dtype=num_non_exiting_tiles.dtype,
-            device=num_non_exiting_tiles.device)
+        token_selected_experts = token_selected_experts.cuda()
+        token_final_scales = torch.ones_like(token_selected_experts,
+                                             dtype=torch.float32)
+        (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.num_local_experts,
+            tile_tokens_dim=self.tile_size,
+        )
         return (a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx,
                 tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles, global_sf)
@@ -337,11 +314,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
+    from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
+        Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
-    class CuteDSLNVFP4BlackwellLinear(TunableRunner):
+    class CuteDSLNVFP4BlackwellRunner(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
         tuning_config = TuningConfig(
@@ -523,7 +502,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> torch.Tensor:
             """
-            Performs fp8 blockwise gemm operation using CuTe DSL.
+            Performs fp4 blockwise gemm operation using CuTe DSL.
 
             Args:
                 inputs (List[torch.Tensor]):
@@ -613,7 +592,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 stream = cuda.CUstream(torch_stream.cuda_stream)
 
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                         use_prefetch)
+                         use_prefetch, self.use_tvm_ffi)
             if swap_ab:
                 kernel_m = n
                 kernel_n = m
@@ -793,7 +772,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLNVFP4BlackwellLinear(output_dtype, to_userbuffers,
+        runner = CuteDSLNVFP4BlackwellRunner(output_dtype, to_userbuffers,
                                              use_tvm_ffi)
         inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
@@ -924,6 +903,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1222,6 +1202,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             8, 0, helper.infer_shape_max_num_permuted_tokens),
                         ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
+                    use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1326,6 +1307,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    use_blkred=True,
                     raster_along_m=raster_along_m,
                 )
                 # Compute max active clusters on current device
@@ -1602,6 +1584,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1931,6 +1914,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           6, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -2179,3 +2163,629 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    dtype=input_scale.dtype,
                                    device=input_scale.device)
         return output, output_scale
+
+    class CuteDSLFp8BlackwellRunner(TunableRunner):
+        kernel_class = Sm100BlockwiseGemmKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(2, 1, fp8_scale_infer_shape), ),
+        )
+
+        def __init__(self,
+                     output_dtype: torch.dtype = torch.bfloat16,
+                     use_tvm_ffi: bool = True):
+            super().__init__()
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
+                )
+            self.output_dtype = output_dtype
+            self.use_tvm_ffi = use_tvm_ffi
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL FP8 GEMM only supports SM 100 family. Skipping all tactics."
+                )
+                return []
+
+            m = inputs[0].shape[0]
+            n = inputs[1].shape[0]
+            k = inputs[0].shape[1]
+            batch_size = 1
+            # m,k
+            a_major = "k"
+            # n, k
+            b_major = "k"
+            # m, n
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.Float8E4M3FN,  # ab_dtype,
+                    cutlass.Float32,  # acc_dtype,
+                    cutlass.BFloat16,  # c_dtype,
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> torch.Tensor:
+            """
+            Performs fp8 blockwise (deepgemm like) operation using CuTe DSL.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (m, k), dtype: fp8.
+                    inputs[1]: Weight tensor of shape (n, k), dtype: fp8.
+                    inputs[2]: Input scale factor tensor of shape (k // 128, m), dtype: fp32.
+                    inputs[3]: Weight scale factor tensor of shape (n // 128, k // 128), dtype: fp32.
+                tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
+
+            Returns:
+                torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
+            """
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                # fallback to default tactic
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
+            m, n, k = a_tensor.shape[0], b_tensor.shape[0], b_tensor.shape[1]
+            sf_m = m
+            sf_k = ceil_div(k, 128)
+            sf_n = ceil_div(n, 128)
+            c_tensor = torch.empty(*(m, n),
+                                   dtype=torch.bfloat16,
+                                   device=a_tensor.device)
+            c_tmp = c_tensor.view((1, m, n))
+            c_tmp = c_tmp.permute(1, 2, 0)
+
+            if not self.use_tvm_ffi:
+                a_ptr = make_ptr(
+                    cutlass.Float8E4M3FN,
+                    a_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_ptr = make_ptr(
+                    cutlass.Float8E4M3FN,
+                    b_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                a_sf_ptr = make_ptr(
+                    cutlass.Float32,
+                    a_sf_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_sf_ptr = make_ptr(
+                    cutlass.Float32,
+                    b_sf_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                c_cute_tensor = cute.runtime.from_dlpack(
+                    c_tmp).mark_layout_dynamic(leading_dim=1)
+
+                # get stream
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.use_tvm_ffi,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        a_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        b_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    a_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        a_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        b_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    # Convert c_tensor to cute tensor for TVM FFI for env stream detection
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype,
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                # Compute max active clusters on current device
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    1,  # batch
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            if self.use_tvm_ffi:
+                # call with torch pointer types and no need to pass stream.
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    1,  # batch
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    a_sf_tensor.data_ptr(),
+                    b_sf_tensor.data_ptr(),
+                    c_tmp,
+                )
+            else:
+                # call with cute types and need to pass torch stream.
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    1,  # batch
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    stream=stream,
+                )
+            return c_tensor
+
+    # a/b: fp8, scale: fp32, output: bf16
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_gemm_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_fp8_gemm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype = torch.bfloat16,
+        use_tvm_ffi: bool = True,
+    ) -> torch.Tensor:
+        if output_dtype != torch.bfloat16:
+            raise ValueError(
+                f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
+            )
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL FP8 GEMM only supports SM 100 family. Skipping all tactics."
+            )
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLFp8BlackwellRunner(output_dtype=output_dtype,
+                                           use_tvm_ffi=use_tvm_ffi)
+
+        inputs = [input, weight, input_scale, weight_scale]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_fp8_gemm_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        return runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_gemm_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype = torch.bfloat16,
+        use_tvm_ffi: bool = True,
+    ):
+        # [m, k]
+        shape = list(mat_a.shape)
+        # [n, k]
+        shape[-1] = mat_b.shape[-2]
+        # output is fixed as bf16
+        ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
+        return ret
+
+    class CuteDSLFp8BlackwellBmmRunner(TunableRunner):
+        kernel_class = Sm100BlockwiseGemmKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 1, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(2, 2, fp8_scale_infer_shape), ),
+        )
+
+        def __init__(self,
+                     output_dtype: torch.dtype = torch.bfloat16,
+                     use_tvm_ffi: bool = True):
+            super().__init__()
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL FP8 BMM only supports bfloat16 output, got {output_dtype}"
+                )
+            self.output_dtype = output_dtype
+            self.use_tvm_ffi = use_tvm_ffi
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL FP8 BMM only supports SM 100 family. Skipping all tactics."
+                )
+                return []
+            # [b, m, k]
+            batch_size, m, k = inputs[0].shape[0], inputs[0].shape[1], inputs[
+                0].shape[2]
+            # [b, n, k]
+            n = inputs[1].shape[1]
+            # m,k
+            a_major = "k"
+            # n, k
+            b_major = "k"
+            # m, n
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.Float8E4M3FN,  # ab_dtype,
+                    cutlass.Float32,  # acc_dtype,
+                    cutlass.BFloat16,  # c_dtype,
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            """
+            Performs fp8 blockwise (deepgemm like) batched gemm operation using CuTe DSL.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (batch_size, m, k), dtype: fp8.
+                    inputs[1]: Weight tensor of shape (batch_size, n, k), dtype: fp8.
+                    inputs[2]: Input scale tensor of shape (batch_size, k // 128, pad_up(m, 4)), dtype: fp32.
+                    inputs[3]: Weight scale tensor of shape (batch_size, n // 128, k // 128), dtype: fp32.
+                tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
+
+            Returns:
+                torch.Tensor: Output tensor of shape (batch_size, m, n), dtype: bf16.
+            """
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                # fallback to default tactic
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor = inputs
+            c_tmp = c_tensor.permute(1, 2, 0)
+
+            batch_size = a_tensor.shape[0]
+            m = a_tensor.shape[1]
+            k = a_tensor.shape[2]
+            n = b_tensor.shape[1]
+            sf_m = pad_up(m, 4)
+            sf_k = ceil_div(k, 128)
+            sf_n = ceil_div(n, 128)
+
+            if not self.use_tvm_ffi:
+                a_ptr = make_ptr(
+                    cutlass.Float8E4M3FN,
+                    a_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_ptr = make_ptr(
+                    cutlass.Float8E4M3FN,
+                    b_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                a_sf_ptr = make_ptr(
+                    cutlass.Float32,
+                    a_sf_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                b_sf_ptr = make_ptr(
+                    cutlass.Float32,
+                    b_sf_tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                c_cute_tensor = cute.runtime.from_dlpack(
+                    c_tmp).mark_layout_dynamic(leading_dim=1)
+
+                # get stream
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.use_tvm_ffi,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        a_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        b_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    a_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        a_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        b_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    # Convert c_tensor to cute tensor for TVM FFI for env stream detection)
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    # make faked stream for TVM FFI
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype,
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                # Compute max active clusters on current device
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            if self.use_tvm_ffi:
+                # call with torch pointer types and no need to pass stream.
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    batch_size,
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    a_sf_tensor.data_ptr(),
+                    b_sf_tensor.data_ptr(),
+                    c_tmp,
+                )
+            else:
+                # call with cute types and need to pass torch stream.
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    stream=stream,
+                )
+
+    # a/b: fp8, scale: fp32, output: bf16
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
+                             mutates_args=("output", ),
+                             device_types="cuda")
+    def cute_dsl_fp8_bmm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output: torch.Tensor,
+        output_dtype: torch.dtype = torch.bfloat16,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        if output_dtype != torch.bfloat16:
+            raise ValueError(
+                f"CuteDSL FP8 BMM only supports bfloat16 output, got {output_dtype}"
+            )
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL FP8 BMM only supports SM 100 family. Skipping all tactics."
+            )
+
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLFp8BlackwellBmmRunner(output_dtype=output_dtype,
+                                              use_tvm_ffi=use_tvm_ffi)
+
+        inputs = [input, weight, input_scale, weight_scale, output]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_fp8_bmm_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_bmm_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output: torch.Tensor,
+        output_dtype: torch.dtype = torch.bfloat16,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
+        n = mat_b.shape[1]
+        assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
+        assert output.shape == (batch_size, m,
+                                n), "CuTe DSL fp8 bmm output shape is incorrect"

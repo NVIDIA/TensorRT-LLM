@@ -20,7 +20,8 @@ from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
-                                 mpi_send_object, torch_pybind11_abi)
+                                 mpi_send_object, mpi_world_size,
+                                 torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
@@ -196,6 +197,35 @@ class Distributed(ABC):
         if self.cp_size > 1:
             obj = self.cp_broadcast(obj, root=root, **kwargs)
         return obj
+
+    @abstractmethod
+    def tp_allgather(self, obj):
+        pass
+
+    @abstractmethod
+    def cp_allgather(self, obj):
+        pass
+
+    def tp_cp_allgather(self, obj):
+        """Allgather across both TP and CP dimensions.
+
+        First gathers within CP group, then across TP groups, returning
+        a flattened list with tp_size * cp_size entries.
+        """
+        # Gather across CP dimension.
+        if self.cp_size > 1:
+            obj = self.cp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match cp_allgather output format.
+
+        # Gather across TP dimension.
+        if self.tp_size > 1:
+            obj = self.tp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match tp_allgather output format.
+
+        # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
+        return [entry for tp_group in obj for entry in tp_group]
 
 
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
@@ -427,6 +457,19 @@ class MPIDist(Distributed):
         self._tp_comm = None
         self._pp_comm = None
 
+    def _validate_world_size(self):
+        """Validate world size before creating sub-communicators to prevent segfaults."""
+
+        if ENABLE_MULTI_DEVICE:
+            actual_world_size = mpi_world_size()
+            max_rank_needed = self.mapping.world_size
+
+            if max_rank_needed > actual_world_size:
+                raise RuntimeError(
+                    f"Mapping requires world_size={max_rank_needed} "
+                    f"(tp_size={self.mapping.tp_size} * pp_size={self.mapping.pp_size} * cp_size={self.mapping.cp_size}), "
+                    f"but MPI world size is only {actual_world_size}. ")
+
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
@@ -464,9 +507,8 @@ class MPIDist(Distributed):
     @property
     def tp_comm(self):
         if self._tp_comm is None:
+            self._validate_world_size()
             mapping = self.mapping
-            if mapping.has_cp_helix():
-                mapping = mapping.repurpose_helix_cp_to_tp()
             new_group = mpi_comm().group.Incl(mapping.tp_group)
             self._tp_comm = mpi_comm().Create_group(new_group)
         return self._tp_comm
@@ -474,9 +516,8 @@ class MPIDist(Distributed):
     @property
     def pp_comm(self):
         if self._pp_comm is None:
+            self._validate_world_size()
             mapping = self.mapping
-            if mapping.has_cp_helix():
-                mapping = mapping.repurpose_helix_cp_to_tp()
             new_group = mpi_comm().group.Incl(mapping.pp_group)
             self._pp_comm = mpi_comm().Create_group(new_group)
         return self._pp_comm
@@ -484,6 +525,7 @@ class MPIDist(Distributed):
     @property
     def cp_comm(self):
         if self._cp_comm is None:
+            self._validate_world_size()
             new_group = mpi_comm().group.Incl(self.mapping.cp_group)
             self._cp_comm = mpi_comm().Create_group(new_group)
         return self._cp_comm
@@ -831,6 +873,22 @@ class TorchDist(Distributed):
                 group=self.mapping.cp_group_pg,
                 device=torch.device("cpu"))
             return ret[0]
+
+    @log_op
+    def cp_allgather(self, obj):
+        if isinstance(obj, torch.Tensor):
+            output_list = [
+                torch.empty_like(obj)
+                for _ in range(self.mapping.cp_group_pg.size())
+            ]
+            dist.all_gather(output_list, obj, group=self.mapping.cp_group_pg)
+            return output_list
+        else:
+            output_list = [None] * self.mapping.cp_group_pg.size()
+            dist.all_gather_object(output_list,
+                                   obj,
+                                   group=self.mapping.cp_group_pg)
+            return output_list
 
     @log_op
     def pp_allgather(self, obj):

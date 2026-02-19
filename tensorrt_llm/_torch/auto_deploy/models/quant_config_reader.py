@@ -11,6 +11,8 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
+from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+
 
 class QuantConfigReader(ABC):
     """Base class for reading and parsing quantization config."""
@@ -83,7 +85,9 @@ class QuantConfigReaderRegistry:
 
 @QuantConfigReaderRegistry.register("modelopt")
 class ModelOPTQuantConfigReader(QuantConfigReader):
-    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*")
+    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*", "*.mlp.gate")
+    DEFAULT_TORCH_DTYPE = "float16"
+    DEFAULT_KV_CACHE_DTYPE = "fp8"
 
     def read_config(self, config: Dict) -> Dict:
         producer = config.get("producer", {}).get("name")
@@ -97,24 +101,22 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
         quant_config["exclude_modules"] = excludes + [
             n for n in self._ALWAYS_EXCLUDE if n not in excludes
         ]
-        # Update dtype
-        if quant_config.get("quant_algo") == "NVFP4":
-            quant_config["torch_dtype"] = "float16"
 
+        if "torch_dtype" not in quant_config:
+            ad_logger.warning(
+                f"torch_dtype not found in quant_config, using default {self.DEFAULT_TORCH_DTYPE}"
+            )
+            quant_config["torch_dtype"] = self.DEFAULT_TORCH_DTYPE
         # Handle kv cache
         kv_algo = quant_config.get("kv_cache_quant_algo")
         if kv_algo:
             if kv_algo != "FP8":
                 raise ValueError(f"KV cache quantization format {kv_algo} not supported.")
-            quant_config["kv_cache_dtype"] = "float8_e4m3fn"
+            quant_config["kv_cache_dtype"] = "fp8"
 
         self._quant_config = quant_config
 
-        extra_model_kwargs: Dict[str, Any] = {}
-        if quant_config.get("quant_algo", None) == "NVFP4":
-            extra_model_kwargs["torch_dtype"] = "float16"
-
-        return extra_model_kwargs
+        return {}
 
     @classmethod
     def from_file(
@@ -146,6 +148,8 @@ class HFQuantConfigReader(QuantConfigReader):
     Quantization reader that process transformers.quantizers.HFQuantizer functionality
     """
 
+    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens")
+
     def __init__(self):
         super().__init__()
         self._hf_quantizer = None
@@ -155,6 +159,10 @@ class HFQuantConfigReader(QuantConfigReader):
         qconf = config.get("quantization_config")
         if not qconf:
             raise ValueError("HF quantization_config not found.")
+
+        # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
+        excludes = qconf.get("exclude_modules", [])
+        qconf["exclude_modules"] = excludes + [n for n in self._ALWAYS_EXCLUDE if n not in excludes]
 
         self._quant_config = qconf
         from transformers.quantizers import AutoHfQuantizer
@@ -177,11 +185,22 @@ class HFQuantConfigReader(QuantConfigReader):
         if not isinstance(qconf, dict):
             return None
 
-        # TODO(Fridah-nv):this class is only verified with GPT-OSS MXFP4, other hf quantizers
+        # TODO(Fridah-nv):this class is only verified with GPT-OSS MXFP4 and INT4-GPTQ, other hf quantizers
         # should have similar workflow and will be added to the pipeline
         quant_method = str(qconf.get("quant_method", "")).lower()
-        if quant_method != "mxfp4":
+        if quant_method not in ["mxfp4", "gptq"]:
             return None
+
+        # Validate GPTQ config: currently only INT4 with group_size=128 is supported
+        if quant_method == "gptq":
+            bits = qconf.get("bits")
+            group_size = qconf.get("group_size")
+            if bits != 4:
+                raise ValueError(f"GPTQ quantization only supports bits=4, got bits={bits}")
+            if group_size != 128:
+                raise ValueError(
+                    f"GPTQ quantization only supports group_size=128, got group_size={group_size}"
+                )
 
         reader = cls()
         extra_model_kwargs = reader.read_config(raw)
@@ -191,11 +210,11 @@ class HFQuantConfigReader(QuantConfigReader):
     # more features to be added
     def post_process_model(self, model, model_config):
         if self._hf_quantizer is None:
-            return
+            return model
         dtype = getattr(model_config, "dtype", None)
         new_dtype = self._hf_quantizer.update_dtype(dtype)
         if new_dtype is None:
-            return
+            return model
         model.to(new_dtype)
         return model
 

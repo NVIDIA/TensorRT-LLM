@@ -66,12 +66,10 @@ class RawRequestResponseHooks(ResponseHooks):
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
-        logger.debug(f"Received context response from {ctx_server} for request {response.choices[0].disaggregated_params.ctx_request_id}")
 
     def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
-        logger.debug(f"Received first token from {gen_server} for request {request.disaggregated_params.ctx_request_id}")
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         if request.disaggregated_params:
