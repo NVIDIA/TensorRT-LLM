@@ -20,15 +20,12 @@ import torch
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
 )
-<<<<<<< HEAD
 from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
-=======
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
->>>>>>> d17461ce7 (added unit test)
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm.mapping import Mapping
 
 
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
