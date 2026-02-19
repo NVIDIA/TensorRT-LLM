@@ -133,61 +133,45 @@ class TinyFP4Ref(nn.Module):
         )
 
 
-@pytest.mark.parametrize("use_bias", [True, False])
-@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_fuse_quant_rewrites_fp8_linear(use_bias):
-    torch.manual_seed(0)
-    model = TinyFP8Ref(use_bias=use_bias).to("cuda")
-    x = torch.rand(3, 16, dtype=torch.float16, device="cuda")
-
-    gm = torch_export_to_gm(model, args=(x,), clone=True)
-    gm_transformed = InferenceOptimizer(
-        None,
-        {
-            "fuse_fp8_linear": {"stage": "post_load_fusion", "backend": "torch"},
-        },
-    )(None, gm)
-    gm_transformed.to("cuda")
-
-    run_test_transformed_gm(
-        model,
-        x,
-        gm_transformed,
-        _has_fused_linear_fp8,
-        lambda n: n,
-        0.1,  # atol
-        0.05,  # rtol
-        False,  # test_load_hook
-        False,  # strict_loading
-        None,  # dynamic_shapes
-        False,  # skip_output_assert
-    )
-
-
-@pytest.mark.parametrize("use_bias", [True, False])
-@pytest.mark.skipif(
-    not (fp4_compatible() and trtllm_ops_available()),
-    reason="Requires NVFP4 and TRT-LLM ops",
+@pytest.mark.parametrize(
+    "quant_type",
+    [
+        pytest.param(
+            "fp8", marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+        ),
+        pytest.param(
+            "fp4",
+            marks=pytest.mark.skipif(
+                not (fp4_compatible() and trtllm_ops_available()),
+                reason="Requires NVFP4 and TRT-LLM ops",
+            ),
+        ),
+    ],
 )
-def test_fuse_quant_rewrites_fp4_linear(use_bias):
+@pytest.mark.parametrize("use_bias", [True, False])
+def test_fuse_quant_rewrites_linear(quant_type, use_bias):
+    """Fuse reference FP8 or FP4 linear to backend fused op; parametrized by quant_type and use_bias."""
     torch.manual_seed(0)
-    model = TinyFP4Ref(use_bias=use_bias).to("cuda")
-    x = torch.rand(3, 64, dtype=torch.float16, device="cuda")
+    if quant_type == "fp8":
+        model = TinyFP8Ref(use_bias=use_bias).to("cuda")
+        x = torch.rand(3, 16, dtype=torch.float16, device="cuda")
+        opt_config = {"fuse_fp8_linear": {"stage": "post_load_fusion", "backend": "torch"}}
+        has_fused = _has_fused_linear_fp8
+    else:
+        model = TinyFP4Ref(use_bias=use_bias).to("cuda")
+        x = torch.rand(3, 64, dtype=torch.float16, device="cuda")
+        opt_config = {"fuse_nvfp4_linear": {"stage": "post_load_fusion", "backend": "trtllm"}}
+        has_fused = _has_fused_linear_fp4
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
-    gm_transformed = InferenceOptimizer(
-        None,
-        {
-            "fuse_nvfp4_linear": {"stage": "post_load_fusion", "backend": "trtllm"},
-        },
-    )(None, gm)
+    gm_transformed = InferenceOptimizer(None, opt_config)(None, gm)
     gm_transformed.to("cuda")
 
     run_test_transformed_gm(
         model,
         x,
         gm_transformed,
-        _has_fused_linear_fp4,
+        has_fused,
         lambda n: n,
         0.1,  # atol
         0.05,  # rtol
@@ -350,95 +334,67 @@ def _has_fused_rmsnorm_quant_fp8(gm, fused_add=False):
 
 
 @pytest.mark.parametrize("num_linears", [1, 3])
-@pytest.mark.parametrize("extra_norm_consumer", [True, False])
+@pytest.mark.parametrize(
+    "fused_add,extra_norm_consumer",
+    [(False, True), (False, False), (True, True)],
+)
 @pytest.mark.skipif(
     not (fp8_compatible() and trtllm_ops_available()),
     reason="Requires FP8 support and TRT-LLM ops",
 )
-def test_fuse_rmsnorm_quant_fp8(num_linears, extra_norm_consumer):
-    """Verify FuseRMSNormQuantFP8 transform replaces ops and preserves numerics."""
+def test_fuse_rmsnorm_quant_fp8(num_linears, fused_add, extra_norm_consumer):
+    """FuseRMSNormQuantFP8: direct RMSNorm+FP8 or fused add+RMSNorm+FP8; graph fused, numerics match."""
     torch.manual_seed(0)
     K, N = 128, 256
-    model = _RMSNormFP8LinearModel(
-        in_features=K,
-        out_features=N,
-        num_linears=num_linears,
-        extra_norm_consumer=extra_norm_consumer,
-    ).cuda()
-    x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+    if fused_add:
+        model = _RMSNormFP8FusedAddModel(
+            in_features=K,
+            out_features=N,
+            num_linears=num_linears,
+        ).cuda()
+        x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+        residual = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+        x_ref = x.clone()
+        residual_ref = residual.clone()
+        ref_out = model(x_ref, residual_ref)
+    else:
+        model = _RMSNormFP8LinearModel(
+            in_features=K,
+            out_features=N,
+            num_linears=num_linears,
+            extra_norm_consumer=extra_norm_consumer,
+        ).cuda()
+        x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+        ref_out = model(x)
 
-    # Get reference output before transform
-    ref_out = model(x)
-
-    # Trace to FX graph (symbolic_trace handles custom ops cleanly)
     gm = torch.fx.symbolic_trace(model)
-
-    # Verify precondition: graph has the unfused ops
-    assert any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes), (
-        "Precondition: graph should contain flashinfer_rms_norm before transform"
-    )
+    if fused_add:
+        assert any(_is_flashinfer_fused_add_rms_norm_node(n) for n in gm.graph.nodes), (
+            "Precondition: graph should contain flashinfer_fused_add_rms_norm"
+        )
+    else:
+        assert any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes), (
+            "Precondition: graph should contain flashinfer_rms_norm before transform"
+        )
     assert any(is_op(n, torch.ops.auto_deploy.trtllm_quant_fp8_linear) for n in gm.graph.nodes), (
         "Precondition: graph should contain trtllm_quant_fp8_linear before transform"
     )
 
     gm, info = _apply_norm_quant_transform(gm, FuseRMSNormQuantFP8)
-
     assert info.num_matches == num_linears, (
         f"Expected {num_linears} matches, got {info.num_matches}"
     )
     assert not info.skipped
-    assert _has_fused_rmsnorm_quant_fp8(gm, fused_add=False), (
-        "Graph should contain triton_rms_norm_quant_fp8 + trtllm_fp8_gemm, "
-        "and no flashinfer_rms_norm or trtllm_quant_fp8_linear"
+    assert _has_fused_rmsnorm_quant_fp8(gm, fused_add=fused_add), (
+        "Graph should contain fused FP8 norm+quant ops and no unfused norm/linear"
     )
 
-    fused_out = gm(x)
-    _assert_numerics(ref_out, fused_out, extra_norm_consumer)
-
-
-@pytest.mark.parametrize("num_linears", [1, 3])
-@pytest.mark.skipif(
-    not (fp8_compatible() and trtllm_ops_available()),
-    reason="Requires FP8 support and TRT-LLM ops",
-)
-@pytest.mark.xfail(
-    strict=False,
-    reason="Triton fused FP8 add+norm+quant numerics differ from ref (FlashInfer + trtllm_quant_fp8_linear)",
-)
-def test_fuse_rmsnorm_quant_fp8_fused_add(num_linears):
-    """Fused add+norm FP8: getitem(flashinfer_fused_add_rms_norm, 0) -> trtllm_quant_fp8_linear
-    fuses to triton_fused_add_rms_norm_quant_fp8."""
-    torch.manual_seed(0)
-    K, N = 128, 256
-    model = _RMSNormFP8FusedAddModel(
-        in_features=K,
-        out_features=N,
-        num_linears=num_linears,
-    ).cuda()
-    x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-
-    # Reference uses in-place FlashInfer fused add+norm; run on clones so (x, residual) stay intact.
-    x_ref = x.clone()
-    residual_ref = residual.clone()
-    ref_out = model(x_ref, residual_ref)
-    gm = torch.fx.symbolic_trace(model)
-    assert any(_is_flashinfer_fused_add_rms_norm_node(n) for n in gm.graph.nodes), (
-        "Precondition: graph should contain flashinfer_fused_add_rms_norm"
-    )
-    assert any(is_op(n, torch.ops.auto_deploy.trtllm_quant_fp8_linear) for n in gm.graph.nodes), (
-        "Precondition: graph should contain trtllm_quant_fp8_linear"
-    )
-
-    gm, info = _apply_norm_quant_transform(gm, FuseRMSNormQuantFP8)
-    assert info.num_matches == num_linears
-    assert not info.skipped
-    assert _has_fused_rmsnorm_quant_fp8(gm, fused_add=True), (
-        "Graph should contain triton_fused_add_rms_norm_quant_fp8 and no flashinfer_fused_add_rms_norm"
-    )
-
-    fused_out = gm(x, residual)
-    _assert_numerics(ref_out, fused_out, extra_norm_consumer=True)
+    if fused_add:
+        fused_out = gm(x, residual)
+        _assert_numerics(ref_out, fused_out, extra_norm_consumer=True)
+    else:
+        fused_out = gm(x)
+        _assert_numerics(ref_out, fused_out, extra_norm_consumer)
 
 
 # ---------------------------------------------------------------------------
@@ -588,28 +544,48 @@ def _has_fused_rmsnorm_quant_nvfp4(gm, fused_add=False):
 
 
 @pytest.mark.parametrize("num_linears", [1, 3])
-@pytest.mark.parametrize("extra_norm_consumer", [True, False])
+@pytest.mark.parametrize(
+    "fused_add,extra_norm_consumer",
+    [(False, True), (False, False), (True, True)],
+)
 @pytest.mark.skipif(
     not (fp4_compatible() and trtllm_ops_available()),
     reason="Requires FP4 support and TRT-LLM ops",
 )
-def test_fuse_rmsnorm_quant_nvfp4(num_linears, extra_norm_consumer):
-    """NVFP4 direct path: FuseRMSNormQuantNVFP4 on _RMSNormNVFP4LinearModel, graph fused, numerics match."""
+def test_fuse_rmsnorm_quant_nvfp4(num_linears, fused_add, extra_norm_consumer):
+    """FuseRMSNormQuantNVFP4: direct RMSNorm+linear or fused add+RMSNorm+linear; graph fused, numerics match."""
     torch.manual_seed(0)
     K, N = 2048, 2048
-    model = _RMSNormNVFP4LinearModel(
-        in_features=K,
-        out_features=N,
-        num_linears=num_linears,
-        extra_norm_consumer=extra_norm_consumer,
-    ).cuda()
-    x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+    if fused_add:
+        model = _RMSNormNVFP4FusedAddModel(
+            in_features=K,
+            out_features=N,
+            num_linears=num_linears,
+        ).cuda()
+        x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+        residual = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+        x_ref = x.clone()
+        residual_ref = residual.clone()
+        ref_out = model(x_ref, residual_ref)
+    else:
+        model = _RMSNormNVFP4LinearModel(
+            in_features=K,
+            out_features=N,
+            num_linears=num_linears,
+            extra_norm_consumer=extra_norm_consumer,
+        ).cuda()
+        x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+        ref_out = model(x)
 
-    ref_out = model(x)
     gm = torch.fx.symbolic_trace(model)
-    assert any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes), (
-        "Precondition: graph should contain flashinfer_rms_norm before transform"
-    )
+    if fused_add:
+        assert any(_is_flashinfer_fused_add_rms_norm_node(n) for n in gm.graph.nodes), (
+            "Precondition: graph should contain flashinfer_fused_add_rms_norm"
+        )
+    else:
+        assert any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes), (
+            "Precondition: graph should contain flashinfer_rms_norm before transform"
+        )
     assert any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes), (
         "Precondition: graph should contain torch_quant_nvfp4_linear before transform"
     )
@@ -617,13 +593,16 @@ def test_fuse_rmsnorm_quant_nvfp4(num_linears, extra_norm_consumer):
     gm, info = _apply_norm_quant_transform(gm, FuseRMSNormQuantNVFP4)
     assert info.num_matches == num_linears
     assert not info.skipped
-    assert _has_fused_rmsnorm_quant_nvfp4(gm, fused_add=False), (
-        "Graph should contain trtllm_rms_norm_quant_nvfp4 + trtllm_nvfp4_gemm, "
-        "and no flashinfer_rms_norm or torch_quant_nvfp4_linear"
+    assert _has_fused_rmsnorm_quant_nvfp4(gm, fused_add=fused_add), (
+        "Graph should contain fused NVFP4 norm+quant ops and no unfused norm/linear"
     )
 
-    fused_out = gm(x)
-    _assert_numerics(ref_out, fused_out, extra_norm_consumer)
+    if fused_add:
+        fused_out = gm(x, residual)
+        _assert_numerics(ref_out, fused_out, extra_norm_consumer=True)
+    else:
+        fused_out = gm(x)
+        _assert_numerics(ref_out, fused_out, extra_norm_consumer)
 
 
 @pytest.mark.skipif(
@@ -712,46 +691,3 @@ def test_debug_nvfp4_fused_add_intermediates():
             % (diff.max().item(), diff.float().mean().item())
         )
         raise
-
-
-@pytest.mark.parametrize("num_linears", [1, 3])
-@pytest.mark.skipif(
-    not (fp4_compatible() and trtllm_ops_available()),
-    reason="Requires FP4 support and TRT-LLM ops",
-)
-def test_fuse_rmsnorm_quant_nvfp4_fused_add(num_linears):
-    """NVFP4 fused add+norm: getitem(flashinfer_fused_add_rms_norm, 0) -> torch_quant_nvfp4_linear
-    fuses to trtllm_fused_add_rms_norm_quant_nvfp4."""
-    torch.manual_seed(0)
-    K, N = 2048, 2048
-    model = _RMSNormNVFP4FusedAddModel(
-        in_features=K,
-        out_features=N,
-        num_linears=num_linears,
-    ).cuda()
-    x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-
-    # Reference uses FlashInfer fused_add_rms_norm which is IN-PLACE (mutates x, residual).
-    # Run reference on clones so original (x, residual) are unchanged for the fused graph.
-    x_ref = x.clone()
-    residual_ref = residual.clone()
-    ref_out = model(x_ref, residual_ref)
-
-    gm = torch.fx.symbolic_trace(model)
-    assert any(_is_flashinfer_fused_add_rms_norm_node(n) for n in gm.graph.nodes), (
-        "Precondition: graph should contain flashinfer_fused_add_rms_norm"
-    )
-    assert any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes), (
-        "Precondition: graph should contain torch_quant_nvfp4_linear"
-    )
-
-    gm, info = _apply_norm_quant_transform(gm, FuseRMSNormQuantNVFP4)
-    assert info.num_matches == num_linears
-    assert not info.skipped
-    assert _has_fused_rmsnorm_quant_nvfp4(gm, fused_add=True), (
-        "Graph should contain trtllm_fused_add_rms_norm_quant_nvfp4 and no flashinfer_fused_add_rms_norm"
-    )
-
-    fused_out = gm(x, residual)
-    _assert_numerics(ref_out, fused_out, extra_norm_consumer=True)
