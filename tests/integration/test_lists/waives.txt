@@ -366,3 +366,8 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[Fals
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingDSv3-swiglu-1024-1024-1] SKIP (https://nvbugspro.nvidia.com/bug/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_qwen_next-swiglu-1024-1024-150] SKIP (https://nvbugspro.nvidia.com/bug/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_topk_4-swiglu-1024-1024-150] SKIP (https://nvbugspro.nvidia.com/bug/5908070)
+unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[Qwen3/Qwen3-8B-FP8] SKIP (https://nvbugspro.nvidia.com/bug/5911788)
+unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[Qwen3/Qwen3-30B-A3B-FP8] SKIP (https://nvbugspro.nvidia.com/bug/5911788)
+unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights_with_quant_config[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8] SKIP (https://nvbugspro.nvidia.com/bug/5911788)
+unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_update_weights_with_quant_config[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B-FP8] SKIP (https://nvbugspro.nvidia.com/bug/5911788)
+unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py::test_llm_partial_update_weights[Qwen3/Qwen3-30B-A3B] SKIP (https://nvbugspro.nvidia.com/bug/5911788)
