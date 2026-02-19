@@ -5819,9 +5819,16 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     auto const remainingBeforeAdd = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remainingBeforeAdd, numContextBlocks + numGenBlocks);
 
+    // Verify estimatedReusableTokens is still set after getRemainingBlocksToCompletion
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
+
     // After addSequence, context blocks are allocated (reuse already applied during allocation)
     // Only generation blocks remain to be allocated
     kvCacheManager->addSequence(req1.mRequestId, req1.getPromptLen(), maxBeamWidth, req1);
+
+    // Verify estimatedReusableTokens is cleared to 0 after addSequence
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+
     auto const remainingAfterContextAlloc = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remainingAfterContextAlloc, maxNewTokens / tokensPerBlock);
 }
@@ -5933,7 +5940,14 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
     // getNeededBlocksOneStep must NOT subtract free reusable blocks to avoid double-counting.
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
+<<<<<<< HEAD
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
+=======
+    EXPECT_EQ(neededOneStep, 2);
+
+    // Verify estimatedReusableTokens is set as a side effect of getNeededBlocksOneStep
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 2 * tokensPerBlock);
+>>>>>>> 5bcde2232 ([TRTLLM-11070][feat] Account for reusable KV cache blocks in micro batch scheduler capacity scheduling)
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartialReuse)
@@ -5992,9 +6006,19 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
     // getRemainingBlocksToCompletion must NOT subtract free reusable blocks.
     // Needs all 5 context + 3 generation = 8 blocks.
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
+<<<<<<< HEAD
     auto const numContextBlocks = promptLength / tokensPerBlock; // 5 blocks
     auto const numGenBlocks = maxNewTokens / tokensPerBlock;     // 3 blocks
     EXPECT_EQ(remaining, numContextBlocks + numGenBlocks);       // 5 context + 3 generation = 8
+=======
+    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 4 blocks
+    auto const numContextBlocks = promptLength / tokensPerBlock;             // 5 blocks
+    auto const expectedRemaining = (numContextBlocks - expectedReusableBlocks) + (maxNewTokens / tokensPerBlock);
+    EXPECT_EQ(remaining, expectedRemaining);                                 // 1 context + 3 generation = 4
+
+    // Verify estimatedReusableTokens is set as a side effect of getRemainingBlocksToCompletion
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
+>>>>>>> 5bcde2232 ([TRTLLM-11070][feat] Account for reusable KV cache blocks in micro batch scheduler capacity scheduling)
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
@@ -6053,8 +6077,17 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
     // getNeededBlocksOneStep must NOT subtract free reusable blocks.
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
+<<<<<<< HEAD
     auto const numSharedBlocks = promptLength / tokensPerBlock; // 3 blocks
     EXPECT_EQ(neededOneStep, numSharedBlocks);                  // All 3 context blocks
+=======
+    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 2 blocks
+    auto const numSharedBlocks = promptLength / tokensPerBlock;              // 3 blocks
+    EXPECT_EQ(neededOneStep, numSharedBlocks - expectedReusableBlocks);      // 3 - 2 = 1
+
+    // Verify estimatedReusableTokens is set as a side effect of getNeededBlocksOneStep
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
+>>>>>>> 5bcde2232 ([TRTLLM-11070][feat] Account for reusable KV cache blocks in micro batch scheduler capacity scheduling)
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -6100,11 +6133,17 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
     auto const neededOneStep = kvCacheManager->getNeededBlocksOneStep(req, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
+    // Verify estimatedReusableTokens stays 0 when reuse is disabled
+    EXPECT_EQ(req.getEstimatedReusableTokens(), 0);
+
     // getRemainingBlocksToCompletion should include both context and generation blocks
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req, onlyWindowSize);
     auto const expectedContextBlocks = promptLength / tokensPerBlock;
     auto const expectedGenBlocks = maxNewTokens / tokensPerBlock;
     EXPECT_EQ(remaining, expectedContextBlocks + expectedGenBlocks); // 4 + 2 = 6 blocks
+
+    // Verify estimatedReusableTokens still 0 after getRemainingBlocksToCompletion
+    EXPECT_EQ(req.getEstimatedReusableTokens(), 0);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
@@ -6184,7 +6223,15 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
+<<<<<<< HEAD
     // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction)
+=======
+    // Verify estimatedReusableTokens is set as a side effect
+    EXPECT_EQ(req1.getEstimatedReusableTokens(),
+        static_cast<SizeType32>(sharedPrefixLength / tokensPerBlock) * tokensPerBlock);
+
+    // getRemainingBlocksToCompletion: (4 context - 2 reusable) + 1 gen = 3 blocks
+>>>>>>> 5bcde2232 ([TRTLLM-11070][feat] Account for reusable KV cache blocks in micro batch scheduler capacity scheduling)
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remaining, (promptLength / tokensPerBlock) + (maxNewTokens / tokensPerBlock));
 }
