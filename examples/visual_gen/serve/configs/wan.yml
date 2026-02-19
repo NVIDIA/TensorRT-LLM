@@ -1,0 +1,8 @@
+linear:
+  type: default
+teacache:
+   enable_teacache: true
+   teacache_thresh: 0.2
+parallel:
+   dit_cfg_size: 1
+   dit_ulysses_size: 1
