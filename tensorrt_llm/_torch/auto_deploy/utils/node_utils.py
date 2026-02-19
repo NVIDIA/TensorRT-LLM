@@ -322,6 +322,39 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             ],
             biases=[],
         )
+    elif is_fake_quantized_linear_op(node):
+        # For quantized linear ops (FP8, FP4, etc.), only args[1] is the actual shardable
+        # weight. Scale buffers (input_scale, weight_scale, alpha, ...) are also registered
+        # as get_attr nodes in the graph and would otherwise be picked up by the generic
+        # all_input_nodes scan below -- causing shard_weight_tensor to overwrite them as
+        # nn.Parameters, which then breaks quantization_cb's get_buffer() call.
+        # The quantization_cb (QuantizationShardingMixin) is responsible for sharding scales.
+        weight_node = find_get_attr_node(node.args[1])
+        if weight_node is None:
+            return WeightNodes(weights=[], biases=[])
+        biases = []
+        if len(node.args) > 2 and isinstance(node.args[2], Node):
+            b = find_get_attr_node(node.args[2])
+            if b is not None and b.target.rsplit(".", 1)[-1] == "bias":
+                biases = [
+                    WeightNode(
+                        node=node.args[2],
+                        node_key=b.target,
+                        submod=gm.get_submodule(b.target.rpartition(".")[0]),
+                        tensor=get_param_or_buffer(b.target, gm),
+                    )
+                ]
+        return WeightNodes(
+            weights=[
+                WeightNode(
+                    node=node.args[1],
+                    node_key=weight_node.target,
+                    submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
+                    tensor=get_param_or_buffer(weight_node.target, gm),
+                )
+            ],
+            biases=biases,
+        )
     elif is_weight_node(node):
         weights = []
         biases = []
