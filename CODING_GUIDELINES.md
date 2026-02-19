@@ -487,22 +487,39 @@ else:
     f.read()
 ```
 
-## Pre-commit Linting (Boy Scout Rule)
+## Pre-commit Linting (Supplemental Rules)
 
-All Python files are linted by ruff via pre-commit. When you modify any Python
-file and commit, ruff will:
-1. Lint the **entire file** (not just your changes)
-2. Auto-fix what it can (unused imports, import sorting, etc.)
-3. Report remaining issues that you must fix manually
+Python files are split into two groups with separate lint toolchains:
 
-This is intentional — every commit should leave touched files cleaner than before.
-If you see pre-existing lint errors in a file you're modifying, fix them as part
-of your change. Use a separate commit for lint fixes if the diff is large.
+| Group | Files | Formatting | Linting |
+|-------|-------|-----------|---------|
+| **A (new)** | ~550 files | ruff format (100-char) | Full ruff rules |
+| **B (legacy)** | ~1,350 files (listed in `legacy-files.txt`) | yapf (80-char) + isort + autoflake | Supplemental ruff rules only |
 
-> **Note:** Some legacy files are formatted by yapf (80-char line width) rather
-> than ruff. Ruff will still *lint* these files but will not *reformat* them.
-> The formatting boundary is managed by the `[tool.ruff.format] exclude` list
-> in `pyproject.toml`.
+### Group A files
+
+When you modify a Group A file and commit, ruff will:
+1. Format the file (100-char line width)
+2. Lint the **entire file** with the full rule set
+3. Auto-fix what it can; report remaining issues for you to fix
+
+### Group B (legacy) files
+
+When you modify a Group B file and commit, the legacy tools handle formatting
+(isort, yapf, autoflake) and the `ruff-legacy` hook applies supplemental lint
+rules that the legacy tools don't cover (e.g., bare except, undefined names,
+invalid escape sequences). Auto-fixable issues are fixed in-place.
+
+### Graduating a file from Group B to Group A
+
+1. Remove the path from `legacy-files.txt`
+2. Run `python scripts/generate_legacy_lint_config.py`
+3. Run `ruff check <file>` and `ruff format <file>` to confirm it passes
+4. Commit all changes (regenerated configs + formatted file)
+
+> **Note:** The supplemental `ruff-legacy` hook is skipped in CI's `--all-files`
+> mode to avoid failing on pre-existing violations. It runs locally on staged
+> files only via pre-commit.
 
 ## Documentation Guidelines
 

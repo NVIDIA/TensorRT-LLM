@@ -49,11 +49,12 @@ mdformat.................................................................Passed
 
 If any files were modified by this hook, you will need to stage and commit them again.
 
-> **Note:** Pre-commit runs whole-file linting on every Python file you touch.
-> You may see auto-fixes for import sorting or unused imports. If pre-commit
-> modifies files, re-stage them (`git add`) and commit again. See
-> [CODING_GUIDELINES.md](CODING_GUIDELINES.md#pre-commit-linting-boy-scout-rule)
-> for details.
+> **Note:** Python files are split into two groups. **Group A** files get full
+> ruff formatting and linting. **Group B** (legacy) files get yapf/isort/autoflake
+> formatting plus supplemental ruff lint rules via the `ruff-legacy` hook.
+> If pre-commit modifies files, re-stage them (`git add`) and commit again.
+> See [CODING_GUIDELINES.md](CODING_GUIDELINES.md#pre-commit-linting-supplemental-rules)
+> for details on the two-group system and how to graduate files.
 
 In addition, please try to keep pull requests (PRs) as concise as possible:
 * Avoid committing commented-out code.
