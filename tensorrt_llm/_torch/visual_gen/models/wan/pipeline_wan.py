@@ -106,6 +106,11 @@ class WanPipeline(BasePipeline):
             return ["transformer", "transformer_2"]
         return ["transformer"]
 
+    @property
+    def common_warmup_shapes(self) -> list:
+        """Return list of common warmup shapes for the pipeline."""
+        return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
+
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
         self.transformer = WanTransformer3DModel(model_config=self.model_config)
@@ -247,13 +252,12 @@ class WanPipeline(BasePipeline):
 
         Runs warmup inference with common shapes for Wan models.
         """
-        common_shapes = [(480, 832, 33), (720, 1280, 81)]
-        
+
         if self.is_wan22:
             # Double warmup steps to also warmup the 2nd transformer
             warmup_steps = warmup_steps * 2
 
-        for height, width, num_frames in common_shapes:
+        for height, width, num_frames in self.common_warmup_shapes:
             logger.info(f"Warmup: Wan {height}x{width}, {num_frames} frames {warmup_steps} steps")
 
             with torch.no_grad():

@@ -97,6 +97,14 @@ class BasePipeline(nn.Module):
         """Return list of transformer components this pipeline needs."""
         return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
 
+    @property
+    def common_warmup_shapes(self) -> list:
+        """Return list of common warmup shapes for the pipeline.
+        Should be in format of (height, width, num_frames)
+        Override this property and use in self._run_warmup() for model-specific warmup.
+        """
+        return []
+
     def infer(self, req: Any):
         raise NotImplementedError
 
@@ -246,7 +254,10 @@ class BasePipeline(nn.Module):
             logger.info("Warmup disabled (warmup_steps=0)")
             return
 
-        logger.info(f"Running warmup ({warmup_steps} steps)...")
+        logger.info(
+            f"Running warmup for {self.__class__.__name__} with {self.common_warmup_shapes} shapes "
+            f"and {warmup_steps} steps..."
+        )
         warmup_start = time.time()
 
         self._run_warmup(warmup_steps)
@@ -265,7 +276,6 @@ class BasePipeline(nn.Module):
         Args:
             warmup_steps: Number of denoising steps to run
         """
-        # Subclasses should override this with model-specific warmup
         logger.warning(
             f"{self.__class__.__name__} does not implement _run_warmup(); "
             "skipping warmup. Override _run_warmup() for model-specific warmup."

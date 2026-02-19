@@ -95,6 +95,11 @@ class WanImageToVideoPipeline(BasePipeline):
             return ["transformer", "transformer_2"]
         return ["transformer"]
 
+    @property
+    def common_warmup_shapes(self) -> list:
+        """Return list of common warmup shapes for the pipeline."""
+        return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
+
     def _init_transformer(self) -> None:
         logger.info("Creating WAN I2V transformer with quantization support...")
         self.transformer = WanTransformer3DModel(model_config=self.model_config)
@@ -277,12 +282,11 @@ class WanImageToVideoPipeline(BasePipeline):
         Runs warmup inference with common shapes for Wan I2V models.
         Creates a dummy black image for the image conditioning input.
         """
-        common_shapes = [(480, 832, 33), (720, 1280, 81)]
 
         if self.is_wan22:
             warmup_steps = warmup_steps * 2
 
-        for height, width, num_frames in common_shapes:
+        for height, width, num_frames in self.common_warmup_shapes:
             logger.info(
                 f"Warmup: Wan I2V {height}x{width}, {num_frames} frames {warmup_steps} steps"
             )
