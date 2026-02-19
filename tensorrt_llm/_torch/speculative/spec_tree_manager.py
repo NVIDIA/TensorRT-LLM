@@ -3,7 +3,7 @@ from typing import List
 
 import torch
 
-from tensorrt_llm._utils import use_pinned_memory
+from tensorrt_llm._utils import prefer_pinned
 
 
 class SpecTreeManager:
@@ -89,7 +89,7 @@ class SpecTreeManager:
              self.max_draft_len + 1),
             dtype=torch.int32,
             device='cpu',
-            pin_memory=use_pinned_memory(),
+            pin_memory=prefer_pinned(),
         ) * -1
 
         self.spec_dec_mask_matrix = torch.eye(
@@ -124,8 +124,7 @@ class SpecTreeManager:
             torch.ones(self.dynamic_tree_max_topK,
                        dtype=torch.int32,
                        device='cpu',
-                       pin_memory=use_pinned_memory()) *
-            self.dynamic_tree_max_topK
+                       pin_memory=prefer_pinned()) * self.dynamic_tree_max_topK
         ]
 
     # For the static tree
@@ -174,7 +173,7 @@ class SpecTreeManager:
                 torch.tensor(tmp_top_k_list,
                              dtype=torch.int32,
                              device='cpu',
-                             pin_memory=use_pinned_memory()))
+                             pin_memory=prefer_pinned()))
 
         # 6) Compute the spec decoding according to the eagle_paths for the target model
         for i, path in enumerate(self.eagle_paths[0]):

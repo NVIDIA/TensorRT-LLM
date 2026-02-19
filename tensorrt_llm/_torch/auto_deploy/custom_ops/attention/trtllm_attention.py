@@ -32,7 +32,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
@@ -110,19 +110,23 @@ class _TrtllmPlanner:
         # Workspace: pre-allocate a modest initial buffer (like flashinfer's 320MB).
         # thop.attention auto-resizes via resize_() if more space is needed during warm-up.
         self.workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-        self.host_pool_mapping = torch.zeros(1, 2, dtype=torch.int32, device="cpu", pin_memory=use_pinned_memory())
-        self.host_total_kv_lens = torch.zeros(2, dtype=torch.int64, device="cpu", pin_memory=use_pinned_memory())
+        self.host_pool_mapping = torch.zeros(
+            1, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.host_total_kv_lens = torch.zeros(
+            2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
         self.host_request_types = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=use_pinned_memory()
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.block_offsets = torch.zeros(
             1, max_batch, 2, max_blocks_per_seq, dtype=torch.int32, device=device
         )
         self.host_past_kv_lengths = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=use_pinned_memory()
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.host_context_lengths = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=use_pinned_memory()
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
 
     def plan(
@@ -187,7 +191,7 @@ class _TrtllmPlanner:
         if t is not None:
             return t
 
-        t = torch.zeros(1, 2, dtype=torch.int64, device="cpu", pin_memory=use_pinned_memory())
+        t = torch.zeros(1, 2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned())
         t[0, 0] = ptr
         self._per_layer_pool_ptrs[ptr] = t
         return t

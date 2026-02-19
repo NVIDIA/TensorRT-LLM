@@ -30,7 +30,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-from ..._utils import use_pinned_memory
+from ..._utils import prefer_pinned
 from ..flashinfer_utils import get_env_enable_pdl
 from .sampling_utils import (
     GREEDY,
@@ -92,7 +92,7 @@ class _StrategyImpls:
 
         @staticmethod
         def _make_tensor(data: list, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-            return torch.tensor(data, dtype=dtype, pin_memory=use_pinned_memory()).to(
+            return torch.tensor(data, dtype=dtype, pin_memory=prefer_pinned()).to(
                 device=device, non_blocking=True
             )
 

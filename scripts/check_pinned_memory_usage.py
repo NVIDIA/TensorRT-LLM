@@ -31,7 +31,7 @@ class PinnedMemoryUsageChecker(ast.NodeVisitor):
                 self.violations.append(
                     (
                         node.lineno,
-                        "Use `pin_memory=use_pinned_memory()` instead of `pin_memory=True`.",
+                        "Use `pin_memory=prefer_pinned()` instead of `pin_memory=True`.",
                     )
                 )
 

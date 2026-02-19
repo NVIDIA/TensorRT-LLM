@@ -1301,23 +1301,27 @@ def confidential_compute_enabled() -> bool:
 
 
 @lru_cache(maxsize=None)
-def use_pinned_memory() -> bool:
+def prefer_pinned() -> bool:
     """
-    Return False when confidential compute is enabled, since pinned memory with
-    confidential compute active has only downsides (and no upside). When
-    confidential compute is enabled, all D2H and H2D copies become synchronous,
-    except for pageable H2D copies <2MB (most if not all H2D copies involved in
-    input preparation fall into this category).
+    Returns whether pinned memory is beneficial for performance.
+
+    While pinned memory is typically preferred for H2D and D2H transfers, it
+    offers no advantage when Confidential Compute (CC) is enabled. In fact, CC
+    forces most transfers to be synchronous. The exception is pageable H2D
+    copies smaller than 2MB, which remain asynchronous.
+
+    Since input preparation relies heavily on these small H2D copies, usage of
+    pageable (and not pinned) memory across the board is preferred in CC mode
+    to maintain asynchronous execution.
     """
     return not confidential_compute_enabled()
 
 
 def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Wrapper around torch.Tensor.pin_memory() that conditionally pins the tensor
-    memory if use_pinned_memory() returns True
+    Pin the Tensor memory if pinning is preferred/beneficial for performance
     """
-    if use_pinned_memory():
+    if prefer_pinned():
         return tensor.pin_memory()
     return tensor
 

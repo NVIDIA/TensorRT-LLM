@@ -24,11 +24,12 @@ import tensorrt_llm.bindings
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import torch_dtype_to_binding, use_pinned_memory
+from tensorrt_llm._utils import prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -342,7 +343,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.state_indices[:len(self.state_indices_list)].copy_(
             torch.tensor(self.state_indices_list,
                          dtype=torch.int32,
-                         pin_memory=use_pinned_memory()),
+                         pin_memory=prefer_pinned()),
             non_blocking=True)
 
     # When there exists padded requests, the state indices should not be repeated.
@@ -359,7 +360,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                padding_size] = torch.tensor(
                                    self.mamba_cache_free_blocks[:padding_size],
                                    dtype=self.state_indices.dtype,
-                                   pin_memory=use_pinned_memory()).to(
+                                   pin_memory=prefer_pinned()).to(
                                        self.state_indices.device,
                                        non_blocking=True)
         # But just finished requests won't free their used resources immediately
@@ -373,7 +374,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                padding_size] = torch.tensor(
                                    free_indices[:padding_size],
                                    dtype=self.state_indices.dtype,
-                                   pin_memory=use_pinned_memory()).to(
+                                   pin_memory=prefer_pinned()).to(
                                        self.state_indices.device,
                                        non_blocking=True)
 
