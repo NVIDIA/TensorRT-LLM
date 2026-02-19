@@ -355,7 +355,8 @@ def _run_sharding_execution_job(
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": from_config,
+                "sharding_scope": ["tp"],
+                "tp_sharding_source": ["heuristic"],
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -462,7 +463,7 @@ def _run_pattern_detection_job(
     # if world_size == 1, no sharding transformations should be detected
     if world_size > 1:
         if model_cls == GQA_Block:
-            min_local_shape = num_features // num_heads
+            head_dim = num_features // num_heads
             for node in gm.graph.nodes:
                 if is_linear_op(node):
                     # for Q, K, V layers, we expect:
@@ -472,9 +473,11 @@ def _run_pattern_detection_job(
                     if "o_proj" in node.args[1].name:
                         dim = SplitDimension.ROW
                         dist_op = "all_reduce"
+                        min_local_shape = 1
                     else:
                         dim = SplitDimension.COLUMN
                         dist_op = None
+                        min_local_shape = head_dim
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,
@@ -655,7 +658,8 @@ def _run_pattern_detection_job(
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": from_config,
+                "sharding_scope": ["tp"],
+                "tp_sharding_source": ["heuristic"],
             },
         },
     )
