@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 from defs.conftest import skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
@@ -24,6 +27,15 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root
 from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+
+_AD_CONFIGS_DIR = (Path(__file__).resolve().parents[4] / 'examples' /
+                   'auto_deploy' / 'model_registry' / 'configs')
+
+
+def _load_ad_config(config_name):
+    """Load a YAML config from the AutoDeploy model registry configs directory."""
+    with open(_AD_CONFIGS_DIR / config_name) as f:
+        return yaml.safe_load(f)
 
 
 def print_memory_usage(label: str):
@@ -219,28 +231,7 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
     MODEL_PATH_NVFP4 = f"{_MODEL_PATH_BASE}-NVFP4"
 
     def get_default_kwargs(self, enable_chunked_prefill=False):
-        config = {
-            "skip_tokenizer_init": False,
-            "trust_remote_code": True,
-            # SSMs do not support cache reuse.
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.7
-            },
-            # Keep max_batch_size as in the PyTorch test to avoid OOM
-            "max_batch_size": 128,
-            # Model context length is 8K
-            "max_seq_len": 8192,
-            # Set explicitly to match default build_config behavior
-            "max_num_tokens": 8192,
-            "skip_loading_weights": False,
-            "transforms": {
-                "compile_model": {
-                    "backend": "torch-cudagraph",
-                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
-                },
-            },
-        }
+        config = _load_ad_config('nemotron-nano-9b-v2.yaml')
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
             # NOTE: must be > max(tokens_per_block, max_batch_size)
