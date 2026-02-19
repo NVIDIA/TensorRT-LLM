@@ -69,12 +69,12 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
     TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation success; ptr=%p size_bytes=%zu shape=%s", buffer.ptr,
         buffer.size, outShape);
     return {tensor, true};
-#else
+#else  // defined(ENABLE_MULTI_DEVICE)
     (void) group;
     (void) like;
     (void) shape;
     return {torch::Tensor(), false};
-#endif
+#endif // defined(ENABLE_MULTI_DEVICE)
 }
 
 } // namespace torch_ext

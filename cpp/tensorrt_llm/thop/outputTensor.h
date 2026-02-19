@@ -42,6 +42,7 @@ enum class OutputBufferKind : int
 inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::ScalarType dtype, c10::Device device,
     OutputBufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
+    at::Tensor result;
     switch (output_buffer_kind)
     {
     case OutputBufferKind::NcclWindow:
@@ -60,10 +61,13 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
                     = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(*commPtr, output_size, dtype);
                 if (tensor.defined() && buffer.isValid())
                 {
-                    return tensor;
+                    result = tensor;
                 }
-                TLLM_LOG_DEBUG("[allocate_output] NCCL window alloc failed; tensor_defined=%d buffer_valid=%d",
-                    tensor.defined() ? 1 : 0, buffer.isValid() ? 1 : 0);
+                else
+                {
+                    TLLM_LOG_DEBUG("[allocate_output] NCCL window alloc failed; tensor_defined=%d buffer_valid=%d",
+                        tensor.defined() ? 1 : 0, buffer.isValid() ? 1 : 0);
+                }
             }
             else
             {
@@ -79,13 +83,17 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
         (void) group;
         TLLM_LOG_DEBUG(
             "[allocate_output] NCCL window requested but multi-device is disabled; fallback to default output buffer");
-#endif
+#endif // defined(ENABLE_MULTI_DEVICE)
         break;
-    case OutputBufferKind::Userbuffers: return torch_ext::create_userbuffers_tensor(output_size, dtype).first;
+    case OutputBufferKind::Userbuffers: result = torch_ext::create_userbuffers_tensor(output_size, dtype).first; break;
     case OutputBufferKind::Default:
-    default: break;
+    default: result = at::detail::empty_cuda(output_size, dtype, device, std::nullopt); break;
     }
-    return at::detail::empty_cuda(output_size, dtype, device, std::nullopt);
+    if (!result.defined())
+    {
+        result = at::detail::empty_cuda(output_size, dtype, device, std::nullopt);
+    }
+    return result;
 }
 
 } // namespace torch_ext
