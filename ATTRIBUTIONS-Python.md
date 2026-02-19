@@ -33478,7 +33478,6 @@ limitations under the License.
   - `Homepage`: https://github.com/NVIDIA/Model-Optimizer
 
 
-<<<<<<< HEAD
 ## nvidia-modelopt-core (0.33.1)
 
 ### Licenses
@@ -33506,10 +33505,7 @@ limitations under the License.
   - `Homepage`: https://github.com/NVIDIA/Model-Optimizer
 
 
-## nvidia-nccl-cu12 (2.27.3)
-=======
 ## nvidia-nccl-cu13 (2.27.7)
->>>>>>> fd7624b32 (modify ATTRIBUTIONS-Python.md)
 
 ### Licenses
 License: `BSD-3-Clause`
