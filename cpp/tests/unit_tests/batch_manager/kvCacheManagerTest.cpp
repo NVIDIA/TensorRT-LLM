@@ -5810,14 +5810,24 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     auto const expectedNeededOneStep = (promptLength / tokensPerBlock) - expectedReusableBlocks;
     EXPECT_EQ(neededOneStep, expectedNeededOneStep);
 
+    // Verify estimatedReusableTokens is set as a side effect of getNeededBlocksOneStep
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
+
     // remainingBeforeAdd: (4 context - 3 reusable) + 2 generation = 3
     auto const remainingBeforeAdd = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     auto const expectedRemainingBeforeAdd = expectedNeededOneStep + (maxNewTokens / tokensPerBlock);
     EXPECT_EQ(remainingBeforeAdd, expectedRemainingBeforeAdd);
 
+    // Verify estimatedReusableTokens is still set after getRemainingBlocksToCompletion
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
+
     // After addSequence, context blocks are allocated (reuse already applied during allocation)
     // Only generation blocks remain to be allocated
     kvCacheManager->addSequence(req1.mRequestId, req1.getPromptLen(), maxBeamWidth, req1);
+
+    // Verify estimatedReusableTokens is cleared to 0 after addSequence
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+
     auto const remainingAfterContextAlloc = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remainingAfterContextAlloc, maxNewTokens / tokensPerBlock);
 }
@@ -5930,6 +5940,9 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, 2);
+
+    // Verify estimatedReusableTokens is set as a side effect of getNeededBlocksOneStep
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 2 * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartialReuse)
@@ -5992,6 +6005,9 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
     auto const numContextBlocks = promptLength / tokensPerBlock;             // 5 blocks
     auto const expectedRemaining = (numContextBlocks - expectedReusableBlocks) + (maxNewTokens / tokensPerBlock);
     EXPECT_EQ(remaining, expectedRemaining);                                 // 1 context + 3 generation = 4
+
+    // Verify estimatedReusableTokens is set as a side effect of getRemainingBlocksToCompletion
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
@@ -6053,6 +6069,9 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
     auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 2 blocks
     auto const numSharedBlocks = promptLength / tokensPerBlock;              // 3 blocks
     EXPECT_EQ(neededOneStep, numSharedBlocks - expectedReusableBlocks);      // 3 - 2 = 1
+
+    // Verify estimatedReusableTokens is set as a side effect of getNeededBlocksOneStep
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -6098,11 +6117,17 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
     auto const neededOneStep = kvCacheManager->getNeededBlocksOneStep(req, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
+    // Verify estimatedReusableTokens stays 0 when reuse is disabled
+    EXPECT_EQ(req.getEstimatedReusableTokens(), 0);
+
     // getRemainingBlocksToCompletion should include both context and generation blocks
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req, onlyWindowSize);
     auto const expectedContextBlocks = promptLength / tokensPerBlock;
     auto const expectedGenBlocks = maxNewTokens / tokensPerBlock;
     EXPECT_EQ(remaining, expectedContextBlocks + expectedGenBlocks); // 4 + 2 = 6 blocks
+
+    // Verify estimatedReusableTokens still 0 after getRemainingBlocksToCompletion
+    EXPECT_EQ(req.getEstimatedReusableTokens(), 0);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
@@ -6180,6 +6205,10 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, uniqueSuffixLength / tokensPerBlock);
+
+    // Verify estimatedReusableTokens is set as a side effect
+    EXPECT_EQ(req1.getEstimatedReusableTokens(),
+        static_cast<SizeType32>(sharedPrefixLength / tokensPerBlock) * tokensPerBlock);
 
     // getRemainingBlocksToCompletion: (4 context - 2 reusable) + 1 gen = 3 blocks
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);

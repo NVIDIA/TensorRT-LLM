@@ -829,14 +829,10 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
     constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
     for (auto const& [windowSize, _] : mWindowBlockManagers)
     {
-        if (mWindowBlockManagers.at(windowSize).isSWA())
-        {
-            // SWA cannot store new blocks on the fly because the block stored
-            // may go OOW and be reused by another sequence.
-            continue;
-        }
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
+        TLLM_LOG_DEBUG("storeContextBlocks for request %lu on window %d with %d unique tokens", llmRequest.mRequestId,
+            windowSize, uniqueTokens.size());
 
         auto blockedUniqueTokens
             = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
@@ -1331,8 +1327,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                             *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
                     }
                     matchingBlock->setHash();
-                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
-                        matchingBlockId);
+                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks for request %lu - Copied partially filled block %d",
+                        mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
                 }
                 else
                 {
@@ -1340,8 +1336,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                     freeLeafBlock(matchingBlock);
                     mEvictionPolicy->claimBlock(
                         matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
-                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
-                        matchingBlockId);
+                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks for request %lu - Reused partially filled block %d",
+                        mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
                 }
                 searchRoot = nullptr; // no matching needed for following blocks
             }
@@ -1350,7 +1346,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 // Recover block and reuse
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
-                TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
+                TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks for request %lu - Matched full block %d", mLogPrefix.c_str(),
+                    sequence.getRequestId(), matchingBlockId);
                 searchRoot = matchingBlock;
             }
             onboardBlock(sequence, matchingBlock, mode, directory);
@@ -1416,7 +1413,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         }
     }
 
-    sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
     return numMatchedTokens;
 }
 
@@ -2278,13 +2274,16 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
         // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
-        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv())
+        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv() && req.isContextInitState()
+            && req.isFirstContextChunk())
         {
             auto const uniqueTokens = req.getUniqueTokens(0);
             auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req);
             // Only subtract from shared blocks (reusable blocks are always shared)
             auto const reusableSharedBlocks = std::min(numReusableBlocks, numSharedBlocks);
             numRequiredBlocks -= reusableSharedBlocks;
+            // Store on request so the micro batch scheduler can use it for token budget
+            req.setEstimatedReusableTokens(numReusableBlocks * getTokensPerBlock());
         }
         return numRequiredBlocks;
     }
@@ -2366,6 +2365,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         auto const uniqueTokens = req.getUniqueTokens(0);
         auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req);
         numReusableContextBlocks = std::min(numReusableBlocks, numContextBlocks);
+        // Store on request so the micro batch scheduler can use it for token budget
+        req.setEstimatedReusableTokens(numReusableBlocks * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, numReusableBlocks=%d, "
             "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
@@ -2593,6 +2594,9 @@ bool KVCacheManager::addSequence(
     {
         TLLM_LOG_DEBUG("KVCacheManager::addSequence: Setting prepopulatedPromptLen to %d", minPrepopulatedPromptLen);
         llmRequest->setPrepopulatedPromptLen(minPrepopulatedPromptLen, getTokensPerBlock());
+        // Clear the scheduling estimate now that the authoritative value is set.
+        // This prevents subsequent chunks from double-counting reusable tokens.
+        llmRequest->setEstimatedReusableTokens(0);
     }
 
     if (llmRequest)
