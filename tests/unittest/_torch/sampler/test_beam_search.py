@@ -525,7 +525,8 @@ def test_beam_search_sampling_batch_basic():
     logprobs = torch.log_softmax(logits, dim=-1)
     # adjust our expected log probs accordingly
     logprobs[beam_width - 1] = float('-inf')
-    logprobs[beam_width - 1, vocab_size - 1] = 0
+    end_id = vocab_size - 1
+    logprobs[beam_width - 1, end_id] = 0
     logprobs = logprobs.view(batch_size, beam_width * vocab_size)
 
     _, top_indices = torch.topk(logprobs, k=beam_width, dim=-1, sorted=True)
