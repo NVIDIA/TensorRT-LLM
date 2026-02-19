@@ -40,6 +40,7 @@ from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
+from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
 
@@ -223,6 +224,14 @@ def create_py_executor(
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
     torch.cuda.set_per_process_memory_fraction(1.0)
+
+    # Apply model-specific defaults early, before destructuring llm_args fields
+    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
+                                                     llm_args.checkpoint_loader,
+                                                     llm_args.checkpoint_format)
+    llm_args = ModelLoader.load_config_and_apply_defaults(
+        checkpoint_dir, llm_args, checkpoint_loader)
+
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config
@@ -241,6 +250,19 @@ def create_py_executor(
         kv_cache_config.enable_partial_reuse = False
 
     decoding_config = llm_args.decoding_config
+
+    # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
+    # failures with trust_remote_code models.  Reload it from the checkpoint
+    # when guided decoding needs it.
+    if (tokenizer is None and llm_args.guided_decoding_backend is not None
+            and checkpoint_dir is not None):
+        logger.info(
+            "Tokenizer not provided; loading from checkpoint for guided decoding"
+        )
+        from tensorrt_llm.tokenizer import TransformersTokenizer
+        tokenizer = TransformersTokenizer.from_pretrained(
+            checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
 
@@ -352,6 +374,7 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
+            checkpoint_loader=checkpoint_loader,
         )
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
