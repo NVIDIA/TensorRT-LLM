@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from defs.conftest import skip_pre_blackwell
+from defs.conftest import get_llm_root, skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -28,8 +28,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..conftest import get_device_count, llm_models_root
 from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
-_AD_CONFIGS_DIR = (Path(__file__).resolve().parents[4] / 'examples' /
-                   'auto_deploy' / 'model_registry' / 'configs')
+_AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
+                   'model_registry' / 'configs')
 
 
 def _load_ad_config(config_name):
