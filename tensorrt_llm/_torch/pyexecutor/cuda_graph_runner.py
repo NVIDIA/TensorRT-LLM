@@ -15,7 +15,6 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
-from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
@@ -161,8 +160,7 @@ class CUDAGraphRunner:
             new_tokens_device, next_draft_tokens_device = None, None
             if new_tensors_device is not None:
                 new_tokens_device = new_tensors_device.new_tokens
-                if isinstance(new_tensors_device,
-                              (SampleStateTensorsMTP, SampleStateTensorsSpec)):
+                if isinstance(new_tensors_device, SampleStateTensorsSpec):
                     next_draft_tokens_device = new_tensors_device.next_draft_tokens
             overlap_scheduler_enabled = new_tokens_device is not None
             for request in batch.generation_requests:

@@ -15,10 +15,10 @@ from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, Sampler, SampleState,
-                                  SampleStateTensors, TorchSampler, add_token,
-                                  int_tensor)
+                                  TorchSampler, add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
+from .spec_sampler_base import SampleStateTensorsSpec
 from .suffix_automaton import SuffixAutomatonManager
 
 if TYPE_CHECKING:
@@ -31,13 +31,8 @@ else:
 
 
 @dataclass(kw_only=True)
-class SampleStateTensorsMTP(SampleStateTensors):
-    new_tokens_lens: torch.Tensor
-    next_draft_tokens: torch.Tensor
-
-
-@dataclass(kw_only=True)
-class SampleStateMTP(SampleState[SampleStateTensorsMTP, SampleStateTensorsMTP]):
+class SampleStateMTP(SampleState[SampleStateTensorsSpec,
+                                 SampleStateTensorsSpec]):
     pass
 
 
@@ -365,12 +360,12 @@ class MTPSampler(Sampler[SampleStateMTP]):
         new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
         next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
 
-        device = SampleStateTensorsMTP(
+        device = SampleStateTensorsSpec(
             new_tokens=next_new_tokens,
             new_tokens_lens=new_tokens_lens,
             next_draft_tokens=next_draft_tokens,
         )
-        host = SampleStateTensorsMTP(
+        host = SampleStateTensorsSpec(
             new_tokens=new_tokens.to('cpu', non_blocking=True),
             new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
             next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),

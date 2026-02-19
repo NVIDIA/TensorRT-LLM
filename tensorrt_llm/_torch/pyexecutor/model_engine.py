@@ -52,7 +52,6 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
-from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
@@ -2037,9 +2036,8 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsMTP or SampleStateTensorsSpec.
-            if isinstance(new_tensors_device,
-                          (SampleStateTensorsMTP, SampleStateTensorsSpec)):
+            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsSpec.
+            if isinstance(new_tensors_device, SampleStateTensorsSpec):
                 assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
