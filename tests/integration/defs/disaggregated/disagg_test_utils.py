@@ -84,7 +84,9 @@ def periodic_check(timeout=300, interval=3):
     return decorator
 
 
-def _run_worker(model_name, worker_config, role, port, work_dir, device=-1, save_log=False, env=None):
+def _run_worker(
+    model_name, worker_config, role, port, work_dir, device=-1, save_log=False, env=None
+):
     """Run a worker process (context or generation).
 
     Args:
@@ -375,7 +377,9 @@ def disagg_port():
 @pytest.fixture
 def work_dir():
     """Create a temporary working directory."""
-    return tempfile.mkdtemp()
+    d = tempfile.mkdtemp()
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
 
 
 @pytest.fixture

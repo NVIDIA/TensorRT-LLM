@@ -562,6 +562,9 @@ def background_workers(llm_venv, config_file: str):
     gen_urls = []
     next_device = 0
 
+    import torch
+    num_gpus = torch.cuda.device_count()
+
     for i in range(num_ctx):
         port = get_free_port()
         ctx_urls.append(f"http://localhost:{port}")
@@ -570,7 +573,7 @@ def background_workers(llm_venv, config_file: str):
                            ctx_worker_config,
                            work_dir,
                            port=port,
-                           device=next_device,
+                           device=next_device % num_gpus,
                            env=env))
         next_device += gpus_per_ctx
 
@@ -582,7 +585,7 @@ def background_workers(llm_venv, config_file: str):
                            gen_worker_config,
                            work_dir,
                            port=port,
-                           device=next_device,
+                           device=next_device % num_gpus,
                            env=env))
         next_device += gpus_per_gen
 
