@@ -1,23 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX attention modules: joint attention, position embeddings, and parallel self-attention.
+"""FLUX attention modules: joint attention and parallel self-attention.
 
 Key Components:
 - FluxJointAttention: Joint attention for dual-stream blocks (FLUX.1 and FLUX.2)
 - Flux2ParallelSelfAttention: Fused QKV+MLP for FLUX.2 single-stream blocks
-- Flux2PosEmbed: 4-axis rotary position embeddings (FLUX.2)
-- Flux2SwiGLU: SwiGLU activation for FLUX.2 FFN
 """
 
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, _per_head_norm
+from tensorrt_llm._torch.modules.swiglu import swiglu
+from tensorrt_llm._torch.visual_gen.modules.attention import (
+    Attention,
+    QKVMode,
+    _per_head_norm,
+    apply_rotary_emb,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -47,8 +50,6 @@ class FluxJointAttention(Attention):
         head_dim: int = 128,
         bias: bool = False,
         added_kv_proj_dim: Optional[int] = None,
-        added_proj_bias: bool = True,
-        out_bias: bool = True,
         eps: float = 1e-6,
         pre_only: bool = False,
         config: Optional["DiffusionModelConfig"] = None,
@@ -63,7 +64,6 @@ class FluxJointAttention(Attention):
             qk_norm_mode="per_head",
             eps=eps,
             bias=bias,
-            out_bias=out_bias,
             config=config,
             layer_idx=layer_idx,
         )
@@ -80,12 +80,11 @@ class FluxJointAttention(Attention):
             self.add_qkv_proj = Linear(
                 added_kv_proj_dim,
                 3 * self.q_dim,
-                bias=added_proj_bias,
+                bias=self.bias,
                 dtype=self.dtype,
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
-                disable_deep_gemm=True,
                 weights_loading_config=WeightsLoadingConfig(
                     weight_mode=WeightMode.FUSED_QKV_LINEAR
                 ),
@@ -106,34 +105,12 @@ class FluxJointAttention(Attention):
             self.to_add_out = Linear(
                 self.q_dim,
                 added_kv_proj_dim,
-                bias=out_bias,
+                bias=self.bias,
                 dtype=self.dtype,
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
-                disable_deep_gemm=True,
             )
-
-    @staticmethod
-    def _apply_rope(
-        x: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply FLUX-style rotary embeddings to a 4D tensor.
-
-        Args:
-            x: Input [B, S, H, D]
-            freqs_cos: Cosine frequencies [S, D]
-            freqs_sin: Sine frequencies [S, D]
-        """
-        x_fp32 = x.float()
-        cos = freqs_cos.float().unsqueeze(0).unsqueeze(2)  # [1, S, 1, D]
-        sin = freqs_sin.float().unsqueeze(0).unsqueeze(2)
-
-        # Rotate pairs: [x0, x1, x2, x3, ...] -> [-x1, x0, -x3, x2, ...]
-        x_rotated = torch.stack([-x_fp32[..., 1::2], x_fp32[..., 0::2]], dim=-1).flatten(-2)
-        return (x_fp32 * cos + x_rotated * sin).to(x.dtype)
 
     def forward(
         self,
@@ -186,8 +163,8 @@ class FluxJointAttention(Attention):
         # Apply RoPE
         if image_rotary_emb is not None:
             freqs_cos, freqs_sin = image_rotary_emb
-            query = self._apply_rope(query, freqs_cos, freqs_sin)
-            key = self._apply_rope(key, freqs_cos, freqs_sin)
+            query = apply_rotary_emb(query, freqs_cos, freqs_sin)
+            key = apply_rotary_emb(key, freqs_cos, freqs_sin)
 
         # Flatten 4D->3D for base _attn_impl
         seq_len = query.shape[1]
@@ -216,84 +193,6 @@ class FluxJointAttention(Attention):
 
 
 # =============================================================================
-# Activation Functions
-# =============================================================================
-
-
-class Flux2SwiGLU(nn.Module):
-    """SwiGLU activation function used in FLUX.2 FFN.
-
-    FLUX.2 uses gate_fn(x1) * x2 (different from standard SwiGLU which is x * gate_fn(gate)).
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.gate_fn = nn.SiLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        return self.gate_fn(x1) * x2
-
-
-# =============================================================================
-# Position Embedding
-# =============================================================================
-
-
-class Flux2PosEmbed(nn.Module):
-    """4-axis RoPE position embedding for FLUX.2.
-
-    FLUX.2 uses 4 axes: [32, 32, 32, 32] = 128 head_dim
-    FLUX.1 uses 3 axes: [16, 56, 56] = 128 head_dim
-    """
-
-    def __init__(self, theta: float = 2000.0, axes_dim: Tuple[int, ...] = (32, 32, 32, 32)):
-        super().__init__()
-        self.theta = theta
-        self.axes_dim = axes_dim
-
-    def forward(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate RoPE embeddings from position IDs.
-
-        Args:
-            ids: Position IDs of shape [seq_len, num_axes]
-
-        Returns:
-            Tuple of (freqs_cos, freqs_sin), each of shape [seq_len, head_dim]
-        """
-        n_axes = ids.shape[-1]
-        cos_out = []
-        sin_out = []
-        pos = ids.float()
-
-        freqs_dtype = torch.float32 if ids.device.type in ("mps", "npu") else torch.float64
-
-        for i in range(n_axes):
-            cos, sin = self._get_1d_rotary_pos_embed(
-                self.axes_dim[i], pos[:, i], self.theta, freqs_dtype
-            )
-            cos_out.append(cos)
-            sin_out.append(sin)
-
-        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
-        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
-
-        return freqs_cos, freqs_sin
-
-    def _get_1d_rotary_pos_embed(
-        self, dim: int, pos: torch.Tensor, theta: float, freqs_dtype: torch.dtype
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate 1D rotary position embeddings."""
-        freqs = 1.0 / (
-            theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim)
-        )
-        freqs = torch.outer(pos.to(freqs_dtype), freqs)
-        cos = freqs.cos().repeat_interleave(2, dim=-1).to(pos.dtype)
-        sin = freqs.sin().repeat_interleave(2, dim=-1).to(pos.dtype)
-        return cos, sin
-
-
-# =============================================================================
 # Parallel Self-Attention (for FLUX.2 single-stream blocks)
 # =============================================================================
 
@@ -303,7 +202,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
     Reuses from FluxJointAttention/Attention:
     - apply_qk_norm(): Per-head QK normalization
-    - _apply_rope(): FLUX-style rotary embeddings
+    - apply_rotary_emb(): FLUX-style rotary embeddings (from modules/attention.py)
     - _attn_impl(): Backend dispatch + layout handling (+ Ulysses)
     - Attention backend creation (VANILLA/TRTLLM)
 
@@ -343,15 +242,13 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             head_dim=head_dim,
             bias=bias,
             added_kv_proj_dim=None,  # No text stream
-            out_bias=bias,
             eps=eps,
             pre_only=True,  # Deletes base to_out
             config=config,
             layer_idx=layer_idx,
         )
 
-        # MLP activation (SwiGLU: 2*mlp_hidden_dim -> mlp_hidden_dim)
-        self.mlp_act_fn = Flux2SwiGLU()
+        # MLP activation uses swiglu from _torch/modules (Triton-optimized)
 
         # Combined output: [q_dim + mlp_hidden_dim] -> [hidden_size]
         self.to_out = Linear(
@@ -362,7 +259,6 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
-            disable_deep_gemm=True,
         )
 
     def _init_qkv_proj(self):
@@ -377,7 +273,6 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
-            disable_deep_gemm=True,
         )
 
     def forward(
@@ -412,11 +307,11 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         # Per-head QK norm (inherited)
         q, k = self.apply_qk_norm(q, k)
 
-        # RoPE (inherited static method)
+        # RoPE
         if image_rotary_emb is not None:
             freqs_cos, freqs_sin = image_rotary_emb
-            q = self._apply_rope(q, freqs_cos, freqs_sin)
-            k = self._apply_rope(k, freqs_cos, freqs_sin)
+            q = apply_rotary_emb(q, freqs_cos, freqs_sin)
+            k = apply_rotary_emb(k, freqs_cos, freqs_sin)
 
         # Flatten 4D->3D for _attn_impl
         seq_len = q.shape[1]
@@ -426,8 +321,9 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         attn_out = self._attn_impl(q, k, v, batch_size, seq_len)
         attn_out = attn_out.to(q.dtype)
 
-        # Parallel MLP path
-        mlp_out = self.mlp_act_fn(mlp_hidden)
+        # Parallel MLP path (reshape to 2D for Triton kernel, then back)
+        shape = mlp_hidden.shape
+        mlp_out = swiglu(mlp_hidden.reshape(-1, shape[-1])).reshape(*shape[:-1], -1)
 
         # Concatenate + project
         return self.to_out(torch.cat([attn_out, mlp_out], dim=-1))

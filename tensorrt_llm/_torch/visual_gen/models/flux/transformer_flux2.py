@@ -6,7 +6,7 @@
 FLUX.2 has a DIFFERENT architecture from FLUX.1:
 - Different modulation: Flux2Modulation with mod_param_sets
 - Different embedding: time_guidance_embed (always, with optional guidance_embedder)
-- Different FFN: Flux2FeedForward with Flux2SwiGLU
+- Different FFN: GatedMLP with swiglu (shared from _torch/modules)
 - Different single-stream: Fused QKV+MLP projection (to_qkv_mlp_proj)
 
 Variants:
@@ -23,21 +23,30 @@ import torch
 import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.models.flux.attention import (
     Flux2ParallelSelfAttention,
-    Flux2PosEmbed,
-    Flux2SwiGLU,
     FluxJointAttention,
 )
+from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     AdaLayerNormContinuous,
     _remap_checkpoint_keys,
 )
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+
+# HF FLUX.2 uses Flux2FeedForward with linear_in/linear_out attribute names.
+# We use GatedMLP which uses gate_up_proj/down_proj. Remap at load time.
+# NOTE: linear_in is NOT remapped here — it's split into gate/up halves in load_weights()
+# because GatedMLP.gate_up_proj uses FUSED_GATE_UP_LINEAR mode (expects 2 separate weights).
+_FLUX2_WEIGHT_KEY_REMAPS = [
+    ("linear_out.", "down_proj."),
+]
 
 # =============================================================================
 # Time + Guidance Embedding (matches HuggingFace structure exactly)
@@ -147,7 +156,6 @@ class Flux2Modulation(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
         self.act_fn = nn.SiLU()
 
@@ -180,58 +188,30 @@ class Flux2Modulation(nn.Module):
 # =============================================================================
 
 
-class Flux2FeedForward(nn.Module):
-    """FLUX.2 feed-forward network with SwiGLU activation (matches HuggingFace).
+def _make_ffn(
+    dim: int,
+    mult: float = 3.0,
+    bias: bool = False,
+    config: Optional["DiffusionModelConfig"] = None,
+    layer_idx: int = 0,
+) -> GatedMLP:
+    """Create a GatedMLP feed-forward network for FLUX.2.
 
-    Structure: linear_in -> SwiGLU -> linear_out
-    Note: linear_in outputs 2x inner_dim for the SwiGLU gate.
+    Reuses the shared TRT-LLM GatedMLP module (same as LLM models) which provides
+    SwiGLU activation, TP sharding, and FP8 fused activation support.
+
+    HF checkpoint key remapping in load_weights() translates HF names
+    (linear_in.*, linear_out.*) to GatedMLP attribute names (gate_up_proj.*, down_proj.*).
     """
-
-    def __init__(
-        self,
-        dim: int,
-        dim_out: Optional[int] = None,
-        mult: float = 3.0,
-        inner_dim: Optional[int] = None,
-        bias: bool = False,
-        dtype: Optional[torch.dtype] = None,
-        quant_config=None,
-        skip_create_weights: bool = False,
-        force_dynamic_quant: bool = False,
-    ):
-        super().__init__()
-        if inner_dim is None:
-            inner_dim = int(dim * mult)
-        dim_out = dim_out or dim
-
-        # linear_in outputs 2x for SwiGLU (value + gate)
-        self.linear_in = Linear(
-            dim,
-            inner_dim * 2,
-            bias=bias,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights,
-            force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
-        )
-        self.act_fn = Flux2SwiGLU()
-        self.linear_out = Linear(
-            inner_dim,
-            dim_out,
-            bias=bias,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights,
-            force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.linear_in(x)
-        x = self.act_fn(x)
-        x = self.linear_out(x)
-        return x
+    return GatedMLP(
+        hidden_size=dim,
+        intermediate_size=int(dim * mult),
+        bias=bias,
+        dtype=config.torch_dtype if config else None,
+        config=config,
+        layer_idx=layer_idx,
+        reduce_output=False,
+    )
 
 
 # =============================================================================
@@ -278,32 +258,16 @@ class Flux2TransformerBlock(nn.Module):
             head_dim=attention_head_dim,
             bias=bias,
             added_kv_proj_dim=dim,
-            added_proj_bias=bias,
-            out_bias=bias,
             eps=eps,
             config=config,
             layer_idx=layer_idx,
         )
 
-        # FFN for image stream
-        self.ff = Flux2FeedForward(
-            dim=dim,
-            mult=mlp_ratio,
-            bias=bias,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
-        )
+        # FFN for image stream (shared GatedMLP from _torch/modules)
+        self.ff = _make_ffn(dim=dim, mult=mlp_ratio, bias=bias, config=config, layer_idx=layer_idx)
         # FFN for text stream
-        self.ff_context = Flux2FeedForward(
-            dim=dim,
-            mult=mlp_ratio,
-            bias=bias,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights=skip_create_weights,
-            force_dynamic_quant=force_dynamic_quant,
+        self.ff_context = _make_ffn(
+            dim=dim, mult=mlp_ratio, bias=bias, config=config, layer_idx=layer_idx
         )
 
     def forward(
@@ -363,8 +327,17 @@ class Flux2TransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states * (1 + txt_scale2) + txt_shift2
 
         # FFN with gate
-        hidden_states = img_residual + self.ff(hidden_states) * img_gate2
-        encoder_hidden_states = txt_residual + self.ff_context(encoder_hidden_states) * txt_gate2
+        # GatedMLP's swiglu Triton kernel requires 2D input [tokens, features],
+        # so flatten 3D [batch, seq, dim] before and unflatten after.
+        b, s, d = hidden_states.shape
+        hidden_states = (
+            img_residual + self.ff(hidden_states.view(b * s, d)).view(b, s, -1) * img_gate2
+        )
+        b, s, d = encoder_hidden_states.shape
+        encoder_hidden_states = (
+            txt_residual
+            + self.ff_context(encoder_hidden_states.view(b * s, d)).view(b, s, -1) * txt_gate2
+        )
 
         return encoder_hidden_states, hidden_states
 
@@ -531,7 +504,7 @@ class Flux2Transformer2DModel(nn.Module):
         )()
 
         # Position embedding (4-axis RoPE)
-        self.pos_embed = Flux2PosEmbed(
+        self.pos_embed = FluxPosEmbed(
             theta=theta_rope,
             axes_dim=axes_dims_rope,
         )
@@ -578,21 +551,24 @@ class Flux2Transformer2DModel(nn.Module):
         )
 
         # Input embedders
-        # NOTE: x_embedder quantization is disabled when in_channels < 128.
+        # NOTE: x_embedder quantization is excluded when in_channels < 128.
         # FLUX.2 has in_channels=128 (OK), but future variants with smaller latent
         # channels would hit the same fp8_block_scaling_gemm NVRTC failure as FLUX.1
         # (in_channels=64). This layer runs once per forward pass, so the perf
         # impact is negligible.
-        embedder_quant_config = None if in_channels < 128 else quant_config
+        if in_channels < 128 and quant_config is not None:
+            if quant_config.exclude_modules is None:
+                quant_config.exclude_modules = []
+            if "*x_embedder*" not in quant_config.exclude_modules:
+                quant_config.exclude_modules.append("*x_embedder*")
         self.x_embedder = Linear(
             in_channels,
             inner_dim,
             bias=False,
             dtype=dtype,
-            quant_config=embedder_quant_config,
+            quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
         self.context_embedder = Linear(
             joint_attention_dim,
@@ -602,7 +578,6 @@ class Flux2Transformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
 
         # Dual-stream transformer blocks
@@ -667,10 +642,32 @@ class Flux2Transformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
 
         self.gradient_checkpointing = False
+
+        self.__post_init__()
+
+    def __post_init__(self):
+        self.apply_quant_config_exclude_modules()
+
+        for _, module in self.named_modules():
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
+
+    def apply_quant_config_exclude_modules(self):
+        quant_config = self.model_config.quant_config
+        if quant_config is None or quant_config.exclude_modules is None:
+            return
+
+        kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
+        no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                is_excluded = quant_config.is_module_excluded_from_quantization(name)
+                if is_excluded and getattr(module, "quant_config", None) is not None:
+                    module.quant_config = no_quant_config
 
     def forward(
         self,
@@ -772,13 +769,44 @@ class Flux2Transformer2DModel(nn.Module):
 
         # Remap HF checkpoint keys to our module attribute names
         weights = _remap_checkpoint_keys(weights)
+        # Remap FLUX.2 FFN keys (linear_out -> down_proj)
+        remapped = {}
+        for key, value in weights.items():
+            new_key = key
+            for old, new in _FLUX2_WEIGHT_KEY_REMAPS:
+                new_key = new_key.replace(old, new)
+            remapped[new_key] = value
+        weights = remapped
 
-        # Map fused QKV layer names to original HF checkpoint names
-        # HF checkpoint has separate to_q, to_k, to_v / add_q_proj, add_k_proj, add_v_proj
-        # We fuse them into qkv_proj / add_qkv_proj for better performance
+        # Split pre-fused linear_in weights into gate/up halves for GatedMLP.
+        # HF checkpoint has single linear_in.weight [2*intermediate, hidden],
+        # but GatedMLP.gate_up_proj uses FUSED_GATE_UP_LINEAR mode which
+        # expects separate gate and up weights to concatenate during loading.
+        keys_to_add = {}
+        keys_to_remove = []
+        for key, value in weights.items():
+            if ".linear_in.weight" in key:
+                prefix = key.replace("linear_in.weight", "")
+                gate, up = value.chunk(2, dim=0)
+                keys_to_add[f"{prefix}linear_in_gate.weight"] = gate
+                keys_to_add[f"{prefix}linear_in_up.weight"] = up
+                keys_to_remove.append(key)
+            elif ".linear_in.bias" in key:
+                prefix = key.replace("linear_in.bias", "")
+                gate, up = value.chunk(2, dim=0)
+                keys_to_add[f"{prefix}linear_in_gate.bias"] = gate
+                keys_to_add[f"{prefix}linear_in_up.bias"] = up
+                keys_to_remove.append(key)
+        for k in keys_to_remove:
+            del weights[k]
+        weights.update(keys_to_add)
+
+        # Map fused layer names to original HF checkpoint names.
+        # The loader concatenates these checkpoint keys into fused module weights.
         params_map = {
             "add_qkv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
             "qkv_proj": ["to_q", "to_k", "to_v"],
+            "gate_up_proj": ["linear_in_gate", "linear_in_up"],
         }
 
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)

@@ -75,39 +75,8 @@ class BasePipeline(nn.Module):
             self.transformer.load_weights(weights)
 
     def post_load_weights(self) -> None:
-        if self.transformer is not None:
-            if hasattr(self.transformer, "post_load_weights"):
-                self.transformer.post_load_weights()
-
-            # Handle device placement and FP8 dtype conversion
-            has_fp8 = (
-                self.model_config.quant_config
-                and self.model_config.quant_config.quant_algo
-                and "FP8" in self.model_config.quant_config.quant_algo.name
-            )
-            target_dtype = self.model_config.torch_dtype
-            if has_fp8:
-                self.transformer.to(device="cuda")
-                self._convert_non_fp8_to_target_dtype(target_dtype)
-            else:
-                self.transformer.to(device="cuda", dtype=target_dtype)
-
-    def _convert_non_fp8_to_target_dtype(self, target_dtype) -> None:
-        """Convert non-FP8/non-scale parameters to target dtype.
-
-        When using FP8 quantization:
-        - Linear weights are FP8 (torch.float8_e4m3fn) - keep as-is
-        - Scale parameters (weight_scale, input_scale, etc.) are float32 - keep as-is
-        - Other parameters (LayerNorm, embeddings, biases) - convert to target dtype
-        """
-        scale_suffixes = ("_scale", "inv_input_scale", "inv_kv_scales", "kv_scales")
-
-        for name, param in self.transformer.named_parameters():
-            if param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                continue
-            if any(name.endswith(suffix) for suffix in scale_suffixes):
-                continue
-            param.data = param.data.to(target_dtype)
+        if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
+            self.transformer.post_load_weights()
 
     def _setup_teacache(self, model, coefficients: Optional[Dict] = None):
         """Setup TeaCache optimization for the transformer model.

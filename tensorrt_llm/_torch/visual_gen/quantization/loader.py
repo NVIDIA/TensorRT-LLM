@@ -59,7 +59,7 @@ class DynamicLinearWeightLoader:
         weights_config = getattr(module, "weights_loading_config", None)
         if weights_config is not None:
             weight_mode = getattr(weights_config, "weight_mode", None)
-            if weight_mode == WeightMode.FUSED_QKV_LINEAR:
+            if weight_mode in (WeightMode.FUSED_QKV_LINEAR, WeightMode.FUSED_GATE_UP_LINEAR):
                 fused_names = self._get_fused_names(full_name)
                 return self._get_fused_weights(full_name, weights, fused_names)
 
@@ -187,10 +187,6 @@ class DynamicLinearWeightLoader:
         module_quant_config = getattr(module, "quant_config", None)
         if module_quant_config is not None:
             quant_algo = module_quant_config.quant_algo
-        elif hasattr(module, "quant_config"):
-            # Module explicitly has quant_config=None (e.g., x_embedder with
-            # in_channels < 128). Respect the opt-out — don't quantize.
-            quant_algo = None
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
 

@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX attention utilities: position embeddings and rotary encoding.
+"""FLUX position embedding utilities.
 
 Key Components:
-- FluxPosEmbed: 2D rotary position embeddings for (txt, h, w) axes
+- FluxPosEmbed: Multi-axis rotary position embeddings (FLUX.1: 3-axis, FLUX.2: 4-axis)
 - get_1d_rotary_pos_embed: 1D rotary position embedding computation
-- apply_rotary_emb: Apply rotary embeddings to tensors
 - prepare_flux_image_ids / prepare_flux_text_ids: Position ID helpers
+
+RoPE application uses the shared apply_rotary_emb from modules/attention.py.
 """
 
 from typing import List, Tuple
@@ -62,59 +63,15 @@ def get_1d_rotary_pos_embed(
         return torch.polar(torch.ones_like(freqs), freqs)
 
 
-def apply_rotary_emb(
-    x: torch.Tensor,
-    freqs_cis: Tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    """Apply rotary position embeddings to input tensor.
-
-    Args:
-        x: Input tensor of shape (batch, seq_len, heads, dim) or (batch, seq_len, dim)
-        freqs_cis: Tuple of (cos, sin) from get_1d_rotary_pos_embed or FluxPosEmbed
-
-    Returns:
-        Tensor with RoPE applied, same shape as input
-    """
-    cos, sin = freqs_cis
-
-    # Upcast to float32 for RoPE multiply-add (matches HF diffusers).
-    # BF16 accumulates significant rounding error over 57 blocks x 50 steps.
-    x_fp32 = x.float()
-    cos = cos.float()
-    sin = sin.float()
-
-    # Handle different input shapes
-    ndim = x.ndim
-    if ndim == 4:
-        # (batch, seq, heads, dim)
-        cos = cos.unsqueeze(0).unsqueeze(2)  # (1, seq, 1, dim)
-        sin = sin.unsqueeze(0).unsqueeze(2)
-    elif ndim == 3:
-        # (batch, seq, dim)
-        cos = cos.unsqueeze(0)  # (1, seq, dim)
-        sin = sin.unsqueeze(0)
-
-    # Rotate pairs: [x0, x1, x2, x3, ...] -> [-x1, x0, -x3, x2, ...]
-    x_rotated = torch.stack([-x_fp32[..., 1::2], x_fp32[..., 0::2]], dim=-1).flatten(-2)
-
-    return (x_fp32 * cos + x_rotated * sin).to(x.dtype)
-
-
 class FluxPosEmbed(nn.Module):
-    """2D Rotary Position Embedding for FLUX.
+    """Multi-axis Rotary Position Embedding for FLUX models.
 
-    FLUX uses 3-axis RoPE encoding with dimensions:
-    - txt_dim (16): For text sequence marker
-    - h_dim (56): For height positions
-    - w_dim (56): For width positions
+    Computes RoPE for each axis independently and concatenates the results.
+    Parameterized by axes_dim to support different FLUX variants:
+    - FLUX.1: axes_dim=[16, 56, 56] (3-axis: txt, h, w), theta=10000
+    - FLUX.2: axes_dim=[32, 32, 32, 32] (4-axis: t, h, w, l), theta=2000
 
-    Total: 16 + 56 + 56 = 128 = attention_head_dim
-
-    Position IDs format:
-    - txt_ids: (seq_len, 3) with zeros (text has no spatial position)
-    - img_ids: (seq_len, 3) with [0, h_pos, w_pos] for each patch
-
-    The concatenated IDs (txt_ids + img_ids) are passed to forward().
+    Total dimension = sum(axes_dim) = attention_head_dim (128 for both).
     """
 
     def __init__(self, theta: int = 10000, axes_dim: List[int] = None):
@@ -122,24 +79,21 @@ class FluxPosEmbed(nn.Module):
 
         Args:
             theta: Base for exponential frequency computation
-            axes_dim: Dimensions for each axis [txt_dim, h_dim, w_dim]
-                     Default: [16, 56, 56] which sums to 128
+            axes_dim: Dimensions for each axis. Default: [16, 56, 56] (FLUX.1)
         """
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim if axes_dim is not None else [16, 56, 56]
 
+    @torch.compiler.disable
     def forward(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute rotary embeddings from position IDs.
 
         Args:
-            ids: Position IDs tensor of shape (seq_len, 3)
-                 Column 0: text marker (0 for text, 0 for image)
-                 Column 1: height position
-                 Column 2: width position
+            ids: Position IDs tensor of shape (seq_len, n_axes)
 
         Returns:
-            Tuple of (freqs_cos, freqs_sin), each of shape (seq_len, head_dim)
+            Tuple of (freqs_cos, freqs_sin), each of shape (1, seq_len, 1, head_dim)
         """
         n_axes = ids.shape[-1]
         assert n_axes == len(self.axes_dim), (
@@ -167,9 +121,12 @@ class FluxPosEmbed(nn.Module):
             cos_out.append(cos)
             sin_out.append(sin)
 
-        # Concatenate along dimension axis
+        # Concatenate along dimension axis and reshape to [1, S, 1, D]
+        # to match WAN's format expected by the shared apply_rotary_emb()
         freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
         freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
+        freqs_cos = freqs_cos.unsqueeze(0).unsqueeze(2)
+        freqs_sin = freqs_sin.unsqueeze(0).unsqueeze(2)
 
         return freqs_cos, freqs_sin
 

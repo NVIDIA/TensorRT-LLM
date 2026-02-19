@@ -33,6 +33,7 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -94,7 +95,6 @@ class _AdaLayerNormBase(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
         self.norm = LayerNorm(
             hidden_size=embedding_dim,
@@ -114,7 +114,7 @@ class AdaLayerNormZero(_AdaLayerNormBase):
     def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, **kwargs):
         super().__init__(embedding_dim, num_chunks=6, **kwargs)
 
-    @maybe_compile(dynamic=True)
+    @maybe_compile()
     def forward(
         self, x: torch.Tensor, emb: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -133,7 +133,7 @@ class AdaLayerNormZeroSingle(_AdaLayerNormBase):
     def __init__(self, embedding_dim: int, **kwargs):
         super().__init__(embedding_dim, num_chunks=3, **kwargs)
 
-    @maybe_compile(dynamic=True)
+    @maybe_compile()
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         emb = self.linear(self.silu(emb))
         shift, scale, gate = emb.chunk(3, dim=1)
@@ -155,7 +155,7 @@ class AdaLayerNormContinuous(_AdaLayerNormBase):
             **kwargs,
         )
 
-    @maybe_compile(dynamic=True)
+    @maybe_compile()
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         emb = self.linear(self.silu(emb))
         scale, shift = emb.unsqueeze(1).chunk(2, dim=-1)
@@ -461,7 +461,6 @@ class FluxSingleTransformerBlock(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
         self.act_mlp = _gelu_tanh_eager
 
@@ -474,7 +473,6 @@ class FluxSingleTransformerBlock(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
 
         # Attention (no added_kv_proj_dim since tokens are already concatenated)
@@ -654,22 +652,24 @@ class FluxTransformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
-        # NOTE: x_embedder quantization is disabled when in_channels < 128.
+        # NOTE: x_embedder quantization is excluded when in_channels < 128.
         # FLUX.1 has in_channels=64, which is below the 128-block size required by
         # fp8_block_scaling_gemm (causes NVRTC compilation failure). This layer runs
         # once per forward pass (not in the block loop), so the perf impact is negligible.
-        embedder_quant_config = None if in_channels < 128 else quant_config
+        if in_channels < 128 and quant_config is not None:
+            if quant_config.exclude_modules is None:
+                quant_config.exclude_modules = []
+            if "*x_embedder*" not in quant_config.exclude_modules:
+                quant_config.exclude_modules.append("*x_embedder*")
         self.x_embedder = Linear(
             in_channels,
             self.inner_dim,
             bias=True,
             dtype=dtype,
-            quant_config=embedder_quant_config,
+            quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
 
         # Dual-stream transformer blocks
@@ -728,10 +728,32 @@ class FluxTransformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
-            disable_deep_gemm=True,
         )
 
         self.gradient_checkpointing = False
+
+        self.__post_init__()
+
+    def __post_init__(self):
+        self.apply_quant_config_exclude_modules()
+
+        for _, module in self.named_modules():
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
+
+    def apply_quant_config_exclude_modules(self):
+        quant_config = self.model_config.quant_config
+        if quant_config is None or quant_config.exclude_modules is None:
+            return
+
+        kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
+        no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                is_excluded = quant_config.is_module_excluded_from_quantization(name)
+                if is_excluded and getattr(module, "quant_config", None) is not None:
+                    module.quant_config = no_quant_config
 
     def forward(
         self,

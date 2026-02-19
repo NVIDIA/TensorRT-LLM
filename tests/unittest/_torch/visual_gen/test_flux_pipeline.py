@@ -764,9 +764,8 @@ class TestFluxE2E:
         psnr = 10 * np.log10(255**2 / mse) if mse > 0 else float("inf")
         print(f"\n[E2E FLUX.2] PSNR: {psnr:.2f} dB")
 
-        # FLUX.2 uses Mistral3 text encoder + different VAE/RoPE, so more divergence
         # from HF is expected (~15 dB) compared to FLUX.1 (~32 dB).
-        assert psnr > 12.0, f"PSNR too low: {psnr:.2f} dB (expected >12 dB)"
+        assert psnr > 20.0, f"PSNR too low: {psnr:.2f} dB (expected >20 dB)"
 
         del pipeline
         gc.collect()

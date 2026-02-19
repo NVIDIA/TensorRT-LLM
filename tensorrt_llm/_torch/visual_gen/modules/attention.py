@@ -48,14 +48,7 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
-    """Attention module for visual generation models.
-
-    Args:
-        qk_norm_mode: "full" applies RMSNorm on the full q/k dim (Wan-style, 3D input).
-            "per_head" applies RMSNorm per attention head (FLUX-style, 4D input).
-        bias: Bias for QKV and output projections.
-        out_bias: Bias for output projection only. Defaults to ``bias`` if not set.
-    """
+    """Attention module for visual generation models."""
 
     def __init__(
         self,
