@@ -655,8 +655,8 @@ def test_sequence_info_estimate_cache_tokens_per_forward_with_overflow():
     assert result == 128
 
 
-def test_sequence_info_estimate_cache_loc_capacity_no_resize():
-    """Test estimate_cache_loc_capacity() when capacity is sufficient."""
+def test_sequence_info_update_cache_information_no_resize():
+    """Test update_cache_information() when capacity is sufficient."""
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
@@ -667,15 +667,15 @@ def test_sequence_info_estimate_cache_loc_capacity_no_resize():
     initial_capacity = seq_info._input_buffer.get_capacity("cache_loc")
 
     # Request a small capacity that should already be available
-    seq_info.estimate_cache_loc_capacity(num_blocks=4)
+    seq_info.update_cache_information(num_blocks=4)
 
     # Capacity should not have changed if it was already sufficient
     if initial_capacity >= 4 * 4 + 1:  # num_blocks * max_batch_size + 1
         assert seq_info._input_buffer.get_capacity("cache_loc") == initial_capacity
 
 
-def test_sequence_info_estimate_cache_loc_capacity_resizes():
-    """Test estimate_cache_loc_capacity() resizes buffer when needed."""
+def test_sequence_info_update_cache_information_resizes():
+    """Test update_cache_information() resizes buffer when needed."""
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
@@ -687,7 +687,7 @@ def test_sequence_info_estimate_cache_loc_capacity_resizes():
 
     # Request a large capacity
     large_num_blocks = 1000
-    seq_info.estimate_cache_loc_capacity(num_blocks=large_num_blocks)
+    seq_info.update_cache_information(num_blocks=large_num_blocks)
 
     expected_capacity = large_num_blocks * 4 + 1  # num_blocks * max_batch_size + 1
     if expected_capacity > initial_capacity:
@@ -886,3 +886,116 @@ def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
     assert interface._caches["generic_state"] is not None
     # Without typed handlers, should use plain KVCacheManager
     assert isinstance(interface.kv_cache_manager, KVCacheManager)
+
+
+# =============================================================================
+# _requires_copy Tests
+# =============================================================================
+
+
+def test_requires_copy_pre_populated():
+    """Verify _requires_copy is pre-populated with expected args."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    expected = {
+        "max_seq_info",
+        "page_seq_indices",
+        "page_in_seq",
+        "logits_gather_indices",
+        "logits_gather_info",
+        "_gather_idx",
+        "_mask_scatter_indices",
+    }
+    assert expected.issubset(seq_info._requires_copy)
+
+
+def test_requires_copy_args_not_in_named_args():
+    """Verify that _requires_copy args do NOT appear in named_args."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    named_args = seq_info.named_args
+    for rc_arg in seq_info._requires_copy:
+        assert rc_arg not in named_args, f"{rc_arg} should not be in named_args"
+        assert f"{rc_arg}_host" not in named_args, f"{rc_arg}_host should not be in named_args"
+
+
+def test_requires_copy_args_stored_to_input_buffer():
+    """Verify that _requires_copy args are written to InputBuffer by _store_arg."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    # logits_gather_indices is in _requires_copy, so nest_sequences should store it
+    seq_info.nest_sequences(
+        input_ids=[[1, 2, 3]],
+        input_pos=0,
+        cache_loc=[0],
+        pages_per_seq=[1],
+    )
+
+    # Should be accessible via _get_arg (reads from InputBuffer)
+    logits_gather_indices = seq_info._get_arg("logits_gather_indices")
+    assert logits_gather_indices is not None
+
+    logits_gather_info = seq_info._get_arg("logits_gather_info")
+    assert logits_gather_info is not None
+
+
+def test_require_copy_marks_new_arg():
+    """Verify require_copy() adds an arg to _requires_copy."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    # cu_seqlen is available but not in _requires_copy by default
+    assert "cu_seqlen" not in seq_info._requires_copy
+
+    result = seq_info.require_copy("cu_seqlen")
+    assert result is True
+    assert "cu_seqlen" in seq_info._requires_copy
+
+    # Second call should return False (already marked)
+    result = seq_info.require_copy("cu_seqlen")
+    assert result is False
+
+
+def test_require_copy_rejects_unavailable_arg():
+    """Verify require_copy() rejects args not in available_args."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    with pytest.raises(AssertionError):
+        seq_info.require_copy("nonexistent_arg")
+
+
+def test_register_host_prepare_populates_requires_copy():
+    """Verify register_host_prepare_for_attention_forward auto-populates _requires_copy."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    # Define a dummy host prepare function
+    def dummy_host_prepare(batch_info_host: torch.Tensor, cu_num_pages_host: torch.Tensor):
+        pass
+
+    # batch_info_host and cu_num_pages_host should be marked in _requires_copy
+    seq_info.register_host_prepare_for_attention_forward(
+        dummy_host_prepare, ["batch_info_host", "cu_num_pages_host"]
+    )
+
+    assert "batch_info_host" in seq_info._requires_copy
+    assert "cu_num_pages_host" in seq_info._requires_copy
+
+
+def test_requires_copy_host_suffix_enables_base_storage():
+    """Verify that marking a _host arg enables storage of the base arg."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    # Mark batch_info_host as requires_copy
+    seq_info.require_copy("batch_info_host")
+
+    # nest_sequences stores batch_info (base name) -- the _host suffix check in
+    # _store_arg should allow it through because batch_info_host is in _requires_copy
+    seq_info.nest_sequences(
+        input_ids=[[1, 2, 3]],
+        input_pos=0,
+        cache_loc=[0],
+        pages_per_seq=[1],
+    )
+
+    # batch_info_host should be accessible via _get_arg
+    batch_info_host = seq_info._get_arg("batch_info_host")
+    assert batch_info_host is not None

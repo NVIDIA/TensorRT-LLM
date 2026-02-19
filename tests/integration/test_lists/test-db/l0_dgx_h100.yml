@@ -337,8 +337,8 @@ l0_dgx_h100:
       orchestrator: mpi
   tests:
   - unittest/_torch/auto_deploy/unit/multigpu
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-4]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[False-4]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[True-4]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-4]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16[trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[False-trtllm-4]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[True-trtllm-8]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_attention_dp[4]
