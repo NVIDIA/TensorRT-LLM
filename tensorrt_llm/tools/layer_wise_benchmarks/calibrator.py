@@ -8,7 +8,7 @@ from typing import Optional
 import nvtx
 import torch
 
-from tensorrt_llm._utils import use_pinned_memory
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
 
@@ -488,7 +488,7 @@ class Calibrator:
                 self.MAX_SLOTS_BUFFER_SIZE,
                 dtype=torch.int32,
                 device="cpu",
-                pin_memory=use_pinned_memory(),
+                pin_memory=prefer_pinned(),
             )
             self._collected_records = []
 

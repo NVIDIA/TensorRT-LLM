@@ -13,8 +13,7 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import (get_sm_version, maybe_pin_memory,
-                                 use_pinned_memory)
+from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -875,7 +874,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu = torch.empty_like(
             self.prompt_lens_cuda,
             device='cpu',
-            pin_memory=use_pinned_memory(),
+            pin_memory=prefer_pinned(),
         )
         self.kv_lens_cuda = self.get_empty_like(
             buffers,
@@ -885,7 +884,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         )
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
-                                        pin_memory=use_pinned_memory())
+                                        pin_memory=prefer_pinned())
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
 
@@ -935,7 +934,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.draft_host_kv_cache_block_offsets = torch.empty_like(
                     self.draft_kv_cache_block_offsets,
                     device='cpu',
-                    pin_memory=use_pinned_memory(),
+                    pin_memory=prefer_pinned(),
                 )
 
             if self.enable_flash_mla:
@@ -971,7 +970,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_ctx_cached_token_indptr = torch.zeros_like(
                     self.ctx_cached_token_indptr,
                     device='cpu',
-                    pin_memory=use_pinned_memory(),
+                    pin_memory=prefer_pinned(),
                 )
                 self.ctx_uncached_token_indptr = self.get_empty(
                     buffers,
@@ -983,7 +982,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_ctx_uncached_token_indptr = torch.zeros_like(
                     self.ctx_uncached_token_indptr,
                     device='cpu',
-                    pin_memory=use_pinned_memory(),
+                    pin_memory=prefer_pinned(),
                 )
                 # context full seqlens include cached tokens and uncached tokens
                 self.ctx_kv_indptr = self.get_empty(
@@ -996,7 +995,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_ctx_kv_indptr = torch.zeros_like(
                     self.ctx_kv_indptr,
                     device='cpu',
-                    pin_memory=use_pinned_memory(),
+                    pin_memory=prefer_pinned(),
                 )
 
         # Allocate static buffers for helix parallelism support.
@@ -1011,7 +1010,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_position_offsets_cpu = torch.empty_like(
                 self.helix_position_offsets,
                 device='cpu',
-                pin_memory=use_pinned_memory(),
+                pin_memory=prefer_pinned(),
             )
             self.helix_is_inactive_rank = self.get_empty(
                 buffers,
@@ -1023,7 +1022,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_is_inactive_rank_cpu = torch.empty_like(
                 self.helix_is_inactive_rank,
                 device='cpu',
-                pin_memory=use_pinned_memory(),
+                pin_memory=prefer_pinned(),
             )
 
     def on_update_kv_lens(self):
@@ -1279,7 +1278,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_chunked_seq_len = torch.zeros_like(
                     self.chunked_seq_len,
                     device='cpu',
-                    pin_memory=use_pinned_memory(),
+                    pin_memory=prefer_pinned(),
                 )
                 self.cu_chunked_seq_len = torch.zeros(
                     (self.chunked_loop_num, self.num_contexts + 1),
@@ -1289,7 +1288,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_cu_chunked_seq_len = torch.zeros_like(
                     self.cu_chunked_seq_len,
                     device='cpu',
-                    pin_memory=use_pinned_memory(),
+                    pin_memory=prefer_pinned(),
                 )
                 self.chunked_global_offset = torch.zeros(
                     (self.chunked_loop_num + 1, self.num_contexts),
@@ -1299,7 +1298,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_chunked_global_offset = torch.zeros_like(
                     self.chunked_global_offset,
                     device='cpu',
-                    pin_memory=use_pinned_memory(),
+                    pin_memory=prefer_pinned(),
                 )
                 self.max_chunk_len_per_loop = []
                 # For last chunk we use the uncached kv
@@ -1311,7 +1310,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_merge_op_tensor = torch.empty_like(
                     self.merge_op_tensor,
                     device='cpu',
-                    pin_memory=use_pinned_memory(),
+                    pin_memory=prefer_pinned(),
                 )
 
                 self.pre_process_for_chunked_prefill(
@@ -1553,7 +1552,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         max_draft_len + 1,
                         dtype=torch.int,
                         device='cpu',
-                        pin_memory=use_pinned_memory()).repeat(batch_size)
+                        pin_memory=prefer_pinned()).repeat(batch_size)
                     self.spec_decoding_position_offsets.reshape(
                         -1)[:(max_draft_len + 1) * batch_size].copy_(
                             position_offset, non_blocking=True)
@@ -1586,7 +1585,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         position_offset = torch.arange(max_draft_len + 1,
                                        dtype=torch.int,
                                        device='cpu',
-                                       pin_memory=use_pinned_memory())
+                                       pin_memory=prefer_pinned())
         # fill all the batches with same position offset
         self.spec_decoding_position_offsets.copy_(position_offset,
                                                   non_blocking=True)

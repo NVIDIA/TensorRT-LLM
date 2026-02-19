@@ -9,7 +9,7 @@ from transformers.modeling_utils import (get_parameter_device,
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 
-from tensorrt_llm._utils import use_pinned_memory
+from tensorrt_llm._utils import prefer_pinned
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            PredefinedAttentionMask)
@@ -208,7 +208,7 @@ class CLIPVisionModel(nn.Module):
         prompt_lens = [seq_len] * batch_size
         seq_lens = torch.tensor([seq_len] * batch_size,
                                 dtype=torch.int,
-                                pin_memory=use_pinned_memory())
+                                pin_memory=prefer_pinned())
 
         self.attn_metadata.num_contexts = batch_size
         self.attn_metadata.request_ids = request_ids

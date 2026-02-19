@@ -27,7 +27,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ..._utils import nvtx_range, use_pinned_memory
+from ..._utils import nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
@@ -777,7 +777,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         prompt_lens = seq_lens
         seq_lens = torch.tensor(seq_lens,
                                 dtype=torch.int,
-                                pin_memory=use_pinned_memory())
+                                pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.num_contexts = len(seq_lens)

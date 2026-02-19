@@ -35,7 +35,7 @@ from torch.types import Number
 
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-from ...._utils import nvtx_range, str_dtype_to_torch, use_pinned_memory
+from ...._utils import nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
@@ -111,7 +111,7 @@ class InputBuffer:
         if self._total_bytes > 0:
             self._device_buffer = torch.empty(self._total_bytes, dtype=torch.uint8)
             self._host_buffer = torch.empty(
-                self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=use_pinned_memory()
+                self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
             )
         else:
             self._device_buffer = torch.empty(0, dtype=torch.uint8)
@@ -130,7 +130,7 @@ class InputBuffer:
             byte_size = numel * dtype.itemsize
             self._trunc_device_bufs[name] = torch.empty(byte_size, dtype=torch.uint8)
             self._trunc_host_bufs[name] = torch.empty(
-                byte_size, dtype=torch.uint8, device="cpu", pin_memory=use_pinned_memory()
+                byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
             )
             # Create typed views
             self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
@@ -262,7 +262,7 @@ class InputBuffer:
         # Host buffer must be re-allocated for pinned memory
         old_host = self._trunc_host_bufs[name]
         self._trunc_host_bufs[name] = torch.empty(
-            new_byte_size, dtype=torch.uint8, device="cpu", pin_memory=use_pinned_memory()
+            new_byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
         )
         self._trunc_host_bufs[name][: old_host.numel()].copy_(old_host)
         del old_host

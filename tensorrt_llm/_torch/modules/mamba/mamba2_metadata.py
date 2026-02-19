@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
-from tensorrt_llm._utils import use_pinned_memory
+from tensorrt_llm._utils import prefer_pinned
 
 
 @triton.jit
@@ -196,7 +196,7 @@ class Mamba2Metadata:
 
         self.state_indices_cpu = torch.zeros(max_batch_size,
                                              dtype=torch.int32,
-                                             pin_memory=use_pinned_memory())
+                                             pin_memory=prefer_pinned())
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
