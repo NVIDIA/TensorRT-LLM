@@ -405,38 +405,38 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
     class _Store:
         """Auxiliary data structures used for efficiently grouping requests for batched sampling."""
 
-        slots_needing_recompute: set
+        slots_needing_recompute: set[int]
         """Slots where strategy needs (re)computation. Populated in setup_sampler_step."""
-        need_processed: list
-        """Length: max_num_sequences. True if logprob mode is PROCESSED and return_log_probs is set."""
-        need_raw: list
-        """Length: max_num_sequences. True if logprob mode is RAW and return_log_probs is set."""
-        strategies: list
-        """Length: max_num_sequences. Stores cached Strategy tuple for each seq_slot."""
-        uses_beam_search: list
-        """Length: max_num_sequences. True if max_beam_width > 1 for this slot."""
-        non_greedy_slots: set
+        non_greedy_slots: set[int]
         """Slots with non-greedy strategies. Used to limit draft-token checks."""
-        speculation_needs_probs: list
+        need_processed_logprobs: list[bool]
+        """Length: max_num_sequences. True if logprob mode is PROCESSED and return_log_probs is set."""
+        need_raw_logprobs: list[bool]
+        """Length: max_num_sequences. True if logprob mode is RAW and return_log_probs is set."""
+        speculation_needs_probs: list[bool]
         """Length: max_num_sequences. True if request has draft tokens and non-greedy sampling."""
-        needs_probs: list
-        """Length: max_num_sequences. True if speculation_needs_probs or need_processed."""
+        needs_probs: list[bool]
+        """Length: max_num_sequences. True if speculation_needs_probs or need_processed_logprobs."""
+        strategies: list[Strategy | None]
+        """Length: max_num_sequences. Stores cached Strategy tuple for each seq_slot."""
+        uses_beam_search: list[bool]
+        """Length: max_num_sequences. True if max_beam_width > 1 for this slot."""
 
     def __init__(self, max_num_sequences: int):
         # Use Python lists instead of tensors to avoid .item() overhead in hot loops
-        speculation_needs_probs: list = [False] * max_num_sequences
-        need_processed: list = [False] * max_num_sequences
-        need_raw: list = [False] * max_num_sequences
-        needs_probs: list = [False] * max_num_sequences
-        strategies: list = [None] * max_num_sequences
-        uses_beam_search: list = [False] * max_num_sequences
-        slots_needing_recompute: set = set()
-        non_greedy_slots: set = set()
+        speculation_needs_probs = [False] * max_num_sequences
+        need_processed_logprobs = [False] * max_num_sequences
+        need_raw_logprobs = [False] * max_num_sequences
+        needs_probs = [False] * max_num_sequences
+        strategies: list[Strategy | None] = [None] * max_num_sequences
+        uses_beam_search = [False] * max_num_sequences
+        slots_needing_recompute: set[int] = set()
+        non_greedy_slots: set[int] = set()
 
         self._store = self._Store(
             speculation_needs_probs=speculation_needs_probs,
-            need_processed=need_processed,
-            need_raw=need_raw,
+            need_processed_logprobs=need_processed_logprobs,
+            need_raw_logprobs=need_raw_logprobs,
             needs_probs=needs_probs,
             strategies=strategies,
             uses_beam_search=uses_beam_search,
@@ -471,9 +471,9 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
 
         # Convert to list for efficient indexing
         requests_list = list(requests) if not isinstance(requests, list) else requests
-        n = len(requests_list)
+        num_requests = len(requests_list)
 
-        if n == 0:
+        if num_requests == 0:
             return {}
 
         assert not seq_slots.is_cuda, "seq_slots is expected to be a host tensor"
@@ -487,7 +487,7 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
 
         # Build strategies from cache in one shot (C-level list comprehension, ~50ns/elem)
         s_strategies = store.strategies
-        strategies = [s_strategies[slot] for slot in seq_slots_list]
+        batch_strategies = [s_strategies[slot] for slot in seq_slots_list]
 
         # Build slot→request_index mapping for targeted access
         slot_to_idx = {slot: i for i, slot in enumerate(seq_slots_list)}
@@ -500,43 +500,47 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
         #    (For greedy: current_has_draft is always False, matching cached, so never stale)
         draft_check_slots = (store.non_greedy_slots & active_slots) - recompute_batch_slots
         for slot in draft_check_slots:
-            i = slot_to_idx[slot]
-            has_draft = bool(requests_list[i].py_draft_tokens)
+            batch_index = slot_to_idx[slot]
+            has_draft = bool(requests_list[batch_index].py_draft_tokens)
             if store.speculation_needs_probs[slot] != has_draft:
                 # Draft-token status changed — only update the affected flags.
                 # The strategy itself doesn't depend on draft tokens (only on sampling params).
                 store.speculation_needs_probs[slot] = has_draft
-                store.needs_probs[slot] = has_draft or store.need_processed[slot]
+                store.needs_probs[slot] = has_draft or store.need_processed_logprobs[slot]
 
         # 3) Full recompute for the pre-recorded slots.
         #    Every slot with a None strategy must already be in slots_needing_recompute
         #    (populated by setup_sampler_step when a new request arrives).
-        assert None not in strategies or all(
-            seq_slots_list[i] in recompute_batch_slots for i in range(n) if strategies[i] is None
+        assert None not in batch_strategies or all(
+            seq_slots_list[batch_index] in recompute_batch_slots
+            for batch_index in range(num_requests)
+            if batch_strategies[batch_index] is None
         ), (
             "Found slots with uncached strategies not registered in slots_needing_recompute. "
             "Ensure setup_sampler_step is called before sample_async for new requests."
         )
 
         for slot in recompute_batch_slots:
-            i = slot_to_idx[slot]
-            request = requests_list[i]
+            batch_index = slot_to_idx[slot]
+            request = requests_list[batch_index]
             has_draft_tokens = bool(request.py_draft_tokens)
 
             strategy = _request_strategy(request, vocab_size=vocab_size)
             store.strategies[slot] = strategy
-            strategies[i] = strategy
+            batch_strategies[batch_index] = strategy
 
             is_greedy = strategy == GREEDY
-            store.speculation_needs_probs[slot] = has_draft_tokens and not is_greedy
-            store.need_processed[slot] = (
+            current_speculation_needs_probs = has_draft_tokens and not is_greedy
+            store.speculation_needs_probs[slot] = current_speculation_needs_probs
+            current_need_processed_logprobs = (
                 request.py_logprobs_mode == LogprobMode.PROCESSED and request.return_log_probs
             )
-            store.need_raw[slot] = (
+            store.need_processed_logprobs[slot] = current_need_processed_logprobs
+            store.need_raw_logprobs[slot] = (
                 request.py_logprobs_mode == LogprobMode.RAW and request.return_log_probs
             )
             store.needs_probs[slot] = (
-                store.speculation_needs_probs[slot] or store.need_processed[slot]
+                current_speculation_needs_probs or current_need_processed_logprobs
             )
 
             # Track non-greedy slots for future draft-token checks
@@ -559,22 +563,26 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
             dtype=torch.bool,
             device="cpu",
         )
-        need_processed = torch.tensor(
-            [store.need_processed[slot] for slot in seq_slots_list], dtype=torch.bool, device="cpu"
+        need_processed_logprobs = torch.tensor(
+            [store.need_processed_logprobs[slot] for slot in seq_slots_list],
+            dtype=torch.bool,
+            device="cpu",
         )
-        need_raw = torch.tensor(
-            [store.need_raw[slot] for slot in seq_slots_list], dtype=torch.bool, device="cpu"
+        need_raw_logprobs = torch.tensor(
+            [store.need_raw_logprobs[slot] for slot in seq_slots_list],
+            dtype=torch.bool,
+            device="cpu",
         )
         # Build strategy ID mapping for vectorized comparison (all on CPU).
         # NB: set() does not preserve insertion order, so we use dict.fromkeys() to deduplicate while preserving order.
-        unique_strategies = list(dict.fromkeys(strategies))
+        unique_strategies = list(dict.fromkeys(batch_strategies))
         strategy_to_id = {s: idx for idx, s in enumerate(unique_strategies)}
         strategy_ids = torch.tensor(
-            [strategy_to_id[s] for s in strategies], dtype=torch.int32, device="cpu"
+            [strategy_to_id[s] for s in batch_strategies], dtype=torch.int32, device="cpu"
         )
 
         # Pre-allocate group_ids array
-        group_ids = torch.empty(n, dtype=torch.int32, device="cpu")
+        group_ids = torch.empty(num_requests, dtype=torch.int32, device="cpu")
 
         _next_gid = 0
 
@@ -605,7 +613,7 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
         group_starts = torch.nonzero(
             torch.diff(sorted_group_ids, prepend=torch.tensor([-1], device="cpu")) != 0
         ).squeeze(1)
-        group_ends = torch.cat([group_starts[1:], torch.tensor([n], device="cpu")])
+        group_ends = torch.cat([group_starts[1:], torch.tensor([num_requests], device="cpu")])
         # Since groups are assigned in request order, gid → key is just list indexing
         id_to_key = list(unique_keys)
 
@@ -619,11 +627,13 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
             indices_arr = group_sorted_indices.to(torch.int32)
             # Convert to list for Python list indexing
             group_sorted_indices_list = group_sorted_indices.tolist()
-            group_strategies = [strategies[i] for i in group_sorted_indices_list]
+            group_strategies = [
+                batch_strategies[batch_index] for batch_index in group_sorted_indices_list
+            ]
             spec_mask = speculation_needs_probs[group_sorted_indices]
             spec_indices = indices_arr[spec_mask]
-            processed_flags = need_processed[group_sorted_indices]
-            raw_flags = need_raw[group_sorted_indices]
+            processed_flags = need_processed_logprobs[group_sorted_indices]
+            raw_flags = need_raw_logprobs[group_sorted_indices]
 
             if pin_memory:
                 indices_tensor = indices_arr.pin_memory()
