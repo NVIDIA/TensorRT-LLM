@@ -11,9 +11,6 @@ import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.flashinfer_fused_add_rms_norm import (
     flashinfer_fused_add_rms_norm,
 )
-from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.trtllm_fused_add_rms_norm_quant_nvfp4 import (
-    trtllm_fused_add_rms_norm_quant_nvfp4,
-)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8 import (
@@ -655,91 +652,3 @@ def test_fuse_rmsnorm_quant_nvfp4(num_linears, fused_add, extra_norm_consumer):
     else:
         fused_out = gm(x)
     _assert_numerics(ref_out, fused_out, extra_norm_consumer)
-
-
-@pytest.mark.skipif(
-    not (fp4_compatible() and trtllm_ops_available()),
-    reason="Requires FP4 support and TRT-LLM ops",
-)
-def test_debug_nvfp4_fused_add_intermediates():
-    """Compare add_out and norm_out (bf16) from FlashInfer vs C++ fused kernel to isolate divergence.
-
-    Reference: flashinfer_fused_add_rms_norm (in-place) then norm_out = first return, add_out = second.
-    Fused: trtllm_fused_add_rms_norm_quant_nvfp4(x, residual, weight, eps, scale) -> (bf16_norm, _, _, add_out).
-    If add_out or bf16_norm differ, the bug is in the C++ kernel. If they match, the bug is in quant/gemm wiring.
-    """
-    torch.manual_seed(0)
-    K, N = 2048, 2048
-    model = _RMSNormNVFP4FusedAddModel(
-        in_features=K,
-        out_features=N,
-        num_linears=1,
-    ).cuda()
-    x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-    weight = model.norm_weight
-    eps = 1e-5
-    scale = model.input_scale
-
-    # Reference: FlashInfer in-place; returns (norm_out, add_out) = (x_after_norm, residual_after_add)
-    x_ref = x.clone()
-    res_ref = residual.clone()
-    norm_out_ref, add_out_ref = flashinfer_fused_add_rms_norm(x_ref, res_ref, weight, eps)
-
-    # Fused: C++ kernel (no in-place)
-    bf16_norm_fused, fp4_u8_fused, sf_out_fused, add_out_fused = (
-        trtllm_fused_add_rms_norm_quant_nvfp4(x, residual, weight, eps, scale)
-    )
-
-    # Compare add_out (pre-norm sum: x + residual)
-    try:
-        torch.testing.assert_close(add_out_ref, add_out_fused, atol=0, rtol=0)
-        print("GAGAM debug_nvfp4_fused_add: add_out REF vs FUSED match")
-    except AssertionError:
-        diff = (add_out_ref - add_out_fused).abs()
-        print(
-            "GAGAM debug_nvfp4_fused_add: add_out MISMATCH max_abs_diff=%s mean_diff=%s"
-            % (diff.max().item(), diff.float().mean().item())
-        )
-        raise
-
-    # Compare norm_out (bf16 normalized)
-    try:
-        torch.testing.assert_close(norm_out_ref, bf16_norm_fused, atol=0, rtol=0)
-        print("GAGAM debug_nvfp4_fused_add: norm_out (bf16) REF vs FUSED match")
-    except AssertionError:
-        diff = (norm_out_ref - bf16_norm_fused).abs()
-        print(
-            "GAGAM debug_nvfp4_fused_add: norm_out MISMATCH max_abs_diff=%s mean_diff=%s"
-            % (diff.max().item(), diff.float().mean().item())
-        )
-        raise
-
-    # If we get here, add and norm match; compare full pipeline (ref linear on norm_out_ref vs gemm on fused fp4)
-    ref_linear_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
-        norm_out_ref,
-        model.w_fp4_0,
-        bias=None,
-        input_scale=model.input_scale,
-        weight_scale=model.w_scale_0,
-        alpha=model.alpha_0,
-    )
-    fused_gemm_out = torch.ops.auto_deploy.trtllm_nvfp4_gemm.default(
-        fp4_u8_fused,
-        model.w_fp4_0,
-        sf_out_fused,
-        model.w_scale_0,
-        model.alpha_0,
-        bias=None,
-        out_dtype="bfloat16",
-    )
-    try:
-        torch.testing.assert_close(ref_linear_out, fused_gemm_out, atol=0, rtol=0)
-        print("GAGAM debug_nvfp4_fused_add: linear_out (ref linear vs fused gemm) match")
-    except AssertionError:
-        diff = (ref_linear_out - fused_gemm_out).abs()
-        print(
-            "GAGAM debug_nvfp4_fused_add: linear_out MISMATCH max_abs_diff=%s mean_diff=%s"
-            % (diff.max().item(), diff.float().mean().item())
-        )
-        raise
