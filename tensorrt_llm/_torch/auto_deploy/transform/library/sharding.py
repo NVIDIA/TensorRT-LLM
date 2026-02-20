@@ -2728,7 +2728,7 @@ def detect_sharding_from_config(
                     if _process_ssm_sharding(layer_subgraph, transform_container) > 0:
                         num_ssm_shards += 1
                         num_row_col_shards += 1
-                elif config == "gdn":
+                elif config == "delta":
                     if _process_delta_sharding(layer_subgraph, transform_container) > 0:
                         num_delta_shards += 1
                         num_row_col_shards += 1
