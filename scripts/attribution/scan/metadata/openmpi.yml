@@ -1,0 +1,5 @@
+name: openmpi
+description: Open MPI - a high performance message passing library (via HPC-X)
+source: container
+directory_matches:
+- /opt/hpcx/ompi

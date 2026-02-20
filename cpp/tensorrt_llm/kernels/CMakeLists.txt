@@ -56,6 +56,19 @@ if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
 endif()
 
+# Lower CUDA optimization level when FAST_BUILD is enabled to speed up
+# compilation. CMake by default adds -O3 to CMAKE_CUDA_FLAGS_RELEASE. We
+# override it here before creating the target to avoid the "incompatible
+# redefinition" warning.
+if(FAST_BUILD)
+  string(REPLACE "-O3" "-O1" CMAKE_CUDA_FLAGS_RELEASE
+                 "${CMAKE_CUDA_FLAGS_RELEASE}")
+  string(REPLACE "-O3" "-O1" CMAKE_CUDA_FLAGS_RELWITHDEBINFO
+                 "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+  message(
+    STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
+endif()
+
 add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

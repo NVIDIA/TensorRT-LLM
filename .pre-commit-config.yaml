@@ -1401,7 +1401,7 @@ repos:
         args: [--allow-multiple-documents, --unsafe]
         exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
-        exclude: '\.(patch|md)$'
+        exclude: '(\.(patch|md)|scripts/attribution/data/cas/.*)$'
     -   id: check-toml
     -   id: mixed-line-ending
         args: [--fix=lf]
@@ -1442,6 +1442,7 @@ repos:
         - tomli
         # add ignore words list
         args: ["-L", "Mor,ans,thirdparty,subtiles", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
