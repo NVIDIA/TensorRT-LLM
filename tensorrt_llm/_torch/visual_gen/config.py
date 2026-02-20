@@ -196,14 +196,19 @@ class PipelineConfig(BaseModel):
     """General pipeline configuration."""
 
     enable_torch_compile: bool = True
-    torch_compile_models: str = PipelineComponent.TRANSFORMER
-    torch_compile_mode: str = "default"
+    torch_compile_models: List[str] = []  # empty = auto detect transformer components
+    torch_compile_mode: Literal["default", "max-autotune", "reduce-overhead"] = "default"
+    enable_fullgraph: bool = False
     fuse_qkv: bool = True
+    enable_cuda_graph: bool = False
+    enable_layerwise_nvtx_marker: bool = False
 
     # Offloading Config
     enable_offloading: bool = False
     offload_device: Literal["cpu", "cuda"] = "cpu"
     offload_param_pin_memory: bool = True
+
+    warmup_steps: int = 1  # Number of denoising steps to run during warmup (0 to disable)
 
 
 # =============================================================================
