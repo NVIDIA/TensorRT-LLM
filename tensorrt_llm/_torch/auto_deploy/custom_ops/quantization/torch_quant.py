@@ -471,6 +471,16 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
     return y, s
 
 
+def _dequant_block_fp8_weight(weight_fp8, weight_scale, block_n, block_k, dtype=torch.bfloat16):
+    """Dequantize block-scaled FP8 weight to BF16 for tiny projections."""
+    N, K = weight_fp8.shape
+    scale_expanded = weight_scale.repeat_interleave(block_n, dim=0).repeat_interleave(
+        block_k, dim=1
+    )
+    scale_expanded = scale_expanded[:N, :K]
+    return weight_fp8.to(dtype) * scale_expanded.to(dtype)
+
+
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
 def torch_fake_quant_finegrained_fp8_linear(
     input: torch.Tensor,  # [..., K]
@@ -572,20 +582,12 @@ def trtllm_finegrained_fp8_linear(
     # size will be < 128.  Fall back to the Triton-based implementation which
     # handles arbitrary block sizes correctly.
     if block_n != 128 or block_k != 128:
-        from transformers.integrations.finegrained_fp8 import w8a8_block_fp8_matmul_triton
-
-        block_size = [block_n, block_k]
-        qinput, act_scale = _safe_act_quant(input, block_size[1])
-        output = w8a8_block_fp8_matmul_triton(
-            qinput,
-            weight,
-            act_scale,
-            weight_scale,
-            block_size,
-            output_dtype=input.dtype,
+        # BF16 fallback: the Triton FP8 kernel launches Grid=1x1x1 for tiny N,
+        # wasting 99% of SM capacity. Dequantize weight + cuBLAS is faster.
+        weight_dequant = _dequant_block_fp8_weight(
+            weight, weight_scale, block_n, block_k, dtype=input.dtype
         )
-        if bias is not None:
-            output = output + bias
+        output = torch.nn.functional.linear(input, weight_dequant, bias)
         return output.reshape(*input_shape[:-1], N) if len(input_shape) > 2 else output
 
     # Flatten input for GEMM: [..., K] -> [M, K]
