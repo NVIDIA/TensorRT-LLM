@@ -147,6 +147,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp.yaml"
          ),
+        "deepseek_v3_lite_fp8_attention_dp_gen_only":
+        (4,
+         f"{test_configs_root}/disagg_config_gentp2_deepseek_v3_lite_attention_dp_gen_only.yaml"
+         ),
         "deepseek_v3_lite_fp_8_attention_dp_overlap":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap.yaml"
@@ -384,7 +388,7 @@ def run_client_tests(example_dir,
         if client_test_set.chat_streaming and client_test_set.verify_streaming_chat:
             output_files.append('output_streaming_chat.json')
 
-        if test_desc.startswith("gen_only"):
+        if test_desc.endswith("gen_only") or test_desc.startswith("gen_only"):
             continue
 
         for output_file in output_files:
@@ -1341,6 +1345,31 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp",
                            env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_attention_dp_gen_only",
+                           env=env,
                            cwd=llm_venv.get_working_directory())
 
 
