@@ -2815,13 +2815,26 @@ class Linear(nn.Module):
                         if window_out is not None:
                             output = self.quant_method.apply_out(
                                 self, input, bias, window_out)
+                            # apply_out may fall back (e.g. float8) and return a
+                            # new tensor; window path is not used in that case.
+                            if output.data_ptr() != window_out.data_ptr():
+                                logger.warning_once(
+                                    "NCCL window output path not used: apply_out did not write "
+                                    "into the provided buffer (e.g. float8 where torch.matmul(out=) "
+                                    "is unsupported). Proceeding with non-window buffer.",
+                                    key="linear_apply_out_window_fallback",
+                                )
+                                window_out = None
                         else:
                             output = self.apply_linear(input, bias, lora_params,
                                                        layer_idx)
                     else:
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)
-                    window_success = window_attempted and window_out is not None
+                    window_success = (window_attempted
+                                      and window_out is not None
+                                      and output.data_ptr()
+                                      == window_out.data_ptr())
                     window_info = ""
                     if window_attempted:
                         window_info = f" (path={window_path})"
