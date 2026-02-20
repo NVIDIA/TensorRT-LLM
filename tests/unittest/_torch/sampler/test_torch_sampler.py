@@ -647,6 +647,7 @@ class TestFinishReasons:
                     disable_overlap_scheduler=False,
                 )
                 sampler = TorchSampler(args=sampler_args)
+                finish_reasons_store = sampler._finish_reasons_handler.store
                 # setup the sampler store for the requests
                 scheduled_requests = ScheduledRequests()
                 scheduled_requests.context_requests = [req.request for req in requests]
@@ -654,7 +655,7 @@ class TestFinishReasons:
 
                 # fill with garbage value so we can observe that finish reasons are filled
                 # with NOT_FINISHED before we write to them.
-                sampler.store.finish_reasons.fill_(205)
+                finish_reasons_store.finish_reasons_cuda.fill_(205)
                 seq_slots_host = torch.tensor(
                     [req.request.py_seq_slot for req in requests], device="cpu", dtype=torch.int64
                 )
@@ -669,7 +670,7 @@ class TestFinishReasons:
                 ).T
                 sampler.store.new_tokens[:, seq_slots_device, cls.BEAM] = new_tokens
                 num_accepted_tokens, stop_word_indices, single_token_stop_words_only = (
-                    sampler._prepare_stop_word_handling_for_finish_reasons(
+                    sampler._finish_reasons_handler._prepare_stop_word_handling_for_finish_reasons(
                         seq_slots_host,
                         torch.zeros(len(requests), dtype=torch.bool),
                         torch.zeros((0,), dtype=torch.bool),
@@ -678,11 +679,10 @@ class TestFinishReasons:
 
                 def _uut():
                     with extra_context() if extra_context is not None else nullcontext():
-                        sampler._write_finish_reasons(
-                            finish_reasons=sampler.store.finish_reasons,
-                            new_tokens=sampler.store.new_tokens,
-                            seq_lens=seq_lens,
+                        sampler._finish_reasons_handler._write_finish_reasons(
                             seq_slots=seq_slots_device,
+                            seq_lens=seq_lens,
+                            new_tokens=sampler.store.new_tokens,
                             num_accepted_tokens=num_accepted_tokens,
                             stop_word_indices=stop_word_indices,
                             single_token_stop_words_only=single_token_stop_words_only,
@@ -690,7 +690,9 @@ class TestFinishReasons:
 
                 yield _uut
 
-                reasons = sampler.store.finish_reasons[:, seq_slots_device, cls.BEAM].T.tolist()
+                reasons = finish_reasons_store.finish_reasons_cuda[
+                    :, seq_slots_device, cls.BEAM
+                ].T.tolist()
 
                 for actual, request in zip(reasons, requests, strict=True):
                     expected = request.finish_reasons
@@ -790,9 +792,13 @@ class TestFinishReasons:
         @contextmanager
         def raising_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
-                patch_ctx.setattr(TorchSampler, "_are_stop_words", stop_words_that_raises)
                 patch_ctx.setattr(
-                    TorchSampler, "_are_stop_words_single_token", stop_words_that_raises
+                    TorchSampler.FinishReasonsHandler, "_are_stop_words", stop_words_that_raises
+                )
+                patch_ctx.setattr(
+                    TorchSampler.FinishReasonsHandler,
+                    "_are_stop_words_single_token",
+                    stop_words_that_raises,
                 )
                 with pytest.raises(AssertionError) if expect_raise else nullcontext():
                     yield
@@ -841,7 +847,9 @@ class TestFinishReasons:
         def raising_single_token_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
                 patch_ctx.setattr(
-                    TorchSampler, "_are_stop_words_single_token", stop_words_that_raises
+                    TorchSampler.FinishReasonsHandler,
+                    "_are_stop_words_single_token",
+                    stop_words_that_raises,
                 )
                 with pytest.raises(AssertionError) if expect_raise else nullcontext():
                     yield
@@ -1363,7 +1371,6 @@ class TestBatchedSampling:
         *,
         num_repeats: Optional[int] = None,
         allow_sync: bool = True,
-        monkeypatch: pytest.MonkeyPatch,
         monkeypatch: pytest.MonkeyPatch,
     ) -> torch.Tensor:
         """Call sample_async.

@@ -46,8 +46,9 @@ def run_test(eagle_model_dir, max_seq_len, beam_width, use_dynamic_tree,
             max_beam_width=beam_width,
         ))
     # fill with NOT_FINISHED to ensure that all finish reasons are NOT_FINISHED
-    torch_sampler.store.finish_reasons.fill_(FinishReason.NOT_FINISHED.value)
-    finish_reasons_list = torch_sampler.store.finish_reasons.to(
+    torch_sampler._finish_reasons_handler.store.finish_reasons_cuda.fill_(
+        FinishReason.NOT_FINISHED.value)
+    finish_reasons_list = torch_sampler._finish_reasons_handler.store.finish_reasons_cuda.to(
         device="cpu").permute(1, 0, 2).tolist()
     input_new_tokens_list = input_new_tokens.tolist()
     num_accepted_draft_tokens = torch_sampler._process_draft_tokens_tree(
