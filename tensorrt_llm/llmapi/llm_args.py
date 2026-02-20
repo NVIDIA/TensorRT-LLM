@@ -782,6 +782,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "DraftTarget": DraftTargetDecodingConfig,
             "SaveState": SaveHiddenStatesDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
+            "PARD": PARDDecodingConfig,
             "AUTO": AutoDecodingConfig,
         }
 
@@ -1216,6 +1217,54 @@ class MTPDecodingConfig(DecodingBaseConfig):
         elif self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
+
+
+class PARDDecodingConfig(DecodingBaseConfig):
+    """Configuration for PARD (Parallel Draft) speculative decoding.
+
+    PARD is a target-independent speculative decoding method that uses
+    mask tokens to predict multiple draft tokens in parallel within a
+    single forward pass.
+
+    Key features:
+    - Target-independent: doesn't use target model hidden states
+    - Parallel prediction: all K draft tokens in one forward pass
+    - Shared mask token: uses the same mask_token_id across all positions
+
+    Reference: https://arxiv.org/pdf/2504.18583
+    """
+    # If None, will be read from the draft model config (typically vocab_size)
+    mask_token_id: Optional[int] = None
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # PARD needs 2K tokens per gen request in the draft forward:
+        # K+1 accepted slots + K-1 mask tokens = 2K total.
+        # Setting max_total_draft_tokens to 2K-1 makes the target model
+        # process 1 + (2K-1) = 2K tokens per gen request, giving the
+        # draft model enough room for K unique mask predictions.
+        self.max_total_draft_tokens = 2 * self.max_draft_len - 1
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "PARD"
+
+    @functools.cached_property
+    def is_linear_tree(self) -> bool:
+        # PARD always uses linear decoding, not tree-based.
+        # Override needed because max_total_draft_tokens (2K-1) != max_draft_len (K).
+        return True
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.PARD
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
@@ -1681,6 +1730,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
     SaveHiddenStatesDecodingConfig,
+    PARDDecodingConfig,
     AutoDecodingConfig,
 ]]
 
@@ -2648,6 +2698,10 @@ class TrtLlmArgs(BaseLlmArgs):
                 self.decoding_config = DecodingConfig(
                     decoding_mode=DecodingMode.Eagle(),
                     eagle_config=eagle_config)
+            elif isinstance(self.speculative_config, PARDDecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'PARD' is only supported on the PyTorch backend."
+                )
             else:
                 raise ValueError(
                     f"Unrecognized speculative config type {type(self.speculative_config)}"
@@ -3180,6 +3234,8 @@ class TorchLlmArgs(BaseLlmArgs):
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 assert self.speculative_config.num_nextn_predict_layers > 0
                 self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers
+            elif isinstance(self.speculative_config, PARDDecodingConfig):
+                assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
             elif isinstance(self.speculative_config,
                             UserProvidedDecodingConfig):
                 pass

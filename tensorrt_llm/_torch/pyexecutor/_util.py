@@ -546,15 +546,17 @@ class KvCacheCreator:
         # Draft model layers in one-model mode start at target_num_layers.
         target_pretrained_config = self._model_engine.model.model_config.pretrained_config
         target_num_layers = target_pretrained_config.num_hidden_layers
-        # Use get_num_spec_layers to get the correct number of draft layers
-        # for the speculative decoding mode (e.g., num_eagle_layers for Eagle3)
-        num_draft_layers = get_num_spec_layers(self._speculative_config)
 
-        # Create layer_mask: False for target layers, True for draft layers.
-        # This ensures the draft KV cache manager uses the correct layer indices
-        # (e.g., layers 32, 33, ... instead of 0, 1, ...).
-        spec_dec_layer_mask = [False
-                               ] * target_num_layers + [True] * num_draft_layers
+        # PARD: draft is a separate model, layers start from 0.
+        # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
+        if self._speculative_config.spec_dec_mode.is_pard():
+            num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
+            spec_dec_layer_mask = [True] * num_draft_layers
+        else:
+            num_draft_layers = get_num_spec_layers(self._speculative_config)
+            spec_dec_layer_mask = [False] * target_num_layers + [
+                True
+            ] * num_draft_layers
 
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(

@@ -583,6 +583,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        self.py_multimodal_uuids = kwargs.pop("multimodal_uuids", None)
         if llm_request is not None:
             super().__init__(llm_request)
         else:
