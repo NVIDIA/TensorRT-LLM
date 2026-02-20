@@ -91,15 +91,6 @@ class AutoPipeline:
             if "LTX" in class_name or "Ltx" in class_name:
                 return "LTX2Pipeline"
 
-            # Also check transformer type in model_index
-            transformer_info = index.get("transformer", [])
-            if len(transformer_info) >= 2:
-                transformer_class = transformer_info[1]
-                if "Flux2" in transformer_class:
-                    return "Flux2Pipeline"
-                if "Flux" in transformer_class:
-                    return "FluxPipeline"
-
         raise ValueError(
             f"Cannot detect pipeline type for {checkpoint_dir}\n"
             f"Expected model_index.json with '_class_name' field at: {index_path}"
