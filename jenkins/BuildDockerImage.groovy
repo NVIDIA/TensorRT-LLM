@@ -230,8 +230,8 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
         return ""
     }
 
-    if (dockerfileStage != "release") {
-        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not release"
+    if (dockerfileStage != "release" && dockerfileStage != "runtime") {
+        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not release or runtime"
         return ""
     }
 
@@ -242,30 +242,11 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
 
 def buildImage(config, imageKeyToTag)
 {
-    def target = config.target
     def action = config.action
     def torchInstallType = config.torchInstallType
     def args = config.args ?: ""
-    def customTag = config.customTag
     def postTag = config.postTag
-    def dependent = config.dependent
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
-    def dockerfileStage = config.dockerfileStage
-
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
-
-    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
-
-    def imageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${tag}"
-    def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
-    def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
-
-    if (target == "ngc-release" && TRIGGER_TYPE == "post-merge") {
-        echo "Use NGC artifacts for post merge build"
-        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
-        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
-        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
-    }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
@@ -300,96 +281,93 @@ def buildImage(config, imageKeyToTag)
     def containerGenFailure = null
     try {
         def build_jobs = BUILD_JOBS
-        // Fix the triton image pull timeout issue
         def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        def RUNTIME_BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG RUNTIME_BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"' || echo ''", returnStdout: true).trim()
 
-        if (target == "rockylinux8") {
+        if (config.stages.any { it.target == "rockylinux8" }) {
             BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
 
-        // Replace the base image and triton image with the internal mirror
         BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
+        RUNTIME_BASE_IMAGE = RUNTIME_BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
         TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
-        if (dependent) {
-            stage ("make ${dependent.target}_${action} (${arch})") {
-                def randomSleep = (Math.random() * 600 + 600).toInteger()
-                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-                trtllm_utils.llmExecStepWithRetry(this, script: """
-                cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${dependentImageWithTag} \
-                STAGE=${dependent.dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-                args += " DEVEL_IMAGE=${dependentImageWithTag}"
-                if (target == "ngc-release") {
-                    imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
-                }
-            }
+        // Generates the make command string. Captures build_jobs and args by
+        // reference so mutations (e.g. DEVEL_IMAGE, OOM job limit) are visible.
+        def makeBuildScript = { makeTarget, makeImageWithTag, makeStage, wheelArgs ->
+            """
+            cd ${LLM_ROOT} && make -C docker ${makeTarget}_${action} \
+            BASE_IMAGE=${BASE_IMAGE} \
+            RUNTIME_BASE_IMAGE=${RUNTIME_BASE_IMAGE} \
+            TRITON_IMAGE=${TRITON_IMAGE} \
+            TORCH_INSTALL_TYPE=${torchInstallType} \
+            IMAGE_WITH_TAG=${makeImageWithTag} \
+            STAGE=${makeStage} \
+            BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${wheelArgs}
+            """
         }
 
-        def buildWheelArgs = prepareWheelFromBuildStage(dockerfileStage, arch)
-        // Avoid the frequency of OOM issue when building the wheel
-        if (target == "trtllm") {
-            if (arch == "x86_64") {
-                build_jobs = BUILD_JOBS_RELEASE_X86_64
-            } else {
-                build_jobs = BUILD_JOBS_RELEASE_SBSA
-            }
+        def runMakeBuild = { makeTarget, makeImageWithTag, makeStage, wheelArgs ->
+            def sleepSecs = (Math.random() * 600 + 600).toInteger()
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: sleepSecs, numRetries: 6, shortCommondRunTimeMax: 7200)
+            trtllm_utils.llmExecStepWithRetry(this, script: makeBuildScript(makeTarget, makeImageWithTag, makeStage, wheelArgs), sleepInSecs: sleepSecs, numRetries: 6, shortCommondRunTimeMax: 7200)
         }
-        stage ("make ${target}_${action} (${arch})") {
-            sh "env | sort"
-            def randomSleep = (Math.random() * 600 + 600).toInteger()
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+
+        def runMakeBuildWithWheelRetry = { makeTarget, makeImageWithTag, makeStage, wheelArgs ->
             try {
-                trtllm_utils.llmExecStepWithRetry(this, script: """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                runMakeBuild(makeTarget, makeImageWithTag, makeStage, wheelArgs)
             } catch (InterruptedException ex) {
                 throw ex
             } catch (Exception ex) {
-                if (buildWheelArgs.trim().isEmpty()) {
-                    throw ex
-                }
+                if (!wheelArgs.trim()) throw ex
                 echo "Build failed with wheel arguments, retrying without them"
-                buildWheelArgs = ""
-                trtllm_utils.llmExecStepWithRetry(this, script: """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            }
-            if (target == "ngc-release") {
-                imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+                runMakeBuild(makeTarget, makeImageWithTag, makeStage, "")
             }
         }
 
-        if (customTag) {
-            stage ("Custom Tag: ${customTag} (${arch})") {
-                sh """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${customImageWithTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """
+        // Iterate over the ordered list of images. Stages with outputAsVariable
+        // forward their image tag as a Docker/make variable to subsequent stages.
+        def isNgcPostMerge = config.stages.any { it.target.startsWith("ngc-") } && TRIGGER_TYPE == "post-merge"
+
+        sh "env | sort"
+
+        config.stages.eachWithIndex { stageConfig, idx ->
+            def stageTarget = stageConfig.target
+            def stageDfStage = stageConfig.dockerfileStage
+            def stageTag = "${arch}-${stageTarget}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
+            def stageImageWithTag = "${IMAGE_NAME}/${stageDfStage}:${stageTag}"
+            if (isNgcPostMerge) {
+                stageImageWithTag = "${NGC_IMAGE_NAME}:${stageTag}"
+            }
+
+            def stageWheelArgs = prepareWheelFromBuildStage(stageDfStage, arch)
+
+            if (stageTarget == "trtllm") {
+                build_jobs = (arch == "x86_64") ? BUILD_JOBS_RELEASE_X86_64 : BUILD_JOBS_RELEASE_SBSA
+            }
+
+            stage ("make ${stageTarget}_${action} (${arch})") {
+                runMakeBuildWithWheelRetry(stageTarget, stageImageWithTag, stageDfStage, stageWheelArgs)
+            }
+
+            if (stageConfig.outputAsVariable) {
+                args += " ${stageConfig.outputAsVariable}=${stageImageWithTag}"
+            }
+
+            if (stageConfig.imageKeyName) {
+                imageKeyToTag["${stageConfig.imageKeyName} ${config.arch}"] = stageImageWithTag
+            }
+
+            if (stageConfig.customTag) {
+                def customImageWithTag = "${IMAGE_NAME}/${stageDfStage}:${stageConfig.customTag}"
+                if (isNgcPostMerge) {
+                    customImageWithTag = "${NGC_IMAGE_NAME}:${stageConfig.customTag}"
+                }
+                stage ("Custom Tag: ${stageConfig.customTag} (${arch})") {
+                    sh makeBuildScript(stageTarget, customImageWithTag, stageDfStage, stageWheelArgs)
+                }
             }
         }
     } catch (Exception ex) {
@@ -410,71 +388,64 @@ def buildImage(config, imageKeyToTag)
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     def defaultBuildConfig = [
-        target: "tritondevel",
         action: params.action,
-        customTag: "",
         postTag: "",
         args: "",
         torchInstallType: "skip",
         arch: "amd64",
         build_wheel: false,
-        dependent: [:],
-        dockerfileStage: "tritondevel",
     ]
 
     def release_action = params.action
     def buildConfigs = [
         "Build Internal release (x86_64 trtllm)": [
-            target: "trtllm",
             action: release_action,
-            customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
-            dockerfileStage: "release",
+            stages: [[target: "trtllm", dockerfileStage: "release", customTag: LLM_BRANCH_TAG + "-x86_64"]],
         ],
         "Build Internal release (SBSA trtllm)": [
-            target: "trtllm",
             action: release_action,
-            customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64",
-            dockerfileStage: "release",
+            stages: [[target: "trtllm", dockerfileStage: "release", customTag: LLM_BRANCH_TAG + "-sbsa"]],
         ],
-        "Build CI Image (x86_64 tritondevel)": [:],
+        "Build CI Image (x86_64 tritondevel)": [
+            stages: [[target: "tritondevel", dockerfileStage: "tritondevel"]],
+        ],
         "Build CI Image (SBSA tritondevel)": [
             arch: "arm64",
+            stages: [[target: "tritondevel", dockerfileStage: "tritondevel"]],
         ],
         "Build CI Image (RockyLinux8 Python310)": [
-            target: "rockylinux8",
             args: "PYTHON_VERSION=3.10.12",
             postTag: "-py310",
+            stages: [[target: "rockylinux8", dockerfileStage: "tritondevel"]],
         ],
         "Build CI Image (RockyLinux8 Python312)": [
-            target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
+            stages: [[target: "rockylinux8", dockerfileStage: "tritondevel"]],
         ],
-        "Build NGC devel And release (x86_64)": [
-            target: "ngc-release",
+        "Build NGC devel, release, and runtime (x86_64)": [
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
             build_wheel: true,
-            dependent: [
-                target: "ngc-devel",
-                dockerfileStage: "devel",
+            stages: [
+                [target: "ngc-devel", dockerfileStage: "devel", imageKeyName: "NGC Devel Image", outputAsVariable: "DEVEL_IMAGE"],
+                [target: "ngc-release", dockerfileStage: "release", imageKeyName: "NGC Release Image"],
+                [target: "ngc-runtime", dockerfileStage: "runtime", imageKeyName: "NGC Runtime Image"],
             ],
-            dockerfileStage: "release",
         ],
-        "Build NGC devel And release (SBSA)": [
-            target: "ngc-release",
+        "Build NGC devel, release, and runtime (SBSA)": [
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
             arch: "arm64",
             build_wheel: true,
-            dependent: [
-                target: "ngc-devel",
-                dockerfileStage: "devel",
+            stages: [
+                [target: "ngc-devel", dockerfileStage: "devel", imageKeyName: "NGC Devel Image", outputAsVariable: "DEVEL_IMAGE"],
+                [target: "ngc-release", dockerfileStage: "release", imageKeyName: "NGC Release Image"],
+                [target: "ngc-runtime", dockerfileStage: "runtime", imageKeyName: "NGC Runtime Image"],
             ],
-            dockerfileStage: "release",
         ],
     ]
     // Override all fields in build config with default values
