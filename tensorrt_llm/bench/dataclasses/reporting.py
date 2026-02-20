@@ -450,8 +450,8 @@ class ReportUtility:
             stats_dict["energy"] = {
                 "total_energy_j":
                 self.statistics.total_energy,
-                "output_token_per_j":
-                self.statistics.output_token_per_j,
+                "output_tps_per_w":
+                self.statistics.output_tps_per_w,
                 "average_gpu_power":
                 self.statistics.total_gpu_power /
                 self.rt_cfg.mapping["world_size"]
@@ -687,7 +687,7 @@ class ReportUtility:
             perf_stats += (
                 "\n-- Energy Metrics --------------------------------------\n\n"
                 f"Total Energy (J):                                 {energy['total_energy_j']:.4f}\n"
-                f"Output Tokens per Joule (tokens/J):               {energy['output_token_per_j']:.4f}\n"
+                f"Output Tokens per Second per Watt (tps/W):         {energy['output_tps_per_w']:.4f}\n"
                 f"Average GPU Power (W):                            {energy['average_gpu_power']:.4f}\n"
             )
 

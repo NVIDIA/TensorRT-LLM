@@ -200,7 +200,7 @@ class BenchmarkStatistics(BaseModel):
         return self.output_throughput_percentiles.average
 
     @computed_field
-    def output_token_per_j(self) -> Optional[float]:
+    def output_tps_per_w(self) -> Optional[float]:
         if not self.total_energy:
             return None
         return float(self.total_output_tokens / self.total_energy)
