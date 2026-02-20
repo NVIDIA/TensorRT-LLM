@@ -63,7 +63,6 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
-    end_ids: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -122,16 +122,12 @@ class _InsertCachedOperator(BaseTransform):
         if prep_meta_host_op is None:
             return
 
-        # analyze the args of the host-side prepare metadata function using inspect
+        # Register the host-side prepare metadata function with SequenceInfo.
+        # Arg availability is validated by require_copy() inside register_host_prepare.
         sig = inspect.signature(prep_meta_host_op)
-        args = sig.parameters.keys()
-
-        # check if all args are available in the cached sequence interface
-        unavailable_args = args - cm.info.available_args
-        assert not unavailable_args, f"Missing args in SequenceInfo: {unavailable_args=}"
-
-        # add the host-side prepare metadata function to the graph
-        cm.info.register_host_prepare_for_attention_forward(prep_meta_host_op, list(args))
+        cm.info.register_host_prepare_for_attention_forward(
+            prep_meta_host_op, list(sig.parameters.keys())
+        )
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""

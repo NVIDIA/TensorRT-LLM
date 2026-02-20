@@ -36,7 +36,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_mla
+from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
@@ -649,6 +649,14 @@ def create_py_executor(
 
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
+
+        # Disagg for hybrid models is currently only supported with C++ RnnStateManager
+        config = model_engine.model.model_config.pretrained_config
+        if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
+            if is_nemotron_hybrid(config) or is_qwen3_next(config):
+                logger.info("Disaggregated serving with hybrid model detected. "
+                            "Enabling C++ MambaCacheManager automatically.")
+                os.environ['TRTLLM_USE_CPP_MAMBA'] = '1'
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)

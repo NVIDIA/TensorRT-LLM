@@ -505,8 +505,15 @@ class TorchCudagraphCompiler(CompilerBackend):
             "get_args_kwargs_for_compile must be provided"
         )
 
+        # wrap get_args_kwargs_for_compile with CudaGraphWarmUpPhase. Note that host-side prepare
+        # functions may be called as part of get_args_kwargs. We want to let these functions know it's
+        # a warm-up phase.
+        def get_args_kwargs_warmup(batch_size: int):
+            with CudaGraphWarmUpPhase():
+                return self.get_args_kwargs_for_compile(batch_size)
+
         monolithic = CapturedGraph(self.model, num_batched_inputs=self.num_batched_inputs)
-        monolithic.capture_graph(self.get_args_kwargs_for_compile, self.cuda_graph_batch_sizes)
+        monolithic.capture_graph(get_args_kwargs_warmup, self.cuda_graph_batch_sizes)
 
         piecewise = None
         if self.piecewise_enabled:

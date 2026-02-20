@@ -94,8 +94,11 @@ int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, i
 
 // inputBlockNums: [outputBlockNum, inputRanks.size]
 // [PP, TP]
-TargetRanksInfo TargetRanksInfoForDP(
-    kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
+// Core implementation for computing target ranks info for data parallelism.
+// Takes explicit layer vectors and head counts so it can be reused for both KV and RNN cache.
+TargetRanksInfo TargetRanksInfoForDPImpl(kv_cache::CacheState const& peerCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfRank, std::vector<SizeType32> const& peerNumLayerPerPP,
+    std::vector<SizeType32> const& selfNumLayerPerPP, SizeType32 peerNbHeadsPerLayer, SizeType32 selfNbHeadsPerLayer)
 {
     auto const& peerParConfig = peerCacheState.getParallelConfig();
     auto const& selfParConfig = selfCacheState.getParallelConfig();
@@ -114,8 +117,18 @@ TargetRanksInfo TargetRanksInfoForDP(
     int peerPPRankStart = 0;
     int mDomainPPSize = 1;
     int peerPPRankEnd = 0;
-    std::vector<SizeType32> peerNumLayerPerPP = peerParConfig.mAttentionLayerNumPerPP;
-    std::vector<SizeType32> selfNumLayerPerPP = selfParConfig.mAttentionLayerNumPerPP;
+
+    if (selfNumLayerPerPP[selfPPRank] == 0)
+    {
+        return TargetRanksInfo{.mDomainPPSize = 0,
+            .mDomainTPSize = 0,
+            .mDomainCPSize = 0,
+            .mIRanks = {}, // caller should handle this case. No transfer needed.
+            .mDupHeadFactor = 1,
+            .mPeerDupHeadFactor = 1,
+            .mPeerLayerNumInDomainPP = {}};
+    }
+
     TLLM_CHECK(peerNumLayerPerPP.size() == peerPPNum);
     TLLM_CHECK(selfNumLayerPerPP.size() == selfPPNum);
     int selfStartLayerId = 0;
@@ -128,6 +141,7 @@ TargetRanksInfo TargetRanksInfoForDP(
         selfStartLayerId += selfNumLayerPerPP[ppRank];
     }
     int selfEndLayerId = selfStartLayerId + selfNumLayerPerPP[selfPPRank];
+
     int prePeerPPLayerId = 0;
     std::vector<int> targetPeerPPRanks;
     std::vector<int> targetPeerPPLayerNum;
@@ -165,8 +179,6 @@ TargetRanksInfo TargetRanksInfoForDP(
     int const selfTPSizePerDPGroup = selfParConfig.mEnableAttentionDP ? selfTPNum / selfParConfig.mDPsize : selfTPNum;
     int const peerTPSizePerDPGroup = peerParConfig.mEnableAttentionDP ? peerTPNum / peerParConfig.mDPsize : peerTPNum;
 
-    int const selfNbHeadsPerLayer = selfCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
-    int const peerNbHeadsPerLayer = peerCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
     int const selfTPrankInDPGroup = selfTPRank % selfTPSizePerDPGroup;
     for (auto val : {peerTPSizePerDPGroup, selfTPSizePerDPGroup})
     {
@@ -257,7 +269,23 @@ TargetRanksInfo TargetRanksInfoForDP(
 TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
 {
-    return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
+    auto const& peerHeads = peerCacheState.getModelConfig().mNbKvHeadsPerLayer;
+    auto const& selfHeads = selfCacheState.getModelConfig().mNbKvHeadsPerLayer;
+    return TargetRanksInfoForDPImpl(peerCacheState, selfCacheState, selfRank,
+        peerCacheState.getParallelConfig().mAttentionLayerNumPerPP,
+        selfCacheState.getParallelConfig().mAttentionLayerNumPerPP, peerHeads.empty() ? 0 : peerHeads[0],
+        selfHeads.empty() ? 0 : selfHeads[0]);
+}
+
+TargetRanksInfo targetIRanksForRnn(
+    kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
+{
+    auto targetInfo = TargetRanksInfoForDPImpl(peerCacheState, selfCacheState, selfRank,
+        peerCacheState.getRnnCacheState().mLayerNumPerPP, selfCacheState.getRnnCacheState().mLayerNumPerPP,
+        peerCacheState.getRnnModelConfig().mNumHeads, selfCacheState.getRnnModelConfig().mNumHeads);
+    targetInfo.mDupHeadFactor = 1;
+    targetInfo.mPeerDupHeadFactor = 1; // RNN cache does not have head duplication.
+    return targetInfo;
 }
 
 template <typename T>
@@ -1171,7 +1199,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
     {
-        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
     bool const isWindow = windowSizes.size() > 1;
@@ -1530,7 +1558,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
     {
-        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer

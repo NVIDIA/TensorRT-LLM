@@ -37,24 +37,49 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-// some context rank in connection
-std::vector<size_t> MLACacheFormatter::pickRecvConnections(
-    size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
+std::pair<std::vector<size_t>, std::vector<size_t>> MLACacheFormatter::pickRecvConnections(size_t numConnections,
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks) const
 {
-
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    // This function is called only by gen side and we only support CPSize=1 on context size.
+    if (targetInfo.mIRanks.empty())
+    {
+        return {{}, {}};
+    }
+
     TLLM_CHECK(targetInfo.mDomainCPSize == 1);
-    TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
-    std::vector<size_t> ret;
-    // targetInfo , mRanks [tpranks, ppranks]
+    TLLM_CHECK(numConnections == counterPartRanks.size());
+    std::vector<size_t> pickUpConnections;
+    std::vector<size_t> localRankIndices;
     int dpRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
     for (int i = 0; i < targetInfo.mDomainPPSize; i++)
     {
-        ret.push_back(i + (dpRank % (targetInfo.mDomainTPSize)) * targetInfo.mDomainPPSize);
+        size_t rankIdx = i + (dpRank % (targetInfo.mDomainTPSize)) * targetInfo.mDomainPPSize;
+        auto rank = targetInfo.mIRanks.at(rankIdx);
+        auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
+        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
+        pickUpConnections.push_back(std::distance(counterPartRanks.begin(), it));
+        localRankIndices.push_back(rankIdx);
     }
-    return ret;
+    return {pickUpConnections, localRankIndices};
+}
+
+std::vector<size_t> MLACacheFormatter::pickSendConnections(size_t numConnections, CacheState const& selfConfig,
+    SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const
+{
+    TLLM_CHECK(numConnections == counterPartRanks.size());
+    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
+
+    // Map needed ranks to indices in counterPartRanks
+    std::vector<size_t> indices;
+    for (auto rank : targetInfo.mIRanks)
+    {
+        auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
+        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
+        indices.push_back(std::distance(counterPartRanks.begin(), it));
+    }
+    return indices;
 }
 
 bool MLACacheFormatter::needSendCache(
@@ -115,6 +140,15 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     {
         return;
     }
+    auto pickUpConnections
+        = pickSendConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto targetNum = pickUpConnections.size();
+    if (targetNum == 0)
+    {
+        TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
+        return;
+    }
+
     bool hasIndexerKCache = mCacheManager->getIndexerKCachePool() != nullptr;
     std::vector<bool> transferringIndexerKCache;
     transferringIndexerKCache.push_back(false);
@@ -135,8 +169,9 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     for (auto transferIndexerKCache : transferringIndexerKCache)
     {
         auto activeBufferIdx = transferIndexerKCache ? 1UL : 0UL;
-        for (auto const* connection : connections)
+        for (size_t i = 0; i < pickUpConnections.size(); i++)
         {
+            auto const* connection = connections.at(pickUpConnections[i]);
             if (auto const* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection))
             {
                 TLLM_CHECK(agentConnection->getSenderBufferCount() > activeBufferIdx);
@@ -180,11 +215,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             NVTX3_SCOPED_RANGE(sendBufferFun);
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-            for (size_t i = 0; i < connections.size(); i++)
+            for (size_t i = 0; i < pickUpConnections.size(); i++)
             {
                 for (auto const& block : inputKvCacheBlocks)
                 {
-                    session.send(i, block->data(), block->getSizeInBytes());
+                    session.send(pickUpConnections[i], block->data(), block->getSizeInBytes());
                 }
             }
 
@@ -228,7 +263,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         auto& outputSplitCaches = std::get<0>(result);
         auto& bufferCoverTargetNum = std::get<1>(result);
         auto& onlyUseDynamicBuffer = std::get<2>(result);
-        auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+        auto* agentConnnecion
+            = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
         if (agentConnnecion != nullptr)
         {
             TLLM_CHECK_WITH_INFO(
@@ -251,13 +287,13 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             TLLM_CHECK(preAllocSendBuffer->getDataType() == inputKvCacheBlocks.at(0)->getDataType());
         }
-        auto sendBufferFun = [&](int deviceId, size_t processIdx)
+        auto sendBufferFun = [&](int deviceId, size_t localIdx, size_t processIdx)
         {
             NVTX3_SCOPED_RANGE(sendBufferFun);
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             auto startTime = LlmRequest::getSteadyClockNow();
-            auto cacheIdx = processIdx % (pPDomainSize * cPDomainSize);
+            auto cacheIdx = localIdx % (pPDomainSize * cPDomainSize);
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
@@ -293,14 +329,14 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             session.appendMeasure(startTime, endTime, outputSplitCaches.at(cacheIdx)->getSizeInBytes());
         };
 
-        if (connections.size() > 1)
+        if (pickUpConnections.size() > 1)
         {
             if (!common::getEnvEnableReceiveKVCacheParallel())
             {
                 TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
-                for (size_t i = 0; i < connections.size(); i++)
+                for (size_t i = 0; i < pickUpConnections.size(); i++)
                 {
-                    sendBufferFun(deviceId, i);
+                    sendBufferFun(deviceId, i, pickUpConnections[i]);
                 }
             }
             else
@@ -309,7 +345,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 auto concurrencyNum
                     = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
 
-                auto remainSendNum = connections.size();
+                auto remainSendNum = pickUpConnections.size();
 
                 while (remainSendNum > 0)
                 {
@@ -318,9 +354,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                     futures.reserve(sendConcurrencyNum);
                     for (size_t i = 0; i < sendConcurrencyNum; i++)
                     {
-                        TLLM_CHECK((i + (connections.size() - remainSendNum)) < connections.size());
-                        futures.push_back(std::async(
-                            std::launch::async, sendBufferFun, deviceId, i + (connections.size() - remainSendNum)));
+                        size_t idx = i + (pickUpConnections.size() - remainSendNum);
+                        size_t connIdx = pickUpConnections[idx];
+                        TLLM_CHECK(idx < pickUpConnections.size());
+                        TLLM_CHECK(connIdx < session.getConnections().size());
+                        futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, idx, connIdx));
                     }
                     for (auto& future : futures)
                     {
@@ -332,7 +370,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         }
         else
         {
-            sendBufferFun(deviceId, 0);
+            sendBufferFun(deviceId, 0, pickUpConnections[0]);
         }
         mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
     }
@@ -357,7 +395,15 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
-    auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
+    auto pickRecvConnResult
+        = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto pickUpConnections = std::get<0>(pickRecvConnResult);
+    auto localRankIndices = std::get<1>(pickRecvConnResult);
+    if (pickUpConnections.empty())
+    {
+        TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: %ld", llmRequest.mRequestId);
+        return;
+    }
     bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
     auto const srcPpSize = destConfig.getParallelConfig().mPipelineParallelism;
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
@@ -430,7 +476,8 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         }
         else
         {
-            auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+            auto* agentConnnecion
+                = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
             size_t activeBufferIdx = transferIndexerKCache ? 1 : 0;
             if (agentConnnecion != nullptr)
             {
@@ -458,7 +505,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 for (size_t i = 0; i < targetNum; i++)
                 {
                     auto const peerAttentionLayerNum
-                        = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
+                        = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(localRankIndices[i]));
                     bufferEleSizes[i] = cacheSizePerLayer * peerAttentionLayerNum;
                 }
                 return bufferEleSizes;

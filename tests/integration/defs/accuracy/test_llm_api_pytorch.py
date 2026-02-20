@@ -132,13 +132,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
-    def test_chunked_prefill(self, attn_backend):
+    # NB: Because greedy sampling is handled via a "fast path", a small non-zero
+    #     temperature is required to also cover the regular (batched) sampling code.
+    @parametrize_with_ids("use_temperature", [False, True])
+    def test_chunked_prefill(self, attn_backend, use_temperature: bool):
         with LLM(self.MODEL_PATH,
                  attn_backend=attn_backend,
                  enable_chunked_prefill=True,
                  max_num_tokens=512) as llm:
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm,
+                          sampling_params=(SamplingParams(
+                              temperature=0.001) if use_temperature else None))
 
     @pytest.mark.skip_less_device_memory(32000)
     def test_dummy_load_format(self):
