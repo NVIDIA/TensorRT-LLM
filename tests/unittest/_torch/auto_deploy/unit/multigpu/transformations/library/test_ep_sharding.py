@@ -224,3 +224,77 @@ def test_llama4_stacked_moe_pattern_detection():
     detected = optimizer.shared_config.sharding_transform_container.ep_transforms
     assert len(detected) == 1, f"Expected 1 EP transform, got {len(detected)}"
     assert detected[0].target_node == moe_node.name
+
+
+class PreStackedMoEModel(torch.nn.Module):
+    """Minimal model using torch_moe_fused with stacked expert tensors."""
+
+    def __init__(self, hidden_size=32, intermediate_size=16, num_experts=4, top_k=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.top_k = top_k
+        self.gate = torch.nn.Linear(hidden_size, num_experts, bias=False)
+        self.gate_up_proj = torch.nn.Parameter(
+            torch.randn(num_experts, 2 * intermediate_size, hidden_size)
+        )
+        self.down_proj = torch.nn.Parameter(
+            torch.randn(num_experts, hidden_size, intermediate_size)
+        )
+
+    def forward(self, x):
+        router_logits = self.gate(x)
+        routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = (routing_weights / routing_weights.sum(dim=-1, keepdim=True)).to(x.dtype)
+        return torch.ops.auto_deploy.torch_moe_fused(
+            x,
+            selected_experts,
+            routing_weights,
+            self.gate_up_proj,
+            self.down_proj,
+        )
+
+    def get_input(self, device, dtype=torch.bfloat16):
+        return torch.randn(2, self.hidden_size, device=device, dtype=dtype)
+
+
+def test_split_moe_fused_then_ep_sharding_executor():
+    """Verify pre-sharding split enables EP path for torch_moe_fused models."""
+    device = "cuda"
+    model = PreStackedMoEModel().to(device=device, dtype=torch.bfloat16)
+    x = model.get_input(device=device, dtype=torch.bfloat16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "split_moe_fused_for_sharding": {
+                "stage": "pattern_matcher",
+            },
+            "detect_sharding": {
+                "stage": "sharding",
+                "use_sharding_from_factory": False,
+                "sharding_dims": ["ep"],
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = 0
+    optimizer.shared_config.world_size = 2
+    gm_transformed = optimizer(None, gm)
+
+    has_torch_moe = any(
+        is_op(n, torch.ops.auto_deploy.torch_moe) for n in gm_transformed.graph.nodes
+    )
+    has_torch_moe_fused = any(
+        is_op(n, torch.ops.auto_deploy.torch_moe_fused) for n in gm_transformed.graph.nodes
+    )
+    has_allreduce = any(
+        is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm_transformed.graph.nodes
+    )
+
+    assert has_torch_moe, "Expected converted torch_moe node for EP sharding"
+    assert not has_torch_moe_fused, "torch_moe_fused should be converted before EP sharding"
+    assert has_allreduce, "Expected EP sharding to insert torch_dist_all_reduce"

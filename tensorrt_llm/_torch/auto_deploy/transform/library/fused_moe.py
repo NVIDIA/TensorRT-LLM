@@ -15,7 +15,12 @@ from ...custom_ops.quantization.quant import (
 )
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code, get_attr_by_name
+from ...utils._graph import (
+    del_attr_by_name,
+    delete_all_unused_submodules,
+    eliminate_dead_code,
+    get_attr_by_name,
+)
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
@@ -83,6 +88,62 @@ def _bmm_moe_down_split_hook(
             state_dict[prefix + w2_key] = w2
 
 
+def _fused_moe_gate_up_split_hook(
+    state_dict,
+    prefix,
+    *args,
+    source_key: str,
+    intermediate_size: int,
+    w1_keys: List[str],
+    w3_keys: List[str],
+):
+    """Fallback hook to split fused gate_up tensor into per-expert w1/w3 tensors.
+
+    This hook is intentionally ordering-agnostic w.r.t. checkpoint families:
+    it assumes `source_key` has already been normalized to runtime/operator layout
+    by model-specific hooks (if needed), then performs structural splitting only.
+    """
+    source_full_key = prefix + source_key
+    if source_full_key not in state_dict:
+        return
+
+    stacked_tensor = state_dict[source_full_key]
+    # Runtime/operator layout: [w3, w1] along dim=1 for shape (E, 2I, H)
+    w3_stacked, w1_stacked = stacked_tensor.split(intermediate_size, dim=1)
+    w3_experts = w3_stacked.contiguous().unbind(0)
+    w1_experts = w1_stacked.contiguous().unbind(0)
+
+    # Don't overwrite keys already populated by model-owned hooks.
+    for w1_key, w1 in zip(w1_keys, w1_experts):
+        dst = prefix + w1_key
+        if dst not in state_dict:
+            state_dict[dst] = w1
+    for w3_key, w3 in zip(w3_keys, w3_experts):
+        dst = prefix + w3_key
+        if dst not in state_dict:
+            state_dict[dst] = w3
+
+
+def _fused_moe_down_split_hook(
+    state_dict,
+    prefix,
+    *args,
+    source_key: str,
+    w2_keys: List[str],
+):
+    """Fallback hook to split fused down tensor into per-expert w2 tensors."""
+    source_full_key = prefix + source_key
+    if source_full_key not in state_dict:
+        return
+
+    stacked_tensor = state_dict[source_full_key]
+    w2_experts = stacked_tensor.contiguous().unbind(0)
+    for w2_key, w2 in zip(w2_keys, w2_experts):
+        dst = prefix + w2_key
+        if dst not in state_dict:
+            state_dict[dst] = w2
+
+
 def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """Replace torch MoE ops with fused backend-specific implementations.
 
@@ -124,6 +185,178 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
             delete_all_unused_submodules(gm)
 
     return fused_key_counter
+
+
+def _replace_torch_moe_fused_ops(
+    gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]
+) -> int:
+    """Replace torch_moe_fused (pre-stacked ref impl) with backend-specific fused MoE.
+
+    Unlike _insert_fused_moe_ops which handles per-expert weight lists,
+    this handles models that already use pre-stacked 3D weight tensors directly
+    (e.g. Qwen 3.5 MoE). No weight restructuring is needed -- it is a 1:1 op swap.
+    """
+    count = 0
+    graph = gm.graph
+    replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_moe_fused,
+        "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
+        "triton": torch.ops.auto_deploy.triton_moe_fused,
+    }[backend.lower()]
+
+    for node in graph.nodes:
+        if is_op(node, torch.ops.auto_deploy.torch_moe_fused):
+            with graph.inserting_before(node):
+                new_node = graph.call_function(
+                    replacement_op,
+                    args=node.args,
+                    kwargs={"is_gated_mlp": True, "act_fn": int(ActivationType.Silu)},
+                )
+            node.replace_all_uses_with(new_node)
+            graph.erase_node(node)
+            count += 1
+
+    return count
+
+
+def _split_torch_moe_fused_to_expert_lists(gm: GraphModule) -> int:
+    """Rewrite torch_moe_fused nodes into torch_moe with per-expert weight lists.
+
+    This runs before sharding so EP can operate on existing torch_moe list-based path.
+    The transform keeps checkpoint-order policy out of transform logic by:
+      - materializing expert-list parameters structurally, and
+      - registering fallback structural split hooks on the owner module.
+    Model-specific hooks can normalize checkpoint layout before these fallback hooks run.
+    """
+    graph = gm.graph
+    converted = 0
+
+    for node in list(graph.nodes):
+        if not is_op(node, torch.ops.auto_deploy.torch_moe_fused):
+            continue
+
+        hidden_states, selected_experts, routing_weights, w3_w1_node, w2_node = node.args
+        if not (
+            isinstance(w3_w1_node, Node)
+            and isinstance(w2_node, Node)
+            and w3_w1_node.op == "get_attr"
+            and w2_node.op == "get_attr"
+        ):
+            continue
+
+        w3_w1_target = str(w3_w1_node.target)
+        w2_target = str(w2_node.target)
+        w3_w1_tensor = gm.get_parameter(w3_w1_target)
+        w2_tensor = gm.get_parameter(w2_target)
+
+        if len(w3_w1_tensor.shape) != 3 or len(w2_tensor.shape) != 3:
+            continue
+
+        num_experts = w3_w1_tensor.shape[0]
+        intermediate_size = w3_w1_tensor.shape[1] // 2
+        if w3_w1_tensor.shape[1] != 2 * intermediate_size:
+            continue
+        if w2_tensor.shape[0] != num_experts:
+            continue
+
+        owner_module, owner_path, source_name = get_submodule_of_param(gm, w3_w1_target)
+        owner_module_w2, owner_path_w2, source_name_w2 = get_submodule_of_param(gm, w2_target)
+        if owner_module is not owner_module_w2 or owner_path != owner_path_w2:
+            continue
+
+        # Materialize per-expert params under the owner module.
+        w1_full_keys: list[str] = []
+        w2_full_keys: list[str] = []
+        w3_full_keys: list[str] = []
+        w1_local_names: list[str] = []
+        w2_local_names: list[str] = []
+        w3_local_names: list[str] = []
+
+        for expert_idx in range(num_experts):
+            # Keep stable names so model-side hooks can target them.
+            w1_name = f"w1_expert_{expert_idx}"
+            w2_name = f"w2_expert_{expert_idx}"
+            w3_name = f"w3_expert_{expert_idx}"
+
+            if not hasattr(owner_module, w1_name):
+                owner_module.register_parameter(
+                    w1_name,
+                    torch.nn.Parameter(w3_w1_tensor[expert_idx, intermediate_size:, :]),
+                )
+            if not hasattr(owner_module, w2_name):
+                owner_module.register_parameter(
+                    w2_name,
+                    torch.nn.Parameter(w2_tensor[expert_idx, :, :]),
+                )
+            if not hasattr(owner_module, w3_name):
+                owner_module.register_parameter(
+                    w3_name,
+                    torch.nn.Parameter(w3_w1_tensor[expert_idx, :intermediate_size, :]),
+                )
+
+            w1_local_names.append(w1_name)
+            w2_local_names.append(w2_name)
+            w3_local_names.append(w3_name)
+
+            prefix = f"{owner_path}." if owner_path else ""
+            w1_full_keys.append(prefix + w1_name)
+            w2_full_keys.append(prefix + w2_name)
+            w3_full_keys.append(prefix + w3_name)
+
+        # Fallback structural split hooks (model hooks can pre-normalize layout).
+        owner_module._register_load_state_dict_pre_hook(
+            partial(
+                _fused_moe_gate_up_split_hook,
+                source_key=source_name,
+                intermediate_size=intermediate_size,
+                w1_keys=w1_local_names,
+                w3_keys=w3_local_names,
+            )
+        )
+        owner_module._register_load_state_dict_pre_hook(
+            partial(
+                _fused_moe_down_split_hook,
+                source_key=source_name_w2,
+                w2_keys=w2_local_names,
+            )
+        )
+
+        with graph.inserting_before(node):
+            w1_nodes = [graph.get_attr(k) for k in w1_full_keys]
+            w2_nodes = [graph.get_attr(k) for k in w2_full_keys]
+            w3_nodes = [graph.get_attr(k) for k in w3_full_keys]
+            new_node = graph.call_function(
+                torch.ops.auto_deploy.torch_moe,
+                args=(
+                    hidden_states,
+                    selected_experts,
+                    routing_weights,
+                    w1_nodes,
+                    w2_nodes,
+                    w3_nodes,
+                ),
+                kwargs={"is_gated_mlp": True, "act_fn": int(ActivationType.Silu)},
+            )
+
+        node.replace_all_uses_with(new_node)
+        graph.erase_node(node)
+        converted += 1
+
+        # Clean dead graph/state then explicitly remove unused fused params.
+        eliminate_dead_code(gm)
+        delete_all_unused_submodules(gm)
+
+        for old_target in (w3_w1_target, w2_target):
+            still_used = any(
+                n.op == "get_attr" and str(n.target) == old_target for n in gm.graph.nodes
+            )
+            if not still_used:
+                try:
+                    del_attr_by_name(gm, old_target)
+                except AttributeError:
+                    pass
+
+    return converted
 
 
 def _process_moe_node(
@@ -1623,8 +1856,8 @@ class FuseMoeConfig(TransformConfig):
 @TransformRegistry.register("fuse_moe")
 class FuseMoe(BaseTransform):
     """
-    Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
-    torch.ops.auto_deploy.trtllm_moe_fused.
+    Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe and
+    torch.ops.auto_deploy.torch_moe_fused with torch.ops.auto_deploy.trtllm_moe_fused.
     """
 
     @classmethod
@@ -1640,12 +1873,44 @@ class FuseMoe(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
             fused_key_counter = _insert_fused_moe_ops(gm, backend=self.config.backend)
+            fused_key_counter += _replace_torch_moe_fused_ops(gm, backend=self.config.backend)
 
         info = TransformInfo(
             skipped=False,
             num_matches=fused_key_counter,
             is_clean=fused_key_counter == 0,
             has_valid_shapes=fused_key_counter == 0,
+        )
+        return gm, info
+
+
+class SplitMoeFusedForShardingConfig(TransformConfig):
+    """Configuration for converting torch_moe_fused to torch_moe pre-sharding."""
+
+    pass
+
+
+@TransformRegistry.register("split_moe_fused_for_sharding")
+class SplitMoeFusedForSharding(BaseTransform):
+    """Convert torch_moe_fused nodes to list-based torch_moe nodes before sharding."""
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return SplitMoeFusedForShardingConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        num_matches = _split_torch_moe_fused_to_expert_lists(gm)
+        info = TransformInfo(
+            skipped=(num_matches == 0),
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
         return gm, info
 

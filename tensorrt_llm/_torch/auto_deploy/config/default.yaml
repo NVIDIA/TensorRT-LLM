@@ -30,6 +30,8 @@ transforms:
     stage: pattern_matcher
   match_bmm_moe_pattern:
     stage: pattern_matcher
+  split_moe_fused_for_sharding:
+    stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
     run_shape_prop: true
@@ -102,7 +104,7 @@ transforms:
     sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
-    shard_all_unprocessed: true
+    shard_all_unprocessed: false
     enable_attention_dp: false
     allreduce_strategy: 'NCCL'
     dist_backend: auto
@@ -200,6 +202,10 @@ transforms:
   insert_cached_delta_rule:
     stage: cache_init
     backend: fla_delta
+  insert_cached_gated_delta_rule:
+    stage: cache_init
+    backend: fla_gated_delta
+    enabled: true
   insert_cached_residual_add:
     stage: cache_init
     backend: cached_residual_add
