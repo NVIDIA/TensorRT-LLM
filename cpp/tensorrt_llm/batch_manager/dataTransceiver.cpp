@@ -825,8 +825,10 @@ public:
         {
             auto* cacheManager = mFormatter->getCacheManager();
             auto beam = 0;
-            auto requestedBlockRange = getBlockRangeForReceiving(
-                cacheManager, llmRequest, destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse());
+            auto const srcPpSize = destCacheState.getParallelConfig().mPipelineParallelism;
+            auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest,
+                destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse(),
+                /*recvSideHasCP=*/false, srcPpSize);
 
             auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
             auto lastBlockKey

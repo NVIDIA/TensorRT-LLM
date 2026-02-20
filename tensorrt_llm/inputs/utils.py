@@ -500,7 +500,7 @@ class MultimodalDataTracker:
                  media_type: str,
                  data: Union[Coroutine, Any],
                  *,
-                 is_embedding: bool = False):
+                 is_embedding: bool = False) -> Optional[str]:
         current_count = len(self._data[media_type]) + len(
             self._embeddings[media_type]) + 1
         placeholder = retrieve_multimodal_placeholder(self._model_type,
@@ -509,6 +509,7 @@ class MultimodalDataTracker:
          if is_embedding else self._data)[media_type].append(data)
         if placeholder:
             self._placeholder_counts[placeholder] += 1
+        return placeholder
 
     def placeholder_counts(self) -> Dict[str, int]:
         """Get the count of multimodal placeholders."""
