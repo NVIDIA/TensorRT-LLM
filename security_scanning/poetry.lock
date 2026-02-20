@@ -1404,14 +1404,14 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.3"
+version = "0.6.4"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.3-py3-none-any.whl", hash = "sha256:0fe2de934a4b3690c543dafb03f38d7bb4a762431abe8ae4f7292d6fef10c65d"},
-    {file = "flashinfer_python-0.6.3.tar.gz", hash = "sha256:84a762538247a86bc52ff31d9505d161ce1ec059174c1821c87c3ed1e44670fc"},
+    {file = "flashinfer_python-0.6.4-py3-none-any.whl", hash = "sha256:105596b505892ae330af84e250ee0eb6fc2c3a22e8dc42bd46de1b90d36004c8"},
+    {file = "flashinfer_python-0.6.4.tar.gz", hash = "sha256:e6ab798bd1030e5ff7a3bc6952f36386c406928f60b79cf964a6db7aa7ccde75"},
 ]
 
 [package.dependencies]
@@ -5875,6 +5875,22 @@ files = [
 ]
 
 [[package]]
+name = "smg-grpc-proto"
+version = "0.3.3"
+description = "SMG gRPC proto definitions for SGLang, vLLM, and TRT-LLM"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "smg_grpc_proto-0.3.3-py3-none-any.whl", hash = "sha256:2aaf353ae65623073e9d8d64372a0b2c2b62633beb3670ddf9a9ffcfc3668384"},
+    {file = "smg_grpc_proto-0.3.3.tar.gz", hash = "sha256:069bfab2ceb0ca972e9ac278459d6fd343a3b1c0f58f9ea2720b5d6a0db0fb6d"},
+]
+
+[package.dependencies]
+grpcio = ">=1.78.0"
+protobuf = ">=5.26.0"
+
+[[package]]
 name = "sniffio"
 version = "1.3.1"
 description = "Sniff out which async library your code is running under"
@@ -6982,4 +6998,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "7476170a6fd3c5e2e6a5cf36683fa65c5acc8748dd9d21f4c13541fd7ff1846c"
+content-hash = "5040209fdb0c6fae33a90977bc51d91ad22c08248b8480b62fdf425d4acbfa3e"
