@@ -44,18 +44,18 @@ def load_weight_shard(
     device: torch.device = torch.device("cpu"),
     return_slice_indices: bool = False,
 ) -> torch.Tensor:
-    # Skip device transfers on integrated GPUs to conserve shared memory
-    if weight.device.type != device.type and is_device_integrated():
-        # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
-        # Avoiding device transfers reduces memory consumption and unnecessary data copies,
-        # enabling support for larger models on memory-constrained systems.
-        logger.warning_once(
-            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} "
-            "on integrated GPU to conserve shared memory.",
-            key="load_weight_shard_skip_device_transfer_with_integrated_gpu",
-        )
-        device = weight.device
     if isinstance(weight, torch.Tensor):
+        # Skip device transfers on integrated GPUs to conserve shared memory
+        if weight.device.type != device.type and is_device_integrated():
+            # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
+            # Avoiding device transfers reduces memory consumption and unnecessary data copies,
+            # enabling support for larger models on memory-constrained systems.
+            logger.warning_once(
+                f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} "
+                "on integrated GPU to conserve shared memory.",
+                key="load_weight_shard_skip_device_transfer_with_integrated_gpu",
+            )
+            device = weight.device
         tensor_shape = weight.shape
 
         def maybe_convert_to_torch_tensor(tensor: torch.Tensor, indices: list[slice] | None = None):
