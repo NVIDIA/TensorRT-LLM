@@ -1,24 +1,21 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""MLA (Multi-head Latent Attention) custom ops.
 
-"""Multi-head Latent Attention operations.
-
-This module provides Multi-head Latent Attention (MLA) implementations:
-- mla: MLA operations and attention descriptor
+Exports:
+- TorchBackendMLAAttention: Attention descriptor for MLA (registered as "torch_mla")
+- FlashInferMLAAttention: Attention descriptor for FlashInfer MLA (registered as "flashinfer_mla")
+- torch_mla: Source op for MLA attention
+- torch_backend_mla_with_cache: Cached backend op with FlashInfer-compatible cache
+- flashinfer_mla_with_cache: Cached backend op using FlashInfer MLA kernels
 """
 
+from .flashinfer_mla import FlashInferMLAAttention, flashinfer_mla_with_cache
+from .torch_backend_mla import TorchBackendMLAAttention, torch_backend_mla_with_cache
+from .torch_mla import torch_mla
+
 __all__ = [
-    "mla",
+    "TorchBackendMLAAttention",
+    "FlashInferMLAAttention",
+    "torch_mla",
+    "torch_backend_mla_with_cache",
+    "flashinfer_mla_with_cache",
 ]

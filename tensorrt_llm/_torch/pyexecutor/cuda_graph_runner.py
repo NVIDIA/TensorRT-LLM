@@ -16,9 +16,10 @@ from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import get_draft_token_length
-from .mamba_cache_manager import MambaCacheManager
+from .mamba_cache_manager import MambaCacheManager, use_cpp_mamba_cache_manager
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -435,12 +436,20 @@ class CUDAGraphRunner:
         # respect the requirement just in case that changes in the future.
         if self.padding_dummy_request is None:
 
+            # Get draft KV cache manager only for one-model speculative decoding.
+            # In two-model mode, each model has its own KV cache manager, so
+            # draft_kv_cache_manager should be None.
+            draft_kv_cache_manager = get_draft_kv_cache_manager(
+                self.spec_config, resource_manager)
+
             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
-                max_beam_width=self.config.max_beam_width)
+                max_beam_width=self.config.max_beam_width,
+                draft_kv_cache_manager=draft_kv_cache_manager)
+
             if self.padding_dummy_request is None:
                 return 0
             else:
@@ -451,8 +460,8 @@ class CUDAGraphRunner:
             if spec_res_mgr:
                 spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
 
-        # handle special cases of padding requests + MambaCacheManager or MambaHybridCacheManager
-        if isinstance(kv_cache_manager, MambaCacheManager):
+        if (isinstance(kv_cache_manager, MambaCacheManager)
+                and not use_cpp_mamba_cache_manager()):
             kv_cache_manager.reorder_state_indices_when_padding_requests(
                 batch_size, padding_size)
 

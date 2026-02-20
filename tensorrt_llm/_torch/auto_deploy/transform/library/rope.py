@@ -363,7 +363,11 @@ class MatchRopeLayout(BaseTransform):
 class OptimizeRope(BaseTransform):
     """
     Scan the FX graph and replace calls to the torch-reference RoPE ops with
-    the optimized `rope::flashinfer` kernel.
+    optimized kernels:
+    - ``torch_rope_with_explicit_cos_sin`` → ``flashinfer_rope``
+    - ``torch_rope_with_complex_freqs``    → ``flashinfer_rope``
+    - ``torch_rope_with_qk_interleaving``  → ``triton_rope_on_interleaved_qk_inputs``
+
     Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
     and reuses those nodes when possible.
     """
@@ -385,6 +389,9 @@ class OptimizeRope(BaseTransform):
                 _optimize_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
             elif is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
                 _optimize_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
+            elif is_op(node, torch.ops.auto_deploy.torch_rope_with_qk_interleaving):
+                if not _optimize_interleaved(graph, node):
+                    continue
             else:
                 continue
             num_rope_optimizations += 1
@@ -544,6 +551,117 @@ def _optimize_complex(
     flash_node.meta["val"] = node.meta.get("val", None)
     node.replace_all_uses_with(flash_node)
     graph.erase_node(node)
+
+
+def _trace_back_index(node: Node) -> Optional[Tuple[Node, Node]]:
+    """Trace back from a node to find an aten.index.Tensor producer.
+
+    If ``node`` was produced by ``aten.index.Tensor(cache, [position_ids])``,
+    return ``(cache_node, position_ids_node)``.  Otherwise return ``None``.
+    """
+    if not is_op(node, torch.ops.aten.index.Tensor):
+        return None
+    cache_node = node.args[0]
+    indices = node.args[1]
+    if not isinstance(indices, (list, tuple)) or len(indices) != 1:
+        return None
+    position_ids_node = indices[0]
+    if not isinstance(cache_node, Node) or not isinstance(position_ids_node, Node):
+        return None
+    return cache_node, position_ids_node
+
+
+def _validate_interleaved_rope_inputs(q_node: Node, k_node: Node) -> bool:
+    """Validate q/k inputs for the interleaved triton RoPE kernel.
+
+    Relaxed compared to ``_validate_rope_inputs``: requires even head_dim
+    (not head_dim % 64 == 0) since the triton kernel pads to next-power-of-2.
+    """
+    for node in (q_node, k_node):
+        fake_val = node.meta.get("val", None)
+        if fake_val is None:
+            return False
+
+        # dtype must be half-precision
+        if fake_val.dtype not in (torch.float16, torch.bfloat16):
+            return False
+
+        # Must be at least 4-D
+        if len(fake_val.shape) < 4:
+            return False
+
+        # head_dim must be even
+        head_dim = fake_val.shape[-1]
+        if isinstance(head_dim, int) and head_dim % 2 != 0:
+            return False
+
+        # BSND layout: dim 1 (S) should be symbolic, dim 2 (N) should be static
+        if not isinstance(fake_val.shape[1], torch.SymInt):
+            return False
+        if not isinstance(fake_val.shape[2], int):
+            return False
+
+    return True
+
+
+def _optimize_interleaved(graph: torch.fx.Graph, node: Node) -> bool:
+    """Replace ``torch_rope_with_qk_interleaving`` with ``triton_rope_on_interleaved_qk_inputs``.
+
+    Traces back from cos/sin nodes to find the original ``aten.index.Tensor``
+    producer and extracts the cached cos/sin tensors and position_ids, passing
+    them directly to the triton kernel (which fuses the position lookup).
+
+    Returns True if the replacement was made, False if skipped.
+    """
+    # --- extract arguments ---------------------------------------------------
+    q_node, k_node, cos_node, sin_node, *rest = node.args
+    q_rope_old, k_rope_old = extract_output_tuple(node, 2)
+    if q_rope_old is None or k_rope_old is None:
+        return False
+
+    # --- validate inputs -----------------------------------------------------
+    if not _validate_interleaved_rope_inputs(q_node, k_node):
+        return False
+
+    # --- trace back cos/sin to find cache + position_ids ---------------------
+    cos_traced = _trace_back_index(cos_node)
+    if cos_traced is None:
+        return False
+    cos_cache_node, cos_position_ids_node = cos_traced
+
+    sin_traced = _trace_back_index(sin_node)
+    if sin_traced is None:
+        return False
+    sin_cache_node, sin_position_ids_node = sin_traced
+
+    # Both cos and sin must use the same position_ids
+    if cos_position_ids_node is not sin_position_ids_node:
+        return False
+
+    position_ids_node = cos_position_ids_node
+
+    # --- insert the triton op ------------------------------------------------
+    with graph.inserting_before(node):
+        triton_node = graph.call_function(
+            torch.ops.auto_deploy.triton_rope_on_interleaved_qk_inputs,
+            args=(q_node, k_node, cos_cache_node, sin_cache_node, position_ids_node),
+        )
+
+    with graph.inserting_after(triton_node):
+        q_rope_new = graph.call_function(operator.getitem, args=(triton_node, 0))
+        k_rope_new = graph.call_function(operator.getitem, args=(triton_node, 1))
+
+    # --- rewire outputs ------------------------------------------------------
+    q_rope_new.meta["val"] = q_rope_old.meta.get("val", None)
+    k_rope_new.meta["val"] = k_rope_old.meta.get("val", None)
+
+    q_rope_old.replace_all_uses_with(q_rope_new)
+    k_rope_old.replace_all_uses_with(k_rope_new)
+
+    graph.erase_node(q_rope_old)
+    graph.erase_node(k_rope_old)
+
+    return True
 
 
 def _match_input_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:

@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -17,6 +18,19 @@ LOOKBACK_JOBS = 30
 MAX_QUERY_SIZE = 3000
 MAX_TEST_CASES_PER_MSG = 4
 POST_SLACK_MSG_RETRY_TIMES = 5
+
+
+def _timestamp_to_date(ts):
+    """Convert millisecond timestamp to YYYY/MM/DD format."""
+    if ts == "N/A" or ts is None:
+        return "N/A"
+    try:
+        ts_int = int(ts)
+        # Convert milliseconds to seconds
+        dt = datetime.fromtimestamp(ts_int / 1000)
+        return dt.strftime("%Y/%m/%d")
+    except (ValueError, TypeError, OSError):
+        return str(ts)
 
 
 def _parse_value(value):
@@ -231,14 +245,14 @@ def split_regression_message(regression_dict):
             for part in regression_info.split(","):
                 part = part.strip()
                 if "baseline_date:" in part:
-                    baseline_date = part.split(":", 1)[-1].strip()
+                    baseline_date = _timestamp_to_date(part.split(":", 1)[-1].strip())
                 elif "baseline_branch:" in part:
                     baseline_branch = part.split(":", 1)[-1].strip()
                 elif "baseline_commit:" in part:
                     baseline_commit = part.split(":", 1)[-1].strip()
 
             # Get regression branch and commit from data
-            regression_date = data.get("ts_created", "N/A")
+            regression_date = _timestamp_to_date(data.get("ts_created", "N/A"))
             regression_branch = data.get("s_branch", "N/A")
             regression_commit = data.get("s_commit", "N/A")
 

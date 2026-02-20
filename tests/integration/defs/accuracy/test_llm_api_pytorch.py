@@ -335,7 +335,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM"])
-    def test_nvfp4_kv(self, attn_backend, torch_compile):
+    @parametrize_with_ids("v2_kv_cache", [True, False])
+    def test_nvfp4_kv(self, attn_backend, torch_compile, v2_kv_cache):
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -344,7 +345,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
-        pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="nvfp4")
+        pytorch_config["kv_cache_config"] = KvCacheConfig(
+            dtype="nvfp4", use_kv_cache_manager_v2=v2_kv_cache)
         with LLM(f"{llm_models_root()}/Llama-3_1-8B-Instruct_fp8_kv_nvfp4",
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
@@ -3133,6 +3135,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_post_blackwell
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
         [(8, 1, 8, False, False, True, True, 16)],
@@ -5690,6 +5693,17 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(40000)
     @pytest.mark.parametrize(
+        "use_cpp_mamba",
+        [
+            False,
+            True,
+        ],
+        ids=[
+            "python_mamba_cache",
+            "cpp_mamba_cache",
+        ],
+    )
+    @pytest.mark.parametrize(
         "attention_dp",
         [
             False,
@@ -5700,7 +5714,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             "attention_dp_on",
         ],
     )
-    def test_fp8_4gpus(self, attention_dp):
+    def test_fp8_4gpus(self, attention_dp, use_cpp_mamba, monkeypatch):
+        monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA",
+                           "1" if use_cpp_mamba else "0")
+
         with LLM(
                 f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-fp8-fp8kv",
                 kv_cache_config=KvCacheConfig(

@@ -54,12 +54,18 @@ async def send_request(session, server_host, server_port, model, prompt,
                     if line.startswith("data: "):
                         line = line[len("data: "):]
                         response_json = json.loads(line)
-                        text += response_json["choices"][0]["text"]
+                        choices = response_json.get("choices", [])
+                        if not choices:
+                            continue
+                        text += choices[0].get("text", "")
             logging.info(text)
             return text
         else:
             response_json = await response.json()
-            text = response_json["choices"][0]["text"]
+            choices = response_json.get("choices", [])
+            if not choices:
+                raise ValueError("Missing choices in completion response")
+            text = choices[0].get("text", "")
             logging.info(text)
             return text
 
@@ -100,14 +106,21 @@ async def send_chat_request(session, server_host, server_port, model, prompt,
                     if line.startswith("data: "):
                         line = line[len("data: "):]
                         response_json = json.loads(line)
-                        if "content" in response_json["choices"][0]["delta"]:
-                            text += response_json["choices"][0]["delta"][
-                                "content"]
+                        choices = response_json.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        content = delta.get("content")
+                        if content is not None:
+                            text += content
             logging.info(text)
             return text
         else:
             response_json = await response.json()
-            text = response_json["choices"][0]["message"]["content"]
+            choices = response_json.get("choices", [])
+            if not choices:
+                raise ValueError("Missing choices in chat completion response")
+            text = choices[0].get("message", {}).get("content", "")
             logging.info(text)
             return text
 

@@ -2,8 +2,11 @@
 
 import heapq
 import os
-from collections import deque, namedtuple
-from typing import Any, Dict, List, Optional, Tuple
+from collections import namedtuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .scheduler import WaitingQueue
 
 import torch
 
@@ -246,7 +249,7 @@ def can_process_attention_dp_request(
 
 
 def get_from_waiting_queue(
-    waiting_queue: deque,
+    waiting_queue: "WaitingQueue",
     max_req_count: int,
     enable_attention_dp: bool,
     max_num_active_requests: int,
@@ -277,11 +280,11 @@ def get_from_waiting_queue(
     )
 
     while req_count < max_req_count and waiting_queue:
-        req_item = waiting_queue[0]
+        req_item = waiting_queue.peek_request()
         num_children = len(req_item.child_req_ids) if req_item.child_req_ids else 0
         if (req_count + 1 + num_children) > max_req_count:
             break
-        req_item = waiting_queue.popleft()
+        req_item = waiting_queue.pop_request()
 
         can_process = (
             can_process_attention_dp_request(
@@ -299,7 +302,7 @@ def get_from_waiting_queue(
 
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
-    waiting_queue.extendleft(reversed(pending_requests))
+    waiting_queue.prepend_requests(reversed(pending_requests))
 
     return items
 
@@ -673,7 +676,8 @@ class RequestBroadcaster:
         # Broadcast within first PP stage before send/recv chain to other PP stages.
         # This needs to cover both TP and CP ranks within the first PP stage.
         if self.dist.is_first_pp_rank:
-            payloads = self.dist.tp_cp_broadcast(payloads, root=0)
+            with nvtx_range("tp_broadcast_requests"):
+                payloads = self.dist.tp_cp_broadcast(payloads, root=0)
 
         # Tag for communication
         tag = self.dist.pp_size  # Use pp_size as tag to avoid conflicts

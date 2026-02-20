@@ -15,7 +15,7 @@
 import enum
 import sys
 from abc import ABC, abstractmethod
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from collections.abc import Iterable
 from concurrent import futures
 from dataclasses import dataclass
@@ -326,7 +326,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
                     f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
                 )
 
-            request.py_result.append_mm_embeddings(mm_embedding)
+            request.py_result.append_mm_embeddings(mm_embedding, request.multimodal_lengths)
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
@@ -369,10 +369,6 @@ def _get_max_beam_width(request: LlmRequest) -> int:
     return max_beam_width
 
 
-def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
-    return not params.use_beam_search
-
-
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
     temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
@@ -393,16 +389,13 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
 
 
 def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
-    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
-    # resolve it on every iteration.
-    if request._py_sampling_strategy is not None:
-        return request._py_sampling_strategy
+    """Resolve the sampling strategy for a request.
 
+    Note: Callers inside _group_requests_by_strategy_key benefit from store.strategies
+    caching, which ensures this function is called at most once per request per slot.
+    """
     params = _request_get_sampling_params(request)
-    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
-    if _request_sampling_params_cachable(params):
-        request._py_sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
-    return sampling_strategy
+    return resolve_sampling_strategy(params, vocab_size=vocab_size)
 
 
 def _group_requests_by_strategy_key(
@@ -410,63 +403,191 @@ def _group_requests_by_strategy_key(
     *,
     strategy_to_key: Callable[[Strategy], GenericStrategyKeyType],
     pin_memory: bool = False,
+    store: "TorchSampler.Store",
+    seq_slots: torch.Tensor,
     vocab_size: int,
 ) -> dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValue]:
-    # NB: Client code relies on request indices in returned torch.Tensor being ordered
-    #     by ascending "requests" index.
-    RequestGroupValueBuilder = namedtuple(
-        "RequestGroupValueBuilder",
-        [
-            "indices",
-            "strategies",
-            "speculation_needs_probs_list",
-            "need_processed_logprobs_list",
-            "need_raw_logprobs_list",
-        ],
+    """
+    Optimized implementation with vectorized boolean operations and efficient grouping.
+
+    NB: Client code relies on request indices in returned torch.Tensor being sorted.
+    """
+    # Convert to list for efficient indexing
+    requests_list = list(requests) if not isinstance(requests, list) else requests
+    n = len(requests_list)
+
+    if n == 0:
+        return {}
+
+    assert not seq_slots.is_cuda, "seq_slots is expected to be a host tensor"
+    seq_slots_list = seq_slots.tolist()
+
+    # Get strategies from cache, only recomputing for slots that need it.
+    # Recompute is needed for:
+    #   - Uncached slots (strategy is None) — recorded in store.slots_needing_recompute
+    #   - Beam search (beam_width_in changes) — kept in slots_needing_recompute permanently
+    #   - Speculative decoding (draft_tokens can change) — checked for non-greedy slots only
+
+    # Build strategies from cache in one shot (C-level list comprehension, ~50ns/elem)
+    s_strategies = store.strategies
+    strategies = [s_strategies[slot] for slot in seq_slots_list]
+
+    # Build slot→request_index mapping for targeted access
+    slot_to_idx = {slot: i for i, slot in enumerate(seq_slots_list)}
+    active_slots = set(slot_to_idx)
+
+    # 1) Slots pre-recorded for recompute (context-phase or beam search)
+    recompute_batch_slots = store.slots_needing_recompute & active_slots
+
+    # 2) Non-greedy slots where draft-token status may have changed
+    #    (For greedy: current_has_draft is always False, matching cached, so never stale)
+    draft_check_slots = (store.non_greedy_slots & active_slots) - recompute_batch_slots
+    for slot in draft_check_slots:
+        i = slot_to_idx[slot]
+        has_draft = bool(requests_list[i].py_draft_tokens)
+        if store.speculation_needs_probs[slot] != has_draft:
+            # Draft-token status changed — only update the affected flags.
+            # The strategy itself doesn't depend on draft tokens (only on sampling params).
+            store.speculation_needs_probs[slot] = has_draft
+            store.needs_probs[slot] = has_draft or store.need_processed[slot]
+
+    # 3) Full recompute for the pre-recorded slots.
+    #    Every slot with a None strategy must already be in slots_needing_recompute
+    #    (populated by setup_sampler_step when a new request arrives).
+    assert None not in strategies or all(
+        seq_slots_list[i] in recompute_batch_slots for i in range(n) if strategies[i] is None
+    ), (
+        "Found slots with uncached strategies not registered in slots_needing_recompute. "
+        "Ensure setup_sampler_step is called before sample_async for new requests."
     )
 
-    group_dict: dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValueBuilder] = (
-        defaultdict(lambda: RequestGroupValueBuilder([], [], [], [], []))
+    for slot in recompute_batch_slots:
+        i = slot_to_idx[slot]
+        request = requests_list[i]
+        has_draft_tokens = bool(request.py_draft_tokens)
+
+        strategy = _request_strategy(request, vocab_size=vocab_size)
+        store.strategies[slot] = strategy
+        strategies[i] = strategy
+
+        is_greedy = strategy == GREEDY
+        store.speculation_needs_probs[slot] = has_draft_tokens and not is_greedy
+        store.need_processed[slot] = (
+            request.py_logprobs_mode == LogprobMode.PROCESSED and request.return_log_probs
+        )
+        store.need_raw[slot] = (
+            request.py_logprobs_mode == LogprobMode.RAW and request.return_log_probs
+        )
+        store.needs_probs[slot] = store.speculation_needs_probs[slot] or store.need_processed[slot]
+
+        # Track non-greedy slots for future draft-token checks
+        if is_greedy:
+            store.non_greedy_slots.discard(slot)
+        else:
+            store.non_greedy_slots.add(slot)
+
+        # Keep beam-search slots in the recompute set (they always need it);
+        # remove everything else (strategy is now cached).
+        if not store.uses_beam_search[slot]:
+            store.slots_needing_recompute.discard(slot)
+
+    # Gather flags using list comprehension (faster than append in loop)
+    needs_probs = torch.tensor(
+        [store.needs_probs[slot] for slot in seq_slots_list], dtype=torch.bool, device="cpu"
+    )
+    speculation_needs_probs = torch.tensor(
+        [store.speculation_needs_probs[slot] for slot in seq_slots_list],
+        dtype=torch.bool,
+        device="cpu",
+    )
+    need_processed = torch.tensor(
+        [store.need_processed[slot] for slot in seq_slots_list], dtype=torch.bool, device="cpu"
+    )
+    need_raw = torch.tensor(
+        [store.need_raw[slot] for slot in seq_slots_list], dtype=torch.bool, device="cpu"
+    )
+    # Build strategy ID mapping for vectorized comparison (all on CPU).
+    # NB: set() does not preserve insertion order, so we use dict.fromkeys() to deduplicate while preserving order.
+    unique_strategies = list(dict.fromkeys(strategies))
+    strategy_to_id = {s: idx for idx, s in enumerate(unique_strategies)}
+    strategy_ids = torch.tensor(
+        [strategy_to_id[s] for s in strategies], dtype=torch.int32, device="cpu"
     )
 
-    for req_index, req in enumerate(requests):
-        strategy = _request_strategy(req, vocab_size=vocab_size)
-        speculation_needs_probs = (
-            # NB: This criterion needs to be consistent with the gating of rejection sampling in
-            #     process_draft_tokens.
-            TorchSampler._speculation_could_use_rejection_sampling(req, strategy)
+    # Pre-allocate group_ids array
+    group_ids = torch.empty(n, dtype=torch.int32, device="cpu")
+
+    _next_gid = 0
+
+    def _provision_gid() -> int:
+        nonlocal _next_gid
+        gid = _next_gid
+        _next_gid += 1
+        return gid
+
+    unique_keys: defaultdict[tuple, int] = defaultdict(_provision_gid)
+
+    # Vectorized assignment: loop over unique combinations instead of all requests
+    for sid, strategy in enumerate(unique_strategies):
+        strat_mask = strategy_ids == sid
+
+        for needs_probs_val in (False, True):
+            # Vectorized mask for this (strategy, needs_probs) group
+            mask = strat_mask & (needs_probs if needs_probs_val else ~needs_probs)
+
+            if torch.any(mask):
+                strategy_key = strategy_to_key(strategy)  # Called once per group!
+                key = (strategy_key, needs_probs_val)
+                group_ids[mask] = unique_keys[key]  # Vectorized assignment
+
+    # Efficient grouping using sort
+    sorted_group_ids, sorted_order = torch.sort(group_ids, stable=True)
+    # Use prepend to detect a "change" at position 0, giving us group_starts directly
+    group_starts = torch.nonzero(
+        torch.diff(sorted_group_ids, prepend=torch.tensor([-1], device="cpu")) != 0
+    ).squeeze(1)
+    group_ends = torch.cat([group_starts[1:], torch.tensor([n], device="cpu")])
+    # Since groups are assigned in request order, gid → key is just list indexing
+    id_to_key = list(unique_keys)
+
+    # Build result dictionary efficiently
+    result: dict[RequestGroupKey, RequestGroupValue] = {}
+
+    for gid, (start, end) in enumerate(zip(group_starts.tolist(), group_ends.tolist())):
+        group_sorted_indices = sorted_order[start:end]
+        strategy_key, needs_probs_bool = id_to_key[gid]
+
+        indices_arr = group_sorted_indices.to(torch.int32)
+        # Convert to list for Python list indexing
+        group_sorted_indices_list = group_sorted_indices.tolist()
+        group_strategies = [strategies[i] for i in group_sorted_indices_list]
+        spec_mask = speculation_needs_probs[group_sorted_indices]
+        spec_indices = indices_arr[spec_mask]
+        processed_flags = need_processed[group_sorted_indices]
+        raw_flags = need_raw[group_sorted_indices]
+
+        if pin_memory:
+            indices_tensor = indices_arr.pin_memory()
+            spec_tensor = spec_indices.pin_memory()
+            processed_tensor = processed_flags.pin_memory()
+            raw_tensor = raw_flags.pin_memory()
+        else:
+            indices_tensor = indices_arr
+            spec_tensor = spec_indices
+            processed_tensor = processed_flags
+            raw_tensor = raw_flags
+
+        result[RequestGroupKey(strategy_key=strategy_key, needs_probs=needs_probs_bool)] = (
+            RequestGroupValue(
+                indices=indices_tensor,
+                strategies=group_strategies,
+                speculation_needs_probs_indices=spec_tensor,
+                need_processed_logprobs=processed_tensor,
+                need_raw_logprobs=raw_tensor,
+            )
         )
-        need_processed_logprobs = (
-            req.py_logprobs_mode == LogprobMode.PROCESSED and req.return_log_probs
-        )
-        need_raw_logprobs = req.py_logprobs_mode == LogprobMode.RAW and req.return_log_probs
-        needs_probs = speculation_needs_probs or need_processed_logprobs
-        strategy_key = strategy_to_key(strategy)
-        group_dict_entry = group_dict[
-            RequestGroupKey(strategy_key=strategy_key, needs_probs=needs_probs)
-        ]
-        group_dict_entry.indices.append(req_index)
-        group_dict_entry.strategies.append(strategy)
-        if speculation_needs_probs:
-            group_dict_entry.speculation_needs_probs_list.append(req_index)
-        group_dict_entry.need_processed_logprobs_list.append(need_processed_logprobs)
-        group_dict_entry.need_raw_logprobs_list.append(need_raw_logprobs)
-    return {
-        group_key: RequestGroupValue(
-            indices=torch.tensor(group_value.indices, pin_memory=pin_memory, dtype=torch.int32),
-            strategies=group_value.strategies,
-            speculation_needs_probs_indices=torch.tensor(
-                group_value.speculation_needs_probs_list, pin_memory=pin_memory, dtype=torch.int32
-            ),
-            need_processed_logprobs=torch.tensor(
-                group_value.need_processed_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
-            ),
-            need_raw_logprobs=torch.tensor(
-                group_value.need_raw_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
-            ),
-        )
-        for group_key, group_value in group_dict.items()
-    }
+
+    return result
 
 
 def add_token(
@@ -766,6 +887,13 @@ class BeamHistory:
     cum_logprobs: torch.Tensor | None = None
 
 
+BeamHistoryBuilder: TypeAlias = Callable[[], BeamHistory | None]
+"""Builder for BeamHistory.
+
+Used to defer possibly unnecessary host-tensor construction until update_requests().
+"""
+
+
 @dataclass(kw_only=True)
 class SamplingRequestsMetadata:
     req_num_generated_tokens: torch.Tensor
@@ -789,7 +917,7 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
-    beam_histories: list[BeamHistory | None] | None = None
+    beam_history_builders: list[BeamHistoryBuilder | None] | None = None
 
 
 class AsyncWorkerMixin:
@@ -898,6 +1026,8 @@ class AsyncWorkerMixin:
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     DEFAULT_MAX_TOPK_LOGPROBS = 20
 
+    SampleState = SampleStateTorch
+
     @override
     def get_cache_indirection(self) -> torch.Tensor | None:
         return self.store.cache_indirection
@@ -953,6 +1083,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Shape: batch_size, beam_width, sequence_length
            Usage: Stores the original tokens for each beam.
            This is used to recover the original tokens for each beam when streaming is enabled"""
+        speculation_needs_probs: list | None = None
+        """Length: max_num_sequences. True if request has draft tokens and non-greedy sampling."""
+        need_processed: list | None = None
+        """Length: max_num_sequences. True if logprob mode is PROCESSED and return_log_probs is set."""
+        need_raw: list | None = None
+        """Length: max_num_sequences. True if logprob mode is RAW and return_log_probs is set."""
+        needs_probs: list | None = None
+        """Length: max_num_sequences. True if speculation_needs_probs or need_processed."""
+        strategies: list | None = None
+        """Length: max_num_sequences. Stores cached Strategy tuple for each seq_slot."""
+        uses_beam_search: list | None = None
+        """Length: max_num_sequences. True if max_beam_width > 1 for this slot."""
+        slots_needing_recompute: set | None = None
+        """Slots where strategy needs (re)computation. Populated in setup_sampler_step."""
+        non_greedy_slots: set | None = None
+        """Slots with non-greedy strategies. Used to limit draft-token checks."""
 
         def __post_init__(self):
             assert self.new_tokens.shape == self.finish_reasons.shape
@@ -982,6 +1128,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         predecessor_beams: torch.Tensor | None = None
         original_tokens: torch.Tensor | None = None
         first_finish_reasons: torch.Tensor | None = None
+
+        # Use Python lists instead of tensors to avoid .item() overhead in hot loops
+        speculation_needs_probs: list = [False] * self.max_num_sequences
+        need_processed: list = [False] * self.max_num_sequences
+        need_raw: list = [False] * self.max_num_sequences
+        needs_probs: list = [False] * self.max_num_sequences
+        strategies: list = [None] * self.max_num_sequences
+        uses_beam_search: list = [False] * self.max_num_sequences
+        slots_needing_recompute: set = set()
+        non_greedy_slots: set = set()
+
         if self._use_beam_search:
             cache_indirection = torch.empty(
                 self.CACHE_INDIRECTION_SHAPE, device="cuda", dtype=torch.int
@@ -1009,6 +1166,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             predecessor_beams=predecessor_beams,
             original_tokens=original_tokens,
             first_finish_reasons=first_finish_reasons,
+            speculation_needs_probs=speculation_needs_probs,
+            need_processed=need_processed,
+            need_raw=need_raw,
+            needs_probs=needs_probs,
+            strategies=strategies,
+            uses_beam_search=uses_beam_search,
+            slots_needing_recompute=slots_needing_recompute,
+            non_greedy_slots=non_greedy_slots,
         )
 
     @dataclass(frozen=True, kw_only=True)
@@ -1038,7 +1203,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.CACHE_INDIRECTION_SHAPE = (
             self.max_num_sequences,
             self.max_beam_width,
-            self.max_seq_len + (0 if args.disable_overlap_scheduler else 1),
+            self.max_seq_len,
         )
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
@@ -1247,9 +1412,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         token_tensor: torch.Tensor,
         logprobs_tensor: torch.Tensor,
-        sampled_log_probs_indices: torch.Tensor | None,
-        sampled_log_probs_vals: torch.Tensor | None,
-        sampled_log_probs_rank: torch.Tensor | None,
     ) -> list[list[dict[int, Logprob]]]:
         """Convert the logprobs tensor to a list of lists of dictionaries of Logprob objects
 
@@ -1258,9 +1420,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         args:
             token_tensor: torch.Tensor. Shape: beam_width, num_tokens, num_logprobs
             logprobs_tensor: torch.Tensor. Shape: beam_width, num_tokens, num_logprobs
-            sampled_log_probs_indices: torch.Tensor | None. Shape: num_tokens
-            sampled_log_probs_vals: torch.Tensor | None. Shape: num_tokens
-            sampled_log_probs_rank: torch.Tensor | None. Shape: num_tokens
         output:
             list[list[dict[int, Logprob]]]. Shape: (beam_width, num_tokens)
         """
@@ -1272,38 +1431,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         token_log_probs: list[list[dict[int, Logprob]]] = []
         token_list = token_tensor.tolist()
         logprobs_list = logprobs_tensor.tolist()
-        sampled_log_probs_indices_list: list[int] | None = None
-        sampled_log_probs_vals_list: list[float] | None = None
-        sampled_log_probs_rank_list: list[int] | None = None
-        if sampled_log_probs_indices is not None:
-            sampled_log_probs_indices_list = sampled_log_probs_indices.tolist()
-            assert sampled_log_probs_vals is not None, "sampled_log_probs_vals must be provided"
-            assert sampled_log_probs_rank is not None, "sampled_log_probs_rank must be provided"
-            sampled_log_probs_vals_list = sampled_log_probs_vals.tolist()
-            sampled_log_probs_rank_list = sampled_log_probs_rank.tolist()
         for beam_idx in range(token_tensor.shape[0]):
             beam_token_log_probs: list[dict[int, Logprob]] = []
-            for step_idx, (topk_token, topk_logprob) in enumerate(
-                zip(token_list[beam_idx], logprobs_list[beam_idx])
-            ):
+            for topk_token, topk_logprob in zip(token_list[beam_idx], logprobs_list[beam_idx]):
                 logprobs = {
                     token: Logprob(logprob=logprob, rank=rank + 1)
                     for rank, (token, logprob) in enumerate(zip(topk_token, topk_logprob))
                 }
-                if sampled_log_probs_indices is not None:
-                    assert beam_idx == DEFAULT_BEAM_IDX, (
-                        "beam search does not need to explicitly handle sampled log probs"
-                    )
-                    assert sampled_log_probs_indices_list is not None
-                    assert sampled_log_probs_vals_list is not None
-                    assert sampled_log_probs_rank_list is not None
-                    if sampled_log_probs_indices_list[step_idx] not in logprobs:
-                        logprobs[sampled_log_probs_indices_list[step_idx]] = Logprob(
-                            logprob=sampled_log_probs_vals_list[step_idx],
-                            rank=max(
-                                token_tensor.shape[2] + 1, sampled_log_probs_rank_list[step_idx]
-                            ),
-                        )
                 beam_token_log_probs.append(logprobs)
             token_log_probs.append(beam_token_log_probs)
 
@@ -1543,61 +1677,109 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Args:
             requests: list[LlmRequest]. The requests to setup the sampler step for
         """
-        if self._use_beam_search:
-            self._prepare_beam_search(scheduled_requests.all_requests())
-
         seq_slots: list[int] = []
         max_lens: list[int] = []
         end_ids: list[int] = []
+        prompt_lens: list[int] = []
         for request in scheduled_requests.context_requests:
             if self._is_new_request(request):
                 assert request.py_seq_slot is not None
-                seq_slots.append(request.py_seq_slot)
+                slot = request.py_seq_slot
+                seq_slots.append(slot)
                 max_lens.append(
                     min(self.max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
                 )
                 end_ids.append(request.py_end_id if request.py_end_id is not None else -1)
+
+                if self._use_beam_search:
+                    if request.py_return_log_probs and request.py_num_logprobs > 1:
+                        raise ValueError("Beam search does not support multiple logprobs")
+                    prompt_lens.append(request.py_prompt_len)
+
+                # Initialize cached data for this slot (prevents stale data from previous request)
+                self.store.strategies[slot] = None
+                self.store.uses_beam_search[slot] = _get_max_beam_width(request) > 1
+                # Mark slot for strategy recomputation in _group_requests_by_strategy_key
+                self.store.slots_needing_recompute.add(slot)
+                self.store.non_greedy_slots.discard(slot)  # reset until strategy is computed
+
         if len(seq_slots) > 0:
             full_list = [seq_slots, max_lens, end_ids]
+            if self._use_beam_search:
+                full_list.append(prompt_lens)
             # perform only a single copy
-            full_list_tensor = torch.tensor(full_list, device="cpu", dtype=torch.int32).to(
-                device="cuda", non_blocking=True
-            )
+            full_list_tensor = torch.tensor(
+                full_list, device="cpu", dtype=torch.int32, pin_memory=True
+            ).to(device="cuda", non_blocking=True)
             seq_slots_tensor = full_list_tensor[0]
             max_lens_tensor = full_list_tensor[1]
             end_ids_tensor = full_list_tensor[2]
             self.store.max_lengths_tensor[seq_slots_tensor] = max_lens_tensor
             self.store.end_ids[seq_slots_tensor] = end_ids_tensor
 
+            if self._use_beam_search:
+                prompt_lens_tensor = full_list_tensor[3]
+                self._prepare_beam_search(
+                    seq_slots=seq_slots_tensor,
+                    prompt_lens=prompt_lens_tensor,
+                )
+
     def _prepare_beam_search(
         self,
-        requests: list[LlmRequest],
+        seq_slots: torch.Tensor,
+        prompt_lens: torch.Tensor,
     ):
         """Prepare the beam search buffers for the requests
 
         If the last context chunk is being processed,
         initialize/reset the buffers for the request
         """
-        for request in requests:
-            if self._is_new_request(request):
-                if request.py_return_log_probs and request.py_num_logprobs > 1:
-                    raise ValueError("Beam search does not support multiple logprobs")
-                assert self.store.cache_indirection is not None
-                assert self.store.cum_log_probs is not None
-                assert self.store.sampled_log_probs is not None
-                assert self.store.sampled_log_prob_ranks is not None
-                assert self.store.predecessor_beams is not None
-                assert self.store.first_finish_reasons is not None
-                assert self.store.original_tokens is not None
-                self.store.cache_indirection[request.py_seq_slot, :, request.py_prompt_len].fill_(0)
-                self.store.cum_log_probs[request.py_seq_slot].fill_(0)
-                self.store.sampled_log_probs[request.py_seq_slot].fill_(0)
-                self.store.sampled_log_prob_ranks[request.py_seq_slot].fill_(0)
-                self.store.predecessor_beams[request.py_seq_slot].fill_(0)
-                self.store.first_finish_reasons[request.py_seq_slot].fill_(
-                    FinishReason.NOT_FINISHED.value
-                )
-                self.store.original_tokens[request.py_seq_slot].fill_(0)
+        assert self.store.cache_indirection is not None
+        assert self.store.cum_log_probs is not None
+        assert self.store.sampled_log_probs is not None
+        assert self.store.sampled_log_prob_ranks is not None
+        assert self.store.predecessor_beams is not None
+        assert self.store.first_finish_reasons is not None
+        assert self.store.original_tokens is not None
+        self.store.cache_indirection[seq_slots, :, prompt_lens] = torch.zeros(
+            (1, 1),
+            dtype=self.store.cache_indirection.dtype,
+            device=self.store.cache_indirection.device,
+        )
+        self.store.cum_log_probs[seq_slots] = torch.zeros(
+            (1,),
+            dtype=self.store.cum_log_probs.dtype,
+            device=self.store.cum_log_probs.device,
+        )
+        self.store.sampled_log_probs[seq_slots] = torch.zeros(
+            (1,),
+            dtype=self.store.sampled_log_probs.dtype,
+            device=self.store.sampled_log_probs.device,
+        )
+        self.store.sampled_log_prob_ranks[seq_slots] = torch.zeros(
+            (1,),
+            dtype=self.store.sampled_log_prob_ranks.dtype,
+            device=self.store.sampled_log_prob_ranks.device,
+        )
+        self.store.predecessor_beams[seq_slots] = torch.zeros(
+            (1,),
+            dtype=self.store.predecessor_beams.dtype,
+            device=self.store.predecessor_beams.device,
+        )
+        self.store.first_finish_reasons[seq_slots] = (
+            torch.tensor(
+                FinishReason.NOT_FINISHED.value,
+                pin_memory=True,
+                dtype=self.store.first_finish_reasons.dtype,
+            )
+            .to(self.store.first_finish_reasons.device, non_blocking=True)
+            .unsqueeze(0)
+        )
+        self.store.original_tokens[seq_slots] = torch.zeros(
+            (1,),
+            dtype=self.store.original_tokens.dtype,
+            device=self.store.original_tokens.device,
+        )
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
@@ -1730,7 +1912,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 request, new_tokens_list=new_tokens_list, new_tokens_tensor=new_tokens_tensor
             )
 
-    def _get_logprobs_from_request(self, request: LlmRequest) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_logprobs_from_request(
+        self,
+        request: LlmRequest,
+        pin_memory: bool = True,
+        preallocate_extra_steps: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract the logprobs from the request
 
         Returns:
@@ -1741,25 +1928,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         assert request.py_num_logprobs == 0, (
             "Beam search only supports returning the sampled logprob per token"
         )
-        logprobs_tensor = torch.empty(
+        logprobs_tensor_full = torch.empty(
             (
                 request.sampling_config.beam_width,
-                num_generated_tokens,
+                num_generated_tokens + preallocate_extra_steps,
                 request.py_num_logprobs + 1,
             ),
-            device="cuda",
+            pin_memory=pin_memory,
             dtype=torch.float32,
         )
-        logprobs_indices_tensor = torch.empty(
+        logprobs_indices_tensor_full = torch.empty(
             (
                 request.sampling_config.beam_width,
-                num_generated_tokens,
+                num_generated_tokens + preallocate_extra_steps,
                 request.py_num_logprobs + 1,
             ),
-            device="cuda",
+            pin_memory=pin_memory,
             dtype=torch.int32,
         )
-        if hasattr(request.py_result._log_probs, "log_probs"):
+        logprobs_tensor = logprobs_tensor_full[:, :-preallocate_extra_steps, :]
+        logprobs_indices_tensor = logprobs_indices_tensor_full[:, :-preallocate_extra_steps, :]
+        if logprobs_tensor.numel() > 0:
             logprobs_list = request.py_result.log_probs
             assert logprobs_list is not None
             for beam_idx, beam_logprobs in enumerate(logprobs_list):
@@ -1768,12 +1957,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         assert value.rank is not None
                         logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
                         logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
-        return logprobs_tensor, logprobs_indices_tensor
+        return logprobs_tensor_full, logprobs_indices_tensor_full
 
-    def _create_beam_history(
+    def _prepare_beam_history(
         self,
         request: LlmRequest,
-    ) -> BeamHistory | None:
+        *,
+        finish_reasons: torch.Tensor,
+    ) -> BeamHistoryBuilder | None:
         """Correct the stored tokens for each beam and return it as a BeamHistory object.
 
         Beam Search sampling only adds new tokens to the beam.
@@ -1782,9 +1973,30 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         If logprobs are requested, the function also corrects the stored logprobs for each beam.
         The function returns a BeamHistory object that contains the corrected tokens and logprobs for each beam.
 
+        Note: To defer the decision whether or not to skip BeamHistory construction until update_requests(), only
+              a builder (BeamHistoryBuilder) is returned here. The builder contains host tensors which are
+              being populated asynchronously. Hence, it can only be invoked after async D2H copies have completed,
+              e.g., after awaiting state.sampler_event in update_requests.
+
         arguments:
             request: The request to create the beam history for
+            finish_reasons: The first finish reason encountered for each beam of the request.
+                            Shape: (max_tokens, max_beam_width)
         """
+
+        # Gather data used for skipping beam history processing
+        need_finalize_due_to_stop_words = self._check_stop_words_length(request)
+        if need_finalize_due_to_stop_words:
+            need_history = torch.tensor(True)
+        else:
+            should_stop = self._check_beam_search_stop_criteria(
+                request,
+                finish_reasons=finish_reasons,
+            )
+            need_history = should_stop
+            # enqueue async D2H copy
+            need_history = self._copy_to_host(need_history)
+
         num_tokens = request.max_beam_num_tokens + 1  # last token is not yet added
         prompt_length = request.py_prompt_len
         num_generated_tokens = num_tokens - prompt_length
@@ -1793,73 +2005,98 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if num_generated_tokens == 0 or request.state == LlmRequestState.GENERATION_COMPLETE:
             # early return if no tokens have been generated yet or the request is already finished
             return None
+
         assert self.store.cache_indirection is not None
         assert self.store.original_tokens is not None
-        assert self.store.sampled_log_probs is not None
         cache_indirection = self.store.cache_indirection[
             request.py_seq_slot, :num_beams, prompt_length:num_tokens
         ]
         current_path = self.store.original_tokens[
             request.py_seq_slot, :num_beams, prompt_length:num_tokens
         ]
-        new_path = torch.zeros_like(current_path)
 
-        # initialize each beam with its own index
+        # enqueue async D2H copies
+        cache_indirection = self._copy_to_host(cache_indirection)
+        current_path = self._copy_to_host(current_path)
 
-        # Gather the correct tokens and logprobs for each beam
-        torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
+        def _post_process_path() -> torch.Tensor:
+            # Gather the correct tokens for each beam
+            new_path = torch.zeros_like(current_path)
+            torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
+            return new_path
+
         if request.py_return_log_probs:
+            assert self.store.sampled_log_probs is not None
             assert self.store.cum_log_probs is not None
-            current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(request)
-            # concatenate the newly generated logprobs and newly
-            # generated tokens to the current logprobs and logprobs indices
-            current_logprobs = torch.cat(
-                [
-                    current_logprobs,
-                    self.store.sampled_log_probs[request.py_seq_slot, :num_beams].view(-1, 1, 1),
-                ],
-                dim=1,
+            sampled_log_probs = self.store.sampled_log_probs[request.py_seq_slot, :num_beams].view(
+                -1, 1
             )
-            current_logprobs_indices = torch.cat(
-                [
-                    current_logprobs_indices,
-                    self.store.new_tokens[0, request.py_seq_slot, :num_beams].view(-1, 1, 1),
-                ],
-                dim=1,
-            )
-            # Initialize the buffers to store the results
-            new_logprobs = torch.zeros_like(current_logprobs)
-            new_logprobs_indices = torch.zeros_like(current_logprobs_indices)
-
-            cache_indirection_for_logprobs = cache_indirection.unsqueeze(-1).expand(
-                -1, -1, current_logprobs.shape[2]
-            )
-            torch.gather(
-                input=current_logprobs,
-                dim=0,
-                index=cache_indirection_for_logprobs,
-                out=new_logprobs,
-            )
-            torch.gather(
-                input=current_logprobs_indices,
-                dim=0,
-                index=cache_indirection_for_logprobs,
-                out=new_logprobs_indices,
-            )
+            sampled_logprobs_indices = self.store.new_tokens[
+                0, request.py_seq_slot, :num_beams
+            ].view(-1, 1)
             cum_logprobs = self.store.cum_log_probs[request.py_seq_slot, :num_beams]
+
+            # enqueue async D2H copies
+            sampled_log_probs = self._copy_to_host(sampled_log_probs)
+            sampled_logprobs_indices = self._copy_to_host(sampled_logprobs_indices)
+            cum_logprobs = self._copy_to_host(cum_logprobs)
+
+            def _maybe_postprocess_logprobs() -> tuple[
+                torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+            ]:
+                # Gather the correct logprobs for each beam
+
+                current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(
+                    request, preallocate_extra_steps=1
+                )
+                # concatenate the newly generated logprobs and newly
+                # generated tokens to the current logprobs and logprobs indices
+                current_logprobs[:, -1, :].copy_(sampled_log_probs)
+                current_logprobs_indices[:, -1, :].copy_(sampled_logprobs_indices)
+
+                # Initialize the buffers to store the results
+                new_logprobs = torch.zeros_like(current_logprobs)
+                new_logprobs_indices = torch.zeros_like(current_logprobs_indices)
+
+                cache_indirection_for_logprobs = cache_indirection.unsqueeze(-1).expand(
+                    -1, -1, current_logprobs.shape[2]
+                )
+                torch.gather(
+                    input=current_logprobs,
+                    dim=0,
+                    index=cache_indirection_for_logprobs,
+                    out=new_logprobs,
+                )
+                torch.gather(
+                    input=current_logprobs_indices,
+                    dim=0,
+                    index=cache_indirection_for_logprobs,
+                    out=new_logprobs_indices,
+                )
+                return new_logprobs, new_logprobs_indices, cum_logprobs
+
+        else:
+
+            def _maybe_postprocess_logprobs() -> tuple[
+                torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+            ]:
+                return None, None, None
+
+        def _builder() -> BeamHistory | None:
+            if not need_history.item():
+                return None
+
+            new_path = _post_process_path()
+            new_logprobs, new_logprobs_indices, cum_logprobs = _maybe_postprocess_logprobs()
+
             return BeamHistory(
                 tokens=new_path,
                 logprobs=new_logprobs,
                 logprobs_indices=new_logprobs_indices,
                 cum_logprobs=cum_logprobs,
             )
-        else:
-            return BeamHistory(
-                tokens=new_path,
-                logprobs=None,
-                logprobs_indices=None,
-                cum_logprobs=None,
-            )
+
+        return _builder
 
     def _finalize_beam(
         self,
@@ -1895,23 +2132,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 f"Beam_history.cum_logprobs.shape[0] should equal beam width: \
                     {beam_history.cum_logprobs.shape[0]} != {beam_width}"
             )
-        valid_tokens = (beam_history.tokens != BEAM_SEARCH_PAD_TOKEN).sum(dim=-1)
+        valid_tokens = (beam_history.tokens != BEAM_SEARCH_PAD_TOKEN).sum(dim=-1).tolist()
         gen_token_list = []
         gen_log_probs_list = []
         for beam_idx in range(beam_width):
-            gen_token_list.append(beam_history.tokens[beam_idx, : valid_tokens[beam_idx]].tolist())
+            beam_valid_tokens = valid_tokens[beam_idx]
+            gen_token_list.append(beam_history.tokens[beam_idx, :beam_valid_tokens].tolist())
             if request.py_return_log_probs:
                 assert beam_history.logprobs_indices is not None
                 assert beam_history.logprobs is not None
                 gen_log_probs_list.append(
                     self._convert_logprobs_tensor_to_list(
-                        beam_history.logprobs_indices[
-                            beam_idx : beam_idx + 1, : valid_tokens[beam_idx]
-                        ],
-                        beam_history.logprobs[beam_idx : beam_idx + 1, : valid_tokens[beam_idx]],
-                        None,
-                        None,
-                        None,
+                        beam_history.logprobs_indices[beam_idx : beam_idx + 1, :beam_valid_tokens],
+                        beam_history.logprobs[beam_idx : beam_idx + 1, :beam_valid_tokens],
                     )[0]
                 )
         request.set_generated_tokens(gen_token_list)
@@ -1965,6 +2198,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                             for request_idx in grouped_requests[key].indices
                         ],
                         dtype=torch.int32,
+                        pin_memory=True,
                     ).to(
                         device="cuda", non_blocking=True
                     ),  # end_ids should be on device for beam search
@@ -1987,11 +2221,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         request: LlmRequest,
         finish_reasons: torch.Tensor,
-    ) -> bool:
-        """Check if the stop criteria is met for the request"""
+    ) -> torch.Tensor:
+        """Check if the stop criteria is met for the request.
+
+        Returns a boolean tensor of shape (), whose value is computed asynchronously.
+        """
         return (
             finish_reasons[: request.sampling_config.beam_width] > 0
-        ).sum().item() == request.sampling_config.beam_width  # NB: This syncs
+        ).sum() == request.sampling_config.beam_width
 
     def _check_stop_words_length(self, request: LlmRequest) -> bool:
         """Check if the stop words length is greater than 1"""
@@ -2004,23 +2241,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return False
 
     @nvtx_range("maybe_create_beam_histories")
-    def _maybe_create_beam_histories(
+    def _prepare_beam_histories(
         self,
         requests: list[LlmRequest],
         finish_reasons: torch.Tensor,
-        beam_histories: list[BeamHistory | None],
-    ) -> None:
-        """Create the corrected tokens and logprobs for each beam of a request
+    ) -> list[BeamHistoryBuilder | None]:
+        """Create the corrected tokens and logprobs for each beam of a request.
 
-        This function creates a beam history object containing the corrected
-        tokens and logprobs for each beam of a request"""
-        for req_idx, req in enumerate(requests):
-            should_stop = self._check_beam_search_stop_criteria(
-                req, finish_reasons=finish_reasons[req.py_seq_slot]
-            )
-            need_finalize_due_to_stop_words = self._check_stop_words_length(req)
-            if should_stop or req.streaming or need_finalize_due_to_stop_words:
-                beam_histories[req_idx] = self._create_beam_history(req)
+        The builders returned by this function create a beam history object containing
+        the corrected tokens and logprobs for each beam of a request.
+        """
+        return [
+            self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
+            for req in requests
+        ]
 
     @override
     @nvtx_range("update_requests")
@@ -2038,10 +2272,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         finish_reasons = state.host.finish_reasons_list()
 
         new_tokens_list = new_tokens.tolist()
-        beam_histories = state.beam_histories
+
         logprobs_state_list: LogProbsStateList | None = None
         if state.host.logprobs_state is not None:
             logprobs_state_list = LogProbsStateList.from_logprobs_state(state.host.logprobs_state)
+
+        beam_history_builders = state.beam_history_builders
+        assert (beam_history_builders is not None) == self._use_beam_search
+
+        def _maybe_build_beam_history(req_idx: int) -> BeamHistory | None:
+            if (
+                beam_history_builders is not None
+                and (beam_history_builder := beam_history_builders[req_idx]) is not None
+            ):
+                return beam_history_builder()
+            else:
+                return None
 
         for req_idx, req in enumerate(state.scheduled_requests.context_requests):
             if (
@@ -2049,11 +2295,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 or req.context_remaining_length != 0
             ):
                 continue
-            if beam_histories is not None and beam_histories[req_idx] is not None:
-                self._finalize_beam(
-                    req,
-                    cast(BeamHistory, beam_histories[req_idx]),
-                )
+            if (beam_history := _maybe_build_beam_history(req_idx)) is not None:
+                self._finalize_beam(req, beam_history)
             else:
                 for beam_idx in range(req.sampling_config.beam_width):
                     add_token(req, new_tokens_list, beam_idx=beam_idx)
@@ -2067,12 +2310,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         ):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
+
             if req.sampling_config.beam_width > 1:
-                if beam_histories is not None and beam_histories[req_idx] is not None:
-                    self._finalize_beam(
-                        req,
-                        cast(BeamHistory, beam_histories[req_idx]),
-                    )
+                if (beam_history := _maybe_build_beam_history(req_idx)) is not None:
+                    self._finalize_beam(req, beam_history)
                 else:
                     for beam_idx in range(req.sampling_config.beam_width):
                         # Beam search does not support speculative decoding.
@@ -2081,7 +2322,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
-
             else:
                 processed = 1
                 num_accepted = self.process_draft_tokens(
@@ -2173,7 +2413,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
         finish_reasons_host = self._copy_to_host(finish_reasons)
 
-        beam_histories: list[BeamHistory | None] = [None] * len(requests)
+        beam_history_builders = None
         if self._use_beam_search:
             assert first_finish_reasons is not None
             assert seq_lens_host is not None, "seq_lens is required for beam search"
@@ -2183,8 +2423,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_lens = seq_lens_host.to(device="cuda", non_blocking=True)
             first_finish_reasons_host = self._copy_to_host(self.store.first_finish_reasons)
             self._update_original_tokens(seq_slots, seq_lens, new_tokens)
-            self._maybe_create_beam_histories(
-                requests, finish_reasons=first_finish_reasons, beam_histories=beam_histories
+            beam_history_builders = self._prepare_beam_histories(
+                requests, finish_reasons=first_finish_reasons
             )
         else:
             first_finish_reasons_host = None
@@ -2229,7 +2469,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 logprobs_state=logprobs_state,
             ),
             sampler_event=sampler_event,
-            beam_histories=beam_histories,
+            beam_history_builders=beam_history_builders,
         )
 
     @staticmethod
@@ -2374,8 +2614,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         grouped_requests = _group_requests_by_strategy_key(
             requests,
             pin_memory=True,
-            vocab_size=logits_cuda.size(1),
             strategy_to_key=self._grouped_sampler_cls.strategy_grouping_key,
+            store=self.store,
+            seq_slots=seq_slots,
+            vocab_size=logits_cuda.size(1),  # Dummy value; strategy should already be cached
         )
         grouped_requests_with_metadata = self._add_metadata_to_grouped_requests(
             requests,
@@ -2883,12 +3125,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if first_finish_reasons is not None:
             # store the first stop reason for each beam of a seq_slot.
             batched_first_finish_reasons = first_finish_reasons[seq_slots]
-            batched_first_finish_reasons = torch.where(
+            first_finish_reasons[seq_slots, ...] = torch.where(
                 batched_first_finish_reasons == FinishReason.NOT_FINISHED.value,
                 batched_finish_reasons,
                 batched_first_finish_reasons,
             )
-            first_finish_reasons[seq_slots] = batched_first_finish_reasons
 
     def _are_end_id(self, end_ids: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
         return tokens == end_ids.view(1, -1, 1).expand(self.max_tokens, -1, self.max_beam_width)
@@ -3006,11 +3247,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             words_device = words.to("cuda", non_blocking=True)
 
             draft_token_length = get_draft_token_length(request)
+            max_draft_token_length = self.max_tokens - 1
 
             for beam_idx in range(self.max_beam_width):
                 new_tokens = padded_tokens[request_idx, beam_idx]
                 for step_idx in range(draft_token_length + 1):
-                    size_per_step = new_tokens.size(0) - draft_token_length + step_idx
+                    size_per_step = new_tokens.size(0) - max_draft_token_length + step_idx
                     matches = []
                     for word, L in zip(words_device, lens):
                         truncated_seq = new_tokens[size_per_step - L : size_per_step]
@@ -3188,7 +3430,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots: torch.Tensor,
         seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        seq_slots = seq_slots.to(dtype=torch.int32)  # int32 suffices here
+        seq_slots_int64 = seq_slots
+        seq_slots = torch.empty_like(
+            seq_slots_int64, dtype=torch.int32, pin_memory=True
+        )  # int32 suffices here
+        seq_slots[:] = seq_slots_int64
 
         raw_logits_cuda = model_outputs["logits"]
 

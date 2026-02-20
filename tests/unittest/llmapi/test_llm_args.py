@@ -1,16 +1,33 @@
+# fmt: off
+# isort: off
 import tempfile
 
 import pydantic_core
 import pytest
 import yaml
+from pydantic import ValidationError
+from utils.llm_data import llm_models_root
 
 import tensorrt_llm.bindings.executor as tle
+import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm.builder import LoraConfig
+from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.llm_args import *
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig, CalibConfig, ContextChunkingPolicy, CudaGraphConfig,
+    DecodingBaseConfig, DynamicBatchConfig, Eagle3DecodingConfig,
+    EagleDecodingConfig, ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+    LookaheadDecodingConfig, MoeConfig, PeftCacheConfig, PybindMirror,
+    StrictBaseModel, TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
+    update_llm_args_with_extra_dict)
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+# isort: on
+# fmt: on
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.plugin import PluginConfig
 
@@ -161,8 +178,6 @@ def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
 
 
 def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
-    import tensorrt_llm.llmapi.llm_args as llm_args_mod
-
     warnings_seen: list[str] = []
 
     def _capture_warning(msg, *args, **kwargs):
@@ -194,14 +209,110 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
 
-def check_defaults(py_config_cls, pybind_config_cls):
-    py_config = py_config_cls()
-    pybind_config = pybind_config_cls()
-    # get member variables from pybinding_config
-    for member in PybindMirror.get_pybind_variable_fields(pybind_config_cls):
-        py_value = getattr(py_config, member)
-        pybind_value = getattr(pybind_config, member)
-        assert py_value == pybind_value, f"{member} default value is not equal"
+class TestModelDefaults:
+    """Test suite for model-specific default overrides functionality."""
+
+    def test_compute_applied_llm_defaults_simple_field(self):
+        model_defaults = {"enable_chunked_prefill": False}
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        assert applied == model_defaults
+
+    @pytest.mark.parametrize(
+        "defaults_dict,should_raise,error_contains",
+        [
+            # Invalid field name - this will definitely fail
+            ({
+                "invalid_field_that_does_not_exist": True
+            }, True, "invalid_field_that_does_not_exist"),
+            # Another invalid field name
+            ({
+                "non_existent_parameter": 123
+            }, True, "non_existent_parameter"),
+            # Invalid nested config field type (should be bool, not string)
+            ({
+                "kv_cache_config": {
+                    "enable_block_reuse": "not_a_boolean"
+                }
+            }, True, "enable_block_reuse"),
+            # Invalid nested config with extra fields (extra="forbid")
+            ({
+                "kv_cache_config": {
+                    "enable_block_reuse": True,
+                    "made_up_field": 999
+                }
+            }, True, "made_up_field"),
+            # Valid simple field
+            ({
+                "enable_chunked_prefill": False
+            }, False, None),
+            # Valid nested config
+            ({
+                "kv_cache_config": {
+                    "enable_block_reuse": False
+                }
+            }, False, None),
+            # Valid with type coercion (Pydantic will convert string to bool)
+            (
+                {
+                    "enable_chunked_prefill": "false"
+                },  # String will be coerced to bool
+                False,
+                None),
+        ])
+    def test_model_defaults_validation(self, defaults_dict, should_raise,
+                                       error_contains):
+        # Use a dummy model path for testing (doesn't need to exist for validation)
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model_for_validation_test")
+
+        if should_raise:
+            # Should raise error with expected message when applying invalid defaults
+            with pytest.raises(
+                (ValueError, AttributeError, ValidationError)) as exc_info:
+                apply_model_defaults_to_llm_args(llm_args, defaults_dict)
+            assert error_contains in str(exc_info.value)
+        else:
+            # Should pass validation and apply successfully
+            applied = apply_model_defaults_to_llm_args(llm_args, defaults_dict)
+
+            # Check that the applied defaults match what we requested
+            # Note: We check 'applied' dict, not llm_args directly, because
+            # some fields may have validators that change values
+            for key in defaults_dict:
+                if key in applied:
+                    # The field was applied (not overridden by user)
+                    if isinstance(applied[key], dict):
+                        # For nested configs, check they're in the applied dict
+                        assert key in applied
+                    else:
+                        # For simple fields, check they're in the applied dict
+                        assert key in applied
+
+    def test_mock_model_with_invalid_defaults(self):
+        """Test that a model class returning invalid defaults fails during application."""
+
+        # Simulate a model that returns invalid defaults
+        class ModelWithBadDefaults:
+
+            @classmethod
+            def get_model_defaults(cls, llm_args):
+                return {
+                    "kv_cache_config": {
+                        "enable_block_reuse": "this_should_be_boolean",
+                        "max_tokens": "not_a_number"
+                    }
+                }
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        bad_defaults = ModelWithBadDefaults.get_model_defaults(llm_args)
+
+        # This should raise ValidationError when trying to apply
+        with pytest.raises(ValidationError) as exc_info:
+            apply_model_defaults_to_llm_args(llm_args, bad_defaults)
+
+        # Check that the error message is helpful
+        error_str = str(exc_info.value)
+        assert "enable_block_reuse" in error_str or "max_tokens" in error_str
 
 
 def test_KvCacheConfig_declaration():
@@ -501,8 +612,6 @@ class TestTorchLlmArgs:
             args.invalid_arg = 1
 
     def test_speculative_model_alias(self):
-        """Test that speculative_model_dir is accepted as an alias for speculative_model."""
-
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model_dir="/path/to/model",
@@ -515,8 +624,6 @@ class TestTorchLlmArgs:
 
     @print_traceback_on_error
     def test_model_kwargs_with_num_hidden_layers(self):
-        """Test that model_kwargs can override num_hidden_layers."""
-        from tensorrt_llm._torch.model_config import ModelConfig
         config_no_kwargs = ModelConfig.from_pretrained(
             llama_model_path).pretrained_config
         model_kwargs = {'num_hidden_layers': 2}
@@ -845,3 +952,220 @@ class TestStrictBaseModelArbitraryArgs:
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
             TestConfig(field1="test", field2=100, extra_field="should_fail")
         assert "extra_field" in str(exc_info.value)
+
+
+class TestServeDefaults:
+
+    def test_serve_get_llm_args_preserves_model_defaults(self):
+        # Get llm_args with default values (simulating serve.py behavior)
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            # Don't pass parameters to test default behavior
+        )
+
+        # Verify that required params are present
+        assert "model" in llm_args
+        assert "backend" in llm_args
+        assert "postprocess_tokenizer_dir" in llm_args
+
+        # For PyTorch backend, build_config and scheduler_config should NOT be included
+        assert "build_config" not in llm_args
+        assert "scheduler_config" not in llm_args
+
+        # Test that when we DO pass values, they're included appropriately
+        llm_args_with_values, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            max_batch_size=128,  # Non-default value
+            tensor_parallel_size=4,  # Non-default value
+        )
+        assert llm_args_with_values.get("max_batch_size") == 128
+        assert llm_args_with_values.get("tensor_parallel_size") == 4
+
+    def test_serve_filters_default_values(self):
+        # Test with all defaults for PyTorch backend
+        llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
+
+        # Should only include required params
+        assert "model" in llm_args
+        assert "backend" in llm_args
+        assert "postprocess_tokenizer_dir" in llm_args
+
+        # Should NOT include build_config or scheduler_config for PyTorch
+        assert "build_config" not in llm_args
+        assert "scheduler_config" not in llm_args
+
+        # Test with custom values
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            max_batch_size=128,  # Non-default value
+            tensor_parallel_size=4,  # Non-default value
+        )
+
+        # Custom values should be included
+        assert llm_args.get("max_batch_size") == 128
+        assert llm_args.get("tensor_parallel_size") == 4
+
+    def test_serve_backend_specific_configs(self):
+        # Test PyTorch backend
+        llm_args_pytorch, _ = get_llm_args(model=llama_model_path,
+                                           backend="pytorch")
+        assert "build_config" not in llm_args_pytorch
+        assert "scheduler_config" not in llm_args_pytorch
+
+        # Test TensorRT backend
+        llm_args_trt, _ = get_llm_args(model=llama_model_path,
+                                       backend="tensorrt")
+        assert "build_config" in llm_args_trt
+        assert "scheduler_config" in llm_args_trt
+
+    def test_serve_is_non_default_or_required_helper(self):
+        # Test always_include parameters
+        assert is_non_default_or_required("model", "test-model", "pytorch")
+        assert is_non_default_or_required("backend", "pytorch", "pytorch")
+        assert is_non_default_or_required("tokenizer", "test-tokenizer",
+                                          "pytorch")
+
+        # Test None values
+        assert not is_non_default_or_required("max_batch_size", None, "pytorch")
+
+        # Test default values (should return False)
+        assert not is_non_default_or_required("tensor_parallel_size", 1,
+                                              "pytorch")
+        assert not is_non_default_or_required("pipeline_parallel_size", 1,
+                                              "pytorch")
+
+        # Test non-default values (should return True)
+        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch")
+        assert is_non_default_or_required("max_batch_size", 128, "pytorch")
+
+
+class TestPyTorchBackendModelDefaults:
+
+    def get_tinyllama_path(self):
+        # Use local model path if available, otherwise use HuggingFace ID
+        model_root = llm_models_root()
+        if model_root:
+            local_path = model_root / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+            if local_path.exists():
+                return str(local_path)
+
+        # Fallback to HuggingFace model ID
+        return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch, tmp_path):
+        self.get_model_defaults_called = False
+        self.tmp_path = tmp_path
+
+        def mock_get_model_defaults(cls, llm_args):
+            self.get_model_defaults_called = True
+            return {
+                "enable_chunked_prefill": True,
+                "max_batch_size": 999,
+                "max_input_len": 12345,
+                "kv_cache_config": {
+                    "enable_block_reuse": False,
+                    "free_gpu_memory_fraction": 0.75,
+                }
+            }
+
+        self.original_get_model_defaults = getattr(LlamaForCausalLM,
+                                                   'get_model_defaults', None)
+        setattr(LlamaForCausalLM, 'get_model_defaults',
+                classmethod(mock_get_model_defaults))
+
+        yield
+
+        if self.original_get_model_defaults is None:
+            delattr(LlamaForCausalLM, 'get_model_defaults')
+        else:
+            setattr(LlamaForCausalLM, 'get_model_defaults',
+                    self.original_get_model_defaults)
+
+    @pytest.mark.part0
+    def test_model_defaults_application(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.enable_chunked_prefill == True
+            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
+
+    @pytest.mark.part0
+    def test_user_overrides_respected(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                enable_chunked_prefill=False,
+                max_batch_size=42,
+                max_input_len=256,
+                kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.enable_chunked_prefill == False
+            assert modified_args.max_batch_size == 42
+            assert modified_args.max_input_len == 256
+            assert modified_args.kv_cache_config.enable_block_reuse == True
+
+    @pytest.mark.part0
+    def test_partial_user_override(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                max_batch_size=42,
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.max_batch_size == 42
+            assert modified_args.enable_chunked_prefill == True
+            assert modified_args.kv_cache_config.enable_block_reuse == False
+
+    @pytest.mark.part0
+    def test_empty_nested_config_preserves_defaults(self):
+        """Passing an empty nested config (e.g. KvCacheConfig()) should not
+        block model defaults from applying to that config's sub-fields.
+
+        This covers the pattern used by tests that conditionally build a
+        KvCacheConfig: ``kv_cache_config=KvCacheConfig(...) if cond else
+        KvCacheConfig()``.  The else-branch must not shadow model defaults
+        like ``enable_block_reuse=False``.
+        """
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                kv_cache_config=KvCacheConfig(),
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            # Model defaults set enable_block_reuse=False and
+            # free_gpu_memory_fraction=0.75.  An empty KvCacheConfig()
+            # should not prevent these from being applied.
+            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75

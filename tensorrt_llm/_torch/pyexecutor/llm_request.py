@@ -1,14 +1,10 @@
 from copy import copy, deepcopy
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm.bindings
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.sampler import Strategy
-
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
@@ -232,6 +228,29 @@ class LogProbStorage:
 class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
 
+    @dataclass
+    class Diff:
+        """
+        Diff is used to track the changes of the PyResult.
+        It is designed to incrementally sync the PyResult to other ranks
+        by `get_diff` on one rank and `apply_diff` on other ranks.
+        """
+        exclude_last_generation_logits: bool | None = None
+        context_logits_list: list[torch.Tensor] = field(default_factory=list)
+        generation_logits_list: list[torch.Tensor] = field(default_factory=list)
+        reset_log_probs: tuple[list[TokenLogprobs],
+                               list[float] | None] | None = None
+        log_probs_list: list[tuple[list[TokenLogprobs], list[float]
+                                   | None]] = field(default_factory=list)
+        mm_embeddings: list[dict[str, Any] | None] = None
+        mrope_position_ids: dict[str, Any] | None = None
+        mrope_position_deltas: dict[str, Any] | None = None
+        additional_context_outputs_list: list[tuple[str, torch.Tensor]] = field(
+            default_factory=list)
+        additional_generation_outputs_list: list[tuple[str,
+                                                       torch.Tensor]] = field(
+                                                           default_factory=list)
+
     def __init__(self,
                  *,
                  prompt_len: int,
@@ -266,7 +285,7 @@ class PyResult:
             use_chunked_generation_logits=use_chunked_generation_logits,
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
-        self._mm_embeddings = None
+        self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
         self._mrope_position_ids = None
         self._mrope_position_deltas = None
         self._additional_context_outputs = {
@@ -277,28 +296,85 @@ class PyResult:
             name: []
             for name in additional_outputs
         } if additional_outputs else None
+        self.diff = PyResult.Diff()
+
+    def reset_diff(self):
+        self.diff = PyResult.Diff()
+
+    def get_diff(self) -> Diff:
+        for i, context_logits in enumerate(self.diff.context_logits_list):
+            self.diff.context_logits_list[i] = context_logits.to("cpu")
+        for i, generation_logits in enumerate(self.diff.generation_logits_list):
+            self.diff.generation_logits_list[i] = generation_logits.to("cpu")
+        return self.diff
+
+    def apply_diff(self, diff: Diff):
+        if diff.exclude_last_generation_logits is not None:
+            self._exclude_last_generation_logits = diff.exclude_last_generation_logits
+        if len(diff.context_logits_list) > 0:
+            for context_logits in diff.context_logits_list:
+                self._context_logits.append(context_logits)
+        if len(diff.generation_logits_list) > 0:
+            for generation_logits in diff.generation_logits_list:
+                self._generation_logits.append(generation_logits)
+        if diff.reset_log_probs is not None:
+            self._log_probs.set_log_probs(*diff.reset_log_probs)
+        if len(diff.log_probs_list) > 0:
+            for log_probs, cum_log_probs in diff.log_probs_list:
+                self._log_probs.append(log_probs, cum_log_probs)
+        if diff.mm_embeddings is not None:
+            self._mm_embeddings = diff.mm_embeddings
+        if diff.mrope_position_ids is not None:
+            self._mrope_position_ids = diff.mrope_position_ids
+            self._mrope_position_deltas = diff.mrope_position_deltas
+        if len(diff.additional_context_outputs_list) > 0:
+            for name, additional_context_outputs in diff.additional_context_outputs_list:
+                self._additional_context_outputs[name].append(
+                    additional_context_outputs)
+        if len(diff.additional_generation_outputs_list) > 0:
+            for name, additional_generation_outputs in diff.additional_generation_outputs_list:
+                self._additional_generation_outputs[name].append(
+                    additional_generation_outputs)
 
     def set_exclude_last_generation_logits(
             self, exclude_last_generation_logits: bool):
         self._exclude_last_generation_logits = exclude_last_generation_logits
+        self.diff.exclude_last_generation_logits = exclude_last_generation_logits
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
             self._context_logits.append(context_logits)
+            self.diff.context_logits_list.append(context_logits)
 
     def append_generation_logits(self, generation_logits: torch.Tensor):
         if self._generation_logits:
             self._generation_logits.append(generation_logits)
+            self.diff.generation_logits_list.append(generation_logits)
 
     def append_log_probs(self,
                          log_probs: list[TokenLogprobs],
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+            self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
-        self._mm_embeddings = SharedTensorContainer.from_tensor(
-            mm_embeddings).dump_to_dict()
+    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
+                             multimodal_lengths: List[int]):
+        """Split concatenated embeddings by multimodal_lengths and create handles for each.
+
+        Args:
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape [total_tokens, hidden_dim]
+            multimodal_lengths: List of token lengths for each multimodal item
+        """
+        # Split the concatenated tensor by lengths to get per-item embeddings
+        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+
+        # Create a SharedTensorContainer handle for each split
+        self._mm_embeddings = [
+            SharedTensorContainer.from_tensor(emb).dump_to_dict()
+            for emb in split_embeddings
+        ]
+        self.diff.mm_embeddings = self._mm_embeddings
 
     def set_mrope_position(
         self,
@@ -309,6 +385,8 @@ class PyResult:
             mrope_position_ids).dump_to_dict())
         self._mrope_position_deltas = (SharedTensorContainer.from_tensor(
             mrope_position_deltas).dump_to_dict())
+        self.diff.mrope_position_ids = self._mrope_position_ids
+        self.diff.mrope_position_deltas = self._mrope_position_deltas
 
     def transfer_remaining_device_logits(self):
         """Finalize any remaining generation logits transfers (for chunked mode)"""
@@ -319,11 +397,15 @@ class PyResult:
             self, name: str, additional_context_outputs: torch.Tensor):
         self._additional_context_outputs[name].append(
             additional_context_outputs.to("cpu", non_blocking=True))
+        self.diff.additional_context_outputs_list.append(
+            (name, self._additional_context_outputs[name][-1]))
 
     def append_additional_generation_outputs(
             self, name: str, additional_generation_outputs: torch.Tensor):
         self._additional_generation_outputs[name].append(
             additional_generation_outputs.to("cpu", non_blocking=True))
+        self.diff.additional_generation_outputs_list.append(
+            (name, self._additional_generation_outputs[name][-1]))
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -334,6 +416,8 @@ class PyResult:
         """
         if self._log_probs:
             self._log_probs.set_log_probs(log_probs, cum_log_probs)
+            self.diff.reset_log_probs = (log_probs, cum_log_probs)
+            self.diff.log_probs_list.clear()
 
     @property
     def context_logits(self) -> torch.Tensor | None:
@@ -366,7 +450,8 @@ class PyResult:
         return self._log_probs and self._log_probs.cum_log_probs
 
     @property
-    def mm_embedding_handle(self) -> Dict[str, Any] | None:
+    def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:
+        """Returns a list of SharedTensorContainer handles, one per multimodal item."""
         return self._mm_embeddings
 
     @property
@@ -410,7 +495,7 @@ class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handle', 'additional_context_outputs',
+         'mm_embedding_handles', 'additional_context_outputs',
          'additional_generation_outputs', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
 
@@ -587,8 +672,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             additional_outputs=additional_outputs)
         self.child_requests = []
 
-        self._py_sampling_strategy: "Strategy | None" = None
-
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
             # Pre-squeeze to 1D if needed (remove batch dimension)
@@ -757,10 +840,12 @@ def executor_request_to_llm_request(
     multimodal_hashes = None
     multimodal_positions = None
     multimodal_lengths = None
+    multimodal_uuids = None
     if executor_request.multimodal_input is not None:
         multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
         multimodal_positions = executor_request.multimodal_input.multimodal_positions
         multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
+        multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
@@ -790,6 +875,7 @@ def executor_request_to_llm_request(
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
+        multimodal_uuids=multimodal_uuids,
         multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,

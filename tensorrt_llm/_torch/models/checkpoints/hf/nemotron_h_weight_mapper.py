@@ -80,7 +80,9 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             elif "A" in key:
                 w = split(weights[name], tp_size, tp_rank)
                 w = w.to(torch.float32)
-                w = -torch.exp(w)
+                # Avoid extra temporaries: one fp32 cast, then in-place exp/neg.
+                w.exp_()
+                w.neg_()
                 new_weights[key] = w
             elif "D" in key:
                 w = split(weights[name], tp_size, tp_rank)

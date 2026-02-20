@@ -167,6 +167,11 @@ public:
         NB_OVERRIDE_PURE(isEnableBlockReuse);
     }
 
+    bool isEnablePartialReuse() const override
+    {
+        NB_OVERRIDE_PURE(isEnablePartialReuse);
+    }
+
     void rewindKVCache(tb::LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override
     {
         NB_OVERRIDE_PURE(rewindKVCache, requestId, rewindLengths);

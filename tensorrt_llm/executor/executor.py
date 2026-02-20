@@ -4,6 +4,7 @@ import multiprocessing
 import platform
 import signal
 import traceback
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
@@ -88,7 +89,10 @@ class GenerationExecutor(ABC):
         self.kv_events_queues = IterationResultQueue()
         self.stats_queues = IterationResultQueue()
 
-        atexit.register(self.shutdown)
+        atexit.register(
+            lambda ref, finalizer=type(self).shutdown: finalizer(obj)
+            if (obj := ref()) is not None else None,
+            weakref.ref(self))
 
         # This is used to capture the exceptions from the threads.
         self._error_queue = Queue()

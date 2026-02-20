@@ -10,6 +10,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -211,6 +212,40 @@ class ModelLoader:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
+
+    @staticmethod
+    def load_config_and_apply_defaults(
+            checkpoint_dir: str, llm_args: TorchLlmArgs,
+            checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
+        """Load model config and apply model-specific defaults to llm_args."""
+        if checkpoint_loader is None:
+            return llm_args
+
+        config_kwargs = {
+            'trust_remote_code': True,
+            'mm_encoder_only': llm_args.mm_encoder_only,
+        }
+        if llm_args.parallel_config:
+            config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
+
+        if llm_args.speculative_config:
+            config_kwargs['spec_config'] = llm_args.speculative_config
+
+        config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
+
+        model_cls = AutoModelForCausalLM._resolve_class(config)
+
+        # model_cls is None when the architecture is unknown/unsupported.
+        if model_cls and hasattr(model_cls, 'get_model_defaults'):
+            model_defaults = model_cls.get_model_defaults(llm_args)
+            if model_defaults:
+                applied_defaults = apply_model_defaults_to_llm_args(
+                    llm_args, model_defaults)
+                if applied_defaults:
+                    logger.info("Applied model defaults for %s: %s",
+                                model_cls.__name__, applied_defaults)
+
+        return llm_args
 
     def load(
         self,

@@ -43,14 +43,17 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP)
+    BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP, SizeType32 ppSize)
 {
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
 
     // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
     // distributed among CP ranks. So, we transfer all blocks from send side.
-    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP)
+    // TODO(tabrizian): Remove the condition on the PP size once disagg support from KVCache reuse
+    // path is fixed.
+    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || !cacheManager->isEnablePartialReuse()
+        || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
     {
         // disable reuse path, and vwsa don't support reuse.
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
@@ -87,13 +90,15 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
 
-BlockRange getBlockRangeForReceiving(
-    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse, bool recvSideHasCP)
+BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    bool srcEnableBlockReuse, bool srcEnablePartialReuse, bool recvSideHasCP, SizeType32 srcPpSize)
 {
     // Note: When recv side has CP, we request all blocks from send side right now.
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
-    if (poolNum == 1 && srcEnableBlockReuse && !recvSideHasCP)
+    // TODO(tabrizian): Remove the condition on the PP size once disagg support from KVCache reuse
+    // path is fixed.
+    if (poolNum == 1 && srcEnableBlockReuse && srcEnablePartialReuse && !recvSideHasCP && srcPpSize == 1)
     {
         // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
         auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
@@ -252,7 +257,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     }
     auto& blockManager = mCacheManager->getBlockManager();
     auto const& lastBlockKey = session.getLastBlockKey();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd);
+    auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd,
+        /*recvSideHasCP=*/false, ppSize);
     auto const numPools
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
@@ -555,7 +562,10 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
-    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse());
+    auto const srcPpSize = destConfig.getParallelConfig().mPipelineParallelism;
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
+        destConfig.getEnablePartialReuse(),
+        /*recvSideHasCP=*/false, srcPpSize);
 
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
 

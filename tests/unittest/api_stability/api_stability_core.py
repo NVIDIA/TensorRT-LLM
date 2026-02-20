@@ -19,7 +19,7 @@ import yaml
 from pydantic import BaseModel
 
 import tensorrt_llm
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM, DisaggregatedParams
 # Import BaseCheckpointLoader for YAML processing
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader

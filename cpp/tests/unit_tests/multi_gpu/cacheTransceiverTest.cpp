@@ -1606,8 +1606,8 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
     if (mIsContext || mIsGeneration)
     {
         bool enableDP = mIsContext ? contextDP : generationDP;
-        setUpCacheManager(
-            numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow);
+        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP,
+            isWindow, isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
         int requestId = 0;

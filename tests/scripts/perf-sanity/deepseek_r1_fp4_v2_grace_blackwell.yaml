@@ -3,6 +3,8 @@ metadata:
   supported_gpus:
   - GB200
   - GB300
+hardware:
+  gpus_per_node: 4
 server_configs:
   # 1k1k configs - DEP4 with CUTLASS, MTP1
   - name: "r1_fp4_v2_dep4_mtp1_1k1k"

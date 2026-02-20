@@ -123,7 +123,8 @@ methods:
   generate_async:
     parameters:
       inputs:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
+          tensorrt_llm.llmapi.llm.PreprocessedInputs]
         default: inspect._empty
       sampling_params:
         annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
