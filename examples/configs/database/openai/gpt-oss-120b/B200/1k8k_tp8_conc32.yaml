@@ -5,14 +5,14 @@ cuda_graph_config:
   enable_padding: true
   max_batch_size: 32
 enable_attention_dp: false
+print_iter_log: true
 kv_cache_config:
   dtype: fp8
   free_gpu_memory_fraction: 0.85
-print_iter_log: true
 stream_interval: 20
-num_postprocess_workers: 4
 moe_config:
   backend: TRTLLM
+num_postprocess_workers: 4
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8
 trust_remote_code: true
