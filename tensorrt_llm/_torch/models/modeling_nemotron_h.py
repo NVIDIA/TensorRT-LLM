@@ -283,8 +283,7 @@ class NemotronHMOE(nn.Module):
 
             routed_hidden_states = hidden_states
             if self.use_latent_moe:
-                routed_hidden_states = self.fc1_latent_proj(
-                    routed_hidden_states)
+                routed_hidden_states = self.fc1_latent_proj(hidden_states_hp)
 
             final_hidden_states = self.experts(
                 routed_hidden_states,
