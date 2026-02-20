@@ -125,6 +125,7 @@ class SAWorker(SpecWorkerBase):
         attn_metadata,
         spec_metadata: SASpecMetadata,
         draft_model=None,  # Not used for SA
+        resource_manager=None,  # Not used for SA
     ):
         """
         SA speculative decoding forward pass.

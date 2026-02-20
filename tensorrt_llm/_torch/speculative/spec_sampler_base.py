@@ -76,6 +76,9 @@ class SpecSamplerBase(TorchSampler):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
         # Necessary to satisfy the interface of TorchSampler.Store
+        # These fields are not used by speculative samplers
+        max_lengths_tensor: None = None
+        end_ids: None = None
         finish_reasons: None = None
 
         def __post_init__(self):

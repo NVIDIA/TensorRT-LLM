@@ -969,19 +969,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                     model_config.quant_config.kv_cache_quant_algo
 
-            self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
-                spec_config)
+                self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
+                    spec_config)
 
-            self.draft_model = get_draft_model(model_config, self.draft_config,
-                                               self.lm_head, self.model)
-            if self.draft_model is not None:
-                self.epilogue.append(self.draft_model)
+                self.draft_model = get_draft_model(model_config,
+                                                   self.draft_config,
+                                                   self.lm_head, self.model)
+                if self.draft_model is not None:
+                    self.epilogue.append(self.draft_model)
 
-            if self.draft_config is not None and model_config.spec_config.eagle3_model_arch == "llama3":
-                for key, value in self.draft_config.extra_attrs.items():
-                    assert key in ('attn_layers', 'mla_layers')
-                    assert key in model_config.extra_attrs
-                    model_config.extra_attrs[key].update(value)
+                if self.draft_config is not None and model_config.spec_config.eagle3_model_arch == "llama3":
+                    for key, value in self.draft_config.extra_attrs.items():
+                        assert key in ('attn_layers', 'mla_layers')
+                        assert key in model_config.extra_attrs
+                        model_config.extra_attrs[key].update(value)
 
             # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(
