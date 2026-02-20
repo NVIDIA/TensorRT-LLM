@@ -1728,9 +1728,9 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MedusaDecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
-    PARDDecodingConfig,
     UserProvidedDecodingConfig,
     SaveHiddenStatesDecodingConfig,
+    PARDDecodingConfig,
     AutoDecodingConfig,
 ]]
 
