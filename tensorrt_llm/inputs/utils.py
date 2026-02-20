@@ -550,7 +550,7 @@ def resolve_hf_chat_template(
 
     # 2. If tool is not provided, use the processor's default chat template
     if not tools and processor and hasattr(processor, 'chat_template'):
-        return processor.chat_template
+        return processor.get_chat_template(chat_template, tools=tools)
 
     # 3. If tool is provided, use the tool
     try:
