@@ -28,25 +28,25 @@ from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
     # ATTENTION
-    # "q_proj": "colwise",
-    # "k_proj": "colwise",
-    # "v_proj": "colwise",
-    # "o_proj": "rowwise",
-    # # gated MLP
-    # "gate_proj": "colwise",
-    # "up_proj": "colwise",
-    # "down_proj": "rowwise",
-    # # GPT-style MLP
-    # "linear1": "colwise",
-    # "linear2": "rowwise",
-    # "linear": "gather",
-    # # Mamba2 specific projections
-    # "in_proj": "mamba",
-    # # MLA specific projections
-    # "q_a_proj": "mla",
-    # # delta net
-    # # qkv regex matches both fused (qkvz) and unfused (qkv) opening nodes
-    # "in_proj_qkv": "delta",
+    "q_proj": "colwise",
+    "k_proj": "colwise",
+    "v_proj": "colwise",
+    "o_proj": "rowwise",
+    # gated MLP
+    "gate_proj": "colwise",
+    "up_proj": "colwise",
+    "down_proj": "rowwise",
+    # GPT-style MLP
+    "linear1": "colwise",
+    "linear2": "rowwise",
+    "linear": "gather",
+    # Mamba2 specific projections
+    "in_proj": "mamba",
+    # MLA specific projections
+    "q_a_proj": "mla",
+    # delta net
+    # qkv regex matches both fused (qkvz) and unfused (qkv) opening nodes
+    "in_proj_qkv": "delta",
 }
 
 predefined_config = {
