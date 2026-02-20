@@ -77,6 +77,11 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_seq_len": 8192,
             "compile_backend": "torch-cudagraph",
         },
+        "trtllm": {
+            "max_batch_size": 512,
+            "max_seq_len": 8192,
+            "compile_backend": "torch-cudagraph",
+        },
         "torch": {
             "max_batch_size": 128,
             "max_seq_len": 2048,
@@ -129,7 +134,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    @pytest.mark.parametrize("attn_backend", ["flashinfer", "torch"])
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm", "torch"])
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
@@ -166,10 +171,13 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
     MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
 
-    def get_default_kwargs(self, enable_chunked_prefill=False):
+    def get_default_kwargs(self,
+                           enable_chunked_prefill=False,
+                           attn_backend="flashinfer"):
         config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
+            "attn_backend": attn_backend,
             # SSMs do not support cache reuse.
             "kv_cache_config": {
                 "enable_block_reuse": False,
@@ -206,8 +214,10 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
     @pytest.mark.parametrize("ssm_backend", ["triton_ssm", "flashinfer_ssm"])
-    def test_auto_dtype(self, enable_chunked_prefill, ssm_backend):
-        kwargs = self.get_default_kwargs(enable_chunked_prefill)
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_auto_dtype(self, enable_chunked_prefill, ssm_backend,
+                        attn_backend):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         kwargs.setdefault("transforms", {})
         insert_ssm_cfg = {"backend": ssm_backend}
         if ssm_backend == "flashinfer_ssm":
@@ -299,10 +309,11 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     MODEL_PATH_FP8 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev"
     MODEL_PATH_NVFP4 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
 
-    def get_default_kwargs(self, world_size=1):
+    def get_default_kwargs(self, world_size=1, attn_backend="flashinfer"):
         return {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
+            "attn_backend": attn_backend,
             # SSMs do not support cache reuse.
             "kv_cache_config": {
                 "enable_block_reuse": False,
@@ -343,8 +354,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 4])
-    def test_bf16(self, world_size):
-        kwargs = self.get_default_kwargs(world_size=world_size)
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_bf16(self, world_size, attn_backend):
+        kwargs = self.get_default_kwargs(world_size=world_size,
+                                         attn_backend=attn_backend)
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
         kwargs["kv_cache_config"] = {"free_gpu_memory_fraction": 0.4}
@@ -361,8 +374,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 4])
-    def test_fp8(self, world_size):
-        kwargs = self.get_default_kwargs(world_size=world_size)
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_fp8(self, world_size, attn_backend):
+        kwargs = self.get_default_kwargs(world_size=world_size,
+                                         attn_backend=attn_backend)
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
                            world_size=world_size,
@@ -378,8 +393,9 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize("world_size", [1, 2, 4])
-    def test_nvfp4(self, world_size):
-        kwargs = self.get_default_kwargs()
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_nvfp4(self, world_size, attn_backend):
+        kwargs = self.get_default_kwargs(attn_backend=attn_backend)
         with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
                            tokenizer=self.MODEL_PATH_NVFP4,
                            world_size=world_size,
@@ -410,10 +426,11 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
-    def get_default_kwargs(self):
+    def get_default_kwargs(self, attn_backend="flashinfer"):
         return {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
+            "attn_backend": attn_backend,
             "skip_loading_weights": False,
             "compile_backend": "torch-cudagraph",
             "max_batch_size": 128,
@@ -443,8 +460,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     # 180GB works, might be able to go lower
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.skip_less_device(4)
-    def test_bf16(self):
-        kwargs = self.get_default_kwargs()
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_bf16(self, attn_backend):
+        kwargs = self.get_default_kwargs(attn_backend=attn_backend)
         sampling_params = self.get_default_sampling_params()
         print_memory_usage("Before evaluation")
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
@@ -459,11 +477,12 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [1, 4, 8])
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize("enable_attention_dp", [True, False])
-    def test_fp8(self, world_size, enable_attention_dp):
+    def test_fp8(self, world_size, attn_backend, enable_attention_dp):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
-        kwargs = self.get_default_kwargs()
+        kwargs = self.get_default_kwargs(attn_backend=attn_backend)
         kwargs["transforms"]["detect_sharding"][
             "enable_attention_dp"] = enable_attention_dp
         sampling_params = self.get_default_sampling_params()
@@ -483,11 +502,12 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip("Skipping FP4 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize("enable_attention_dp", [True, False])
-    def test_fp4(self, world_size, enable_attention_dp):
+    def test_fp4(self, world_size, attn_backend, enable_attention_dp):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
-        kwargs = self.get_default_kwargs()
+        kwargs = self.get_default_kwargs(attn_backend=attn_backend)
         kwargs["transforms"]["detect_sharding"][
             "enable_attention_dp"] = enable_attention_dp
         sampling_params = self.get_default_sampling_params()
@@ -517,10 +537,13 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
     MAX_NUM_TOKENS = MAX_SEQ_LEN
 
-    def get_default_kwargs(self, enable_chunked_prefill=False):
+    def get_default_kwargs(self,
+                           enable_chunked_prefill=False,
+                           attn_backend="flashinfer"):
         config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
+            "attn_backend": attn_backend,
             "compile_backend": "torch-cudagraph",
             "max_batch_size": 128,
             "max_seq_len": self.MAX_SEQ_LEN,
@@ -565,8 +588,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
-    def test_auto_dtype(self, enable_chunked_prefill):
-        kwargs = self.get_default_kwargs(enable_chunked_prefill)
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_auto_dtype(self, enable_chunked_prefill, attn_backend):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
