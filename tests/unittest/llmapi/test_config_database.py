@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,36 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""L0 tests for validating config database YAML files against TorchLlmArgs."""
+"""L0 wrapper tests for validating database YAML files against TorchLlmArgs."""
 
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import pytest
-import yaml
 
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, update_llm_args_with_extra_dict
+from . import yaml_validation_harness as yaml_harness
 
 CONFIG_ROOT = Path(__file__).parents[3] / "examples" / "configs"
 DATABASE_DIR = CONFIG_ROOT / "database"
 
-DATABASE_CONFIGS = (
-    [c for c in DATABASE_DIR.rglob("*.yaml") if c.name != "lookup.yaml"]
-    if DATABASE_DIR.exists()
-    else []
+DATABASE_CONFIGS = yaml_harness.collect_yaml_files(
+    DATABASE_DIR, "**/*.yaml", exclude_names={"lookup.yaml"}
 )
 
 
 @pytest.fixture(autouse=True)
 def mock_gpu_environment():
     """Mock GPU functions for CPU-only test execution."""
-    mock_props = Mock()
-    mock_props.major = 8
-
-    with patch("torch.cuda.device_count", return_value=8):
-        with patch("torch.cuda.get_device_properties", return_value=mock_props):
-            with patch("torch.cuda.is_available", return_value=True):
-                yield
+    with yaml_harness.mock_cuda_for_schema_validation():
+        yield
 
 
 def get_config_id(config_path: Path) -> str:
@@ -51,21 +42,19 @@ def get_config_id(config_path: Path) -> str:
 @pytest.mark.part0
 @pytest.mark.parametrize("config_path", DATABASE_CONFIGS, ids=get_config_id)
 def test_config_validates_against_llm_args(config_path: Path):
-    with open(config_path) as f:
-        config_dict = yaml.safe_load(f) or {}
+    config_dict = yaml_harness.load_yaml_dict(config_path)
+    yaml_harness.validate_torch_llm_args_config(config_dict)
 
-    base_args = TorchLlmArgs(model="dummy/model", skip_tokenizer_init=True)
-    merged = update_llm_args_with_extra_dict(base_args.model_dump(), config_dict)
-    TorchLlmArgs(**merged)
+
+def _assert_kv_cache_block_reuse_policy(config_dict: dict) -> None:
+    assert config_dict.get("kv_cache_config", {}).get("enable_block_reuse") is not False
 
 
 @pytest.mark.part0
 @pytest.mark.parametrize("config_path", DATABASE_CONFIGS, ids=get_config_id)
 def test_config_does_not_disable_kv_cache_block_reuse(config_path: Path):
-    with open(config_path) as f:
-        config_dict = yaml.safe_load(f) or {}
-
-    assert config_dict.get("kv_cache_config", {}).get("enable_block_reuse") is not False
+    config_dict = yaml_harness.load_yaml_dict(config_path)
+    yaml_harness.assert_custom_policy(config_dict, _assert_kv_cache_block_reuse_policy)
 
 
 @pytest.mark.part0
