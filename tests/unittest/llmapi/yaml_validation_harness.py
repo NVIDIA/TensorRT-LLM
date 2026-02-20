@@ -58,6 +58,8 @@ def validate_torch_llm_args_config(cfg: dict[str, Any]) -> llm_args_module.Torch
     merged = llm_args_module.update_llm_args_with_extra_dict(
         copy.deepcopy(base_args.model_dump(mode="json")), copy.deepcopy(cfg)
     )
+    if "load_format" in merged:
+        merged["load_format"] = llm_args_module.LoadFormat(merged["load_format"])
     return llm_args_module.TorchLlmArgs(**merged)
 
 

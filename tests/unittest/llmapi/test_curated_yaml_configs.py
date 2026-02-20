@@ -14,10 +14,13 @@
 # limitations under the License.
 """L0 tests for validating curated YAML files against TorchLlmArgs."""
 
+import asyncio
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
+from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import llm_args as llm_args_module
 
 from . import yaml_validation_harness as yaml_harness
@@ -72,3 +75,56 @@ def test_curated_config_does_not_set_default_leaves(config_path: Path):
 @pytest.mark.part0
 def test_curated_config_count():
     assert len(CURATED_CONFIGS) > 0, "No curated config files found"
+
+
+def _serve_cli_args(config_path: Path, port: int = 17999):
+    """CLI argv for serve, like: trtllm-serve <model> --config <config.yaml> --port <port>."""
+    return [
+        "dummy/model",
+        "--config",
+        str(config_path),
+        "--port",
+        str(port),
+    ]
+
+
+async def _noop_serve(_host, _port, sockets=None):
+    pass
+
+
+class _MockOpenAIServer:
+    def __init__(self, generator, model, **kwargs):
+        self.generator = generator
+        self.model = model
+
+    def __call__(self, host, port, sockets=None):
+        return _noop_serve(host, port, sockets)
+
+
+@pytest.mark.part0
+@pytest.mark.parametrize("config_path", CURATED_CONFIGS, ids=get_config_id)
+def test_curated_config_serve_cli(config_path: Path):
+    """Invoke serve via CLI (as a user would); Click supplies defaults; server/LLM mocked."""
+    mock_llm = mock.Mock()
+    mock_pytorch_llm = mock.Mock(return_value=mock_llm)
+
+    # Run the coroutine (mock server's _noop_serve) so it is awaited and we avoid
+    # "coroutine was never awaited". Must capture the real asyncio.run before
+    # patching: we patch tensorrt_llm.commands.serve.asyncio.run, which is the
+    # same asyncio module this test uses, so asyncio.run would recurse otherwise.
+    _real_asyncio_run = asyncio.run
+
+    def _run_coroutine(coroutine):
+        return _real_asyncio_run(coroutine)
+
+    with (
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
+        mock.patch("tensorrt_llm.commands.serve.PyTorchLLM", mock_pytorch_llm),
+        mock.patch("tensorrt_llm.commands.serve.OpenAIServer", _MockOpenAIServer),
+        mock.patch("tensorrt_llm.commands.serve.asyncio.run", side_effect=_run_coroutine),
+    ):
+        serve_main(args=_serve_cli_args(config_path), standalone_mode=False)
+        mock_pytorch_llm.assert_called_once()
+    call_kwargs = mock_pytorch_llm.call_args[1]
+    llm_args_module.TorchLlmArgs(**call_kwargs)
