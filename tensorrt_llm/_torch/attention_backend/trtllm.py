@@ -510,32 +510,30 @@ class TrtllmAttentionWrapper:
 
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
-        _trtllm_gen_supported, _trtllm_gen_reason = trtllm_gen.is_supported(
-            q=q,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_size,
-            out_dtype=output.dtype,
-            mask_type=int(mask_type),
-            has_alibi=(self.position_embedding_type == 4
-                       or self.position_embedding_type == 5),
-            is_padded=False,
-            use_paged_kv_cache=(self.kv_cache_block_offsets is not None),
-            tokens_per_block=self.tokens_per_block,
-            beam_width=self.beam_width,
-            position_shift_enabled=False,
-            sink_token_length=self.sink_token_length,
-            cross_attention=False,
-            is_spec_decoding=self.is_spec_decoding_enabled,
-            is_mla_enable=self.is_mla_enable,
-            is_fused_qkv=is_fused_qkv,
-            update_kv_cache=update_kv_cache,
-            has_cross_kv=False,
-            quant_config=self.quant_config,
-            kv_cache_manager=self.kv_cache_manager,
-        ) if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION else (False, "disabled")
-
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and _trtllm_gen_supported:
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and trtllm_gen.is_supported(
+                q=q,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                out_dtype=output.dtype,
+                mask_type=int(mask_type),
+                has_alibi=(self.position_embedding_type == 4
+                           or self.position_embedding_type == 5),
+                is_padded=False,
+                use_paged_kv_cache=(self.kv_cache_block_offsets is not None),
+                tokens_per_block=self.tokens_per_block,
+                beam_width=self.beam_width,
+                position_shift_enabled=False,
+                sink_token_length=self.sink_token_length,
+                cross_attention=False,
+                is_spec_decoding=self.is_spec_decoding_enabled,
+                is_mla_enable=self.is_mla_enable,
+                is_fused_qkv=is_fused_qkv,
+                update_kv_cache=update_kv_cache,
+                has_cross_kv=False,
+                quant_config=self.quant_config,
+                kv_cache_manager=self.kv_cache_manager,
+        )[0]:
             trtllm_gen_attention(
                 q,
                 k,
@@ -618,12 +616,6 @@ class TrtllmAttentionWrapper:
                 self.kv_cache_manager,
             )
         else:
-            # KV cache update is expected to fall back to thop since
-            # trtllm-gen only reads from KV cache. Assert on other reasons.
-            assert not _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION or (
-                "KV cache update" in _trtllm_gen_reason), (
-                    f"TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION is set but trtllm-gen "
-                    f"is not supported: {_trtllm_gen_reason}")
             thop.attention(
                 q,
                 k,

@@ -457,6 +457,10 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             TLLM_CHECK(preAllocSendBuffer->getDataType()
                 == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
+        // processIdx: index of the network connection / destination rank (one per peer).
+        // bufferIdx:  index into outputSplitCaches (the pre-formatted send buffers).
+        //             When duplicate heads exist, multiple destination ranks share the
+        //             same buffer, so bufferIdx < processIdx for some connections.
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send processIdx: %ld", processIdx);
@@ -975,8 +979,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     if (selfConfig.getParallelConfig().mContextParallelism != 1
         && destConfig.getParallelConfig().mContextParallelism != 1)
     {
-        TLLM_LOG_WARNING(
-            "CacheFormatter::inquireSupport: at least one side must have CP=1 for Helix CP (selfCP=%d, destCP=%d).",
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: Helix CP is decode-only (selfCP=%d, destCP=%d).",
             selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
         return false;
     }
