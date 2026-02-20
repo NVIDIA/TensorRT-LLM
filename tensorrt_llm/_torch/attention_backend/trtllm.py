@@ -145,6 +145,7 @@ class TrtllmAttentionWrapper:
         )
 
         self.num_heads = num_heads
+
         self.num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
         self.position_embedding_type = int(
@@ -176,10 +177,14 @@ class TrtllmAttentionWrapper:
 
         Both MLA-specific kernels (mla_rope_generation,
         mla_rope_append_paged_kv_assign_q) and the generic attention path
-        (plan()->run()) may need a table that covers `required_max_positions`.
+        (plan->run) may need a table that covers `required_max_positions`.
         Call this before any kernel that reads `rotary_cos_sin`.
         """
         if required_max_positions > self.rope_params.max_positions:
+            logger.info(
+                f"[TrtllmAttentionWrapper.ensure_rope_table_size] "
+                f"Expanding RoPE: {required_max_positions} > "
+                f"{self.rope_params.max_positions}")
             self.rope_params.max_positions = required_max_positions
             self.rotary_inv_freq, self.rotary_cos_sin = (
                 self.rope_params.create_rope_const_params())
@@ -2089,8 +2094,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Ensure RoPE cos/sin table covers the sequence length before the
         # kernel reads it.  plan() also calls ensure_rope_table_size, but it
         # runs AFTER this method in the MLA context path.
-        self.wrapper.ensure_rope_table_size(
-            metadata.kv_cache_manager.max_seq_len)
+        self.wrapper.ensure_rope_table_size(metadata.kv_cache_manager.max_seq_len)
 
         sink_token_length = 0
         beam_width = 1
