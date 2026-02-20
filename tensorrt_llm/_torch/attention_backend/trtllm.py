@@ -501,7 +501,7 @@ class TrtllmAttentionWrapper:
             spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
             spec_decoding_tensor_params.append(
                 self.spec_bl_tree_first_sparse_mask_offset_kv)
-        mla_tensor_params = [
+        helix_tensor_params = [
             self.helix_position_offsets, self.helix_is_inactive_rank
         ]
 
@@ -593,7 +593,6 @@ class TrtllmAttentionWrapper:
                 self.v_head_dim,
                 self.mrope_rotary_cos_sin,
                 self.mrope_position_deltas,
-                mla_tensor_params,
                 self.attention_chunk_size,
                 self.softmax_stats_tensor,
                 spec_decoding_bool_params,
@@ -676,7 +675,7 @@ class TrtllmAttentionWrapper:
                 self.v_head_dim,
                 self.mrope_rotary_cos_sin,
                 self.mrope_position_deltas,
-                mla_tensor_params,
+                helix_tensor_params,
                 self.attention_chunk_size,
                 self.softmax_stats_tensor,
                 spec_decoding_bool_params,
@@ -2192,7 +2191,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
 
-        mla_tensor_params = [
+        helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
 
@@ -2218,7 +2217,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.kv_scale_quant_orig,
             out_scale,
             metadata.block_ids_per_seq,
-            mla_tensor_params,
+            helix_tensor_params,
             self.wrapper.predicted_tokens_per_seq,
             self.get_local_layer_idx(metadata),
             self.wrapper.num_heads,

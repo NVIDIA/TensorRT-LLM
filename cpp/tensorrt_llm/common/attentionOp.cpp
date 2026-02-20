@@ -122,6 +122,9 @@ struct FusedQKVMaskedAttentionDispatchParams
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params;
     int32_t const* mrope_position_deltas;
+    // Helix parallelism params.
+    int32_t const* helix_position_offsets = nullptr;
+    bool const* helix_is_inactive_rank = nullptr;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -284,6 +287,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.spec_decoding_bl_tree_mask = generationsParams.spec_decoding_bl_tree_mask;
     xqaParams.spec_bl_tree_first_sparse_mask_offset_kv = generationsParams.spec_bl_tree_first_sparse_mask_offset_kv;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
+    xqaParams.helix_position_offsets = generationsParams.helix_position_offsets;
+    xqaParams.helix_is_inactive_rank = generationsParams.helix_is_inactive_rank;
+    xqaParams.softmax_stats = generationsParams.softmax_stats;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
@@ -688,6 +694,8 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.memory_length_per_sample = input_params.memory_length_per_sample;
 
     params.mrope_position_deltas = input_params.mrope_position_deltas;
+    params.helix_position_offsets = input_params.helix_position_offsets;
+    params.helix_is_inactive_rank = input_params.helix_is_inactive_rank;
     sync_check_cuda_error(stream);
 
     masked_multihead_attention(params, input_params.kv_block_array, input_params.shift_k_cache_buffer, stream);
@@ -1687,6 +1695,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.mrope_rotary_cos_sin = params.mrope_rotary_cos_sin;
         preprocessingParams.qkv_scale_orig_quant = params.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr;
+        preprocessingParams.helix_position_offsets = params.helix_position_offsets;
+        preprocessingParams.helix_is_inactive_rank = params.helix_is_inactive_rank;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;
 
         // Sparse KV write
@@ -2488,6 +2498,8 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.block_sparse_attention = mMaskType == AttentionMaskType::BLOCKSPARSE;
     dispatch_params.block_sparse_params = mBlockSparseParams;
     dispatch_params.mrope_position_deltas = params.mrope_position_deltas;
+    dispatch_params.helix_position_offsets = params.helix_position_offsets;
+    dispatch_params.helix_is_inactive_rank = params.helix_is_inactive_rank;
 
     using DataType = typename SATypeConverter<T>::Type;
     if (!isCrossAttention())

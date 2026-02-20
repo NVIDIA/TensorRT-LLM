@@ -211,6 +211,11 @@ struct Multihead_attention_params_base
 
     int const* memory_length_per_sample = nullptr;
     int32_t const* mrope_position_deltas = nullptr;
+    // Helix parallelism params.
+    // Per-token global position offsets for correct RoPE in helix mode.
+    int32_t const* helix_position_offsets = nullptr;
+    // Per-request flag indicating whether this rank is inactive for this request.
+    bool const* helix_is_inactive_rank = nullptr;
 };
 
 template <typename T, bool USE_CROSS_ATTENTION = false>

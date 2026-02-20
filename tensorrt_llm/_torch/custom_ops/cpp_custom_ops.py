@@ -973,7 +973,7 @@ def _register_fake():
         kv_scale_quant_orig: Optional[torch.Tensor],
         out_scale: Optional[torch.Tensor],
         block_ids_per_seq: Optional[torch.Tensor],
-        mla_tensor_params: List[Optional[torch.Tensor]],
+        helix_tensor_params: List[Optional[torch.Tensor]],
         predicted_tokens_per_seq: int,
         layer_idx: int,
         num_heads: int,

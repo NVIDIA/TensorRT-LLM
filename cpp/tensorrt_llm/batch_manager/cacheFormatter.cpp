@@ -258,8 +258,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto& blockManager = mCacheManager->getBlockManager();
     auto const& lastBlockKey = session.getLastBlockKey();
     auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd,
-        /*recvSideHasCP=*/false, ppSize);
+    bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
+    auto blockRange
+        = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
     auto const numPools
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
@@ -388,22 +389,38 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         auto getBufferSizeForTarget = [&]()
         {
-            std::vector<size_t> bufferSizeForTarget(targetNum, 0);
-            // only first bufferTargetNum is used.
+            std::vector<size_t> bufferSizeForTarget(bufferTargetNum, 0);
+            size_t const cPDomainSize = targetInfo.mDomainCPSize;
+            size_t const numTPCaches = targetInfo.mDomainTPSize / peerDuplicateHeadFactor;
+            size_t const ppDomainSize = targetInfo.mDomainPPSize;
+
             if (inputKvCacheBlocksPerWindow.size() > 1)
             {
                 // for VWSA
-                for (size_t i = 0; i < targetNum; i++)
+                for (size_t i = 0; i < bufferTargetNum; i++)
                 {
                     bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetNum;
                 }
                 return bufferSizeForTarget;
             }
 
-            for (size_t i = 0; i < targetNum; i++)
+            // Per-block, per-layer size for one TP head group.
+            size_t const sizePerBlockPerLayerPerTP = allCacheBlockSize * peerDuplicateHeadFactor
+                / targetInfo.mDomainTPSize / selfAttentionLayerNum / blockNum;
+
+            for (size_t cpIdx = 0; cpIdx < cPDomainSize; cpIdx++)
             {
-                bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetInfo.mDomainTPSize
-                    / selfAttentionLayerNum * targetInfo.getPeerPPDomainLayerNum(i);
+                size_t const peerBlockNum
+                    = executor::kv_cache::getBlockNumAccountingForCP(cpIdx, cPDomainSize, blockNum);
+                for (size_t tpIdx = 0; tpIdx < numTPCaches; tpIdx++)
+                {
+                    for (size_t ppIdx = 0; ppIdx < ppDomainSize; ppIdx++)
+                    {
+                        size_t const bufIdx = cpIdx * (numTPCaches * ppDomainSize) + tpIdx * ppDomainSize + ppIdx;
+                        size_t const peerLayerNum = targetInfo.getPeerPPDomainLayerNum(ppIdx);
+                        bufferSizeForTarget[bufIdx] = sizePerBlockPerLayerPerTP * peerLayerNum * peerBlockNum;
+                    }
+                }
             }
 
             return bufferSizeForTarget;
@@ -440,19 +457,27 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             TLLM_CHECK(preAllocSendBuffer->getDataType()
                 == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
+        // processIdx: index of the network connection / destination rank (one per peer).
+        // bufferIdx:  index into outputSplitCaches (the pre-formatted send buffers).
+        //             When duplicate heads exist, multiple destination ranks share the
+        //             same buffer, so bufferIdx < processIdx for some connections.
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send processIdx: %ld", processIdx);
             NVTX3_SCOPED_RANGE(sendBufferFun);
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-            TLLM_CHECK(connections.size() > (processIdx / peerDuplicateHeadFactor));
-            TLLM_CHECK(outputSplitCaches.size() > (processIdx / peerDuplicateHeadFactor));
             auto startTime = LlmRequest::getSteadyClockNow();
 
-            size_t ppDomainSize = targetInfo.mDomainPPSize;
-            size_t bufferTpRank = (processIdx / ppDomainSize) / peerDuplicateHeadFactor;
-            size_t bufferIdx = (bufferTpRank * ppDomainSize) + (processIdx % ppDomainSize);
-            size_t size = outputSplitCaches[bufferIdx]->getSizeInBytes();
+            size_t const ppDomainSize = targetInfo.mDomainPPSize;
+            size_t const tpDomainSize = targetInfo.mDomainTPSize;
+            size_t const ppRank = processIdx % ppDomainSize;
+            size_t const tpRank = (processIdx / ppDomainSize) % tpDomainSize;
+            size_t const cpRank = processIdx / (ppDomainSize * tpDomainSize);
+            size_t const bufferTpRank = tpRank / peerDuplicateHeadFactor;
+            size_t const numTPCaches = tpDomainSize / peerDuplicateHeadFactor;
+            size_t const bufferIdx = cpRank * (numTPCaches * ppDomainSize) + bufferTpRank * ppDomainSize + ppRank;
+            TLLM_CHECK(outputSplitCaches.size() > bufferIdx);
+            size_t const size = outputSplitCaches[bufferIdx]->getSizeInBytes();
 
             if (bufferIdx < bufferCoverTargetNum)
             {
@@ -471,8 +496,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 // bufferCoverTargetNum == 0, mSendBuffer size < one outputSlice
                 // send multiple times
 
-                size_t remainSendSize = outputSplitCaches[processIdx]->getSize();
-                size_t needSendSize = outputSplitCaches[processIdx]->getSize();
+                size_t remainSendSize = outputSplitCaches[bufferIdx]->getSize();
+                size_t const needSendSize = outputSplitCaches[bufferIdx]->getSize();
                 auto sendBufferIdx = bufferCoverTargetNum == 0 ? 0 : bufferIdx % bufferCoverTargetNum;
 
                 auto sendUseAllocBuffer
@@ -563,9 +588,9 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
     auto const srcPpSize = destConfig.getParallelConfig().mPipelineParallelism;
+    bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
-        destConfig.getEnablePartialReuse(),
-        /*recvSideHasCP=*/false, srcPpSize);
+        destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize);
 
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
 
@@ -950,11 +975,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support non-MLA");
         return false;
     }
+    // Helix CP for disagg serving: one side (context) must have CP=1, the other side (gen) can have CP>=1.
     if (selfConfig.getParallelConfig().mContextParallelism != 1
-        || destConfig.getParallelConfig().mContextParallelism != 1)
+        && destConfig.getParallelConfig().mContextParallelism != 1)
     {
-        TLLM_LOG_WARNING(
-            "CacheFormatter::inquireSupport: context parallelism is not currently supported (selfCP=%d, destCP=%d).",
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: Helix CP is decode-only (selfCP=%d, destCP=%d).",
             selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
         return false;
     }
