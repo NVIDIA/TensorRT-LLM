@@ -1166,24 +1166,6 @@ class TestBatchedSampling:
             )
         )
 
-    @staticmethod
-    def _init_store_for_new_requests(
-        sampler: TorchSampler,
-        scheduled_requests: ScheduledRequests,
-    ) -> None:
-        """Initialize store for request slots that haven't been through setup_sampler_step.
-
-        In production, setup_sampler_step registers each new request's slot in
-        store.slots_needing_recompute so that _group_requests_by_strategy_key
-        knows to compute its strategy.  Tests skip setup_sampler_step, so we
-        replicate the relevant initialization here to exercise the same code
-        path as production.
-        """
-        for req in scheduled_requests.all_requests():
-            slot = req.py_seq_slot
-            if sampler.store.strategies[slot] is None:
-                sampler.store.slots_needing_recompute.add(slot)
-
     def _sample(
         self,
         sampler: TorchSampler,
@@ -1192,15 +1174,13 @@ class TestBatchedSampling:
         *,
         num_repeats: Optional[int] = None,
         allow_sync: bool = True,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> torch.Tensor:
         """Call sample_async.
 
         Optionally, run sampling repeatedly, e.g., to gather statistics.
         """
         assert not scheduled_requests.context_requests
-        # Simulate the store initialization that setup_sampler_step performs
-        # for new requests in production.
-        self._init_store_for_new_requests(sampler, scheduled_requests)
         num_actual_repeats = num_repeats if num_repeats is not None else 1
 
         T = TypeVar("T")
@@ -1219,17 +1199,26 @@ class TestBatchedSampling:
                 is_first = False
                 return func()
 
-        sample_states = [
-            maybe_check_no_sync(
-                lambda: sampler.sample_async(
-                    scheduled_requests,
-                    model_outputs=model_outputs,
-                    num_context_logits_prefix_sum=[0],
-                    resource_manager=None,  #  only used for tree sampling, which is not tested here
+        with monkeypatch.context() as patcher:
+            # Ensure that internal sampler data structures are set up for all requests
+            # (production code only considers context requests and examines other not mocked
+            # LlmRequest fields)
+            def _mock_filter(self, requests: ScheduledRequests) -> list[LlmRequest]:
+                return requests.all_requests()
+
+            patcher.setattr(TorchSampler, "_filter_new_requests", _mock_filter)
+
+            sample_states = [
+                maybe_check_no_sync(
+                    lambda: sampler.sample_async(
+                        scheduled_requests,
+                        model_outputs=model_outputs,
+                        num_context_logits_prefix_sum=[0],
+                        resource_manager=None,  #  only used for tree sampling, which is not tested here
+                    )
                 )
-            )
-            for _ in range(num_actual_repeats)
-        ]
+                for _ in range(num_actual_repeats)
+            ]
         new_tokens_tensors = []
         for sample_state in sample_states:
             assert sample_state.sampler_event is not None
@@ -1306,6 +1295,7 @@ class TestBatchedSampling:
         allow_zero_draft_len: bool,  # used by fixtures
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
+        monkeypatch: pytest.MonkeyPatch,
     ):
         """Validate probabilities returned by sample_async.
 
@@ -1347,6 +1337,7 @@ class TestBatchedSampling:
                     scheduled_requests=uut_mock_requests,
                     model_outputs=model_outputs,
                     allow_sync=is_warmup,
+                    monkeypatch=monkeypatch,
                 )
 
             yield _uut
@@ -1489,6 +1480,7 @@ class TestBatchedSampling:
         vocab_size: int,
         max_draft_len: int,
         draft_lens: list[int],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> ScheduledRequests:
         """Construct a batch of requests with given sampling params and invoke sampler to compute probs.
 
@@ -1533,6 +1525,7 @@ class TestBatchedSampling:
             sampler_with_probs,
             scheduled_requests=mock_requests_with_probs,
             model_outputs=model_outputs_with_probs,
+            monkeypatch=monkeypatch,
         )
         return mock_requests_with_probs
 
@@ -2063,6 +2056,7 @@ class TestBatchedSampling:
                 vocab_size=vocab_size,
                 max_draft_len=max_draft_len,
                 draft_lens=draft_lens,
+                monkeypatch=monkeypatch,
             )
 
             num_samples = 5000 if not (bypass_sampling or is_warmup) else 1
@@ -2096,6 +2090,7 @@ class TestBatchedSampling:
                         model_outputs=model_outputs,
                         num_repeats=num_samples,
                         allow_sync=is_warmup,
+                        monkeypatch=monkeypatch,
                     )
                     res.result = UutResult(new_tokens_repeats=new_tokens_repeats)
 

@@ -468,9 +468,6 @@ def test_beam_search_sampling_batch_basic():
     finished_beams[seq_slots[0], beam_width - 1] = FinishReason.STOP_WORDS.value
     finished_beams_result = finished_beams.clone()
 
-    # define our end ids for each request
-    end_ids = torch.tensor([vocab_size - 1] * batch_size, dtype=torch.int32)
-
     new_log_probs = torch.zeros((max_batch_size, beam_width),
                                 dtype=torch.float32)
     predecessor_beams = torch.zeros((max_batch_size, beam_width),
@@ -489,7 +486,6 @@ def test_beam_search_sampling_batch_basic():
         finished_beams=finished_beams_result,
         new_log_probs=new_log_probs_result,
         predecessor_beams=predecessor_beams_result,
-        end_ids=end_ids,
     )
 
     # Run beam search sampling
@@ -529,7 +525,8 @@ def test_beam_search_sampling_batch_basic():
     logprobs = torch.log_softmax(logits, dim=-1)
     # adjust our expected log probs accordingly
     logprobs[beam_width - 1] = float('-inf')
-    logprobs[beam_width - 1, end_ids[0]] = 0
+    end_id = vocab_size - 1
+    logprobs[beam_width - 1, end_id] = 0
     logprobs = logprobs.view(batch_size, beam_width * vocab_size)
 
     _, top_indices = torch.topk(logprobs, k=beam_width, dim=-1, sorted=True)
@@ -629,12 +626,14 @@ def create_default_sampler(test_params: GeneralTestParams) -> TorchSampler:
     assert max_seq_len > test_params.seq_len, "Max sequence length must be greater than sequence length"
     assert max_batch_size > test_params.batch_size, "Max batch size must be greater than batch size"
     assert max_batch_size > test_params.seq_slot, "Max batch size must be greater than sequence slot"
-    assert sampler.store.cache_indirection is not None
-    assert sampler.store.cache_indirection.shape == (
+    beam_search_store = sampler.store.beam_search_store
+    assert beam_search_store is not None
+    assert beam_search_store.cache_indirection is not None
+    assert beam_search_store.cache_indirection.shape == (
         max_batch_size, max_beam_width,
         max_seq_len), "Cache indirection shape mismatch"
-    assert sampler.store.original_tokens is not None
-    assert sampler.store.original_tokens.shape == (
+    assert beam_search_store.original_tokens is not None
+    assert beam_search_store.original_tokens.shape == (
         max_batch_size, max_beam_width,
         max_seq_len), "Original tokens shape mismatch"
     return sampler
@@ -661,9 +660,11 @@ def test_create_beam_history():
         seq_slot = test_params.seq_slot
         vocab_size = test_params.vocab_size
         num_logprobs = test_params.num_logprobs + 1
-        cache_indirection = sampler.store.cache_indirection
+        beam_search_store = sampler.store.beam_search_store
+        assert beam_search_store is not None
+        cache_indirection = beam_search_store.cache_indirection
         assert cache_indirection is not None
-        original_tokens = sampler.store.original_tokens
+        original_tokens = beam_search_store.original_tokens
         assert original_tokens is not None
         original_logprobs = torch.zeros(
             (beam_width, num_generated_tokens, num_logprobs),
@@ -673,7 +674,7 @@ def test_create_beam_history():
             (beam_width, num_generated_tokens, num_logprobs),
             dtype=torch.int32,
             device=original_tokens.device)
-        original_cum_logprobs = sampler.store.cum_log_probs
+        original_cum_logprobs = beam_search_store.cum_log_probs
         assert original_cum_logprobs is not None
 
         # Fill the request with some random tokens that will be overwritten by the beam search sampling
@@ -731,8 +732,8 @@ def test_create_beam_history():
             ) > 0, "Deterministic offsets must not only contain zeros. Otherwise change the seed."
 
         # set the new log probs and tokens for the beam search sampling
-        assert sampler.store.sampled_log_probs is not None
-        sampler.store.sampled_log_probs[
+        log_probs_store = sampler.store.log_probs_store
+        log_probs_store.sampled_log_probs[
             seq_slot, :beam_width] = original_logprobs[:beam_width,
                                                        num_generated_tokens - 1,
                                                        0:1]
@@ -814,7 +815,9 @@ def test_finish_beams():
         num_logprobs = 1
         request = create_default_request(test_params)
         sampler = create_default_sampler(test_params)
-        assert sampler.store.cache_indirection is not None
+        beam_search_store = sampler.store.beam_search_store
+        assert beam_search_store is not None
+        assert beam_search_store.cache_indirection is not None
 
         request.set_generated_tokens(
             torch.randint(0,
