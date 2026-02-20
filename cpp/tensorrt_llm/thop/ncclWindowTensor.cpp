@@ -20,7 +20,26 @@
 #include <torch/extension.h>
 
 #include <set>
+#include <sstream>
+#include <string>
 #include <tuple>
+
+namespace
+{
+std::string shapeToDebugString(at::IntArrayRef shape)
+{
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < shape.size(); ++i)
+    {
+        if (i != 0)
+            oss << ", ";
+        oss << shape[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+} // namespace
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -57,17 +76,18 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
     }
 
     at::IntArrayRef const outShape = (shape.has_value() && !shape->empty()) ? *shape : like.sizes();
+    std::string const shapeStr = shapeToDebugString(outShape);
     auto [tensor, buffer]
         = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(*commPtr, outShape, like.scalar_type());
     if (!tensor.defined() || buffer.invalid())
     {
         TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation failed; tensor_defined=%d buffer_valid=%d shape=%s",
-            tensor.defined() ? 1 : 0, buffer.isValid() ? 1 : 0, outShape);
+            tensor.defined() ? 1 : 0, buffer.isValid() ? 1 : 0, shapeStr.c_str());
         return {torch::Tensor(), false};
     }
 
     TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation success; ptr=%p size_bytes=%zu shape=%s", buffer.ptr,
-        buffer.size, outShape);
+        buffer.size, shapeStr.c_str());
     return {tensor, true};
 #else  // defined(ENABLE_MULTI_DEVICE)
     (void) group;
