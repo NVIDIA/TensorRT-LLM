@@ -91,11 +91,15 @@ transforms:
   # proceeds normally.
   match_swiglu_pattern:
     stage: pattern_matcher
-    enabled: false
+    enabled: true
   match_nvfp4_swiglu_pattern:
     stage: pattern_matcher
     requires_shape_prop: true
-    enabled: false
+    enabled: true
+  match_finegrained_fp8_swiglu_pattern:
+    stage: pattern_matcher
+    requires_shape_prop: true
+    enabled: true
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
@@ -149,6 +153,8 @@ transforms:
     stage: post_load_fusion
     backend: trtllm
   fuse_nvfp4_swiglu:
+    stage: post_load_fusion
+  fuse_finegrained_fp8_swiglu:
     stage: post_load_fusion
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
