@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 import torch
-from defs.conftest import skip_pre_blackwell
+import yaml
+from defs.conftest import get_llm_root, skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -24,6 +27,15 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root
 from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+
+_AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
+                   'model_registry' / 'configs')
+
+
+def _load_ad_config(config_name):
+    """Load a YAML config from the AutoDeploy model registry configs directory."""
+    with open(_AD_CONFIGS_DIR / config_name) as f:
+        return yaml.safe_load(f)
 
 
 def print_memory_usage(label: str):
@@ -209,6 +221,76 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestNemotronV2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    _MODEL_PATH_BASE = f"{llm_models_root()}/NVIDIA-Nemotron-Nano-9B-v2"
+    MODEL_PATH = _MODEL_PATH_BASE
+    MODEL_PATH_FP8 = f"{_MODEL_PATH_BASE}-FP8"
+    MODEL_PATH_NVFP4 = f"{_MODEL_PATH_BASE}-NVFP4"
+
+    def get_default_kwargs(self, enable_chunked_prefill=False):
+        config = _load_ad_config('nemotron-nano-9b-v2.yaml')
+        if enable_chunked_prefill:
+            config["enable_chunked_prefill"] = True
+            # NOTE: must be > max(tokens_per_block, max_batch_size)
+            config["max_num_tokens"] = 512
+        return config
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    def evaluate_tasks(self, llm, sampling_params):
+        task = MMLU(self.MODEL_NAME)
+        task.evaluate(llm, sampling_params=sampling_params)
+        task = GSM8K(self.MODEL_NAME)
+        task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
+    def test_auto_dtype(self, enable_chunked_prefill):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        kwargs.setdefault("transforms", {})
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           **kwargs) as llm:
+            self.evaluate_tasks(llm, sampling_params)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("enable_chunked_prefill", [True])
+    def test_fp8(self, enable_chunked_prefill):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        kwargs.setdefault("transforms", {})
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH_FP8,
+                           tokenizer=self.MODEL_PATH_FP8,
+                           **kwargs) as llm:
+            # Manually set quant_config for FP8 model to get the accuracy threshold
+            llm.args.quant_config.quant_algo = QuantAlgo.FP8
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            self.evaluate_tasks(llm, sampling_params)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("enable_chunked_prefill", [True])
+    def test_nvfp4(self, enable_chunked_prefill):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        kwargs.setdefault("transforms", {})
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
+                           tokenizer=self.MODEL_PATH_NVFP4,
+                           **kwargs) as llm:
+            # Manually set quant_config for NVFP4 model to get the accuracy threshold
+            llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            self.evaluate_tasks(llm, sampling_params)
 
 
 class TestNemotronMOE(LlmapiAccuracyTestHarness):
@@ -506,6 +588,126 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             # Manually set quant_config for NVFP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
             llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Qwen3-Next Instruct via AutoDeploy.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    Configuration derived from examples/auto_deploy/model_registry/configs/qwen3Next.yaml.
+    """
+
+    MODEL_NAME = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "skip_loading_weights": False,
+            "enable_chunked_prefill": True,
+            "max_batch_size": 64,
+            "max_seq_len": 4096,
+            "max_num_tokens": 4096,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.7,
+            },
+            "transforms": {
+                "export_to_gm": {
+                    "num_moe_experts_for_export": 2,
+                },
+                "detect_sharding": {
+                    "sharding_source": ['factory', 'heuristic'],
+                    "sharding_dims": ['ep', 'bmm'],
+                },
+            },
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("world_size", [1, 4])
+    def test_auto_dtype(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           world_size=world_size,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Qwen3.5-397B-A17B via AutoDeploy.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    Configuration derived from examples/auto_deploy/model_registry/configs/qwen3.5_moe_400b.yaml.
+    """
+
+    MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "compile_backend": "torch-cudagraph",
+            "max_batch_size": 128,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+                "tokens_per_block": 64,
+            },
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
+            "transforms": {
+                "export_to_gm": {
+                    "num_moe_experts_for_export": 2,
+                },
+            },
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("world_size", [8])
+    def test_bf16(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           dtype="bfloat16",
+                           world_size=world_size,
+                           **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)

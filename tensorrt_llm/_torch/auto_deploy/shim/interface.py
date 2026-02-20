@@ -177,8 +177,15 @@ class CachedSequenceInterface:
             d_state = ssm_ref.d_state
             ssm_dtype = ssm_ref.dtype
         else:
-            # Dummy SSM params - d_state=0 means empty tensor (no memory used)
-            num_heads, head_dim, d_state = 1, 1, 0
+            # Dummy SSM params - d_state=0 means empty tensor (no memory used).
+            # MambaCacheManager computes conv_dim = head_dim * num_heads + 2 * n_groups * d_state.
+            # When only conv resources exist (e.g. GDN/linear-attention models like Qwen3-Next),
+            # we set num_heads = conv_ref.conv_dim so that the formula yields the correct conv_dim
+            # (with d_state=0, n_groups=0: conv_dim = head_dim * num_heads = 1 * conv_dim).
+            if conv_ref:
+                num_heads, head_dim, d_state = conv_ref.conv_dim, 1, 0
+            else:
+                num_heads, head_dim, d_state = 1, 1, 0
             ssm_dtype = torch.float32
 
         # Get Conv parameters (or dummy if not managing Conv)
