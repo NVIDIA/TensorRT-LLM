@@ -152,9 +152,8 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_eagle3_one_model() or self.is_sa()
 
     def has_spec_drafter(self):
-        return self.is_eagle3() or self.is_draft_target(
-        ) or self.is_user_provided() or self.is_mtp_eagle(
-        ) or self.is_save_hidden_states() or self.is_ngram()
+        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
+        ) or self.is_user_provided() or self.is_mtp_eagle()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

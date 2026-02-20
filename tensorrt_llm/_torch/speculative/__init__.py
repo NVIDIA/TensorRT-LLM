@@ -5,7 +5,8 @@ from .interface import (SpecMetadata, SpecWorkerBase,
 from .mtp import MTPEagleWorker, MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
-from .save_hidden_state import SaveHiddenStatesDrafter
+from .save_hidden_state import (SaveHiddenStatesResourceManager,
+                                SaveHiddenStatesSpecMetadata)
 from .spec_sampler_base import (SampleStateSpec, SampleStateTensorsSpec,
                                 SpecSamplerBase)
 from .spec_tree_manager import SpecTreeManager
@@ -29,7 +30,8 @@ __all__ = [
     "SuffixAutomatonManager",
     "SampleStateSpec",
     "SampleStateTensorsSpec",
-    "SaveHiddenStatesDrafter",
+    "SaveHiddenStatesResourceManager",
+    "SaveHiddenStatesSpecMetadata",
     "SpecMetadata",
     "SpecSamplerBase",
     "SpecWorkerBase",

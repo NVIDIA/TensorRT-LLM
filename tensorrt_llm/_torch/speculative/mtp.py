@@ -244,19 +244,12 @@ class MTPSampler(Sampler[SampleStateMTP]):
         return True
 
     @dataclass(kw_only=True)
-    class Store(TorchSampler.Store):
+    class Store:
         new_tokens: torch.Tensor
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
         max_total_draft_tokens: torch.Tensor
-        # Necessary to satisfy the interface of TorchSampler.Store
-        finish_reasons: None = None
-        end_ids: None = None
-        max_lengths_tensor: None = None
-
-        def __post_init__(self):
-            pass  # finish_reasons has no size to compare against new_tokens in MTPSampler
 
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         # MTPSampler does not need to setup additional buffers before the sampler step
