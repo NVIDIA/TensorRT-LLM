@@ -211,12 +211,14 @@ class MultiStreamMOE(BaseTransform):
             torch.ops.auto_deploy.triton_moe_fused,
             torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
             torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused,
+            torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused,
         ]
 
         # Ensure that aux stream and events for the current device are added to the CudaStreamManager.
         cuda_stream_manager.add_device(torch.cuda.current_device())
         gm, num_matches = _execute_shared_expert_in_aux_stream(gm, base_ops)
-
+        with open("after_multi_stream_moe.txt", "w") as f:
+            f.write(str(gm.graph))
         info = TransformInfo(
             skipped=False,
             num_matches=num_matches,
