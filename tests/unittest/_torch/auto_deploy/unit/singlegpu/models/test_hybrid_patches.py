@@ -153,4 +153,4 @@ def _generate(tokenizer, model):
         model.device
     )
     response = model.generate(input_ids, max_new_tokens=64)
-    print("\n".join(tokenizer.batch_decode(response, skip_special_tokens=True)))
+    print("\n".join(tokenizer.decode(response, skip_special_tokens=True)))

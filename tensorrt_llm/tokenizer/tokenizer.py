@@ -1,4 +1,5 @@
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -55,7 +56,18 @@ class TransformersTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
-        return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
+        """Deprecated: Use tokenizer(texts, ...) instead.
+
+        This method is deprecated since Transformers v5.0.0.
+        Use the __call__ method directly: tokenizer(texts, ...)
+        """
+        warnings.warn(
+            "batch_encode_plus is deprecated since Transformers v5.0.0. "
+            "Use tokenizer(texts, ...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.tokenizer(texts, *args, **kwargs)
 
     def get_chat_template(self,
                           chat_template: Optional[str] = None,
@@ -81,7 +93,27 @@ class TransformersTokenizer(TokenizerBase):
         self.tokenizer.save_pretrained(pretrained_model_dir, **kwargs)
 
     def clean_up_tokenization(self, out_string: str) -> str:
-        return self.tokenizer.clean_up_tokenization(out_string)
+        """Clean up tokenization artifacts (spaces before punctuation, contractions, etc.)
+
+        In transformers v5.0+, this method was removed from the base tokenizer class
+        and moved to model-specific tokenizers. We check if the underlying tokenizer
+        has it, otherwise fall back to the standard English cleanup logic.
+        """
+        if hasattr(self.tokenizer, 'clean_up_tokenization'):
+            return self.tokenizer.clean_up_tokenization(out_string)
+        # Fallback for transformers v5.0+ where the method was removed from base class
+        return (
+            out_string.replace(" .", ".")
+            .replace(" ?", "?")
+            .replace(" !", "!")
+            .replace(" ,", ",")
+            .replace(" ' ", "'")
+            .replace(" n't", "n't")
+            .replace(" 'm", "'m")
+            .replace(" 's", "'s")
+            .replace(" 've", "'ve")
+            .replace(" 're", "'re")
+        )
 
     @property
     def clean_up_tokenization_spaces(self):

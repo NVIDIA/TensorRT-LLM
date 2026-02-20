@@ -990,15 +990,19 @@ class TestFunctional(unittest.TestCase):
                 step = get_step(req_idx)
                 assert is_valid_step(step)
                 if step == 1 and beam_width > 1:
+                    cache = torch_cache_list[req_idx]
                     if attention_type != "gpt_bigcode_attention":
-                        assert torch_cache_list[req_idx][0].shape[0] == 1
-                        torch_cache_list[req_idx] = [
-                            x.repeat((beam_width, 1, 1, 1))
-                            for x in torch_cache_list[req_idx]
-                        ]
+                        assert cache.key_cache[0].shape[0] == 1
+                        # Repeat cache tensors for beam width
+                        cache.key_cache[0] = cache.key_cache[0].repeat(
+                            (beam_width, 1, 1, 1))
+                        cache.value_cache[0] = cache.value_cache[0].repeat(
+                            (beam_width, 1, 1, 1))
                     else:
-                        torch_cache_list[req_idx] = torch_cache_list[
-                            req_idx].repeat(beam_width, 1, 1)
+                        cache.key_cache[0] = cache.key_cache[0].repeat(
+                            beam_width, 1, 1)
+                        cache.value_cache[0] = cache.value_cache[0].repeat(
+                            beam_width, 1, 1)
                 input_length = input_length_list[i][0]
                 local_beam_width = beam_width if step != 0 else 1
                 offset_next = offset + input_length * local_beam_width
@@ -1009,23 +1013,24 @@ class TestFunctional(unittest.TestCase):
                     torch_in = input_tensor[:, offset:offset_next, :].reshape(
                         (local_beam_width, input_length, hidden_size))
 
-                # llama/gpt2 uses DynamicCache
-                past_key_values = DynamicCache.from_legacy_cache(
-                    torch_cache_list[req_idx])
+                # Use DynamicCache directly - no conversion needed
+                past_key_values = torch_cache_list[req_idx]
+                if past_key_values is None:
+                    past_key_values = DynamicCache()
 
                 torch_out, past_key_values = torch_exec(
                     step, torch_in, ctx_attention_mask_list[req_idx], req_idx,
                     past_key_values)
 
-                # llama/gpt2 uses DynamicCache
-                torch_cache_list[req_idx] = past_key_values.to_legacy_cache()
-                past_key_values = torch_cache_list[req_idx][0]
+                # Store DynamicCache directly
+                torch_cache_list[req_idx] = past_key_values
 
                 if use_fp8_kv_cache or use_int8_kv_cache:
                     max_kv_cache = max(
                         max_kv_cache,
-                        torch.concat((past_key_values[0],
-                                      past_key_values[1])).abs().max().item())
+                        torch.concat((
+                            past_key_values.key_cache[0],
+                            past_key_values.value_cache[0])).abs().max().item())
 
                 if use_fp8_context_fmha:
                     max_output = max(max_output, torch_out.abs().max().item())

@@ -17,7 +17,7 @@ from typing import Optional, Union
 
 from ...layers import MoeConfig
 from ...mapping import Mapping
-from ..convert_utils import infer_dtype
+from ..convert_utils import get_rope_scaling, get_rope_theta, infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -96,8 +96,9 @@ class Phi3Config(PretrainedConfig):
                 hf_config, "dense_attention_every_n_layers", None)
             kwargs['norm_epsilon'] = hf_config.layer_norm_epsilon
         else:
-            kwargs['rotary_base'] = hf_config.rope_theta
+            kwargs['rotary_base'] = get_rope_theta(hf_config)
             kwargs['norm_epsilon'] = hf_config.rms_norm_eps
+        rope_scaling = get_rope_scaling(hf_config)
         moe_variant = hf_config.architectures[0] == "PhiMoEForCausalLM"
         if moe_variant:
             kwargs.update({
@@ -116,15 +117,13 @@ class Phi3Config(PretrainedConfig):
             kwargs[
                 'original_max_position_embeddings'] = hf_config.original_max_position_embeddings
             kwargs['position_embedding_type'] = "long_rope"
-            kwargs['longrope_scaling_short_factors'] = hf_config.rope_scaling[
+            kwargs['longrope_scaling_short_factors'] = rope_scaling[
                 "short_factor"]
-            kwargs['longrope_scaling_long_factors'] = hf_config.rope_scaling[
+            kwargs['longrope_scaling_long_factors'] = rope_scaling[
                 "long_factor"]
             if small_variant or moe_variant:
-                kwargs['longrope_long_mscale'] = hf_config.rope_scaling[
-                    "long_mscale"]
-                kwargs['longrope_short_mscale'] = hf_config.rope_scaling[
-                    "short_mscale"]
+                kwargs['longrope_long_mscale'] = rope_scaling["long_mscale"]
+                kwargs['longrope_short_mscale'] = rope_scaling["short_mscale"]
 
         return cls(architecture=hf_config.architectures[0],
                    dtype=dtype,

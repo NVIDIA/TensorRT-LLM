@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import yaml
 from tqdm import tqdm
-from transformers import (AutoModelForCausalLM, AutoModelForVision2Seq,
+from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
                           AutoTokenizer)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
@@ -910,7 +910,7 @@ def quantize(hf_model_dir: str,
 
 def load_hf_gpt(model_dir: str, load_model_on_cpu: bool = False):
     if 'kosmos-2' in model_dir:
-        hf_model = AutoModelForVision2Seq.from_pretrained(
+        hf_model = AutoModelForImageTextToText.from_pretrained(
             model_dir, trust_remote_code=True)
     else:
         hf_model = AutoModelForCausalLM.from_pretrained(

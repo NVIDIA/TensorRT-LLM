@@ -24,6 +24,7 @@ from utils.util import unittest_name_func
 
 import tensorrt_llm
 from tensorrt_llm import Builder
+from tensorrt_llm.models.convert_utils import get_rope_theta
 from tensorrt_llm.models.phi.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
@@ -61,7 +62,7 @@ class TestPhi(unittest.TestCase):
             'num_attention_heads': hf_config.num_key_value_heads,
             'rotary_pct': hf_config.partial_rotary_factor,
             'position_embedding_type': 'rope_gpt_neox',
-            'rope_theta': hf_config.rope_theta,
+            'rope_theta': get_rope_theta(hf_config),
             'hidden_size': hf_config.hidden_size,
             'intermediate_size': hf_config.intermediate_size,
             'vocab_size': hf_config.vocab_size,

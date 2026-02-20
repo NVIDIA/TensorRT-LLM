@@ -671,6 +671,7 @@ def _add_plugin_info(layer, plugin_creator: trt.IPluginCreator,
 
 class RotaryScalingType(IntEnum):
     none = 0
+    default = 0  # Alias: HuggingFace transformers 5.0+ uses "default" for standard RoPE
     linear = 1
     dynamic = 2
     longrope = 3
@@ -690,6 +691,7 @@ class PositionEmbeddingType(IntEnum):
     learned_absolute = 0
     rope_gptj = 1
     rope_gpt_neox = 2
+    default = 2  # Alias: HuggingFace transformers 5.0+ uses "default" for standard RoPE
     long_rope = 3
     alibi = 4
     alibi_with_scale = 5
