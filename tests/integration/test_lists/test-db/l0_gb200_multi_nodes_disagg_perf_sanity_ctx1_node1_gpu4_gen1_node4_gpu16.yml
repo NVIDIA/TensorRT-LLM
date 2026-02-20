@@ -1,0 +1,18 @@
+version: 0.0.1
+l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16:
+- condition:
+    ranges:
+      # 1 ctx worker with each 1 node and 4 GPUs
+      # 1 gen worker with each 4 nodes and 16 GPUs
+      system_gpu_count:
+        gte: 20
+        lte: 20
+    wildcards:
+      gpu:
+      - '*gb200*'
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-deepseek-r1-fp4_8k1k_ctx1_dep4_gen1_dep16_eplb0_mtp1_ccb-UCX] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-gb200-kimi-k2-thinking-fp4_8k1k_ctx1_dep4_gen1_dep16_eplb384_mtp0_ccb-UCX] TIMEOUT (120)
