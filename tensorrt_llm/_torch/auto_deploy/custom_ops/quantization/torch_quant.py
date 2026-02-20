@@ -582,6 +582,8 @@ def trtllm_finegrained_fp8_linear(
     # For small layers where a dimension < 128 (e.g. N=64), the derived block
     # size will be < 128.  Fall back to BF16 dequant + cuBLAS.
     if block_n != 128 or block_k != 128:
+        # BF16 fallback: the Triton FP8 kernel launches Grid=1x1x1 for tiny N,
+        # wasting 99% of SM capacity. Dequantize weight + cuBLAS is faster.
         weight_dequant = _dequant_block_fp8_weight(
             weight, weight_scale, block_n, block_k, dtype=input.dtype
         )
