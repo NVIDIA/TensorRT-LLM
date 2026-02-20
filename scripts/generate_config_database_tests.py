@@ -46,6 +46,7 @@ MODEL_NAME_MAPPING = {
     "deepseek-ai/DeepSeek-R1-0528": "deepseek_r1_0528_fp8",
     "nvidia/DeepSeek-R1-0528-FP4-v2": "deepseek_r1_0528_fp4_v2",
     "openai/gpt-oss-120b": "gpt_oss_120b_fp4",
+    "warnold-nv/glm-4.7-modelopt-fp8": "glm_4_7_fp8",
 }
 
 

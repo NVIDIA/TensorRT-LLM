@@ -55,6 +55,7 @@ MODEL_PATH_DICT = {
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
+    "glm_4_7_fp8": "warnold-nv/glm-4.7-modelopt-fp8",
 }
 
 SUPPORTED_GPU_MAPPING = {
