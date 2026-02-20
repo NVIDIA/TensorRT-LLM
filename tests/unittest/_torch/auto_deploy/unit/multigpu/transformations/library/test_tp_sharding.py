@@ -27,36 +27,26 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
-    "q_proj": "colwise",
-    "k_proj": "colwise",
-    "v_proj": "colwise",
-    "o_proj": "rowwise",
-    "gate_proj": "colwise",
-    "up_proj": "colwise",
-    "down_proj": "rowwise",
-    "linear1": "colwise",
-    "linear2": "rowwise",
-    "linear": "gather",
-    # Mamba2 specific projections
-    "in_proj": "mamba",
-    "out_proj": "rowwise",
-    # MLA specific projections
-    "q_a_proj": "gather",
-    "q_b_proj": "colwise",
-    "kv_a_proj_with_mqa": "gather",
-    "kv_b_proj": "colwise",
-    # "input_layernorm.weight": "sequence_parallel",
-    # "post_attention_layernorm.weight": "sequence_parallel",
-    # "norm.weight": "sequence_parallel",
-    # "shared_expert.gate_proj": "local_colwise",
-    # "shared_expert.up_proj": "local_colwise",
-    # "shared_expert.down_proj": "local_rowwise",
-    # "experts.gate_up_proj": "local_packed_rowwise",
-    # "experts.down_proj": "local_colwise",
-    # "experts": "local",
-    "feed_forward": "gather",
-    "self": "gather",
-    "weight": "gather",
+    # ATTENTION
+    # "q_proj": "colwise",
+    # "k_proj": "colwise",
+    # "v_proj": "colwise",
+    # "o_proj": "rowwise",
+    # # gated MLP
+    # "gate_proj": "colwise",
+    # "up_proj": "colwise",
+    # "down_proj": "rowwise",
+    # # GPT-style MLP
+    # "linear1": "colwise",
+    # "linear2": "rowwise",
+    # "linear": "gather",
+    # # Mamba2 specific projections
+    # "in_proj": "mamba",
+    # # MLA specific projections
+    # "q_a_proj": "mla",
+    # # delta net
+    # # qkv regex matches both fused (qkvz) and unfused (qkv) opening nodes
+    # "in_proj_qkv": "delta",
 }
 
 predefined_config = {
@@ -563,13 +553,16 @@ def _run_sharding_execution_job(
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    sharding_source = "heuristic" if from_config else "manual"
     gm_transformed = InferenceOptimizer(
         None,
         {
             "detect_sharding": {
                 "stage": "sharding",
                 "sharding_scope": ["tp"],
-                "tp_sharding_source": ["heuristic"],
+                "sharding_source": [sharding_source],
+                "manual_config": predefined_config,
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -931,6 +924,7 @@ def _run_pattern_detection_job(
                             )
                         )
 
+    sharding_source = "heuristic" if from_config else "manual"
     # get detected transformations
     optimizer = InferenceOptimizer(
         None,
@@ -938,8 +932,9 @@ def _run_pattern_detection_job(
             "detect_sharding": {
                 "stage": "sharding",
                 "sharding_scope": ["tp"],
-                "tp_sharding_source": ["heuristic"],
+                "sharding_source": [sharding_source],
                 "shard_all_unprocessed": True,
+                "manual_config": predefined_config,
             },
         },
     )

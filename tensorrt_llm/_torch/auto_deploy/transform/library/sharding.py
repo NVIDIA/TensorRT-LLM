@@ -239,7 +239,9 @@ class ShardingTransformConfig(TransformConfig):
             supported_modes = {
                 "colwise",  # row split and no collective
                 "rowwise",  # column split and all-reduce
+                "mla",  # mla layer
                 "mamba",  # mamba SSM layer
+                "delta",  # gated delta net layer
                 "gather",  # simple shard (row + all_gather)
                 # TODO: remaining values are not supported yet.
                 # They require hybrid EP+TP and/or SP support.
@@ -2663,6 +2665,8 @@ def detect_sharding_from_config(
     num_row_col_shards = 0
     num_attention_shards = 0
     num_ssm_shards = 0
+    num_mla_shards = 0
+    num_delta_shards = 0
     linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
 
     # use layer_subgraphs to determine the layer_type
@@ -2724,7 +2728,14 @@ def detect_sharding_from_config(
                     if _process_ssm_sharding(layer_subgraph, transform_container) > 0:
                         num_ssm_shards += 1
                         num_row_col_shards += 1
-
+                elif config == "gdn":
+                    if _process_delta_sharding(layer_subgraph, transform_container) > 0:
+                        num_delta_shards += 1
+                        num_row_col_shards += 1
+                elif config == "mla":
+                    if _process_mla_sharding(layer_subgraph, transform_container) > 0:
+                        num_mla_shards += 1
+                        num_row_col_shards += 1
                 elif "sequence" in config:
                     # TODO: Sequence parallelism is not supported yet.
                     ad_logger.warning("Sequence parallelism is not supported yet. Skipping.")
@@ -2783,7 +2794,8 @@ def detect_sharding_from_config(
     num_shards = num_simple_shards + num_row_col_shards
     ad_logger.info(
         f"Applied {num_shards} TP shards from config. Simple: {num_simple_shards}, "
-        f"row-col: {num_row_col_shards} (including: ssm: {num_ssm_shards}, attention: {num_attention_shards})"
+        f"row-col: {num_row_col_shards} (attention: {num_attention_shards}, "
+        f"mla: {num_mla_shards}, delta: {num_delta_shards}, ssm: {num_ssm_shards})"
     )
 
     num_matches = len(transform_container.weight_sharding_transforms)
