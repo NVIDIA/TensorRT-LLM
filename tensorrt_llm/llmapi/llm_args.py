@@ -1052,11 +1052,10 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     def model_post_init(self, __context):
         self._last_hidden_in_save = True
-        if self.eagle3_layers_to_capture is None:
+        if self.eagle3_layers_to_capture is None or -1 not in self.eagle3_layers_to_capture:
+            # This variable is queried to determine whether we should write the final hidden state
+            # to the aux_hidden_states buffer.
             self._last_hidden_in_save = False
-        elif -1 not in self.eagle3_layers_to_capture:
-            self._last_hidden_in_save = False
-            self.eagle3_layers_to_capture.add(-1)
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1078,13 +1077,23 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     @functools.cached_property
     def num_capture_layers(self):
         """
-        Returns the number of layers to capture of the target model.
-        If eagle3_layers_to_capture is not None, return the length of the set.
-        Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden state).
+        Returns the number of layers to save.
+        The following hidden states are saved:
+        - If eagle3_layers_to_capture is None, save the eagle3 base set plus
+        the post norm last hidden state.
+        - Otherwise, save the specified layers plus the post norm last hidden state.
+
+        The saved data will contain two tensors, hidden_states and aux_hidden_states.
+        * hidden_states will contain the last post norm state.
+        * aux_hidden_states will contain all other captured layers. The last hidden state
+        will also be included in this tensor if you explicitly captured layer -1.
+
+        Note that if you set layers to capture to {-1}, aux_hidden_states won't exist.
         """
         if self.eagle3_layers_to_capture is None:
             return 4
-        return len(self.eagle3_layers_to_capture)
+        return len(self.eagle3_layers_to_capture) + int(
+            -1 not in self.eagle3_layers_to_capture)
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
