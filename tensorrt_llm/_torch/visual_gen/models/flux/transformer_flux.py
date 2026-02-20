@@ -243,30 +243,6 @@ def _gelu_tanh_eager(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
-def _make_ffn(
-    dim: int,
-    mult: float = 4.0,
-    bias: bool = True,
-    config: Optional["DiffusionModelConfig"] = None,
-    layer_idx: int = 0,
-) -> MLP:
-    """Create an MLP feed-forward network using the shared TRT-LLM MLP module.
-
-    HF checkpoint key remapping in load_weights() translates HF names
-    (net.0.proj.*, net.2.*) to MLP attribute names (up_proj.*, down_proj.*).
-    """
-    return MLP(
-        hidden_size=dim,
-        intermediate_size=int(dim * mult),
-        bias=bias,
-        activation=_gelu_tanh_eager,
-        dtype=config.torch_dtype if config else None,
-        config=config,
-        layer_idx=layer_idx,
-        reduce_output=False,
-    )
-
-
 class FluxTransformerBlock(nn.Module):
     """Dual-stream transformer block for FLUX.
 
@@ -338,8 +314,27 @@ class FluxTransformerBlock(nn.Module):
         )
 
         # FFN layers (shared TRT-LLM MLP module)
-        self.ff = _make_ffn(dim=dim, config=config, layer_idx=layer_idx)
-        self.ff_context = _make_ffn(dim=dim, config=config, layer_idx=layer_idx)
+        # HF key remapping (net.0.proj.* → up_proj.*, net.2.* → down_proj.*) in load_weights()
+        self.ff = MLP(
+            hidden_size=dim,
+            intermediate_size=int(dim * 4.0),
+            bias=True,
+            activation=_gelu_tanh_eager,
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
+            reduce_output=False,
+        )
+        self.ff_context = MLP(
+            hidden_size=dim,
+            intermediate_size=int(dim * 4.0),
+            bias=True,
+            activation=_gelu_tanh_eager,
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
+            reduce_output=False,
+        )
 
     def forward(
         self,

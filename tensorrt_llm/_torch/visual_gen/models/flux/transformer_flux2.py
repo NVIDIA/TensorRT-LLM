@@ -188,32 +188,6 @@ class Flux2Modulation(nn.Module):
 # =============================================================================
 
 
-def _make_ffn(
-    dim: int,
-    mult: float = 3.0,
-    bias: bool = False,
-    config: Optional["DiffusionModelConfig"] = None,
-    layer_idx: int = 0,
-) -> GatedMLP:
-    """Create a GatedMLP feed-forward network for FLUX.2.
-
-    Reuses the shared TRT-LLM GatedMLP module (same as LLM models) which provides
-    SwiGLU activation, TP sharding, and FP8 fused activation support.
-
-    HF checkpoint key remapping in load_weights() translates HF names
-    (linear_in.*, linear_out.*) to GatedMLP attribute names (gate_up_proj.*, down_proj.*).
-    """
-    return GatedMLP(
-        hidden_size=dim,
-        intermediate_size=int(dim * mult),
-        bias=bias,
-        dtype=config.torch_dtype if config else None,
-        config=config,
-        layer_idx=layer_idx,
-        reduce_output=False,
-    )
-
-
 # =============================================================================
 # Transformer Blocks
 # =============================================================================
@@ -264,10 +238,25 @@ class Flux2TransformerBlock(nn.Module):
         )
 
         # FFN for image stream (shared GatedMLP from _torch/modules)
-        self.ff = _make_ffn(dim=dim, mult=mlp_ratio, bias=bias, config=config, layer_idx=layer_idx)
+        # HF key remapping (linear_in.* → gate_up_proj.*, linear_out.* → down_proj.*) in load_weights()
+        self.ff = GatedMLP(
+            hidden_size=dim,
+            intermediate_size=int(dim * mlp_ratio),
+            bias=bias,
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
+            reduce_output=False,
+        )
         # FFN for text stream
-        self.ff_context = _make_ffn(
-            dim=dim, mult=mlp_ratio, bias=bias, config=config, layer_idx=layer_idx
+        self.ff_context = GatedMLP(
+            hidden_size=dim,
+            intermediate_size=int(dim * mlp_ratio),
+            bias=bias,
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
+            reduce_output=False,
         )
 
     def forward(
