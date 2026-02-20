@@ -202,12 +202,10 @@ class DynamicLinearWeightLoader:
         quant_algo: Optional[QuantAlgo],
         name: str,
     ) -> bool:
-        """Check if this is a fused weight that needs NVFP4 dynamic quantization."""
         if len(weight_dicts) <= 1:
             return False
         if quant_algo != QuantAlgo.NVFP4:
             return False
-        # Check if any weight needs dynamic quantization
         return any(self._should_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts)
 
     def _quantize_fused_nvfp4(
