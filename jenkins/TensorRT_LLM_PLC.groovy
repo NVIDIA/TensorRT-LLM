@@ -106,7 +106,7 @@ def getPulseToken() {
         // will expose the auth_header without being masked
         token= sh(script: '''
             AUTH_HEADER=$(echo -n $SF_CLIENT_ID:$SF_CLIENT_SECRET | base64 -w0)
-            curl -s --request POST --header \"Authorization: Basic $AUTH_HEADER\" --header \"Content-Type: application/x-www-form-urlencoded\" \"https://4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i.ssa.nvidia.com/token?grant_type=client_credentials&scope=verify:nspectid%20sourcecode:blackduck%20update:report\" | jq \".access_token\" |  tr -d '\"'
+            curl -s --request POST --header "Authorization: Basic $AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i.ssa.nvidia.com/token?grant_type=client_credentials&scope=verify:nspectid%20sourcecode:blackduck%20update:report" | jq ".access_token" |  tr -d '"'
         ''', returnStdout: true).trim()
     }
     return token
@@ -191,12 +191,16 @@ def pulseScan(llmRepo, branchName) {
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
                         "PULSE_REPO_URL=${llmRepo}",
-                        "PULSE_REPO_BRANCH=${branchName}",
+                        "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : branchName}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
                         "PULSE_SCAN_PROJECT_VERSION=${branchName.replace("release/", "")}",
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
                     ]) {
-                        sh 'pulse scan --no-fail --sbom --override .'
+                        if (params.repoUrlKey == "github_fork") {
+                            sh 'pulse scan --no-fail --sbom .'
+                        } else {
+                            sh 'pulse scan --no-fail --sbom --override .'
+                        }
                     }
                   }
             }
