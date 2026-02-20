@@ -218,8 +218,12 @@ def _response_format_to_guided_decoding_params(
             raise ValueError(
                 f"response_format.json_schema is required for response_format.type == {response_format.type!r}, but got None."
             )
-        guided_decoding_params = GuidedDecodingParams(
-            json=response_format.json_schema)
+        # OpenAI API spec wraps the actual JSON schema under a "schema" key.
+        # Extract the actual schema if the wrapper format is used.
+        json_schema = response_format.json_schema
+        if isinstance(json_schema, dict) and "schema" in json_schema:
+            json_schema = json_schema["schema"]
+        guided_decoding_params = GuidedDecodingParams(json=json_schema)
     elif response_format.type == "json_object":
         guided_decoding_params = GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
