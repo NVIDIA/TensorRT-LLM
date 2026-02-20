@@ -1150,6 +1150,13 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
+            if not isinstance(shared_output, torch.Tensor):
+                final_hidden_states = shared_output + routed_output
+                if not self.use_dp and self.mapping.tp_size > 1:
+                    final_hidden_states = self.allreduce(
+                        final_hidden_states,
+                        all_reduce_params=final_all_reduce_params)
+                return final_hidden_states
             if not self.use_dp and self.mapping.tp_size > 1:
                 window = self.allreduce.get_nccl_window_for_shape(
                     shared_output.shape,
