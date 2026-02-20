@@ -28,7 +28,7 @@ from .quantization import (
     W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod)
 # isort: on
-from .routing import BaseMoeRoutingMethod
+from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
 
 class CutlassFusedMoE(MoE):
@@ -594,6 +594,15 @@ class CutlassFusedMoE(MoE):
         if enable_alltoall is None:
             enable_alltoall = self.enable_alltoall
 
+        if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
+            n_group = self.routing_method.routing_impl.n_group
+            topk_group = self.routing_method.routing_impl.topk_group
+            routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
+        else:
+            n_group = None
+            topk_group = None
+            routed_scaling_factor = None
+
         result = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
@@ -626,6 +635,10 @@ class CutlassFusedMoE(MoE):
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
             activation_type=self.activation_type,
+            routing_method_type=self.routing_method.routing_method_type,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
         )
