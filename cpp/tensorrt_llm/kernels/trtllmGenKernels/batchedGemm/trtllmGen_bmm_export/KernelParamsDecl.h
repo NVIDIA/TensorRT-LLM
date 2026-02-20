@@ -230,7 +230,7 @@ struct KernelParams
 
     // The pre-activation scaling factor (typically dequantA * dequantB) for non-gated non-linear
     // activation.
-    // Only used when non-linear activation is applied (e.g., GELU, Relu2).
+    // Only used when non-linear activation is applied (e.g., GELU, Relu2, Silu).
     // When used, scaleC should be quantScaleC only, and this scale is applied before the
     // activation. Shape is [B].
     float const* ptrScaleAct{nullptr};

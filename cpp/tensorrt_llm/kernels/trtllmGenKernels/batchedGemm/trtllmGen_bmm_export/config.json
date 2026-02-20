@@ -205,7 +205,8 @@
             "fusedAct,act,eltwiseActType": [
                 [true, "swiglu", "none"],
                 [true, "geglu", "none"],
-                [false, "swiglu", "relu2"]
+                [false, "swiglu", "relu2"],
+                [false, "swiglu", "silu"]
             ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
@@ -230,7 +231,8 @@
             "routeSfsAct": "tma",
             "fusedAct,act,eltwiseActType": [
                 [true, "geglu", "none"],
-                [false, "none", "relu2"]
+                [false, "none", "relu2"],
+                [false, "none", "silu"]
             ],
             "sfLayoutA": "128x4",
             "sfLayoutB": "linear",
@@ -254,7 +256,8 @@
             "fusedAct,act,eltwiseActType": [
                 [true, "swiglu", "none"],
                 [true, "geglu", "none"],
-                [false, "none", "relu2"]
+                [false, "none", "relu2"],
+                [false, "none", "silu"]
             ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
@@ -275,7 +278,8 @@
             "fusedAct,act,eltwiseActType": [
                 [true, "swiglu", "none"],
                 [true, "geglu", "none"],
-                [false, "none", "relu2"]
+                [false, "none", "relu2"],
+                [false, "none", "silu"]
             ],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": false,
@@ -409,7 +413,8 @@
             "routeAct": "tma",
             "fusedAct,eltwiseActType": [
                 [true, "none"],
-                [false, "relu2"]
+                [false, "relu2"],
+                [false, "silu"]
             ],
             "usePerTokenSfB": true,
             "useUnrollLoop2xForMma": [true, false],
@@ -431,7 +436,8 @@
             "routeAct": "tma",
             "fusedAct,eltwiseActType": [
                 [true, "none"],
-                [false, "relu2"]
+                [false, "relu2"],
+                [false, "silu"]
             ],
             "usePerTokenSfB": true,
             "numRegsPerThreadNonEpilogueWarp": 56,
