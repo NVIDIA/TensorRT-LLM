@@ -145,10 +145,30 @@ class Flux2Pipeline(BasePipeline):
             return next(self.transformer.parameters()).device
         return torch.device("cuda:0")
 
+    @property
+    def common_warmup_shapes(self) -> list:
+        """Return list of common warmup shapes (height, width, num_frames)."""
+        return [(1024, 1024, 1)]
+
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
         logger.info("Creating FLUX.2 transformer with quantization support...")
         self.transformer = Flux2Transformer2DModel(model_config=self.model_config)
+
+    def _run_warmup(self, warmup_steps: int) -> None:
+        """Run warmup inference to trigger torch.compile and CUDA init."""
+        for height, width, _ in self.common_warmup_shapes:
+            logger.info(f"Warmup: FLUX.2 {height}x{width}, {warmup_steps} steps")
+            with torch.no_grad():
+                self.forward(
+                    prompt="warmup",
+                    height=height,
+                    width=width,
+                    num_inference_steps=warmup_steps,
+                    guidance_scale=3.5,
+                    seed=0,
+                    max_sequence_length=512,
+                )
 
     def _detect_text_encoder_type(self, checkpoint_dir: str) -> str:
         """Detect text encoder class from model_index.json."""
