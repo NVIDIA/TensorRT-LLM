@@ -175,6 +175,8 @@ class Eagle3DecoderLayer(DecoderLayer):
                                     and not is_first_layer) or eagle_config.get(
                                         "eh_proj_before_attn", False)
 
+        self._use_mla = use_mla
+
         # Select attention type based on config
         if use_mla:
             self.self_attn = Eagle3MLAttention(
@@ -236,11 +238,19 @@ class Eagle3DecoderLayer(DecoderLayer):
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
-        hidden_states = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-        )
+        if self._use_mla:
+            hidden_states, residual = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+            )
+        else:
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+            )
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
