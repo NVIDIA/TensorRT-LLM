@@ -745,6 +745,11 @@ class PyTorchModelEngine(ModelEngine):
                 )
                 return
 
+        # Create AutoTuner singleton in eager context before any compiled forward.
+        # Otherwise the first get() can happen inside torch.compile tracing and
+        # trigger non-traceable code (time.time(), torch.cuda.*) in the cache.
+        AutoTuner.get()
+
         can_run_general_warmup = (
             not self.is_draft_model and not self.mapping.has_cp_helix()
             and self.guided_decoder is None
@@ -765,7 +770,6 @@ class PyTorchModelEngine(ModelEngine):
                 # Memory pool will be warmed up later.
                 gc.collect()
                 torch.cuda.empty_cache()
-
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
