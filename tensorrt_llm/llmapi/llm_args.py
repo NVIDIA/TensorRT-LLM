@@ -498,6 +498,8 @@ class CpConfig(StrictBaseModel):
     """
     Configuration for context parallelism.
     """
+    # TODO: given that multiple fields here are only used with specific cp_types, consider
+    # making this a Pydantic discriminated union.
     cp_type: CpType = Field(default=CpType.ULYSSES,
                             description="Context parallel type.")
     tokens_per_block: Optional[int] = Field(
@@ -507,6 +509,11 @@ class CpConfig(StrictBaseModel):
         default=None,
         description=
         "Whether to use NCCL for alltoall communication. Used in HELIX parallelism. Defaults to True."
+    )
+    fifo_version: Optional[int] = Field(
+        default=None,
+        description=
+        "FIFO version for alltoall communication. Used in HELIX parallelism. Defaults to 2."
     )
     cp_anchor_size: Optional[int] = Field(
         default=None, description="Anchor size for STAR attention.")
@@ -586,7 +593,8 @@ class _ParallelConfig(StrictBaseModel):
             pp_partition=self.pp_partition,
             cp_size=self.cp_size,
             # TODO: Mapping still uses cp_config as a dict; migrate to CpConfig
-            cp_config=self.cp_config.model_dump() if self.cp_config else {},
+            cp_config=self.cp_config.model_dump(
+                exclude_none=True) if self.cp_config else {},
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
             moe_cluster_size=self.moe_cluster_size,
