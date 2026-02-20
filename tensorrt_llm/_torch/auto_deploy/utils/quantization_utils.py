@@ -107,11 +107,30 @@ def get_quantization_from_linear_node(node: torch.fx.node.Node):
     return ""
 
 
+def _pattern_matches(modname: str, pattern: str) -> bool:
+    """Check if a pattern matches the module name.
+
+    Supports both:
+    - Glob patterns (with * or ?): use fnmatch
+    - Simple strings (no wildcards): use substring matching (HF style)
+    """
+    # If pattern contains wildcards, use fnmatch
+    if "*" in pattern or "?" in pattern:
+        return fnmatch(modname, pattern)
+    # Otherwise, use substring matching (HF modules_to_not_convert style)
+    # Check if pattern appears as a component in the module path
+    return pattern in modname.split(".")
+
+
 def should_skip_quantization(
     node_or_name: Union[Node, str],
     excluded_patterns: list[str],
 ) -> bool:
-    """Check if a node or parameter name should be skipped based on excluded patterns."""
+    """Check if a node or parameter name should be skipped based on excluded patterns.
+
+    Supports both glob patterns (e.g., "*gate*") and simple substring patterns
+    (e.g., "gate" matches "model.layers.0.block_sparse_moe.gate").
+    """
     if isinstance(node_or_name, str):
         modname, _, _ = node_or_name.rpartition(".")
     else:
@@ -120,7 +139,7 @@ def should_skip_quantization(
         weight_name = extract_weight_name(node_or_name)
         modname = weight_name.rpartition(".")[0]
 
-    return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
+    return any(_pattern_matches(modname, pattern) for pattern in excluded_patterns)
 
 
 def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Optional[Node]]:

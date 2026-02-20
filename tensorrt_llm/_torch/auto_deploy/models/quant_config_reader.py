@@ -149,6 +149,7 @@ class HFQuantConfigReader(QuantConfigReader):
     """
 
     _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens")
+    _SUPPORTED_QUANT_METHODS = ("mxfp4", "gptq", "fp8")
 
     def __init__(self):
         super().__init__()
@@ -188,7 +189,7 @@ class HFQuantConfigReader(QuantConfigReader):
         # TODO(Fridah-nv):this class is only verified with GPT-OSS MXFP4 and INT4-GPTQ, other hf quantizers
         # should have similar workflow and will be added to the pipeline
         quant_method = str(qconf.get("quant_method", "")).lower()
-        if quant_method not in ["mxfp4", "gptq"]:
+        if quant_method not in cls._SUPPORTED_QUANT_METHODS:
             return None
 
         # Validate GPTQ config: currently only INT4 with group_size=128 is supported

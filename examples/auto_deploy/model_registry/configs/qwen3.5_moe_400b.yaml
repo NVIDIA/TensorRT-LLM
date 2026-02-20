@@ -1,18 +1,23 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
-max_seq_len: 2048
-max_num_tokens: 2048
-max_batch_size: 512
-cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+max_seq_len: 262144
+max_num_tokens: 4096
+max_batch_size: 32
+cuda_graph_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
 world_size: 8
 enable_chunked_prefill: true
 model_factory: AutoModelForCausalLM
 kv_cache_config:
-  enable_block_reuse: false
-  free_gpu_memory_fraction: 0.95
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
   tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
 transforms:
   export_to_gm:
     num_moe_experts_for_export: 2
+  detect_sharding:
+    allreduce_strategy: SYMM_MEM
+  multi_stream_moe:
+    stage: compile
+    enabled: true

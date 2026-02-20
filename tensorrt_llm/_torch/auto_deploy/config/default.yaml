@@ -55,6 +55,8 @@ transforms:
     run_shape_prop: true
   match_l2norm_pattern:
     stage: pattern_matcher
+  match_moe_routing_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -72,6 +74,10 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_linear_from_config:
     stage: pattern_matcher
+  quantize_finegrained_fp8_linear_from_config:
+    stage: pattern_matcher
+  quantize_finegrained_fp8_moe:
+    stage: pattern_matcher
   quantize_fp8_bmm_from_config:
     stage: pattern_matcher
   quantize_fp8_from_graph:
@@ -85,11 +91,15 @@ transforms:
   # proceeds normally.
   match_swiglu_pattern:
     stage: pattern_matcher
-    enabled: false
+    enabled: true
   match_nvfp4_swiglu_pattern:
     stage: pattern_matcher
     requires_shape_prop: true
-    enabled: false
+    enabled: true
+  match_finegrained_fp8_swiglu_pattern:
+    stage: pattern_matcher
+    requires_shape_prop: true
+    enabled: true
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
@@ -144,6 +154,11 @@ transforms:
     backend: trtllm
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
+  fuse_finegrained_fp8_swiglu:
+    stage: post_load_fusion
+  fuse_finegrained_fp8_linear:
+    stage: post_load_fusion
+    backend: trtllm
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -152,6 +167,10 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     backend: trtllm
+    allow_different_input_scales: false
+  fuse_finegrained_fp8_moe:
+    stage: post_load_fusion
+    expect_mem_change: true
     allow_different_input_scales: false
   fuse_nvfp4_moe:
     stage: post_load_fusion
