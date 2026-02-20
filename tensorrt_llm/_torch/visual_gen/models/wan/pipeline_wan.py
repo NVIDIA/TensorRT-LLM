@@ -13,6 +13,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from .transformer_wan import WanTransformer3DModel
@@ -104,6 +105,11 @@ class WanPipeline(BasePipeline):
         if self.transformer_2 is not None:
             return ["transformer", "transformer_2"]
         return ["transformer"]
+
+    @property
+    def common_warmup_shapes(self) -> list:
+        """Return list of common warmup shapes for the pipeline."""
+        return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
@@ -241,6 +247,32 @@ class WanPipeline(BasePipeline):
             # Save transformer_2 backend
             self.transformer_2_cache_backend = self.cache_backend
 
+    def _run_warmup(self, warmup_steps: int) -> None:
+        """Run warmup inference to trigger torch.compile and CUDA init.
+
+        Runs warmup inference with common shapes for Wan models.
+        """
+
+        if self.is_wan22:
+            # Double warmup steps to also warmup the 2nd transformer
+            warmup_steps = warmup_steps * 2
+
+        for height, width, num_frames in self.common_warmup_shapes:
+            logger.info(f"Warmup: Wan {height}x{width}, {num_frames} frames {warmup_steps} steps")
+
+            with torch.no_grad():
+                self.forward(
+                    prompt="warmup",
+                    negative_prompt="",
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    num_inference_steps=warmup_steps,
+                    guidance_scale=5.0,
+                    seed=0,
+                    max_sequence_length=512,  # should match DiffusionRequest.max_sequence_length
+                )
+
     def infer(self, req):
         """Run inference with request parameters."""
         return self.forward(
@@ -257,6 +289,7 @@ class WanPipeline(BasePipeline):
             max_sequence_length=req.max_sequence_length,
         )
 
+    @nvtx_range("WanPipeline.forward")
     @torch.no_grad()
     def forward(
         self,
@@ -324,7 +357,7 @@ class WanPipeline(BasePipeline):
 
         # Prepare Latents
         latents = self._prepare_latents(height, width, num_frames, generator)
-        logger.info(f"Latents shape: {latents.shape}")
+        logger.debug(f"Latents shape: {latents.shape}")
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
@@ -431,6 +464,7 @@ class WanPipeline(BasePipeline):
 
         return MediaOutput(video=video)
 
+    @nvtx_range("_encode_prompt", color="blue")
     def _encode_prompt(self, prompt, negative_prompt, max_sequence_length):
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
@@ -478,6 +512,7 @@ class WanPipeline(BasePipeline):
 
         return prompt_embeds, neg_embeds
 
+    @nvtx_range("_prepare_latents", color="blue")
     def _prepare_latents(self, height, width, num_frames, generator):
         num_channels_latents = 16
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
@@ -491,6 +526,7 @@ class WanPipeline(BasePipeline):
         )
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
+    @nvtx_range("_decode_latents", color="blue")
     def _decode_latents(self, latents):
         latents = latents.to(self.vae.dtype)
 
