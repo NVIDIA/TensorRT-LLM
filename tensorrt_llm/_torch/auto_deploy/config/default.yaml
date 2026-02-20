@@ -159,6 +159,7 @@ transforms:
     allow_different_input_scales: false
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
+    requires_shape_prop: true
   fuse_rmsnorm:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer
