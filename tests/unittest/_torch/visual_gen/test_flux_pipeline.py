@@ -14,6 +14,7 @@ Tests cover:
 
 import gc
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -24,9 +25,29 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionArgs, PipelineConfig
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
+
+def _llm_models_root() -> str:
+    """Return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path."""
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ["LLM_MODELS_ROOT"])
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+    assert root.exists(), (
+        "You shall set LLM_MODELS_ROOT env or be able to access scratch.trt_llm_data to run this test"
+    )
+    return str(root)
+
+
 # Checkpoint paths for integration tests
-FLUX1_CHECKPOINT_PATH = os.environ.get("FLUX1_MODEL_PATH", "black-forest-labs/FLUX.1-dev")
-FLUX2_CHECKPOINT_PATH = os.environ.get("FLUX2_MODEL_PATH", "black-forest-labs/FLUX.2-dev")
+FLUX1_CHECKPOINT_PATH = os.environ.get(
+    "FLUX1_MODEL_PATH",
+    os.path.join(_llm_models_root(), "FLUX.1-dev"),
+)
+FLUX2_CHECKPOINT_PATH = os.environ.get(
+    "FLUX2_MODEL_PATH",
+    os.path.join(_llm_models_root(), "FLUX.2-dev"),
+)
 SKIP_COMPONENTS = ["text_encoder", "text_encoder_2", "vae", "tokenizer", "tokenizer_2", "scheduler"]
 
 
@@ -101,26 +122,22 @@ def _find_first_quantizable_linear(transformer):
 @pytest.fixture
 def flux1_checkpoint_exists():
     """Check if FLUX.1 checkpoint is available locally."""
-    path = FLUX1_CHECKPOINT_PATH
-    if not path:
-        pytest.skip("FLUX1_MODEL_PATH not set")
-    if not path.startswith("/"):
-        pytest.skip(f"FLUX1_MODEL_PATH must be a local path (got HF model ID: {path})")
-    if not os.path.exists(path):
-        pytest.skip(f"FLUX.1 checkpoint not found at {path}")
+    if not FLUX1_CHECKPOINT_PATH or not os.path.exists(FLUX1_CHECKPOINT_PATH):
+        pytest.skip(
+            f"FLUX.1 checkpoint not found at {FLUX1_CHECKPOINT_PATH}. "
+            "Set FLUX1_MODEL_PATH or stage checkpoint under LLM_MODELS_ROOT."
+        )
     return True
 
 
 @pytest.fixture
 def flux2_checkpoint_exists():
     """Check if FLUX.2 checkpoint is available locally."""
-    path = FLUX2_CHECKPOINT_PATH
-    if not path:
-        pytest.skip("FLUX2_MODEL_PATH not set")
-    if not path.startswith("/"):
-        pytest.skip(f"FLUX2_MODEL_PATH must be a local path (got HF model ID: {path})")
-    if not os.path.exists(path):
-        pytest.skip(f"FLUX.2 checkpoint not found at {path}")
+    if not FLUX2_CHECKPOINT_PATH or not os.path.exists(FLUX2_CHECKPOINT_PATH):
+        pytest.skip(
+            f"FLUX.2 checkpoint not found at {FLUX2_CHECKPOINT_PATH}. "
+            "Set FLUX2_MODEL_PATH or stage checkpoint under LLM_MODELS_ROOT."
+        )
     return True
 
 
