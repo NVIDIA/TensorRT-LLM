@@ -50,7 +50,7 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
     // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
     // distributed among CP ranks. So, we transfer all blocks from send side.
-    // TODO(tabrizian): Remove the condition on the PP size once disagg support from KVCache reuse
+    // TODO: Remove the condition on the PP size once disagg support from KVCache reuse
     // path is fixed.
     if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || !cacheManager->isEnablePartialReuse()
         || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
@@ -96,7 +96,7 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
     // Note: When recv side has CP, we request all blocks from send side right now.
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
-    // TODO(tabrizian): Remove the condition on the PP size once disagg support from KVCache reuse
+    // TODO: Remove the condition on the PP size once disagg support from KVCache reuse
     // path is fixed.
     if (poolNum == 1 && srcEnableBlockReuse && srcEnablePartialReuse && !recvSideHasCP && srcPpSize == 1)
     {
