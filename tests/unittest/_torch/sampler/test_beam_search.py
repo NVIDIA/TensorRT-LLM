@@ -81,14 +81,17 @@ def with_cuda_graph_and_overlap(request):
 
 
 def _build_llm(fixed_params, input_prompts, llm_kwargs):
+    if "max_batch_size" not in llm_kwargs:
+        llm_kwargs = llm_kwargs | dict(
+            max_batch_size=fixed_params["max_beam_width"] * len(
+                input_prompts
+            ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
+        )
     return LLM(
         **llm_kwargs,
         kv_cache_config=KvCacheConfig(
             max_tokens=10000,  # type: ignore
         ),
-        max_batch_size=fixed_params["max_beam_width"] * len(
-            input_prompts
-        ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
         max_seq_len=32,
         max_beam_width=fixed_params["max_beam_width"],
     )
@@ -904,6 +907,16 @@ class TestParameterValidation:
     def fixed_params():
         return {"max_tokens": 8, "max_beam_width": 4}
 
+    @pytest.fixture(scope="module", params=[1, 4])
+    @staticmethod
+    def batch_size(request) -> int:
+        return request.param
+
+    @pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
+    @staticmethod
+    def sampler_type(request) -> str:
+        return request.param
+
     @pytest.fixture(scope="module")
     @staticmethod
     def model_kwargs() -> dict[str, Any]:
@@ -915,8 +928,17 @@ class TestParameterValidation:
     # NB: Class-level fixture overrides do not work without this
     @pytest.fixture(scope="module")
     @staticmethod
-    def llm(fixed_params, input_prompts, model_kwargs):
-        return _build_llm(fixed_params, input_prompts, model_kwargs)
+    def llm(fixed_params, input_prompts, model_kwargs, batch_size: int,
+            sampler_type: str):
+        return _build_llm(
+            fixed_params,
+            input_prompts,
+            (model_kwargs
+             | dict(
+                 max_batch_size=batch_size,
+                 sampler_type=sampler_type,
+             )),
+        )
 
     def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
                                fixed_params: dict):
@@ -936,7 +958,13 @@ class TestParameterValidation:
         llm: LLM,
         input_prompts: list[str],
         fixed_params: dict,
+        batch_size: int,
+        sampler_type: str,
     ):
+        if batch_size == 1:
+            pytest.skip("Test does not depend on batch size")
+        if sampler_type == "TorchSampler":
+            pytest.skip("Test does not depend on sampler_type")
         assert fixed_params["max_beam_width"] > 2
         with pytest.raises(
                 ValueError,
@@ -955,12 +983,13 @@ class TestParameterValidation:
 
     @pytest.mark.timeout(120)
     @pytest.mark.threadleak(enabled=False)
-    def test_use_beam_search_ommitted(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict,
-    ):
+    def test_use_beam_search_ommitted(self, llm: LLM, input_prompts: list[str],
+                                      fixed_params: dict, batch_size: int,
+                                      sampler_type: str):
+        if batch_size == 1:
+            pytest.skip("Test does not depend on batch size")
+        if sampler_type == "TorchSampler":
+            pytest.skip("Test does not depend on sampler_type")
         assert fixed_params["max_beam_width"] > 2
         with pytest.raises(
                 ValueError,
@@ -983,11 +1012,17 @@ class TestParameterValidation:
         llm: LLM,
         input_prompts: list[str],
         fixed_params: dict,
+        batch_size: int,
+        sampler_type: str,
     ):
+        if batch_size == 1:
+            pytest.skip("Test does not depend on batch size")
+        if sampler_type == "TorchSampler":
+            pytest.skip("Test does not depend on sampler_type")
         assert fixed_params["max_beam_width"] > 2
         with pytest.raises(
                 RequestError,
-                match=".*Request beam width 2 is not equal to max_beam_width 4*"
+                match=".*Request beam width 2 is not equal to max_beam_width 4.*"
         ):
             _ = llm.generate(input_prompts,
                              sampling_params=SamplingParams(
@@ -997,6 +1032,92 @@ class TestParameterValidation:
                                  use_beam_search=True,
                                  end_id=-1,
                              ))
+        self._check_engine_responds(llm, input_prompts, fixed_params)
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.threadleak(enabled=False)
+    def test_logprobs_trtllm_sampler(
+        self,
+        llm: LLM,
+        input_prompts: list[str],
+        fixed_params: dict,
+        batch_size: int,
+        sampler_type: str,
+    ):
+        if sampler_type != "TRTLLMSampler":
+            pytest.skip("Test is specific to TRTLLMSampler")
+
+        with pytest.raises(
+                RequestError,
+                match=
+                ".*Beam search only supports logprobs when batch size is 1.*"
+        ) if batch_size > 1 else nullcontext():
+            _ = llm.generate(input_prompts,
+                             sampling_params=SamplingParams(
+                                 max_tokens=fixed_params["max_tokens"],
+                                 n=1,
+                                 best_of=fixed_params["max_beam_width"],
+                                 use_beam_search=True,
+                                 end_id=-1,
+                                 logprobs=1,
+                             ))
+        self._check_engine_responds(llm, input_prompts, fixed_params)
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.threadleak(enabled=False)
+    def test_logprobs_torch_sampler(
+        self,
+        llm: LLM,
+        input_prompts: list[str],
+        fixed_params: dict,
+        batch_size: int,
+        sampler_type: str,
+    ):
+        if sampler_type != "TorchSampler":
+            pytest.skip("Test is specific to TorchSampler")
+        if batch_size == 1:
+            pytest.skip("Test does not depend on batch size")
+
+        _ = llm.generate(input_prompts,
+                         sampling_params=SamplingParams(
+                             max_tokens=fixed_params["max_tokens"],
+                             n=1,
+                             best_of=fixed_params["max_beam_width"],
+                             use_beam_search=True,
+                             end_id=-1,
+                             logprobs=0,
+                         ))
+
+        with pytest.raises(
+                RequestError,
+                match=
+                ".*Beam search only supports returning the sampled logprob per token.*"
+        ):
+            _ = llm.generate(input_prompts,
+                             sampling_params=SamplingParams(
+                                 max_tokens=fixed_params["max_tokens"],
+                                 n=1,
+                                 best_of=fixed_params["max_beam_width"],
+                                 use_beam_search=True,
+                                 end_id=-1,
+                                 logprobs=1,
+                             ))
+
+        with pytest.raises(
+                RequestError,
+                match=
+                ".*Beam search does not support returning multiple logprobs per request.*"
+        ):
+            _ = llm.generate(input_prompts,
+                             sampling_params=SamplingParams(
+                                 max_tokens=fixed_params["max_tokens"],
+                                 n=1,
+                                 best_of=fixed_params["max_beam_width"],
+                                 use_beam_search=True,
+                                 end_id=-1,
+                                 logprobs=2,
+                             ))
+
         self._check_engine_responds(llm, input_prompts, fixed_params)
 
 
