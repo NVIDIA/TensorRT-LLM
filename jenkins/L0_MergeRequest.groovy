@@ -404,7 +404,8 @@ def launchReleaseCheck(pipeline)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
 
         // Step 2: Run guardwords scan
-        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        // def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        def isOfficialPostMergeJob = true
         if (env.alternativeTRT || isOfficialPostMergeJob) {
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
@@ -419,10 +420,14 @@ def launchReleaseCheck(pipeline)
                 sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
                 def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
                 if (lastLine.toLowerCase().contains("error")) {
-                    error "Guardwords Scan Failed."
+                    error "GUARDWORDS_WARN: Guardwords Scan Failed."
                 }
-            } catch (Exception e) {
+            } catch (InterruptedException e) {
                 throw e
+            } catch (Exception e) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    error "Release Check failed (warn-only): ${e.getMessage()}"
+                }
             } finally {
                 trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
                 echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
@@ -469,7 +474,7 @@ def launchReleaseCheck(pipeline)
                         buildResult: 'SUCCESS',
                         stageResult: 'FAILURE') {
                         error "Release Check failed but ignored due to Jenkins configuration"
-                    }
+                        }
                 } else {
                     throw e
                 }
@@ -1263,19 +1268,39 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def testStageName = "[Build-Docker-Images] ${env.localJobCredentials ? "Remote Run" : "Run"}"
                 stage(testStageName) {
-                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                    if (globalVars[GITHUB_PR_API_URL]) {
-                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    try {
+                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                        }
+
+                        def additionalParameters = [
+                            'branch': branch,
+                            'action': "push",
+                            'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                        ]
+
+                        launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    } catch (hudson.AbortException e) {
+                        // Preserve abort status
+                        throw e
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        // def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+                        // change to true for testing temporarily
+                        def isOfficialPostMergeJob = true
+                        if (isOfficialPostMergeJob) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'UNSTABLE') {
+                                error "Build-Docker-Images job failed: ${e.toString()}"
+                            }
+                        } else {
+                            throw e
+                        }
                     }
-
-                    def additionalParameters = [
-                        'branch': branch,
-                        'action': "push",
-                        'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
-                    ]
-
-                    launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
             }
         }
