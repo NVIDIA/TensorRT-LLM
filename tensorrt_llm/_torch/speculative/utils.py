@@ -1,5 +1,6 @@
+from bisect import bisect_left
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -284,3 +285,45 @@ class SpecDecodingTensor:
     position_offsets: torch.Tensor
     packed_mask: torch.Tensor
     generation_lengths: Optional[torch.Tensor] = None
+
+
+def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
+                                 batch_size: int, max_draft_len: int) -> int:
+    """
+    Get the appropriate draft length for the given batch size using binary search.
+
+    This is a standalone function that can be used by both the drafter (two-model path)
+    and the model engine / spec workers (one-model path).
+
+    New semantics: Keys represent specific batch sizes (transition points).
+    Values represent draft_len to use for batch sizes UP TO that key.
+
+    Args:
+        draft_len_schedule: Mapping from batch size thresholds to draft lengths.
+                            Example: {4: 4, 8: 2, 32: 1} means:
+                            - batch size 1-4:   use draft_len=4 (up to key 4)
+                            - batch size 5-8:   use draft_len=2 (up to key 8)
+                            - batch size 9-32:  use draft_len=1 (up to key 32)
+                            - batch size 33+:   use draft_len=0 (speculation disabled, implicit)
+        batch_size: Current batch size.
+        max_draft_len: Maximum draft length to use if no schedule is provided.
+
+    Returns:
+        The draft length to use for this batch size.
+    """
+    if draft_len_schedule is None:
+        return max_draft_len
+
+    # Binary search to find the first threshold >= batch_size
+    # draft_len_schedule is already sorted by config validator
+    schedule_batch_sizes = list(draft_len_schedule.keys())
+
+    # bisect_left finds where to insert batch_size to keep list sorted
+    # This gives us the index of the first key >= batch_size
+    idx = bisect_left(schedule_batch_sizes, batch_size)
+
+    if idx < len(schedule_batch_sizes):
+        return draft_len_schedule[schedule_batch_sizes[idx]]
+
+    # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
+    return 0

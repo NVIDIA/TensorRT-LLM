@@ -149,11 +149,10 @@ GenericSampleStateTensorsDevice = TypeVar(
 @dataclass(kw_only=True)
 class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTensorsDevice]):
     scheduled_requests: ScheduledRequests
-
     device: Optional[GenericSampleStateTensorsDevice] = None
     host: Optional[GenericSampleStateTensorsHost] = None
-
     sampler_event: Optional[SamplerEvent] = None
+    runtime_draft_len: Optional[int] = None
 
 
 GenericSampleState = TypeVar("GenericSampleState", bound=SampleState)
