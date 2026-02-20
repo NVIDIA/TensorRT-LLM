@@ -3070,6 +3070,12 @@ class TorchLlmArgs(BaseLlmArgs):
         exclude=True,
         status="prototype")
 
+    ray_worker_nsight_options: Optional[dict] = Field(
+        default=None,
+        description="Nsight options.",
+        status="prototype",
+    )
+
     enable_sleep: bool = Field(
         default=False,
         description=
