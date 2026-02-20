@@ -10,6 +10,7 @@ Tests cover:
 - Full transformer E2E numerical correctness
 - Memory usage comparison
 - Attention backend comparison (VANILLA vs TRTLLM)
+- Multi-GPU parallelism (Ulysses sequence parallelism, 2+ GPUs)
 """
 
 import gc
@@ -19,6 +20,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear
@@ -49,6 +52,8 @@ FLUX2_CHECKPOINT_PATH = os.environ.get(
     os.path.join(_llm_models_root(), "FLUX.2-dev"),
 )
 SKIP_COMPONENTS = ["text_encoder", "text_encoder_2", "vae", "tokenizer", "tokenizer_2", "scheduler"]
+# When skip_components includes tokenizer, warmup must be disabled (warmup calls _encode_prompt)
+PIPELINE_NO_WARMUP = PipelineConfig(warmup_steps=0, enable_torch_compile=False)
 
 
 def _get_flux_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -157,6 +162,7 @@ class TestFluxPipelineLoading:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline=PIPELINE_NO_WARMUP,
         )
 
         pipeline = PipelineLoader(args).load()
@@ -178,6 +184,7 @@ class TestFluxPipelineLoading:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline=PIPELINE_NO_WARMUP,
         )
 
         pipeline = PipelineLoader(args).load()
@@ -200,6 +207,7 @@ class TestFluxPipelineLoading:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend=backend),
+            pipeline=PIPELINE_NO_WARMUP,
         )
 
         pipeline = PipelineLoader(args).load()
@@ -229,6 +237,7 @@ class TestFluxQuantization:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline=PIPELINE_NO_WARMUP,
         )
 
         pipeline = PipelineLoader(args).load()
@@ -273,6 +282,7 @@ class TestFluxQuantization:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline=PIPELINE_NO_WARMUP,
         )
 
         pipeline = PipelineLoader(args).load()
@@ -333,6 +343,7 @@ class TestFluxFP8NumericalCorrectness:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline=PIPELINE_NO_WARMUP,
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
 
@@ -344,6 +355,7 @@ class TestFluxFP8NumericalCorrectness:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline=PIPELINE_NO_WARMUP,
         )
         pipeline_fp8 = PipelineLoader(args_fp8).load()
 
@@ -415,6 +427,7 @@ class TestFluxFP8NumericalCorrectness:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline=PIPELINE_NO_WARMUP,
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
         transformer_bf16 = pipeline_bf16.transformer
@@ -427,6 +440,7 @@ class TestFluxFP8NumericalCorrectness:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline=PIPELINE_NO_WARMUP,
         )
         pipeline_fp8 = PipelineLoader(args_fp8).load()
         transformer_fp8 = pipeline_fp8.transformer
@@ -530,6 +544,7 @@ class TestFluxFP8Memory:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline=PIPELINE_NO_WARMUP,
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
 
@@ -551,6 +566,7 @@ class TestFluxFP8Memory:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            pipeline=PIPELINE_NO_WARMUP,
         )
         pipeline_fp8 = PipelineLoader(args_fp8).load()
 
@@ -599,7 +615,7 @@ class TestFluxAttentionBackend:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="VANILLA"),
-            pipeline=PipelineConfig(),
+            pipeline=PIPELINE_NO_WARMUP,
         )
         pipeline_baseline = PipelineLoader(args_baseline).load()
         transformer_baseline = pipeline_baseline.transformer
@@ -623,7 +639,7 @@ class TestFluxAttentionBackend:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="TRTLLM"),
-            pipeline=PipelineConfig(),
+            pipeline=PIPELINE_NO_WARMUP,
         )
         pipeline_trtllm = PipelineLoader(args_trtllm).load()
         transformer_trtllm = pipeline_trtllm.transformer
@@ -785,6 +801,171 @@ class TestFluxE2E:
         assert psnr > 20.0, f"PSNR too low: {psnr:.2f} dB (expected >20 dB)"
 
         del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Multi-GPU Parallelism Tests (Ulysses sequence parallelism)
+# =============================================================================
+
+
+def _setup_distributed(rank, world_size, backend="nccl"):
+    """Initialize distributed process group for multi-GPU tests."""
+    os.environ["TLLM_DISABLE_MPI"] = "1"
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def _cleanup_distributed():
+    """Clean up distributed process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _run_ulysses_worker(rank, world_size, checkpoint_path, inputs_cpu, return_dict):
+    """Worker function for Ulysses multi-GPU test.
+
+    Must be module-level for multiprocessing.spawn() pickling.
+    """
+    try:
+        _setup_distributed(rank, world_size)
+
+        from tensorrt_llm._torch.visual_gen.config import DiffusionArgs, ParallelConfig
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+
+        # Load pipeline with Ulysses parallelism
+        args = DiffusionArgs(
+            checkpoint_path=checkpoint_path,
+            device=f"cuda:{rank}",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+            parallel=ParallelConfig(dit_ulysses_size=world_size),
+            pipeline={"warmup_steps": 0, "enable_torch_compile": False},
+        )
+        pipeline = PipelineLoader(args).load()
+
+        # Load inputs on this GPU
+        inputs = {k: v.to(f"cuda:{rank}") for k, v in inputs_cpu.items()}
+
+        # Run transformer forward
+        with torch.no_grad():
+            output = pipeline.transformer(**inputs)
+
+        sample = _extract_transformer_output(output)
+
+        # Only rank 0 stores the result
+        if rank == 0:
+            return_dict["output"] = sample.cpu()
+            return_dict["shape"] = list(sample.shape)
+
+        del pipeline
+        torch.cuda.empty_cache()
+
+    except Exception as e:
+        return_dict[f"error_{rank}"] = str(e)
+        raise
+    finally:
+        _cleanup_distributed()
+
+
+class TestFluxParallelism:
+    """Ulysses sequence parallelism tests for FLUX (requires 2+ GPUs)."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        torch.cuda.is_available() and torch.cuda.device_count() < 2,
+        reason="Ulysses parallel test requires at least 2 GPUs",
+    )
+    def test_ulysses_2gpu_correctness(self, flux1_checkpoint_exists):
+        """Test Ulysses (ulysses_size=2) correctness against single-GPU baseline.
+
+        Similar pattern to WAN's test_cfg_2gpu_correctness:
+        1. Load single-GPU reference pipeline, run forward
+        2. Spawn 2-GPU Ulysses workers, run same forward
+        3. Compare outputs (PSNR > 30 dB)
+        """
+
+        print("\n" + "=" * 80)
+        print("ULYSSES SEQUENCE PARALLELISM (ulysses_size=2) CORRECTNESS TEST")
+        print("=" * 80)
+
+        # Load single-GPU reference
+        print("\n[1/3] Loading single-GPU reference (ulysses_size=1) on GPU 0...")
+        args_baseline = DiffusionArgs(
+            checkpoint_path=FLUX1_CHECKPOINT_PATH,
+            device="cuda:0",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+            pipeline=PIPELINE_NO_WARMUP,
+        )
+        pipeline_baseline = PipelineLoader(args_baseline).load()
+
+        # Create test inputs (seq_len must be divisible by 2 for Ulysses)
+        print("\n[2/3] Creating test inputs...")
+        inputs = _get_flux_transformer_inputs(
+            pipeline_baseline.transformer, device="cuda:0", dtype=torch.bfloat16
+        )
+
+        # Run single-GPU reference
+        with torch.no_grad():
+            ref_output = pipeline_baseline.transformer(**inputs)
+        ref_sample = _extract_transformer_output(ref_output)
+        print(f"  Reference output shape: {ref_sample.shape}")
+        print(f"  Reference range: [{ref_sample.min():.4f}, {ref_sample.max():.4f}]")
+
+        # Store inputs on CPU for workers
+        inputs_cpu = {k: v.cpu() for k, v in inputs.items()}
+
+        # Cleanup baseline
+        del pipeline_baseline
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch._dynamo.reset()
+
+        # Run Ulysses parallel (2 GPUs)
+        print("\n[3/3] Running Ulysses (ulysses_size=2) across 2 GPUs...")
+        manager = mp.Manager()
+        return_dict = manager.dict()
+
+        mp.spawn(
+            _run_ulysses_worker,
+            args=(2, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
+            nprocs=2,
+            join=True,
+        )
+
+        # Check for errors
+        for i in range(2):
+            assert f"error_{i}" not in return_dict, (
+                f"Rank {i} failed: {return_dict.get(f'error_{i}')}"
+            )
+
+        ulysses_sample = return_dict["output"].to("cuda:0")
+        print(f"  Ulysses output shape: {ulysses_sample.shape}")
+        print(f"  Ulysses range: [{ulysses_sample.min():.4f}, {ulysses_sample.max():.4f}]")
+
+        # Compare outputs
+        assert ref_sample.shape == ulysses_sample.shape, (
+            f"Shape mismatch: ref={ref_sample.shape}, ulysses={ulysses_sample.shape}"
+        )
+
+        mse = ((ref_sample.float() - ulysses_sample.float()) ** 2).mean().item()
+        ref_range = (ref_sample.max() - ref_sample.min()).float().item()
+        psnr = 10 * np.log10(ref_range**2 / mse) if mse > 0 else float("inf")
+
+        print(f"\n  MSE: {mse:.6e}")
+        print(f"  PSNR: {psnr:.2f} dB")
+
+        # Ulysses should be nearly identical (only BF16 rounding from all-to-all)
+        assert psnr > 30.0, f"PSNR too low: {psnr:.2f} dB (expected >30 dB)"
+
+        del ref_sample, ulysses_sample
         gc.collect()
         torch.cuda.empty_cache()
 
