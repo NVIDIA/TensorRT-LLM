@@ -386,7 +386,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
         all_weight_nodes = [
             attr_node
             for n in node.all_input_nodes
-            if (attr_node := find_get_attr_node(n)) is not None
+            if (attr_node := find_get_attr_node(n)) is not None or "_scale" not in attr_node.target
         ]
         # separate weight nodes and bias nodes
         bias_nodes = [n for n in all_weight_nodes if n.target.rsplit(".", 1)[-1] == "bias"]
