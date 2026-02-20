@@ -1,4 +1,3 @@
-import unittest
 from copy import deepcopy
 
 import torch
@@ -94,7 +93,7 @@ COHERE2_SMALL_CONFIG = {
 }
 
 
-class TestCohere2(unittest.TestCase):
+class TestCohere2:
     def get_kv_cache_manager(
         self,
         dtype: torch.dtype,

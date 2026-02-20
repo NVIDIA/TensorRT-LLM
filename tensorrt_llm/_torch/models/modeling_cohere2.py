@@ -20,14 +20,9 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
-
-
-class LayerNorm(nn.LayerNorm):
-    def reset_parameters(self) -> None:
-        # Skip the initialization operations that conflict with MetaInitMode
-        pass
 
 
 class Cohere2MLP(nn.Module):
@@ -37,7 +32,7 @@ class Cohere2MLP(nn.Module):
         """
         config = model_config.pretrained_config
 
-        super(Cohere2MLP, self).__init__()
+        super().__init__()
 
         self.gate_proj = Linear(
             config.hidden_size,
@@ -147,11 +142,11 @@ class Cohere2DecoderLayer(DecoderLayer):
         self.mlp = Cohere2MLP(model_config)
 
         self.input_layernorm = LayerNorm(
-            config.hidden_size,
-            elementwise_affine=True,
-            bias=False,
+            hidden_size=config.hidden_size,
             eps=config.layer_norm_eps,
             dtype=config.dtype,
+            has_weights=True,
+            has_bias=False,
         )
 
     @torch.inference_mode()
@@ -198,11 +193,11 @@ class Cohere2Model(DecoderModel):
         )
 
         self.norm = LayerNorm(
-            config.hidden_size,
-            bias=False,
-            elementwise_affine=True,
+            hidden_size=config.hidden_size,
             eps=config.layer_norm_eps,
             dtype=config.dtype,
+            has_weights=True,
+            has_bias=False,
         )
 
         self.layers = nn.ModuleList(
