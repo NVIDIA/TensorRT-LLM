@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -42,7 +43,7 @@ public:
 
     RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32 numHeads, SizeType32 nGroups, SizeType32 headDim,
         SizeType32 maxBatchSize, runtime::WorldConfig const& worldConfig, int64_t stream, nvinfer1::DataType dtype,
-        nvinfer1::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers);
+        nvinfer1::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers, SizeType32 numLayers);
 
     void getPtrBuffers(TensorMap& inputBuffers, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig) const;
@@ -63,6 +64,33 @@ public:
 
     [[nodiscard]] TensorPtr getSsmStates(SizeType32 layerIdx) const;
 
+    [[nodiscard]] TensorPtr getConvStates() const;
+
+    [[nodiscard]] TensorPtr getSsmStates() const;
+
+    [[nodiscard]] nvinfer1::DataType getConvStateDataType() const noexcept;
+
+    [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const noexcept;
+
+    [[nodiscard]] executor::kv_cache::CacheState::RnnModelConfig getRnnCacheStateModelConfig() const noexcept;
+
+    [[nodiscard]] SizeType32 getMaxBatchSize() const noexcept;
+
+    /// Returns the number of local RNN layers on this PP rank
+    [[nodiscard]] SizeType32 getNumLocalLayers() const noexcept;
+
+    /// Returns the buffer manager
+    [[nodiscard]] runtime::BufferManager const& getBufferManager() const noexcept
+    {
+        return mBufferManager.value();
+    }
+
+    [[nodiscard]] SizeType32 getGlobalLayerNum(SizeType32 localOffset) const
+    {
+        TLLM_CHECK(localOffset < static_cast<SizeType32>(mGlobalLayerNumsPerPP.size()));
+        return mGlobalLayerNumsPerPP[localOffset];
+    }
+
 private:
     // If we need support beam search, we may need mMaxBeamWidth + 1 slots and use separate input / output states.
     TensorPtr pagedRnnStates;  // [local_nb_layers, max_seq_num * max_beam_width, state_size, rnn_hidden_size] or
@@ -79,9 +107,23 @@ private:
     SizeType32 mMaxBeamWidth = 0;
     SizeType32 mBeamSlotsPerSequence = 0;
     std::unordered_map<SizeType32, SizeType32> mLayerOffsets;
+    std::vector<SizeType32> mGlobalLayerNumsPerPP; // contains the global index of RNN layers on self rank
     std::vector<SizeType32> mFreeBlocks;
     std::unordered_map<RequestIdType, SizeType32> mCacheIndex;
     std::optional<runtime::BufferManager> mBufferManager;
+    nvinfer1::DataType mDtype{nvinfer1::DataType::kFLOAT};
+    nvinfer1::DataType mSsmCacheDtype{nvinfer1::DataType::kFLOAT};
+
+    // RNN model config (global values before TP/PP split)
+    SizeType32 mDState{0};
+    SizeType32 mDConv{0};
+    SizeType32 mHiddenSize{0};
+    SizeType32 mHeadDim{0};
+    SizeType32 mConvDimSize{0};
+    SizeType32 mNGroups{0};
+    SizeType32 mNumLayers{0};
+    SizeType32 mNumHeads{0};
+    SizeType32 mNumLocalLayers{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::rnn_state_manager
