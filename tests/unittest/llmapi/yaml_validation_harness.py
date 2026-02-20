@@ -56,10 +56,11 @@ def load_yaml_dict(path: Path) -> dict[str, Any]:
 def validate_torch_llm_args_config(cfg: dict[str, Any]) -> llm_args_module.TorchLlmArgs:
     base_args = llm_args_module.TorchLlmArgs(model="dummy/model", skip_tokenizer_init=True)
     merged = llm_args_module.update_llm_args_with_extra_dict(
-        copy.deepcopy(base_args.model_dump(mode="json")), copy.deepcopy(cfg)
+        # NOTE: using model_dump with mode='python' so enums (e.g. load_format) stay as enum,
+        # not int.
+        copy.deepcopy(base_args.model_dump()),
+        copy.deepcopy(cfg),
     )
-    if "load_format" in merged:
-        merged["load_format"] = llm_args_module.LoadFormat(merged["load_format"])
     return llm_args_module.TorchLlmArgs(**merged)
 
 
