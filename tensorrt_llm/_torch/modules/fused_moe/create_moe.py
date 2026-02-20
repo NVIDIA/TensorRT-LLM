@@ -9,7 +9,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
-#from .fused_moe_cute_dsl import CuteDslFusedMoE
+from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_triton import TritonFusedMoE
