@@ -26,8 +26,14 @@ import tensorrt_llm.bindings as _tb
 from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
-                 build_extra_args):
+def build_engine(
+    *,
+    weight_dir: _pl.Path,
+    engine_dir: _pl.Path,
+    convert_extra_args: list[str] = [],
+    build_extra_args: list[str] = [],
+    num_workers: int = 1,
+):
 
     ckpt_dir = engine_dir / 'ckpt'
 
@@ -36,6 +42,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
     ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
         f'--output_dir={ckpt_dir}',
         '--dtype=float16',
+        f'--workers={num_workers}',
     ] + convert_extra_args
 
     run_command(convert_cmd)
@@ -53,6 +60,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
         '--log_level=error',
         '--paged_kv_cache=enable',
         '--remove_input_padding=enable',
+        f'--workers={num_workers}',
     ] + build_extra_args
 
     run_command(build_args)
@@ -98,16 +106,22 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
         start_time = time.time()
 
         tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
+        world_size = tp_size * pp_size * cp_size
         model_spec_obj.use_tensor_parallelism(tp_size)
         model_spec_obj.use_pipeline_parallelism(pp_size)
         model_spec_obj.use_context_parallelism(cp_size)
 
         build_engine(
-            hf_dir, engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
-            [
+            weight_dir=hf_dir,
+            engine_dir=engine_dir / model_spec_obj.get_model_path() /
+            tp_pp_cp_dir,
+            convert_extra_args=[
                 f'--tp_size={tp_size}', f'--pp_size={pp_size}',
                 f'--cp_size={cp_size}'
-            ], ['--use_paged_context_fmha=disable'])
+            ],
+            build_extra_args=['--use_paged_context_fmha=disable'],
+            num_workers=world_size,
+        )
 
         duration = time.time() - start_time
         print(
@@ -123,12 +137,14 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
         model_spec_obj.use_context_parallelism(1)
         model_spec_obj.use_lookahead_decoding()
         build_engine(
-            hf_dir,
-            engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-cp1-gpu',
-            [], [
+            weight_dir=hf_dir,
+            engine_dir=engine_dir / model_spec_obj.get_model_path() /
+            'tp1-pp1-cp1-gpu',
+            build_extra_args=[
                 '--max_draft_len=39',
                 '--speculative_decoding_mode=lookahead_decoding'
-            ])
+            ],
+        )
 
         duration = time.time() - start_time
         print(f"Building lookahead engine took {duration} seconds")
