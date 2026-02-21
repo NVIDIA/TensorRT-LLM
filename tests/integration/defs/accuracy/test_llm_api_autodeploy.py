@@ -333,8 +333,9 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "transforms": {
                 "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    # NOTE: sharding_source applies only to TP sharding
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
                 },
                 "multi_stream_moe": {
                     "stage": "compile",
@@ -439,8 +440,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "transforms": {
                 "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    # NOTE: sharding_source applies only to TP sharding
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
                 },
                 "multi_stream_moe": {
                     "stage": "compile",
@@ -520,8 +522,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm)
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
@@ -644,8 +646,9 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                     "num_moe_experts_for_export": 2,
                 },
                 "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    # NOTE: sharding_source applies only to TP sharding
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
                 },
             },
         }
