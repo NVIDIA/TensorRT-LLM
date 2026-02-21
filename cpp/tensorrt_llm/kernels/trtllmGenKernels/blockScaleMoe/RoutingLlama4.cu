@@ -27,7 +27,7 @@ static constexpr int NumThreads = 1024;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int MaxNumTopExperts = 1;
 // static constexpr int MaxNumExperts = 128;
-static constexpr int NumExpertsLimit = 128;
+static constexpr int MaxSupportedExperts = 128;
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 static constexpr int WarpKernelSmemStride = 33;
@@ -556,8 +556,8 @@ void run(Data const& data, void* stream)
         "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
     TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
         MaxNumTopExperts, data.mTopK);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumExpertsLimit,
-        "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, NumExpertsLimit);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExperts,
+        "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, MaxSupportedExperts);
     // static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
     // static_assert(MaxNumExperts <= numThreadsHist, "#experts must be bounded by #threads");
     TLLM_CHECK_WITH_INFO(

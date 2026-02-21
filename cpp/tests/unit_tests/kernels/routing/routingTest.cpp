@@ -357,12 +357,10 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     }
     // Set seed to time-based seed
     resetToTimeBasedSeed();
-
     // Allocate buffers
     allocateBuffers(param);
     // Setup buffers
     setupBuffers(param);
-
     // Call host function
     callHostFunction(param);
     if (param.useTopKAsInput)
@@ -376,7 +374,6 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     auto const workspaceSize = getDeviceWorkspaceSize(param);
     TensorPtr workspaceDevice
         = mBufferManager->gpu(ITensor::makeShape({static_cast<int64_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
-
     // Call tested function routing
     callTestedFunction(param, workspaceDevice);
     // Verify results
