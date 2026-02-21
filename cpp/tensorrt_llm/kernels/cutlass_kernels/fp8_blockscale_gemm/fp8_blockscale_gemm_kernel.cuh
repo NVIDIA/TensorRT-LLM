@@ -724,7 +724,7 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -764,7 +764,7 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;
@@ -998,7 +998,7 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -1031,7 +1031,7 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;
