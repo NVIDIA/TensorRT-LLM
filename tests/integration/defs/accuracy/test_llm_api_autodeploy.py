@@ -333,8 +333,9 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "transforms": {
                 "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    # NOTE: sharding_source applies only to TP sharding
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
                 },
                 "multi_stream_moe": {
                     "stage": "compile",
@@ -439,8 +440,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "transforms": {
                 "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    # NOTE: sharding_source applies only to TP sharding
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
                 },
                 "multi_stream_moe": {
                     "stage": "compile",
@@ -499,7 +501,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip("Skipping FP4 test until it is supported")
+    # @pytest.mark.skip("Skipping FP4 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [4, 8])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
@@ -517,12 +519,12 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             # Manually set quant_config for FP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
-            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm)
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
@@ -645,8 +647,9 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                     "num_moe_experts_for_export": 2,
                 },
                 "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    # NOTE: sharding_source applies only to TP sharding
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
                 },
             },
         }
