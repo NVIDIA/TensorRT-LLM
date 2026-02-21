@@ -53,7 +53,7 @@ FLUX2_CHECKPOINT_PATH = os.environ.get(
 )
 SKIP_COMPONENTS = ["text_encoder", "text_encoder_2", "vae", "tokenizer", "tokenizer_2", "scheduler"]
 # When skip_components includes tokenizer, warmup must be disabled (warmup calls _encode_prompt)
-PIPELINE_NO_WARMUP = PipelineConfig(warmup_steps=0, enable_torch_compile=False)
+PIPELINE_NO_WARMUP = PipelineConfig(warmup_steps=0)
 
 
 def _get_flux_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -846,7 +846,7 @@ def _run_ulysses_worker(rank, world_size, checkpoint_path, inputs_cpu, return_di
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             parallel=ParallelConfig(dit_ulysses_size=world_size),
-            pipeline={"warmup_steps": 0, "enable_torch_compile": False},
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -890,6 +890,10 @@ class TestFluxParallelism:
         2. Spawn 2-GPU Ulysses workers, run same forward
         3. Compare outputs (PSNR > 30 dB)
         """
+
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
 
         print("\n" + "=" * 80)
         print("ULYSSES SEQUENCE PARALLELISM (ulysses_size=2) CORRECTNESS TEST")
@@ -966,6 +970,195 @@ class TestFluxParallelism:
         assert psnr > 30.0, f"PSNR too low: {psnr:.2f} dB (expected >30 dB)"
 
         del ref_sample, ulysses_sample
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu, return_dict):
+    """Worker for combined optimizations test (FP8 + TeaCache + TRTLLM + Ulysses).
+
+    Must be module-level for multiprocessing.spawn() pickling.
+    """
+    try:
+        _setup_distributed(rank, world_size)
+
+        from tensorrt_llm._torch.visual_gen.config import (
+            AttentionConfig,
+            DiffusionArgs,
+            ParallelConfig,
+            TeaCacheConfig,
+        )
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        # Load pipeline with ALL optimizations
+        args = DiffusionArgs(
+            checkpoint_path=checkpoint_path,
+            device=f"cuda:{rank}",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            teacache=TeaCacheConfig(
+                enable_teacache=True,
+                teacache_thresh=0.2,
+                use_ret_steps=True,
+            ),
+            attention=AttentionConfig(backend="TRTLLM"),
+            parallel=ParallelConfig(dit_ulysses_size=world_size),
+            pipeline={"warmup_steps": 0},
+        )
+        pipeline = PipelineLoader(args).load()
+        transformer = pipeline.transformer.eval()
+
+        # Verify all optimizations are enabled
+        assert pipeline.model_config.parallel.dit_ulysses_size == world_size, (
+            "Ulysses parallel not enabled"
+        )
+        assert transformer.model_config.quant_config.quant_algo == QuantAlgo.FP8, "FP8 not enabled"
+        assert hasattr(pipeline, "cache_backend"), "TeaCache not enabled"
+        assert transformer.transformer_blocks[0].attn.attn_backend == "TRTLLM", "TRTLLM not enabled"
+
+        if rank == 0:
+            print(f"  All optimizations verified on rank {rank}:")
+            print(f"    - FP8: {transformer.model_config.quant_config.quant_algo}")
+            print("    - TeaCache: enabled")
+            print(f"    - TRTLLM attention: {transformer.transformer_blocks[0].attn.attn_backend}")
+            print(f"    - Ulysses: ulysses_size={world_size}")
+
+        # Initialize TeaCache for single-step inference
+        if hasattr(pipeline, "cache_backend") and pipeline.cache_backend:
+            pipeline.cache_backend.refresh(num_inference_steps=1)
+
+        # Load inputs on this GPU
+        inputs = {k: v.to(f"cuda:{rank}") for k, v in inputs_cpu.items()}
+
+        # Run transformer forward (return_dict=False for TeaCache compatibility)
+        inputs["return_dict"] = False
+        with torch.no_grad():
+            output = transformer(**inputs)[0]
+
+        # Validate output
+        assert not torch.isnan(output).any(), f"Rank {rank}: Output contains NaN"
+        assert not torch.isinf(output).any(), f"Rank {rank}: Output contains Inf"
+
+        if rank == 0:
+            return_dict["output"] = output.cpu()
+
+        del pipeline, transformer
+        torch.cuda.empty_cache()
+
+    except Exception as e:
+        return_dict[f"error_{rank}"] = str(e)
+        raise
+    finally:
+        _cleanup_distributed()
+
+
+class TestFluxCombinedOptimizations:
+    """Test all optimizations combined: FP8 + TeaCache + TRTLLM attention + Ulysses."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        torch.cuda.is_available() and torch.cuda.device_count() < 2,
+        reason="Combined optimization test requires at least 2 GPUs",
+    )
+    def test_all_optimizations_combined(self, flux1_checkpoint_exists):
+        """Test FP8 + TeaCache + TRTLLM attention + Ulysses=2 combined correctness.
+
+        Validates that all optimizations work together correctly.
+        Compares against a BF16 single-GPU baseline with relaxed thresholds
+        since multiple optimizations compound numerical differences.
+        """
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
+
+        print("\n" + "=" * 80)
+        print("ALL OPTIMIZATIONS COMBINED TEST")
+        print("FP8 + TeaCache + TRTLLM Attention + Ulysses (ulysses_size=2)")
+        print("=" * 80)
+
+        # Load baseline on GPU 0 (no optimizations)
+        print("\n[1/3] Loading baseline on GPU 0 (BF16, no optimizations)...")
+        args_baseline = DiffusionArgs(
+            checkpoint_path=FLUX1_CHECKPOINT_PATH,
+            device="cuda:0",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+            pipeline=PIPELINE_NO_WARMUP,
+        )
+        pipeline_baseline = PipelineLoader(args_baseline).load()
+
+        # Reset torch compile state
+        torch._dynamo.reset()
+
+        # Create test inputs
+        print("\n[2/3] Creating test inputs...")
+        inputs = _get_flux_transformer_inputs(
+            pipeline_baseline.transformer, device="cuda:0", dtype=torch.bfloat16
+        )
+
+        # Run baseline
+        with torch.no_grad():
+            ref_output = pipeline_baseline.transformer(**inputs)
+        ref_sample = _extract_transformer_output(ref_output)
+        print(f"  Baseline output shape: {ref_sample.shape}")
+        print(f"  Baseline range: [{ref_sample.min():.4f}, {ref_sample.max():.4f}]")
+
+        # Store inputs on CPU for workers
+        inputs_cpu = {k: v.cpu() for k, v in inputs.items()}
+
+        # Cleanup baseline
+        del pipeline_baseline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Run with ALL optimizations in distributed processes
+        print("\n[3/3] Running with ALL optimizations (FP8 + TeaCache + TRTLLM + Ulysses=2)...")
+        manager = mp.Manager()
+        return_dict = manager.dict()
+
+        mp.spawn(
+            _run_all_optimizations_worker,
+            args=(2, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
+            nprocs=2,
+            join=True,
+        )
+
+        # Check for errors
+        for i in range(2):
+            assert f"error_{i}" not in return_dict, (
+                f"Rank {i} failed: {return_dict.get(f'error_{i}')}"
+            )
+
+        combined_sample = return_dict["output"].to("cuda:0")
+
+        # Compare outputs with relaxed thresholds (multiple optimizations compound errors)
+        print("\n[Comparison] Combined Optimizations vs Baseline:")
+        ref_float = ref_sample.float()
+        combined_float = combined_sample.float()
+
+        cos_sim = F.cosine_similarity(combined_float.flatten(), ref_float.flatten(), dim=0).item()
+
+        max_diff = torch.max(torch.abs(combined_float - ref_float)).item()
+        mean_diff = torch.mean(torch.abs(combined_float - ref_float)).item()
+
+        print(f"  Cosine similarity: {cos_sim:.6f}")
+        print(f"  Max absolute difference: {max_diff:.6f}")
+        print(f"  Mean absolute difference: {mean_diff:.6f}")
+        print(f"  Combined range: [{combined_float.min():.4f}, {combined_float.max():.4f}]")
+        print(f"  Baseline range: [{ref_float.min():.4f}, {ref_float.max():.4f}]")
+
+        # Relaxed threshold: cos_sim > 0.90 (compounded from FP8 + Ulysses + TeaCache)
+        assert cos_sim > 0.90, (
+            f"Combined optimization cosine similarity {cos_sim:.6f} below threshold 0.90. "
+            f"This suggests an issue with optimization interactions."
+        )
+
+        print(f"\n[PASS] All optimizations validated! cos_sim={cos_sim:.6f}")
+        print("=" * 80)
+
+        del ref_sample, combined_sample
         gc.collect()
         torch.cuda.empty_cache()
 
