@@ -140,6 +140,26 @@ def parse_args():
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
     )
 
+    # torch.compile
+    parser.add_argument(
+        "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
+    )
+    parser.add_argument(
+        "--torch_compile_mode",
+        type=str,
+        default="default",
+        help="Torch compile mode",
+        choices=["default", "max-autotune", "reduce-overhead"],
+    )
+
+    # Warmup
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=1,
+        help="Number of warmup steps (0 to disable)",
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -201,6 +221,11 @@ def build_diffusion_config(args):
         "parallel": {
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+        },
+        "pipeline": {
+            "enable_torch_compile": not args.disable_torch_compile,
+            "torch_compile_mode": args.torch_compile_mode,
+            "warmup_steps": args.warmup_steps,
         },
     }
 
