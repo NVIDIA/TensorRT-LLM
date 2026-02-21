@@ -303,3 +303,6 @@ class SASampler(SpecSamplerBase):
 
     def __init__(self, args: TorchSampler.Args, *, max_draft_len: int):
         super().__init__(args, draft_len=max_draft_len)
+
+    def is_generation_model(self) -> bool:
+        return True

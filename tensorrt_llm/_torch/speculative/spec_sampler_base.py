@@ -28,6 +28,7 @@ from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
+    Sampler,
     SampleState,
     SampleStateTensors,
     TorchSampler,
@@ -53,9 +54,9 @@ class SampleStateSpec(SampleState):
     host: SampleStateTensorsSpec
 
 
-class SpecSamplerBase(TorchSampler):
+class SpecSamplerBase(Sampler[SampleStateSpec]):
     """
-    Base class for speculative decoding samplers (MTP, NGram, Eagle3).
+    Base class for speculative decoding samplers (MTP, NGram, Eagle3, SA).
 
     Provides common functionality:
     - Pre-allocated GPU storage buffers
@@ -64,25 +65,23 @@ class SpecSamplerBase(TorchSampler):
 
     Subclasses can customize behavior by overriding:
     - _get_max_tokens(): How to calculate max_tokens for storage
+    - _get_draft_tokens_storage_size(): Size of next_draft_tokens tensor
     - _add_dummy_draft_tokens(): Whether to add dummy drafts for context requests
     """
 
     SampleState = SampleStateSpec
 
+    def is_generation_model(self) -> bool:
+        return True
+
     @dataclass(kw_only=True)
-    class Store(TorchSampler.Store):
+    class Store:
+        """Storage for speculative decoding tensors."""
+
         new_tokens: torch.Tensor
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
-        # Necessary to satisfy the interface of TorchSampler.Store
-        # These fields are not used by speculative samplers
-        max_lengths_tensor: None = None
-        end_ids: None = None
-        finish_reasons: None = None
-
-        def __post_init__(self):
-            pass  # finish_reasons has no size to compare against new_tokens
 
     def __init__(self, args: TorchSampler.Args, *, draft_len: int):
         """
@@ -98,13 +97,14 @@ class SpecSamplerBase(TorchSampler):
 
         seq_slots = args.max_num_sequences
         max_tokens = self._get_max_tokens(args, draft_len)
+        draft_tokens_size = self._get_draft_tokens_storage_size(args, draft_len)
         self.max_beam_width = args.max_beam_width
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
         self.store = self.Store(
             new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
-            next_draft_tokens=int_tensor((seq_slots, draft_len)),
+            next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
             new_tokens_lens=int_tensor((seq_slots,)),
         )
 
@@ -116,6 +116,15 @@ class SpecSamplerBase(TorchSampler):
         MTP uses args.max_total_draft_tokens + 1 for tree-based speculation.
         """
         return draft_len + 1
+
+    def _get_draft_tokens_storage_size(self, args: TorchSampler.Args, draft_len: int) -> int:
+        """
+        Calculate storage size for next_draft_tokens tensor.
+
+        Override in subclasses if needed. Default: draft_len.
+        MTP uses args.max_total_draft_tokens for tree-based speculation.
+        """
+        return draft_len
 
     def _add_dummy_draft_tokens(self) -> bool:
         """

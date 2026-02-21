@@ -12,13 +12,12 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, Sampler, SampleState,
-                                  TorchSampler, add_token, int_tensor)
+from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
-from .spec_sampler_base import SampleStateTensorsSpec
+from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
 from .suffix_automaton import SuffixAutomatonManager
 
 if TYPE_CHECKING:
@@ -29,11 +28,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-
-@dataclass(kw_only=True)
-class SampleStateMTP(SampleState[SampleStateTensorsSpec,
-                                 SampleStateTensorsSpec]):
-    pass
+SampleStateMTP = SampleStateSpec
 
 
 class MTPHiddenStatesManager(BaseResourceManager):
@@ -232,9 +227,12 @@ class MTPSpecMetadata(SpecMetadata):
                 self.sa_manager.prepare(gen_request_ids, self.max_draft_len)
 
 
-class MTPSampler(Sampler[SampleStateMTP]):
+class MTPSampler(SpecSamplerBase):
     """
     MTP sampler.
+
+    Inherits from SpecSamplerBase with overrides for tree-based speculation
+    using max_total_draft_tokens instead of draft_len.
     """
 
     SampleState = SampleStateMTP
@@ -243,136 +241,22 @@ class MTPSampler(Sampler[SampleStateMTP]):
     def is_generation_model(self) -> bool:
         return True
 
-    @dataclass(kw_only=True)
-    class Store:
-        new_tokens: torch.Tensor
-        next_new_tokens: torch.Tensor
-        next_draft_tokens: torch.Tensor
-        new_tokens_lens: torch.Tensor
-        max_total_draft_tokens: torch.Tensor
-
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
-        # MTPSampler does not need to setup additional buffers before the sampler step
         pass
 
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        self.mapping = None
-        self.draft_len = nextn
-        self.max_seq_len = args.max_seq_len
+        super().__init__(args, draft_len=nextn)
 
-        seq_slots = args.max_num_sequences
-        max_tokens = args.max_total_draft_tokens + 1
-        self.max_beam_width = args.max_beam_width
-        assert self.max_beam_width == 1, "beam width must be 1 for MTP"
+    @override
+    def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
+        """MTP uses max_total_draft_tokens + 1 for tree-based speculation."""
+        return args.max_total_draft_tokens + 1
 
-        self.store = self.Store(
-            new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
-            next_new_tokens=int_tensor(
-                (max_tokens, seq_slots, self.max_beam_width)),
-            next_draft_tokens=int_tensor(
-                (seq_slots, args.max_total_draft_tokens)),
-            new_tokens_lens=int_tensor((seq_slots, )),
-            max_total_draft_tokens=int_tensor(
-                (seq_slots, args.max_total_draft_tokens)),
-        )
-
-    def _request_common_handling(self, request: LlmRequest,
-                                 next_draft_tokens: list[list[int]]):
-        assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
-        assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
-        assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
-        request.py_decoding_iter += 1
-
-    def update_requests(
-            self,
-            state: SampleStateMTP,
-            resource_manager: Optional[BaseResourceManager] = None) -> None:
-        # resource_manager will be not be used in this function
-        assert isinstance(state, SampleStateMTP)
-
-        state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens.tolist()
-        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
-        next_draft_tokens_list = state.host.next_draft_tokens.tolist()
-        beam_idx = DEFAULT_BEAM_IDX
-        for req in state.scheduled_requests.context_requests:
-            if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
-                continue
-            new_token = add_token(req, new_tokens, beam_idx=beam_idx)
-            TorchSampler._handle_stop_criteria(req,
-                                               new_token,
-                                               max_seq_len=self.max_seq_len,
-                                               beam_idx=beam_idx)
-            self._request_common_handling(req, next_draft_tokens_list)
-
-        for req in state.scheduled_requests.generation_requests:
-            if req.state == LlmRequestState.GENERATION_COMPLETE:
-                continue
-            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
-            for i in range(num_new_tokens):
-                new_token = add_token(req,
-                                      new_tokens,
-                                      beam_idx=beam_idx,
-                                      step=i)
-                if TorchSampler._handle_stop_criteria(
-                        req,
-                        new_token,
-                        max_seq_len=self.max_seq_len,
-                        beam_idx=beam_idx):
-                    break
-            req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list)
-
-    def sample_async(
-            self, scheduled_requests: ScheduledRequests,
-            outputs: dict[str, torch.Tensor],
-            num_context_logits_prefix_sum: list[int]) -> SampleStateMTP:
-        # new_tokens_device: accepted tokens, device tensor, shape: batch_size, nextn + 1
-        # new_tokens_lens_device: accepted lengths, device tensor, shape: batch_size
-        # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
-        # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
-
-        requests = scheduled_requests.all_requests()
-        slots = torch.as_tensor([r.py_seq_slot for r in requests])
-        slots = slots.to(device="cuda", non_blocking=True)
-
-        o_new_tokens = outputs['new_tokens'][:len(requests)]
-        o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
-        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
-        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
-
-        new_tokens = self.store.new_tokens
-        next_new_tokens = self.store.next_new_tokens
-        new_tokens_lens = self.store.new_tokens_lens
-        next_draft_tokens = self.store.next_draft_tokens
-
-        new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
-        next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
-        new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
-        next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
-
-        device = SampleStateTensorsSpec(
-            new_tokens=next_new_tokens,
-            new_tokens_lens=new_tokens_lens,
-            next_draft_tokens=next_draft_tokens,
-        )
-        host = SampleStateTensorsSpec(
-            new_tokens=new_tokens.to('cpu', non_blocking=True),
-            new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
-            next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),
-        )
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        # add dummy draft tokens to context requests to prepare kv cache in advance
-        # with the max draft token length
-        for request in scheduled_requests.context_requests:
-            request.py_draft_tokens = [1] * self.draft_len
-        return SampleStateMTP(scheduled_requests=scheduled_requests,
-                              device=device,
-                              host=host,
-                              sampler_event=sampler_event)
+    @override
+    def _get_draft_tokens_storage_size(self, args: TorchSampler.Args,
+                                       draft_len: int) -> int:
+        """MTP uses max_total_draft_tokens for draft token storage."""
+        return args.max_total_draft_tokens
 
 
 class MTPWorker(SpecWorkerBase):
