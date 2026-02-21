@@ -19,23 +19,25 @@ from ..interface import (
 def _generate_default_piecewise_num_tokens(max_num_tokens: int) -> List[int]:
     """Generate default piecewise bucket sizes when none are specified.
 
-    Uses powers-of-2 from 64 up to max_num_tokens. This provides ~log2(max/64)
+    Uses powers-of-2 from 64 up to max_num_tokens // 2. This provides ~log2(max/64)
     bucket sizes with at most 2x padding overhead per bucket.
 
-    For example, max_num_tokens=8192 → [64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    For example, max_num_tokens=8192 → [64, 128, 256, 512, 1024, 2048, 4096]
     """
     if max_num_tokens <= 0:
         return []
 
+    # TODO(nvchenghaoz): restore upper bound to max_num_tokens once piecewise capture
+    # memory behavior is improved for large-token buckets.
+    max_bucket = max_num_tokens // 2
+    if max_bucket < 64:
+        return [max_num_tokens]
+
     buckets = []
     nt = 64
-    while nt <= max_num_tokens:
+    while nt <= max_bucket:
         buckets.append(nt)
         nt *= 2
-
-    # Always include max_num_tokens as the largest bucket
-    if not buckets or buckets[-1] != max_num_tokens:
-        buckets.append(max_num_tokens)
 
     return sorted(buckets)
 
