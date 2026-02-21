@@ -404,6 +404,43 @@ foo.SomeClass()
 1. For interfaces that may be used outside a file, prefer docstrings over comments.
 2. Comments should be reserved for code within a function, or interfaces that are local to a file.
 
+### Pydantic Guidelines
+
+When defining any user-facing configuration classes (particularly `LlmArgs` or any class used in its fields), **always** use Pydantic classes rather than dataclasses or vanilla classes.
+
+**Model Structure:**
+- Inherit from `StrictBaseModel` (which sets `extra="forbid"`) to fail fast when users specify invalid field names
+- Use [discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) when a field needs to accept one of several possible config classes (e.g. `speculative_config` accepts any of `EagleDecodingConfig`, `MedusaDecodingConfig`, etc.)
+- **Do not define `__init__` methods** - this bypasses Pydantic's validation and type coercion, and can cause subtle bugs with model inheritance. Instead:
+  - For validation logic, use `@field_validator` or `@model_validator`
+  - For post-validation initialization (e.g. setting up private fields and state), use [`model_post_init()`](https://docs.pydantic.dev/latest/api/base_model/#pydantic.BaseModel.model_post_init)
+  - For custom construction patterns, use classmethods (e.g. `from_yaml()`)
+  - See [Defining a custom `__init__()`](https://docs.pydantic.dev/latest/concepts/models/#defining-a-custom-__init__) for more details
+
+**Field Definitions:**
+- Add descriptions to all user-facing fields via `Field(description="...")`. Avoid using comments for descriptions.
+- Avoid `dict`, `object`, `Any` as field types - use properly typed alternatives
+- Avoid defining mutable defaults directly; use `default_factory` instead.
+  - Good: `Field(default_factory=list)`, `Field(default_factory=dict)`, `Field(default_factory=MyClass)`
+  - Bad: `Field(default=[])`, `Field(default={})`, `Field(default=MyClass())` directly
+- Use `Literal["value1", "value2"]` instead of `str` when a field should only accept certain values
+- Prefer `PositiveInt`, `NonNegativeInt`, `NonNegativeFloat`, `PositiveFloat`, `Field(gt=0)`, `Field(ge=0)`, etc. for numeric constraints instead of defining custom validators
+- Use `Field(min_length=1)` to enforce minimum length of a list
+
+**Validation:**
+- Use `@field_validator` and `@model_validator` instead of manual `validate()` or `is_valid()` methods
+- Raise `ValueError` instead of using assertions
+- Co-locate validation logic within the class itself rather than in a parent class, unless it depends on fields in the parent
+
+**Serialization:**
+- Avoid defining `to_dict()` methods - prefer Pydantic's built-in `model_dump()` to convert to a dictionary.
+  - Good: `MyModel.model_dump()`
+  - Bad: `MyModel.to_dict()`
+  - Note: you can override `model_dump()` to customize its behavior, but avoid doing so unless absolutely necessary.
+- Avoid defining `from_dict()` / `from_kwargs()` methods - prefer constructing the class directly from arguments.
+  - Good: `MyModel(**kwargs)`, `MyModel(**my_dict)`
+  - Bad: `MyModel.from_dict(kwargs)`, `MyModel.from_kwargs(kwargs)`
+
 #### Docstring Syntax
 ##### Classes and Functions
 Use the [Google style](https://google.github.io/styleguide/pyguide.html), which can be parsed by Sphinx.

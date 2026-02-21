@@ -189,7 +189,7 @@ def get_llm_args(
         KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction)
         if free_gpu_memory_fraction != kv_cache_default_fraction else None,
         "cp_config":
-        cp_config if cp_config else {},
+        cp_config,
         "build_config":
         BuildConfig(max_batch_size=max_batch_size,
                     max_num_tokens=max_num_tokens,
