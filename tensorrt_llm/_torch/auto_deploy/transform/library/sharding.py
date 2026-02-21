@@ -189,6 +189,7 @@ class ShardingTransformConfig(TransformConfig):
                 moe_tp_size=self.dist_mapping.get("moe_tp", 1),
                 moe_ep_size=self.dist_mapping.get("moe_ep", self.world_size),
                 moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
+                enable_attention_dp=self.enable_attention_dp,
             )
         except ValueError as e:
             ad_logger.warning(f"Invalid parallel grid config: {e}")
@@ -239,9 +240,7 @@ class ShardingTransformConfig(TransformConfig):
             supported_modes = {
                 "colwise",  # row split and no collective
                 "rowwise",  # column split and all-reduce
-                "mla",  # mla layer
                 "mamba",  # mamba SSM layer
-                "delta",  # gated delta net layer
                 "gather",  # simple shard (row + all_gather)
                 # TODO: remaining values are not supported yet.
                 # They require hybrid EP+TP and/or SP support.
@@ -1360,9 +1359,9 @@ def _shard_parameter_node(
 
     # Shard weight using the unified function (also updates the parameter)
     weight_nodes = extract_weight_nodes(node)
-    # Parametrized nodes must have at least one weight (for debugging)
-    assert len(weight_nodes.weights) > 0, (
-        f"Node {node.name} has no weights - weight mapping may be incorrect"
+    # Parametrized nodes must have at least one weight or bias (for debugging)
+    assert len(weight_nodes.weights) > 0 or len(weight_nodes.biases) > 0, (
+        f"Node {node.name} has no weights or biases - weight mapping may be incorrect"
     )
 
     for weight_node in weight_nodes.weights:
@@ -1727,7 +1726,7 @@ def _insert_sharded_mxfp4_mlp_ep(
 def _process_simple_shard(
     nodes_linear: Dict[Node, List[Node]],
     transform_container: ShardingTransformContainer,
-    layer_type: LayerType = LayerType.MLP,
+    layer_type: LayerType = LayerType.UNKNOWN,
 ) -> int:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
@@ -2665,8 +2664,6 @@ def detect_sharding_from_config(
     num_row_col_shards = 0
     num_attention_shards = 0
     num_ssm_shards = 0
-    num_mla_shards = 0
-    num_delta_shards = 0
     linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
 
     # use layer_subgraphs to determine the layer_type
@@ -2728,14 +2725,7 @@ def detect_sharding_from_config(
                     if _process_ssm_sharding(layer_subgraph, transform_container) > 0:
                         num_ssm_shards += 1
                         num_row_col_shards += 1
-                elif config == "delta":
-                    if _process_delta_sharding(layer_subgraph, transform_container) > 0:
-                        num_delta_shards += 1
-                        num_row_col_shards += 1
-                elif config == "mla":
-                    if _process_mla_sharding(layer_subgraph, transform_container) > 0:
-                        num_mla_shards += 1
-                        num_row_col_shards += 1
+
                 elif "sequence" in config:
                     # TODO: Sequence parallelism is not supported yet.
                     ad_logger.warning("Sequence parallelism is not supported yet. Skipping.")
@@ -2794,8 +2784,7 @@ def detect_sharding_from_config(
     num_shards = num_simple_shards + num_row_col_shards
     ad_logger.info(
         f"Applied {num_shards} TP shards from config. Simple: {num_simple_shards}, "
-        f"row-col: {num_row_col_shards} (attention: {num_attention_shards}, "
-        f"mla: {num_mla_shards}, delta: {num_delta_shards}, ssm: {num_ssm_shards})"
+        f"row-col: {num_row_col_shards} (including: ssm: {num_ssm_shards}, attention: {num_attention_shards})"
     )
 
     num_matches = len(transform_container.weight_sharding_transforms)
