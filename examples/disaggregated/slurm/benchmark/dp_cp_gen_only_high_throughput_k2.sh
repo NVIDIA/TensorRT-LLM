@@ -32,7 +32,7 @@ CONFIGS_DIR="${WORK_DIR}/saved_configs/${TIMESTAMP}_dp_cp_high_throughput_k2"
 # =============================================================================
 # Format: "num_gpus,global_batch_size,isl,osl,gen_pp,gen_tp,gen_cp,gen_moe_ep,attn_dp"
 # attn_dp: 0=false (TEP), 1=true (DEP)
-# global_batch_size = concurrency
+# concurrency = global_batch_size * 2
 # PP is always 1 for this script (TP x CP only)
 # =============================================================================
 
@@ -210,7 +210,7 @@ generate_pp_partition() {
 # Function to update config.yaml using sed
 update_config() {
     local num_gpus=$1
-    local global_batch_size=$2  # global_batch_size = concurrency
+    local global_batch_size=$2  # concurrency = global_batch_size * 2
     local isl=$3
     local osl=$4
     local pp=$5
@@ -220,33 +220,16 @@ update_config() {
     local attn_dp=$9
 
     # Calculate derived values
-    # global_batch_size = concurrency (directly from experiments)
-    local concurrency=$global_batch_size
-    local max_seq_len=$((isl / cp + osl + 512))  # isl/cp + osl + buffer for special tokens
+    # concurrency = global_batch_size * 2 (2x over-subscription to keep pipeline saturated)
+    local concurrency=$((global_batch_size * 2))
+    local max_seq_len=$((isl + osl + 512))  # isl + osl + buffer for special tokens
     local moe_backend=$(get_moe_backend "$global_batch_size")
     local attn_dp_bool=$( [ "$attn_dp" -eq 1 ] && echo "true" || echo "false" )
     local mode_str=$( [ "$attn_dp" -eq 1 ] && echo "DEP" || echo "TEP" )
-    # Worker max_batch_size calculation:
-    # - max_batch_size in config = micro-batch size (per forward pass)
-    # - Runtime computes: max_num_sequences = max_batch_size * pp_size (total in-flight capacity)
-    # - With AttnDP: max_batch_size is per-rank, so micro-batch = global_batch_size / (tp * pp)
-    # - Without AttnDP: micro-batch = global_batch_size / pp
-    local worker_max_batch_size
-    local micro_batch_size
-    if [ "$attn_dp" -eq 1 ]; then
-        # With AttnDP: per-rank micro-batch = global_batch_size / (tp * pp)
-        micro_batch_size=$(( global_batch_size / (tp * pp) ))
-        # IMPORTANT: We intentionally set worker_max_batch_size to a high value (micro_batch_size * tp)
-        # to avoid deadlocking in disaggregated serving with attention DP. The runtime may add
-        # dummy requests for padding, and with tight max_batch_size limits, these dummy requests
-        # can block real requests from being scheduled, causing the system to hang.
-        worker_max_batch_size=$(( micro_batch_size * tp ))
-    else
-        # Without AttnDP: micro-batch = global_batch_size / pp
-        # Runtime will compute max_num_sequences = micro_batch * pp = global_batch_size (total)
-        worker_max_batch_size=$(( global_batch_size / pp ))
-        micro_batch_size=$worker_max_batch_size
-    fi
+    # Both max_batch_size and cuda_graph_config.max_batch_size = global_batch_size / (tp * pp)
+    # This is the per-rank micro-batch size (what each rank processes per forward pass)
+    local micro_batch_size=$(( global_batch_size / (tp * pp) ))
+    local worker_max_batch_size=$micro_batch_size
 
     # Ensure minimum batch size of 1
     if [ "$worker_max_batch_size" -lt 1 ]; then
@@ -259,17 +242,12 @@ update_config() {
     echo "  Mode: ${mode_str}_${num_gpus} (${mode_str} mode with ${num_gpus} GPUs)"
     echo "  NUM_GPUS=$num_gpus, PP=$pp, TP=$tp, CP=$cp, EP=$ep"
     echo "  ISL=$isl, OSL=$osl"
-    echo "  global_batch_size=$global_batch_size (= concurrency)"
+    echo "  global_batch_size=$global_batch_size, concurrency=$concurrency (= global_batch_size * 2)"
     echo "  enable_attention_dp=$attn_dp_bool"
-    echo "  concurrency=$concurrency, max_seq_len=$max_seq_len (isl/cp + osl + 512 = $isl/$cp + $osl + 512)"
+    echo "  concurrency=$concurrency, max_seq_len=$max_seq_len (isl + osl + 512 = $isl + $osl + 512)"
     echo "  moe_backend=$moe_backend (auto-selected for GB200 NVFP4)"
-    if [ "$attn_dp" -eq 1 ]; then
-        echo "  worker max_batch_size=$worker_max_batch_size (micro-batch = global_batch_size / (tp * pp) with AttnDP)"
-        echo "  max_num_sequences per rank=$(( worker_max_batch_size * pp )) (= global_batch_size / tp)"
-    else
-        echo "  worker max_batch_size=$worker_max_batch_size (micro-batch = global_batch_size / pp)"
-        echo "  max_num_sequences=$(( worker_max_batch_size * pp )) (= global_batch_size)"
-    fi
+    echo "  worker max_batch_size=$worker_max_batch_size (= global_batch_size / (tp * pp) = $global_batch_size / ($tp * $pp))"
+    echo "  cuda_graph_config.max_batch_size=$micro_batch_size"
     if [ "$pp" -gt 1 ]; then
         local layers_per_rank=$(( (61 + pp - 1) / pp ))
         local last_rank_layers=$(( 61 - (pp - 1) * layers_per_rank ))
@@ -436,7 +414,8 @@ for combo in "${COMBINATIONS[@]}"; do
     echo "============================================"
     echo "[$MODE_DESC] Processing combination $current/$total_combinations"
     echo "  Experiment: ${mode_str}_${num_gpus}"
-    echo "  Config: GPUs=$num_gpus, concurrency=$global_batch_size, ISL=$isl, OSL=$osl"
+    concurrency=$((global_batch_size * 2))
+    echo "  Config: GPUs=$num_gpus, global_batch_size=$global_batch_size, concurrency=$concurrency, ISL=$isl, OSL=$osl"
     echo "  Parallelism: PP=$gen_pp, TP=$gen_tp, CP=$gen_cp, EP=$gen_moe_ep, AttnDP=$attn_dp"
     echo "============================================"
 
@@ -450,7 +429,7 @@ for combo in "${COMBINATIONS[@]}"; do
     submit_job
 
     # Optional: Add delay between submissions to avoid overwhelming the scheduler
-    sleep 5
+    sleep 2
 done
 
 echo ""
