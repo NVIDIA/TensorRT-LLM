@@ -189,6 +189,7 @@ class ShardingTransformConfig(TransformConfig):
                 moe_tp_size=self.dist_mapping.get("moe_tp", 1),
                 moe_ep_size=self.dist_mapping.get("moe_ep", self.world_size),
                 moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
+                enable_attention_dp=self.enable_attention_dp,
             )
         except ValueError as e:
             ad_logger.warning(f"Invalid parallel grid config: {e}")
@@ -1358,9 +1359,9 @@ def _shard_parameter_node(
 
     # Shard weight using the unified function (also updates the parameter)
     weight_nodes = extract_weight_nodes(node)
-    # Parametrized nodes must have at least one weight (for debugging)
-    assert len(weight_nodes.weights) > 0, (
-        f"Node {node.name} has no weights - weight mapping may be incorrect"
+    # Parametrized nodes must have at least one weight or bias (for debugging)
+    assert len(weight_nodes.weights) > 0 or len(weight_nodes.biases) > 0, (
+        f"Node {node.name} has no weights or biases - weight mapping may be incorrect"
     )
 
     for weight_node in weight_nodes.weights:
@@ -1725,7 +1726,7 @@ def _insert_sharded_mxfp4_mlp_ep(
 def _process_simple_shard(
     nodes_linear: Dict[Node, List[Node]],
     transform_container: ShardingTransformContainer,
-    layer_type: LayerType = LayerType.MLP,
+    layer_type: LayerType = LayerType.UNKNOWN,
 ) -> int:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
