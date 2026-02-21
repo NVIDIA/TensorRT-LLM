@@ -1570,15 +1570,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Case 4: linear tree
             else:
-                assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
                 # Prepare for the linear-tree.
                 # Populate the mask that won't change during inference phase.
+                # Use max_total_draft_tokens which equals the number of draft
+                # tokens per request (may differ from max_draft_len for PARD).
                 self.generate_spec_decoding_position_offsets(
-                    max_draft_len=max_draft_len)
+                    max_draft_len=max_total_draft_tokens)
                 self.generate_spec_decoding_packed_mask(
-                    max_draft_len=max_draft_len)
+                    max_draft_len=max_total_draft_tokens)
                 self.generate_spec_decoding_generation_length(
-                    max_draft_len=max_draft_len)
+                    max_draft_len=max_total_draft_tokens)
 
     def generate_spec_decoding_position_offsets(self, max_draft_len):
         position_offset = torch.arange(max_draft_len + 1,
