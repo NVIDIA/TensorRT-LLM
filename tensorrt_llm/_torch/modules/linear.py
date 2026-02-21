@@ -1005,19 +1005,14 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         assert input.dtype == torch.bfloat16
 
         if is_sm_100f():
-            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                    act_input_fp8, module.weight, act_input_sf,
-                    module.weight_scale)
-            else:
-                output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    disable_ue8m0_cast=True,
-                )
+            # Always use CUDA fp8_quantize_1x128 + cuteDSL GEMM on SM100f.
+            # This avoids the slow Triton _per_token_quant_and_transform_kernel
+            # (from fp8_utils.per_token_quant_and_transform) that was previously
+            # used in the fp8_swap_ab_gemm/deep_gemm path.
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                input)
+            output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
         elif get_sm_version() == 120:
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
@@ -1143,9 +1138,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def post_load_weights(self, module: Linear):
         super().post_load_weights(module)
-        if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
-                                 or module.disable_deep_gemm)) or \
-           get_sm_version() == 120:
+        # Only SM120 needs resmooth + transform: SM100f uses cuteDSL which
+        # consumes raw float32 scales directly.
+        if get_sm_version() == 120:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
             transformed_scale = transform_sf_into_required_layout(
