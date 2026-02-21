@@ -8,13 +8,13 @@ transforms:
     stage: factory
     run_per_gm: false
     device: meta
-    requires_clean_graph: false
+    pre_graph_cleanup: false
   export_to_gm:
     stage: export
     clone_state_dict: false
     strict: false
     run_per_gm: false
-    requires_clean_graph: false
+    pre_graph_cleanup: false
   cleanup_noop_slice:
     stage: post_export
   cleanup_noop_add:
@@ -32,10 +32,10 @@ transforms:
     stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
-    run_shape_prop: true
+    post_shape_prop: true
   match_eager_attention:
     stage: pattern_matcher
-    requires_shape_prop: true
+    pre_shape_prop: true
   match_sdpa_to_torch_attention:
     stage: pattern_matcher
   match_grouped_attention:
@@ -124,3 +124,4 @@ transforms:
     stage: export_onnx
     output_dir: "."
     output_name: "model.onnx"
+    pre_recompile_forward: true

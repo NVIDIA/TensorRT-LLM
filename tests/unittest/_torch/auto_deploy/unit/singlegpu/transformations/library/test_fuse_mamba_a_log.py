@@ -44,6 +44,7 @@ def _apply_fuse_mamba_a_log(gm: GraphModule) -> GraphModule:
         {
             "fuse_mamba_a_log": {
                 "stage": "post_load_fusion",
+                "post_recompile_forward": True,
             },
         },
     )(None, gm)

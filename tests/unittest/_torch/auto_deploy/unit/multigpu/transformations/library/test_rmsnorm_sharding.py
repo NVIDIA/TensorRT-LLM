@@ -186,11 +186,11 @@ class TestRMSNormShardingTransform:
                     "shard_all_unprocessed": True,
                     "allreduce_strategy": "NCCL",
                     "dist_backend": "auto",
-                    "requires_shape_prop": True,
+                    "pre_shape_prop": True,
                 },
                 "sharding_transform_executor": {
                     "stage": "sharding",
-                    "run_shape_prop": True,
+                    "post_shape_prop": True,
                 },
             },
         )
@@ -241,11 +241,11 @@ class TestRMSNormShardingTransform:
                     "shard_all_unprocessed": True,
                     "allreduce_strategy": "NCCL",
                     "dist_backend": "auto",
-                    "requires_shape_prop": True,
+                    "pre_shape_prop": True,
                 },
                 "sharding_transform_executor": {
                     "stage": "sharding",
-                    "run_shape_prop": True,
+                    "post_shape_prop": True,
                 },
             },
         )
@@ -300,11 +300,11 @@ class TestRMSNormShardingTransform:
                     "shard_all_unprocessed": True,
                     "allreduce_strategy": "NCCL",
                     "dist_backend": "auto",
-                    "requires_shape_prop": True,
+                    "pre_shape_prop": True,
                 },
                 "sharding_transform_executor": {
                     "stage": "sharding",
-                    "run_shape_prop": True,
+                    "post_shape_prop": True,
                 },
             },
         )
