@@ -15,7 +15,10 @@
 # the License.
 #
 
-find_library(NCCL_LIBRARY NAMES nccl)
+find_library(
+  NCCL_LIBRARY
+  NAMES nccl "libnccl.so.${NCCL_FIND_VERSION_MAJOR}"
+  PATHS ${NCCL_ROOT})
 
 if(NCCL_LIBRARY)
   set(NCCL_LIBRARIES ${NCCL_LIBRARIES} ${NCCL_LIBRARY})
