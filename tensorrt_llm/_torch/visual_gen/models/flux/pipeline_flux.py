@@ -216,7 +216,7 @@ class FluxPipeline(BasePipeline):
             max_sequence_length=req.max_sequence_length,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(
         self,
         prompt: str,
