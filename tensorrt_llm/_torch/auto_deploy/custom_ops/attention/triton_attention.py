@@ -287,6 +287,10 @@ def flattened_mha_with_cache(
             sliding_window,
         )
 
+    # Zero padding positions so downstream ops don't see garbage (piecewise CG)
+    if num_total_tokens < bs:
+        y[num_total_tokens:].zero_()
+
     return y.view(*output_shape)
 
 

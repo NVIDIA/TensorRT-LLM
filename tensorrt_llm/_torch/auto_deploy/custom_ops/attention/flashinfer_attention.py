@@ -366,10 +366,10 @@ def flashinfer_mha_with_cache(
         v = v.to(torch.float8_e4m3fn)
 
     flashinfer.page.append_paged_kv_cache(
-        append_key=k,
-        append_value=v,
-        batch_indices=flashinfer_batch_indices,
-        positions=flashinfer_positions,
+        append_key=k[:num_total_tokens],
+        append_value=v[:num_total_tokens],
+        batch_indices=flashinfer_batch_indices[:num_total_tokens],
+        positions=flashinfer_positions[:num_total_tokens],
         paged_kv_cache=kv_cache,
         kv_indices=cache_loc,
         kv_indptr=cu_num_pages[: num_seq + 1],
@@ -453,7 +453,21 @@ def flashinfer_mha_with_cache(
         else:
             y = y_decode
 
-    return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
+    # Reshape to match input shape [b, s, ...]
+    # y has shape [num_total_tokens, n_heads, head_dim] (pure) or [b*s, n_heads, head_dim] (mixed).
+    # q_shape_og is [b, s, ...] which may be padded (bucketed) for piecewise CG.
+    # Pad with zeros if y is smaller than the padded shape, so downstream ops
+    # (o_proj, residual add, LayerNorm) don't see garbage in padding positions.
+    bs = b * s
+    if y.shape[0] < bs:
+        y_padded = torch.zeros((bs, y.shape[1], y.shape[2]), dtype=y.dtype, device=y.device)
+        y_padded[: y.shape[0]] = y
+        y = y_padded
+    elif num_total_tokens < bs:
+        # Mixed batch: y is already [b*s, ...] but positions [num_total_tokens:] are uninitialized
+        y[num_total_tokens:].zero_()
+
+    return y.view(q_shape_og)
 
 
 @flashinfer_mha_with_cache.register_fake
