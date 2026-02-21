@@ -1,4 +1,4 @@
-# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -37,8 +37,8 @@ from torch.utils.dlpack import from_dlpack, to_dlpack
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
-from tensorrt_llm._utils import (str_dtype_to_torch, torch_dtype_to_trt,
-                                 trt_dtype_to_torch)
+from tensorrt_llm._utils import (maybe_pin_memory, str_dtype_to_torch,
+                                 torch_dtype_to_trt, trt_dtype_to_torch)
 from tensorrt_llm.runtime import Session, TensorInfo
 
 logger.set_level('info')
@@ -218,22 +218,24 @@ class TritonPythonModel:
 
             batch_size = img_tensor.shape[0]
             num_image = img_tensor.shape[1]
-            img_tensor = img_tensor.to(str_dtype_to_torch(
-                self.vision_dtype_str)).pin_memory()
+            img_tensor = maybe_pin_memory(
+                img_tensor.to(str_dtype_to_torch(self.vision_dtype_str)))
         else:
             batch_size = 1
             num_image = 0
         # TODO these should be refactored into a factory
         if self.model_type == 'mllama':
             if img_tensor is not None:
-                aspect_ratio_ids = from_dlpack(
-                    pb_utils.get_input_tensor_by_name(
-                        request, "aspect_ratio_ids").to_dlpack()).to(
-                            torch.int64).pin_memory()
-                aspect_ratio_mask = from_dlpack(
-                    pb_utils.get_input_tensor_by_name(
-                        request, "aspect_ratio_mask").to_dlpack()).to(
-                            torch.int64).pin_memory()
+                aspect_ratio_ids = maybe_pin_memory(
+                    from_dlpack(
+                        pb_utils.get_input_tensor_by_name(
+                            request,
+                            "aspect_ratio_ids").to_dlpack()).to(torch.int64))
+                aspect_ratio_mask = maybe_pin_memory(
+                    from_dlpack(
+                        pb_utils.get_input_tensor_by_name(
+                            request,
+                            "aspect_ratio_mask").to_dlpack()).to(torch.int64))
                 num_tiles = aspect_ratio_mask.shape[-1]
                 # Reshape img_tensor to [bs, num_image, num_tiles, ...]
                 if img_tensor is not None:
@@ -282,14 +284,14 @@ class TritonPythonModel:
                 input_tensors['input'].append(img_tensor)
 
         elif self.model_type == 'qwen2_vl':
-            image_grid_thw = from_dlpack(
-                pb_utils.get_input_tensor_by_name(
-                    request,
-                    "image_grid_thw").to_dlpack()).to(torch.int64).pin_memory()
-            attention_mask = from_dlpack(
-                pb_utils.get_input_tensor_by_name(
-                    request,
-                    "attention_mask").to_dlpack()).to(torch.int64).pin_memory()
+            image_grid_thw = maybe_pin_memory(
+                from_dlpack(
+                    pb_utils.get_input_tensor_by_name(
+                        request, "image_grid_thw").to_dlpack()).to(torch.int64))
+            attention_mask = maybe_pin_memory(
+                from_dlpack(
+                    pb_utils.get_input_tensor_by_name(
+                        request, "attention_mask").to_dlpack()).to(torch.int64))
             #remove dummy dim and reshape to 2D dim
             img_tensor = img_tensor.squeeze(1).squeeze(1)
             img_tensor = img_tensor.view(-1, img_tensor.shape[-1])

@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 InputDimT = Union[int, Tuple[int, int]]
@@ -594,7 +595,9 @@ class VisionTransformer(nn.Module):
         Call this function before forward pass
         """
         prompt_lens = seq_lengths
-        seq_lens = torch.tensor(seq_lengths, dtype=torch.int, pin_memory=True)
+        seq_lens = torch.tensor(seq_lengths,
+                                dtype=torch.int,
+                                pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.seq_lens = seq_lens
