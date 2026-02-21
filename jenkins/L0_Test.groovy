@@ -172,7 +172,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         }
 
         if (hasTimeoutTest || downloadResultSucceed) {
-            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml", stdioRetention: 'NONE')
         }
     }
 }
@@ -811,7 +811,8 @@ def getPytestBaseCommandLine(
     // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
-    extraInternalEnv += " NCCL_DEBUG=INFO"
+    // Temporarily disable to reduce the log size
+    // extraInternalEnv += " NCCL_DEBUG=INFO"
 
     // Container port allocation environment variables for avoiding port conflicts
     def portEnvVars = ""
@@ -829,7 +830,7 @@ def getPytestBaseCommandLine(
         portEnvVars,
         pytestUtil,
         "pytest",
-        "-vv",
+        "-v",
         testFilter[(DETAILED_LOG)] ? "-s" : "",
         "--timeout-method=thread",
         "--apply-test-list-correction",
@@ -1630,7 +1631,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
-            junit(testResults: "${stageName}/results*.xml")
+            junit(testResults: "${stageName}/results*.xml", stdioRetention: 'NONE')
         }
 
         // Clean up the workspace
@@ -2556,7 +2557,8 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt) {
                 "${test} SKIP (Reused from previous pipeline)"
             }.join('\n')
 
-            echo "Reused tests:\n${reusedTestsContent}"
+            // Temporarily disable to reduce the log size
+            // echo "Reused tests:\n${reusedTestsContent}"
 
             sh(label: "Append Reused Tests", script: """
 cat >> ${waivesTxt} << 'REUSED_TESTS_EOF'
