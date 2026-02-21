@@ -6,7 +6,6 @@
 Key Components:
 - FluxPosEmbed: Multi-axis rotary position embeddings (FLUX.1: 3-axis, FLUX.2: 4-axis)
 - get_1d_rotary_pos_embed: 1D rotary position embedding computation
-- prepare_flux_image_ids / prepare_flux_text_ids: Position ID helpers
 
 RoPE application uses the shared apply_rotary_emb from modules/attention.py.
 """
@@ -129,64 +128,3 @@ class FluxPosEmbed(nn.Module):
         freqs_sin = freqs_sin.unsqueeze(0).unsqueeze(2)
 
         return freqs_cos, freqs_sin
-
-
-def prepare_flux_image_ids(
-    height: int,
-    width: int,
-    patch_size: int = 2,
-    vae_scale_factor: int = 8,
-    device: torch.device = None,
-) -> torch.Tensor:
-    """Prepare position IDs for image latents in FLUX.
-
-    FLUX packs 2x2 patches, so the effective grid is (height/16, width/16).
-
-    Args:
-        height: Image height in pixels
-        width: Image width in pixels
-        patch_size: Packing patch size (default: 2)
-        vae_scale_factor: VAE spatial downsampling factor (default: 8)
-        device: Target device
-
-    Returns:
-        Position IDs tensor of shape (num_patches, 3) with columns [0, h_pos, w_pos]
-    """
-    # Compute latent dimensions after VAE and packing
-    latent_h = height // (vae_scale_factor * patch_size)
-    latent_w = width // (vae_scale_factor * patch_size)
-
-    # Create position grid
-    h_pos = torch.arange(latent_h, device=device)
-    w_pos = torch.arange(latent_w, device=device)
-
-    # Create meshgrid
-    h_grid, w_grid = torch.meshgrid(h_pos, w_pos, indexing="ij")
-
-    # Flatten and stack: (num_patches, 3)
-    # Column 0: text marker (0 for images)
-    # Column 1: height position
-    # Column 2: width position
-    img_ids = torch.zeros(latent_h * latent_w, 3, device=device)
-    img_ids[:, 1] = h_grid.flatten()
-    img_ids[:, 2] = w_grid.flatten()
-
-    return img_ids
-
-
-def prepare_flux_text_ids(
-    seq_len: int,
-    device: torch.device = None,
-) -> torch.Tensor:
-    """Prepare position IDs for text tokens in FLUX.
-
-    Text tokens have no spatial position, so all IDs are zeros.
-
-    Args:
-        seq_len: Text sequence length
-        device: Target device
-
-    Returns:
-        Position IDs tensor of shape (seq_len, 3) with all zeros
-    """
-    return torch.zeros(seq_len, 3, device=device)
