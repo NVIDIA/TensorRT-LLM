@@ -25,6 +25,9 @@
 #include <torch/types.h>
 #include <vector>
 
+// Forward declaration for NCCL device communicator (defined in moeAlltoAllKernels.cu)
+struct ncclDevComm;
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
@@ -52,10 +55,6 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
     MoeA2ADataOffsets offsets;
     size_t offset = 0;
 
-    // flag_val
-    offsets[FLAG_VAL_OFFSET_INDEX] = offset;
-    offset += SIZEOF_INT32;
-
     // local_token_counter
     offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX] = offset;
     offset += SIZEOF_INT32;
@@ -66,16 +65,6 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 
     // recv_counters
     offsets[RECV_COUNTERS_OFFSET_INDEX] = offset;
-    offset += epSize * SIZEOF_INT32;
-
-    // dispatch completion flags
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX] = offset;
-    offset += epSize * SIZEOF_INT32;
-
-    // combine completion flags
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[COMBINE_COMPLETION_FLAGS_OFFSET_INDEX] = offset;
     offset += epSize * SIZEOF_INT32;
 
     // topk_target_ranks: [maxNumTokens, kMaxTopK]
@@ -103,7 +92,7 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 }
 
 // Initialize auxiliary data in workspace
-// This function sets up the initial values for flag_val and completion_flags
+// This function sets up the initial workspace values and creates the NCCL device communicator
 //
 // Inputs:
 //   - workspace: [ep_size, size_per_rank] unified virtual memory workspace
@@ -114,6 +103,10 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 //
 // Returns:
 //   - metainfo: Tensor containing offsets for auxiliary data
+
+// Global storage for NCCL device communicator (persistent across dispatch/combine calls).
+static ncclDevComm* g_moeDevComm = nullptr;
+
 torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens,
     torch::optional<int64_t> eplbStatsNumExperts)
 {
@@ -142,9 +135,20 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
         metainfo[i] = static_cast<int64_t>(offsets[i]);
     }
 
-    // Synchronize among ranks
+    // Synchronize among ranks before NCCL initialization
     cudaDeviceSynchronize();
     tensorrt_llm::mpi::MpiComm::world().barrier();
+
+    // Create NCCL device communicator with 2 LSA barriers:
+    //   - Index 0: dispatch barrier (warp 0 of last-token CTA)
+    //   - Index 1: combine barrier (warp 0 of an elected CTA, other CTAs wait via local_token_counter)
+    // This is a collective call -- all EP ranks must participate.
+    if (g_moeDevComm == nullptr)
+    {
+        using tensorrt_llm::kernels::moe_comm::create_moe_nccl_dev_comm;
+        g_moeDevComm
+            = create_moe_nccl_dev_comm(static_cast<int>(epSize), static_cast<int>(epRank), /*num_lsa_barriers=*/2);
+    }
 
     return metainfo;
 }
@@ -186,6 +190,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_dispatch_launch;
+    using tensorrt_llm::kernels::moe_comm::moe_a2a_prepare_dispatch_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
     using tensorrt_llm::kernels::moe_comm::kMaxPayloads;
 
@@ -320,7 +325,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.num_payloads = num_payloads;
     std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), &params.payloads[0]);
 
-    params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
+    params.dev_comm = g_moeDevComm;
     params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
     params.send_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[SEND_COUNTERS_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
@@ -332,8 +337,6 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
         params.recv_counters[target_rank]
             = reinterpret_cast<int*>(targetWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
-        params.completion_flags[target_rank]
-            = reinterpret_cast<uint32_t*>(targetWorkSpacePtr + offsets[DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX]);
         if (enableEplb)
         {
             params.eplb_gathered_stats[target_rank]
@@ -362,7 +365,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     params.stream = at::cuda::getCurrentCUDAStream();
 
-    // Prepare for dispatch (zero counters/indices and increment flag_val)
+    // Prepare for dispatch (zero counters/indices)
     moe_a2a_prepare_dispatch_launch(params);
 
     // Launch the dispatch kernel
@@ -417,6 +420,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
+    using tensorrt_llm::kernels::moe_comm::moe_a2a_prepare_combine_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
 
     // Validate inputs
@@ -505,7 +509,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.elements_per_token = static_cast<int>(elementsPerToken);
     params.dtype = nvDtype;
 
-    params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
+    params.dev_comm = g_moeDevComm;
+    params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
     params.topk_send_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_SEND_INDICES_OFFSET_INDEX]);
     params.recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
@@ -513,8 +518,6 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     for (int target_rank = 0; target_rank < epSize; target_rank++)
     {
         uint8_t* target_workspace_ptr = workspacePtr + target_rank * workspace.stride(0);
-        params.completion_flags[target_rank]
-            = reinterpret_cast<uint32_t*>(target_workspace_ptr + offsets[COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]);
         params.recv_buffers[target_rank] = target_workspace_ptr + combinePayloadOffset;
     }
 
@@ -522,7 +525,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     moe_a2a_prepare_combine_launch(params);
 
-    // Launch the combine kernel
+    // Launch the combine kernel (includes per-CTA NCCL LSA barrier)
     moe_a2a_combine_launch(params);
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_combine kernel launch failed: ", cudaGetErrorString(result));
