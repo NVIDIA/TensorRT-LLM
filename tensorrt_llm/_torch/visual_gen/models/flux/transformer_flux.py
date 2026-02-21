@@ -735,8 +735,6 @@ class FluxTransformer2DModel(nn.Module):
             force_dynamic_quantization=force_dynamic_quant,
         )
 
-        self.gradient_checkpointing = False
-
         self.__post_init__()
 
     def __post_init__(self):

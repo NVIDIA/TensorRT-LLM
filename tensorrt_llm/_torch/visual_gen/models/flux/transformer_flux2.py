@@ -423,8 +423,6 @@ class Flux2Transformer2DModel(nn.Module):
     - Shared modulation layers for all blocks of same type
     """
 
-    _supports_gradient_checkpointing = True
-
     def __init__(self, model_config: "DiffusionModelConfig"):
         """Initialize FLUX.2 transformer.
 
@@ -644,8 +642,6 @@ class Flux2Transformer2DModel(nn.Module):
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
         )
-
-        self.gradient_checkpointing = False
 
         self.__post_init__()
 
