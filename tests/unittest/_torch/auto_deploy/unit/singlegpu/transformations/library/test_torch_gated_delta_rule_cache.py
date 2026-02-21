@@ -13,6 +13,7 @@ The stale-cache fix zeroes delta_cache tensors between phases because
 
 from typing import List, Optional
 
+import pytest
 import torch
 import torch.nn as nn
 from _torch_test_utils import all_close
@@ -64,6 +65,9 @@ class DummyFactory(ModelFactory):
 class GatedDeltaRuleModel(nn.Module):
     """Minimal model that projects embeddings through torch_gated_delta_rule.
 
+    Supports GVA: q/k use num_k_heads, v/g/beta use num_v_heads.
+    L2 normalization and repeat_interleave are handled inside the op.
+
     Architecture:
       input_ids -> embedding -> linear projections -> torch_gated_delta_rule -> output proj
     """
@@ -72,22 +76,24 @@ class GatedDeltaRuleModel(nn.Module):
         self,
         vocab_size: int,
         hidden_size: int,
-        num_heads: int,
+        num_k_heads: int,
+        num_v_heads: int,
         key_dim: int,
         value_dim: int,
     ):
         super().__init__()
-        self.num_heads = num_heads
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
         self.key_dim = key_dim
         self.value_dim = value_dim
 
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
-        self.q_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, num_heads * value_dim, bias=False)
-        self.g_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.beta_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.o_proj = nn.Linear(num_heads * value_dim, hidden_size, bias=False)
+        self.q_proj = nn.Linear(hidden_size, num_k_heads * key_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_k_heads * key_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_v_heads * value_dim, bias=False)
+        self.g_proj = nn.Linear(hidden_size, num_v_heads, bias=False)
+        self.beta_proj = nn.Linear(hidden_size, num_v_heads, bias=False)
+        self.o_proj = nn.Linear(num_v_heads * value_dim, hidden_size, bias=False)
 
     @torch.no_grad()
     def forward(
@@ -96,20 +102,17 @@ class GatedDeltaRuleModel(nn.Module):
         x = self.embed_tokens(input_ids)  # [B, S, hidden]
         b, s, _ = x.shape
 
-        q = self.q_proj(x).view(b, s, self.num_heads, self.key_dim)
-        k = self.k_proj(x).view(b, s, self.num_heads, self.key_dim)
-        v = self.v_proj(x).view(b, s, self.num_heads, self.value_dim)
-
-        # L2 normalize Q and K
-        q = torch.nn.functional.normalize(q, dim=-1)
-        k = torch.nn.functional.normalize(k, dim=-1)
+        q = self.q_proj(x).view(b, s, self.num_k_heads, self.key_dim)
+        k = self.k_proj(x).view(b, s, self.num_k_heads, self.key_dim)
+        v = self.v_proj(x).view(b, s, self.num_v_heads, self.value_dim)
 
         # g should be negative (decay), beta should be in (0, 1)
-        g = -torch.nn.functional.softplus(self.g_proj(x))  # [B, S, H]
-        beta = torch.sigmoid(self.beta_proj(x))  # [B, S, H]
+        g = -torch.nn.functional.softplus(self.g_proj(x))  # [B, S, HV]
+        beta = torch.sigmoid(self.beta_proj(x))  # [B, S, HV]
 
+        # L2 norm and GVA head expansion are handled inside the op
         attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q, k, v, g, beta)
-        # attn_out: [B, S, H, V]
+        # attn_out: [B, S, HV, V]
 
         attn_out = attn_out.reshape(b, s, -1)
         return self.o_proj(attn_out)
@@ -120,8 +123,9 @@ class GatedDeltaRuleModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 2), (2, 4)])
 @torch.inference_mode()
-def test_torch_gated_delta_rule_cache():
+def test_torch_gated_delta_rule_cache(num_k_heads, num_v_heads):
     """Test the insert_cached_gated_delta_rule transform with torch_gated_delta backend."""
     # Configuration
     dtype = torch.float32
@@ -131,7 +135,6 @@ def test_torch_gated_delta_rule_cache():
     seq_len = 16
     vocab_size = 100
     hidden_size = 32
-    num_heads = 2
     key_dim = 8
     value_dim = 8
     max_position_embeddings = 64
@@ -153,7 +156,8 @@ def test_torch_gated_delta_rule_cache():
     model = GatedDeltaRuleModel(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
-        num_heads=num_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
         key_dim=key_dim,
         value_dim=value_dim,
     ).to(dtype=dtype, device="cuda")

@@ -345,6 +345,9 @@ class SequenceInfo:
       Corresponds to the slot index of each sequence in the batch.
     - use_initial_states: [bool_0, bool_1, ..., bool_{b-1}]
       Per-sequence boolean indicating whether initial states should be used (True if input_pos > 0).
+    - any_prefill_use_initial_states: [bool]
+      Scalar boolean indicating whether any prefill sequence needs initial states. Precomputed on
+      the host to avoid GPU->CPU sync from torch.any() on the device tensor per layer.
     - batch_info: [num_prefill, num_prefill_tokens, num_decode]
       Batch metadata containing the number of prefill sequences, total prefill tokens, and number
       of decode sequences.
@@ -451,6 +454,7 @@ class SequenceInfo:
             ("last_page_len", self.max_batch_size, torch.int),
             ("slot_idx", self.max_batch_size, torch.long),
             ("use_initial_states", self.max_batch_size, torch.bool),
+            ("any_prefill_use_initial_states", 1, torch.bool),
             ("batch_info", 3, torch.int),
             ("logits_gather_indices", self.max_num_tokens, torch.long),
             ("logits_gather_info", 2, torch.int),
@@ -946,6 +950,14 @@ class SequenceInfo:
         if use_initial_states is None:
             use_initial_states = [i_p > 0 for i_p in self.input_pos]
         self._store_arg("use_initial_states", use_initial_states)
+
+        # precompute any(use_initial_states[:num_prefill]) on the host to avoid
+        # per-layer GPU->CPU sync from torch.any() inside cached ops
+        num_prefill = batch_info[0]
+        self._store_arg(
+            "any_prefill_use_initial_states",
+            [any(use_initial_states[:num_prefill])],
+        )
 
         # check for updated logits_gather_indices
         if logits_gather_indices is None:

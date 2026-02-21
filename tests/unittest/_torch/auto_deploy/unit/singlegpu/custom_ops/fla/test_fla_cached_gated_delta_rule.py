@@ -9,6 +9,7 @@ Covers:
 - Prefill with initial state: same as prefill but with ``use_initial_states=True``
   and non-zero initial cache, verifying the cache history is correctly loaded and
   passed to the kernel.
+- GVA (Grouped Value Attention): q/k have fewer heads than v/g/beta.
 """
 
 import pytest
@@ -30,21 +31,22 @@ def gdr_env():
     return {"device": device, "dtype": dtype}
 
 
-def _random_inputs(device, dtype, batch, seq, num_heads, key_dim, value_dim):
-    """Generate random gated delta rule inputs."""
-    q = torch.randn(batch, seq, num_heads, key_dim, device=device, dtype=dtype)
-    k = torch.randn(batch, seq, num_heads, key_dim, device=device, dtype=dtype)
-    v = torch.randn(batch, seq, num_heads, value_dim, device=device, dtype=dtype)
-    g = -torch.rand(batch, seq, num_heads, device=device, dtype=dtype)  # negative (decay)
-    beta = torch.sigmoid(torch.randn(batch, seq, num_heads, device=device, dtype=dtype))
+def _random_inputs(device, dtype, batch, seq, num_k_heads, num_v_heads, key_dim, value_dim):
+    """Generate random gated delta rule inputs.
 
-    # L2 normalize Q and K as the patched forward does
-    q = torch.nn.functional.normalize(q, dim=-1)
-    k = torch.nn.functional.normalize(k, dim=-1)
+    q/k have num_k_heads, v/g/beta have num_v_heads (GVA when num_v_heads > num_k_heads).
+    q/k are NOT L2-normalized here; normalization is handled inside the op.
+    """
+    q = torch.randn(batch, seq, num_k_heads, key_dim, device=device, dtype=dtype)
+    k = torch.randn(batch, seq, num_k_heads, key_dim, device=device, dtype=dtype)
+    v = torch.randn(batch, seq, num_v_heads, value_dim, device=device, dtype=dtype)
+    g = -torch.rand(batch, seq, num_v_heads, device=device, dtype=dtype)  # negative (decay)
+    beta = torch.sigmoid(torch.randn(batch, seq, num_v_heads, device=device, dtype=dtype))
     return q, k, v, g, beta
 
 
-def test_decode_only(gdr_env):
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 2), (2, 4)])
+def test_decode_only(gdr_env, num_k_heads, num_v_heads):
     """Decode-only: batch of single tokens through the cached op.
 
     Verifies output and cache state match fused_recurrent_gated_delta_rule_fwd
@@ -57,21 +59,23 @@ def test_decode_only(gdr_env):
 
     batch = 3
     seq = 1
-    num_heads = 2
     key_dim = 8
     value_dim = 8
     max_batch_size = 6
     scale = key_dim**-0.5
 
-    q, k, v, g, beta = _random_inputs(device, dtype, batch, seq, num_heads, key_dim, value_dim)
+    q, k, v, g, beta = _random_inputs(
+        device, dtype, batch, seq, num_k_heads, num_v_heads, key_dim, value_dim
+    )
 
     # Slot mapping with arbitrary order
     slot_idx = torch.tensor([4, 1, 3], device=device, dtype=torch.int32)
 
     # Initialize cache with random state (simulating existing history)
+    # Cache shape uses num_v_heads (HV), not num_k_heads
     delta_cache = torch.randn(
         max_batch_size,
-        num_heads,
+        num_v_heads,
         key_dim,
         value_dim,
         device=device,
@@ -101,31 +105,30 @@ def test_decode_only(gdr_env):
         scale,
     )
 
-    assert y.shape == (batch, seq, num_heads, value_dim)
+    assert y.shape == (batch, seq, num_v_heads, value_dim)
     assert torch.isfinite(y).all()
 
     # Reference: call fused_recurrent_gated_delta_rule_fwd directly
-    # The cached op internally does:
-    #   q_flat[num_prefill_tokens:, None] -> [num_decode, 1, H, K]
-    # So we reshape our inputs similarly
-    q_flat = q.view(batch, num_heads, -1)  # [B, H, K]
-    k_flat = k.view(batch, num_heads, -1)  # [B, H, K]
-    v_flat = v.view(batch, num_heads, -1)  # [B, H, V]
-    g_flat = g.view(batch, num_heads)  # [B, H]
-    beta_flat = beta.view(batch, num_heads)  # [B, H]
+    # q/k have num_k_heads, v/g/beta have num_v_heads
+    q_flat = q.view(batch, num_k_heads, -1)  # [B, Hg, K]
+    k_flat = k.view(batch, num_k_heads, -1)  # [B, Hg, K]
+    v_flat = v.view(batch, num_v_heads, -1)  # [B, HV, V]
+    g_flat = g.view(batch, num_v_heads)  # [B, HV]
+    beta_flat = beta.view(batch, num_v_heads)  # [B, HV]
 
     y_ref, final_state_ref = fused_recurrent_gated_delta_rule_fwd(
-        q=q_flat[:, None],  # [B, 1, H, K]
-        k=k_flat[:, None],  # [B, 1, H, K]
-        v=v_flat[:, None],  # [B, 1, H, V]
-        g=g_flat[:, None],  # [B, 1, H]
-        beta=beta_flat[:, None],  # [B, 1, H]
+        q=q_flat[:, None],  # [B, 1, Hg, K]
+        k=k_flat[:, None],  # [B, 1, Hg, K]
+        v=v_flat[:, None],  # [B, 1, HV, V]
+        g=g_flat[:, None],  # [B, 1, HV]
+        beta=beta_flat[:, None],  # [B, 1, HV]
         scale=scale,
         initial_state=gathered_before.clone(),
         output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
     )
 
-    # y_ref shape: [B, 1, H, V] -> compare against y: [B, 1, H, V]
+    # y_ref shape: [B, 1, HV, V] -> compare against y: [B, 1, HV, V]
     y_ref_reshaped = y_ref.to(dtype)
     torch.testing.assert_close(y, y_ref_reshaped, atol=atol, rtol=rtol)
 
@@ -139,7 +142,8 @@ def test_decode_only(gdr_env):
     )
 
 
-def test_prefill_only(gdr_env):
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 2), (2, 4)])
+def test_prefill_only(gdr_env, num_k_heads, num_v_heads):
     """Prefill-only: two sequences of different lengths, flattened.
 
     Verifies output and final state match per-sequence chunk_gated_delta_rule.
@@ -151,7 +155,6 @@ def test_prefill_only(gdr_env):
 
     seq_lens = [5, 3]
     total_tokens = sum(seq_lens)
-    num_heads = 2
     key_dim = 8
     value_dim = 8
     max_batch_size = 4
@@ -163,15 +166,17 @@ def test_prefill_only(gdr_env):
         dtype,
         1,
         total_tokens,
-        num_heads,
+        num_k_heads,
+        num_v_heads,
         key_dim,
         value_dim,
     )
 
     slot_idx = torch.tensor([2, 0], device=device, dtype=torch.int32)
+    # Cache shape uses num_v_heads
     delta_cache = torch.zeros(
         max_batch_size,
-        num_heads,
+        num_v_heads,
         key_dim,
         value_dim,
         device=device,
@@ -203,7 +208,7 @@ def test_prefill_only(gdr_env):
         scale,
     )
 
-    assert y.shape == (1, total_tokens, num_heads, value_dim)
+    assert y.shape == (1, total_tokens, num_v_heads, value_dim)
     assert torch.isfinite(y).all()
 
     # Reference: call chunk_gated_delta_rule per sequence
@@ -222,6 +227,7 @@ def test_prefill_only(gdr_env):
             scale=scale,
             initial_state=None,
             output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
         )
 
         y_ref[:, start:end] = y_seq.to(dtype)
@@ -237,7 +243,8 @@ def test_prefill_only(gdr_env):
     torch.testing.assert_close(y, y_ref, atol=atol, rtol=rtol)
 
 
-def test_prefill_with_initial_state(gdr_env):
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 2), (2, 4)])
+def test_prefill_with_initial_state(gdr_env, num_k_heads, num_v_heads):
     """Prefill with initial state: verifies cache history is correctly loaded.
 
     Sets use_initial_states=True and a non-zero initial cache, then checks that
@@ -250,20 +257,21 @@ def test_prefill_with_initial_state(gdr_env):
     rtol = 5e-3
 
     seq_len = 4
-    num_heads = 2
     key_dim = 8
     value_dim = 8
     max_batch_size = 2
     scale = key_dim**-0.5
 
-    q, k, v, g, beta = _random_inputs(device, dtype, 1, seq_len, num_heads, key_dim, value_dim)
+    q, k, v, g, beta = _random_inputs(
+        device, dtype, 1, seq_len, num_k_heads, num_v_heads, key_dim, value_dim
+    )
 
     slot_idx = torch.tensor([1], device=device, dtype=torch.int32)
 
-    # Non-zero initial state in cache
+    # Non-zero initial state in cache (uses num_v_heads)
     delta_cache = torch.randn(
         max_batch_size,
-        num_heads,
+        num_v_heads,
         key_dim,
         value_dim,
         device=device,
@@ -301,6 +309,7 @@ def test_prefill_with_initial_state(gdr_env):
         scale=scale,
         initial_state=initial_state.unsqueeze(0),
         output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
     )
 
     torch.testing.assert_close(y_with_init, y_ref.to(dtype), atol=atol, rtol=rtol)

@@ -16,8 +16,6 @@ model_kwargs:
 transforms:
   export_to_gm:
     num_moe_experts_for_export: 2
-  detect_sharding:
-    allreduce_strategy: SYMM_MEM
   multi_stream_moe:
     stage: compile
     enabled: true
