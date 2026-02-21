@@ -45,11 +45,11 @@ class LayerType(Enum):
 
 class LayerSubgraph(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    opening_nodes: List[Node]
-    subgraph_nodes: List[Node]
-    terminating_node: Union[Node, None]
     layer_type: LayerType
+    opening_nodes: List[Node]
+    terminating_node: Union[Node, None]
     min_local_shape: int = 1
+    subgraph_nodes: List[Node]
 
 
 class WeightNode(BaseModel):
