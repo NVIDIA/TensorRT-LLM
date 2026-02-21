@@ -1562,6 +1562,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
+        self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
@@ -1870,9 +1872,6 @@ class KVCacheManagerV2(BaseResourceManager):
                                  token_num_upper_bound: int,
                                  batch_size: int = 1,
                                  max_num_draft_tokens: int = 0) -> int:
-        if max_num_draft_tokens > 0:
-            raise ValueError(
-                "max_num_draft_tokens is not supported for KVCacheManagerV2")
         extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
@@ -1933,7 +1932,10 @@ class KVCacheManagerV2(BaseResourceManager):
                         success = kv_cache.resume(self._stream.cuda_stream)
                         assert success
 
-                        success = kv_cache.resize(req.prompt_len)
+                        num_draft_tokens = get_draft_token_length(req)
+                        success = kv_cache.resize(req.prompt_len +
+                                                  self.num_extra_kv_tokens +
+                                                  num_draft_tokens)
                         if not success:
                             raise ValueError(
                                 f"Failed to resize capacity of KV cache for request {req.py_request_id} to {req.prompt_len} tokens for context update"
@@ -1946,7 +1948,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
             for req in generation_batch:
                 kv_cache = self.kv_cache_map[req.py_request_id]
-                success = kv_cache.resize(kv_cache.capacity + 1)
+                num_draft_tokens = get_draft_token_length(req)
+                success = kv_cache.resize(kv_cache.capacity + 1 +
+                                          num_draft_tokens)
                 if not success:
                     raise ValueError(
                         f"Failed to resize capacity of KV cache for request {req.py_request_id} to {kv_cache.capacity + 1} tokens for generation update"
@@ -2036,7 +2040,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     self.free_resources(req)
                     return None
                 kv_cache.stop_committing()
-                success = kv_cache.resize(token_num)
+                success = kv_cache.resize(token_num + self.num_extra_kv_tokens)
                 if not success:
                     raise ValueError(
                         f"Failed to resize capacity of KV cache for request {req.py_request_id} to {token_num} tokens for dummy request"
@@ -2046,6 +2050,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
+                req.py_draft_tokens = [1] * max_num_draft_tokens
+                if prepare_resource:
+                    kv_cache = self.kv_cache_map[req.py_request_id]
+                    kv_cache.resize(kv_cache.capacity + max_num_draft_tokens)
+
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.add_dummy_requests(
+                            [req_id],
+                            token_nums=[token_num],
+                            is_gen=is_gen,
+                            prepare_resource=prepare_resource,
+                            max_num_draft_tokens=max_num_draft_tokens,
+                        )
 
             # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
             if use_mrope:
@@ -2269,6 +2286,28 @@ class KVCacheManagerV2(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
+        # TODO: Add update_kv_cache_draft_token_location for tree-based
+        # speculative decoding (e.g., EAGLE3 one-model with trees). For
+        # linear spec decoding (MTP one-model), accepted tokens are always
+        # sequential so no KV cache relocation is needed.
+
+        # Rewind KV cache for requests with rejected draft tokens.
+        # Skip:
+        # - GENERATION_COMPLETE: finished requests
+        # - CONTEXT_INIT: requests whose state was reset after being paused
+        #   with KV cache freed. With overlap scheduler, the scheduler pauses
+        #   a request and frees KV cache at iteration N, while the previous
+        #   batch (N-1) is still trying to update the KV cache after forward
+        #   pass.
+        for req in scheduled_batch.generation_requests:
+            if req.state in (LlmRequestState.GENERATION_COMPLETE,
+                             LlmRequestState.CONTEXT_INIT):
+                continue
+            if req.py_request_id not in self.kv_cache_map:
+                continue
+            if req.py_rewind_len > 0:
+                self.rewind_kv_cache(req, req.py_rewind_len)
+
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
@@ -2296,6 +2335,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise ValueError(
                     f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.max_beam_num_tokens - 1} tokens at generation update"
                 )
+
+    def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
+        """Rewind the KV cache by reducing capacity for rejected draft tokens."""
+        kv_cache = self.kv_cache_map[request.py_request_id]
+        new_capacity = kv_cache.capacity - rewind_len
+        kv_cache.resize(new_capacity)
 
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
