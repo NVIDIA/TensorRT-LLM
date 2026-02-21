@@ -4,6 +4,243 @@
    :end-before: .. end-note-traffic-patterns
 .. end-config-table-note
 
+.. start-Qwen/Qwen3-235B-A22B
+
+.. _Qwen/Qwen3-235B-A22B:
+
+`Qwen3-235B-A22B <https://huggingface.co/Qwen/Qwen3-235B-A22B>`_
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. list-table::
+   :width: 100%
+   :header-rows: 1
+   :widths: 12 15 15 13 20 25
+
+   * - GPU
+     - Performance Profile
+     - ISL / OSL
+     - Concurrency
+     - Config
+     - Command
+   * - GB200
+     - Low Latency
+     - 1024 / 8192
+     - 4
+     - `1k8k_tp1_conc4.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp1_conc4.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp1_conc4.yaml``
+   * - 4xGB200
+     - Min Latency
+     - 1024 / 1024
+     - 1
+     - `1k1k_tp4_conc1.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp4_conc1.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp4_conc1.yaml``
+   * - 4xGB200
+     - Balanced
+     - 1024 / 1024
+     - 2
+     - `1k1k_tp4_conc2.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp4_conc2.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp4_conc2.yaml``
+   * - 4xGB200
+     - Balanced
+     - 1024 / 1024
+     - 4
+     - `1k1k_tp4_conc4.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp4_conc4.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp4_conc4.yaml``
+   * - 4xGB200
+     - Max Throughput
+     - 1024 / 1024
+     - 8
+     - `1k1k_tp4_conc8.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp4_conc8.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp4_conc8.yaml``
+   * - 4xGB200
+     - Min Latency
+     - 1024 / 8192
+     - 1
+     - `1k8k_tp4_conc1.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp4_conc1.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp4_conc1.yaml``
+   * - 4xGB200
+     - Balanced
+     - 1024 / 8192
+     - 2
+     - `1k8k_tp4_conc2.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp4_conc2.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp4_conc2.yaml``
+   * - 4xGB200
+     - Balanced
+     - 1024 / 8192
+     - 8
+     - `1k8k_tp4_conc8.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp4_conc8.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp4_conc8.yaml``
+   * - 4xGB200
+     - Max Throughput
+     - 1024 / 8192
+     - 16
+     - `1k8k_tp4_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp4_conc16.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp4_conc16.yaml``
+   * - 4xGB200
+     - Min Latency
+     - 8192 / 1024
+     - 1
+     - `8k1k_tp4_conc1.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp4_conc1.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp4_conc1.yaml``
+   * - 4xGB200
+     - Balanced
+     - 8192 / 1024
+     - 2
+     - `8k1k_tp4_conc2.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp4_conc2.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp4_conc2.yaml``
+   * - 4xGB200
+     - Balanced
+     - 8192 / 1024
+     - 4
+     - `8k1k_tp4_conc4.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp4_conc4.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp4_conc4.yaml``
+   * - 4xGB200
+     - Max Throughput
+     - 8192 / 1024
+     - 8
+     - `8k1k_tp4_conc8.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp4_conc8.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp4_conc8.yaml``
+   * - 8xGB200
+     - Min Latency
+     - 1024 / 1024
+     - 16
+     - `1k1k_tp8_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc16.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc16.yaml``
+   * - 8xGB200
+     - Low Latency
+     - 1024 / 1024
+     - 32
+     - `1k1k_tp8_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc32.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc32.yaml``
+   * - 8xGB200
+     - Low Latency
+     - 1024 / 1024
+     - 64
+     - `1k1k_tp8_conc64.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc64.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc64.yaml``
+   * - 8xGB200
+     - Balanced
+     - 1024 / 1024
+     - 128
+     - `1k1k_tp8_conc128.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc128.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc128.yaml``
+   * - 8xGB200
+     - Balanced
+     - 1024 / 1024
+     - 256
+     - `1k1k_tp8_conc256.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc256.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc256.yaml``
+   * - 8xGB200
+     - High Throughput
+     - 1024 / 1024
+     - 512
+     - `1k1k_tp8_conc512.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc512.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc512.yaml``
+   * - 8xGB200
+     - High Throughput
+     - 1024 / 1024
+     - 1024
+     - `1k1k_tp8_conc1024.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc1024.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc1024.yaml``
+   * - 8xGB200
+     - Max Throughput
+     - 1024 / 1024
+     - 2048
+     - `1k1k_tp8_conc2048.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc2048.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k1k_tp8_conc2048.yaml``
+   * - 8xGB200
+     - Min Latency
+     - 1024 / 8192
+     - 32
+     - `1k8k_tp8_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc32.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc32.yaml``
+   * - 8xGB200
+     - Low Latency
+     - 1024 / 8192
+     - 64
+     - `1k8k_tp8_conc64.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc64.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc64.yaml``
+   * - 8xGB200
+     - Low Latency
+     - 1024 / 8192
+     - 128
+     - `1k8k_tp8_conc128.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc128.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc128.yaml``
+   * - 8xGB200
+     - Balanced
+     - 1024 / 8192
+     - 256
+     - `1k8k_tp8_conc256.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc256.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc256.yaml``
+   * - 8xGB200
+     - High Throughput
+     - 1024 / 8192
+     - 512
+     - `1k8k_tp8_conc512.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc512.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc512.yaml``
+   * - 8xGB200
+     - High Throughput
+     - 1024 / 8192
+     - 1024
+     - `1k8k_tp8_conc1024.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc1024.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc1024.yaml``
+   * - 8xGB200
+     - Max Throughput
+     - 1024 / 8192
+     - 2048
+     - `1k8k_tp8_conc2048.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc2048.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/1k8k_tp8_conc2048.yaml``
+   * - 8xGB200
+     - Min Latency
+     - 8192 / 1024
+     - 16
+     - `8k1k_tp8_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc16.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc16.yaml``
+   * - 8xGB200
+     - Low Latency
+     - 8192 / 1024
+     - 32
+     - `8k1k_tp8_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc32.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc32.yaml``
+   * - 8xGB200
+     - Low Latency
+     - 8192 / 1024
+     - 64
+     - `8k1k_tp8_conc64.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc64.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc64.yaml``
+   * - 8xGB200
+     - Balanced
+     - 8192 / 1024
+     - 128
+     - `8k1k_tp8_conc128.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc128.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc128.yaml``
+   * - 8xGB200
+     - Balanced
+     - 8192 / 1024
+     - 256
+     - `8k1k_tp8_conc256.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc256.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc256.yaml``
+   * - 8xGB200
+     - High Throughput
+     - 8192 / 1024
+     - 512
+     - `8k1k_tp8_conc512.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc512.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc512.yaml``
+   * - 8xGB200
+     - High Throughput
+     - 8192 / 1024
+     - 1024
+     - `8k1k_tp8_conc1024.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc1024.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc1024.yaml``
+   * - 8xGB200
+     - Max Throughput
+     - 8192 / 1024
+     - 2048
+     - `8k1k_tp8_conc2048.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc2048.yaml>`_
+     - ``trtllm-serve Qwen/Qwen3-235B-A22B --config ${TRTLLM_DIR}/examples/configs/database/Qwen/Qwen3-235B-A22B/GB200/8k1k_tp8_conc2048.yaml``
+
+.. end-Qwen/Qwen3-235B-A22B
+
 .. start-deepseek-ai/DeepSeek-R1-0528
 
 .. _deepseek-ai/DeepSeek-R1-0528:

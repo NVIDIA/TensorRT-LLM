@@ -117,6 +117,55 @@ llm_config_database:
 - condition:
     wildcards:
       gpu:
+      - '*gb200*'
+      cpu: aarch64
+      linux_distribution_name: ubuntu*
+    ranges:
+      system_gpu_count:
+        gte: 1
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_8192_conc4_gpu1]
+- condition:
+    wildcards:
+      gpu:
+      - '*gb200*'
+      cpu: aarch64
+      linux_distribution_name: ubuntu*
+    ranges:
+      system_gpu_count:
+        gte: 4
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_1024_conc1_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_1024_conc2_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_1024_conc8_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_8192_conc1_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_8192_conc2_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_8192_conc16_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_8192_1024_conc1_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_8192_1024_conc2_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_8192_1024_conc8_gpu4]
+- condition:
+    wildcards:
+      gpu:
+      - '*gb200*'
+      cpu: aarch64
+      linux_distribution_name: ubuntu*
+    ranges:
+      system_gpu_count:
+        gte: 8
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_1024_conc16_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_1024_conc128_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_1024_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_8192_conc32_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_8192_conc256_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_1024_8192_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_8192_1024_conc16_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_8192_1024_conc128_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-Qwen_Qwen3_235B_A22B_8192_1024_conc2048_gpu8]
+- condition:
+    wildcards:
+      gpu:
       - '*h200*'
       cpu: x86_64
       linux_distribution_name: ubuntu*
