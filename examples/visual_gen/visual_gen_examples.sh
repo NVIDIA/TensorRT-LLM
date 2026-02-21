@@ -232,6 +232,56 @@ python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_wan_i2v.py \
     --guidance_scale_2 5.0 \
     --boundary_ratio 0.85
 
+#############################################
+# FLUX.1 Text-to-Image Examples
+#############################################
+
+echo ""
+echo "=== FLUX.1 Example 1: Baseline ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_flux.py \
+    --height 1024 \
+    --width 1024 \
+    --prompt "A cat holding a sign that says hello world" \
+    --output_path flux1_cat_sign.png \
+    --model_path ${MODEL_ROOT}/FLUX.1-dev/ \
+    --guidance_scale 3.5
+
+echo ""
+echo "=== FLUX.1 Example 2: With FP8 Quantization ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_flux.py \
+    --height 1024 \
+    --width 1024 \
+    --prompt "A cat holding a sign that says hello world" \
+    --output_path flux1_cat_sign_fp8.png \
+    --model_path ${MODEL_ROOT}/FLUX.1-dev/ \
+    --guidance_scale 3.5 \
+    --linear_type trtllm-fp8-per-tensor
+
+#############################################
+# FLUX.2 Text-to-Image Examples
+#############################################
+
+echo ""
+echo "=== FLUX.2 Example 1: Baseline ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_flux.py \
+    --height 1024 \
+    --width 1024 \
+    --prompt "A cat holding a sign that says hello world" \
+    --output_path flux2_cat_sign.png \
+    --model_path ${MODEL_ROOT}/FLUX.2-dev/ \
+    --guidance_scale 4.0
+
+echo ""
+echo "=== FLUX.2 Example 2: With TeaCache ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_flux.py \
+    --height 1024 \
+    --width 1024 \
+    --prompt "A cat holding a sign that says hello world" \
+    --output_path flux2_cat_sign_teacache.png \
+    --model_path ${MODEL_ROOT}/FLUX.2-dev/ \
+    --guidance_scale 4.0 \
+    --enable_teacache
+
 echo ""
 echo "============================================"
 echo "All examples completed successfully!"

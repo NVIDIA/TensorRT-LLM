@@ -78,7 +78,7 @@ echo ""
 #############################################
 
 echo "============================================"
-echo "1/1: WAN Baseline Test"
+echo "1/3: WAN Baseline Test"
 echo "============================================"
 echo ""
 
@@ -102,6 +102,70 @@ if [ -d "$WAN_MODEL" ]; then
     echo "   Output: $WAN_OUTPUT"
 else
     echo "⚠️  SKIPPED: WAN model not found at $WAN_MODEL"
+fi
+
+echo ""
+
+#############################################
+# FLUX.1 Baseline Test
+#############################################
+
+echo "============================================"
+echo "2/3: FLUX.1 Baseline Test"
+echo "============================================"
+echo ""
+
+FLUX1_MODEL="${MODEL_ROOT}/FLUX.1-dev/"
+FLUX1_OUTPUT="${OUTPUT_DIR}/flux1_baseline.png"
+
+if [ -d "$FLUX1_MODEL" ]; then
+    echo "Testing FLUX.1 with official diffusers..."
+    python ${PROJECT_ROOT}/examples/visual_gen/hf_flux.py \
+        --model_path "$FLUX1_MODEL" \
+        --output_path "$FLUX1_OUTPUT" \
+        --prompt "A cat holding a sign that says hello world" \
+        --height 1024 \
+        --width 1024 \
+        --steps 50 \
+        --guidance_scale 3.5 \
+        --seed 42
+    echo ""
+    echo "✅ FLUX.1 baseline test completed"
+    echo "   Output: $FLUX1_OUTPUT"
+else
+    echo "⚠️  SKIPPED: FLUX.1 model not found at $FLUX1_MODEL"
+fi
+
+echo ""
+
+#############################################
+# FLUX.2 Baseline Test
+#############################################
+
+echo "============================================"
+echo "3/3: FLUX.2 Baseline Test"
+echo "============================================"
+echo ""
+
+FLUX2_MODEL="${MODEL_ROOT}/FLUX.2-dev/"
+FLUX2_OUTPUT="${OUTPUT_DIR}/flux2_baseline.png"
+
+if [ -d "$FLUX2_MODEL" ]; then
+    echo "Testing FLUX.2 with official diffusers..."
+    python ${PROJECT_ROOT}/examples/visual_gen/hf_flux2.py \
+        --model_path "$FLUX2_MODEL" \
+        --output_path "$FLUX2_OUTPUT" \
+        --prompt "A cat holding a sign that says hello world" \
+        --height 1024 \
+        --width 1024 \
+        --steps 50 \
+        --guidance_scale 3.5 \
+        --seed 42
+    echo ""
+    echo "✅ FLUX.2 baseline test completed"
+    echo "   Output: $FLUX2_OUTPUT"
+else
+    echo "⚠️  SKIPPED: FLUX.2 model not found at $FLUX2_MODEL"
 fi
 
 echo ""

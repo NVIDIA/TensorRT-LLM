@@ -2,7 +2,7 @@
 
 Follows: DiffusionArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
 
-All pipelines (Wan, Flux2, LTX2) register via @register_pipeline decorator.
+All pipelines (Wan, Flux, Flux2, LTX2) register via @register_pipeline decorator.
 """
 
 import json
@@ -83,6 +83,9 @@ class AutoPipeline:
             # Generic Wan (T2V)
             if "Wan" in class_name:
                 return "WanPipeline"
+            # Check FLUX.2 before FLUX.1 (more specific match first)
+            if "Flux2" in class_name:
+                return "Flux2Pipeline"
             if "Flux" in class_name:
                 return "FluxPipeline"
             if "LTX" in class_name or "Ltx" in class_name:

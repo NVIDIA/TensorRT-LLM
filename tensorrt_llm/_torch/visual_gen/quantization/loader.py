@@ -61,7 +61,7 @@ class DynamicLinearWeightLoader:
         weights_config = getattr(module, "weights_loading_config", None)
         if weights_config is not None:
             weight_mode = getattr(weights_config, "weight_mode", None)
-            if weight_mode == WeightMode.FUSED_QKV_LINEAR:
+            if weight_mode in (WeightMode.FUSED_QKV_LINEAR, WeightMode.FUSED_GATE_UP_LINEAR):
                 fused_names = self._get_fused_names(full_name)
                 return self._get_fused_weights(full_name, weights, fused_names)
 
@@ -88,7 +88,7 @@ class DynamicLinearWeightLoader:
     def _get_fused_names(self, full_name: str) -> List[str]:
         """Get checkpoint names for a fused module from params_map."""
         for suffix, names in self.params_map.items():
-            if full_name.endswith(suffix):
+            if full_name == suffix or full_name.endswith("." + suffix):
                 return names
         raise ValueError(
             f"No params_map entry for fused module '{full_name}'. "
