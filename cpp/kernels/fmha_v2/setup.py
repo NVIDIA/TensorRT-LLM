@@ -1728,7 +1728,7 @@ void {launcher_name}(
         size_t m_steps = size_t((params.s + {loop_step} * NUM_COMPUTE_GROUPS - 1) / ({loop_step} * NUM_COMPUTE_GROUPS));
 
         // 2 * {bytes_per_elt} stands for kv cache and {bytes_per_elt} bytes per element.
-        size_t size_in_bytes = block_size.y * params.s * params.d * 2 * {bytes_per_elt};
+        size_t size_in_bytes = static_cast<size_t>(block_size.y) * params.s * params.d * 2 * {bytes_per_elt};
         if( size_in_bytes <= launch_params.device_l2_cache_size ) {{
             // strategy 1: limit to only 1 wave
             block_size.x = std::min(m_steps, sms_per_head);
@@ -1745,7 +1745,7 @@ void {launcher_name}(
         params.num_tiles = static_cast<uint32_t>(m_steps * params.b * params.h);
         if (launch_params.attention_mask_type == Attention_mask_type::CAUSAL) {{
             // 2 * {bytes_per_elt} stands for kv cache and {bytes_per_elt} bytes per element.
-            size_t size_in_bytes = params.b * params.h * params.s * params.d * 2 * {bytes_per_elt};
+            size_t size_in_bytes = static_cast<size_t>(params.b) * params.h * params.s * params.d * 2 * {bytes_per_elt};
             params.use_balanced_scheduling = (size_in_bytes <= launch_params.device_l2_cache_size);
         }}
 
