@@ -776,7 +776,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     @staticmethod
     def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
         """Return (yaml_extra paths, world_size) from model registry."""
-        registry_path = (pathlib.Path(__file__).resolve().parents[4] /
+        registry_path = (Path(__file__).resolve().parents[4] /
                          "examples/auto_deploy/model_registry")
         with open(registry_path / "models.yaml") as f:
             registry = yaml.safe_load(f)
