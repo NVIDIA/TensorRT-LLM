@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
@@ -36,6 +37,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     _remap_checkpoint_keys,
 )
 from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 if TYPE_CHECKING:
@@ -799,11 +801,6 @@ class Flux2Transformer2DModel(nn.Module):
         Args:
             weights: Dictionary of parameter name -> tensor (from safetensors)
         """
-        from tqdm import tqdm
-
-        from tensorrt_llm._torch.modules.linear import Linear
-        from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-
         # Remap HF checkpoint keys to our module attribute names
         weights = _remap_checkpoint_keys(weights)
         # Remap FLUX.2 FFN keys (linear_out -> down_proj)

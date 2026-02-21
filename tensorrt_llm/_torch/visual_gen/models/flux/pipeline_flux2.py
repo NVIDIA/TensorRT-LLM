@@ -23,6 +23,7 @@ import os
 import time
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
@@ -348,8 +349,6 @@ class Flux2Pipeline(BasePipeline):
         # Prepare timesteps with dynamic shifting
         # Use explicit linear sigmas (matches HF diffusers exactly)
         # This is critical for step-distilled models like FLUX.2-klein
-        import numpy as np
-
         image_seq_len = latents.shape[1]
         mu = compute_empirical_mu(image_seq_len, num_inference_steps)
         sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
