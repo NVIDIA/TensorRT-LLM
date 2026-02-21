@@ -54,25 +54,28 @@ def fla_cached_gated_delta_rule(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     #
     # CACHES
-    delta_cache: torch.Tensor,  # [max_batch_size, H, K, V]
+    delta_cache: torch.Tensor,  # [max_batch_size, HV, K, V]
     # CONSTANTS
     scale: float,
 ) -> torch.Tensor:
-    b, s, num_heads, _ = q.shape
+    b, s, num_k_heads, _ = q.shape
+    num_v_heads = v.shape[2]
 
     # flatten batch and sequence dims
-    q_flat = q.view(b * s, num_heads, -1)
-    k_flat = k.view(b * s, num_heads, -1)
-    v_flat = v.view(b * s, num_heads, -1)
-    g_flat = g.view(b * s, num_heads)
-    beta_flat = beta.view(b * s, num_heads)
+    # q/k have num_k_heads (Hg), v/g/beta have num_v_heads (HV) for GVA
+    q_flat = q.view(b * s, num_k_heads, -1)
+    k_flat = k.view(b * s, num_k_heads, -1)
+    v_flat = v.view(b * s, num_v_heads, -1)
+    g_flat = g.view(b * s, num_v_heads)
+    beta_flat = beta.view(b * s, num_v_heads)
 
-    # pre-allocate output
+    # pre-allocate output (same shape as v: [B, S, HV, V])
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
-    y_flat = y.view(b * s, num_heads, -1)
+    y_flat = y.view(b * s, num_v_heads, -1)
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
@@ -84,7 +87,8 @@ def fla_cached_gated_delta_rule(
 
     if num_prefill > 0:
         initial_states = None
-        if torch.any(use_initial_states[:num_prefill]):
+        # Use precomputed host flag to avoid GPU->CPU sync from torch.any()
+        if any_prefill_use_initial_states_host.item():
             initial_states = torch.where(
                 use_initial_states[:num_prefill, None, None, None],
                 delta_cache[slot_idx[:num_prefill]],
@@ -101,6 +105,7 @@ def fla_cached_gated_delta_rule(
             initial_state=initial_states,
             output_final_state=True,
             cu_seqlens=cu_seqlen_prefill,
+            use_qk_l2norm_in_kernel=True,
         )
 
         y_flat[None, :num_prefill_tokens] = y_prefill.to(y_flat.dtype)
@@ -121,6 +126,7 @@ def fla_cached_gated_delta_rule(
             scale=scale,
             initial_state_source=delta_cache,
             initial_state_indices=slot_idx[num_prefill:].contiguous(),
+            use_qk_l2norm_in_kernel=True,
             cu_seqlens=cu_seqlen_decode,
         )
 
@@ -144,6 +150,7 @@ def fla_cached_gated_delta_rule_fake(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     #
     # CACHES
@@ -175,7 +182,13 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info_host", "cu_seqlen", "slot_idx", "use_initial_states"]
+        return [
+            "batch_info_host",
+            "cu_seqlen",
+            "slot_idx",
+            "use_initial_states",
+            "any_prefill_use_initial_states_host",
+        ]
 
     @classmethod
     def get_cache_initializers(
@@ -183,7 +196,10 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
     ) -> ResourceHandlerDict:
         key_node = source_attn_node.args[1]
         value_node = source_attn_node.args[2]
-        num_heads = key_node.meta["val"].shape[-2]
+        # Cache shape is [max_batch_size, HV, K, V] where HV = num_v_heads.
+        # With GVA, q/k may have fewer heads (Hg) than v (HV), so read
+        # num_heads from value_node to get the correct cache dimension.
+        num_heads = value_node.meta["val"].shape[-2]
         key_dim = key_node.meta["val"].shape[-1]
         value_dim = value_node.meta["val"].shape[-1]
         key_dtype = key_node.meta["val"].dtype

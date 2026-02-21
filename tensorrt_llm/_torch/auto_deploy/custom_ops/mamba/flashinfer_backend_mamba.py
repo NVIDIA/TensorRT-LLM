@@ -43,6 +43,7 @@ def _flashinfer_cached_ssm(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     chunk_indices: torch.Tensor,  # [num_logical_chunks]
     chunk_offsets: torch.Tensor,  # [num_logical_chunks]
@@ -81,6 +82,7 @@ def _flashinfer_cached_ssm(
         cu_seqlen,
         slot_idx,
         use_initial_states,
+        any_prefill_use_initial_states_host,
         chunk_indices,
         chunk_offsets,
         seq_idx_prefill,
@@ -164,6 +166,7 @@ def _flashinfer_cached_ssm_fake(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     chunk_indices: torch.Tensor,  # [num_logical_chunks]
     chunk_offsets: torch.Tensor,  # [num_logical_chunks]

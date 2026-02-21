@@ -33,6 +33,13 @@ import torch
 import torch.nn.functional as F
 
 
+def _l2_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """L2 normalize along the last dimension."""
+    x_f32 = x.float()
+    s = (x_f32 * x_f32).sum(dim=-1, keepdim=True)
+    return (x_f32 * torch.rsqrt(s + eps)).to(x.dtype)
+
+
 def _torch_chunk_gated_delta_rule_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -47,8 +54,8 @@ def _torch_chunk_gated_delta_rule_impl(
     Adapted from HF transformers v4.57.1 modeling_qwen3_next.py `torch_chunk_gated_delta_rule`.
 
     Args:
-        query: [B, H, S, K] - query states (already l2-normalized externally)
-        key:   [B, H, S, K] - key states (already l2-normalized externally)
+        query: [B, H, S, K] - query states (already l2-normalized and head-expanded)
+        key:   [B, H, S, K] - key states (already l2-normalized and head-expanded)
         value: [B, H, S, V] - value states
         g:     [B, H, S]    - gating/decay values (negative log-space)
         beta:  [B, H, S]    - beta scaling values (sigmoid-activated)
@@ -143,18 +150,35 @@ def torch_gated_delta_rule(
     """Gated Delta Rule custom op for linear attention (torch reference implementation).
 
     All inputs use the autodeploy [B, S, H, D] (bsnd) layout convention.
+    L2 normalization is applied internally to q and k.
+    GVA (Grouped Value Attention) is supported: q/k may have fewer heads than v/g/beta,
+    in which case q/k are repeat-interleaved to match v's head count.
 
     Args:
-        q:    [B, S, H, K] - query states (should be l2-normalized before calling)
-        k:    [B, S, H, K] - key states (should be l2-normalized before calling)
-        v:    [B, S, H, V] - value states
-        g:    [B, S, H]    - gating/decay values
-        beta: [B, S, H]    - beta scaling values
+        q:    [B, S, Hg, K] - query states (raw, will be l2-normalized internally)
+        k:    [B, S, Hg, K] - key states (raw, will be l2-normalized internally)
+        v:    [B, S, H, V]  - value states
+        g:    [B, S, H]     - gating/decay values
+        beta: [B, S, H]     - beta scaling values
         scale: optional query scaling factor (defaults to K^-0.5)
 
     Returns:
         output: [B, S, H, V]
     """
+    # L2 normalize q and k
+    q = _l2_normalize(q)
+    k = _l2_normalize(k)
+
+    # Expand q/k heads to match v's head count (GVA)
+    num_k_heads = q.shape[2]
+    num_v_heads = v.shape[2]
+    if num_v_heads > num_k_heads:
+        assert num_v_heads % num_k_heads == 0, (
+            f"num_v_heads ({num_v_heads}) must be divisible by num_k_heads ({num_k_heads})"
+        )
+        q = q.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        k = k.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+
     # Transpose from bsnd -> bhsd for internal computation
     q_t = q.transpose(1, 2)
     k_t = k.transpose(1, 2)
@@ -177,4 +201,5 @@ def torch_gated_delta_rule_fake(
     beta: torch.Tensor,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
+    # Output shape is [B, S, H, V] matching v (not q/k which may have fewer heads)
     return torch.empty_like(v)
