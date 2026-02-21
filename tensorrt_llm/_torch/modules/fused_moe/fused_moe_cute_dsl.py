@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -325,6 +326,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         CuteDslFusedMoE supports:
         - NVFP4: SM in {100, 103}
+        - FP8_BLOCK_SCALES: SM in {100, 103}
 
         Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
         Does NOT support gptoss_style (bias/swiglu with custom alpha/beta/limit).
@@ -371,6 +373,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             if sm_version not in {100, 103}:
                 return _warn_and_return(
                     f"NVFP4 requires SM100 or SM103, got SM{sm_version}")
+            return True, None
+        # FP8_BLOCK_SCALES - SM in {100, 103}
+        if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            if sm_version not in {100, 103}:
+                return _warn_and_return(
+                    f"FP8_BLOCK_SCALES cute_dsl backend requires SM100 or SM103, got SM{sm_version}"
+                )
             return True, None
 
         return _warn_and_return(
@@ -638,6 +647,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
+        assert is_sm_100f()
         weight_dtype = self.w3_w1_weight.dtype
 
         (
@@ -666,22 +676,42 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             use_fp8_block_scaling=True,
         )
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        x = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=x,
-            b=self.w3_w1_weight.view(weight_dtype),
-            a_sf=x_sf,
-            b_sf=self.quant_scales[0],
-            offset_array=expert_first_token_offset,
-        )
+        use_cute_dsl = os.environ.get(
+            "TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM", "0") == "1"
+        if use_cute_dsl:
+            x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+                input=x,
+                weight=self.w3_w1_weight.view(weight_dtype),
+                input_scale=x_sf,
+                weight_scale=self.quant_scales[0],
+                group_offset=expert_first_token_offset,
+            )
+        else:
+            x = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=x,
+                b=self.w3_w1_weight.view(weight_dtype),
+                a_sf=x_sf,
+                b_sf=self.quant_scales[0],
+                offset_array=expert_first_token_offset,
+            )
         x = swiglu_fused_moe(x)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        x = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=x,
-            b=self.w2_weight.view(weight_dtype),
-            a_sf=x_sf,
-            b_sf=self.quant_scales[1],
-            offset_array=expert_first_token_offset,
-        )
+        if use_cute_dsl:
+            x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+                input=x,
+                weight=self.w2_weight.view(weight_dtype),
+                input_scale=x_sf,
+                weight_scale=self.quant_scales[1],
+                group_offset=expert_first_token_offset,
+            )
+        else:
+            x = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=x,
+                b=self.w2_weight.view(weight_dtype),
+                a_sf=x_sf,
+                b_sf=self.quant_scales[1],
+                offset_array=expert_first_token_offset,
+            )
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases
