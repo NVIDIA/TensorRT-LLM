@@ -534,10 +534,10 @@ def flashinfer_mla_with_cache(
     # Append to paged cache using FlashInfer's append function
     # Note: caches are guaranteed contiguous by CachedSequenceInterface._create_kv_cache_manager
     flashinfer.page.append_paged_mla_kv_cache(
-        compressed_kv_flat,
-        kpe_flat,
-        flashinfer_batch_indices,
-        flashinfer_positions,
+        compressed_kv_flat[:num_total_tokens],
+        kpe_flat[:num_total_tokens],
+        flashinfer_batch_indices[:num_total_tokens],
+        flashinfer_positions[:num_total_tokens],
         ckv_cache,
         kpe_cache,
         cache_loc,
@@ -756,6 +756,15 @@ def flashinfer_mla_with_cache(
             y[num_prefill_tokens:num_total_tokens] = y_decode
         else:
             y = y_decode
+
+    # piecewise bucket padding can make b*s > num_total_tokens.
+    # pad/truncate output to [b*s, ...] before view so padded slots are deterministic.
+    if y.shape[0] < bs:
+        y_padded = torch.zeros((bs, y.shape[1], y.shape[2]), dtype=y.dtype, device=y.device)
+        y_padded[: y.shape[0]] = y
+        y = y_padded
+    elif num_total_tokens < bs:
+        y[num_total_tokens:].zero_()
 
     return y.view(b, s, num_heads, v_head_dim)
 
