@@ -17,8 +17,8 @@ from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
 from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
-from ..speculative.mtp import SampleStateTensorsMTP
 from .drafter import Drafter
+from .spec_sampler_base import SampleStateTensorsSpec
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DecodingBaseConfig
@@ -524,9 +524,9 @@ class ModelDrafter(Drafter):
     def _initialize_draft_tokens_for_target_inputs(
         self,
         scheduled_batch: ScheduledRequests,
-        target_inputs: Optional[SampleStateTensorsMTP] = None,
+        target_inputs: Optional[SampleStateTensorsSpec] = None,
         num_accepted_tokens_device: Optional[torch.Tensor] = None
-    ) -> Optional[SampleStateTensorsMTP]:
+    ) -> Optional[SampleStateTensorsSpec]:
         """
         Convert tensors for draft model processing.
 
@@ -535,7 +535,7 @@ class ModelDrafter(Drafter):
             new_tensors_device: The device tensors to convert
 
         Returns:
-            SampleStateTensorsMTP: Converted tensors or None
+            SampleStateTensorsSpec: Converted tensors or None
         """
         if target_inputs is None:
             return None
@@ -567,7 +567,7 @@ class ModelDrafter(Drafter):
 
     @nvtx_range("_update_draft_tokens_for_target_inputs")
     def _update_draft_tokens_for_target_inputs(
-            self, target_inputs: SampleStateTensorsMTP,
+            self, target_inputs: SampleStateTensorsSpec,
             draft_tensors: Optional[torch.Tensor], draft_position: int,
             draft_length: int, draft_batch: ScheduledRequests) -> None:
         """
@@ -788,7 +788,7 @@ class ModelDrafter(Drafter):
         self,
         draft_batch: ScheduledRequests,
         resource_manager: ResourceManager,
-        target_inputs: Optional[SampleStateTensorsMTP] = None,
+        target_inputs: Optional[SampleStateTensorsSpec] = None,
         num_draft_reqs: Optional[int] = None,
         initial_draft_state: Optional[SampleState] = None
     ) -> Optional[SampleState]:
@@ -850,7 +850,7 @@ class ModelDrafter(Drafter):
             scheduled_batch: ScheduledRequests,
             resource_manager: ResourceManager,
             previous_tensors: Optional[SampleStateTensors],
-            target_inputs: Optional[SampleStateTensorsMTP],
+            target_inputs: Optional[SampleStateTensorsSpec],
             num_accepted_tokens_device: Optional[torch.Tensor] = None) -> None:
         """
         Generate draft tokens with overlap scheduling support.
@@ -862,7 +862,7 @@ class ModelDrafter(Drafter):
             guided_decoder: The guided decoder
 
         Returns:
-            Tuple[Optional[SampleStateTensorsMTP], Optional[SampleState]]:
+            Tuple[Optional[SampleStateTensorsSpec], Optional[SampleState]]:
                 - Updated target inputs or None
                 - Draft sample state or None
         """

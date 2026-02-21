@@ -779,6 +779,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "Eagle3": Eagle3DecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
+            "SA": SADecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
             "SaveState": SaveHiddenStatesDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
@@ -1151,6 +1152,47 @@ class NGramDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class SADecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
+
+    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside
+    the target model forward; supports CUDA graph and overlap scheduler.
+
+    Arguments:
+        max_draft_len: int
+            The maximum number of draft tokens per step.
+
+        max_matching_ngram_size: int
+            - Positive value (e.g., 3): Fixed-size ngram matching.
+            - -1: Longest possible match via suffix automaton.
+            - 0: Invalid.
+    """
+    max_matching_ngram_size: int = -1
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # SA only supports linear tree
+
+    @model_validator(mode='after')
+    def validate_sa_config(self) -> 'SADecodingConfig':
+        """Validate SA configuration."""
+        if self.max_matching_ngram_size == 0:
+            raise ValueError(
+                "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
+                "Got 0.")
+        return self
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "SA"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class DraftTargetDecodingConfig(DecodingBaseConfig):
 
     def __init__(self, **kwargs):
@@ -1174,6 +1216,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
     relaxed_delta: float = 0.
     use_mtp_vanilla: bool = False
     mtp_eagle_one_model: bool = True
+
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: int = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
@@ -1688,6 +1741,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MedusaDecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
+    SADecodingConfig,
     UserProvidedDecodingConfig,
     SaveHiddenStatesDecodingConfig,
     AutoDecodingConfig,
@@ -3183,6 +3237,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
+            elif isinstance(self.speculative_config, SADecodingConfig):
+                assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size != 0
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
