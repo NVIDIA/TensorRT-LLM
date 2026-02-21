@@ -61,7 +61,6 @@ class Attention(nn.Module):
         qk_norm_mode: str = "full",
         eps: float = 1e-6,
         bias: bool = True,
-        out_bias: Optional[bool] = None,
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: Optional[int] = None,
     ):
@@ -80,7 +79,6 @@ class Attention(nn.Module):
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
         self.bias = bias
-        self.out_bias = out_bias if out_bias is not None else bias
 
         # Select compute backend (orthogonal to parallelism)
         ulysses_size = config.parallel.dit_ulysses_size
@@ -121,7 +119,7 @@ class Attention(nn.Module):
                 Linear(
                     self.q_dim,
                     self.hidden_size,
-                    bias=self.out_bias,
+                    bias=self.bias,
                     dtype=self.dtype,
                     mapping=self.mapping,
                     quant_config=self.quant_config,
