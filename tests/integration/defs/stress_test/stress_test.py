@@ -384,31 +384,39 @@ def is_port_available(port: int,
     "config",
     [
         # Configuration for TinyLlama model
+        # memory_requirement is in MiB (12 GB = 12288 MiB)
         ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
                     tp_size=1,
-                    memory_requirement=12),
+                    memory_requirement=12288),
         # Configuration for Llama-v3 model
+        # memory_requirement is in MiB (12 GB = 12288 MiB)
         ModelConfig(model_dir="llama-models-v3/llama-v3-8b-instruct-hf",
                     tp_size=1,
-                    memory_requirement=12),
+                    memory_requirement=12288),
         # Configuration for DeepSeek-V3 model
-        ModelConfig(model_dir="DeepSeek-V3", tp_size=8, memory_requirement=96),
+        # memory_requirement is in MiB (96 GB = 98304 MiB)
+        ModelConfig(
+            model_dir="DeepSeek-V3", tp_size=8, memory_requirement=98304),
         # Configuration for DeepSeek-R1 model with FP8 checkpoints (8 GPU setup)
+        # memory_requirement is in MiB (96 GB = 98304 MiB)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
                     tp_size=8,
-                    memory_requirement=96),
+                    memory_requirement=98304),
         # Configuration for DeepSeek-R1 model with FP8 checkpoints (4 GPU setup, requires GB300 288GB)
+        # memory_requirement is in MiB (256 GB = 262144 MiB)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
                     tp_size=4,
-                    memory_requirement=256),
+                    memory_requirement=262144),
         # Configuration for DeepSeek-R1 model with NVFP4 checkpoints (8 GPU setup)
+        # memory_requirement is in MiB (96 GB = 98304 MiB)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
                     tp_size=8,
-                    memory_requirement=96),
+                    memory_requirement=98304),
         # Configuration for DeepSeek-R1 model with NVFP4 checkpoints (4 GPU setup)
+        # memory_requirement is in MiB (168 GB = 172032 MiB)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
                     tp_size=4,
-                    memory_requirement=168),
+                    memory_requirement=172032),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, backend,
@@ -490,9 +498,12 @@ def stress_test(config,
         return
 
     # Skip if not enough GPU memory
+    # get_device_memory() returns per-GPU memory in MiB
     if get_device_memory() < config.memory_requirement:
         pytest.skip(
-            f"Not enough GPU memory. Required: {config.memory_requirement}GB")
+            f"Not enough GPU memory. Required: {config.memory_requirement} MiB ({config.memory_requirement // 1024} GB), "
+            f"Available: {get_device_memory()} MiB ({get_device_memory() // 1024} GB)"
+        )
 
     # Skip if not enough GPUs for tensor parallelism
     if get_device_count() < config.tp_size:
