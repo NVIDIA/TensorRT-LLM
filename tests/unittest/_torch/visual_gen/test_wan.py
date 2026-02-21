@@ -75,6 +75,10 @@ CHECKPOINT_PATH_WAN22_T2V = os.environ.get(
     "DIFFUSION_MODEL_PATH_WAN22_T2V",
     os.path.join(_llm_models_root(), "Wan2.2-T2V-A14B-Diffusers"),
 )
+CHECKPOINT_PATH_WAN22_T2V_NVFP4 = os.environ.get(
+    "DIFFUSION_MODEL_PATH_WAN22_T2V_NVFP4",
+    os.path.join(_llm_models_root(), "Wan2.2-T2V-A14B-Diffusers-NVFP4"),
+)
 SKIP_COMPONENTS = [
     PipelineComponent.TEXT_ENCODER,
     PipelineComponent.VAE,
@@ -155,6 +159,7 @@ def _run_cfg_worker(rank, world_size, checkpoint_path, inputs_list, return_dict)
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             parallel=ParallelConfig(dit_cfg_size=world_size),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -262,6 +267,7 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_list
             ),
             attention=AttentionConfig(backend="TRTLLM"),
             parallel=ParallelConfig(dit_cfg_size=world_size),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args_full).load()
         transformer = pipeline.transformer.eval()
@@ -769,6 +775,7 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -823,6 +830,7 @@ class TestWanPipeline:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -840,6 +848,48 @@ class TestWanPipeline:
                     break
 
         assert found_fp8, f"No FP8 Linear modules found for {quant_algo}"
+
+    def test_load_wan_pipeline_with_nvfp4_quantization(self, checkpoint_exists):
+        """Test loading Wan with NVFP4 dynamic quantization."""
+        if not checkpoint_exists:
+            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH.")
+        if not is_wan21_checkpoint():
+            pytest.skip(
+                "This test requires Wan 2.1 checkpoint. Use DIFFUSION_MODEL_PATH with '2.1' in the path."
+            )
+
+        from tensorrt_llm.quantization.utils import fp4_utils
+
+        args = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+            quant_config={
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+            },
+        )
+        pipeline = PipelineLoader(args).load()
+
+        # Verify NVFP4 weights in transformer blocks
+        found_nvfp4 = False
+        for name, module in pipeline.transformer.named_modules():
+            if isinstance(module, Linear):
+                if "blocks." in name and hasattr(module, "weight") and module.weight is not None:
+                    # NVFP4 uses packed FP4 format (float4_e2m1x2)
+                    assert module.weight.dtype == fp4_utils.float4_e2m1x2, (
+                        f"Linear {name} should have NVFP4 weight, got {module.weight.dtype}"
+                    )
+                    assert hasattr(module, "weight_scale"), f"Linear {name} missing weight_scale"
+                    assert hasattr(module, "weight_scale_2"), (
+                        f"Linear {name} missing weight_scale_2"
+                    )
+                    found_nvfp4 = True
+                    print(f"[NVFP4] NVFP4 layer {name}: weight {module.weight.shape}")
+                    break
+
+        assert found_nvfp4, "No NVFP4 Linear modules found"
 
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_fp8_vs_bf16_numerical_correctness(self, checkpoint_exists, quant_algo):
@@ -868,6 +918,7 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
+            pipeline={"warmup_steps": 0},
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
 
@@ -881,6 +932,7 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline={"warmup_steps": 0},
         )
         pipeline_fp8 = PipelineLoader(args_fp8).load()
 
@@ -986,6 +1038,7 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
+            pipeline={"warmup_steps": 0},
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
 
@@ -1006,6 +1059,7 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            pipeline={"warmup_steps": 0},
         )
         pipeline_fp8 = PipelineLoader(args_fp8).load()
 
@@ -1056,6 +1110,7 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
+            pipeline={"warmup_steps": 0},
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
         transformer_bf16 = pipeline_bf16.transformer
@@ -1070,6 +1125,7 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline={"warmup_steps": 0},
         )
         pipeline_fp8 = PipelineLoader(args_fp8).load()
         transformer_fp8 = pipeline_fp8.transformer
@@ -1226,6 +1282,7 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
+            pipeline={"warmup_steps": 0},
         )
         # Default attention backend is VANILLA
         pipeline_baseline = PipelineLoader(args_baseline).load()
@@ -1240,6 +1297,7 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
+            pipeline={"warmup_steps": 0},
         )
         args_vanilla.attention = AttentionConfig(backend="VANILLA")
         pipeline_vanilla = PipelineLoader(args_vanilla).load()
@@ -1353,6 +1411,7 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
+            pipeline={"warmup_steps": 0},
         )
         args_trtllm.attention = AttentionConfig(backend="TRTLLM")
         pipeline_trtllm = PipelineLoader(args_trtllm).load()
@@ -1464,6 +1523,7 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
 
@@ -1478,6 +1538,7 @@ class TestWanPipeline:
                 "dynamic": True,
                 "ignore": mixed_ignore_patterns,
             },
+            pipeline={"warmup_steps": 0},
         )
         pipeline_fp8_mixed = PipelineLoader(args_fp8_mixed).load()
 
@@ -1557,7 +1618,7 @@ class TestWanPipeline:
         del pipeline_bf16, pipeline_fp8_mixed
         torch.cuda.empty_cache()
 
-    def test_fp8_static_vs_bf16_accuracy(self, wan22_both_checkpoints_exist):
+    def test_fp8_vs_bf16_accuracy(self, wan22_both_checkpoints_exist):
         """Test FP8 static and dynamic quantization accuracy against BF16 reference.
 
         Compares outputs from:
@@ -1589,6 +1650,7 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
 
@@ -1599,6 +1661,7 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline_fp8_static = PipelineLoader(args_fp8_static).load()
 
@@ -1613,6 +1676,7 @@ class TestWanPipeline:
                 "quant_algo": "FP8",
                 "dynamic": True,
             },
+            pipeline={"warmup_steps": 0},
         )
         pipeline_fp8_dynamic = PipelineLoader(args_fp8_dynamic).load()
 
@@ -1766,12 +1830,13 @@ class TestWanPipeline:
         del pipeline_bf16, pipeline_fp8_static, pipeline_fp8_dynamic
         torch.cuda.empty_cache()
 
-    def test_nvfp4_static_vs_bf16_accuracy(self, wan22_nvfp4_bf16_checkpoints_exist):
-        """Test NVFP4 static quantization accuracy against BF16 reference.
+    def test_nvfp4_vs_bf16_accuracy(self, wan22_nvfp4_bf16_checkpoints_exist):
+        """Test NVFP4 static and dynamic quantization accuracy against BF16 reference.
 
         Compares outputs from:
         1. TRT-LLM BF16 model (reference checkpoint)
         2. TRT-LLM NVFP4 static quantized model (pre-quantized checkpoint)
+        3. TRT-LLM NVFP4 dynamic quantized model (BF16 checkpoint + on-the-fly quant)
 
         Uses spatially-correlated inputs that mimic real VAE latent patterns.
         NVFP4 (4-bit) has lower precision than FP8 (8-bit), so we use relaxed thresholds.
@@ -1787,7 +1852,7 @@ class TestWanPipeline:
         torch._dynamo.reset()
 
         print("\n" + "=" * 70)
-        print("NVFP4 STATIC QUANT vs BF16 ACCURACY TEST")
+        print("NVFP4 STATIC & DYNAMIC QUANT vs BF16 ACCURACY TEST")
         print("=" * 70)
 
         # Load BF16 reference model
@@ -1797,6 +1862,7 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load()
 
@@ -1807,8 +1873,23 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline_nvfp4_static = PipelineLoader(args_nvfp4_static).load()
+
+        # Load NVFP4 dynamic quantized model (from BF16 checkpoint with on-the-fly quant)
+        print(f"\n[NVFP4 Dynamic] Loading from {CHECKPOINT_PATH_WAN22_BF16} with dynamic quant")
+        args_nvfp4_dynamic = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH_WAN22_BF16,
+            device="cuda",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+            quant_config={
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+            },
+        )
+        pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load()
 
         # Verify NVFP4 static model has quantized weights
         static_quant_modules = 0
@@ -1820,25 +1901,32 @@ class TestWanPipeline:
         print(f"[NVFP4 Static] Quantized Linear modules: {static_quant_modules}")
         assert static_quant_modules > 0, "NVFP4 static model should have quantization scales"
 
+        # Verify NVFP4 dynamic model has quantized weights
+        dynamic_quant_modules = 0
+        for name, module in pipeline_nvfp4_dynamic.transformer.named_modules():
+            if isinstance(module, Linear):
+                if hasattr(module, "weight_scale") and module.weight_scale is not None:
+                    if module.weight_scale.numel() > 1:
+                        dynamic_quant_modules += 1
+        print(f"[NVFP4 Dynamic] Quantized Linear modules: {dynamic_quant_modules}")
+
+        # Read model config for input dimensions (auto-detect from checkpoint)
+        cfg = pipeline_bf16.model_config.pretrained_config
+        in_channels = getattr(cfg, "in_channels", 16)
+        text_dim = getattr(cfg, "text_dim", 4096)
+
         # Create spatially-correlated test inputs (mimics real VAE latent patterns)
-        # Wan 2.2 TI2V-5B specs:
-        #   - VAE compression: 16x16x4 (spatial x spatial x temporal)
-        #   - Latent channels: 48 (z_dim=48)
-        #   - 720P resolution: 1280x704 -> latent: 80x44
-        #   - Text encoder: UMT5, max_length=512, dim=4096
         torch.manual_seed(42)
 
         batch_size = 2  # For CFG (positive + negative)
-        in_channels = 48  # Wan 2.2 TI2V-5B uses 48 latent channels
         time_dim = 1  # Single frame for unit test
 
         # 720P latent dimensions: 1280/16=80 width, 704/16=44 height
         height = 44  # 720P latent height (704 / 16)
         width = 80  # 720P latent width (1280 / 16)
 
-        # Text encoder: UMT5 with 4096 dim, typical sequence length ~226
+        # Text encoder: UMT5 with text_dim, typical sequence length ~226
         text_seq_len = 226  # Default max_sequence_length for Wan
-        text_dim = 4096
 
         # Create structured latent (not purely random - simulate real VAE output)
         base_pattern = torch.randn(
@@ -1861,7 +1949,7 @@ class TestWanPipeline:
         encoder_hidden_states = text_base.expand(batch_size, -1, -1).contiguous()
 
         print(
-            f"\n[Input] 720P latent: {hidden_states.shape} "
+            f"\n[Input] latent: {hidden_states.shape} "
             f"(batch={batch_size}, ch={in_channels}, t={time_dim}, h={height}, w={width})"
         )
         print(f"[Input] range: [{hidden_states.min():.2f}, {hidden_states.max():.2f}]")
@@ -1884,9 +1972,18 @@ class TestWanPipeline:
                 encoder_hidden_states=encoder_hidden_states.clone(),
             )
 
+        print("[Forward] Running NVFP4 dynamic quant model...")
+        with torch.no_grad():
+            output_nvfp4_dynamic = pipeline_nvfp4_dynamic.transformer(
+                hidden_states=hidden_states.clone(),
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states.clone(),
+            )
+
         # Compute metrics
         output_bf16_float = output_bf16.float()
         output_nvfp4_static_float = output_nvfp4_static.float()
+        output_nvfp4_dynamic_float = output_nvfp4_dynamic.float()
 
         # NVFP4 Static vs BF16
         cos_sim_static = F.cosine_similarity(
@@ -1894,11 +1991,21 @@ class TestWanPipeline:
         ).item()
         mse_static = F.mse_loss(output_nvfp4_static_float, output_bf16_float).item()
 
+        # NVFP4 Dynamic vs BF16
+        cos_sim_dynamic = F.cosine_similarity(
+            output_nvfp4_dynamic_float.flatten(), output_bf16_float.flatten(), dim=0
+        ).item()
+        mse_dynamic = F.mse_loss(output_nvfp4_dynamic_float, output_bf16_float).item()
+
         # Output statistics
         bf16_range = (output_bf16_float.min().item(), output_bf16_float.max().item())
         nvfp4_static_range = (
             output_nvfp4_static_float.min().item(),
             output_nvfp4_static_float.max().item(),
+        )
+        nvfp4_dynamic_range = (
+            output_nvfp4_dynamic_float.min().item(),
+            output_nvfp4_dynamic_float.max().item(),
         )
 
         print("\n" + "=" * 70)
@@ -1907,42 +2014,369 @@ class TestWanPipeline:
         print(f"{'Method':<25} {'Cosine Sim':>12} {'MSE':>12}")
         print("-" * 70)
         print(f"{'NVFP4 Static':<25} {cos_sim_static:>12.6f} {mse_static:>12.6f}")
+        print(f"{'NVFP4 Dynamic (TRT-LLM)':<25} {cos_sim_dynamic:>12.6f} {mse_dynamic:>12.6f}")
         print("-" * 70)
         print(f"BF16 Output Range:         [{bf16_range[0]:.4f}, {bf16_range[1]:.4f}]")
         print(
             f"NVFP4 Static Range:        [{nvfp4_static_range[0]:.4f}, {nvfp4_static_range[1]:.4f}]"
         )
+        print(
+            f"NVFP4 Dynamic (TRT) Range: [{nvfp4_dynamic_range[0]:.4f}, {nvfp4_dynamic_range[1]:.4f}]"
+        )
         print("=" * 70)
 
         # Assertions - NVFP4 (4-bit) has lower precision than FP8 (8-bit)
+        # Static has calibrated input scales, dynamic does not
         assert cos_sim_static > 0.95, (
             f"NVFP4 Static cosine similarity too low: {cos_sim_static:.6f}. Expected >0.95."
         )
+        assert cos_sim_dynamic > 0.95, (
+            f"NVFP4 Dynamic cosine similarity too low: {cos_sim_dynamic:.6f}. Expected >0.95."
+        )
         assert not torch.isnan(output_nvfp4_static).any(), "NVFP4 static output contains NaN"
+        assert not torch.isnan(output_nvfp4_dynamic).any(), "NVFP4 dynamic output contains NaN"
 
         print("\n[PASS] NVFP4 quantization accuracy test passed!")
-        print(f"  - NVFP4 Static: cos_sim={cos_sim_static:.4f} (>0.95), MSE={mse_static:.6f}")
+        print(
+            f"  - NVFP4 Static:            cos_sim={cos_sim_static:.4f} (>0.95), MSE={mse_static:.6f}"
+        )
+        print(
+            f"  - NVFP4 Dynamic (TRT-LLM): cos_sim={cos_sim_dynamic:.4f} (>0.95), MSE={mse_dynamic:.6f}"
+        )
 
         # Cleanup
-        del pipeline_bf16, pipeline_nvfp4_static
+        del pipeline_bf16, pipeline_nvfp4_static, pipeline_nvfp4_dynamic
+        torch.cuda.empty_cache()
+
+    def test_nvfp4_vs_bf16_accuracy_mixed_quant(self, wan22_t2v_bf16_checkpoint_exists):
+        """Test NVFP4 mixed quantization accuracy on Wan 2.2 T2V A14B.
+
+        The A14B NVFP4 checkpoint uses mixed quantization — certain layers are
+        excluded from quantization via an ignore list (first/last blocks,
+        condition_embedder, patch_embedding, proj_out).
+
+        Compares outputs from:
+        1. TRT-LLM BF16 model (reference)
+        2. TRT-LLM NVFP4 static model (pre-quantized with ignore patterns)
+           — skipped if NVFP4 checkpoint not available
+        3. TRT-LLM NVFP4 dynamic model (BF16 checkpoint + on-the-fly quant
+           with the same ignore patterns)
+
+        This validates that dynamic quantization with ignore patterns produces
+        comparable accuracy to the statically pre-quantized checkpoint.
+        """
+        if not wan22_t2v_bf16_checkpoint_exists:
+            pytest.skip(f"BF16 checkpoint required: {CHECKPOINT_PATH_WAN22_T2V}")
+
+        have_nvfp4_static = CHECKPOINT_PATH_WAN22_T2V_NVFP4 and os.path.exists(
+            CHECKPOINT_PATH_WAN22_T2V_NVFP4
+        )
+
+        torch._dynamo.reset()
+
+        # Ignore patterns from the A14B NVFP4 pre-quantized checkpoint
+        mixed_ignore_patterns = [
+            "blocks.0*",
+            "blocks.1",
+            "blocks.1.*",
+            "blocks.38*",
+            "blocks.39*",
+            "condition_embedder*",
+            "patch_embedding",
+            "proj_out",
+        ]
+
+        print("\n" + "=" * 70)
+        print("NVFP4 MIXED QUANT (A14B T2V) vs BF16 ACCURACY TEST")
+        print("=" * 70)
+        print(f"Ignore patterns: {mixed_ignore_patterns}")
+        print(
+            f"NVFP4 static checkpoint: {'available' if have_nvfp4_static else 'NOT available (skipping static)'}"
+        )
+
+        # Load BF16 reference model
+        print(f"\n[BF16] Loading from {CHECKPOINT_PATH_WAN22_T2V}")
+        args_bf16 = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
+            device="cuda",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+        )
+        pipeline_bf16 = PipelineLoader(args_bf16).load()
+
+        # Load NVFP4 static model (if checkpoint available)
+        pipeline_nvfp4_static = None
+        static_quant_modules = 0
+        static_bf16_modules = 0
+        if have_nvfp4_static:
+            print(f"\n[NVFP4 Static] Loading from {CHECKPOINT_PATH_WAN22_T2V_NVFP4}")
+            args_nvfp4_static = DiffusionArgs(
+                checkpoint_path=CHECKPOINT_PATH_WAN22_T2V_NVFP4,
+                device="cuda",
+                dtype="bfloat16",
+                skip_components=SKIP_COMPONENTS,
+            )
+            pipeline_nvfp4_static = PipelineLoader(args_nvfp4_static).load()
+
+            # Verify static model has quantized weights (but NOT in ignored layers)
+            for name, module in pipeline_nvfp4_static.transformer.named_modules():
+                if isinstance(module, Linear):
+                    if hasattr(module, "weight_scale") and module.weight_scale is not None:
+                        if module.weight_scale.numel() > 1:
+                            static_quant_modules += 1
+                        else:
+                            static_bf16_modules += 1
+                    else:
+                        static_bf16_modules += 1
+            print(
+                f"[NVFP4 Static] Quantized: {static_quant_modules}, "
+                f"BF16 (ignored): {static_bf16_modules}"
+            )
+            assert static_quant_modules > 0, "NVFP4 static model should have quantization scales"
+            assert static_bf16_modules > 0, (
+                "NVFP4 static mixed model should have some BF16 (ignored) modules"
+            )
+        else:
+            print("\n[NVFP4 Static] SKIPPED — checkpoint not available")
+
+        # Load NVFP4 dynamic model (BF16 checkpoint + on-the-fly quant with same ignores)
+        print(
+            f"\n[NVFP4 Dynamic] Loading from {CHECKPOINT_PATH_WAN22_T2V} "
+            f"with dynamic quant + ignore patterns"
+        )
+        args_nvfp4_dynamic = DiffusionArgs(
+            checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
+            device="cuda",
+            dtype="bfloat16",
+            skip_components=SKIP_COMPONENTS,
+            quant_config={
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+                "ignore": mixed_ignore_patterns,
+            },
+        )
+        pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load()
+
+        # Verify dynamic model has quantized weights
+        dynamic_quant_modules = 0
+        dynamic_bf16_modules = 0
+        for name, module in pipeline_nvfp4_dynamic.transformer.named_modules():
+            if isinstance(module, Linear):
+                if hasattr(module, "weight_scale") and module.weight_scale is not None:
+                    if module.weight_scale.numel() > 1:
+                        dynamic_quant_modules += 1
+                    else:
+                        dynamic_bf16_modules += 1
+                else:
+                    dynamic_bf16_modules += 1
+        print(
+            f"[NVFP4 Dynamic] Quantized: {dynamic_quant_modules}, "
+            f"BF16 (ignored): {dynamic_bf16_modules}"
+        )
+
+        # When both are available, verify they have the same quant/bf16 split
+        if pipeline_nvfp4_static is not None:
+            assert static_quant_modules == dynamic_quant_modules, (
+                f"Quant module count mismatch: static={static_quant_modules}, "
+                f"dynamic={dynamic_quant_modules}. "
+                f"Same ignore patterns should produce the same quantized layer set."
+            )
+            assert static_bf16_modules == dynamic_bf16_modules, (
+                f"BF16 module count mismatch: static={static_bf16_modules}, "
+                f"dynamic={dynamic_bf16_modules}. "
+                f"Same ignore patterns should produce the same ignored layer set."
+            )
+            print(
+                f"[Verify] Static and dynamic have identical quant/bf16 split: "
+                f"{static_quant_modules} quantized, {static_bf16_modules} BF16"
+            )
+
+        # Read model config for input dimensions
+        cfg = pipeline_bf16.model_config.pretrained_config
+        in_channels = getattr(cfg, "in_channels", 16)
+        text_dim = getattr(cfg, "text_dim", 4096)
+
+        # Create spatially-correlated test inputs
+        torch.manual_seed(42)
+
+        batch_size = 2
+        time_dim = 1
+        height = 44
+        width = 80
+        text_seq_len = 226
+
+        base_pattern = torch.randn(
+            1,
+            in_channels,
+            time_dim,
+            height // 4,
+            width // 4,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        hidden_states = F.interpolate(
+            base_pattern.view(1, in_channels, height // 4, width // 4),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        ).view(1, in_channels, time_dim, height, width)
+        hidden_states = hidden_states * 2.0
+        hidden_states = hidden_states.expand(batch_size, -1, -1, -1, -1).contiguous()
+
+        timestep = torch.tensor([500.0, 500.0], device="cuda", dtype=torch.bfloat16)
+
+        text_base = (
+            torch.randn(1, text_seq_len, text_dim, device="cuda", dtype=torch.bfloat16) * 0.1
+        )
+        encoder_hidden_states = text_base.expand(batch_size, -1, -1).contiguous()
+
+        print(
+            f"\n[Input] latent: {hidden_states.shape} "
+            f"(batch={batch_size}, ch={in_channels}, t={time_dim}, h={height}, w={width})"
+        )
+        print(f"[Input] range: [{hidden_states.min():.2f}, {hidden_states.max():.2f}]")
+        print(f"[Input] encoder_hidden_states: {encoder_hidden_states.shape}")
+
+        # Run forward passes
+        print("\n[Forward] Running BF16 model...")
+        with torch.no_grad():
+            output_bf16 = pipeline_bf16.transformer(
+                hidden_states=hidden_states.clone(),
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states.clone(),
+            )
+
+        output_nvfp4_static = None
+        if pipeline_nvfp4_static is not None:
+            print("[Forward] Running NVFP4 static (mixed) quant model...")
+            with torch.no_grad():
+                output_nvfp4_static = pipeline_nvfp4_static.transformer(
+                    hidden_states=hidden_states.clone(),
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states.clone(),
+                )
+
+        print("[Forward] Running NVFP4 dynamic (mixed) quant model...")
+        with torch.no_grad():
+            output_nvfp4_dynamic = pipeline_nvfp4_dynamic.transformer(
+                hidden_states=hidden_states.clone(),
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states.clone(),
+            )
+
+        # Compute metrics
+        output_bf16_float = output_bf16.float()
+        output_nvfp4_dynamic_float = output_nvfp4_dynamic.float()
+
+        cos_sim_dynamic = F.cosine_similarity(
+            output_nvfp4_dynamic_float.flatten(), output_bf16_float.flatten(), dim=0
+        ).item()
+        mse_dynamic = F.mse_loss(output_nvfp4_dynamic_float, output_bf16_float).item()
+
+        # Static metrics (if available)
+        cos_sim_static = None
+        mse_static = None
+        cos_sim_static_vs_dynamic = None
+        mse_static_vs_dynamic = None
+        if output_nvfp4_static is not None:
+            output_nvfp4_static_float = output_nvfp4_static.float()
+
+            cos_sim_static = F.cosine_similarity(
+                output_nvfp4_static_float.flatten(), output_bf16_float.flatten(), dim=0
+            ).item()
+            mse_static = F.mse_loss(output_nvfp4_static_float, output_bf16_float).item()
+
+            cos_sim_static_vs_dynamic = F.cosine_similarity(
+                output_nvfp4_static_float.flatten(),
+                output_nvfp4_dynamic_float.flatten(),
+                dim=0,
+            ).item()
+            mse_static_vs_dynamic = F.mse_loss(
+                output_nvfp4_static_float, output_nvfp4_dynamic_float
+            ).item()
+
+        # Output statistics
+        bf16_range = (output_bf16_float.min().item(), output_bf16_float.max().item())
+        nvfp4_dynamic_range = (
+            output_nvfp4_dynamic_float.min().item(),
+            output_nvfp4_dynamic_float.max().item(),
+        )
+
+        print("\n" + "=" * 70)
+        print("RESULTS: NVFP4 MIXED QUANT (A14B T2V) vs BF16")
+        print("=" * 70)
+        print(f"{'Comparison':<30} {'Cosine Sim':>12} {'MSE':>12}")
+        print("-" * 70)
+        if cos_sim_static is not None:
+            print(f"{'NVFP4 Static vs BF16':<30} {cos_sim_static:>12.6f} {mse_static:>12.6f}")
+        else:
+            print(f"{'NVFP4 Static vs BF16':<30} {'N/A (no ckpt)':>12} {'N/A':>12}")
+        print(f"{'NVFP4 Dynamic vs BF16':<30} {cos_sim_dynamic:>12.6f} {mse_dynamic:>12.6f}")
+        if cos_sim_static_vs_dynamic is not None:
+            print(
+                f"{'Static vs Dynamic':<30} "
+                f"{cos_sim_static_vs_dynamic:>12.6f} {mse_static_vs_dynamic:>12.6f}"
+            )
+        print("-" * 70)
+        print(f"BF16 Output Range:         [{bf16_range[0]:.4f}, {bf16_range[1]:.4f}]")
+        if output_nvfp4_static is not None:
+            nvfp4_static_range = (
+                output_nvfp4_static.float().min().item(),
+                output_nvfp4_static.float().max().item(),
+            )
+            print(
+                f"NVFP4 Static Range:        [{nvfp4_static_range[0]:.4f}, "
+                f"{nvfp4_static_range[1]:.4f}]"
+            )
+        print(
+            f"NVFP4 Dynamic Range:       [{nvfp4_dynamic_range[0]:.4f}, "
+            f"{nvfp4_dynamic_range[1]:.4f}]"
+        )
+        if pipeline_nvfp4_static is not None:
+            print(f"Static quant/bf16 modules: {static_quant_modules}/{static_bf16_modules}")
+        print(f"Dynamic quant/bf16 modules: {dynamic_quant_modules}/{dynamic_bf16_modules}")
+        print("=" * 70)
+
+        # Assertions
+        if cos_sim_static is not None:
+            assert cos_sim_static > 0.99, (
+                f"NVFP4 Static (mixed) cosine similarity too low: {cos_sim_static:.6f}. "
+                f"Expected >0.99."
+            )
+            assert not torch.isnan(output_nvfp4_static).any(), "NVFP4 static output contains NaN"
+
+        assert cos_sim_dynamic > 0.99, (
+            f"NVFP4 Dynamic (mixed) cosine similarity too low: {cos_sim_dynamic:.6f}. "
+            f"Expected >0.99."
+        )
+        assert not torch.isnan(output_nvfp4_dynamic).any(), "NVFP4 dynamic output contains NaN"
+
+        print("\n[PASS] NVFP4 mixed quantization accuracy test passed!")
+        if cos_sim_static is not None:
+            print(
+                f"  - NVFP4 Static (mixed):  cos_sim={cos_sim_static:.4f} (>0.99), "
+                f"MSE={mse_static:.6f}"
+            )
+        print(
+            f"  - NVFP4 Dynamic (mixed): cos_sim={cos_sim_dynamic:.4f} (>0.99), "
+            f"MSE={mse_dynamic:.6f}"
+        )
+        if cos_sim_static_vs_dynamic is not None:
+            print(
+                f"  - Static vs Dynamic:     cos_sim={cos_sim_static_vs_dynamic:.4f}, "
+                f"MSE={mse_static_vs_dynamic:.6f}"
+            )
+
+        # Cleanup
+        del pipeline_bf16, pipeline_nvfp4_dynamic
+        if pipeline_nvfp4_static is not None:
+            del pipeline_nvfp4_static
         torch.cuda.empty_cache()
 
 
 # =============================================================================
-# Wan 2.2 FP8 Pre-quantized Checkpoint Fixtures
+# Wan 2.2 checkpoint fixtures
 # =============================================================================
-
-
-@pytest.fixture
-def wan22_fp8_checkpoint_exists():
-    """Check if Wan 2.2 FP8 checkpoint path exists."""
-    return CHECKPOINT_PATH_WAN22_FP8 and os.path.exists(CHECKPOINT_PATH_WAN22_FP8)
-
-
-@pytest.fixture
-def wan22_bf16_checkpoint_exists():
-    """Check if Wan 2.2 BF16 checkpoint path exists."""
-    return CHECKPOINT_PATH_WAN22_BF16 and os.path.exists(CHECKPOINT_PATH_WAN22_BF16)
 
 
 @pytest.fixture
@@ -1959,6 +2393,12 @@ def wan22_nvfp4_bf16_checkpoints_exist():
     nvfp4_exists = CHECKPOINT_PATH_WAN22_NVFP4 and os.path.exists(CHECKPOINT_PATH_WAN22_NVFP4)
     bf16_exists = CHECKPOINT_PATH_WAN22_BF16 and os.path.exists(CHECKPOINT_PATH_WAN22_BF16)
     return nvfp4_exists and bf16_exists
+
+
+@pytest.fixture
+def wan22_t2v_bf16_checkpoint_exists():
+    """Check if Wan 2.2 T2V A14B BF16 checkpoint exists."""
+    return CHECKPOINT_PATH_WAN22_T2V and os.path.exists(CHECKPOINT_PATH_WAN22_T2V)
 
 
 # =============================================================================
@@ -2020,6 +2460,7 @@ class TestWanOptimizations(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline_trtllm = PipelineLoader(args_trtllm).load()
         config = pipeline_trtllm.transformer.model_config.pretrained_config
@@ -2069,6 +2510,7 @@ class TestWanOptimizations(unittest.TestCase):
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
+            pipeline={"warmup_steps": 0},
         )
         pipeline_teacache = PipelineLoader(args_teacache).load()
         transformer_teacache = pipeline_teacache.transformer.eval()
@@ -2211,6 +2653,7 @@ class TestWanParallelism(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             parallel=ParallelConfig(dit_cfg_size=1),  # Standard CFG (no parallel)
+            pipeline={"warmup_steps": 0},
         )
         pipeline_baseline = PipelineLoader(args_baseline).load()
         config = pipeline_baseline.transformer.model_config.pretrained_config
@@ -2405,6 +2848,7 @@ class TestWanCombinedOptimizations(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             parallel=ParallelConfig(dit_cfg_size=1),  # Standard CFG
+            pipeline={"warmup_steps": 0},
         )
         pipeline_baseline = PipelineLoader(args_baseline).load()
         config = pipeline_baseline.transformer.model_config.pretrained_config
@@ -2573,6 +3017,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -2621,6 +3066,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -2717,6 +3163,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -2768,6 +3215,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -2809,6 +3257,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -2863,6 +3312,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -2915,6 +3365,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="TRTLLM"),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -2988,6 +3439,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -3084,6 +3536,7 @@ class TestWanRobustness(unittest.TestCase):
                 dtype="bfloat16",
                 skip_components=SKIP_COMPONENTS,
                 quant_config={"quant_algo": "INVALID_ALGO"},
+                pipeline={"warmup_steps": 0},
             )
             pipeline = PipelineLoader(args).load()  # noqa: F841
 

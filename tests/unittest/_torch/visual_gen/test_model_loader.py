@@ -82,6 +82,7 @@ def test_load_wan_pipeline_basic(checkpoint_exists):
     args = DiffusionArgs(
         checkpoint_path=CHECKPOINT_PATH,
         skip_components=SKIP_HEAVY_COMPONENTS,
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
 
@@ -120,6 +121,7 @@ def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_exists):
         checkpoint_path=CHECKPOINT_PATH,
         quant_config={"quant_algo": "FP8", "dynamic": True},
         skip_components=SKIP_HEAVY_COMPONENTS,
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
 
@@ -158,6 +160,7 @@ def test_load_wan_pipeline_with_fp8_blockwise(checkpoint_exists):
         checkpoint_path=CHECKPOINT_PATH,
         quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
         skip_components=SKIP_HEAVY_COMPONENTS,
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
 
@@ -264,6 +267,7 @@ def test_load_without_quant_config_no_fp8(checkpoint_exists):
     args = DiffusionArgs(
         checkpoint_path=CHECKPOINT_PATH,
         skip_components=SKIP_HEAVY_COMPONENTS,
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
 
@@ -354,6 +358,7 @@ def test_fp8_vs_bf16_memory_comparison(checkpoint_exists):
     args_bf16 = DiffusionArgs(
         checkpoint_path=CHECKPOINT_PATH,
         skip_components=SKIP_HEAVY_COMPONENTS,
+        pipeline={"warmup_steps": 0},
     )
     pipeline_bf16 = PipelineLoader(args_bf16).load()
 
@@ -378,6 +383,7 @@ def test_fp8_vs_bf16_memory_comparison(checkpoint_exists):
         checkpoint_path=CHECKPOINT_PATH,
         quant_config={"quant_algo": "FP8", "dynamic": True},
         skip_components=SKIP_HEAVY_COMPONENTS,
+        pipeline={"warmup_steps": 0},
     )
     pipeline_fp8 = PipelineLoader(args_fp8).load()
 
@@ -434,6 +440,7 @@ def test_fp8_vs_bf16_memory_comparison(checkpoint_exists):
         checkpoint_path=CHECKPOINT_PATH,
         quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
         skip_components=SKIP_HEAVY_COMPONENTS,
+        pipeline={"warmup_steps": 0},
     )
     pipeline_fp8_block = PipelineLoader(args_fp8_block).load()
 
