@@ -25,6 +25,9 @@ _CACHED_ATTENTION_OPS = [
     "auto_deploy::flashinfer_attention_mha_with_cache",
     "auto_deploy::triton_attention_flattened_mha_with_cache",
     "auto_deploy::torch_cached_attention_with_cache",
+    # MLA attention variants
+    "auto_deploy::flashinfer_mla_with_cache",
+    "auto_deploy::torch_cached_mla_with_cache",
 ]
 
 # Cached SSM ops (Python-level branching on batch_info_host)
@@ -48,6 +51,7 @@ _CACHED_DELTA_OPS = [
 # Metadata preparation ops (branch on batch_info_host, do CPU math on CUDA tensors)
 _METADATA_PREP_OPS = [
     "auto_deploy::flashinfer_attention_prepare_metadata",
+    "auto_deploy::flashinfer_mla_prepare_metadata",
     "auto_deploy::mamba_ssm_prepare_metadata",
 ]
 
