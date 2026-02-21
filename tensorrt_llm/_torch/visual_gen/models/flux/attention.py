@@ -135,9 +135,9 @@ class FluxJointAttention(Attention):
 
         # Image QKV via base (returns 3D), then reshape to 4D for per-head ops
         query, key, value = self.get_qkv(hidden_states)
-        query = query.unflatten(-1, (self.num_attention_heads, self.head_dim))
-        key = key.unflatten(-1, (self.num_attention_heads, self.head_dim))
-        value = value.unflatten(-1, (self.num_attention_heads, self.head_dim))
+        query = query.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        key = key.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        value = value.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
         # Per-head QK normalization via base (per_head mode operates on 4D)
         query, key = self.apply_qk_norm(query, key)
@@ -148,9 +148,9 @@ class FluxJointAttention(Attention):
 
             encoder_qkv = self.add_qkv_proj(encoder_hidden_states)
             enc_q, enc_k, enc_v = encoder_qkv.chunk(3, dim=-1)
-            enc_q = enc_q.unflatten(-1, (self.num_attention_heads, self.head_dim))
-            enc_k = enc_k.unflatten(-1, (self.num_attention_heads, self.head_dim))
-            enc_v = enc_v.unflatten(-1, (self.num_attention_heads, self.head_dim))
+            enc_q = enc_q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+            enc_k = enc_k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+            enc_v = enc_v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
             enc_q = _per_head_norm(enc_q, self.norm_added_q)
             enc_k = _per_head_norm(enc_k, self.norm_added_k)
@@ -287,9 +287,9 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         # Split QKV -> 4D
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.unflatten(-1, (self.num_attention_heads, self.head_dim))
-        k = k.unflatten(-1, (self.num_attention_heads, self.head_dim))
-        v = v.unflatten(-1, (self.num_attention_heads, self.head_dim))
+        q = q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        k = k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        v = v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
         # Per-head QK norm (inherited)
         q, k = self.apply_qk_norm(q, k)
