@@ -169,33 +169,48 @@ def torch_cached_gated_delta_rule(
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
     # CACHES
-    delta_cache: torch.Tensor,  # [max_batch_size, H, K, V]
+    delta_cache: torch.Tensor,  # [max_batch_size, HV, K, V]
     # CONSTANTS
     scale: float,
 ) -> torch.Tensor:
     """Cached gated delta rule using pure-torch recurrence.
 
     Handles mixed prefill + decode batches. Inputs use the autodeploy bsnd layout.
+    L2 normalization and GVA head expansion (repeat_interleave) for q/k are
+    performed internally.
 
     Args:
-        q:    [B, S, H, K]
-        k:    [B, S, H, K]
-        v:    [B, S, H, V]
-        g:    [B, S, H]
-        beta: [B, S, H]
+        q:    [B, S, Hg, K] - q with num_k_heads (may be fewer than v)
+        k:    [B, S, Hg, K] - k with num_k_heads
+        v:    [B, S, HV, V] - v with num_v_heads
+        g:    [B, S, HV]
+        beta: [B, S, HV]
         batch_info_host: [num_prefill, num_prefill_tokens, num_decode] on host
         cu_seqlen:       cumulative sequence lengths for prefill sequences
         slot_idx:        per-sequence slot indices into delta_cache
         use_initial_states: per-sequence bool (True if cache history exists)
-        delta_cache:     [max_slots, H, K, V] recurrent state cache
+        delta_cache:     [max_slots, HV, K, V] recurrent state cache
         scale:           query scaling factor
 
     Returns:
-        output: [B, S, H, V]
+        output: [B, S, HV, V]
     """
-    b, s, num_heads, _ = q.shape
+    b, s, num_k_heads, _ = q.shape
+    num_v_heads = v.shape[2]
 
-    # Pre-allocate output
+    # L2 normalize q and k
+    q_f32 = q.float()
+    k_f32 = k.float()
+    eps = 1e-6
+    q = (q_f32 * torch.rsqrt((q_f32 * q_f32).sum(dim=-1, keepdim=True) + eps)).to(q.dtype)
+    k = (k_f32 * torch.rsqrt((k_f32 * k_f32).sum(dim=-1, keepdim=True) + eps)).to(k.dtype)
+
+    # Expand q/k heads to match v's head count (GVA)
+    if num_v_heads > num_k_heads:
+        q = q.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        k = k.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+
+    # Pre-allocate output (same shape as v: [B, S, HV, V])
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
@@ -205,6 +220,9 @@ def torch_cached_gated_delta_rule(
     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
     slot_idx = slot_idx[:num_seq].to(torch.long)
     use_initial_states = use_initial_states[:num_seq]
+
+    # After GVA expansion, q/k now have num_v_heads
+    num_heads = num_v_heads
 
     # Flatten for indexing: [B*S, H, D]
     q_flat = q.reshape(b * s, num_heads, -1)
@@ -352,7 +370,10 @@ class TorchGatedDeltaBackend(AttentionDescriptor):
     ) -> ResourceHandlerDict:
         key_node = source_attn_node.args[1]
         value_node = source_attn_node.args[2]
-        num_heads = key_node.meta["val"].shape[-2]
+        # Cache shape is [max_batch_size, HV, K, V] where HV = num_v_heads.
+        # With GVA, q/k may have fewer heads (Hg) than v (HV), so read
+        # num_heads from value_node to get the correct cache dimension.
+        num_heads = value_node.meta["val"].shape[-2]
         key_dim = key_node.meta["val"].shape[-1]
         value_dim = value_node.meta["val"].shape[-1]
 
