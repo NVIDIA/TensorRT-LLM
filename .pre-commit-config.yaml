@@ -1429,7 +1429,7 @@ repos:
     -   id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-            (?x)^(.*cubin.cpp$ | .*_cubin.h)$
+            (?x)^(.*cubin.cpp$ | .*_cubin.h | ^3rdparty/.*)$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:
