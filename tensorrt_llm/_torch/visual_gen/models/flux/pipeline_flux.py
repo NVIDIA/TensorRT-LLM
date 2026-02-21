@@ -315,10 +315,6 @@ class FluxPipeline(BasePipeline):
 
         return MediaOutput(image=image)
 
-    def __call__(self, *args, **kwargs):
-        """Backward compatibility wrapper."""
-        return self.forward(*args, **kwargs)
-
     def _encode_prompt(
         self,
         prompt: str,
