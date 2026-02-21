@@ -200,25 +200,12 @@ class FluxJointAttention(Attention):
 class Flux2ParallelSelfAttention(FluxJointAttention):
     """FLUX.2 parallel self-attention for single-stream blocks.
 
-    Reuses from FluxJointAttention/Attention:
-    - apply_qk_norm(): Per-head QK normalization
-    - apply_rotary_emb(): FLUX-style rotary embeddings (from modules/attention.py)
-    - _attn_impl(): Backend dispatch + layout handling (+ Ulysses)
-    - Attention backend creation (VANILLA/TRTLLM)
-
     Uses fused QKV+MLP projection: to_qkv_mlp_proj
     Output: concatenate attention + MLP outputs, then project with to_out
 
     This is a key architectural difference from FLUX.1:
     - FLUX.1: Separate attention and FFN
     - FLUX.2: Fused QKV+MLP projection for efficiency
-
-    Dimensions (default FLUX.2):
-    - input: 6144
-    - QKV: 3 x 6144 = 18432
-    - MLP: 2 x 18432 = 36864 (for SwiGLU)
-    - Fused projection: 6144 -> 55296 (18432 + 36864)
-    - Output: concat(6144, 18432) -> 6144
     """
 
     def __init__(
