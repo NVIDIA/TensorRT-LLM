@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
@@ -34,6 +34,7 @@ from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
+from .moe_op_backend import MoEOpBackend, get_op_backend
 
 # isort: off
 from .quantization import (
@@ -42,7 +43,8 @@ from .quantization import (
     W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
-from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
+from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
+                      DefaultMoeRoutingMethod)
 
 
 class TRTLLMGenFusedMoE(MoE):
@@ -208,6 +210,10 @@ class TRTLLMGenFusedMoE(MoE):
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
+        self.use_flashinfer = self._check_op_backend_support()
+        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
+        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
+
         # Note: Load balancer initialization is handled by base class _init_load_balancer()
         # If no load balancer is available, the base class will set:
         # - self.num_slots = self.num_experts
@@ -227,11 +233,13 @@ class TRTLLMGenFusedMoE(MoE):
                 self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
                 if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
-                    MnnvlMemory.initialize()
-                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                    # Initialize appropriate MnnvlMemory implementation
+                    self.op_backend.mnnvl_initialize()
+                    self.alltoall_workspace = self.op_backend.mnnvl_get_workspaces(
                         model_config.mapping)
-                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                    self.alltoall_prepare_workspace = self.op_backend.mnnvl_get_prepare_workspace(
                         model_config.mapping)
+
                 elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                     # Calculate required workspace size
                     ep_size = self.mapping.moe_ep_size
@@ -240,13 +248,9 @@ class TRTLLMGenFusedMoE(MoE):
                     dtype = self.dtype or torch.bfloat16
 
                     workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-                        ep_size,
-                        self.routing_method.experts_per_token,
-                        max_num_tokens,
-                        hidden_size,
-                        dtype,
-                        self.num_experts if self.layer_load_balancer else None,
-                    )
+                        ep_size, self.routing_method.experts_per_token,
+                        max_num_tokens, hidden_size, dtype,
+                        self.num_experts if self.layer_load_balancer else None)
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
@@ -285,6 +289,40 @@ class TRTLLMGenFusedMoE(MoE):
             return 1
         else:
             raise ValueError(f"Unsupported activation type: {activation_type}")
+
+    def _check_op_backend_support(self) -> bool:
+        # Unsupported activation type or routing method
+        if self.activation_type == ActivationType.Relu2:
+            return False
+        if isinstance(self.routing_method,
+                      (DeepSeekV3MoeRoutingMethod, DefaultMoeRoutingMethod)):
+            return False
+
+        quant_method = self._get_quant_method()
+
+        # NVFP4 base method is always supported
+        if type(quant_method) is NVFP4TRTLLMGenFusedMoEBaseMethod:
+            return True
+
+        if self.quant_config is None:
+            return False
+        mode = self.quant_config.layer_quant_mode
+
+        # These quant modes are never supported via op backend
+        if mode.has_w4a8_nvfp4_fp8() or mode.has_w4a8_mxfp4_fp8():
+            return False
+
+        # These quant modes require alignment and no bias
+        if mode.has_nvfp4() or mode.has_w4a16_mxfp4(
+        ) or mode.has_w4a8_mxfp4_mxfp8():
+            if self.bias:
+                return False
+            if self.intermediate_size_per_partition % quant_method.weight_alignment != 0:
+                return False
+            if self.hidden_size % quant_method.input_hidden_alignment != 0:
+                return False
+
+        return True
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         # If no attention DP, no need to use AlltoAll.
@@ -445,11 +483,11 @@ class TRTLLMGenFusedMoE(MoE):
                     x = torch.nn.functional.pad(x, (0, pad_size))
 
                 x_row = x.shape[0]
-                x, x_sf = torch.ops.trtllm.fp4_quantize(
-                    x, self.fc31_input_scale, self.scaling_vector_size, False,
-                    False)
+                x, x_sf = self.op_backend.fp4_quantize(x, self.fc31_input_scale,
+                                                       self.scaling_vector_size,
+                                                       False, False)
         elif self.has_w4a8_mxfp4_mxfp8:
-            x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+            x, x_sf = self.op_backend.mxfp8_quantize(
                 x, False, alignment=self.quant_method.input_hidden_alignment)
             x_row, x_col = x.shape[0], x.shape[1]
         elif self.has_deepseek_fp8_block_scales:
@@ -547,8 +585,7 @@ class TRTLLMGenFusedMoE(MoE):
             # fp8_block_scale_moe_runner needs 2D shape for x_sf and only support SM100+
             if x_sf is None:
                 x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-
-            final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
+            final_hidden_states = self.op_backend.run_fp8_block_scale_moe(
                 router_logits,
                 routing_bias,
                 x,
@@ -569,28 +606,42 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
             )
-        elif self.has_nvfp4:
+
+        elif self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_mxfp8:
+            if not do_finalize:
+                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
+
             factor = 1 if self.activation_type == ActivationType.Relu2 else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // factor
             act_type = self._to_trtllm_gen_activation_type(self.activation_type)
-            outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
+
+            output1_scale_scalar = getattr(
+                self, 'fc31_scale_c', None).data if getattr(
+                    self, 'fc31_scale_c', None) is not None else None
+            output1_scale_gate_scalar = getattr(
+                self, 'fc31_alpha', None).data if getattr(
+                    self, 'fc31_alpha', None) is not None else None
+            output2_scale_scalar = getattr(
+                self, 'fc2_alpha', None).data if getattr(
+                    self, 'fc2_alpha', None) is not None else None
+            outputs = self.op_backend.run_fp4_block_scale_moe(
                 router_logits,
                 routing_bias,
                 x,
-                x_sf.view(torch.float8_e4m3fn),
+                x_sf,
                 self.w3_w1_weight,
-                self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                self.w3_w1_weight_scale,
                 self.w3_w1_bias if self.bias else None,
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
                 self.w2_weight,
-                self.w2_weight_scale.view(torch.float8_e4m3fn),
+                self.w2_weight_scale,
                 self.w2_bias if self.bias else None,
-                self.fc31_scale_c.data,
-                self.fc31_alpha.data,
-                self.fc2_alpha.data,
+                output1_scale_scalar,
+                output1_scale_gate_scalar,
+                output2_scale_scalar,
                 self.num_slots,
                 top_k,
                 n_group,
@@ -601,56 +652,17 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
-                act_type=act_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
+                valid_hidden_size=self.hidden_size,
+                valid_intermediate_size=getattr(
+                    self.quant_method, 'intermediate_size_per_partition_lean',
+                    None),
+                gated_act_type=act_type,
+                output=moe_output,
             )
 
-            if not do_finalize:
-                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
-                return outputs
-            else:
-                final_hidden_states = outputs[0]
-                # Slice output if it was padded
-                if final_hidden_states.shape[1] > self.hidden_size:
-                    final_hidden_states = final_hidden_states[:, :self.
-                                                              hidden_size].contiguous(
-                                                              )
-        elif self.has_w4a16_mxfp4:
-            assert x.dtype == torch.bfloat16
-
-            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
-            final_hidden_states = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
-                router_logits,
-                routing_bias,
-                x,
-                self.w3_w1_weight,
-                self.w3_w1_weight_scale,
-                self.w3_w1_bias,
-                self.swiglu_alpha,
-                self.swiglu_beta,
-                self.swiglu_limit,
-                self.w2_weight,
-                self.w2_weight_scale,
-                self.w2_bias,
-                self.num_slots,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size_per_partition_padded,
-                self.hidden_size,
-                self.quant_method.intermediate_size_per_partition_lean,
-                self.slot_start,
-                self.expert_size_per_partition,
-                routed_scaling_factor,
-                self.routing_method.routing_method_type,
-                0,  # act_type
-                token_final_scales,
-                token_selected_experts,
-            )
-            final_hidden_states = final_hidden_states[:, :self.
-                                                      hidden_size].contiguous()
+            final_hidden_states = moe_output if moe_output is not None else outputs
         elif self.has_w4a8_nvfp4_fp8:
 
             outputs = torch.ops.trtllm.fp8_fp4_block_scale_moe_runner(
@@ -722,47 +734,6 @@ class TRTLLMGenFusedMoE(MoE):
             )
             final_hidden_states = final_hidden_states[:, :self.
                                                       hidden_size].contiguous()
-        elif self.has_w4a8_mxfp4_mxfp8:
-
-            mxfp8_x, sf = x, x_sf
-
-            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
-
-            result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
-                router_logits,
-                routing_bias,
-                x,
-                x_sf,
-                self.w3_w1_weight,
-                self.w3_w1_weight_scale,
-                self.w3_w1_bias,
-                self.swiglu_alpha,
-                self.swiglu_beta,
-                self.swiglu_limit,
-                self.w2_weight,
-                self.w2_weight_scale,
-                self.w2_bias,
-                self.num_slots,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size_per_partition_padded,
-                self.hidden_size,
-                self.quant_method.intermediate_size_per_partition_lean,
-                self.slot_start,
-                self.expert_size_per_partition,
-                routed_scaling_factor,
-                self.routing_method.routing_method_type,
-                0,  # act_type
-                token_final_scales,
-                token_selected_experts,
-                output=moe_output,
-            )
-
-            # When output is provided, use it directly as the result
-            # (custom op returns empty tensor to avoid PyTorch aliasing constraints)
-            final_hidden_states = moe_output if moe_output is not None else result
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."
@@ -854,7 +825,8 @@ class TRTLLMGenFusedMoE(MoE):
                     )
                 else:
                     loadbalancer_local_statistic_info = None
-                alltoall_info, gathered_loadbalancer_local_statistic_info = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+
+                alltoall_info, gathered_loadbalancer_local_statistic_info = self.op_backend.mnnvl_moe_alltoallv_prepare_without_allgather(
                     token_selected_experts,
                     loadbalancer_local_statistic_info,
                     self.alltoall_prepare_workspace,
@@ -873,7 +845,8 @@ class TRTLLMGenFusedMoE(MoE):
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
-                x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
+
+                x, x_sf, token_selected_experts, token_final_scales = self.op_backend.mnnvl_moe_alltoallv(
                     [x, x_sf, token_selected_experts, token_final_scales],
                     alltoall_info,
                     self.alltoall_workspace,
@@ -991,7 +964,7 @@ class TRTLLMGenFusedMoE(MoE):
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 if alltoall_info is not None:
-                    final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                    final_hidden_states = self.op_backend.mnnvl_moe_alltoallv_combine(
                         final_hidden_states,
                         alltoall_info,
                         self.alltoall_workspace,
