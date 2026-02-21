@@ -465,6 +465,90 @@ class TestNixlFunctionalTransfer:
         agent_a.deregister_memory(src_descs)
         agent_b.deregister_memory(dst_descs)
 
+    def test_nixl_wait_in_progress_on_zero_timeout(self):
+        """Test that wait(timeout_ms=0) returns IN_PROGRESS or SUCCESS, never FAILURE."""
+        device = torch.device("cuda:0")
+
+        # Use a large tensor to maximize chance of catching transfer in-flight
+        num_elements = 10_000_000
+        src_tensor = torch.arange(num_elements, dtype=torch.float32, device=device)
+        dst_tensor = torch.zeros(num_elements, dtype=torch.float32, device=device)
+
+        config_a = tab.BaseAgentConfig(
+            name="agent_a", use_prog_thread=True, use_listen_thread=False
+        )
+        config_b = tab.BaseAgentConfig(
+            name="agent_b", use_prog_thread=True, use_listen_thread=False
+        )
+
+        agent_a = tab.NixlTransferAgent(config_a)
+        agent_b = tab.NixlTransferAgent(config_b)
+
+        src_descs = _create_memory_descs_from_tensor(src_tensor, tab.MemoryType.VRAM)
+        dst_descs = _create_memory_descs_from_tensor(dst_tensor, tab.MemoryType.VRAM)
+
+        agent_a.register_memory(src_descs)
+        agent_b.register_memory(dst_descs)
+
+        agent_a.load_remote_agent("agent_b", agent_b.get_local_agent_desc())
+        agent_b.load_remote_agent("agent_a", agent_a.get_local_agent_desc())
+
+        request = tab.TransferRequest(tab.TransferOp.WRITE, src_descs, dst_descs, "agent_b")
+        status = agent_a.submit_transfer_requests(request)
+
+        # With timeout_ms=0, wait checks status once and returns immediately.
+        # The transfer may or may not have completed, but it should never be FAILURE.
+        result = status.wait(timeout_ms=0)
+        assert result == tab.TransferState.IN_PROGRESS
+
+        # Wait for the transfer to actually finish before cleanup
+        final_result = status.wait(timeout_ms=5000)
+        assert final_result == tab.TransferState.SUCCESS
+
+        torch.cuda.synchronize()
+        assert torch.equal(src_tensor, dst_tensor)
+
+        agent_a.deregister_memory(src_descs)
+        agent_b.deregister_memory(dst_descs)
+
+    def test_nixl_wait_failure_on_invalidated_remote(self):
+        """Test that submitting a transfer to an invalidated remote agent causes FAILURE."""
+        device = torch.device("cuda:0")
+
+        src_tensor = torch.arange(1024, dtype=torch.float32, device=device)
+        dst_tensor = torch.zeros(1024, dtype=torch.float32, device=device)
+
+        config_a = tab.BaseAgentConfig(
+            name="agent_a", use_prog_thread=True, use_listen_thread=False
+        )
+        config_b = tab.BaseAgentConfig(
+            name="agent_b", use_prog_thread=True, use_listen_thread=False
+        )
+
+        agent_a = tab.NixlTransferAgent(config_a)
+        agent_b = tab.NixlTransferAgent(config_b)
+
+        src_descs = _create_memory_descs_from_tensor(src_tensor, tab.MemoryType.VRAM)
+        dst_descs = _create_memory_descs_from_tensor(dst_tensor, tab.MemoryType.VRAM)
+
+        agent_a.register_memory(src_descs)
+        agent_b.register_memory(dst_descs)
+
+        agent_a.load_remote_agent("agent_b", agent_b.get_local_agent_desc())
+        agent_b.load_remote_agent("agent_a", agent_a.get_local_agent_desc())
+
+        # Invalidate the remote agent before submitting
+        agent_a.invalidate_remote_agent("agent_b")
+
+        request = tab.TransferRequest(tab.TransferOp.WRITE, src_descs, dst_descs, "agent_b")
+
+        # Submitting to an invalidated remote should raise or return a failed status
+        with pytest.raises(Exception):
+            agent_a.submit_transfer_requests(request)
+
+        agent_a.deregister_memory(src_descs)
+        agent_b.deregister_memory(dst_descs)
+
 
 @pytest.mark.skipif(
     not (HAS_TORCH and HAS_CUDA),
@@ -587,5 +671,79 @@ class TestMooncakeFunctionalTransfer:
             assert torch.equal(src, dst), f"Data mismatch in chunk {i}"
 
         # Cleanup
+        agent_a.deregister_memory(src_descs)
+        agent_b.deregister_memory(dst_descs)
+
+    def test_mooncake_wait_in_progress_on_zero_timeout(self):
+        """Test that wait(timeout_ms=0) returns IN_PROGRESS or SUCCESS, never FAILURE."""
+        device = torch.device("cuda:0")
+
+        num_elements = 10_000_000
+        src_tensor = torch.arange(num_elements, dtype=torch.float32, device=device)
+        dst_tensor = torch.zeros(num_elements, dtype=torch.float32, device=device)
+
+        config_a = tab.BaseAgentConfig(name="mooncake_agent_a", use_prog_thread=True)
+        config_b = tab.BaseAgentConfig(name="mooncake_agent_b", use_prog_thread=True)
+
+        agent_a = tab.MooncakeTransferAgent(config_a)
+        agent_b = tab.MooncakeTransferAgent(config_b)
+
+        src_descs = _create_memory_descs_from_tensor(src_tensor, tab.MemoryType.VRAM)
+        dst_descs = _create_memory_descs_from_tensor(dst_tensor, tab.MemoryType.VRAM)
+
+        agent_a.register_memory(src_descs)
+        agent_b.register_memory(dst_descs)
+
+        agent_a.load_remote_agent("mooncake_agent_b", agent_b.get_local_agent_desc())
+        agent_b.load_remote_agent("mooncake_agent_a", agent_a.get_local_agent_desc())
+
+        request = tab.TransferRequest(
+            tab.TransferOp.WRITE, src_descs, dst_descs, "mooncake_agent_b"
+        )
+        status = agent_a.submit_transfer_requests(request)
+
+        result = status.wait(timeout_ms=0)
+        assert result == tab.TransferState.IN_PROGRESS
+
+        final_result = status.wait(timeout_ms=5000)
+        assert final_result == tab.TransferState.SUCCESS
+
+        torch.cuda.synchronize()
+        assert torch.equal(src_tensor, dst_tensor)
+
+        agent_a.deregister_memory(src_descs)
+        agent_b.deregister_memory(dst_descs)
+
+    def test_mooncake_wait_failure_on_invalidated_remote(self):
+        """Test that submitting a transfer to an invalidated remote agent causes FAILURE."""
+        device = torch.device("cuda:0")
+
+        src_tensor = torch.arange(1024, dtype=torch.float32, device=device)
+        dst_tensor = torch.zeros(1024, dtype=torch.float32, device=device)
+
+        config_a = tab.BaseAgentConfig(name="mooncake_agent_a", use_prog_thread=True)
+        config_b = tab.BaseAgentConfig(name="mooncake_agent_b", use_prog_thread=True)
+
+        agent_a = tab.MooncakeTransferAgent(config_a)
+        agent_b = tab.MooncakeTransferAgent(config_b)
+
+        src_descs = _create_memory_descs_from_tensor(src_tensor, tab.MemoryType.VRAM)
+        dst_descs = _create_memory_descs_from_tensor(dst_tensor, tab.MemoryType.VRAM)
+
+        agent_a.register_memory(src_descs)
+        agent_b.register_memory(dst_descs)
+
+        agent_a.load_remote_agent("mooncake_agent_b", agent_b.get_local_agent_desc())
+        agent_b.load_remote_agent("mooncake_agent_a", agent_a.get_local_agent_desc())
+
+        agent_a.invalidate_remote_agent("mooncake_agent_b")
+
+        request = tab.TransferRequest(
+            tab.TransferOp.WRITE, src_descs, dst_descs, "mooncake_agent_b"
+        )
+
+        with pytest.raises(Exception):
+            agent_a.submit_transfer_requests(request)
+
         agent_a.deregister_memory(src_descs)
         agent_b.deregister_memory(dst_descs)
