@@ -1,0 +1,19 @@
+# NFS temporary files
+.nfs*
+*.nfs*
+
+# Editor temporary files
+*~
+*.swp
+*.swo
+.*.swp
+.*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
