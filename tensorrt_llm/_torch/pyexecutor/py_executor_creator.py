@@ -379,6 +379,16 @@ def create_py_executor(
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
+    # Auto-populate num_draft_layers from the draft model's config for
+    # DraftTarget one-model mode, so get_num_spec_layers returns the correct
+    # value during KV cache creation.
+    if (spec_config is not None
+            and spec_config.spec_dec_mode.is_draft_target_one_model()):
+        draft_config = getattr(model_engine.model, 'draft_config', None)
+        if draft_config is not None and spec_config.num_draft_layers is None:
+            spec_config.num_draft_layers = \
+                draft_config.pretrained_config.num_hidden_layers
+
     calibrator = get_calibrator()
     layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
     calibrator.init(layer_wise_benchmarks_config.calibration_mode,

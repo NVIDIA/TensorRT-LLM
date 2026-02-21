@@ -131,6 +131,13 @@ class ModelConfig(Generic[TConfig]):
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
 
+    # Offset applied to every attention layer_idx at construction time.
+    # In one-model speculative decoding the draft model's layers must use
+    # KV-cache indices that don't collide with the target model's layers.
+    # Setting this to num_target_layers when building the draft model avoids
+    # the need for a post-hoc index fixup.
+    layer_idx_offset: int = 0
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.

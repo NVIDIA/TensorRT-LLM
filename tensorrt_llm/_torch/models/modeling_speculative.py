@@ -23,6 +23,7 @@ from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
+from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
 
@@ -916,6 +917,16 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                               lm_head, model)
     elif spec_dec_mode.is_mtp_eagle():
         return MTPDraftModelForCausalLM(model_config)
+    elif spec_dec_mode.is_draft_target_one_model():
+        # Set the layer index offset on the draft config so that attention
+        # layers are created with KV-cache indices that don't collide with the
+        # target model's layers (target uses [0, N), draft uses [N, N+M)).
+        num_target_layers = model_config.pretrained_config.num_hidden_layers
+        draft_config._frozen = False
+        draft_config.layer_idx_offset = num_target_layers
+        draft_config._frozen = True
+        draft_model = AutoModelForCausalLM.from_config(draft_config)
+        return draft_model
     else:
         raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
@@ -934,6 +945,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.draft_config = None
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
+        self.spec_config = spec_config
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             if spec_config.spec_dec_mode.is_eagle3_one_model():
                 if spec_config.eagle3_model_arch == "mistral_large3":
@@ -965,6 +977,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     )
                 self.draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
+            elif spec_config.spec_dec_mode.is_draft_target_one_model():
+                self.draft_config = ModelConfig.from_pretrained(
+                    spec_config.speculative_model,
+                    trust_remote_code=True,
+                    attn_backend=model_config.attn_backend,
+                    moe_backend=model_config.moe_backend,
+                    mapping=model_config.mapping,
+                    spec_config=None,  # Draft model doesn't need spec_config
+                    max_num_tokens=model_config.max_num_tokens,
+                    moe_max_num_tokens=model_config.moe_max_num_tokens)
+                self.draft_config.quant_config.kv_cache_quant_algo = \
+                model_config.quant_config.kv_cache_quant_algo
 
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                 spec_config)
@@ -978,12 +1002,13 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             self.epilogue.append(self.draft_model)
             self.epilogue.append(self.spec_worker)
-
-            if self.draft_config is not None and model_config.spec_config.eagle3_model_arch == "llama3":
+            if self.draft_config is not None and (
+                    spec_config.spec_dec_mode.is_draft_target_one_model()
+                    or model_config.spec_config.eagle3_model_arch == "llama3"):
                 for key, value in self.draft_config.extra_attrs.items():
-                    assert key in ('attn_layers', 'mla_layers')
-                    assert key in model_config.extra_attrs
-                    model_config.extra_attrs[key].update(value)
+                    if key in ('attn_layers', 'mla_layers'):
+                        assert key in model_config.extra_attrs
+                        model_config.extra_attrs[key].update(value)
         self.layer_idx = -1
 
     def forward(
@@ -1066,7 +1091,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                            weight_mapper: Optional[BaseWeightMapper] = None):
         self.draft_model.load_weights(weights=weights,
                                       weight_mapper=weight_mapper)
-        self.draft_model.load_weights_from_target_model(self)
+        if self.spec_config and not self.spec_config.spec_dec_mode.is_draft_target_one_model(
+        ):
+            self.draft_model.load_weights_from_target_model(self)
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:

@@ -176,8 +176,14 @@ class Attention(nn.Module):
             attn_output_gate (Optional[bool]): Determines whether to use an output gate in the attention Op. If False, the decision is automatically handled by the attention backend based on its capabilities.
         """
         super().__init__()
-        self.layer_idx = layer_idx
-        self.layer_idx_str = str(layer_idx)
+        # Apply the per-config layer index offset so that, e.g., draft-model
+        # attention layers are created with KV-cache indices that don't collide
+        # with the target model's layers.
+        offset = getattr(config, 'layer_idx_offset',
+                         0) if config is not None else 0
+        effective_layer_idx = layer_idx + offset if layer_idx is not None else layer_idx
+        self.layer_idx = effective_layer_idx
+        self.layer_idx_str = str(effective_layer_idx)
 
         self.register_to_config = False
         # We only register TRTLLM attention layers to config.
@@ -187,7 +193,7 @@ class Attention(nn.Module):
             suffix = 0
             # Makes sure there is no duplicate attention layer identifier.
             while self.layer_idx_str in config.extra_attrs["attn_layers"]:
-                self.layer_idx_str = str(layer_idx) + f"_{suffix}"
+                self.layer_idx_str = str(effective_layer_idx) + f"_{suffix}"
                 suffix += 1
             config.extra_attrs["attn_layers"][self.layer_idx_str] = weakref.ref(
                 self)
@@ -778,8 +784,12 @@ class MLA(nn.Module):
             enable_helix_test (bool): Whether to enable helix unit test.
         """
         super().__init__()
-        self.layer_idx = layer_idx
-        self.layer_idx_str = str(layer_idx)
+        # Apply the per-config layer index offset (see Attention.__init__).
+        offset = getattr(config, 'layer_idx_offset',
+                         0) if config is not None else 0
+        effective_layer_idx = layer_idx + offset if layer_idx is not None else layer_idx
+        self.layer_idx = effective_layer_idx
+        self.layer_idx_str = str(effective_layer_idx)
         self.dtype = dtype
 
         self.hidden_size = hidden_size
