@@ -19,7 +19,7 @@ import torch.nn as nn
 def get_1d_rotary_pos_embed(
     dim: int,
     pos: torch.Tensor,
-    theta: float = 10000.0,
+    theta: "float | torch.Tensor" = 10000.0,
     use_real: bool = True,
     repeat_interleave_real: bool = True,
     freqs_dtype: torch.dtype = torch.float64,
@@ -81,10 +81,9 @@ class FluxPosEmbed(nn.Module):
             axes_dim: Dimensions for each axis. Default: [16, 56, 56] (FLUX.1)
         """
         super().__init__()
-        self.theta = theta
+        self.register_buffer("theta", torch.tensor(theta, dtype=torch.float64), persistent=False)
         self.axes_dim = axes_dim if axes_dim is not None else [16, 56, 56]
 
-    @torch.compiler.disable
     def forward(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute rotary embeddings from position IDs.
 
