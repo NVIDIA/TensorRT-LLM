@@ -235,8 +235,6 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             layer_idx=layer_idx,
         )
 
-        # MLP activation uses swiglu from _torch/modules (Triton-optimized)
-
         # Combined output: [q_dim + mlp_hidden_dim] -> [hidden_size]
         self.to_out = Linear(
             self.q_dim + self.mlp_hidden_dim,
