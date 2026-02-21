@@ -7,7 +7,11 @@ import numpy as np
 import PIL
 import torch
 from blake3 import blake3
-from torchvision.transforms import ToPILImage
+try:
+    from torchvision.transforms import ToPILImage
+except (ImportError, RuntimeError, AttributeError, Exception):
+    ToPILImage = None
+
 
 import tensorrt_llm
 from tensorrt_llm.logger import logger

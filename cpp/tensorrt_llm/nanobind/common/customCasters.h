@@ -1,3 +1,4 @@
+#include <unordered_map>
 /*
  * Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -299,7 +300,28 @@ struct type_caster<torch::ScalarType>
             dtype_name = dtype_name.substr(6);
         }
 
-        auto const& dtype_map = c10::getStringToDtypeMap();
+        static std::unordered_map<std::string, c10::ScalarType> const dtype_map = [](){
+            std::unordered_map<std::string, c10::ScalarType> map;
+            map["float"] = c10::kFloat;
+            map["float32"] = c10::kFloat;
+            map["double"] = c10::kDouble;
+            map["float64"] = c10::kDouble;
+            map["half"] = c10::kHalf;
+            map["float16"] = c10::kHalf;
+            map["bfloat16"] = c10::kBFloat16;
+            map["int"] = c10::kInt;
+            map["int32"] = c10::kInt;
+            map["long"] = c10::kLong;
+            map["int64"] = c10::kLong;
+            map["short"] = c10::kShort;
+            map["int16"] = c10::kShort;
+            map["char"] = c10::kChar;
+            map["int8"] = c10::kChar;
+            map["byte"] = c10::kByte;
+            map["uint8"] = c10::kByte;
+            map["bool"] = c10::kBool;
+            return map;
+        }();
         auto it = dtype_map.find(dtype_name);
         if (it != dtype_map.end())
         {
