@@ -205,12 +205,15 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     }
     TLLM_CU_CHECK(cuMemSetAccess(ptr, mAllocationSize * mGroupSize, &accessDesc, 1));
 
+    // Bind memory to multicast group before mapping MC pointers.
+    // cuMulticastBindMem blocks until all ranks have added their device,
+    // ensuring the multicast handle is fully consistent for cuMemMap.
+    TLLM_CU_CHECK(cuMulticastBindMem(mMcHandle, 0, mUcHandles[mGroupRank], 0 /*memOffset*/, mAllocationSize, 0));
+
     // Bind MC Pointers
     TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, mc_granularity, 0ULL, 0));
     TLLM_CU_CHECK(cuMemMap(mMcPtr, mAllocationSize, 0, mMcHandle, 0));
     TLLM_CU_CHECK(cuMemSetAccess(mMcPtr, mAllocationSize, &accessDesc, 1));
-
-    TLLM_CU_CHECK(cuMulticastBindMem(mMcHandle, 0, mUcHandles[mGroupRank], 0 /*memOffset*/, mAllocationSize, 0));
 }
 
 void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
