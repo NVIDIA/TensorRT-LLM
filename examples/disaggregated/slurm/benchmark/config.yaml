@@ -16,7 +16,7 @@ benchmark:
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "512"
+  concurrency_list: "16"
   input_length: 252928  # Input sequence length
   output_length: 8192  # Output sequence length
   dataset_file: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/datasets/kimi-k2-fp4-252928-8192-8192-ratio-1_for_serve.json"
@@ -24,7 +24,7 @@ benchmark:
 # Hardware Configuration
 hardware:
   gpus_per_node: 4  # Modify this with your hardware configuration
-  num_ctx_servers: 1  # Number of context servers (set to 0 for gen_only_no_context mode)
+  num_ctx_servers: 0  # Number of context servers (set to 0 for gen_only_no_context mode)
   num_gen_servers: 1  # Number of generation servers
 
 # Environment Configuration
@@ -58,21 +58,22 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 64
-    moe_expert_parallel_size: 64
-    enable_attention_dp: true
+    tensor_parallel_size: 1
+    moe_expert_parallel_size: 4
+    enable_attention_dp: false
     enable_lm_head_tp_in_adp: false
     pipeline_parallel_size: 1
-    context_parallel_size: 1
+    context_parallel_size: 4
     enable_autotuner: false
     cp_config:
       cp_type: "HELIX"
       tokens_per_block: 32
       use_nccl_for_alltoall: false
       fifo_version: 2
-    max_batch_size: 512
-    max_num_tokens: 1024
-    max_seq_len: 261632
+    max_batch_size: 8
+    max_num_tokens: 16
+    max_seq_len: 71936
+    max_input_len: 252928
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 8
@@ -89,7 +90,7 @@ worker_config:
       # load_balancer:
       #   num_slots: 0
     cache_transceiver_config:
-      max_tokens_in_buffer: 253952
+      max_tokens_in_buffer: 4096
       backend: UCX
     stream_interval: 20
     num_postprocess_workers: 4
@@ -111,7 +112,7 @@ worker_config:
       free_gpu_memory_fraction: 0.5
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 253952
+      max_tokens_in_buffer: 4096
       backend: UCX
     pp_partition:
     - 8
