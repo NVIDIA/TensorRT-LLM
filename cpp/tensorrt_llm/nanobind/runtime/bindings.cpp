@@ -22,6 +22,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
+#include "tensorrt_llm/kernels/globalTimerKernel.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -315,6 +316,17 @@ void initBindings(nb::module_& m)
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
         "Delay kernel launch on the default stream");
+    m.def(
+        "record_global_timer",
+        [](int64_t data_ptr, nb::object py_stream)
+        {
+            auto* ptr = reinterpret_cast<uint64_t*>(data_ptr);
+            auto stream_ptr = nb::cast<int64_t>(py_stream.attr("cuda_stream"));
+            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            nb::gil_scoped_release release;
+            tensorrt_llm::kernels::invokeReadGlobalTimer(ptr, stream);
+        },
+        "Record GPU global timer value to device memory");
     m.def(
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
