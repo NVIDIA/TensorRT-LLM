@@ -13,20 +13,6 @@ if TYPE_CHECKING:
     from ..config import DiffusionModelConfig
 
 
-def _per_head_norm(x: torch.Tensor, norm_fn: RMSNorm) -> torch.Tensor:
-    """Apply RMSNorm per-head on a 4D tensor.
-
-    TRT-LLM RMSNorm expects 2D input. We reshape [B,S,H,D] -> [B*S*H, D],
-    apply norm, then reshape back.
-
-    Args:
-        x: Input tensor of shape [B, S, H, D]
-        norm_fn: TRT-LLM RMSNorm instance with hidden_size=D
-    """
-    B, S, H, D = x.shape
-    return norm_fn(x.reshape(B * S * H, D)).reshape(B, S, H, D)
-
-
 class QKVMode(str, Enum):
     FUSE_QKV = "fuse_qkv"
     FUSE_KV = "fuse_kv"
@@ -90,7 +76,6 @@ class Attention(nn.Module):
             backend_name = base_backend
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
-        self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.eps = eps
 
@@ -100,7 +85,7 @@ class Attention(nn.Module):
         self._init_qkv_proj()
 
         if self.qk_norm:
-            if self.qk_norm_mode == "per_head":
+            if qk_norm_mode == "per_head":
                 q_norm_dim = self.head_dim
                 kv_norm_dim = self.head_dim
             else:
@@ -231,9 +216,10 @@ class Attention(nn.Module):
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.qk_norm:
-            if self.qk_norm_mode == "per_head":
-                q = _per_head_norm(q, self.norm_q)
-                k = _per_head_norm(k, self.norm_k)
+            if q.ndim == 4:
+                shape = q.shape
+                q = self.norm_q(q.reshape(-1, shape[-1])).view(shape)
+                k = self.norm_k(k.reshape(-1, k.shape[-1])).view(k.shape)
             else:
                 q = self.norm_q(q)
                 k = self.norm_k(k)

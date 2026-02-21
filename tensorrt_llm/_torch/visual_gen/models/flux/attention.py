@@ -15,12 +15,7 @@ import torch
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
-from tensorrt_llm._torch.visual_gen.modules.attention import (
-    Attention,
-    QKVMode,
-    _per_head_norm,
-    apply_rotary_emb,
-)
+from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -152,8 +147,8 @@ class FluxJointAttention(Attention):
             enc_k = enc_k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
             enc_v = enc_v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
-            enc_q = _per_head_norm(enc_q, self.norm_added_q)
-            enc_k = _per_head_norm(enc_k, self.norm_added_k)
+            enc_q = self.norm_added_q(enc_q.reshape(-1, enc_q.shape[-1])).view(enc_q.shape)
+            enc_k = self.norm_added_k(enc_k.reshape(-1, enc_k.shape[-1])).view(enc_k.shape)
 
             # Concatenate text + image for joint attention
             query = torch.cat([enc_q, query], dim=1)
