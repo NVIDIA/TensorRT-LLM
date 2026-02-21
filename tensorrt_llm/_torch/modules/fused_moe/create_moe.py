@@ -12,6 +12,7 @@ from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
+from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -45,6 +46,17 @@ def get_moe_cls(
             return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
         return DeepGemmFusedMoE
+    elif moe_backend.upper() == "DENSEGEMM":
+        if quant_config is not None and (
+                quant_config.quant_mode.has_fp8_block_scales()
+                or quant_config.quant_mode.has_nvfp4()):
+            return DenseGEMMFusedMoE
+        else:
+            logger.warning(
+                "DenseGEMMFusedMoE only supports fp8_block_scales and nvfp4. "
+                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
+            )
+            return CutlassFusedMoE
     elif moe_backend.upper() == "TRTLLM":
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
@@ -276,6 +288,22 @@ def create_moe_backend(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+        )
+    elif moe_cls == DenseGEMMFusedMoE:
+        return moe_cls(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
+            weight_loading_mode=weight_loading_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
         )
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
