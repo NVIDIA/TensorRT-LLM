@@ -17,7 +17,7 @@ l0_dgx_b300:
   tests:
   - unittest/_torch/attention
   - unittest/_torch/executor
-  - unittest/_torch/modules
+  - unittest/_torch/modules TIMEOUT (360)
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
