@@ -190,11 +190,12 @@ l0_b200:
   tests:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[torch-True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[trtllm-1]
   - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-False]
   - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_nvfp4[False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_nvfp4[True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-trtllm]
   - unittest/_torch/auto_deploy/unit/singlegpu
