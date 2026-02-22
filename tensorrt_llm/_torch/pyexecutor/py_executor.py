@@ -2894,6 +2894,15 @@ class PyExecutor:
             gather_context_logits = any(
                 a.py_return_context_logits
                 for a in scheduled_requests.context_requests)
+            # Some context-only singleton batches can return degenerate logits shapes
+            # (e.g., [1]) when context logits are not gathered. Force gather only for
+            # context-only batches with chunk_size==1 to preserve token alignment.
+            if (not gather_context_logits
+                    and len(scheduled_requests.generation_requests) == 0
+                    and len(scheduled_requests.context_requests) > 0
+                    and all(req.context_chunk_size == 1
+                            for req in scheduled_requests.context_requests)):
+                gather_context_logits = True
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization

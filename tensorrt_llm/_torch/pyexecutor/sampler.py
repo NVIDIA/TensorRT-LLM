@@ -3522,6 +3522,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             raw_logits_cuda,
             num_context_logits_prefix_sum=num_context_logits_prefix_sum,
         )
+        logits_cuda = self._canonicalize_logits_for_sampling(logits_cuda)
+
         return_log_probs = self._return_log_probs(requests)
         if return_log_probs:
             self._prepare_log_probs(requests)
@@ -3610,6 +3612,24 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # NB: update_requests syncs w/ device computation and async D2H copies
         return new_tokens_host
+
+    @staticmethod
+    def _canonicalize_logits_for_sampling(logits_cuda: torch.Tensor) -> torch.Tensor:
+        # Canonical shape required by sampling logic: [tokens, vocab].
+        if logits_cuda.dim() == 3:
+            logits_cuda = logits_cuda.reshape(-1, logits_cuda.size(-1))
+        elif logits_cuda.dim() == 1:
+            logits_cuda = logits_cuda.unsqueeze(0)
+        elif logits_cuda.dim() != 2:
+            raise AssertionError(
+                f"Unexpected logits rank for sampling: shape={tuple(logits_cuda.shape)}"
+            )
+
+        assert logits_cuda.size(1) > 1, (
+            "Invalid logits vocab dimension before strategy resolution: "
+            f"logits_shape={tuple(logits_cuda.shape)}"
+        )
+        return logits_cuda
 
     @override
     def should_provide_draft_probs(self, request: LlmRequest) -> bool:

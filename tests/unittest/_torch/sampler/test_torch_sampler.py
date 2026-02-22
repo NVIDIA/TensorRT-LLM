@@ -2381,3 +2381,23 @@ class TestBatchedSampling:
                 input_offset += steps
 
         run_test_with_warmup(_uut_provider, max_sync_s=0.2)
+
+
+def test_canonicalize_logits_for_sampling_flattens_3d():
+    logits = torch.randn(1, 12, 64)
+    normalized = TorchSampler._canonicalize_logits_for_sampling(logits)
+    assert normalized.shape == (12, 64)
+
+
+def test_canonicalize_logits_for_sampling_expands_1d():
+    logits = torch.randn(64)
+    normalized = TorchSampler._canonicalize_logits_for_sampling(logits)
+    assert normalized.shape == (1, 64)
+
+
+def test_canonicalize_logits_for_sampling_rejects_invalid_vocab_dim():
+    logits = torch.randn(1)
+    with pytest.raises(
+        AssertionError, match="Invalid logits vocab dimension before strategy resolution"
+    ):
+        TorchSampler._canonicalize_logits_for_sampling(logits)
