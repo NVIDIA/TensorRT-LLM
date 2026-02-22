@@ -113,6 +113,9 @@ class NemotronHMamba2Mixer(nn.Module):
         A = torch.arange(1, self.num_heads + 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
+        # Pre-computed float32 A buffer: lazily populated on first forward before CUDA graph capture
+        # to avoid a BF16→float32 dtype-copy kernel inside every decode step (once per Mamba layer).
+        self.register_buffer("_A_float32", None, persistent=False)
         self.norm = MambaRMSNormGated(
             self.intermediate_size,
             eps=self.layer_norm_epsilon,
@@ -159,7 +162,12 @@ class NemotronHMamba2Mixer(nn.Module):
         )
 
         # 3. SSM transformation
-        A = -torch.exp(self.A_log.float())
+        # Use cached float32 A to avoid a BF16→float32 dtype-copy kernel on every decode step.
+        # _A_float32 is populated once (before CUDA graph capture) so the CUDA graph only sees a
+        # tensor reference here, with zero per-step conversion overhead.
+        if self._A_float32 is None:
+            self._A_float32 = -torch.exp(self.A_log.float()).detach()
+        A = self._A_float32
         y = torch.ops.auto_deploy.torch_ssm(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
