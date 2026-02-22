@@ -1727,7 +1727,7 @@ def _insert_sharded_mxfp4_mlp_ep(
 def _process_simple_shard(
     nodes_linear: Dict[Node, List[Node]],
     transform_container: ShardingTransformContainer,
-    layer_type: LayerType = LayerType.MLP,
+    layer_type: LayerType = LayerType.UNKNOWN,
 ) -> int:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
