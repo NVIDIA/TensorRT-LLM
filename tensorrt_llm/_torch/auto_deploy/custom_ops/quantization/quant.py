@@ -273,6 +273,61 @@ class FP8Linear(nn.Linear):
         )
 
 
+def _pad_nvfp4_weight(
+    weight_fp4: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    n: int,
+    k: int,
+    align_to: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Pad NVFP4 weight, weight_scale, and alpha so n and k are multiples of ``align_to``.
+
+    TP sharding can misalign either dimension: column-sharding affects n
+    (e.g. Mamba2 in_proj), row-sharding affects k (e.g. shared experts
+    down_proj). Both must be divisible by 32 for nvfp4_gemm.
+
+    weight_fp4 and weight_scale are padded independently because they have
+    different alignment requirements:
+      - weight_fp4 has shape [n, k/2] (packed uint8) — padded along both dims.
+      - weight_scale is 1D with n*k/16 real entries in row-major order, padded
+        to a multiple of 128*4=512 from the checkpoint. Padding k requires
+        reshaping to [n, k/16] because block-scale entries are per-row.
+      - alpha has shape [n] or is a scalar — padded along dim 0 when 1-D.
+
+    Returns (weight_fp4, weight_scale, alpha, n_padded, k_padded).
+    """
+    n_padded = (n + align_to - 1) // align_to * align_to
+    k_padded = (k + align_to - 1) // align_to * align_to
+    pad_n = n_padded - n
+    pad_k = k_padded - k
+
+    # weight_fp4 [n, k/2] (packed uint8): pad both dims
+    weight_fp4 = torch.nn.functional.pad(weight_fp4, (0, pad_k // 2, 0, pad_n))
+
+    # alpha [n] or scalar: pad n dim only
+    if alpha.ndim >= 1 and pad_n > 0:
+        alpha = torch.nn.functional.pad(alpha, (0, pad_n))
+
+    # weight_scale: 1D with row-major layout [row0_blocks, row1_blocks, ...].
+    # Padding k adds zero blocks at the end of each row (requires reshape).
+    # Padding n adds zero rows at the end.
+    bsv = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+    blocks_per_row = k // bsv
+    blocks_per_row_padded = k_padded // bsv
+
+    ws = weight_scale[: n * blocks_per_row].reshape(n, blocks_per_row)
+    ws = torch.nn.functional.pad(ws, (0, blocks_per_row_padded - blocks_per_row, 0, pad_n))
+    ws = ws.flatten()
+    scale_align = 128 * 4
+    remainder = ws.numel() % scale_align
+    if remainder != 0:
+        ws = torch.nn.functional.pad(ws, (0, scale_align - remainder))
+    weight_scale = ws
+
+    return weight_fp4, weight_scale, alpha, n_padded, k_padded
+
+
 @torch.library.custom_op("auto_deploy::torch_quant_nvfp4_linear", mutates_args=())
 @torch.compile(dynamic=True)
 def nvfp4_linear(
@@ -314,12 +369,27 @@ def nvfp4_linear(
     assert weight_scale is not None
     assert alpha is not None
 
+    # nvfp4_gemm requires both n and k to be divisible by 32. TP sharding can
+    # misalign either: column-sharding affects n (e.g. Mamba2 in_proj 10304/8=1288),
+    # row-sharding affects k (e.g. shared experts down_proj 3712/8=464).
+    need_pad = n % 32 != 0 or k % 32 != 0
+    if need_pad:
+        weight_fp4, weight_scale, alpha, n_padded, k_padded = _pad_nvfp4_weight(
+            weight_fp4, weight_scale, alpha, n, k, align_to=32
+        )
+        if k_padded != k:
+            input = torch.nn.functional.pad(input, (0, k_padded - k))
+
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
         input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
     )
+
     output = torch.ops.trtllm.nvfp4_gemm(
         x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
     )
+
+    if need_pad and n % 32 != 0:
+        output = output[:, :n]
 
     if bias is not None:
         output = output + bias
