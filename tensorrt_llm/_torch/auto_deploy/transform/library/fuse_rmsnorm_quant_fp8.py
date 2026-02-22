@@ -244,7 +244,7 @@ class FuseRMSNormQuantFP8(BaseTransform):
         )
 
         # Both cases:
-        linear_out = trtllm_fp8_gemm(fp8_out, w_fp8, bias, in_scale, w_scale, dtype)
+        linear_out = trtllm_fp8_prequant_linear(fp8_out, w_fp8, bias, in_scale, w_scale, dtype)
         (other consumers of norm_out use bf16_out)
 
     Handles multi-consumer case: when norm_out feeds multiple fp8_linear ops
@@ -386,7 +386,7 @@ class FuseRMSNormQuantFP8(BaseTransform):
 
                 with graph.inserting_after(fp8_user):
                     gemm_node = graph.call_function(
-                        torch.ops.auto_deploy.trtllm_fp8_gemm.default,
+                        torch.ops.auto_deploy.trtllm_fp8_prequant_linear.default,
                         args=(fp8_node, weight_arg, bias_arg),
                         kwargs={
                             "input_scale": in_scale,

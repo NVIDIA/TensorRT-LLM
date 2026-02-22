@@ -204,7 +204,7 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
             x, residual, weight, eps, input_scale)
 
         # Both cases:
-        linear_out = trtllm_nvfp4_gemm(fp4_out, w_fp4, sf_out,
+        linear_out = trtllm_nvfp4_prequant_linear(fp4_out, w_fp4, sf_out,
                                         weight_scale, alpha, bias, dtype)
         (other consumers of norm_out use bf16_out)
     """
@@ -329,7 +329,7 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
 
                 with graph.inserting_after(nvfp4_user):
                     gemm_node = graph.call_function(
-                        torch.ops.auto_deploy.trtllm_nvfp4_gemm.default,
+                        torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear.default,
                         args=(fp4_node, weight_arg, sf_node, w_scale, alpha),
                         kwargs={
                             "bias": bias_arg,

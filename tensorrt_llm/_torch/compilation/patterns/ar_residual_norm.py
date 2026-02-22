@@ -534,7 +534,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             output_dtype_key = KeywordArg('output_dtype')
             to_userbuffers_key = KeywordArg('to_userbuffers')
             allowed_backends_key = KeywordArg('allowed_backends')
-            trtllm_nvfp4_gemm_default = CallFunction(
+            trtllm_nvfp4_prequant_linear_default = CallFunction(
                 torch.ops.trtllm.nvfp4_gemm.default,
                 act_fp4_key,
                 weight_key,
@@ -545,7 +545,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 to_userbuffers=to_userbuffers_key,
                 allowed_backends=allowed_backends_key)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
-                                   trtllm_nvfp4_gemm_default)
+                                   trtllm_nvfp4_prequant_linear_default)
 
             def empty_nvfp4_gemm_prologue_pattern(
                 act_fp4: torch.Tensor,

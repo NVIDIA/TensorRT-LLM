@@ -329,7 +329,7 @@ def _fp32_gold_reference_fp8(model, x, residual=None):
         for i in range(model.num_linears):
             w_fp8 = getattr(model, f"w_fp8_{i}")
             w_scale = getattr(model, f"w_scale_{i}")
-            out = torch.ops.auto_deploy.trtllm_fp8_gemm(
+            out = torch.ops.auto_deploy.trtllm_fp8_prequant_linear(
                 fp8_input,
                 w_fp8,
                 None,
@@ -370,7 +370,9 @@ def _has_fused_rmsnorm_quant_fp8(gm, fused_add=False):
         has_fused_norm = any(
             is_op(n, torch.ops.auto_deploy.triton_rms_norm_quant_fp8) for n in gm.graph.nodes
         )
-    has_fp8_gemm = any(is_op(n, torch.ops.auto_deploy.trtllm_fp8_gemm) for n in gm.graph.nodes)
+    has_fp8_gemm = any(
+        is_op(n, torch.ops.auto_deploy.trtllm_fp8_prequant_linear) for n in gm.graph.nodes
+    )
     no_old_norm = not any(
         is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes
     )
@@ -580,7 +582,9 @@ def _has_fused_rmsnorm_quant_nvfp4(gm, fused_add=False):
         has_fused_norm = any(
             is_op(n, torch.ops.auto_deploy.trtllm_rms_norm_quant_nvfp4) for n in gm.graph.nodes
         )
-    has_nvfp4_gemm = any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_gemm) for n in gm.graph.nodes)
+    has_nvfp4_gemm = any(
+        is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes
+    )
     no_old_norm = not any(
         is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes
     )
