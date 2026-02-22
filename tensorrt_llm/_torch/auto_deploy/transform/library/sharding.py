@@ -16,7 +16,6 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
-import math
 import operator
 import re
 from abc import ABC, abstractmethod
@@ -1277,10 +1276,17 @@ def _split_tensor_for_tp(
     """
     max_split_size = t.shape[dim] // min_local_shape
     if world_size > max_split_size:
-        num_groups = math.ceil(world_size / max_split_size)
+        # TODO: support remainder case (world_size % max_split_size != 0).
+        # Currently the downstream view/split/slice fixups in _process_column_sharding
+        # assume even division by world_size, so uneven grouping would produce wrong shapes.
+        assert world_size % max_split_size == 0, (
+            f"world_size ({world_size}) must be divisible by max_split_size ({max_split_size}). "
+            f"GQA with num_kv_heads not dividing world_size is not supported."
+        )
+        num_groups = world_size // max_split_size
         ad_logger.debug(
             f"World size {world_size} is greater than the max split size {max_split_size}. "
-            + f"Splitting tensor to {num_groups} chunks"
+            f"Splitting tensor to {num_groups} chunks"
         )
         return torch.tensor_split(t, max_split_size, dim=dim)[rank // num_groups]
     return torch.tensor_split(t, world_size, dim=dim)[rank]
