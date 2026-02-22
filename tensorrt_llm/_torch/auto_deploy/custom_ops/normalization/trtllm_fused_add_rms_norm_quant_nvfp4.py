@@ -78,6 +78,7 @@ def trtllm_rms_norm_quant_nvfp4(
         input_2d, zeros, weight, sf_scale, True, eps=eps, output_hp_norm=True
     )
     fp4_u8 = normed_i32.view(torch.uint8)
+    assert fp4_u8.shape[0] == input_2d.shape[0], "Packed FP4 rows must match flattened input rows"
     return hp_normed.reshape(orig_shape), fp4_u8, sf_out
 
 

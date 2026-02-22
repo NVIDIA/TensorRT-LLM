@@ -193,7 +193,6 @@ def trtllm_fp8_prequant_linear(
     Args:
         input_fp8: Pre-quantized FP8 input tensor (float8_e4m3fn).
         weight_fp8: Pre-quantized weight tensor (float8_e4m3fn).
-        bias: Optional bias tensor.
         bias: (Optional) bias tensor.
         input_scale: (Optional) pre-computed scalar tensor for static quantization.
         weight_scale: (Optional) scalar tensor for weight dequantization.
