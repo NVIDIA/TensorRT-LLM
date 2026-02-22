@@ -387,17 +387,6 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     {
         TLLM_CHECK_WITH_INFO(false, "Unsupported architecture");
     }
-    // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
-    // Only supports packed_qkv input + padding/causal mask.
-    else if (isSm90 && !separateQKvInput && paddingOrCausalMask
-        && (mFixedParams.headSize == 32 || mFixedParams.headSize == 64) && runnerParams.qSeqLen <= 256
-        && !common::getEnvForceDeterministicAttention())
-    {
-        mLaunchParams.flash_attention = false;
-        // get max sequence length for non-flash-attention.
-        // this doesn't support different q and kv sequence lengths.
-        mLaunchParams.kernel_s = getSFromMaxSeqLen(runnerParams.qSeqLen);
-    }
     else
     { // always use flash attention kernels for Ampere/Ada
         mLaunchParams.flash_attention = true;
