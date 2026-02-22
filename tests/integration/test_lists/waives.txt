@@ -384,3 +384,5 @@ unittest/_torch/visual_gen/test_wan.py::TestWanPipeline::test_nvfp4_vs_bf16_accu
 test/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_grace_blackwell-v32_fp4_tep4_mtp3_1k1k] SKIP (https://nvbugspro.nvidia.com/bug/5919026)
 test/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_grace_blackwell-v32_fp4_tep4_mtp3_8k1k] SKIP (https://nvbugspro.nvidia.com/bug/5919026)
 test/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_tep8_mtp3_8k1k] SKIP (https://nvbugspro.nvidia.com/bug/5919026)
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con512_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] SKIP (https://nvbugspro.nvidia.com/bug/5919026)
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] SKIP (https://nvbugspro.nvidia.com/bug/5919026)
