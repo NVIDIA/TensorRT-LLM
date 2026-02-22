@@ -38,7 +38,8 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.node_utils import is_op
+from ...utils._graph import get_attr_by_name
+from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -47,42 +48,10 @@ from ..interface import (
     TransformRegistry,
 )
 
-
-def _get_nvfp4_linear_args(node: Node):
-    """Extract arguments from a torch_quant_nvfp4_linear node.
-
-    After fuse_nvfp4_linear the node is called as:
-        op(input, weight_fp4, bias=…, input_scale=…, weight_scale=…, alpha=…)
-
-    Returns:
-        (input, weight_fp4, bias, input_scale, weight_scale, alpha) nodes.
-    """
-    input_arg = node.args[0]
-    weight_arg = node.args[1]
-    bias_arg = node.args[2] if len(node.args) > 2 else node.kwargs.get("bias")
-    in_scale = node.args[3] if len(node.args) > 3 else node.kwargs.get("input_scale")
-    w_scale = node.args[4] if len(node.args) > 4 else node.kwargs.get("weight_scale")
-    alpha = node.args[5] if len(node.args) > 5 else node.kwargs.get("alpha")
-    return input_arg, weight_arg, bias_arg, in_scale, w_scale, alpha
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers (duplicated from fuse_rmsnorm_quant_fp8 to keep the modules
 # self-contained; a future refactor could extract them into a common utility).
 # ---------------------------------------------------------------------------
-
-
-def _resolve_get_attr(gm: GraphModule, node: Node) -> "torch.Tensor | None":
-    if node.op != "get_attr":
-        return None
-    try:
-        atoms = node.target.split(".")
-        mod = gm
-        for atom in atoms:
-            mod = getattr(mod, atom)
-        return mod if isinstance(mod, torch.Tensor) else None
-    except (AttributeError, TypeError):
-        return None
 
 
 def _same_scale_source(a: Node, b: Node, gm: "GraphModule | None" = None) -> bool:
@@ -92,9 +61,12 @@ def _same_scale_source(a: Node, b: Node, gm: "GraphModule | None" = None) -> boo
         if a.target == b.target:
             return True
         if gm is not None:
-            val_a = _resolve_get_attr(gm, a)
-            val_b = _resolve_get_attr(gm, b)
-            if val_a is not None and val_b is not None:
+            try:
+                val_a = get_attr_by_name(gm, a.target)
+                val_b = get_attr_by_name(gm, b.target)
+            except AttributeError:
+                return False
+            if isinstance(val_a, torch.Tensor) and isinstance(val_b, torch.Tensor):
                 return torch.equal(val_a, val_b)
     return False
 
@@ -114,7 +86,9 @@ def _find_nvfp4_linear_consumers(
 
     for user in norm_node.users:
         if is_op(user, torch.ops.auto_deploy.torch_quant_nvfp4_linear):
-            _, _, _, in_scale, _, _ = _get_nvfp4_linear_args(user)
+            _, _, _, in_scale, _, _ = extract_op_args(
+                user, "input", "weight_fp4", "bias", "input_scale", "weight_scale", "alpha"
+            )
             if shared_scale is None:
                 shared_scale = in_scale
             elif not _same_scale_source(in_scale, shared_scale, gm):
@@ -163,15 +137,7 @@ def _get_norm_source_info(
                 and source_node.target is flashinfer_fused_add_rms_norm
             ):
                 add_rhs, add_lhs, weight, eps = source_node.args
-                add_out_node = None
-                for user in source_node.users:
-                    if (
-                        user.op == "call_function"
-                        and user.target == operator.getitem
-                        and user.args[1] == 1
-                    ):
-                        add_out_node = user
-                        break
+                _, add_out_node = extract_output_tuple(source_node, count=2)
                 return True, "fused", (add_lhs, add_rhs, weight, eps), source_node, add_out_node
 
     return False, "", (), None, None
@@ -247,7 +213,15 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                 if n in nvfp4_user_set:
                     earliest_nvfp4_user = n
                     break
-            _, _, _, earliest_scale, _, _ = _get_nvfp4_linear_args(earliest_nvfp4_user)
+            _, _, _, earliest_scale, _, _ = extract_op_args(
+                earliest_nvfp4_user,
+                "input",
+                "weight_fp4",
+                "bias",
+                "input_scale",
+                "weight_scale",
+                "alpha",
+            )
 
             # Skip if any norm consumer other than nvfp4_linear appears before the
             # earliest nvfp4_linear user.
@@ -323,8 +297,14 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
 
             # --- Replace each nvfp4_linear consumer with nvfp4_gemm ---
             for nvfp4_user in nvfp4_linear_users:
-                _, weight_arg, bias_arg, _in_scale, w_scale, alpha = _get_nvfp4_linear_args(
-                    nvfp4_user
+                _, weight_arg, bias_arg, _in_scale, w_scale, alpha = extract_op_args(
+                    nvfp4_user,
+                    "input",
+                    "weight_fp4",
+                    "bias",
+                    "input_scale",
+                    "weight_scale",
+                    "alpha",
                 )
 
                 with graph.inserting_after(nvfp4_user):

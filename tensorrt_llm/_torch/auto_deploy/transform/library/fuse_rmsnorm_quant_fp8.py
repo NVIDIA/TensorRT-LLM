@@ -38,7 +38,8 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.node_utils import is_op
+from ...utils._graph import get_attr_by_name
+from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -46,39 +47,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-
-def _get_fp8_linear_args(node: Node):
-    """Extract arguments from a trtllm_quant_fp8_linear node.
-
-    The op can be called with positional or keyword args:
-        op(input, weight_fp8, bias, input_scale=..., weight_scale=...)
-    or:
-        op(input, weight_fp8, None, input_scale=..., weight_scale=...)
-
-    Returns:
-        Tuple of (input, weight_fp8, bias, input_scale, weight_scale) nodes.
-    """
-    input_arg = node.args[0]
-    weight_arg = node.args[1]
-    bias_arg = node.args[2] if len(node.args) > 2 else node.kwargs.get("bias")
-    in_scale = node.args[3] if len(node.args) > 3 else node.kwargs.get("input_scale")
-    w_scale = node.args[4] if len(node.args) > 4 else node.kwargs.get("weight_scale")
-    return input_arg, weight_arg, bias_arg, in_scale, w_scale
-
-
-def _resolve_get_attr(gm: GraphModule, node: Node) -> "torch.Tensor | None":
-    """Resolve a get_attr node to its actual tensor value."""
-    if node.op != "get_attr":
-        return None
-    try:
-        atoms = node.target.split(".")
-        mod = gm
-        for atom in atoms:
-            mod = getattr(mod, atom)
-        return mod if isinstance(mod, torch.Tensor) else None
-    except (AttributeError, TypeError):
-        return None
 
 
 def _same_scale_source(a: Node, b: Node, gm: "GraphModule | None" = None) -> bool:
@@ -103,9 +71,12 @@ def _same_scale_source(a: Node, b: Node, gm: "GraphModule | None" = None) -> boo
             return True
         # Different attributes -- compare actual tensor values if gm available
         if gm is not None:
-            val_a = _resolve_get_attr(gm, a)
-            val_b = _resolve_get_attr(gm, b)
-            if val_a is not None and val_b is not None:
+            try:
+                val_a = get_attr_by_name(gm, a.target)
+                val_b = get_attr_by_name(gm, b.target)
+            except AttributeError:
+                return False
+            if isinstance(val_a, torch.Tensor) and isinstance(val_b, torch.Tensor):
                 return torch.equal(val_a, val_b)
     return False
 
@@ -125,7 +96,9 @@ def _find_fp8_linear_consumers(
 
     for user in norm_node.users:
         if is_op(user, torch.ops.auto_deploy.trtllm_quant_fp8_linear):
-            _, _, _, in_scale, _ = _get_fp8_linear_args(user)
+            _, _, _, in_scale, _ = extract_op_args(
+                user, "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+            )
             if shared_scale is None:
                 shared_scale = in_scale
             elif not _same_scale_source(in_scale, shared_scale, gm):
@@ -143,20 +116,6 @@ def _get_out_dtype_str(norm_node: Node) -> str:
         if hasattr(val, "dtype"):
             return str(val.dtype).replace("torch.", "")
     return "bfloat16"
-
-
-def _find_last_input_node(graph, input_nodes: List[Node]) -> Node:
-    """Find the topologically last node among the given input nodes.
-
-    This determines the earliest safe insertion point where all inputs
-    are guaranteed to be defined.
-    """
-    input_set = set(input_nodes)
-    last_input = None
-    for n in graph.nodes:
-        if n in input_set:
-            last_input = n
-    return last_input
 
 
 def _node_comes_before(node_a: Node, node_b: Node, graph) -> bool:
@@ -200,16 +159,7 @@ def _get_norm_source_info(
             ):
                 # source_node.args = (add_rhs, add_lhs, weight, eps)
                 add_rhs, add_lhs, weight, eps = source_node.args
-                # Find the add_out node (getitem with index 1)
-                add_out_node = None
-                for user in source_node.users:
-                    if (
-                        user.op == "call_function"
-                        and user.target == operator.getitem
-                        and user.args[1] == 1
-                    ):
-                        add_out_node = user
-                        break
+                _, add_out_node = extract_output_tuple(source_node, count=2)
                 # The norm input is the add result, which we'll compute as add(add_lhs, add_rhs)
                 # For triton_rms_norm_quant_fp8, we need (input, weight, eps)
                 # We'll create the add node later; for now return the add operands
@@ -298,7 +248,9 @@ class FuseRMSNormQuantFP8(BaseTransform):
                 if n in fp8_user_set:
                     earliest_fp8_user = n
                     break
-            _, _, _, earliest_scale, _ = _get_fp8_linear_args(earliest_fp8_user)
+            _, _, _, earliest_scale, _ = extract_op_args(
+                earliest_fp8_user, "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+            )
 
             # Skip if any norm consumer other than fp8_linear appears before the
             # earliest fp8_linear user (e.g. MoE gate/view). Then we would keep the
@@ -382,7 +334,9 @@ class FuseRMSNormQuantFP8(BaseTransform):
 
             # --- Replace each fp8_linear consumer with fp8_gemm ---
             for fp8_user in fp8_linear_users:
-                _, weight_arg, bias_arg, in_scale, w_scale = _get_fp8_linear_args(fp8_user)
+                _, weight_arg, bias_arg, in_scale, w_scale = extract_op_args(
+                    fp8_user, "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+                )
 
                 with graph.inserting_after(fp8_user):
                     gemm_node = graph.call_function(
