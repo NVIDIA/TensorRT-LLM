@@ -196,6 +196,8 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
+        # Request-level time breakdown (PyTorch backend); not on CompletionOutput to avoid API churn.
+        self.time_breakdown_metrics: Optional[Dict] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -318,6 +320,11 @@ class GenerationResultBase:
 
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
+
+        # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
+        if hasattr(response_tensors, 'time_breakdown_metrics'
+                   ) and response_tensors.time_breakdown_metrics is not None:
+            self.time_breakdown_metrics = response_tensors.time_breakdown_metrics
 
         # Check if this specific sequence is finished (not just if the entire request is done)
         # This is important for best_of > n sampling where sequences finish at different times
