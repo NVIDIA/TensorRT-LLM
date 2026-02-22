@@ -3,7 +3,7 @@ compile_backend: torch-cudagraph
 max_batch_size: 384
 max_seq_len: 65536 # tunable
 enable_chunked_prefill: true
-attn_backend: flashinfer
+attn_backend: trtllm
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 sampler_type: "TRTLLMSampler"

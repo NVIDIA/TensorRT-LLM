@@ -223,7 +223,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
     attn_backend: str = Field(
-        default="flashinfer",
+        default="trtllm",
         description=_shortcut_description("Attention backend to use.", "attn_backend"),
     )
     compile_backend: str = Field(
