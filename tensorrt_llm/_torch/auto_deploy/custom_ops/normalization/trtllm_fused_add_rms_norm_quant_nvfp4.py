@@ -39,11 +39,7 @@ from typing import Tuple
 
 import torch
 
-
-def _sf_size(m: int, n: int) -> int:
-    """Compute the swizzled scale-factor buffer size (matches cpp_custom_ops fake)."""
-    sf_vec_size = 16
-    return ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
+from tensorrt_llm.quantization.utils import fp4_utils
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +66,9 @@ def trtllm_rms_norm_quant_nvfp4(
         - fp4_u8: [M, N/2] uint8 packed FP4 quantised output (2-D).
         - sf_out: [sf_size] uint8 swizzled block scale factors.
     """
+    assert input.shape[-1] == weight.numel(), "input hidden size must match weight size"
+    assert weight.numel() % 2 == 0, "NVFP4 packing requires even hidden size"
+
     orig_shape = input.shape
     n = weight.shape[0]
     input_2d = input.reshape(-1, n)
@@ -89,11 +88,17 @@ def _rms_norm_quant_nvfp4_fake(
     eps: float,
     sf_scale: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert input.shape[-1] == weight.numel(), "input hidden size must match weight size"
+    assert weight.numel() % 2 == 0, "NVFP4 packing requires even hidden size"
+
     n = weight.shape[0]
     m = input.numel() // n
     bf16_out = torch.empty_like(input)
-    fp4_u8 = input.new_empty((m, n // 2), dtype=torch.uint8)
-    sf_out = input.new_empty((_sf_size(m, n),), dtype=torch.uint8)
+    fp4_shape, scale_shape = fp4_utils.get_fp4_shape(
+        (m, n), sf_vec_size=16, is_swizzled_layout=True
+    )
+    fp4_u8 = input.new_empty(tuple(fp4_shape), dtype=torch.uint8)
+    sf_out = input.new_empty((scale_shape,), dtype=torch.uint8)
     return bf16_out, fp4_u8, sf_out
 
 
@@ -123,6 +128,8 @@ def trtllm_fused_add_rms_norm_quant_nvfp4(
     Returns:
         (bf16_normed, fp4_u8, sf_out, add_out)
     """
+    assert weight.numel() % 2 == 0, "NVFP4 packing requires even hidden size"
+
     orig_shape = x.shape
     n = weight.shape[0]
     x_2d = x.reshape(-1, n)
@@ -143,10 +150,15 @@ def _fused_add_rms_norm_quant_nvfp4_fake(
     eps: float,
     sf_scale: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert weight.numel() % 2 == 0, "NVFP4 packing requires even hidden size"
+
     n = weight.shape[0]
     m = x.numel() // n
     bf16_out = torch.empty_like(x)
-    fp4_u8 = x.new_empty((m, n // 2), dtype=torch.uint8)
-    sf_out = x.new_empty((_sf_size(m, n),), dtype=torch.uint8)
+    fp4_shape, scale_shape = fp4_utils.get_fp4_shape(
+        (m, n), sf_vec_size=16, is_swizzled_layout=True
+    )
+    fp4_u8 = x.new_empty(tuple(fp4_shape), dtype=torch.uint8)
+    sf_out = x.new_empty((scale_shape,), dtype=torch.uint8)
     add_out = torch.empty_like(x)
     return bf16_out, fp4_u8, sf_out, add_out

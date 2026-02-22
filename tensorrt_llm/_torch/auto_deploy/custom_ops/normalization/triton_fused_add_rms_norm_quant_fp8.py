@@ -108,6 +108,8 @@ def rms_norm_quant_fp8(
     Returns:
         Tuple of (bf16_output, fp8_output), both with shape [..., hidden_size].
     """
+    assert hidden_states.shape[-1] == weight.numel(), "hidden size must match weight size"
+
     orig_shape = hidden_states.shape
     feat_size = weight.shape[0]
     hidden_states_flat = hidden_states.reshape(-1, feat_size)
@@ -257,6 +259,9 @@ def fused_add_rms_norm_quant_fp8(
         Tuple of (bf16_norm_output, fp8_norm_output, add_output),
         all with shape [..., hidden_size].
     """
+    assert x.shape == residual.shape, "x and residual must have identical shape"
+    assert x.shape[-1] == weight.numel(), "x hidden size must match weight size"
+
     orig_shape = x.shape
     feat_size = weight.shape[0]
     x_flat = x.reshape(-1, feat_size)
