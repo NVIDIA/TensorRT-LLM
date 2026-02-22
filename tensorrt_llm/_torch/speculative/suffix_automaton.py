@@ -391,6 +391,9 @@ class SuffixAutomatonManager(BaseResourceManager):
 
     def shutdown(self):
         """Clean up all resources."""
+        if self._workspace_allocated:
+            torch.cuda.synchronize()
+
         self._request_to_slot.clear()
         self._free_slots = list(range(self.max_num_requests))
 
