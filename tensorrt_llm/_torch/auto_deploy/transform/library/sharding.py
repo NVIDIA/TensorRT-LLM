@@ -1316,25 +1316,30 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
-    def split_tensor(t: torch.Tensor) -> torch.Tensor:
-        return _split_tensor_for_tp(t, dim, rank, world_size, min_local_shape)
-
     # Handle fused weights
     if fused_weight_dims is not None:
 
-        def split_fused_tensor(
+        def f_split(
             t: torch.Tensor,
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
             return torch.cat(
-                [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
+                [
+                    _split_tensor_for_tp(w, dim, rank, world_size, min_local_shape)
+                    for w in torch.split(t, fused_dims, dim=d)
+                ],
                 dim=d,
             )
 
-        f_split = split_fused_tensor
     else:
-        f_split = split_tensor
+        f_split = partial(
+            _split_tensor_for_tp,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
+        )
 
     sharded_weight = f_split(weight_tensor)
     sharded_shape = sharded_weight.shape
