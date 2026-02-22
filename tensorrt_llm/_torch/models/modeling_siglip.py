@@ -2,8 +2,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
+
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import (SiglipVisionConfig,
                                                         SiglipVisionEmbeddings)
@@ -111,11 +110,11 @@ class SiglipVisionModel(nn.Module):
 
     @property
     def dtype(self):
-        return get_parameter_dtype(self)
+        return next(self.parameters()).dtype
 
     @property
     def device(self):
-        return get_parameter_device(self)
+        return next(self.parameters()).device
 
     @torch.inference_mode()
     def forward(self, pixel_values, attn_metadata: AttentionMetadata):

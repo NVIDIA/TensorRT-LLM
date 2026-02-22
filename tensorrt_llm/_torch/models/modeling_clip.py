@@ -4,8 +4,7 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
+
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 
@@ -218,11 +217,11 @@ class CLIPVisionModel(nn.Module):
 
     @property
     def dtype(self):
-        return get_parameter_dtype(self)
+        return next(self.parameters()).dtype
 
     @property
     def device(self):
-        return get_parameter_device(self)
+        return next(self.parameters()).device
 
     @torch.inference_mode()
     def forward(self,

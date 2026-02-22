@@ -359,11 +359,11 @@ class ModelConfig(Generic[TConfig]):
                 128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
             quant_config.group_size = block_size[0]
 
-            # Set default exclude_modules for FP8_BLOCK_SCALES
-            if moe_backend == 'TRTLLM':
-                default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
-            else:
-                default_exclude = ["*eh_proj"]
+            # kv_b_proj must always be excluded: FP8 128x128 block boundaries
+            # don't necessarily align with per-head dim boundaries (e.g. GLM-5
+            # has qk_nope_head_dim=192), so the scale tensor cannot be cleanly
+            # reshaped per-head. The dequant path handles this correctly.
+            default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
 
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
@@ -504,8 +504,7 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.architectures[
-                        0] == "DeepseekV32ForCausalLM":
+                if pretrained_config.architectures[0] in ("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"):
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
                     if sparse_attention_config:
