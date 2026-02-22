@@ -1086,7 +1086,14 @@ class SequenceInfo:
     @nvtx_range("ad_maybe_gather_logits")
     def maybe_gather_and_squeeze_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Maybe gather the logits if logits have not been gathered yet."""
-        num_tokens = logits.shape[0] * logits.shape[1]
+        if logits.dim() == 3:
+            num_tokens = logits.shape[0] * logits.shape[1]
+        elif logits.dim() == 2:
+            num_tokens = logits.shape[0]
+        else:
+            raise AssertionError(
+                f"Unexpected logits rank in AD gather path: shape={tuple(logits.shape)}"
+            )
         num_tokens_to_gather, gather_required = self._get_arg("logits_gather_info_host").tolist()
         if gather_required and num_tokens_to_gather < num_tokens:
             logits = torch.ops.auto_deploy.gather_logits_before_lm_head(
@@ -1094,7 +1101,18 @@ class SequenceInfo:
                 self._get_arg("logits_gather_indices"),
                 self._get_arg("logits_gather_info_host"),
             )
-        return logits.squeeze(int(self.is_generate))
+        # Keep canonical 2D logits [tokens, vocab] unchanged.
+        # Only squeeze layout dimensions when logits are still 3D:
+        # - generate layout: [batch, 1, vocab] -> [batch, vocab]
+        # - packed layout:   [1, tokens, vocab] -> [tokens, vocab]
+        if logits.dim() == 3:
+            logits = logits.squeeze(1 if self.is_generate else 0)
+        elif logits.dim() != 2:
+            raise AssertionError(
+                f"Unexpected logits rank after AD gather path: shape={tuple(logits.shape)}"
+            )
+        assert logits.shape[-1] > 1, f"Invalid logits vocab axis: shape={tuple(logits.shape)}"
+        return logits
 
     @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
