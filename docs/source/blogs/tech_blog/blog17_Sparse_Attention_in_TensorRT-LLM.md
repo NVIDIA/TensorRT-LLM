@@ -1,8 +1,5 @@
 # Sparse Attention in TensorRT LLM
 
-
-
-
 ## Background and Motivation
 
 As Large Language Models (LLMs) are applied to increasingly complex tasks such as long-document summarization, code generation, and autonomous agents, the demand for processing long contexts and extended generation has surged. In Transformer-based models, the attention mechanism's computational complexity and memory usage grow quadratically and linearly with sequence length, respectively. This creates significant bottlenecks in both the **Context (Prefill)** and **Generation (Decode)** phases:
@@ -10,120 +7,40 @@ As Large Language Models (LLMs) are applied to increasingly complex tasks such a
 *   **Context Phase**: Processing long prompts requires substantial memory bandwidth and computation, affecting time-to-first-token (TTFT). Since the context phase is typically compute-bound, reducing the computational load here is critical.
 *   **Generation Phase**: The Key-Value (KV) cache grows with every generated token, consuming vast amounts of GPU memory and bandwidth. Since the generation phase is memory-bound, reducing the memory footprint directly alleviates memory pressure, improves token-to-token latency (TPOT), and allows for larger batch sizes.
 
-Consequently, using sparse attention to reduce overhead in both context and generation phases has attracted significant research interest. Several state-of-the-art models and techniques are evolving to minimize these overheads. Based on our research, we categorize sparse attention methods as follows:
+Consequently, using sparse attention to reduce overhead in both context and generation phases has attracted significant research interest. A wide range of methods have been proposed, and they can be broadly classified along two dimensions: **where** sparsity is applied (context phase, generation phase, or both) and **how** sparsity is realized (KV cache compression, sparse computation, or both). Some methods, such as RocketKV, compress the KV cache by evicting less important tokens after the context phase, then perform sparse computation during generation on the reduced cache. Others, such as DSA and NSA, compute attention sparsely in the context phase itself—though many of these require structural changes to the model architecture. A complementary class of techniques implements sparsity directly inside the attention kernel by dynamically skipping computation for low-contribution KV blocks, requiring no external prediction or auxiliary structures.
 
-<div align="center">
-<table>
-    <thead>
-        <tr>
-            <th colspan="2" align="center">Context</th>
-            <th colspan="2" align="center">Generation</th>
-            <th rowspan="2" align="center">Training-Free</th>
-            <th rowspan="2" align="center">Methods</th>
-        </tr>
-        <tr>
-            <th align="center">Sparse Computation</th>
-            <th align="center">KV Cache Compression</th>
-            <th align="center">Sparse Computation</th>
-            <th align="center">KV Cache Compression</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">StreamingLLM</td>
-        </tr>
-        <tr>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">DuoAttention</td>
-        </tr>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">H2O</td>
-        </tr>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Minference</td>
-        </tr>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Quest</td>
-        </tr>
-        <tr>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">XAttention</td>
-        </tr>
-        <tr>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">NSA,DSA</td>
-        </tr>
-        <tr>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">MoBA</td>
-        </tr>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">RocketKV</td>
-        </tr>
-    </tbody>
-</table>
-</div>
+TensorRT LLM currently supports three sparse attention algorithms, each targeting a different point in this design space:
 
-The table above summarizes several representative sparse attention algorithms. DuoAttention, NSA and MoBA perform sparse computation in the context phase, but they require structural changes to the model and are therefore architecture-specific methods. For the other methods, we observe that most follow a pattern of performing KV cache compression in the context phase and sparse computation in the generation phase. Approaches such as StreamingLLM and H2O also dynamically compress (or evict) the KV cache during generation in addition to sparse computation, typically following a fixed pattern. Based on these observations, TensorRT LLM first focuses on supporting KV cache compression in the context phase and sparse computation in the generation phase, with RocketKV as the primary reference implementation. With the release of the DeepSeek V3.2 model that adopts sparse attention, we have also added support for this model. In the future, we plan to further explore and support sparse computation in the context phase and KV cache compression in the generation phase.
+*   **[RocketKV](https://arxiv.org/pdf/2502.14051)**: A training-free, two-stage method that performs KV cache eviction in the context phase and dynamic Top-K token selection in the generation phase. It serves as the primary reference implementation for the framework-level sparse attention design.
+*   **[DeepSeek Sparse Attention (DSA)](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf)**: A model-native sparse attention mechanism introduced with DeepSeek V3.2, featuring a lightweight indexer for fine-grained token-level sparse MLA computation.
+*   **[Skip Softmax Attention (BLASST)](https://arxiv.org/pdf/2512.12087)**: A kernel-level method that dynamically skips Softmax and BMM2 for unimportant KV blocks, requiring no framework changes or auxiliary data structures.
+
+In the future, we plan to further explore and support additional sparse attention patterns, including sparse computation in the context phase and KV cache compression in the generation phase.
 
 
 ## Sparse Attention in TensorRT LLM
 
 So far, we have looked at why sparse attention matters and how different research methods position themselves. In this section, we explain how TensorRT LLM brings these ideas into a production-ready system and what kinds of sparse behavior it supports today.
 
+We broadly classify the sparse attention work in TensorRT LLM to:
+
+*   **Framework-level**: An extensible sparse-attention framework—prediction hooks, sparse indices, and metadata interfaces—that drives sparse computation and KV cache behavior. RocketKV is built entirely on this framework; DSA also relies on it for index prediction and integration with the serving system.
+*   **Kernel-level**: Sparsity logic implemented directly inside the attention kernels. Skip Softmax Attention is a pure kernel-level method. DSA additionally introduces a token-level **sparse MLA kernel** to execute the actual sparse computation on Blackwell GPUs in TensorRT LLM.
+
+This blog primarily covers the **framework-level** design that are common across algorithms. For kernel-level optimizations, please refer to the other dedicated documents.
+
 ### What the framework provides
 
 The sparse attention framework in TensorRT LLM is designed to provide a common runway for different algorithms while hiding most of the complexity from end users. At a high level, it offers three core capabilities:
 
 1.  **KV cache compression in the context phase**  
-    During the context phase, TensorRT LLM can selectively keep only the most important tokens in the KV cache instead of storing the entire prompt. Internally, this is implemented by a kernel called `updateSparseKvCacheAfterFmha`, which is invoked after the context attention computation. It uses `sparse_kv_indices` to gather important tokens in-place into the KV cache. Different KV heads can use different sparse patterns, giving algorithms fine-grained control over what information is preserved.
+    During the context phase for MQA/MHA/GQA, TensorRT LLM can selectively keep only the most important tokens in the KV cache instead of storing the entire prompt. Internally, this is implemented by a kernel called `updateSparseKvCacheAfterFmha`, which is invoked after the context attention computation. It uses `sparse_kv_indices` to gather important tokens in-place into the KV cache. Different KV heads can use different sparse patterns, giving algorithms fine-grained control over what information is preserved.
 
 2.  **Sparse attention computation in the generation phase**  
-    During decoding, TensorRT LLM can speed up attention by attending only to relevant parts of the KV cache. A dedicated kernel, `gatherKvPageOffsetsKernel`, converts `sparse_attn_indices` into page-aligned KV cache offsets and updates the effective KV length before the attention kernel runs. This mechanism also supports different selections per KV head.
+    During decoding for MQA/MHA/GQA, TensorRT LLM can speed up attention by attending only to relevant pages of the KV cache. A dedicated kernel, `gatherKvPageOffsetsKernel`, converts `sparse_attn_indices` into page-aligned KV cache offsets and updates the effective KV length before the attention kernel runs. This mechanism also supports different selections per KV head.
 
 3.  **Token-level sparse computation for MLA**  
-    For Multi-Head Latent Attention (MLA), TensorRT LLM supports sparse computation in both the context and generation phases. Instead of working at page granularity, MLA can apply sparsity directly at the token level, which is particularly powerful for algorithms like DSA.
+    TensorRT LLM supports sparse computation in both the context and generation phases for MLA. Instead of working at page granularity, MLA can apply sparsity directly at the token level, which is particularly powerful for algorithms like DSA.
 
 **Note**: Today, sparse attention support in TensorRT LLM is primarily targeted at NVIDIA Blackwell and newer architectures.
 
@@ -156,7 +73,7 @@ From a user perspective, all of this is controlled by a high-level `sparse_atten
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_sparse_attention_framework.png" width="800">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog17_sparse_attention_framework.png" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Sparse attention framework in TensorRT LLM.</em></sub></p>
@@ -187,7 +104,7 @@ From an operator perspective, sparse attention in TensorRT LLM is realized insid
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_sparse_attention_op.png" width="800">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog17_sparse_attention_op.png" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
@@ -198,6 +115,8 @@ At a high level, two kernels play a central role:
 *   **`gatherKvPageOffsetsKernel` (generation phase)**: Before each generation step, this kernel converts `sparse_attn_indices` into page-aligned KV cache offsets and updates the effective KV length. The subsequent attention kernel then runs a dense computation on this reduced set of pages, achieving sparse computation without deeply modifying the core attention kernel.
 
 This separation of responsibilities—prediction module → `AttentionOp` pre/post kernels → core attention—provides a clean layering: algorithms can iterate on prediction and indexing strategies while relying on a stable, high-performance attention kernel underneath.
+
+It is worth noting that the **sparse MLA** path bypasses `updateSparseKvCacheAfterFmha` and `gatherKvPageOffsetsKernel` entirely. Because the sparse MLA kernel natively supports token-level sparsity, it only requires the framework to supply correct sparse indices, no intermediate page-alignment or KV cache rewriting is needed.
 
 ### Auxiliary memory management
 
@@ -221,11 +140,11 @@ TensorRT LLM supports two main ways to manage this extra memory:
 
 As a rule of thumb, we recommend starting with Python-level managers when experimenting with new ideas, and moving to a C++-integrated design once the algorithm is stable and you need advanced features like KV cache reuse at scale.
 
-One practical detail is that we often need to update caches *before* the attention kernel runs, at which point Keys and Values typically must already have RoPE applied. Because TensorRT LLM currently fuses RoPE into the attention kernel, we instead set `rope_fusion=False` and apply RoPE externally using FlashInfer kernels. This preserves correctness but introduces some additional overhead.
+One practical detail is that we often need to update caches *before* the attention kernel runs, at which point Keys and Values typically must already have RoPE applied. Because TensorRT LLM currently fuses RoPE into the attention op, we instead set `rope_fusion=False` and apply RoPE externally using FlashInfer kernels. This preserves correctness but introduces some additional overhead.
 
-## Examples: How sparse attention is used in TensorRT LLM
+## Algorithms: How sparse attention is used in TensorRT LLM
 
-In this section, we highlight two sparse attention algorithms currently implemented in TensorRT LLM: RocketKV and DSA.
+In this section, we highlight the three sparse attention algorithms currently implemented in TensorRT LLM: RocketKV, DSA, and Skip Softmax Attention. For a quick-start guide and configuration details, please refer to the [Sparse Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/sparse-attention.md).
 
 ### RocketKV Implementation
 
@@ -238,7 +157,7 @@ In Transformer-based LLM inference, the KV cache grows linearly with sequence le
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_overview.png" width="800">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog17_rocketkv_overview.png" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: RocketKV Overview</em></sub></p>
@@ -262,7 +181,7 @@ To address these issues, we implemented the following optimizations:
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_prediction.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog17_rocketkv_prediction.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: RocketKV Prediction Overview</em></sub></p>
@@ -308,7 +227,7 @@ We benchmark RocketKV sparse attention against the TensorRT LLM full attention b
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_performance.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog17_rocketkv_performance.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: RocketKV vs. full attention — performance overview</em></sub></p>
@@ -325,7 +244,7 @@ Overall, RocketKV tends to be most beneficial in **max-throughput** scenarios, a
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_breakdown.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog17_rocketkv_breakdown.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: Attention Breakdowns</em></sub></p>
@@ -341,20 +260,86 @@ To better understand where the speedup comes from, Figure 6 demonstrates the per
 By integrating RocketKV into TensorRT LLM, we both validate the current sparse attention framework end-to-end and demonstrate meaningful real speedups on long-context workloads. There is still substantial room for improvement—most notably further kernel fusion and optimization in the prediction path, as well as deeper integration with other features such as KV cache reuse and MTP. Going forward, we will continue optimizing RocketKV and expanding support for additional sparse-attention patterns, with the goal of making TensorRT LLM more flexible and performant across a wider range of sparse attention algorithms.
 
 
+### DeepSeek Sparse Attention (DSA)
+
+#### Overview
+
+DeepSeek Sparse Attention (DSA) is a model-native sparse attention mechanism introduced with [DeepSeek V3.2](https://api-docs.deepseek.com/news/news251201). Unlike RocketKV, which is a training-free technique applicable to standard attention architectures, DSA is the only architectural modification compared to its predecessors (DeepSeek-V3/R1/V3.1). It is a fine-grained sparse attention mechanism that selects only the most important key-value entries for attention computation.
+
+<div align="center">
+<figure>
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_dsa_architecture.png" alt="DSA Architecture" width="700">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7: The architecture of DSA.</em></sub></p>
+
+At a high level, DSA works as follows:
+
+1.  A **lightweight indexer** determines the importance of all key-value entries for each query token using low-rank projections and an MQA-style scoring mechanism.
+2.  A **Top-K selector** retains only the top-$k$ entries (typically k=2048) based on the index scores.
+3.  **Sparse MLA** computes attention exclusively between the query token and these selected entries.
+
+As mentioned earlier, DSA spans both framework-level and kernel-level work. This section focuses on the framework-level parts: how the indexer predicts sparse indices and how those indices are transformed for the sparse MLA kernel.
+
+#### Framework-level integration
+
+From the framework's perspective, DSA integrates into TensorRT LLM through the same `sparse_attn_predict` interface used by RocketKV. As its name implies, `sparse_attn_predict` produces the indices that will be used for sparse attention computation. The key difference is that DSA's prediction module is a neural network—the **indexer**—rather than a heuristic scoring function, and it produces **token-level** indices rather than page-level ones.
+
+The indexer consists of two low-rank linear projections (for Q and K), a LayerNorm, RoPE, and a weight projection layer. Given query token $c_t^Q$ and hidden state $h_t$, it computes index scores via an MQA-style dot product:
+
+$$I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)$$
+
+A Top-K operation then selects the most relevant indices. This produces a `topk_indices` tensor of shape `[num_tokens, topk]` containing **request-local** token positions—that is, positions relative to each request's own sequence.
+
+#### Local-to-global index conversion
+
+The sparse MLA kernel, however, operates on **global** KV cache pool addresses. Therefore, the prediction output needs to be converted from request-local indices to global pool indices before it can be consumed by the kernel. This conversion is the core of the `sparse_attn_predict` method in `DSATrtllmAttention`:
+
+```python
+def sparse_attn_predict(self, q, k, metadata, topk_indices, is_generation, **kwargs):
+    # Transform request-local topk indices to global KV cache pool indices
+    topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
+        topk_indices, metadata, self.get_local_layer_idx(metadata), is_generation)
+    return topk_indices_global, None
+```
+
+Internally, `transform_local_topk_and_prepare_pool_view` calls a Triton kernel `triton_convert_req_index_to_global_index` to perform the address translation. For each request and each query token, this kernel converts the selected KV token positions from their logical positions within the request sequence into physical addresses in the global KV cache memory pool, so that the sparse MLA kernel can directly load the corresponding KV entries.
+
+Unlike RocketKV, which uses `gatherKvPageOffsetsKernel` to convert fine-grained indices into page-aligned offsets for the standard attention kernel, DSA bypasses this step entirely—the sparse MLA kernel natively supports token-level sparsity.
+
+#### Auxiliary memory: indexer K cache
+
+DSA requires an auxiliary **indexer K cache** to store the low-rank K projections for reuse across decoding steps. Unlike RocketKV's Python-level KT cache manager, DSA's indexer K cache is integrated directly into the C++ `KVCacheManager`. This design enables compatibility with advanced features such as KV cache reuse, chunked prefill, and disaggregated serving—features that would be difficult to support with a Python-level manager.
+
+For a comprehensive description of DSA kernel optimizations, precision strategies, feature support (MTP, disaggregated serving, Wide-EP), and benchmark results, please refer to the dedicated blog post: [Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md).
+
+#### Summary
+
+Integrating DSA validates the generality of the sparse attention framework beyond the RocketKV use case it was originally designed for. The same `sparse_attn_predict` / `sparse_kv_predict` interfaces accommodate a fundamentally different algorithm—one driven by a neural-network indexer rather than attention-score heuristics. That said, the current integration still has room for improvement. For instance, the full indexer forward pass currently runs outside `sparse_attn_predict`, which only handles the final index conversion step. A more natural design would encapsulate the entire prediction pipeline—indexer forward, Top-K selection, and index conversion—within `sparse_attn_predict`. We plan to refactor toward this cleaner separation as the framework matures.
+
+### Skip Softmax Attention (BLASST)
+
+Unlike RocketKV and DSA, **Skip Softmax Attention** is a purely **kernel-level** sparse attention method. It does not use the framework's prediction hooks or auxiliary memory—instead, it dynamically skips Softmax and BMM2 computation for low-contribution KV blocks entirely inside the attention kernel. This makes it a zero-overhead, drop-in technique that works with nearly all existing features (FP8 attention, KV cache reuse, chunked prefill) on both Hopper and Blackwell GPUs.
+
+Since Skip Softmax Attention does not involve any framework-level components, we do not cover it in depth here. For algorithm details, usage examples, accuracy evaluation, and performance benchmarks, please refer to:
+
+*   **Paper**: [BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/pdf/2512.12087)
+*   **Tech blog**: [Accelerating Long-Context Inference with Skip Softmax Attention](blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md)
+*   **Feature documentation**: [Sparse Attention — Kernel-Level Sparse Attention](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/sparse-attention.md#kernel-level-sparse-attention)
+
 ## Summary and Future Work
 
 ### Current State
 
-Currently, the status of the Sparse Attention framework is as follows:
+TensorRT LLM now supports three sparse attention algorithms. This blog has focused on the **framework-level** design that underpins RocketKV and DSA:
 
-1.  **Supported Operations**: The `AttentionOp` currently supports **KV cache compression** in the context phase and **sparse computation** in the generation phase. Other combinations (for example, sparse computation in the context phase) are not yet supported for MHA/GQA. For MLA, sparse computation is supported in both the context and generation phases.
-2.  **Algorithm Support**: RocketKV is supported in both the vanilla (PyTorch) backend and the TRTLLM backend, while DSA is supported in the TRTLLM backend. These implementations validate the generality and flexibility of the framework.
-3.  **Auxiliary Memory**: Both Python-level and C++-level implementations are algorithm-specific. There is no unified abstraction for auxiliary memory management yet.
+1.  **Framework-level sparse attention**: The prediction-based workflow (`sparse_kv_predict` / `sparse_attn_predict`) drives KV cache compression and sparse computation through a unified `AttentionOp`. RocketKV demonstrates this for MQA/MHA/GQA with page-level sparsity; DSA extends it to MLA with token-level sparsity. Both algorithms also manage auxiliary memory (KT cache and indexer K cache, respectively) through different integration paths.
+2.  **Kernel-level sparse attention**: Skip Softmax Attention and DSA's sparse MLA kernel implement sparsity directly inside the attention kernels. 
 
 ### Future Work
 
-*   **Sparse Computation in Context Phase**: We plan to introduce sparse computation support for the context phase for MHA/GQA, allowing the TensorRT LLM sparse attention framework to cover most scenarios.
+*   **Sparse Computation in Context Phase**: We plan to introduce sparse computation support for the context phase for MQA/MHA/GQA, allowing the TensorRT LLM sparse attention framework to cover most scenarios.
 *   **Dynamic Eviction in Generation Phase**: Dynamically evicting KV cache blocks during the generation phase poses significant challenges to KV cache flexibility. While difficult to implement in the current framework, block-level eviction appears to be a promising compromise and is under further exploration.
 *   **Unified Auxiliary Memory Management**: We are exploring a unified mechanism to manage auxiliary memory pools. This would allow users to define custom auxiliary spaces more flexibly while automatically inheriting advanced features from the KV cache, such as reuse and offloading.
 *   **Code Refactoring**: As more sparse attention algorithms are integrated, the framework will undergo refactoring to unify code and improve maintainability.
-*   **Optimization and Feature Integration**: We are discussing further optimizations, such as enabling fine-grained token-level sparse computation for MHA/GQA. Additionally, we are exploring integration with other advanced features like Disaggregated Serving.
+*   **Optimization and Feature Integration**: We are pursuing further optimizations, such as enabling fine-grained token-level sparse computation for MQA/MHA/GQA, and deeper integration with advanced features like Disaggregated Serving and MTP.
