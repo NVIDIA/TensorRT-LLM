@@ -1630,23 +1630,9 @@ class PyExecutor:
                 if self.should_stop_processing:
                     return None, None
                 new_requests += iter_requests
-                self._check_disagg_ctx_schedulable_status(iter_requests)
-                self._check_disagg_gen_transfer_status()
-                self._check_kv_transfer_timeout()
                 self.hang_detector.checkpoint()
                 if self.num_fetch_requests < self.benchmark_req_queues_size:
                     time.sleep(1)
-            if self.dist.rank == 0:
-                active_states = {}
-                for r in self.active_requests:
-                    s = str(r.state)
-                    active_states[s] = active_states.get(s, 0) + 1
-                logger.info(
-                    f"Benchmark fill complete, "
-                    f"num_fetch_requests={self.num_fetch_requests}/"
-                    f"{self.benchmark_req_queues_size}, "
-                    f"len(active_requests)={len(self.active_requests)}, "
-                    f"active_states={active_states}")
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -2667,19 +2653,11 @@ class PyExecutor:
         # requests simultaneously. Skip dummy addition until KV transfers
         # complete and real requests become active (num_active_request > 0).
         if (self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver
-                and not self.is_warmup
-                and len(self.active_requests) >= self.max_num_active_requests
+                and not self.is_warmup and len(self.active_requests) > 0
                 and num_active_request == 0):
-            if self.dist.rank == 0:
-                active_states = {}
-                for r in self.active_requests:
-                    s = str(r.state)
-                    active_states[s] = active_states.get(s, 0) + 1
-                logger.info(f"ADP_DUMMY_SKIP: benchmark fill complete, all "
-                            f"{self.max_num_active_requests} slots occupied by "
-                            f"in-flight requests, skipping dummy, "
-                            f"active_states={active_states}, "
-                            f"num_fetch_requests={self.num_fetch_requests}")
+            logger.info(
+                f"Skipped adding dummy requests: num_fetch_requests={self.num_fetch_requests}, {num_active_request=}"
+            )
             return
 
         if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
