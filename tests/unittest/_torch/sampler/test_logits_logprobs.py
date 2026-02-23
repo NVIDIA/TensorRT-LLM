@@ -305,7 +305,7 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str, s
                 assert len(token_logprobs) <= logprobs_k + 1, (
                     f"Token {token_idx}: Expected at most {logprobs_k + 1} logprobs, got {len(token_logprobs)}"
                 )
-                assert len(token_logprobs) >= 1
+                assert len(token_logprobs) >= max(logprobs_k, 1)
 
             sorted_tokens_by_prob = sorted(
                 token_logprobs.items(), key=lambda x: x[1].logprob, reverse=True
@@ -497,6 +497,78 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int, simple_llm:
                 f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
             )
             torch.testing.assert_close(returned_logprob, expected_logprob)
+
+
+@pytest.mark.parametrize("logprobs_k", [None, 0, 2], ids=["None", "top_0", "top_2"])
+@pytest.mark.threadleak(enabled=False)
+def test_prompt_logprobs_against_logits(logprobs_k: int | None, simple_llm: LLM):
+    """Test prompt_logprobs against manually calculated log probabilities from context_logits"""
+
+    test_prompts = [
+        "The capital of France is",
+        "The future of AI is",
+        "Hello, my name is",
+        "Hello, my name is",
+        "Write a short story about a cat",
+    ]
+
+    # Prompt logprobs are not calculated by the sampler.
+    # Therefore, a single SamplingParams object is used for all requests.
+    sampling_params = SamplingParams(
+        max_tokens=6,
+        temperature=0.8,
+        top_k=50,
+        prompt_logprobs=logprobs_k,
+        return_context_logits=True,  # required for checking prompt_logprobs
+    )
+
+    outputs = list(simple_llm.generate(test_prompts, sampling_params=sampling_params))
+
+    for req_idx, output in enumerate(outputs):
+        assert output.context_logits is not None
+        context_logits = output.context_logits.to(device="cuda")
+        token_ids = output.prompt_token_ids
+        prompt_logprobs = output.outputs[0].prompt_logprobs
+        if sampling_params.prompt_logprobs is None:
+            # Prompt logprobs defaults to an empty list if not requested
+            assert prompt_logprobs is not None
+            assert len(prompt_logprobs) == 0
+            continue
+
+        # Check valid prompt_logprobs values
+        assert sampling_params.prompt_logprobs is not None
+
+        assert context_logits is not None
+        assert prompt_logprobs is not None
+        assert len(prompt_logprobs) == len(token_ids), "Logprobs length mismatch"
+
+        # context_logits might be shorter than token_ids
+        num_logits = len(context_logits)
+
+        for token_idx, (sampled_token_id, token_logprobs_dict) in enumerate(
+            zip(token_ids[:num_logits], prompt_logprobs[:num_logits])
+        ):
+            returned_logprob = token_logprobs_dict[sampled_token_id].logprob
+
+            logits_for_token = context_logits[token_idx]
+            expected_logprobs = torch.nn.functional.log_softmax(logits_for_token, dim=-1).to(
+                device="cpu"
+            )
+            expected_logprob = expected_logprobs[sampled_token_id].item()
+            print(
+                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
+            )
+            torch.testing.assert_close(returned_logprob, expected_logprob)
+
+
+@pytest.mark.parametrize("logprobs_k", [-5], ids=["invalid_negative_value"])
+@pytest.mark.threadleak(enabled=False)
+def test_invalid_logprobs(logprobs_k: int):
+    """Test invalid logprobs values"""
+    with pytest.raises(ValueError):
+        SamplingParams(logprobs=logprobs_k)
+    with pytest.raises(ValueError):
+        SamplingParams(prompt_logprobs=logprobs_k)
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])

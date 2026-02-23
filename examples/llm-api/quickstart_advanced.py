@@ -201,7 +201,6 @@ def add_llm_args(parser):
                         type=str,
                         default=None,
                         nargs='+')
-    parser.add_argument('--stop', type=str, default=None, nargs='+')
 
     return parser
 
@@ -336,7 +335,7 @@ def setup_llm(args, **kwargs):
         best_of=best_of,
         use_beam_search=use_beam_search,
         additional_model_outputs=args.additional_model_outputs,
-        stop=args.stop)
+    )
     return llm, sampling_params
 
 
