@@ -1889,6 +1889,7 @@ class TestWanPipeline:
                 "quant_algo": "NVFP4",
                 "dynamic": True,
             },
+            pipeline={"warmup_steps": 0},
         )
         pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load()
 
