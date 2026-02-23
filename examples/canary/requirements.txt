@@ -1,0 +1,10 @@
+--extra-index-url https://pypi.nvidia.com
+torch>=2.5.0
+pytorch-lightning>=2.4.0
+safetensors
+kaldialign
+tensorrt_llm>=0.17.0
+datasets
+lhotse
+nemo_toolkit[asr]==2.2.0
+librosa
