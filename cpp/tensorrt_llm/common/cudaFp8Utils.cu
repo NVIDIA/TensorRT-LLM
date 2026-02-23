@@ -35,15 +35,11 @@ constexpr int CTA_SIZE = 256;
 constexpr int VEC_SIZE = 8; // elements per vectorized iteration (128-bit load = 8 × bf16)
 constexpr int64_t MAX_GRID_DIM = 65536;
 
-inline int64_t scaleMatrixGridSize(int64_t numel)
-{
-    return std::min((numel + CTA_SIZE - 1) / CTA_SIZE, MAX_GRID_DIM);
-}
-
 inline int64_t scaleMatrixVecGridSize(int64_t numel)
 {
     int64_t vecElements = numel / VEC_SIZE;
-    return std::min((vecElements + CTA_SIZE - 1) / CTA_SIZE, MAX_GRID_DIM);
+    int64_t blocks = (vecElements + CTA_SIZE - 1) / CTA_SIZE;
+    return std::max(int64_t(1), std::min(blocks, MAX_GRID_DIM));
 }
 
 template <bool QUANTIZE>
@@ -177,8 +173,7 @@ void invokeQuantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* inp
         }
     }
 
-    // General path: scalar kernel
-    dim3 grid(static_cast<unsigned int>(scaleMatrixGridSize(numel)));
+    dim3 grid(1024);
     dim3 block(CTA_SIZE);
     cudaLaunchConfig_t config;
     config.gridDim = grid;
@@ -212,7 +207,7 @@ template <typename T_OUT, typename T_S, typename T_IN>
 void invokeDequantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* input, int64_t numel, int64_t lda,
     QuantizeMode quantize_mode, cudaStream_t stream)
 {
-    dim3 grid(static_cast<unsigned int>(scaleMatrixGridSize(numel)));
+    dim3 grid(1024);
     dim3 block(CTA_SIZE);
     cudaLaunchConfig_t config;
     config.gridDim = grid;
