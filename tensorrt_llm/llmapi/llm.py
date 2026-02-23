@@ -409,9 +409,6 @@ class BaseLLM:
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
 
-        arrival_time = steady_clock_now(
-        ) if self.args.return_perf_metrics else None
-
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         cache_salt_id = get_cache_salt_id(
@@ -433,6 +430,9 @@ class BaseLLM:
         else:
             prompt_token_ids, prompt, query_token_ids, multimodal_params = (
                 self._preprocess(inputs, sampling_params, disaggregated_params))
+
+        arrival_time = steady_clock_now(
+        ) if self.args.return_perf_metrics else None
 
         self._check_arguments(
             len(prompt_token_ids),
