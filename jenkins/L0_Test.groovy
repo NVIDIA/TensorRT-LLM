@@ -49,6 +49,16 @@ POD_TIMEOUT_SECONDS_TEST = env.podTimeoutSeconds ? env.podTimeoutSeconds : "2160
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 POD_TIMEOUT_SECONDS_SLURM = env.podTimeoutSeconds ? env.podTimeoutSeconds : "79200"  // Use 22 hours to allow for 2 hour of buffer.
 
+// LLM data paths in container for Blossom
+@Field
+def sc_trt_llm_data_mount_path = "/sc.trt_llm_data"
+@Field
+def austin_trt_llm_data_mount_path = "/austin.trt_llm_data"
+@Field
+def pdx_trt_llm_data_mount_path = "/pdx.trt_llm_data"
+@Field
+def llm_data = ""
+
 // Literals for easier access.
 @Field
 def TARNAME = "tarName"
@@ -90,7 +100,7 @@ TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
-MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
+MODEL_CACHE_DIR=""
 
 // GPU types that require open driver
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
@@ -103,6 +113,7 @@ ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+
 
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
@@ -692,9 +703,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         }
                     }
                     if (fileExists('/home/scratch.trt_llm_data_ci')) {
-                        dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
+                        dockerArgs += " -v /home/scratch.trt_llm_data_ci:${sc_trt_llm_data_mount_path}:ro "
                     } else if (fileExists('/home/scratch.trt_llm_data')) {
-                        dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
+                        dockerArgs += " -v /home/scratch.trt_llm_data:${sc_trt_llm_data_mount_path}:ro "
                     } else {
                         echo "Existing TRT-LLM data scratch mount points cannot be set up in this cluster, ignore..."
                     }
@@ -822,8 +833,8 @@ def getPytestBaseCommandLine(
     def testCmdLine = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-        "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
-        "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
+        "LLM_MODELS_ROOT=${llm_data}",
+        "MODEL_CACHE_DIR=${llm_data}",
         "COLUMNS=300",
         extraInternalEnv,
         portEnvVars,
@@ -1812,8 +1823,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     volumeMounts:
                     - name: dshm
                       mountPath: /dev/shm
-                    - name: scratch-trt-llm-data
-                      mountPath: /scratch.trt_llm_data
+                    - name: sc-trt-llm-data
+                      mountPath: ${sc_trt_llm_data_mount_path}
                       readOnly: true
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
@@ -1840,24 +1851,21 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         """
     }
     def llmModelVolume = """
-                - name: scratch-trt-llm-data
+                - name: sc-trt-llm-data
                   nfs:
                     server: 10.117.145.14
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
-
-    // Austin FlexCache looks slow and unstable recently. Remove gh200 temporarily.
-    // That means gh200 nodes will use the default Blossom data scratch.
-    if (type.contains("6000d")) {
-        // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
-        llmModelVolume = """
-                - name: scratch-trt-llm-data
+    /*
+                - name: austin-trt-llm-data
                   nfs:
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
-        """
-    }
-
+                - name: pdx-trt-llm-data
+                  nfs:
+                    server: ipp6-cdot01-fcache01
+                    path: /vol/fcscratch1/scratch.michaeln_blossom
+    */
     def podConfig = [
         cloud: targetCloud,
         namespace: "sw-tensorrt",
@@ -1909,6 +1917,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 ${tolerations}
         """.stripIndent(),
     ]
+    print("Pod config: ${podConfig}")
 
     return podConfig
 }
@@ -2604,8 +2613,19 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sleep(10 * Math.random())
         sh "curl ifconfig.me || true"
         sh "nproc && free -g && hostname"
+        // Determine llm_data based on hostname
+        def hostname = sh(script: 'hostname -f', returnStdout: true).trim()
+        if (hostname.contains('ipp3')) {
+            llm_data = austin_trt_llm_data_mount_path
+        } else if (hostname.contains('ipp6')) {
+            llm_data = pdx_trt_llm_data_mount_path
+        } else {
+            llm_data = sc_trt_llm_data_mount_path
+        }
+        llm_data = "${llm_data}/llm-models"
+
         echoNodeAndGpuInfo(pipeline, stageName)
-        sh "cat ${MODEL_CACHE_DIR}/README"
+        sh "cat ${llm_data}/README"
         sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
         sh "df -h"
 
@@ -2613,7 +2633,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y rsync")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${llm_data}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
         // install package
@@ -3090,6 +3110,27 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                 // We submit the Slurm job with the Slurm partition's time spec.
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
                 timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
+                    // Check hostname and set NFS host/path
+                    def hostname = sh(script: 'hostname -f', returnStdout: true).trim()
+                    def nfs_host = ""
+                    def nfs_path = ""
+                    def mount_path = ""
+                    def STORAGE_NAME = "trt_llm_data"
+                    if (hostname.contains('ipp3')) {
+                        nfs_host = "10.117.145.14"
+                        nfs_path = "/vol/scratch1/scratch.trt_llm_data"
+                        mount_path = austin_trt_llm_data_mount_path
+                    } else if (hostname.contains('ipp6')) {
+                        nfs_host = "10.20.162.212"
+                        nfs_path = "/vol/scratch26/scratch.trt_llm_data"
+                        mount_path = pdx_trt_llm_data_mount_path
+                    } else {
+                        // SC, no NFS, use scratch space which is already in dockerArgs
+                    }
+                    if (nfs_host) {
+                        sh "docker volume create --driver local --opt type=nfs --opt o=addr=${nfs_host},rw --opt device=:${nfs_path} nfs_${STORAGE_NAME} || true"
+                        dockerArgs += " --volume nfs_${STORAGE_NAME}:${mount_path} "
+                    }
                     docker.image(image).inside(dockerArgs) {
                         runner()
                     }
@@ -3244,8 +3285,8 @@ def launchTestJobs(pipeline, testFilter)
         // "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
-        "RTXPro6000D-PyTorch-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 2],
-        "RTXPro6000D-PyTorch-2": ["rtx-pro-6000d", "l0_rtx_pro_6000", 2, 2],
+        "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
