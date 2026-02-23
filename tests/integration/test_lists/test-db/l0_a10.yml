@@ -94,6 +94,7 @@ l0_a10:
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
+  - unittest/llmapi/apps/test_responses_streaming_tool_calls.py
   - llmapi/test_llm_api_connector.py::test_connector_simple[True]
   - llmapi/test_llm_api_connector.py::test_connector_simple[False]
   - llmapi/test_llm_api_connector.py::test_connector_async_onboard[True]
