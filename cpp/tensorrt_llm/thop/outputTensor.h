@@ -46,7 +46,7 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
     switch (output_buffer_kind)
     {
     case OutputBufferKind::NcclWindow:
-#if defined(ENABLE_MULTI_DEVICE)
+#if ENABLE_MULTI_DEVICE
         if (group.has_value() && group->size() > 0)
         {
             std::set<int> groupSet;
@@ -83,7 +83,7 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
         (void) group;
         TLLM_LOG_DEBUG(
             "[allocate_output] NCCL window requested but multi-device is disabled; fallback to default output buffer");
-#endif // defined(ENABLE_MULTI_DEVICE)
+#endif // ENABLE_MULTI_DEVICE
         break;
     case OutputBufferKind::Userbuffers: result = torch_ext::create_userbuffers_tensor(output_size, dtype).first; break;
     case OutputBufferKind::Default:

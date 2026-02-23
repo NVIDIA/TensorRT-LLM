@@ -49,7 +49,7 @@ namespace torch_ext
 std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
     torch::Tensor const& like, torch::List<int64_t> const& group, c10::optional<at::IntArrayRef> shape)
 {
-#if defined(ENABLE_MULTI_DEVICE)
+#if ENABLE_MULTI_DEVICE
     if (!like.defined() || !like.is_cuda())
     {
         TLLM_LOG_DEBUG("[create_nccl_window_tensor] invalid input tensor; defined=%d cuda=%d", like.defined() ? 1 : 0,
@@ -89,12 +89,12 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
     TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation success; ptr=%p size_bytes=%zu shape=%s", buffer.ptr,
         buffer.size, shapeStr.c_str());
     return {tensor, true};
-#else  // defined(ENABLE_MULTI_DEVICE)
+#else  // ENABLE_MULTI_DEVICE
     (void) group;
     (void) like;
     (void) shape;
     return {torch::Tensor(), false};
-#endif // defined(ENABLE_MULTI_DEVICE)
+#endif // ENABLE_MULTI_DEVICE
 }
 
 } // namespace torch_ext
