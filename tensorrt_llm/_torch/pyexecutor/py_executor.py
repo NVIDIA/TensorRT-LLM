@@ -1558,11 +1558,7 @@ class PyExecutor:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
                 self._update_requests(executed_batch.sample_state)
                 if self.kv_cache_transceiver:
-                    finished_ctx_reqs = [
-                        req for req in
-                        executed_batch.scheduled_requests.context_requests()
-                        if req.is_last_context_chunk
-                    ]
+                    finished_ctx_reqs = executed_batch.scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
                 self._handle_canceled_requests()
 
@@ -2314,10 +2310,7 @@ class PyExecutor:
         self._update_request_states(scheduled_batch)
         # Collect sampling requests to update the inflight set
         # Cf. TorchSampler._select_generated_logits
-        sampling_requests = [
-            req for req in scheduled_batch.context_requests
-            if req.is_last_context_chunk
-        ] + scheduled_batch.generation_requests
+        sampling_requests = scheduled_batch.context_requests_last_chunk + scheduled_batch.generation_requests
         return self.sampler.SampleState(
             requests=sampling_requests,
             sampler_event=SamplerEvent(cuda_event=sampler_event))

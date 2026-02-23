@@ -403,7 +403,23 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class ScheduledRequestsMock:
             @property
-            def context_requests(self) -> list[LlmRequest]:
+            def context_requests_chunking(self) -> list[LlmRequest]:
+                return (
+                    [
+                        # This request is expected to be skipped
+                        cast(
+                            LlmRequest,
+                            ContextRequestMock(
+                                is_last_context_chunk=False, return_context_logits=False
+                            ),
+                        )
+                    ]
+                    if with_ctx
+                    else []
+                )
+
+            @property
+            def context_requests_last_chunk(self) -> list[LlmRequest]:
                 return (
                     [
                         # NB: One request with py_return_context_logits is enough
@@ -420,13 +436,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                                 is_last_context_chunk=True, return_context_logits=False
                             ),
                         ),
-                        # This request is expected to be skipped
-                        cast(
-                            LlmRequest,
-                            ContextRequestMock(
-                                is_last_context_chunk=False, return_context_logits=False
-                            ),
-                        ),
                         cast(
                             LlmRequest,
                             ContextRequestMock(
@@ -437,6 +446,13 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                     if with_ctx
                     else []
                 )
+
+            def context_requests(self) -> list[LlmRequest]:
+                return self.context_requests_chunking + self.context_requests_last_chunk
+
+            @property
+            def num_context_requests(self) -> int:
+                return len(self.context_requests_chunking) + len(self.context_requests_last_chunk)
 
             @property
             def generation_requests(self) -> list[LlmRequest]:
@@ -458,11 +474,11 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
             0,
             *(
                 [
-                    100 + 1,  # context req. 1 (assume context len. 100)
-                    (100 + 1) + (0 + 1),  # context req. 2 (not returning context)
-                    (100 + 1) + (0 + 1) + (0 + 1),  # context req. 3 (not returning context)
-                    (100 + 1)
-                    + (0 + 1)
+                    (0 + 1),  # context req. 1 (not returning context)
+                    (0 + 1) + (100 + 1),  # context req. 2 (assume context len. 100)
+                    (0 + 1) + (100 + 1) + (0 + 1),  # context req. 3 (not returning context)
+                    (0 + 1)
+                    + (100 + 1)
                     + (0 + 1)
                     + (50 + 1),  # context req. 4 (assume context len. 50)
                 ]
@@ -473,8 +489,8 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         expected_req_num_generation_steps = [
             *(
                 [
-                    1,  # context req. 1
                     1,  # context req. 2
+                    1,  # context req. 3
                     1,  # context req. 4
                 ]
                 if with_ctx
@@ -514,9 +530,9 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         expected_logit_indices = []
         if with_ctx:
             expected_logit_indices += [
-                100,  # gen logits from context req. 1
+                # 1,  # skipped gen logits from context req. 1
                 101,  # gen logits from context req. 2
-                # 102,  # skipped gen logits from context req. 3
+                102,  # gen logits from context req. 3
                 153,  # gen logits from context req. 4
             ]
         if with_gen:

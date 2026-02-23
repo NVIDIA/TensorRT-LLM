@@ -320,7 +320,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             mm_embeddings=model_outputs.pop("mm_embeddings"),
             extra_data={**model_outputs},
         )
-        return self.SampleState(requests=scheduled_requests.context_requests(), data=data)
+        return self.SampleState(requests=scheduled_requests.context_requests_last_chunk, data=data)
 
     @override
     def update_requests(
@@ -1771,7 +1771,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     @classmethod
     def _filter_new_requests(cls, requests: ScheduledRequests) -> list[LlmRequest]:
-        return [request for request in requests.context_requests() if cls._is_new_request(request)]
+        return [
+            request
+            for request in requests.context_requests_last_chunk
+            if cls._is_new_request(request)
+        ]
 
     @override
     def validate_request(self, request: LlmRequest) -> None:
@@ -3014,18 +3018,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             - sampling requests metadata: The metadata for the sampling requests.
             - logits: The logits for the sampling requests.
         """
-        assert len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests()) + 1
-        finished_context_requests = []
-        finished_context_req_offsets = []
-        for req, offset in zip(
-            scheduled_requests.context_requests(), num_context_logits_prefix_sum[1:]
-        ):
-            if req.is_last_context_chunk:
-                finished_context_requests.append(req)
-                finished_context_req_offsets.append(offset)
+        assert len(num_context_logits_prefix_sum) == scheduled_requests.num_context_requests + 1
+        num_chunking_context_requests = len(scheduled_requests.context_requests_chunking)
+        finished_context_req_offsets = num_context_logits_prefix_sum[
+            num_chunking_context_requests + 1 :
+        ]
         # Add the total number of context logits to the finished context request offsets
         finished_context_req_offsets.append(num_context_logits_prefix_sum[-1])
 
+        finished_context_requests = scheduled_requests.context_requests_last_chunk
         sampling_requests = finished_context_requests + scheduled_requests.generation_requests
 
         req_num_generation_steps_list = [
