@@ -682,6 +682,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             b_sf=self.quant_scales[1],
             offset_array=expert_first_token_offset,
         )
+        top_k = self.routing_method.top_k
+        if token_selected_experts is not None:
+            top_k = token_selected_experts.shape[-1]
+
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases
@@ -694,7 +698,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             token_final_scales.size(0),  # num_rows
             self.hidden_size,  # (possibly padded) hidden_size
             self.unpadded_hidden_size,  # original hidden size
-            self.routing_method.top_k,
+            top_k,
             self.expert_size_per_partition,  # num_experts_per_node
             self.tp_size,
             self.tp_rank,
