@@ -46,3 +46,5 @@ transforms:
     enabled: true
   insert_cached_ssm_attention:
     backend: flashinfer_ssm
+  fuse_nvfp4_trtllm_gen_moe:
+    enabled: true
