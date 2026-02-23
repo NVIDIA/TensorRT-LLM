@@ -77,12 +77,17 @@ def get_cpython_version():
     return "cp{}{}".format(python_version[0], python_version[1])
 
 
-def download_wheel(args):
-    if not args.wheel_path.startswith(("http://", "https://")):
-        args.wheel_path = "https://" + args.wheel_path
-    res = requests.get(args.wheel_path)
+def get_wheel_url(wheel_path):
+    """Get direct wheel URL from wheel_path (directory listing or direct URL)."""
+    if not wheel_path.startswith(("http://", "https://")):
+        wheel_path = "https://" + wheel_path
+
+    if wheel_path.endswith(".whl"):
+        return wheel_path
+
+    res = requests.get(wheel_path)
     if res.status_code != 200:
-        print(f"Fail to get the result of {args.wheel_path}")
+        print(f"Fail to get the result of {wheel_path}")
         exit(1)
     wheel_name = None
     for line in res.text.split("\n"):
@@ -96,57 +101,61 @@ def download_wheel(args):
         wheel_name = name
         break
     if not wheel_name:
-        print(f"Fail to get the wheel name of {args.wheel_path}")
+        print(f"Fail to get the wheel name of {wheel_path}")
         exit(1)
-    if args.wheel_path[-1] == "/":
-        args.wheel_path = args.wheel_path[:-1]
-    wheel_url = f"{args.wheel_path}/{wheel_name}"
+    if wheel_path[-1] == "/":
+        wheel_path = wheel_path[:-1]
+    return f"{wheel_path}/{wheel_name}"
+
+
+def download_wheel(args):
+    wheel_url = get_wheel_url(args.wheel_path)
     subprocess.check_call("rm *.whl || true", shell=True)
     subprocess.check_call(f"apt-get install -y wget && wget -q {wheel_url}",
                           shell=True)
 
 
-def install_tensorrt_llm():
-    """
-    Installs the tensorrt_llm wheel, dynamically creating a torch constraint
-    if torch is already installed to prevent it from being replaced.
-    """
-    print("##########  Install tensorrt_llm package  ##########")
+def get_torch_constraint_file(constraint_dir="."):
+    """Create a torch constraint file if torch is already installed.
 
-    install_command = "pip3 install tensorrt_llm-*.whl"
+    This prevents pip from changing the pre-installed PyTorch version,
+    which could cause ABI incompatibility issues.
 
-    # Always check for an existing torch installation, regardless of OS.
+    Args:
+        constraint_dir: Directory to create the constraint file in.
+
+    Returns:
+        Path to constraint file if torch is installed, None otherwise.
+    """
     try:
-        print("Checking for existing torch installation...")
         torch_version_result = subprocess.run(
             ['python3', '-c', 'import torch; print(torch.__version__)'],
             capture_output=True,
             text=True,
             check=True)
         torch_version = torch_version_result.stdout.strip()
-
         if torch_version:
             print(f"Found installed torch version: {torch_version}")
-            constraint_filename = "torch-constraint.txt"
-            with open(constraint_filename, "w") as f:
+            constraint_file = os.path.join(constraint_dir,
+                                           "torch-constraint.txt")
+            with open(constraint_file, "w") as f:
                 f.write(f"torch=={torch_version}\n")
-            print(
-                f"Created {constraint_filename} to constrain torch to version {torch_version}."
-            )
-
-            # Modify install command to use the constraint
-            install_command += f" -c {constraint_filename}"
-        else:
-            # This case is unlikely if the subprocess call succeeds
-            print(
-                "Could not determine installed torch version. Installing without constraint."
-            )
-
+            print(f"Created {constraint_file} to constrain torch version.")
+            return constraint_file
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # This handles cases where python3 fails or 'import torch' raises an error.
         print("Torch is not installed. Proceeding without constraint.")
+    return None
 
-    # Execute the final installation command
+
+def install_tensorrt_llm():
+    """Install the tensorrt_llm wheel with torch version constraint."""
+    print("##########  Install tensorrt_llm package  ##########")
+
+    install_command = "pip3 install tensorrt_llm-*.whl"
+    constraint_file = get_torch_constraint_file()
+    if constraint_file:
+        install_command += f" -c {constraint_file}"
+
     print(f"Executing command: {install_command}")
     subprocess.check_call(install_command, shell=True)
 
@@ -168,15 +177,25 @@ def create_link_for_models():
             os.symlink(src, dst, target_is_directory=True)
 
 
-def test_pip_install():
-    parser = argparse.ArgumentParser(description="Check Pip Install")
-    parser.add_argument("--wheel_path",
-                        type=str,
-                        required=False,
-                        default="Default",
-                        help="The wheel path")
-    args = parser.parse_args()
+def run_sanity_check(examples_path="../../examples"):
+    """Run sanity checks after installation."""
+    print("##########  Test import tensorrt_llm  ##########")
+    subprocess.check_call(
+        'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
+        shell=True)
+    print("##########  Verify license files  ##########")
+    verify_license_files()
 
+    print("##########  Create link for models  ##########")
+    create_link_for_models()
+
+    print("##########  Test quickstart example  ##########")
+    subprocess.check_call(
+        f"python3 {examples_path}/llm-api/quickstart_example.py", shell=True)
+
+
+def install_system_libs():
+    """Install required system libraries for tensorrt_llm."""
     print("##########  Install required system libs  ##########")
     if not os.path.exists("/usr/local/mpi/bin/mpicc"):
         subprocess.check_call("apt-get -y install libopenmpi-dev", shell=True)
@@ -190,23 +209,64 @@ def test_pip_install():
     subprocess.check_call("pip3 install --ignore-installed wheel || true",
                           shell=True)
 
+
+def test_pip_install(args):
+    install_system_libs()
+
     download_wheel(args)
     install_tensorrt_llm()
 
-    print("##########  Test import tensorrt_llm  ##########")
-    subprocess.check_call(
-        'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
-        shell=True)
-    print("##########  Verify license files  ##########")
-    verify_license_files()
+    run_sanity_check()
 
-    print("##########  Create link for models  ##########")
-    create_link_for_models()
 
-    print("##########  Test quickstart example  ##########")
-    subprocess.check_call(
-        "python3 ../../examples/llm-api/quickstart_example.py", shell=True)
+def test_python_builds(args):
+    """Test Python builds using precompiled wheel (sanity check only).
+
+    This test verifies the TRTLLM_PRECOMPILED_LOCATION workflow:
+    1. Install required system libs
+    2. Use precompiled wheel URL to extract C++ bindings
+    3. Build Python-only wheel (editable install with torch constraint)
+    4. Verify installation works correctly
+    5. Run quickstart example
+    6. Clean up editable install to leave env in clean state
+    """
+    print("##########  Python Builds Test  ##########")
+
+    install_system_libs()
+
+    wheel_url = get_wheel_url(args.wheel_path)
+    print(f"Using precompiled wheel: {wheel_url}")
+
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+    print(f"Repository root: {repo_root}")
+
+    # Uninstall existing tensorrt_llm to test fresh editable install
+    subprocess.run("pip3 uninstall -y tensorrt_llm", shell=True, check=False)
+
+    print("##########  Install with TRTLLM_PRECOMPILED_LOCATION  ##########")
+    env = os.environ.copy()
+    env["TRTLLM_PRECOMPILED_LOCATION"] = wheel_url
+
+    install_cmd = ["pip3", "install", "-e", ".", "-v"]
+    constraint_file = get_torch_constraint_file(repo_root)
+    if constraint_file:
+        install_cmd.extend(["-c", constraint_file])
+
+    subprocess.check_call(install_cmd, cwd=repo_root, env=env)
+    run_sanity_check(examples_path=f"{repo_root}/examples")
+
+    # Clean up: uninstall editable install to leave env in clean state
+    print("##########  Clean up editable install  ##########")
+    subprocess.run("pip3 uninstall -y tensorrt_llm", shell=True, check=False)
 
 
 if __name__ == "__main__":
-    test_pip_install()
+    parser = argparse.ArgumentParser(description="Check Pip Install")
+    parser.add_argument("--wheel_path",
+                        type=str,
+                        required=True,
+                        help="The wheel path")
+    args = parser.parse_args()
+    test_python_builds(args)
+    test_pip_install(args)

@@ -81,13 +81,15 @@ def make_eagle3_config(spec_model_path: str):
     )
 
 
-def run_with_autodeploy(model, speculative_config, batch_size):
+def run_with_autodeploy(model, speculative_config, batch_size, transforms_override=None):
     """Run AutoDeploy with or without speculative decoding.
 
     Args:
         model: Path to the base model
         speculative_config: Speculative decoding config (None for baseline mode)
         batch_size: Number of prompts to process
+        transforms_override: Optional dict of transform config overrides to merge
+            into the default transforms config (e.g. {"fuse_add_rms_norm": {"enabled": False}})
 
     Returns:
         List of (prompt, output) tuples from prompts_and_outputs
@@ -111,6 +113,10 @@ def run_with_autodeploy(model, speculative_config, batch_size):
         "disable_overlap_scheduler": True,
         "max_num_tokens": 64,
     }
+
+    # Apply any transform config overrides
+    if transforms_override:
+        llm_args["transforms"] = transforms_override
 
     # Configure experiment with prompts
     experiment_config = {
@@ -169,18 +175,34 @@ def test_autodeploy_spec_dec_output(spec_dec_mode):
     print(f"\nBase Model: {base_model}")
     print(f"Speculative Model ({spec_dec_mode}): {spec_model}")
 
+    # For eagle3, disable fuse_add_rms_norm for both runs to ensure numerical
+    # parity. The eagle3 hidden state capture replaces aten.add with
+    # residual_add_for_capture at certain layers, which prevents
+    # fuse_add_rms_norm from fusing those layers. This causes the target
+    # model to produce slightly different logits vs baseline (which fuses
+    # all layers), leading to greedy-divergent outputs on some hardware.
+    transforms_override = None
+    if spec_dec_mode == "eagle3":
+        transforms_override = {"fuse_add_rms_norm": {"enabled": False}}
+
     # Run with speculative decoding
     print("\n[1/2] Running with speculative decoding enabled...")
     spec_outputs = run_with_autodeploy(
         model=base_model,
         speculative_config=spec_config,
         batch_size=1,
+        transforms_override=transforms_override,
     )
     print(f"Generated {len(spec_outputs)} outputs with speculative decoding")
 
     # Run without speculative decoding (baseline)
     print("\n[2/2] Running without speculative decoding (baseline)...")
-    baseline_outputs = run_with_autodeploy(model=base_model, speculative_config=None, batch_size=1)
+    baseline_outputs = run_with_autodeploy(
+        model=base_model,
+        speculative_config=None,
+        batch_size=1,
+        transforms_override=transforms_override,
+    )
     print(f"Generated {len(baseline_outputs)} outputs in baseline mode")
 
     # Verify outputs are identical

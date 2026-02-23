@@ -283,6 +283,10 @@ class DeepEPLowLatency(Communication):
             self.expert_size_per_partition, num_tokens_per_expert, self.hidden_size
         )
 
+        if deep_ep_topk_weights.dtype != torch.float32:
+            # Deep ep low latency combine requires for fp32 weights
+            deep_ep_topk_weights = deep_ep_topk_weights.to(torch.float32)
+
         if self.use_low_precision_combine:
             if self._has_nvfp4():
                 precision = "nvfp4"

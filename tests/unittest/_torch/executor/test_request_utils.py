@@ -6,7 +6,6 @@ This module tests:
 - Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request)
 """
 
-from collections import deque
 from unittest.mock import Mock, patch
 
 import pytest
@@ -20,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     merge_requests,
     schedule_attention_dp_requests,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.mapping import CpType
 
@@ -263,7 +263,7 @@ def test_merge_requests_with_helix_cp_config():
 def test_get_from_waiting_queue():
     """Test getting items from waiting queue."""
     # Add items to waiting queue
-    waiting_queue = deque()
+    waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
     waiting_queue.extend(items)
 
@@ -291,7 +291,7 @@ def test_get_from_waiting_queue_edge_cases(
 ):
     """Test edge cases for getting items from waiting queue."""
     # Setup queue
-    waiting_queue = deque()
+    waiting_queue = FCFSWaitingQueue()
     if queue_size > 0:
         items = [RequestQueueItem(i, Mock()) for i in range(queue_size)]
         waiting_queue.extend(items)
@@ -307,7 +307,7 @@ def test_get_from_waiting_queue_edge_cases(
 def test_get_from_waiting_queue_with_attention_dp(
     attention_dp_config, all_ranks_num_active_requests
 ):
-    waiting_queue = deque()
+    waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
     waiting_queue.extend(items)
 
@@ -338,7 +338,8 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
         3, create_mock_request_with_py_schedule_params(attention_dp_rank=None)
     )  # No scheduling params
 
-    waiting_queue = deque([req1, req2, req3])
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.extend([req1, req2, req3])
 
     # Set rank 0 to full capacity to test filtering
     all_ranks_num_active_requests[0] = 8
@@ -719,7 +720,8 @@ def test_achieve_max_num_active_requests(attention_dp_config):
             req_id += 1
 
     all_ranks_num_active_requests = [5, 6, 3, 7]
-    waiting_queue = deque(req_list)
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.extend(req_list)
     available_active_requests = max_num_active_requests * 4 - sum(all_ranks_num_active_requests)
 
     result = get_from_waiting_queue(
@@ -843,7 +845,7 @@ def test_attention_dp_scheduling_cases(
     all_ranks_expected_req_ids,
 ):
     """Test attention DP scheduling with various scenarios."""
-    waiting_queue = deque()
+    waiting_queue = FCFSWaitingQueue()
     for rank, relax in request_configs:
         append_to_waiting_queue(waiting_queue, rank, relax)
 

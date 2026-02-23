@@ -304,13 +304,15 @@ protected:
         bufferManagers.push_back(mCacheTransBufferManager.get());
         if (isSender)
         {
-            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mlocalRank,
+                CacheTransferLayer(
+                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
         }
         else
         {
-            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), mlocalRank,
+                CacheTransferLayer(
+                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
         }
     }
 
@@ -786,12 +788,12 @@ protected:
             if (mIsContext)
             {
                 mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
             }
             else
             {
                 mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
             }
             TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 
@@ -1606,8 +1608,8 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
     if (mIsContext || mIsGeneration)
     {
         bool enableDP = mIsContext ? contextDP : generationDP;
-        setUpCacheManager(
-            numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow);
+        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP,
+            isWindow, isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
         int requestId = 0;
@@ -2014,7 +2016,7 @@ TEST(targetTest, CacheStateNODP)
             sharedModelConfig, genWC, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
 
         auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -2313,7 +2315,7 @@ TEST(targetTest, CacheStateContextDP)
             genEnableDP, generationDPRank, genTP};
 
         auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -2420,7 +2422,7 @@ TEST(targetTest, CacheStateContextDP)
             genEnableDP, generationDPRank, genTP};
 
         auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(contextCache, genCache, generationRank);
+            = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, generationRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
