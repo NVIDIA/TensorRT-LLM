@@ -38,12 +38,18 @@ class RankState:
     num_active_tokens: int = 0
 
     def to_list(self) -> list[int]:
-        """Serialize to a flat list for allgather transport."""
+        """Serialize to a flat list for allgather transport.
+
+        Keep in sync with ``from_list()`` when adding fields.
+        """
         return [self.num_active_requests, self.num_active_tokens]
 
     @classmethod
     def from_list(cls, rank: int, data: list[int]) -> RankState:
-        """Deserialize from a flat list received via allgather."""
+        """Deserialize from a flat list received via allgather.
+
+        Keep in sync with ``to_list()`` when adding fields.
+        """
         return cls(
             rank=rank,
             num_active_requests=data[0],
@@ -59,6 +65,7 @@ class ADPRequestAssigner(ABC):
         Output: dict[rank, list[Request]]
     """
 
+    @abstractmethod
     def create_rank_state(
         self,
         rank: int,
@@ -71,6 +78,8 @@ class ADPRequestAssigner(ABC):
             rank: The current rank index.
             activate_requests: Currently active LlmRequests on this rank.
             new_requests: New requests popped from the waiting queue.
+                Currently unused; reserved for future assigners that need
+                new-request info (e.g. KV-cache-aware scheduling).
 
         Returns:
             RankState for this rank, to be serialized and allgathered.
@@ -180,7 +189,7 @@ class DefaultADPRequestAssigner(ADPRequestAssigner):
             max(all_ranks_num_active_requests),
         )
 
-        all_ranks_new_requests = _balance_requests_across_ranks(
+        all_ranks_new_requests = self._balance_requests_across_ranks(
             remaining_unscheduled,
             all_ranks_new_requests,
             all_ranks_num_active_requests,
@@ -190,73 +199,73 @@ class DefaultADPRequestAssigner(ADPRequestAssigner):
 
         return all_ranks_new_requests, expected_num_active_requests
 
+    def _balance_requests_across_ranks(
+        self,
+        new_requests: List,
+        all_ranks_new_requests: Dict[int, List],
+        all_ranks_num_active_requests: List[int],
+        all_ranks_num_active_tokens: List[int],
+        expected_num_active_requests: int,
+    ) -> Dict[int, List]:
+        """Balance requests across ranks for attention DP.
 
-def _balance_requests_across_ranks(
-    new_requests: List,
-    all_ranks_new_requests: Dict[int, List],
-    all_ranks_num_active_requests: List[int],
-    all_ranks_num_active_tokens: List[int],
-    expected_num_active_requests: int,
-) -> Dict[int, List]:
-    """Balance requests across ranks for attention DP.
+        Uses a heap-based algorithm to distribute requests evenly across ranks,
+        prioritizing ranks with fewer tokens for better load balancing.
 
-    Uses a heap-based algorithm to distribute requests evenly across ranks,
-    prioritizing ranks with fewer tokens for better load balancing.
+        Args:
+            new_requests: List of new requests to distribute.
+            all_ranks_new_requests: Dict mapping rank to list of already assigned
+                requests (will be extended in-place).
+            all_ranks_num_active_requests: Number of active requests per rank.
+            all_ranks_num_active_tokens: Number of active tokens per rank.
+            expected_num_active_requests: Target number of active requests per rank.
 
-    Args:
-        new_requests: List of new requests to distribute.
-        all_ranks_new_requests: Dict mapping rank to list of already assigned
-            requests (will be extended in-place).
-        all_ranks_num_active_requests: Number of active requests per rank.
-        all_ranks_num_active_tokens: Number of active tokens per rank.
-        expected_num_active_requests: Target number of active requests per rank.
+        Returns:
+            Updated all_ranks_new_requests dict with new requests distributed.
+        """
+        if not new_requests:
+            return all_ranks_new_requests
 
-    Returns:
-        Updated all_ranks_new_requests dict with new requests distributed.
-    """
-    if not new_requests:
+        HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
+
+        all_ranks_new_requests_heap = [
+            HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
+            for tp_rank, val in enumerate(all_ranks_num_active_requests)
+        ]
+
+        all_ranks_new_requests_heap = [
+            val
+            for val in all_ranks_new_requests_heap
+            if val.num_requests < expected_num_active_requests
+        ]
+
+        all_ranks_new_scheduled_requests = {
+            val.rank: val.request_list for val in all_ranks_new_requests_heap
+        }
+
+        heapq.heapify(all_ranks_new_requests_heap)
+
+        new_requests = sorted(
+            new_requests,
+            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
+            reverse=True,
+        )
+
+        for req_item in new_requests:
+            val = heapq.heappop(all_ranks_new_requests_heap)
+            token_count = (
+                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
+            )
+            val = val._replace(
+                num_tokens=val.num_tokens + token_count,
+                num_requests=val.num_requests + 1,
+            )
+
+            val.request_list.append(req_item)
+            if val.num_requests < expected_num_active_requests:
+                heapq.heappush(all_ranks_new_requests_heap, val)
+
+        for rank, reqs in all_ranks_new_scheduled_requests.items():
+            all_ranks_new_requests[rank].extend(reqs)
+
         return all_ranks_new_requests
-
-    HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
-
-    all_ranks_new_requests_heap = [
-        HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
-        for tp_rank, val in enumerate(all_ranks_num_active_requests)
-    ]
-
-    all_ranks_new_requests_heap = [
-        val
-        for val in all_ranks_new_requests_heap
-        if val.num_requests < expected_num_active_requests
-    ]
-
-    all_ranks_new_scheduled_requests = {
-        val.rank: val.request_list for val in all_ranks_new_requests_heap
-    }
-
-    heapq.heapify(all_ranks_new_requests_heap)
-
-    new_requests = sorted(
-        new_requests,
-        key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
-        reverse=True,
-    )
-
-    for req_item in new_requests:
-        val = heapq.heappop(all_ranks_new_requests_heap)
-        token_count = (
-            len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
-        )
-        val = val._replace(
-            num_tokens=val.num_tokens + token_count,
-            num_requests=val.num_requests + 1,
-        )
-
-        val.request_list.append(req_item)
-        if val.num_requests < expected_num_active_requests:
-            heapq.heappush(all_ranks_new_requests_heap, val)
-
-    for rank, reqs in all_ranks_new_scheduled_requests.items():
-        all_ranks_new_requests[rank].extend(reqs)
-
-    return all_ranks_new_requests

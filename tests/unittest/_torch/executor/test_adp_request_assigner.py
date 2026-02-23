@@ -3,7 +3,6 @@
 Tests for:
 - RankState serialization/deserialization
 - ADPRequestAssigner interface and DefaultADPRequestAssigner
-- _balance_requests_across_ranks
 """
 
 from unittest.mock import MagicMock, Mock
@@ -17,7 +16,6 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_request_assigner import (
     ADPRequestAssigner,
     DefaultADPRequestAssigner,
     RankState,
-    _balance_requests_across_ranks,
 )
 
 
@@ -206,6 +204,24 @@ class TestDefaultADPRequestAssigner:
         assert total == 8
         for rank_reqs in result.values():
             assert len(rank_reqs) == 2
+
+    def test_create_rank_state_default(self):
+        assigner = DefaultADPRequestAssigner(has_cp_helix=False)
+        req1 = Mock(py_orig_prompt_len=100)
+        req2 = Mock(py_orig_prompt_len=200)
+        state = assigner.create_rank_state(rank=0, activate_requests=[req1, req2], new_requests=[])
+        assert state.rank == 0
+        assert state.num_active_requests == 2
+        assert state.num_active_tokens == 300
+
+    def test_create_rank_state_cp_helix(self):
+        assigner = DefaultADPRequestAssigner(has_cp_helix=True)
+        req1 = Mock(total_input_len_cp=150)
+        req2 = Mock(total_input_len_cp=250)
+        state = assigner.create_rank_state(rank=1, activate_requests=[req1, req2], new_requests=[])
+        assert state.rank == 1
+        assert state.num_active_requests == 2
+        assert state.num_active_tokens == 400
 
 
 def test_schedule_attention_dp_requests_scheduled_requests(
@@ -576,7 +592,7 @@ def test_attention_dp_scheduling_cases(
 
 def test_balance_requests_across_ranks_empty_requests():
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
-    result = _balance_requests_across_ranks(
+    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
         [],
         all_ranks_new_requests,
         [2, 1, 3, 0],
@@ -599,7 +615,7 @@ def test_balance_requests_across_ranks_single_request():
     all_ranks_num_active_tokens = [10, 20, 5, 15]
     expected_num_active_requests = 2
 
-    result = _balance_requests_across_ranks(
+    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
         [req],
         all_ranks_new_requests,
         all_ranks_num_active_requests,
@@ -640,7 +656,7 @@ def test_balance_requests_across_ranks_multiple_requests():
     all_ranks_num_active_tokens = [5, 15, 25, 10]
     expected_num_active_requests = 2
 
-    result = _balance_requests_across_ranks(
+    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
         [req1, req2, req3],
         all_ranks_new_requests,
         all_ranks_num_active_requests,
@@ -678,7 +694,7 @@ def test_balance_requests_across_ranks_capacity_limits():
     all_ranks_num_active_tokens = [10, 10, 10, 10]
     expected_num_active_requests = 2
 
-    result = _balance_requests_across_ranks(
+    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
         requests,
         all_ranks_new_requests,
         all_ranks_num_active_requests,
@@ -720,7 +736,7 @@ def test_balance_requests_across_ranks_heap_ordering():
     all_ranks_num_active_tokens = [30, 10, 5, 20]
     expected_num_active_requests = 4
 
-    result = _balance_requests_across_ranks(
+    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
         [req1, req2, req3],
         all_ranks_new_requests,
         all_ranks_num_active_requests,
@@ -764,7 +780,7 @@ def test_balance_requests_across_ranks_token_count_sorting():
 
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
 
-    result = _balance_requests_across_ranks(
+    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
         [req1, req2, req3],
         all_ranks_new_requests,
         [0, 0, 0, 0],
