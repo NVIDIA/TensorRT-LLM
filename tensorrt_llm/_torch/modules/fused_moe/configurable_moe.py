@@ -496,9 +496,9 @@ class ConfigurableMoE(MoE):
             # [ep_size * max_tokens_per_rank, ...] due to padding for balanced distribution
             # So we need to allocate workspace based on this size
             if isinstance(self.comm, DeepEPLowLatency):
-                # deeptplowlatency dispatch outputs shape is [#local_experts * moe_ep_size * local_batch_size, hidden size]
+                # deeptplowlatency dispatch outputs shape is
+                # [#local_experts * moe_ep_size * max_tokens_per_rank, hidden size]
                 # local_experts = self.num_slots / moe_ep_size
-                # while the other comm dispatch outputs shape is [#local_experts * moe_ep_size * local_batch_size, hidden_size]
                 num_rows = self.num_slots * max(all_rank_num_tokens)
             else:
                 num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
