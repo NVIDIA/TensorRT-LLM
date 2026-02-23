@@ -497,7 +497,7 @@ window.addEventListener("load", load);</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +510,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc4" />
+  <meta name="docsearch:version" content="1.3.0rc5" />
 
 
   </head>
@@ -764,6 +764,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="supported-hardware.html">Supported Hardware</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -800,6 +801,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/prometheus_metrics.html">Prometheus Metrics</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -813,6 +815,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
@@ -844,6 +847,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l1"><a class="reference internal" href="features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -3535,12 +3539,8 @@ window.addEventListener("load", load);</script>
 <h2 id="F">F</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.fail_fast_on_attention_window_too_large">fail_fast_on_attention_window_too_large (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.fail_fast_on_attention_window_too_large">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.fail_fast_on_attention_window_too_large">fail_fast_on_attention_window_too_large (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
-      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.FalconConfig">FalconConfig (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.FalconForCausalLM">FalconForCausalLM (class in tensorrt_llm.models)</a>
@@ -6909,8 +6909,16 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.RecurrentGemmaForCausalLM.prepare_recurrent_inputs">prepare_recurrent_inputs() (tensorrt_llm.models.RecurrentGemmaForCausalLM method)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.preprocess">preprocess() (tensorrt_llm.runtime.MultimodalModelRunner method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.preprocess">preprocess() (tensorrt_llm.llmapi.AsyncLLM method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.preprocess">(tensorrt_llm.llmapi.LLM method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.preprocess">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
+</li>
+        <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.preprocess">(tensorrt_llm.runtime.MultimodalModelRunner method)</a>
+</li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.presence_penalty">presence_penalty (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 
       <ul>
@@ -8220,6 +8228,8 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor20DataTransceiverState12getCommStateEv">tensorrt_llm::executor::DataTransceiverState::getCommState (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor20DataTransceiverState16hasRnnCacheStateEv">tensorrt_llm::executor::DataTransceiverState::hasRnnCacheState (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor20DataTransceiverState11mCacheStateE">tensorrt_llm::executor::DataTransceiverState::mCacheState (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor20DataTransceiverState10mCommStateE">tensorrt_llm::executor::DataTransceiverState::mCommState (C++ member)</a>
@@ -9120,6 +9130,8 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState18getAttentionConfigEv">tensorrt_llm::executor::kv_cache::CacheState::getAttentionConfig (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState20getConvStateDataTypeEv">tensorrt_llm::executor::kv_cache::CacheState::getConvStateDataType (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState11getDataTypeEv">tensorrt_llm::executor::kv_cache::CacheState::getDataType (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState19getEnableBlockReuseEv">tensorrt_llm::executor::kv_cache::CacheState::getEnableBlockReuse (C++ function)</a>
@@ -9135,6 +9147,14 @@ window.addEventListener("load", load);</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState14getModelConfigEv">tensorrt_llm::executor::kv_cache::CacheState::getModelConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState17getParallelConfigEv">tensorrt_llm::executor::kv_cache::CacheState::getParallelConfig (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState16getRnnCacheStateEv">tensorrt_llm::executor::kv_cache::CacheState::getRnnCacheState (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState17getRnnModelConfigEv">tensorrt_llm::executor::kv_cache::CacheState::getRnnModelConfig (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState19getSsmStateDataTypeEv">tensorrt_llm::executor::kv_cache::CacheState::getSsmStateDataType (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState12hasRnnConfigEv">tensorrt_llm::executor::kv_cache::CacheState::hasRnnConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState16mAttentionConfigE">tensorrt_llm::executor::kv_cache::CacheState::mAttentionConfig (C++ member)</a>
 </li>
@@ -9164,6 +9184,8 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState15mParallelConfigE">tensorrt_llm::executor::kv_cache::CacheState::mParallelConfig (C++ member)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14mRnnCacheStateE">tensorrt_llm::executor::kv_cache::CacheState::mRnnCacheState (C++ member)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheStateeqERKN8kv_cache10CacheStateE">tensorrt_llm::executor::kv_cache::CacheState::operator== (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14ParallelConfigE">tensorrt_llm::executor::kv_cache::CacheState::ParallelConfig (C++ struct)</a>
@@ -9183,6 +9205,40 @@ window.addEventListener("load", load);</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14ParallelConfig18mTensorParallelismE">tensorrt_llm::executor::kv_cache::CacheState::ParallelConfig::mTensorParallelism (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState14ParallelConfigeqERK14ParallelConfig">tensorrt_llm::executor::kv_cache::CacheState::ParallelConfig::operator== (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState13RnnCacheStateE">tensorrt_llm::executor::kv_cache::CacheState::RnnCacheState (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState13RnnCacheState18mConvStateDataTypeE">tensorrt_llm::executor::kv_cache::CacheState::RnnCacheState::mConvStateDataType (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState13RnnCacheState14mLayerNumPerPPE">tensorrt_llm::executor::kv_cache::CacheState::RnnCacheState::mLayerNumPerPP (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState13RnnCacheState12mModelConfigE">tensorrt_llm::executor::kv_cache::CacheState::RnnCacheState::mModelConfig (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState13RnnCacheState17mSsmStateDataTypeE">tensorrt_llm::executor::kv_cache::CacheState::RnnCacheState::mSsmStateDataType (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState13RnnCacheStateeqERK13RnnCacheState">tensorrt_llm::executor::kv_cache::CacheState::RnnCacheState::operator== (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfigE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfig12mConvDimSizeE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::mConvDimSize (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfig6mDConvE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::mDConv (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfig7mDStateE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::mDState (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfig8mHeadDimE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::mHeadDim (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfig11mHiddenSizeE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::mHiddenSize (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfig8mNGroupsE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::mNGroups (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfig9mNumHeadsE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::mNumHeads (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfig10mNumLayersE">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::mNumLayers (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfigeqERK14RnnModelConfig">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::operator== (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState12setRnnConfigE14RnnModelConfigNSt6vectorI10SizeType32EEN8nvinfer18DataTypeEN8nvinfer18DataTypeE">tensorrt_llm::executor::kv_cache::CacheState::setRnnConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState8toStringEv">tensorrt_llm::executor::kv_cache::CacheState::toString (C++ function)</a>
 </li>
@@ -11146,6 +11202,8 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kFLOATEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kFLOAT&gt;::type (C++ type)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt; (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt;::name (C++ member)</a>
@@ -11170,8 +11228,6 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::type (C++ type)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64, true&gt; (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EXL1EEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64, true&gt;::name (C++ member)</a>
@@ -15100,9 +15156,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 14, 2026.</p>
+  <p>Last updated on February 23, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4">26901e4</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
   
 </div></div>
       

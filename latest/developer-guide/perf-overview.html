@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc4" />
+  <meta name="docsearch:version" content="1.3.0rc5" />
 
 
   </head>
@@ -334,6 +334,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -370,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -383,6 +385,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
@@ -414,6 +417,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -1145,7 +1149,7 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 </section>
 <section id="preparing-a-dataset">
 <h3>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading">#</a></h3>
-<p>In order to prepare a dataset, you can use the provided <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4/benchmarks/cpp/prepare_dataset.py">script</a>.
+<p>In order to prepare a dataset, you can use the provided <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb/benchmarks/cpp/prepare_dataset.py">script</a>.
 To generate a synthetic dataset, run the following command:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--tokenizer<span class="o">=</span><span class="nv">$model_name</span><span class="w"> </span>--stdout<span class="w"> </span>token-norm-dist<span class="w"> </span>--num-requests<span class="o">=</span><span class="nv">$num_requests</span><span class="w"> </span>--input-mean<span class="o">=</span><span class="nv">$isl</span><span class="w"> </span>--output-mean<span class="o">=</span><span class="nv">$osl</span><span class="w"> </span>--input-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>&gt;<span class="w"> </span><span class="nv">$dataset_file</span>
 </pre></div>
@@ -1194,7 +1198,7 @@ remain in the system longer and therefore require less requests to achieve stead
 <h3>Running the Benchmark<a class="headerlink" href="#running-the-benchmark" title="Link to this heading">#</a></h3>
 <p>To run the benchmark with the generated data set, simply use the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand. The benchmarker will
 run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
-a model name (HuggingFace reference or path to a local model), a <a class="reference internal" href="#preparing-a-dataset">generated dataset</a>, and a file containing any desired extra options to the LLM APIs (details in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4/tensorrt_llm/llmapi/llm_args.py">tensorrt_llm/llmapi/llm_args.py:LlmArgs</a>).</p>
+a model name (HuggingFace reference or path to a local model), a <a class="reference internal" href="#preparing-a-dataset">generated dataset</a>, and a file containing any desired extra options to the LLM APIs (details in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb/tensorrt_llm/llmapi/llm_args.py">tensorrt_llm/llmapi/llm_args.py:LlmArgs</a>).</p>
 <p>For dense / non-MoE models:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--tp<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span>--pp<span class="w"> </span><span class="nv">$pp_size</span><span class="w"> </span>--model<span class="w"> </span><span class="nv">$model_name</span><span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--config<span class="w"> </span><span class="nv">$llm_options</span>
 </pre></div>
@@ -1460,9 +1464,9 @@ using the <code class="docutils literal notranslate"><span class="pre">--kv_cach
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 14, 2026.</p>
+  <p>Last updated on February 23, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4">26901e4</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
   
 </div></div>
       

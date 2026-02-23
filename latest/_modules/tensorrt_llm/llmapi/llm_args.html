@@ -497,7 +497,7 @@ window.addEventListener("load", load);</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +510,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc4" />
+  <meta name="docsearch:version" content="1.3.0rc5" />
 
 
   </head>
@@ -764,6 +764,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../supported-hardware.html">Supported Hardware</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -800,6 +801,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -813,6 +815,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
@@ -844,6 +847,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -2108,11 +2112,10 @@ window.addEventListener("load", load);</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_post_init">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">model_post_init</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">__context</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_last_hidden_in_save</span> <span class="o">=</span> <span class="kc">True</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_last_hidden_in_save</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="k">elif</span> <span class="o">-</span><span class="mi">1</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_last_hidden_in_save</span> <span class="o">=</span> <span class="kc">False</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span></div>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="o">-</span><span class="mi">1</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span><span class="p">:</span>
+            <span class="c1"># This variable is queried to determine whether we should write the final hidden state</span>
+            <span class="c1"># to the aux_hidden_states buffer.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_last_hidden_in_save</span> <span class="o">=</span> <span class="kc">False</span></div>
 
 
 <div class="viewcode-block" id="SaveHiddenStatesDecodingConfig.from_dict">
@@ -2141,13 +2144,23 @@ window.addEventListener("load", load);</script>
     <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_capture_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Returns the number of layers to capture of the target model.</span>
-<span class="sd">        If eagle3_layers_to_capture is not None, return the length of the set.</span>
-<span class="sd">        Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden state).</span>
+<span class="sd">        Returns the number of layers to save.</span>
+<span class="sd">        The following hidden states are saved:</span>
+<span class="sd">        - If eagle3_layers_to_capture is None, save the eagle3 base set plus</span>
+<span class="sd">        the post norm last hidden state.</span>
+<span class="sd">        - Otherwise, save the specified layers plus the post norm last hidden state.</span>
+
+<span class="sd">        The saved data will contain two tensors, hidden_states and aux_hidden_states.</span>
+<span class="sd">        * hidden_states will contain the last post norm state.</span>
+<span class="sd">        * aux_hidden_states will contain all other captured layers. The last hidden state</span>
+<span class="sd">        will also be included in this tensor if you explicitly captured layer -1.</span>
+
+<span class="sd">        Note that if you set layers to capture to {-1}, aux_hidden_states won&#39;t exist.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="mi">4</span>
-        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span><span class="p">)</span> <span class="o">+</span> <span class="nb">int</span><span class="p">(</span>
+            <span class="o">-</span><span class="mi">1</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span><span class="p">)</span></div>
 
 
 
@@ -2282,7 +2295,13 @@ window.addEventListener("load", load);</script>
         <span class="k">if</span> <span class="s1">&#39;num_nextn_predict_layers&#39;</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;num_nextn_predict_layers&#39;</span><span class="p">]</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span>
-                <span class="s1">&#39;num_nextn_predict_layers&#39;</span><span class="p">]</span>  <span class="c1"># Current MTP only support linear tree</span></div>
+                <span class="s1">&#39;num_nextn_predict_layers&#39;</span><span class="p">]</span>  <span class="c1"># Current MTP only support linear tree</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_eagle_one_model</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing &quot;</span>
+                <span class="s2">&quot;in release 1.3. After that, the flag will be removed entirely.&quot;</span>
+            <span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="MTPDecodingConfig.from_dict">
@@ -3250,12 +3269,6 @@ window.addEventListener("load", load);</script>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The format to load the model.&quot;</span><span class="p">,</span>
         <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Literal[&#39;auto&#39;, &#39;dummy&#39;]&quot;</span><span class="p">})</span>
 
-    <span class="n">fail_fast_on_attention_window_too_large</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Fail fast when attention window is too large to fit even a single sequence in the KV cache.&quot;</span><span class="p">,</span>
-        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
-
     <span class="c1"># LoRA arguments</span>
     <span class="n">enable_lora</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable LoRA.&quot;</span><span class="p">)</span>
 
@@ -3632,6 +3645,12 @@ window.addEventListener("load", load);</script>
 
     <span class="n">workspace</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                                      <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The workspace for the model.&quot;</span><span class="p">)</span>
+
+    <span class="n">fail_fast_on_attention_window_too_large</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Fail fast when attention window is too large to fit even a single sequence in the KV cache.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
     <span class="c1"># Once set, the model will reuse the build_cache</span>
     <span class="n">enable_build_cache</span><span class="p">:</span> <span class="nb">object</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -4495,9 +4514,13 @@ window.addEventListener("load", load);</script>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate CUDA graph configuration.</span>
 
 <span class="sd">        Ensures that:</span>
-<span class="sd">        1. If cuda_graph_config.batch_sizes is provided, cuda_graph_config.max_batch_size must be 0</span>
-<span class="sd">        2. If cuda_graph_config.batch_sizes is not provided, it is generated based on cuda_graph_config.max_batch_size</span>
-<span class="sd">        3. If both are provided, cuda_graph_config.batch_sizes must match the generated values</span>
+<span class="sd">        1. If cuda_graph_config.batch_sizes is provided, max_batch_size is</span>
+<span class="sd">           derived as max(batch_sizes).  If max_batch_size was already set it</span>
+<span class="sd">           must be compatible (equal to max(batch_sizes)); otherwise an error</span>
+<span class="sd">           is raised.</span>
+<span class="sd">        2. If only cuda_graph_config.max_batch_size is provided, batch_sizes</span>
+<span class="sd">           is generated from it.</span>
+<span class="sd">        3. If neither is provided, a default max_batch_size of 128 is used.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span>
@@ -4506,17 +4529,17 @@ window.addEventListener("load", load);</script>
 
         <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="p">:</span>
             <span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span> <span class="o">!=</span> <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">_generate_cuda_graph_batch_sizes</span><span class="p">(</span>
-                        <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_padding</span><span class="p">):</span>
-                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                        <span class="s2">&quot;Please don&#39;t set both cuda_graph_config.batch_sizes &quot;</span>
-                        <span class="s2">&quot;and cuda_graph_config.max_batch_size.</span><span class="se">\n</span><span class="s2">&quot;</span>
-                        <span class="sa">f</span><span class="s2">&quot;cuda_graph_config.batch_sizes: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="si">}</span><span class="s2">, &quot;</span>
-                        <span class="sa">f</span><span class="s2">&quot;cuda_graph_config.max_batch_size: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">&quot;</span>
-                    <span class="p">)</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="p">)</span>
+            <span class="n">derived_max</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">!=</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">!=</span> <span class="n">derived_max</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;cuda_graph_config.max_batch_size is incompatible with &quot;</span>
+                    <span class="s2">&quot;cuda_graph_config.batch_sizes. When both are provided, &quot;</span>
+                    <span class="s2">&quot;max_batch_size must equal max(batch_sizes).</span><span class="se">\n</span><span class="s2">&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;cuda_graph_config.batch_sizes: </span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="si">}</span><span class="s2">, &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;max(batch_sizes): </span><span class="si">{</span><span class="n">derived_max</span><span class="si">}</span><span class="s2">, &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;cuda_graph_config.max_batch_size: </span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="p">)</span>
+            <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">derived_max</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">or</span> <span class="mi">128</span>
             <span class="n">generated_sizes</span> <span class="o">=</span> <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">_generate_cuda_graph_batch_sizes</span><span class="p">(</span>
@@ -4924,9 +4947,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 14, 2026.</p>
+  <p>Last updated on February 23, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4">26901e4</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
   
 </div></div>
       

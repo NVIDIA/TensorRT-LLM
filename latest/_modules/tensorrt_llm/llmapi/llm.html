@@ -497,7 +497,7 @@ window.addEventListener("load", load);</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +510,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc4" />
+  <meta name="docsearch:version" content="1.3.0rc5" />
 
 
   </head>
@@ -764,6 +764,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../supported-hardware.html">Supported Hardware</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -800,6 +801,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -813,6 +815,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
@@ -844,6 +847,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -966,8 +970,9 @@ window.addEventListener("load", load);</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">cast</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">cast</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">transformers</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tqdm</span><span class="w"> </span><span class="kn">import</span> <span class="n">tqdm</span>
@@ -1079,6 +1084,18 @@ window.addEventListener("load", load);</script>
 <span class="s2">        llm_id (str): The unique ID of the LLM instance.</span>
 <span class="s2">        disaggregated_params (dict): The disaggregated parameters of the LLM instance.</span>
 <span class="s2">&quot;&quot;&quot;</span>
+
+
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PreprocessedInputs</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Light structure for holding preprocessed inputs.</span>
+
+<span class="sd">    Can be passed to `generate_async` to skip preprocessing.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">query_token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">multimodal_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">MultimodalParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">BaseLLM</span><span class="p">:</span>
@@ -1326,7 +1343,7 @@ window.addEventListener("load", load);</script>
     <span class="nd">@nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;LLM.generate_async&quot;</span><span class="p">,</span> <span class="n">color</span><span class="o">=</span><span class="s2">&quot;green&quot;</span><span class="p">,</span> <span class="n">category</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">generate_async</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
-        <span class="n">inputs</span><span class="p">:</span> <span class="n">PromptInputs</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">PreprocessedInputs</span><span class="p">],</span>
         <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">lora_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoRARequest</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prompt_adapter_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PromptAdapterRequest</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1342,7 +1359,7 @@ window.addEventListener("load", load);</script>
 <span class="sd">        Asynchronous generation accepts single prompt only.</span>
 
 <span class="sd">        Args:</span>
-<span class="sd">            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.</span>
+<span class="sd">            inputs (Union[tensorrt_llm.inputs.data.PromptInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text or token ids, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.</span>
 <span class="sd">            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.</span>
 <span class="sd">                A default one will be used if not provided.</span>
 <span class="sd">            lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.</span>
@@ -1365,6 +1382,7 @@ window.addEventListener("load", load);</script>
         <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">return_perf_metrics</span> <span class="k">else</span> <span class="kc">None</span>
 
         <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_sampling_params</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
+
         <span class="n">cache_salt_id</span> <span class="o">=</span> <span class="n">get_cache_salt_id</span><span class="p">(</span>
             <span class="n">cache_salt</span><span class="p">)</span> <span class="k">if</span> <span class="n">cache_salt</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="c1"># With pytorch backend, py_executor has logic to handle max_tokens of 1,</span>
@@ -1372,11 +1390,66 @@ window.addEventListener("load", load);</script>
         <span class="c1"># TODO: Also support for trt backend</span>
         <span class="n">is_ctx_only</span> <span class="o">=</span> <span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">request_type</span> <span class="o">==</span> <span class="s2">&quot;context_only&quot;</span>
         <span class="n">is_gen_only</span> <span class="o">=</span> <span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">request_type</span> <span class="o">==</span> <span class="s2">&quot;generation_only&quot;</span>
-        <span class="n">is_mm_disagg</span> <span class="o">=</span> <span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_embedding_handles</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 
         <span class="k">if</span> <span class="n">is_ctx_only</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span><span class="p">:</span>
             <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">=</span> <span class="mi">1</span>
 
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">PreprocessedInputs</span><span class="p">):</span>
+            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">prompt_token_ids</span>
+            <span class="n">prompt</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">query_token_ids</span>
+            <span class="n">multimodal_params</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">multimodal_params</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">query_token_ids</span><span class="p">,</span> <span class="n">multimodal_params</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_preprocess</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">,</span> <span class="n">disaggregated_params</span><span class="p">))</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_arguments</span><span class="p">(</span>
+            <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">),</span>
+            <span class="nb">len</span><span class="p">(</span><span class="n">query_token_ids</span><span class="p">)</span> <span class="k">if</span> <span class="n">query_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+            <span class="n">sampling_params</span><span class="p">,</span>
+            <span class="n">is_gen_only</span><span class="o">=</span><span class="n">is_gen_only</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">_postproc_params</span><span class="p">:</span>
+            <span class="n">_postproc_params</span><span class="o">.</span><span class="n">postproc_args</span><span class="o">.</span><span class="n">num_prompt_tokens</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span>
+                <span class="n">prompt_token_ids</span><span class="p">)</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span>
+            <span class="n">prompt_token_ids</span><span class="p">,</span>
+            <span class="n">query_token_ids</span><span class="o">=</span><span class="n">query_token_ids</span><span class="p">,</span>
+            <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">,</span>
+            <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_request</span><span class="p">,</span>
+            <span class="n">prompt_adapter_request</span><span class="o">=</span><span class="n">prompt_adapter_request</span><span class="p">,</span>
+            <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
+            <span class="n">kv_cache_retention_config</span><span class="o">=</span><span class="n">kv_cache_retention_config</span><span class="p">,</span>
+            <span class="n">disaggregated_params</span><span class="o">=</span><span class="n">disaggregated_params</span><span class="p">,</span>
+            <span class="n">trace_headers</span><span class="o">=</span><span class="n">trace_headers</span><span class="p">,</span>
+            <span class="n">postproc_params</span><span class="o">=</span><span class="n">_postproc_params</span><span class="p">,</span>
+            <span class="n">multimodal_params</span><span class="o">=</span><span class="n">multimodal_params</span><span class="p">,</span>
+            <span class="n">scheduling_params</span><span class="o">=</span><span class="n">scheduling_params</span><span class="p">,</span>
+            <span class="n">cache_salt_id</span><span class="o">=</span><span class="n">cache_salt_id</span><span class="p">,</span>
+            <span class="n">arrival_time</span><span class="o">=</span><span class="n">arrival_time</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_perf_metrics</span><span class="p">:</span>
+            <span class="n">result</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+                <span class="p">{</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">ARRIVAL_TIMESTAMP</span><span class="p">:</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()})</span>
+
+        <span class="k">return</span> <span class="n">RequestOutput</span><span class="o">.</span><span class="n">_from_generation_result</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span>
+                                                     <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_preprocess</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">PromptInputs</span><span class="p">,</span>
+        <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">,</span>
+        <span class="n">disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
+               <span class="n">Optional</span><span class="p">[</span><span class="n">MultimodalParams</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Preprocess raw prompts into token IDs and multimodal params.</span>
+
+<span class="sd">        This is the CPU-heavy portion of generate_async (tokenization,</span>
+<span class="sd">        multimodal processing, hash computation).</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            `(prompt_token_ids, prompt, query_token_ids, multimodal_params)`</span>
+<span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">inputs</span> <span class="o">=</span> <span class="n">prompt_inputs</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span>
@@ -1395,8 +1468,15 @@ window.addEventListener("load", load);</script>
                 <span class="p">)</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span> <span class="o">=</span> <span class="kc">False</span>
 
+        <span class="n">is_mm_disagg</span> <span class="o">=</span> <span class="p">(</span><span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                        <span class="ow">and</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_embedding_handles</span>
+                        <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">is_gen_only</span> <span class="o">=</span> <span class="p">(</span><span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span>
+                       <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">request_type</span> <span class="o">==</span> <span class="s2">&quot;generation_only&quot;</span><span class="p">)</span>
+
         <span class="n">query_token_ids</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">multimodal_params</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">prompt</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="k">if</span> <span class="n">is_mm_disagg</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="s2">&quot;support_mm_disagg&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
@@ -1430,15 +1510,13 @@ window.addEventListener("load", load);</script>
                     <span class="n">multimodal_input</span><span class="o">=</span><span class="n">multimodal_input</span><span class="p">,</span>
                     <span class="n">multimodal_data</span><span class="o">=</span><span class="n">multimodal_data</span><span class="p">,</span>
                 <span class="p">)</span>
-
         <span class="k">elif</span> <span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
             <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">]</span>
-            <span class="n">prompt</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;query_token_ids&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">multimodal_data</span> <span class="o">=</span> <span class="p">{}</span>
             <span class="c1"># NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.</span>
             <span class="k">if</span> <span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_ids_handle</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="c1"># It looks like `PyTorchModelEngine` assumes both are present when using mrope?</span>
+                <span class="c1"># PyTorchModelEngine assumes both are present when using mrope.</span>
                 <span class="k">if</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_deltas_handle</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                         <span class="s2">&quot;`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both &quot;</span>
@@ -1511,37 +1589,36 @@ window.addEventListener("load", load);</script>
                 <span class="sa">f</span><span class="s2">&quot;The inputs must be type str or list of int, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_check_arguments</span><span class="p">(</span>
-            <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">),</span>
-            <span class="nb">len</span><span class="p">(</span><span class="n">query_token_ids</span><span class="p">)</span> <span class="k">if</span> <span class="n">query_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="n">sampling_params</span><span class="p">,</span>
-            <span class="n">is_gen_only</span><span class="o">=</span><span class="n">is_gen_only</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">_postproc_params</span><span class="p">:</span>
-            <span class="n">_postproc_params</span><span class="o">.</span><span class="n">postproc_args</span><span class="o">.</span><span class="n">num_prompt_tokens</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span>
-                <span class="n">prompt_token_ids</span><span class="p">)</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span>
-            <span class="n">prompt_token_ids</span><span class="p">,</span>
+        <span class="k">return</span> <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">query_token_ids</span><span class="p">,</span> <span class="n">multimodal_params</span>
+
+    <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">preprocess</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">PromptInputs</span><span class="p">,</span>
+        <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PreprocessedInputs</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Preprocess raw prompts into token IDs and multimodal params.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.</span>
+<span class="sd">            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.</span>
+<span class="sd">                A default one will be used if not provided.</span>
+<span class="sd">            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be</span>
+<span class="sd">                passed directly to :meth:`generate_async` as ``inputs``.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_sampling_params</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
+        <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">_prompt</span><span class="p">,</span> <span class="n">query_token_ids</span><span class="p">,</span> <span class="n">multimodal_params</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_preprocess</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">,</span> <span class="n">disaggregated_params</span><span class="p">))</span>
+
+        <span class="k">return</span> <span class="n">PreprocessedInputs</span><span class="p">(</span>
+            <span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">prompt_token_ids</span><span class="p">,</span>
             <span class="n">query_token_ids</span><span class="o">=</span><span class="n">query_token_ids</span><span class="p">,</span>
-            <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">,</span>
-            <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_request</span><span class="p">,</span>
-            <span class="n">prompt_adapter_request</span><span class="o">=</span><span class="n">prompt_adapter_request</span><span class="p">,</span>
-            <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
-            <span class="n">kv_cache_retention_config</span><span class="o">=</span><span class="n">kv_cache_retention_config</span><span class="p">,</span>
-            <span class="n">disaggregated_params</span><span class="o">=</span><span class="n">disaggregated_params</span><span class="p">,</span>
-            <span class="n">trace_headers</span><span class="o">=</span><span class="n">trace_headers</span><span class="p">,</span>
-            <span class="n">postproc_params</span><span class="o">=</span><span class="n">_postproc_params</span><span class="p">,</span>
             <span class="n">multimodal_params</span><span class="o">=</span><span class="n">multimodal_params</span><span class="p">,</span>
-            <span class="n">scheduling_params</span><span class="o">=</span><span class="n">scheduling_params</span><span class="p">,</span>
-            <span class="n">cache_salt_id</span><span class="o">=</span><span class="n">cache_salt_id</span><span class="p">,</span>
-            <span class="n">arrival_time</span><span class="o">=</span><span class="n">arrival_time</span><span class="p">,</span>
         <span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_perf_metrics</span><span class="p">:</span>
-            <span class="n">result</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
-                <span class="p">{</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">ARRIVAL_TIMESTAMP</span><span class="p">:</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()})</span>
-
-        <span class="k">return</span> <span class="n">RequestOutput</span><span class="o">.</span><span class="n">_from_generation_result</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span>
-                                                     <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
 
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
@@ -2302,9 +2379,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 14, 2026.</p>
+  <p>Last updated on February 23, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4">26901e4</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
   
 </div></div>
       
