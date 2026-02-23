@@ -20,4 +20,5 @@ Online Serving Examples
    openai_completion_client_for_lora
    openai_completion_client_json_schema
    openai_responses_client
+   prometheus_metrics
 

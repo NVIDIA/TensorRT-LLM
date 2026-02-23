@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc4" />
+  <meta name="docsearch:version" content="1.3.0rc5" />
 
 
   </head>
@@ -336,6 +336,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -372,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -385,6 +387,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
@@ -416,6 +419,7 @@
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -706,7 +710,7 @@ of requests with very heterogeneous sampling strategies (e.g. a mix of requests 
 <p>Logits processors allow you to modify the logits produced by the network before sampling, enabling custom generation behavior and constraints.</p>
 <p>To use a custom logits processor:</p>
 <ol class="arabic simple">
-<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
+<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
 <li><p>Pass an instance of this class to the <code class="docutils literal notranslate"><span class="pre">logits_processor</span></code> parameter of <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></p></li>
 </ol>
 <p>The following example demonstrates logits processing:</p>
@@ -734,7 +738,7 @@ of requests with very heterogeneous sampling strategies (e.g. a mix of requests 
 <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4/examples/llm-api/llm_logits_processor.py">here</a>.</p>
+<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb/examples/llm-api/llm_logits_processor.py">here</a>.</p>
 </section>
 </section>
 
@@ -885,9 +889,9 @@ of requests with very heterogeneous sampling strategies (e.g. a mix of requests 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 14, 2026.</p>
+  <p>Last updated on February 23, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26901e4">26901e4</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
   
 </div></div>
       

@@ -1,6 +1,6 @@
 Generate text with multiple LoRA adapters
 =========================================
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/26901e4aa0a51a1863a796999e0476a4b72e5bd5/examples/llm-api/llm_multilora.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/630fccb3ca072a0560f5ea461d57bdab5faa434b/examples/llm-api/llm_multilora.py.
 
 .. literalinclude:: ../../../examples/llm-api/llm_multilora.py
     :lines: 4-89
