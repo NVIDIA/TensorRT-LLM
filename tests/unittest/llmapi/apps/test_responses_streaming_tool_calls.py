@@ -42,9 +42,11 @@ def _make_mock_request(tools: list | None = None):
     """Create a minimal ResponsesRequest-like object with .tools."""
 
     class MockRequest:
-        tools = tools or []
+        pass
 
-    return MockRequest()
+    req = MockRequest()
+    req.tools = tools if tools is not None else []
+    return req
 
 
 class TestShouldSendDoneEventsToolCalls:
