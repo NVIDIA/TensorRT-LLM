@@ -26,43 +26,6 @@ from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimiz
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
 from tensorrt_llm.functional import AllReduceStrategy
 
-base_model_tp_plan = {
-    "q_proj": "colwise",
-    "k_proj": "colwise",
-    "v_proj": "colwise",
-    "o_proj": "rowwise",
-    "gate_proj": "colwise",
-    "up_proj": "colwise",
-    "down_proj": "rowwise",
-    "linear1": "colwise",
-    "linear2": "rowwise",
-    "linear": "gather",
-    # Mamba2 specific projections
-    "in_proj": "mamba",
-    "out_proj": "rowwise",
-    # MLA specific projections
-    "q_a_proj": "gather",
-    "q_b_proj": "colwise",
-    "kv_a_proj_with_mqa": "gather",
-    "kv_b_proj": "colwise",
-    # "input_layernorm.weight": "sequence_parallel",
-    # "post_attention_layernorm.weight": "sequence_parallel",
-    # "norm.weight": "sequence_parallel",
-    # "shared_expert.gate_proj": "local_colwise",
-    # "shared_expert.up_proj": "local_colwise",
-    # "shared_expert.down_proj": "local_rowwise",
-    # "experts.gate_up_proj": "local_packed_rowwise",
-    # "experts.down_proj": "local_colwise",
-    # "experts": "local",
-    "feed_forward": "gather",
-    "self": "gather",
-    "weight": "gather",
-}
-
-predefined_config = {
-    "tp_plan": base_model_tp_plan,
-}
-
 
 class GQA_Block(nn.Module):
     def __init__(
@@ -433,8 +396,27 @@ def _run_sharding_execution_job(
             hidden_size=num_features,
             num_key_value_heads=num_key_value_heads,
         ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {
+            "tp_plan": {
+                "q_proj": "colwise",
+                "k_proj": "colwise",
+                "v_proj": "colwise",
+                "o_proj": "rowwise",
+            }
+        }
     elif model_cls == FP8MLP:
         model = model_cls(num_features, num_features, bias=bias).to("cuda")
+        predefined_config = {
+            "tp_plan": {
+                # gated MLP
+                "gate_proj": "colwise",
+                "up_proj": "colwise",
+                "down_proj": "rowwise",
+                # GPT-style MLP
+                "linear1": "colwise",
+                "linear2": "rowwise",
+            }
+        }
     elif model_cls == NemotronHMamba2Mixer:
         # Create config for Mamba2 based on Nemotron models
         # Scaled down from typical values: hidden_size=5120, ssm_state_size=128
@@ -460,6 +442,7 @@ def _run_sharding_execution_job(
             num_hidden_layers=1,
         )
         model = model_cls(mamba_config, layer_idx=0).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"in_proj": "mamba"}}
     elif model_cls == MLA_Block:
         # Use actual DeepSeek-V3/R1 production values
         # From HuggingFace config (HunYuanPretrainedConfig defaults):
@@ -483,6 +466,7 @@ def _run_sharding_execution_job(
             v_head_dim=v_head_dim,
             bias=bias,
         ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"q_a_proj": "mla"}}
     elif model_cls in (GDN_Block, GDN_Block_Unfused):
         num_k_heads_gdn = 4
         num_v_heads_gdn = 8
@@ -497,10 +481,28 @@ def _run_sharding_execution_job(
             head_v_dim=head_v_dim,
             bias=bias,
         ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"in_proj_qkv": "delta"}}
+    elif model_cls == nn.Linear:
+        model = model_cls(num_features, num_features, bias=bias).to(
+            device="cuda", dtype=torch.float16
+        )
+        # update the tp_plan in predefined_config to force simple sharding of the single linear layer
+        predefined_config = {"tp_plan": {"*": "gather"}}
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
         )
+        predefined_config = {
+            "tp_plan": {
+                # gated MLP
+                "gate_proj": "colwise",
+                "up_proj": "colwise",
+                "down_proj": "rowwise",
+                # GPT-style MLP
+                "linear1": "colwise",
+                "linear2": "rowwise",
+            }
+        }
     x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
 
     # Scale down GDN_Block weights if needed to avoid numerical instability
@@ -541,10 +543,15 @@ def _run_sharding_execution_job(
         else:
             num_params = num_p_og // world_size + num_update
         if model_cls == MLA_Block:
-            # since q_a_proj is simple-sharded and followed by q_a_layernorm, the layernorm params
-            # are NOT sharded - they have to be replicated. To account for this, we need to add the
-            # number of parameters of the layernorm (weight and bias)to the number of parameters of the model.
-            num_params += 2 * kv_lora_rank * (world_size - 1) // world_size
+            # Both q_a_layernorm and kv_a_layernorm are replicated because their preceding
+            # projections (q_a_proj, kv_a_proj_with_mqa) use simple-shard/all_gather.
+            # Each LayerNorm has weight + bias of size kv_lora_rank → 4 * kv_lora_rank
+            # replicated params total.  The base formula (num_p_og // world_size) treated
+            # these as sharded, so we add back the under-counted fraction.
+            replicated_ln_params = (
+                4 * kv_lora_rank
+            )  # q_a_layernorm + kv_a_layernorm, weight+bias each
+            num_params += replicated_ln_params * (world_size - 1) // world_size
         return num_params
 
     def verify_local_weight_sizes(gm) -> bool:
@@ -563,13 +570,18 @@ def _run_sharding_execution_job(
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    sharding_source = "heuristic" if from_config else "manual"
     gm_transformed = InferenceOptimizer(
         None,
         {
             "detect_sharding": {
                 "stage": "sharding",
                 "sharding_scope": ["tp"],
-                "tp_sharding_source": ["heuristic"],
+                "sharding_source": [sharding_source],
+                "manual_config": predefined_config,
+                # needed for a solitary Linear node that is not part of any layer subgraph
+                "shard_all_unprocessed": True,
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -617,6 +629,14 @@ def _run_pattern_detection_job(
             hidden_size=num_features,
             num_key_value_heads=num_key_value_heads,
         ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {
+            "tp_plan": {
+                "q_proj": "colwise",
+                "k_proj": "colwise",
+                "v_proj": "colwise",
+                "o_proj": "rowwise",
+            }
+        }
     elif model_cls == NemotronHMamba2Mixer:
         # Create config for Mamba2
         mamba_config = SimpleNamespace(
@@ -641,6 +661,7 @@ def _run_pattern_detection_job(
             num_hidden_layers=1,
         )
         model = model_cls(mamba_config, layer_idx=0).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"in_proj": "mamba"}}
     elif model_cls == MLA_Block:
         # Create simplified MLA based on DeepSeek-V3 architecture
         qk_nope_head_dim = 2
@@ -658,6 +679,7 @@ def _run_pattern_detection_job(
             v_head_dim=v_head_dim,
             bias=bias,
         ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"q_a_proj": "mla"}}
     elif model_cls in (GDN_Block, GDN_Block_Unfused):
         num_k_heads_gdn = 4
         num_v_heads_gdn = 8
@@ -671,10 +693,26 @@ def _run_pattern_detection_job(
             head_v_dim=head_v_dim,
             bias=bias,
         ).to(device="cuda", dtype=torch.float16)
+        predefined_config = {"tp_plan": {"in_proj_qkv": "delta"}}
+    elif model_cls == nn.Linear:
+        model = model_cls(num_features, num_features, bias=bias).to(
+            device="cuda", dtype=torch.float16
+        )
+        # update the tp_plan in predefined_config to force simple sharding of the single linear layer
+        predefined_config = {"tp_plan": {"*": "gather"}}
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
         )
+        predefined_config = {
+            "tp_plan": {
+                "gate_proj": "colwise",
+                "up_proj": "colwise",
+                "down_proj": "rowwise",
+                "linear1": "colwise",
+                "linear2": "rowwise",
+            }
+        }
     x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
 
     # Test pattern detection - create expected transformations for validation
@@ -746,7 +784,7 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op="all_gather",
                             min_local_shape=1,
-                            layer_type=LayerType.MLP,
+                            layer_type=LayerType.UNKNOWN,
                         )
                     )
         elif model_cls == FP8MLP:
@@ -931,6 +969,7 @@ def _run_pattern_detection_job(
                             )
                         )
 
+    sharding_source = "heuristic" if from_config else "manual"
     # get detected transformations
     optimizer = InferenceOptimizer(
         None,
@@ -938,8 +977,9 @@ def _run_pattern_detection_job(
             "detect_sharding": {
                 "stage": "sharding",
                 "sharding_scope": ["tp"],
-                "tp_sharding_source": ["heuristic"],
+                "sharding_source": [sharding_source],
                 "shard_all_unprocessed": True,
+                "manual_config": predefined_config,
             },
         },
     )
