@@ -20,7 +20,7 @@ import os
 
 import pytest
 from defs.common import venv_check_call
-from defs.conftest import llm_models_root
+from defs.conftest import llm_models_root, unittest_path
 from defs.trt_test_alternative import check_call
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
@@ -285,4 +285,20 @@ def test_vbench_dimension_score_wan(vbench_repo_root, wan_trtllm_video_path, llm
         llm_venv,
         title="WAN",
         max_score_diff=0.05,
+    )
+
+
+def test_visual_gen_benchmark_serving(llm_venv):
+    """Run benchmark_visual_gen.py against a live trtllm-serve visual-gen server."""
+    test_root = unittest_path() / "_torch" / "visual_gen"
+    llm_venv.run_cmd(
+        [
+            "-m",
+            "pytest",
+            "-v",
+            str(
+                test_root / "_test_trtllm_serve_visual_gen_benchmark.py"
+                "::test_visual_gen_benchmark_video[openai-videos]"
+            ),
+        ]
     )
