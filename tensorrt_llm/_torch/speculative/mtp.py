@@ -72,7 +72,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
             )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_batch = scheduled_batch.context_requests
+        context_batch = scheduled_batch.context_requests()
         # allocate hidden state tensors
         for req in context_batch:
             if req.is_first_context_chunk:
@@ -310,11 +310,7 @@ class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
         # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
         # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
 
-        finished_context_requests = [
-            req for req in scheduled_requests.context_requests
-            if req.is_last_context_chunk
-        ]
-
+        finished_context_requests = scheduled_requests.context_requests_last_chunk
         sampling_requests = finished_context_requests + scheduled_requests.generation_requests
         num_sampling_requests = len(sampling_requests)
 

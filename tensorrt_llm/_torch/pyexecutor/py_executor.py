@@ -952,7 +952,8 @@ class PyExecutor:
             req_stat.reused_blocks_per_request = req.reused_blocks
             req_stat.missed_blocks_per_request = req.missed_blocks
             req_stat.kv_cache_hit_rate_per_request = req.kv_cache_hit_rate
-            req_stat.scheduled = req in scheduled_requests.context_requests or req in scheduled_requests.generation_requests
+            req_stat.scheduled = req in scheduled_requests.context_requests(
+            ) or req in scheduled_requests.generation_requests
             if req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY or req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
                 req_stat.dis_serving_stats = DisServingRequestStats()
                 req_stat.dis_serving_stats.kv_cache_transfer_ms = req.kv_cache_transfer_time_ms
@@ -1023,11 +1024,10 @@ class PyExecutor:
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
             stats.kv_cache_stats = kv_stats_to_save
 
-        stats.inflight_batching_stats.num_scheduled_requests = len(
-            scheduled_batch.context_requests) + len(
-                scheduled_batch.generation_requests)
+        stats.inflight_batching_stats.num_scheduled_requests = scheduled_batch.num_context_requests + len(
+            scheduled_batch.generation_requests)
         stats.inflight_batching_stats.num_context_requests = len(
-            scheduled_batch.context_requests)
+            scheduled_batch.context_requests())
         stats.inflight_batching_stats.num_gen_requests = len(
             scheduled_batch.generation_requests)
         stats.inflight_batching_stats.num_paused_requests = len(
@@ -1281,7 +1281,7 @@ class PyExecutor:
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
                     f'has {len(self.active_requests)} active_requests, '
-                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'scheduled {scheduled_batch.num_context_requests} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
                 )
 
@@ -1560,7 +1560,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = [
                         req for req in
-                        executed_batch.scheduled_requests.context_requests
+                        executed_batch.scheduled_requests.context_requests()
                         if req.is_last_context_chunk
                     ]
                     self._send_kv_async(finished_ctx_reqs)
@@ -1736,7 +1736,7 @@ class PyExecutor:
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
-            f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+            f'scheduled {scheduled_batch.num_context_requests} context requests and '
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
 
@@ -1875,8 +1875,7 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
-                    self._send_kv_async(scheduled_batch.context_requests +
-                                        scheduled_batch.generation_requests)
+                    self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
@@ -2055,8 +2054,7 @@ class PyExecutor:
                         # dec on. This ensures that we capture hidden states for requests that haven't done
                         # prefill yet.
                         self.use_spec_decode = False
-                        self.model_engine.enable_spec_decode = len(
-                            scheduled_batch.context_requests) > 0
+                        self.model_engine.enable_spec_decode = scheduled_batch.num_context_requests > 0
                         if not self.model_engine.enable_spec_decode:
                             for request in scheduled_batch.all_requests():
                                 request.py_draft_tokens = []
@@ -2253,7 +2251,7 @@ class PyExecutor:
 
             # Compute number of accepted tokens per request
             # Generation requests: compare with draft tokens to find acceptance
-            num_contexts = len(scheduled_batch.context_requests)
+            num_contexts = scheduled_batch.num_context_requests
             if batch_size > num_contexts:
                 # Use .T to transpose: [max_draft_len + 1, num_gens] -> [num_gens, max_draft_len + 1]
                 gen_target_tokens = target_tokens[:,
@@ -2662,7 +2660,12 @@ class PyExecutor:
                 scheduler_output.generation_requests)
 
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests = scheduled_context_requests
+        scheduled_requests.context_requests_chunking = [
+            r for r in scheduled_context_requests if not r.is_last_context_chunk
+        ]
+        scheduled_requests.context_requests_last_chunk = [
+            r for r in scheduled_context_requests if r.is_last_context_chunk
+        ]
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
@@ -2779,9 +2782,7 @@ class PyExecutor:
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
             disagg_gen_init_to_prepare = ScheduledRequests()
-            disagg_gen_init_to_prepare.context_requests = fitting_disagg_gen_init_requests
-            disagg_gen_init_to_prepare.generation_requests = []
-            disagg_gen_init_to_prepare.paused_requests = []
+            disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
 
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
@@ -2808,7 +2809,7 @@ class PyExecutor:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
-            requests.context_requests = cache_trans_complete_requests
+            requests.context_requests_last_chunk = cache_trans_complete_requests
             self.resource_manager.resource_managers[
                 ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
                     requests)
@@ -2964,7 +2965,7 @@ class PyExecutor:
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
-            f"[Executor] _forward_step {self.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer,
@@ -2980,7 +2981,7 @@ class PyExecutor:
         try:
             gather_context_logits = any(
                 a.py_return_context_logits
-                for a in scheduled_requests.context_requests)
+                for a in scheduled_requests.context_requests())
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
@@ -3017,7 +3018,7 @@ class PyExecutor:
             self._terminate_request(request)
             self.active_requests.remove(request)
 
-        for request in scheduled_requests.context_requests:
+        for request in scheduled_requests.context_requests():
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
                 request.py_last_context_chunk = (
                     request.context_current_position,
@@ -3041,7 +3042,7 @@ class PyExecutor:
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
-        for request in scheduled_requests.context_requests:
+        for request in scheduled_requests.context_requests():
             if request.ctx_iters >= len(request.ctx_blocks) - 2:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
             request.ctx_iters += 1
@@ -3072,7 +3073,7 @@ class PyExecutor:
                 num_context_logits_prefix_sum = [0]
                 prefix_sum = 0
                 num_context_tokens = 0
-                for request in scheduled_batch.context_requests:
+                for request in scheduled_batch.context_requests():
                     context_chunk_size = request.context_chunk_size
                     prefix_sum += context_chunk_size if request.py_return_context_logits else 1
                     num_context_logits_prefix_sum.append(prefix_sum)
@@ -3081,13 +3082,13 @@ class PyExecutor:
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
 
-                HandleLogits()(scheduled_batch.context_requests,
+                HandleLogits()(scheduled_batch.context_requests(),
                                scheduled_batch.generation_requests,
                                batch_outputs["logits"], beam_width,
                                num_context_logits_prefix_sum,
                                self.sampler.is_generation_model())
 
-                HandleAdditionalOutputs()(scheduled_batch.context_requests,
+                HandleAdditionalOutputs()(scheduled_batch.context_requests(),
                                           scheduled_batch.generation_requests,
                                           batch_outputs, beam_width,
                                           num_context_tokens)

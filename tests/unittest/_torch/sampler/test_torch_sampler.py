@@ -1099,9 +1099,21 @@ class TestBatchedSampling:
                 ]
 
             @property
-            def context_requests(self) -> list[LlmRequest]:
+            def num_context_requests(self) -> int:
+                return 0
+
+            @property
+            def context_requests_chunking(self) -> list[LlmRequest]:
                 # Code paths excluded by this choice are addressed by test_select_generated_logits
                 return []
+
+            @property
+            def context_requests_last_chunk(self) -> list[LlmRequest]:
+                # Code paths excluded by this choice are addressed by test_select_generated_logits
+                return []
+
+            def context_requests(self) -> list[LlmRequest]:
+                return self.context_requests_chunking + self.context_requests_last_chunk
 
             @property
             def generation_requests(self) -> list[LlmRequest]:
@@ -1110,7 +1122,7 @@ class TestBatchedSampling:
 
             def all_requests(self) -> list[LlmRequest]:
                 # The sampling code relies on this ordering assumption
-                return self.context_requests + self.generation_requests
+                return self.context_requests() + self.generation_requests
 
         with torch.inference_mode(True):
             return cast(
@@ -1191,7 +1203,7 @@ class TestBatchedSampling:
 
         Optionally, run sampling repeatedly, e.g., to gather statistics.
         """
-        assert not scheduled_requests.context_requests
+        assert scheduled_requests.num_context_requests == 0
         num_actual_repeats = num_repeats if num_repeats is not None else 1
 
         T = TypeVar("T")

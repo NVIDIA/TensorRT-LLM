@@ -1071,7 +1071,12 @@ class PyTorchModelEngine(ModelEngine):
                           num_gen_requests)))
 
         result = ScheduledRequests()
-        result.context_requests = ctx_requests
+        result.context_requests_chunking = [
+            r for r in ctx_requests if not r.is_last_context_chunk
+        ]
+        result.context_requests_last_chunk = [
+            r for r in ctx_requests if r.is_last_context_chunk
+        ]
         result.generation_requests = gen_requests
         return result
 
@@ -1095,7 +1100,6 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         result = ScheduledRequests()
-        result.context_requests = []
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
 
         # Add (batch_size - 1) dummy requests with seq_len=1.
@@ -1577,7 +1581,7 @@ class PyTorchModelEngine(ModelEngine):
             return False
 
         # The changes between context and generation requests are not straightforward.
-        if len(scheduled_requests.context_requests) > 0:
+        if scheduled_requests.num_context_requests > 0:
             return False
 
         # Check if the request_ids changes
@@ -2099,7 +2103,7 @@ class PyTorchModelEngine(ModelEngine):
         # (start_idx, end_idx, seq_slot) for first_draft requests
         first_draft_input_ids_positions = []
 
-        for request in scheduled_requests.context_requests:
+        for request in scheduled_requests.context_requests():
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
@@ -2192,7 +2196,7 @@ class PyTorchModelEngine(ModelEngine):
             _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
         else:
             mm_token_indices = None
-        num_ctx_requests = len(scheduled_requests.context_requests)
+        num_ctx_requests = scheduled_requests.num_context_requests
         num_ctx_tokens = len(input_ids)
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
@@ -2782,7 +2786,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
-        attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        attn_metadata.num_contexts = scheduled_requests.num_context_requests
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
         attn_metadata.num_chunked_ctx_requests = 0
@@ -2921,7 +2925,7 @@ class PyTorchModelEngine(ModelEngine):
         request_ids = []
         multimodal_params_list = []
 
-        for request in scheduled_requests.context_requests:
+        for request in scheduled_requests.context_requests():
             prompt_tokens = request.get_tokens(0)
             input_ids.extend(prompt_tokens)
             request_ids.append(request.py_request_id)
@@ -2978,7 +2982,7 @@ class PyTorchModelEngine(ModelEngine):
                 pin_memory=prefer_pinned(),
             )
 
-        attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        attn_metadata.num_contexts = scheduled_requests.num_context_requests
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
@@ -3076,7 +3080,7 @@ class PyTorchModelEngine(ModelEngine):
         # for star attention, we need customized block ids
         block_ids_per_seq = []
         num_cached_tokens_per_seq = []
-        for request in scheduled_requests.context_requests:
+        for request in scheduled_requests.context_requests():
             request_ids.append(request.py_request_id)
             prompt_lengths.append(request.py_prompt_len)
 
@@ -3134,7 +3138,7 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
             request.cached_tokens = num_cached_tokens_per_seq[-1]
         num_contexts = len(sequence_lengths)
-        for request in scheduled_requests.context_requests:
+        for request in scheduled_requests.context_requests():
             ctx_iter = request.ctx_iters
             ctx_blocks = request.ctx_blocks
             ctx_position_blocks = request.ctx_position_blocks
@@ -3336,7 +3340,7 @@ class PyTorchModelEngine(ModelEngine):
         lora_params = {}
         tmp_lora_params = {}
 
-        request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
+        request_list = scheduled_requests.all_requests()
 
         # trace all requests to get the union set of the lora params
         for request in request_list:
@@ -3640,13 +3644,13 @@ class PyTorchModelEngine(ModelEngine):
         if not multimodal_params or len(multimodal_params) == 0:
             # Return empty embeddings if no multimodal data
             return {'mm_embeddings': []}
-        if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
-                   None) is None:
+        if getattr(scheduled_requests.context_requests()[0],
+                   'multimodal_lengths', None) is None:
             multimodal_chunks = None
         else:
             multimodal_chunks = [
                 sum(request.multimodal_lengths)
-                for request in scheduled_requests.context_requests
+                for request in scheduled_requests.context_requests()
                 if request.multimodal_lengths is not None
             ]
         # For mm_encoder_only mode, we only run the vision encoder part
@@ -3660,7 +3664,7 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_params):
             mm_embeddings = list(
                 torch.chunk(mm_embeddings[0],
-                            len(scheduled_requests.context_requests),
+                            scheduled_requests.num_context_requests,
                             dim=0))
         else:
             mm_embeddings = list(
@@ -3731,7 +3735,7 @@ class PyTorchModelEngine(ModelEngine):
             # TODO: support models that don't return outputs as dict
             return
 
-        num_ctx_req = len(scheduled_requests.context_requests)
+        num_ctx_req = scheduled_requests.num_context_requests
         logits_tensor = outputs["logits"]
 
         for idx, request in enumerate(scheduled_requests.all_requests()):

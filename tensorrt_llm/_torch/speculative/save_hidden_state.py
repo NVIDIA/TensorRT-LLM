@@ -74,7 +74,7 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
             spec_metadata: The spec metadata containing layers_to_capture info
         """
         for request in sorted(
-                scheduled_requests.context_requests,
+                scheduled_requests.context_requests(),
                 key=lambda r:
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
