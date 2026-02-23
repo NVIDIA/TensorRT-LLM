@@ -2,6 +2,8 @@ metadata:
   model_name: deepseek_v32_fp4
   supported_gpus:
   - GB200
+hardware:
+  gpus_per_node: 4
 server_configs:
   # 1k1k configs - TEP4 with TRTLLM, MTP3
   - name: "v32_fp4_tep4_mtp3_1k1k"
