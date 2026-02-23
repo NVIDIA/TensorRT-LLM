@@ -234,10 +234,15 @@ def get_test_config(test_desc, example_dir, test_root):
 def get_extra_llm_config(config, suffix, cwd):
     extra_llm_config = {
         'orchestrator_type': 'ray',
+        'kv_cache_config': {
+            'use_kv_cache_manager_v2': False
+        }
     }
     for key, value in config.items():
         if key not in ['num_instances', 'urls']:
             extra_llm_config[key] = value
+            if key == 'kv_cache_config':
+                extra_llm_config[key]['use_kv_cache_manager_v2'] = False
 
     temp_fd, extra_config_file = tempfile.mkstemp(suffix='_%s.yaml' % suffix,
                                                   dir=cwd)
