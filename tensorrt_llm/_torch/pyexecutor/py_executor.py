@@ -58,8 +58,7 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
-                            get_from_waiting_queue, merge_requests,
-                            schedule_attention_dp_requests)
+                            get_from_waiting_queue, merge_requests)
 from .resource_manager import (ResourceManager, ResourceManagerType,
                                request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
@@ -67,6 +66,9 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
+from .scheduler.adp_request_assigner import (ADPRequestAssigner,
+                                             DefaultADPRequestAssigner,
+                                             RankState)
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -307,6 +309,8 @@ class PyExecutor:
         self.scheduler = scheduler
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
+        self.adp_request_assigner: ADPRequestAssigner = DefaultADPRequestAssigner(
+        )
         self.sampler = sampler
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
@@ -2328,23 +2332,31 @@ class PyExecutor:
         """Fetch new requests and return LlmRequests ready for execution."""
         # 1. Gather info and calculate total_num_active_requests
         if self.enable_attention_dp:
-            all_ranks_num_active_requests = []
-            all_ranks_num_active_tokens = []
             if self.dist.has_cp_helix:
-                num_active_tokens = sum(
-                    [req.total_input_len_cp for req in activate_requests])
+                num_active_tokens = sum(req.total_input_len_cp
+                                        for req in activate_requests)
             else:
-                num_active_tokens = sum(
-                    [req.py_orig_prompt_len for req in activate_requests])
-            responses_list = self.dist.tp_allgather(
-                [len(activate_requests), num_active_tokens])
-            for num_active_requests, num_active_tokens in responses_list:
-                all_ranks_num_active_requests.append(num_active_requests)
-                all_ranks_num_active_tokens.append(num_active_tokens)
+                num_active_tokens = sum(req.py_orig_prompt_len
+                                        for req in activate_requests)
+
+            local_state = RankState(
+                rank=self.dist.tp_rank,
+                num_active_requests=len(activate_requests),
+                num_active_tokens=num_active_tokens,
+            )
+            responses_list = self.dist.tp_allgather(local_state.to_list())
+            all_rank_states = [
+                RankState.from_list(rank=i, data=resp)
+                for i, resp in enumerate(responses_list)
+            ]
+            all_ranks_num_active_requests = [
+                s.num_active_requests for s in all_rank_states
+            ]
             total_num_active_requests = sum(all_ranks_num_active_requests)
         else:
             total_num_active_requests = len(activate_requests)
             all_ranks_num_active_requests = None
+            all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue,
@@ -2362,9 +2374,8 @@ class PyExecutor:
         # 5. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
             all_ranks_new_requests, self.expected_num_active_requests = \
-                schedule_attention_dp_requests(
-                    new_requests, all_ranks_num_active_requests,
-                    all_ranks_num_active_tokens, self.dist.tp_size,
+                self.adp_request_assigner.assign_requests(
+                    all_rank_states, new_requests,
                     self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
