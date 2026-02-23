@@ -30,8 +30,10 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, register_auto_model
 
 
 # MiniMax M2/M2.1 requires the implementation of the following two additional components:
@@ -219,6 +221,7 @@ class MiniMaxM2DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -238,6 +241,11 @@ class MiniMaxM2DecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
+
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states, residual)
+
         return hidden_states, residual
 
 
@@ -278,6 +286,7 @@ class MiniMaxM2Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -297,6 +306,7 @@ class MiniMaxM2Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -304,11 +314,9 @@ class MiniMaxM2Model(DecoderModel):
 
 
 @register_auto_model("MiniMaxM2ForCausalLM")
-class MiniMaxM2ForCausalLM(DecoderModelForCausalLM[MiniMaxM2Model, PretrainedConfig]):
+class MiniMaxM2ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM2Model, PretrainedConfig]):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(
-            MiniMaxM2Model(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
+            model=MiniMaxM2Model(model_config),
+            model_config=model_config,
         )
