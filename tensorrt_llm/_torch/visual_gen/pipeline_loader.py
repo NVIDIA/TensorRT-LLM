@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
@@ -212,7 +213,8 @@ class PipelineLoader:
         else:
             logger.info("torch.compile disabled by config")
 
-        pipeline.warmup()
+        with autotune(cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")):
+            pipeline.warmup()
 
         if config.pipeline.enable_layerwise_nvtx_marker:
             from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
