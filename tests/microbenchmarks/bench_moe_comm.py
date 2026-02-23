@@ -653,7 +653,9 @@ _WORKER_ENV = {
 }
 
 
-def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
+def _run_benchmark_worker_under_current_mpi(
+    args: argparse.Namespace, launcher: str = "spawn"
+) -> None:
     # Keep benchmark output clean.
     tllm.logger.set_level("error")
 
@@ -698,7 +700,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
             json.dumps(
                 {
                     "bench": "bench_moe_comm",
-                    "launcher": "spawn",
+                    "launcher": launcher,
                     "profile": args.profile,
                     "backend": args.backend,
                     "ep_size": ep_size,
@@ -902,7 +904,7 @@ def _spawn_worker_main(args_blob: bytes) -> List[Dict[str, Any]]:
     args = pickle.loads(args_blob)
     # In spawned workers, we are already inside an MPI world of size == ep_size.
     try:
-        _run_benchmark_worker_under_current_mpi(args)
+        _run_benchmark_worker_under_current_mpi(args, launcher="spawn")
     except Exception as e:
         # Make worker-side stack trace visible at the parent.
         rank = mpi_rank()
@@ -938,8 +940,16 @@ def main() -> None:
     if ep_size <= 0:
         raise ValueError("--ep_size must be > 0")
 
-    if mpi_world_size() != 1:
-        raise RuntimeError("bench_moe_comm should be run from a non-MPI parent (world_size==1).")
+    world_size = mpi_world_size()
+    if world_size > 1:
+        if args.ep_size is not None and ep_size != world_size:
+            raise ValueError(
+                f"--ep_size ({ep_size}) must match external MPI world size ({world_size}) "
+                "when running under mpirun."
+            )
+        # Reuse externally launched MPI processes (supports multi-node SPMD).
+        _run_benchmark_worker_under_current_mpi(args, launcher="external_mpi")
+        return
 
     if mpi_rank() == 0:
         print(
