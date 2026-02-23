@@ -9,13 +9,19 @@ Protocol:
     2. All ranks exchange RankState via allgather
     3. ADPRequestAssigner.assign_requests() distributes new requests
 """
+
 from __future__ import annotations
 
 import heapq
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+
+    from ..executor_request_queue import RequestQueueItem
 
 
 @dataclass
@@ -53,13 +59,31 @@ class ADPRequestAssigner(ABC):
         Output: dict[rank, list[Request]]
     """
 
+    def create_rank_state(
+        self,
+        rank: int,
+        activate_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem],
+    ) -> RankState:
+        """Create local RankState from current rank's active and new requests.
+
+        Args:
+            rank: The current rank index.
+            activate_requests: Currently active LlmRequests on this rank.
+            new_requests: New requests popped from the waiting queue.
+
+        Returns:
+            RankState for this rank, to be serialized and allgathered.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def assign_requests(
         self,
         all_rank_states: list[RankState],
-        new_requests: list[Any],
+        new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
-    ) -> Tuple[Dict[int, List[Any]], int]:
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
         """Assign new requests to ranks based on gathered rank states.
 
         Args:
@@ -92,26 +116,40 @@ class DefaultADPRequestAssigner(ADPRequestAssigner):
            (descending) for better load balancing.
     """
 
+    def __init__(self, has_cp_helix: bool = False):
+        self.has_cp_helix = has_cp_helix
+
+    def create_rank_state(
+        self,
+        rank: int,
+        activate_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem],
+    ) -> RankState:
+        if self.has_cp_helix:
+            num_active_tokens = sum(req.total_input_len_cp for req in activate_requests)
+        else:
+            num_active_tokens = sum(req.py_orig_prompt_len for req in activate_requests)
+        return RankState(
+            rank=rank,
+            num_active_requests=len(activate_requests),
+            num_active_tokens=num_active_tokens,
+        )
+
     def assign_requests(
         self,
         all_rank_states: list[RankState],
-        new_requests: list[Any],
+        new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
-    ) -> Tuple[Dict[int, List[Any]], int]:
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
         tp_size = len(all_rank_states)
-        all_ranks_new_requests: Dict[int, List[Any]] = {
+        all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
         }
-        all_ranks_num_active_requests = [
-            s.num_active_requests for s in all_rank_states
-        ]
-        all_ranks_num_active_tokens = [
-            s.num_active_tokens for s in all_rank_states
-        ]
+        all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+        all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
 
         def get_relax_value(req_item):
-            scheduling_params = getattr(req_item.request,
-                                        "py_scheduling_params", None)
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
             if scheduling_params is None:
                 return True
             return scheduling_params.attention_dp_relax
@@ -121,13 +159,13 @@ class DefaultADPRequestAssigner(ADPRequestAssigner):
         remaining_unscheduled = []
         for req_item in sorted_requests:
             scheduled = False
-            scheduling_params = getattr(req_item.request,
-                                        "py_scheduling_params", None)
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
             if scheduling_params is not None:
                 target_dp_rank = scheduling_params.attention_dp_rank
-                if (target_dp_rank is not None and
-                        all_ranks_num_active_requests[target_dp_rank]
-                        < max_num_active_requests):
+                if (
+                    target_dp_rank is not None
+                    and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+                ):
                     all_ranks_num_active_requests[target_dp_rank] += 1
                     scheduled = True
                     all_ranks_new_requests[target_dp_rank].append(req_item)
@@ -138,8 +176,7 @@ class DefaultADPRequestAssigner(ADPRequestAssigner):
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
         expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks + tp_size -
-             1) // tp_size,
+            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
             max(all_ranks_num_active_requests),
         )
 
@@ -180,8 +217,7 @@ def _balance_requests_across_ranks(
     if not new_requests:
         return all_ranks_new_requests
 
-    HeapVal = namedtuple(
-        "HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
+    HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
     all_ranks_new_requests_heap = [
         HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
@@ -189,28 +225,28 @@ def _balance_requests_across_ranks(
     ]
 
     all_ranks_new_requests_heap = [
-        val for val in all_ranks_new_requests_heap
+        val
+        for val in all_ranks_new_requests_heap
         if val.num_requests < expected_num_active_requests
     ]
 
     all_ranks_new_scheduled_requests = {
-        val.rank: val.request_list
-        for val in all_ranks_new_requests_heap
+        val.rank: val.request_list for val in all_ranks_new_requests_heap
     }
 
     heapq.heapify(all_ranks_new_requests_heap)
 
     new_requests = sorted(
         new_requests,
-        key=lambda x: len(getattr(x.request, "input_token_ids", []))
-        if x.request else 0,
+        key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
         reverse=True,
     )
 
     for req_item in new_requests:
         val = heapq.heappop(all_ranks_new_requests_heap)
-        token_count = (len(getattr(req_item.request, "input_token_ids", []))
-                       if req_item.request else 0)
+        token_count = (
+            len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
+        )
         val = val._replace(
             num_tokens=val.num_tokens + token_count,
             num_requests=val.num_requests + 1,

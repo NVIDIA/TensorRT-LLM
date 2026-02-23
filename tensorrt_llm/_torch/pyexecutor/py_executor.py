@@ -283,7 +283,8 @@ class PyExecutor:
             virtual_memory_pools: Optional[dict] = None,
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+            adp_request_assigner: Optional[ADPRequestAssigner] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -309,14 +310,15 @@ class PyExecutor:
         self.scheduler = scheduler
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
-        self.adp_request_assigner: ADPRequestAssigner = DefaultADPRequestAssigner(
-        )
+        self.dist = dist
+        self.adp_request_assigner: ADPRequestAssigner = (
+            adp_request_assigner
+            or DefaultADPRequestAssigner(has_cp_helix=dist.has_cp_helix))
         self.sampler = sampler
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
         self.guided_decoder = guided_decoder
-        self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.virtual_memory_pools = virtual_memory_pools
 
@@ -2304,6 +2306,20 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
+    def _gather_all_rank_states(
+            self, activate_requests: List[LlmRequest]) -> List[RankState]:
+        """Build local RankState, allgather across DP ranks, return all states."""
+        local_state = self.adp_request_assigner.create_rank_state(
+            rank=self.dist.tp_rank,
+            activate_requests=activate_requests,
+            new_requests=[],
+        )
+        responses_list = self.dist.tp_allgather(local_state.to_list())
+        return [
+            RankState.from_list(rank=i, data=resp)
+            for i, resp in enumerate(responses_list)
+        ]
+
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -2330,25 +2346,15 @@ class PyExecutor:
             self, waiting_queue: WaitingQueue,
             activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
-        # 1. Gather info and calculate total_num_active_requests
+        # 1. Gather rank states and calculate total_num_active_requests
         if self.enable_attention_dp:
-            if self.dist.has_cp_helix:
-                num_active_tokens = sum(req.total_input_len_cp
-                                        for req in activate_requests)
-            else:
-                num_active_tokens = sum(req.py_orig_prompt_len
-                                        for req in activate_requests)
-
-            local_state = RankState(
-                rank=self.dist.tp_rank,
-                num_active_requests=len(activate_requests),
-                num_active_tokens=num_active_tokens,
-            )
-            responses_list = self.dist.tp_allgather(local_state.to_list())
-            all_rank_states = [
-                RankState.from_list(rank=i, data=resp)
-                for i, resp in enumerate(responses_list)
-            ]
+            # NOTE: _gather_all_rank_states is called here (before step 3)
+            # because _pop_from_waiting_queue needs all_ranks_num_active_requests
+            # from the allgather result. Moving it to step 5 would require an
+            # extra allgather. When introducing new assigner implementations
+            # (e.g. KV-cache-aware) that need new_requests to gather additional
+            # info, the allgather position may need to be revisited.
+            all_rank_states = self._gather_all_rank_states(activate_requests)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]

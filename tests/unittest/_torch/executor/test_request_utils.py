@@ -4,8 +4,6 @@ This module tests:
 - Request merging functions (merge_requests, merge_helix_requests)
 - Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request)
 
-ADP-specific tests (DefaultADPRequestAssigner, _balance_requests_across_ranks)
-have been moved to test_adp.py.
 """
 
 from unittest.mock import Mock, patch
