@@ -10,5 +10,3 @@ moe_config:
   backend: TRTLLM
 stream_interval: 20
 num_postprocess_workers: 4
-kv_cache_config:
-  enable_block_reuse: false

@@ -64,24 +64,6 @@ def validate_torch_llm_args_config(cfg: dict[str, Any]) -> llm_args_module.Torch
     return llm_args_module.TorchLlmArgs(**merged)
 
 
-def assert_no_deprecated_keys(cfg: dict[str, Any], deprecated_map: dict[str, str]) -> None:
-    violations: list[str] = []
-
-    def walk_dict(node: dict[str, Any], path: tuple[str, ...]) -> None:
-        for key, value in node.items():
-            full_path = path + (str(key),)
-            if key in deprecated_map:
-                replacement = deprecated_map[key]
-                violations.append(f"{'.'.join(full_path)} -> {replacement}")
-
-            if isinstance(value, dict):
-                walk_dict(value, full_path)
-
-    walk_dict(cfg, ())
-    if violations:
-        raise AssertionError("Found deprecated config keys:\n" + "\n".join(sorted(violations)))
-
-
 def assert_no_default_valued_leaves(
     cfg: dict[str, Any],
     default_cfg: dict[str, Any],
