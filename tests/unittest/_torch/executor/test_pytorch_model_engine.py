@@ -159,8 +159,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 _create_request(max_seq_len, i) for i in range(batch_size)
             ]
             batch = ScheduledRequests()
-            batch.context_requests = requests
-            batch.generation_requests = []
+            batch.context_requests_last_chunk = requests
 
             pages_before = kv_cache_manager.get_num_free_blocks()
             with model_engine.cuda_graph_runner.pad_batch(
@@ -171,7 +170,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                              pages_before)
 
             batch = ScheduledRequests()
-            batch.context_requests = []
             batch.generation_requests = requests
             pages_before = kv_cache_manager.get_num_free_blocks()
             new_dummy_block = 1 if model_engine.cuda_graph_runner.padding_dummy_request is None else 0
@@ -203,8 +201,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         # Prefill run
         batch = ScheduledRequests()
-        batch.context_requests = requests
-        batch.generation_requests = []
+        batch.context_requests_last_chunk = requests
         kv_cache_manager.prepare_resources(batch)
         model_engine.forward(batch, resource_manager)
 
@@ -222,7 +219,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         # Generation run
         batch = ScheduledRequests()
-        batch.context_requests = []
         batch.generation_requests = requests
         kv_cache_manager.prepare_resources(batch)
 
@@ -268,8 +264,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         requests = [_create_request(prompt_len, 0)]
 
         batch = ScheduledRequests()
-        batch.context_requests = requests
-        batch.generation_requests = []
+        batch.context_requests_last_chunk = requests
         kv_cache_manager.prepare_resources(batch)
         model_engine.forward(batch, resource_manager)
 
@@ -312,8 +307,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         requests = [_create_request(prompt_len, 0)]
 
         batch = ScheduledRequests()
-        batch.context_requests = requests
-        batch.generation_requests = []
+        batch.context_requests_last_chunk = requests
         kv_cache_manager.prepare_resources(batch)
         model_engine.forward(batch, resource_manager)
 
@@ -332,8 +326,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         requests = [_create_request(prompt_len, 0)]
 
         batch = ScheduledRequests()
-        batch.context_requests = requests
-        batch.generation_requests = []
+        batch.context_requests_last_chunk = requests
         kv_cache_manager.prepare_resources(batch)
         model_engine.forward(batch, resource_manager)
 
@@ -352,8 +345,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         requests = [_create_request(prompt_len, 0)]
 
         batch = ScheduledRequests()
-        batch.context_requests = requests
-        batch.generation_requests = []
+        batch.context_requests_last_chunk = requests
         kv_cache_manager.prepare_resources(batch)
         model_engine.forward(batch, resource_manager)
 
@@ -370,8 +362,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         requests = [_create_request(prompt_len, 0)]
 
         batch = ScheduledRequests()
-        batch.context_requests = requests
-        batch.generation_requests = []
+        batch.context_requests_last_chunk = requests
         kv_cache_manager.prepare_resources(batch)
         model_engine.forward(batch, resource_manager)
 
@@ -397,7 +388,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         # Create scheduled requests with two generation requests.
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests = []
+        scheduled_requests.context_requests_last_chunk = []
         prompt_lens = [20, 15]
         gen_requests = []
         for idx in range(len(prompt_lens)):
@@ -503,8 +494,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         requests = [_create_request(prompt_len, 0)]
 
         batch = ScheduledRequests()
-        batch.context_requests = requests
-        batch.generation_requests = []
+        batch.context_requests_last_chunk = requests
         kv_cache_manager.prepare_resources(batch)
         with torch.cuda.stream(execution_stream):
             model_engine.forward(batch, resource_manager)

@@ -249,7 +249,7 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
         assert isinstance(state, SampleState)
         scheduled_requests = state.scheduled_requests
         assert not scheduled_requests.generation_requests
-        for idx, request in enumerate(scheduled_requests.context_requests):
+        for idx, request in enumerate(scheduled_requests.context_requests()):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
@@ -337,7 +337,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         mrope_position_ids = extra_data.get("mrope_position_ids", None)
         mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
         for i, (request, mm_embedding) in enumerate(
-            zip(scheduled_requests.context_requests, mm_embeddings)
+            zip(scheduled_requests.context_requests(), mm_embeddings)
         ):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
@@ -1765,7 +1765,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     @classmethod
     def _filter_new_requests(cls, requests: ScheduledRequests) -> list[LlmRequest]:
-        return [request for request in requests.context_requests if cls._is_new_request(request)]
+        return [request for request in requests.context_requests() if cls._is_new_request(request)]
 
     @override
     def validate_request(self, request: LlmRequest) -> None:
@@ -2389,7 +2389,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 return None
 
-        for req_idx, req in enumerate(state.scheduled_requests.context_requests):
+        for req_idx, req in enumerate(state.scheduled_requests.context_requests()):
             if (
                 req.state == LlmRequestState.GENERATION_COMPLETE
                 or req.context_remaining_length != 0
@@ -2406,7 +2406,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         for req_idx, req in enumerate(
             state.scheduled_requests.generation_requests,
-            len(state.scheduled_requests.context_requests),
+            len(state.scheduled_requests.context_requests()),
         ):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
@@ -3055,9 +3055,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         generation_requests_total_steps = (
-            # NB: requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
+            # NB: requests == scheduled_requests.context_requests() + scheduled_requests.generation_requests
             sum_num_generated_tokens
-            - cast(int, req_offsets[len(scheduled_requests.context_requests)].item())
+            - cast(int, req_offsets[scheduled_requests.num_context_requests].item())
             if scheduled_requests.generation_requests
             else 0
         )
@@ -3076,11 +3076,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # If return context logits is requested, select only the generated logits.
         #
         # NB: Context request logits always precede generation request logits, also
-        #     requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
-        if any(r.py_return_context_logits for r in scheduled_requests.context_requests):
-            assert (
-                len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
-            )
+        #     requests == scheduled_requests.context_requests() + scheduled_requests.generation_requests
+        if any(r.py_return_context_logits for r in scheduled_requests.context_requests()):
+            assert len(num_context_logits_prefix_sum) == scheduled_requests.num_context_requests + 1
             req_num_generated_tokens_cuda = req_num_generated_tokens.to(
                 raw_logits_cuda.device, non_blocking=True
             )
@@ -3097,7 +3095,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # Since logits for generation requests are densely packed, cover them all by a single
                 # fictituous entry in 'context_req_offsets_cuda'.
                 req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
-                    : (len(scheduled_requests.context_requests) + 1)
+                    : (scheduled_requests.num_context_requests + 1)
                 ].clone()
                 req_num_steps_fictitious_cuda[-1].fill_(generation_requests_total_steps)
                 next_context_req_offsets_cuda[-1].copy_(
@@ -3106,7 +3104,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
             else:
                 req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
-                    : len(scheduled_requests.context_requests)
+                    : scheduled_requests.num_context_requests
                 ]
                 # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
                 # only end-offsets of the token storage locations matter.
@@ -3810,14 +3808,14 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
                 self.model_config,
                 self.world_config,
                 self.decoding_config,
-                scheduled_requests.context_requests,
+                scheduled_requests.context_requests(),
                 self.logits_datatype,
                 self.store["decoder_input_buffers"][self.micro_batch_idx],
                 self.store["decoder_state"],
                 self.store["cuda_stream"],
                 self.algs.decoder.decoder_stream,  # type: ignore
                 self.max_seq_len,
-                self.beam_width(scheduled_requests.context_requests),
+                self.beam_width(scheduled_requests.context_requests()),
             )
         )
 
@@ -3889,7 +3887,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         make_decoding_batch_input(
             self.store["decoder_input_buffers"][self.micro_batch_idx],
             self.store["decoder_state"],
-            scheduled_requests.context_requests,
+            scheduled_requests.context_requests(),
             scheduled_requests.generation_requests,
             model_outputs["logits"],
             beam_width,
@@ -3981,7 +3979,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         finish_reasons = state.host.finish_reasons.flatten().tolist()
 
         reqs = [
-            r for r in state.scheduled_requests.context_requests if not r.is_context_init_state
+            r for r in state.scheduled_requests.context_requests() if not r.is_context_init_state
         ] + [
             r
             for r in state.scheduled_requests.generation_requests
@@ -4067,7 +4065,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         finalize_events = state.finalize_events
 
         reqs = [
-            r for r in state.scheduled_requests.context_requests if not r.is_context_init_state
+            r for r in state.scheduled_requests.context_requests() if not r.is_context_init_state
         ] + [
             r
             for r in state.scheduled_requests.generation_requests
