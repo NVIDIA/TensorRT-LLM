@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,11 +32,74 @@ namespace common
 #ifdef ENABLE_FP8
 
 constexpr int CTA_SIZE = 256;
+constexpr int VEC_SIZE = 8; // elements per vectorized iteration (128-bit load = 8 × bf16)
+constexpr int64_t MAX_GRID_DIM = 65536;
+
+inline int64_t scaleMatrixGridSize(int64_t numel)
+{
+    return std::min((numel + CTA_SIZE - 1) / CTA_SIZE, MAX_GRID_DIM);
+}
+
+inline int64_t scaleMatrixVecGridSize(int64_t numel)
+{
+    int64_t vecElements = numel / VEC_SIZE;
+    return std::min((vecElements + CTA_SIZE - 1) / CTA_SIZE, MAX_GRID_DIM);
+}
 
 template <bool QUANTIZE>
 __inline__ __device__ float scale(float a, float b)
 {
     return QUANTIZE ? a / b : a * b;
+}
+
+// Vectorized PER_TENSOR kernel for bf16 input → fp8 output.
+// Each thread processes 8 bf16 values per iteration via 128-bit loads / 64-bit stores.
+template <bool QUANTIZE>
+__global__ void scaleMatrixPerTensorVec(
+    __nv_fp8_e4m3* output, float const* input_scale, __nv_bfloat16 const* input, int64_t numel)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    float const s = input_scale[0];
+    float const factor = QUANTIZE ? (1.0f / s) : s;
+    int64_t const vecElements = numel / VEC_SIZE;
+    int64_t const stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+
+    for (int64_t vi = threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x; vi < vecElements; vi += stride)
+    {
+        int64_t const base = vi * VEC_SIZE;
+
+        // 128-bit load: 8 × bf16
+        float4 raw = *reinterpret_cast<float4 const*>(input + base);
+        __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+
+        // Convert 4 × bf16-pair → 4 × float2 → 4 × fp8-pair → pack into 2 × uint32
+        __nv_fp8x2_storage_t fp8_pairs[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p)
+        {
+            float2 f2 = __bfloat1622float2(pairs[p]);
+            f2.x *= factor;
+            f2.y *= factor;
+            fp8_pairs[p] = __nv_cvt_float2_to_fp8x2(f2, __NV_SATFINITE, __NV_E4M3);
+        }
+
+        // 64-bit store: 8 × fp8
+        *reinterpret_cast<uint2*>(output + base) = *reinterpret_cast<uint2 const*>(fp8_pairs);
+    }
+
+    // Scalar tail for remaining elements (numel not divisible by 8)
+    int64_t const tailStart = vecElements * VEC_SIZE;
+    for (int64_t i = tailStart + threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x; i < numel; i += stride)
+    {
+        output[i] = __nv_fp8_e4m3(static_cast<float>(input[i]) * factor);
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <QuantizeMode QUANTIZE_MODE, bool QUANTIZE, typename T_OUT, typename T_S, typename T_IN>
@@ -46,20 +109,29 @@ __global__ void scaleMatrix(T_OUT* output, T_S const* input_scale, T_IN const* i
     cudaGridDependencySynchronize();
 #endif
 
-    for (int64_t i = threadIdx.x + blockIdx.x * blockDim.x; i < numel; i += blockDim.x * gridDim.x)
+    if constexpr (QUANTIZE_MODE == QuantizeMode::PER_TENSOR)
     {
-
-        if (QUANTIZE_MODE == QuantizeMode::PER_CHANNEL)
+        float const s = static_cast<float>(input_scale[0]);
+        float const factor = QUANTIZE ? (1.0f / s) : s;
+        for (int64_t i = threadIdx.x + blockIdx.x * blockDim.x; i < numel; i += blockDim.x * gridDim.x)
         {
-            output[i] = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[i % lda])));
+            output[i] = T_OUT(static_cast<float>(input[i]) * factor);
         }
-        else if (QUANTIZE_MODE == QuantizeMode::PER_TOKEN)
+    }
+    else
+    {
+        for (int64_t i = threadIdx.x + blockIdx.x * blockDim.x; i < numel; i += blockDim.x * gridDim.x)
         {
-            output[i] = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[i / lda])));
-        }
-        else if (QUANTIZE_MODE == QuantizeMode::PER_TENSOR)
-        {
-            output[i] = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[0])));
+            if constexpr (QUANTIZE_MODE == QuantizeMode::PER_CHANNEL)
+            {
+                output[i]
+                    = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[i % lda])));
+            }
+            else if constexpr (QUANTIZE_MODE == QuantizeMode::PER_TOKEN)
+            {
+                output[i]
+                    = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[i / lda])));
+            }
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -67,11 +139,46 @@ __global__ void scaleMatrix(T_OUT* output, T_S const* input_scale, T_IN const* i
 #endif
 }
 
+// Helper: can we use the vectorized PER_TENSOR kernel for this type combination?
+template <typename T_OUT, typename T_S, typename T_IN>
+struct CanUseVecPerTensor : std::false_type
+{
+};
+
+template <>
+struct CanUseVecPerTensor<__nv_fp8_e4m3, float, __nv_bfloat16> : std::true_type
+{
+};
+
 template <typename T_OUT, typename T_S, typename T_IN>
 void invokeQuantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* input, int64_t numel, int64_t lda,
     QuantizeMode quantize_mode, cudaStream_t stream)
 {
-    dim3 grid(1024);
+    // PER_TENSOR + bf16→fp8 with float scale: use vectorized kernel (128-bit loads)
+    if constexpr (CanUseVecPerTensor<T_OUT, T_S, T_IN>::value)
+    {
+        if (quantize_mode == QuantizeMode::PER_TENSOR)
+        {
+            dim3 grid(static_cast<unsigned int>(scaleMatrixVecGridSize(numel)));
+            dim3 block(CTA_SIZE);
+            cudaLaunchConfig_t config;
+            config.gridDim = grid;
+            config.blockDim = block;
+            config.dynamicSmemBytes = 0;
+            config.stream = stream;
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+            config.numAttrs = 1;
+            config.attrs = attrs;
+            cudaLaunchKernelEx(&config, scaleMatrixPerTensorVec<true>, output, input_scale, input, numel);
+            sync_check_cuda_error(stream);
+            return;
+        }
+    }
+
+    // General path: scalar kernel
+    dim3 grid(static_cast<unsigned int>(scaleMatrixGridSize(numel)));
     dim3 block(CTA_SIZE);
     cudaLaunchConfig_t config;
     config.gridDim = grid;
@@ -105,7 +212,7 @@ template <typename T_OUT, typename T_S, typename T_IN>
 void invokeDequantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* input, int64_t numel, int64_t lda,
     QuantizeMode quantize_mode, cudaStream_t stream)
 {
-    dim3 grid(1024);
+    dim3 grid(static_cast<unsigned int>(scaleMatrixGridSize(numel)));
     dim3 block(CTA_SIZE);
     cudaLaunchConfig_t config;
     config.gridDim = grid;
