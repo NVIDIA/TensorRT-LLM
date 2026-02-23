@@ -242,9 +242,7 @@ def test_python_builds(args):
     print(f"Repository root: {repo_root}")
 
     # Uninstall existing tensorrt_llm to test fresh editable install
-    subprocess.run("pip3 uninstall -y tensorrt_llm || true",
-                   shell=True,
-                   check=False)
+    subprocess.run("pip3 uninstall -y tensorrt_llm", shell=True, check=False)
 
     print("##########  Install with TRTLLM_PRECOMPILED_LOCATION  ##########")
     env = os.environ.copy()
@@ -260,9 +258,7 @@ def test_python_builds(args):
 
     # Clean up: uninstall editable install to leave env in clean state
     print("##########  Clean up editable install  ##########")
-    subprocess.run("pip3 uninstall -y tensorrt_llm || true",
-                   shell=True,
-                   check=False)
+    subprocess.run("pip3 uninstall -y tensorrt_llm", shell=True, check=False)
 
 
 if __name__ == "__main__":
