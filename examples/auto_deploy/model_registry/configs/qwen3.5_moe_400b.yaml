@@ -41,3 +41,6 @@ transforms:
   multi_stream_moe:
     stage: compile
     enabled: true
+  multi_stream_gemm:
+    stage: compile
+    enabled: true
