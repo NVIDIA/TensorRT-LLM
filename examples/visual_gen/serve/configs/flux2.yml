@@ -7,4 +7,4 @@ attention:
    backend: VANILLA
 parallel:
    dit_cfg_size: 1
-   dit_ulysses_size: 1
+   dit_ulysses_size: 2

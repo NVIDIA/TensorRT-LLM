@@ -115,6 +115,7 @@ def get_model_path(extra_argv):
 
 
 VISUAL_GEN_PARTIAL_MODEL_NAME_TO_MODEL_TYPE = {
+    "FLUX.1": "flux1",
     "FLUX.2": "flux2",
     "LTX-2": "ltx2",
     "Wan2": "wan2",

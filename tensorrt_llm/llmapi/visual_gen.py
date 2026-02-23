@@ -25,7 +25,6 @@ POLL_TIMEOUT = 0.01
 AWAIT_TIMEOUT = 0.05
 THREAD_TIMEOUT = 5.0
 WORKER_TIMEOUT = 2.0
-READY_TIMEOUT = 1200  # 20 minutes for large models (Wan 2.2 with transformer_2)
 
 
 def find_free_port() -> int:
@@ -317,27 +316,39 @@ class DiffusionRemoteClient:
                     p.kill()
                     p.join(timeout=WORKER_TIMEOUT)
 
-    def _wait_ready(self, timeout: float = READY_TIMEOUT):
+    def _wait_ready(self):
         """Wait for workers to be ready (sync wrapper for async operation)."""
         logger.info("DiffusionClient: Waiting for workers")
 
-        # Run the async wait in the background thread's event loop
-        future = asyncio.run_coroutine_threadsafe(self._wait_ready_async(timeout), self._event_loop)
-        return future.result(timeout=timeout)
+        future = asyncio.run_coroutine_threadsafe(self._wait_ready_async(), self._event_loop)
+        future.result()
 
-    async def _wait_ready_async(self, timeout: float = READY_TIMEOUT):
-        """Wait for workers to be ready (async version)."""
+    async def _wait_ready_async(self):
+        """Wait for workers to be ready (async version).
+
+        Polls indefinitely for the ready signal. If any worker process dies
+        during initialization, raises RuntimeError immediately (LLM-style).
+        """
         start_time = time.time()
+        last_log_time = start_time
+        log_interval = 300
 
         while True:
             async with self.lock:
                 if -1 in self.completed_responses:
                     self.completed_responses.pop(-1)
-                    logger.info("DiffusionClient: Workers ready")
+                    elapsed = time.time() - start_time
+                    logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return
 
-            if time.time() - start_time > timeout:
-                raise RuntimeError("DiffusionClient: Timeout waiting for workers")
+            if any(not p.is_alive() for p in self.worker_processes):
+                raise RuntimeError("DiffusionClient: Worker died during initialization")
+
+            now = time.time()
+            if now - last_log_time >= log_interval:
+                elapsed = now - start_time
+                logger.info(f"DiffusionClient: Still waiting for workers ({elapsed:.0f}s elapsed)")
+                last_log_time = now
 
             try:
                 await asyncio.wait_for(self.response_event.wait(), timeout=AWAIT_TIMEOUT)
