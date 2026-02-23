@@ -33,6 +33,9 @@ _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
 
 
+import sa_spec
+
+
 @dataclass(kw_only=True, init=False)
 class TrtllmAttentionWrapper:
     sequence_length: torch.Tensor
@@ -1167,6 +1170,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
+
+        # Suffix Automaton Decoding: copy newly-built suffix automaton states
+        # to the device and update the RequestID->batch_index mapping.
+        sa_spec.prepare(self.request_ids[self.num_contexts:])
 
     def prepare_flash_mla(self) -> None:
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
