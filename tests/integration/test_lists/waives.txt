@@ -388,3 +388,6 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] SKIP (https://nvbugspro.nvidia.com/bug/5919026)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_mpi[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5920761)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[latency_default] SKIP (https://nvbugs/5920751)
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-v32-fp4_1k1k_con2048_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-UCX] SKIP (https://nvbugs/5846166)
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_kimi-k2-thinking-fp4_1k1k_con4_ctx1_dep4_gen1_tep4_eplb0_mtp0_ccb-UCX] SKIP (https://nvbugs/5846166)
+accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[trtllm-1] SKIP (https://nvbugs/5921674)
