@@ -1052,11 +1052,10 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     def model_post_init(self, __context):
         self._last_hidden_in_save = True
-        if self.eagle3_layers_to_capture is None:
+        if self.eagle3_layers_to_capture is None or -1 not in self.eagle3_layers_to_capture:
+            # This variable is queried to determine whether we should write the final hidden state
+            # to the aux_hidden_states buffer.
             self._last_hidden_in_save = False
-        elif -1 not in self.eagle3_layers_to_capture:
-            self._last_hidden_in_save = False
-            self.eagle3_layers_to_capture.add(-1)
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1078,13 +1077,23 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     @functools.cached_property
     def num_capture_layers(self):
         """
-        Returns the number of layers to capture of the target model.
-        If eagle3_layers_to_capture is not None, return the length of the set.
-        Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden state).
+        Returns the number of layers to save.
+        The following hidden states are saved:
+        - If eagle3_layers_to_capture is None, save the eagle3 base set plus
+        the post norm last hidden state.
+        - Otherwise, save the specified layers plus the post norm last hidden state.
+
+        The saved data will contain two tensors, hidden_states and aux_hidden_states.
+        * hidden_states will contain the last post norm state.
+        * aux_hidden_states will contain all other captured layers. The last hidden state
+        will also be included in this tensor if you explicitly captured layer -1.
+
+        Note that if you set layers to capture to {-1}, aux_hidden_states won't exist.
         """
         if self.eagle3_layers_to_capture is None:
             return 4
-        return len(self.eagle3_layers_to_capture)
+        return len(self.eagle3_layers_to_capture) + int(
+            -1 not in self.eagle3_layers_to_capture)
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -1182,6 +1191,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_draft_len = kwargs['num_nextn_predict_layers']
             self.max_total_draft_tokens = kwargs[
                 'num_nextn_predict_layers']  # Current MTP only support linear tree
+
+        if not self.mtp_eagle_one_model:
+            logger.warning(
+                "2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing "
+                "in release 1.3. After that, the flag will be removed entirely."
+            )
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1487,6 +1502,12 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
         return getattr(_ContextChunkingPolicy, self.value)
 
 
+class WaitingQueuePolicy(StrEnum):
+    """Waiting queue scheduling policy for managing pending requests."""
+
+    FCFS = "fcfs"  # First-Come-First-Served
+
+
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
 class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
@@ -1524,6 +1545,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None, description="The dynamic batch config to use")
+
+    waiting_queue_policy: WaitingQueuePolicy = Field(
+        default=WaitingQueuePolicy.FCFS,
+        description="The waiting queue scheduling policy")
 
     def _to_pybind(self):
         return _SchedulerConfig(
@@ -2065,12 +2090,6 @@ class BaseLlmArgs(StrictBaseModel):
         description="The format to load the model.",
         json_schema_extra={"type": "Literal['auto', 'dummy']"})
 
-    fail_fast_on_attention_window_too_large: bool = Field(
-        default=False,
-        description=
-        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
-        status="prototype")
-
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
@@ -2445,6 +2464,12 @@ class TrtLlmArgs(BaseLlmArgs):
 
     workspace: Optional[str] = Field(default=None,
                                      description="The workspace for the model.")
+
+    fail_fast_on_attention_window_too_large: bool = Field(
+        default=False,
+        description=
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
+        status="prototype")
 
     # Once set, the model will reuse the build_cache
     enable_build_cache: object = Field(
@@ -3243,9 +3268,13 @@ class TorchLlmArgs(BaseLlmArgs):
         """Validate CUDA graph configuration.
 
         Ensures that:
-        1. If cuda_graph_config.batch_sizes is provided, cuda_graph_config.max_batch_size must be 0
-        2. If cuda_graph_config.batch_sizes is not provided, it is generated based on cuda_graph_config.max_batch_size
-        3. If both are provided, cuda_graph_config.batch_sizes must match the generated values
+        1. If cuda_graph_config.batch_sizes is provided, max_batch_size is
+           derived as max(batch_sizes).  If max_batch_size was already set it
+           must be compatible (equal to max(batch_sizes)); otherwise an error
+           is raised.
+        2. If only cuda_graph_config.max_batch_size is provided, batch_sizes
+           is generated from it.
+        3. If neither is provided, a default max_batch_size of 128 is used.
         """
         if self.cuda_graph_config is None:
             return self
@@ -3254,17 +3283,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
         if config.batch_sizes:
             config.batch_sizes = sorted(config.batch_sizes)
-            if config.max_batch_size != 0:
-                if config.batch_sizes != CudaGraphConfig._generate_cuda_graph_batch_sizes(
-                        config.max_batch_size, config.enable_padding):
-                    raise ValueError(
-                        "Please don't set both cuda_graph_config.batch_sizes "
-                        "and cuda_graph_config.max_batch_size.\n"
-                        f"cuda_graph_config.batch_sizes: {self.cuda_graph_config.batch_sizes}, "
-                        f"cuda_graph_config.max_batch_size: {self.cuda_graph_config.max_batch_size}"
-                    )
-            else:
-                config.max_batch_size = max(config.batch_sizes)
+            derived_max = max(config.batch_sizes)
+            if config.max_batch_size != 0 and config.max_batch_size != derived_max:
+                raise ValueError(
+                    "cuda_graph_config.max_batch_size is incompatible with "
+                    "cuda_graph_config.batch_sizes. When both are provided, "
+                    "max_batch_size must equal max(batch_sizes).\n"
+                    f"cuda_graph_config.batch_sizes: {config.batch_sizes}, "
+                    f"max(batch_sizes): {derived_max}, "
+                    f"cuda_graph_config.max_batch_size: {config.max_batch_size}"
+                )
+            config.max_batch_size = derived_max
         else:
             max_batch_size = config.max_batch_size or 128
             generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(

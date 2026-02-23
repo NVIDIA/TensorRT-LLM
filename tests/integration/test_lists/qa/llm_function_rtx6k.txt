@@ -56,8 +56,10 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus_sm120[th
 accuracy/test_llm_api_pytorch.py::TestMinitron4BBaseInstruct::test_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp8
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=FLASHINFER]
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=FLASHINFER]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=FLASHINFER]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=TRTLLM]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_llm_sampler
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=True-overlap_scheduler=True]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=False-overlap_scheduler=False]

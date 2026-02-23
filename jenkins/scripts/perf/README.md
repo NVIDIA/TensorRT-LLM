@@ -6,10 +6,7 @@ summaries to Slack.
 
 ## Basic Usage
 
-This script is run by the Jenkins pipeline:
-https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/TRTLLM-Perf/job/PerfSanityTriage/
-
-Inputs are configured in `jenkins/runPerfSanityTriage.groovy`:
+This script is run by the Jenkins pipeline. Inputs are configured in `jenkins/runPerfSanityTriage.groovy`:
 
 - `BRANCH`: repo branch to checkout
 - `OPEN_SEARCH_PROJECT_NAME`: OpenSearch project name
