@@ -187,19 +187,23 @@ def pulseScan(llmRepo, branchName) {
             docker.withRegistry("https://${DEFAULT_GIT_URL}:5005") {
                 docker.image("pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable")
                   .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
+                    def versionMatcher = branchName =~ /^release\/(\d+\.\d+)$/
+                    def version = versionMatcher ? "${versionMatcher[0][1]}.0" : branchName
+                    def SBOMName = "sbom_" + branchName.replaceAll('/', '_')
                     withEnv([
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
                         "PULSE_REPO_URL=${llmRepo}",
                         "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : branchName}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
-                        "PULSE_SCAN_PROJECT_VERSION=${branchName.replace("release/", "")}",
-                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
+                        "PULSE_SCAN_PROJECT_VERSION=${version}",
+                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
+                        "PULSE_SBOM_NAME=${SBOMName}",
+                        "PULSE_SBOM_VERSION=${version}"
                     ]) {
-                        if (params.repoUrlKey == "github_fork") {
-                            sh 'pulse scan --no-fail --sbom .'
-                        } else {
-                            sh 'pulse scan --no-fail --sbom --override .'
+                        sh 'pulse scan --no-fail --sbom .'
+                        if (params.repoUrlKey != "github_fork") {
+                            sh 'pulse upload-sbom --skip-validation --sbom-file sbom.cdx.json --vulnerability-report nspect_scan_report.json'
                         }
                     }
                   }
