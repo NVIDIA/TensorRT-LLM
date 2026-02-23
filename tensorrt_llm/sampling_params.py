@@ -352,6 +352,10 @@ class SamplingParams:
             self.logprobs = None
         if self.logprobs is True:
             self.logprobs = 0
+        if self.logprobs is not None and self.logprobs < 0:
+            raise ValueError("logprobs must be positive, zero or None")
+        if self.prompt_logprobs is not None and self.prompt_logprobs < 0:
+            raise ValueError("prompt_logprobs must be positive, zero or None")
 
     # NB: Static, because downstream code only holds instances of
     #     bindings.SamplingConfig (not SamplingParams).
