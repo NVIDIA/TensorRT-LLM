@@ -7,7 +7,6 @@ import numpy as np
 import PIL
 import torch
 from blake3 import blake3
-from torchvision.transforms import ToPILImage
 
 import tensorrt_llm
 from tensorrt_llm.logger import logger
@@ -629,8 +628,6 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
         modality_token_lengths = []
         for item in items:
             if modality == "image":
-                if isinstance(item, torch.Tensor):
-                    item = ToPILImage()(item)
                 num_tokens = input_processor.get_num_tokens_per_image(
                     image=item, )
                 modality_token_lengths.append(num_tokens)
@@ -638,8 +635,6 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                 if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
-                if isinstance(item[0], torch.Tensor):
-                    item = [ToPILImage()(frame) for frame in item]
                 num_tokens = input_processor.get_num_tokens_per_video(
                     video=item, )
                 modality_token_lengths.append(num_tokens)
