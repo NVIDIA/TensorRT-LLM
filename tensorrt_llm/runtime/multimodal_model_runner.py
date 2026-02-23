@@ -1650,6 +1650,8 @@ class MultimodalModelRunner:
             # CUDA Stream Overlapping Requirements:
             # 1. Both memory copy stream and kernel execution stream must be non-default streams
             # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
+            # NOTE: pinning is skipped under Confidential Compute
+            # (see maybe_pin_memory() and prefer_pinned())
             pinned_embeds = torch.empty_like(image_embeds,
                                              device='cpu',
                                              pin_memory=prefer_pinned())
@@ -2141,6 +2143,8 @@ class MultimodalModelRunner:
                     # CUDA Stream Overlapping Requirements:
                     # 1. Both memory copy stream and kernel execution stream must be non-default streams
                     # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
+                    # NOTE: pinning is skipped under Confidential Compute
+                    # (see maybe_pin_memory() and prefer_pinned())
                     prompt_table = maybe_pin_memory(prompt_table).to(
                         dtype=self.model.dtype)
                 else:
