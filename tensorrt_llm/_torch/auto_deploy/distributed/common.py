@@ -16,6 +16,8 @@ from ..utils.logger import ad_logger
 
 # TODO: check to what extend we can reuse _torch/distributed.py
 
+_MASTER_ADDR = "127.0.0.1"
+
 
 class _DistGroup:
     """Global instance to set/get the default process group for distributed ops."""
@@ -125,7 +127,7 @@ def _set_distributed_env_vars(local_rank: int, world_size: int, port: int) -> No
     """Set environment variables required by NCCL's env:// init method."""
     os.environ["RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_ADDR"] = _MASTER_ADDR
     os.environ["MASTER_PORT"] = str(port)
     os.environ["LOCAL_RANK"] = str(local_rank)
 
@@ -135,7 +137,7 @@ def _is_port_available(port: int) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", port))
+            s.bind((_MASTER_ADDR, port))
             return True
     except OSError:
         return False

@@ -52,7 +52,7 @@ def _run_ep_shard_job(
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "sharding_dims": ["tp", "ep"],
+                "sharding_dims": ["ep"],
                 "enable_attention_dp": enable_attention_dp,
             },
             "sharding_transform_executor": {
