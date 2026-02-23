@@ -750,6 +750,7 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
+    @torch.compiler.disable
     def get_effective_strategy_for_shape(
         self,
         output_shape: Tuple[int, ...],
